@@ -4815,7 +4815,7 @@ fn session_allowed(cfg: &Value, key: &str) -> bool {
 /// JS `isSessionAllowedInCurrentMode` behavior for selected-root social-v2 tools.
 /// This is kept separate from the legacy route preflight while that wider route
 /// family is still being migrated.
-fn social_policy_js_string(value: &Value) -> String {
+pub(crate) fn social_policy_js_string(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(value) => value.to_string(),
@@ -10392,79 +10392,17 @@ fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Resul
     Ok(role.get("mode").and_then(Value::as_str) == Some("silent") && key != owner_key)
 }
 
-/// Plain text of a history record (text segments, or the raw string forms).
-fn plain_text_of_message(message: &Value) -> String {
-    match message.get("message") {
-        Some(Value::Array(segments)) => segments
-            .iter()
-            .filter_map(|s| match s["type"].as_str() {
-                Some("text") => s["data"]["text"].as_str().map(str::to_owned),
-                Some("face") => Some(format!("[表情{}]", social_policy_js_string(&s["data"]["id"]))),
-                _ => None,
-            })
-            .collect(),
-        Some(Value::String(text)) => text.clone(),
-        _ => message.get("raw_message").and_then(Value::as_str).unwrap_or("").to_string(),
-    }
-}
-
 fn value_as_message_id(value: Option<&Value>) -> Option<i64> {
-    match value? {
-        Value::Number(n) => n.as_i64(),
-        Value::String(s) => s.trim().parse().ok(),
-        _ => None,
-    }
+    crate::recorded_send::message_id(value)
 }
 
-/// Look for our own message with this exact text in the recent history of the target. Returns its
-/// id only when such evidence exists; an unreadable history is "not verified".
-fn verify_sent(
-    ob: &crate::onebot::OneBot,
-    kind: &str,
-    id_s: &str,
-    text: &str,
-    since_ms: i64,
-    exclude: &[i64],
-) -> Option<i64> {
-    verify_sent_by(ob, kind, id_s, since_ms, exclude, |m| history_text_matches(m, text))
-}
+#[cfg(test)]
+use crate::recorded_send::history_text_matches;
 
-fn history_text_matches(message: &Value, text: &str) -> bool {
-    let expected = crate::outbound_message::normalize(text);
-    !expected.is_empty() && crate::outbound_message::normalize(&plain_text_of_message(message)) == expected
-}
-
-/// `verify_sent` with the evidence test supplied by the caller (text equality for chat messages,
-/// "has a record segment" for voice).
-fn verify_sent_by(
-    ob: &crate::onebot::OneBot,
-    kind: &str,
-    id_s: &str,
-    since_ms: i64,
-    exclude: &[i64],
-    matches: impl Fn(&Value) -> bool,
-) -> Option<i64> {
-    let login = ob.request("get_login_info", json!({}))?;
-    let me = value_as_message_id(login.get("data")?.get("user_id"))?;
-    let id: i64 = id_s.parse().ok()?;
-    let (action, params) = if kind == "group" {
-        ("get_group_msg_history", json!({ "group_id": id, "count": 30 }))
-    } else {
-        ("get_friend_msg_history", json!({ "user_id": id, "count": 30 }))
-    };
-    let response = ob.request(action, params)?;
-    let messages = response.get("data")?.get("messages")?.as_array()?;
-    // Evidence must be dated at or after the attempt (QQ message times are whole seconds): an
-    // identical older message is not proof. Clock skew can only turn a delivered item into
-    // "unknown", which is never resent, so the window errs towards no duplicate.
-    let threshold_s = since_ms / 1000;
-    messages.iter().rev().find_map(|m| {
-        let sender = value_as_message_id(m.get("sender").and_then(|s| s.get("user_id")).or(m.get("user_id")))?;
-        let time = m.get("time").and_then(Value::as_i64).unwrap_or(0);
-        let message_id = value_as_message_id(m.get("message_id"))?;
-        (sender == me && time >= threshold_s && matches(m) && !exclude.contains(&message_id))
-            .then_some(message_id)
-    })
+/// Our own message with this exact text after `since_ms` (`recorded_send::history_evidence`).
+fn verify_sent(ob: &crate::onebot::OneBot, kind: &str, id_s: &str, text: &str, since_ms: i64, exclude: &[i64]) -> Option<i64> {
+    let history = crate::recorded_send::History { ob, kind, id_s };
+    crate::recorded_send::history_evidence(&history, since_ms, exclude, crate::recorded_send::Proof::Text(text))
 }
 
 struct PlanItem {

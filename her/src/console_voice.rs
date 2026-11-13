@@ -623,11 +623,8 @@ fn send_processed(
             record(json!({ "batch": batch_id, "k": "unknown", "idx": 0, "error": error, "t": now_ms() }));
             // An unknown send spends nothing (JS commits only after a delivered send); evidence below can still confirm it.
             let exclude = recently_confirmed_ids(context, attempt_ms);
-            let evidence = verify_sent_by(&ob, args.kind, args.id_s, attempt_ms, &exclude, |m| {
-                m.get("message").and_then(Value::as_array).is_some_and(|segments| {
-                    segments.iter().any(|s| s.get("type").and_then(Value::as_str) == Some("record"))
-                })
-            });
+            let history = crate::recorded_send::History { ob: &ob, kind: args.kind, id_s: args.id_s };
+            let evidence = crate::recorded_send::history_evidence(&history, attempt_ms, &exclude, crate::recorded_send::Proof::Segment("record"));
             match evidence {
                 Some(message_id) => {
                     record(json!({ "batch": batch_id, "k": "confirmed", "idx": 0, "messageId": message_id, "verified": true, "t": now_ms() }));

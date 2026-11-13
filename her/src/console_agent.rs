@@ -744,12 +744,8 @@ pub(super) fn resolve_quote_js(
 
 pub(super) const UNRESOLVED_QUOTE: &str = "无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）";
 
-/// The process-wide send order (JS `sendChain`). Poisoning cannot corrupt it: it guards no data.
-static SEND_CHAIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-pub(super) fn send_chain() -> std::sync::MutexGuard<'static, ()> {
-    SEND_CHAIN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+/// The process-wide send order (JS `sendChain`), owned by the recorded send.
+pub(super) use crate::recorded_send::send_chain;
 
 /// Everything after the request-specific validation: quota reservation (persisted before any request),
 /// quote resolution, the durable intent record, item-by-item sending with the validity check before each

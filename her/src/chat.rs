@@ -13,7 +13,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::inbound::SharedJournal;
-use crate::onebot::{OneBot, SendError, Target};
+use crate::onebot::{OneBot, Target};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 
 pub const DEFAULT_ACK: &str = "🤔 收到，正在思考…";
@@ -594,8 +594,9 @@ fn target_of(key: &str) -> Option<Target> {
 }
 
 /// `sendToQQ`: split to the QQ limit, send part by part with the configured delay, check the
-/// guard right before every part, and record intent / attempt / outcome of every part in the send
-/// outbox. A part whose outcome is unknown is never sent again.
+/// guard right before every part, and record every part through the recorded send. Chat sends
+/// wait for the process-wide send chain like tool sends; a part whose outcome is unknown is
+/// checked against gateway history and is never sent again.
 pub fn send_recorded(
     context: &RuntimeContext,
     ob: &OneBot,
@@ -606,9 +607,10 @@ pub fn send_recorded(
     delay_ms: u64,
     guard: &dyn Fn() -> Result<(), String>,
 ) -> SendReport {
-    use crate::send_outbox::{append_record, new_batch_id};
+    use crate::recorded_send::{send_chain, BeginError, History, Proof, Recorded, BATCH_BUSY};
+    use crate::send_outbox::ItemState;
     let mut report = SendReport::default();
-    let Some(target) = target_of(key) else {
+    let (Some(target), Some((kind, id_s))) = (target_of(key), key.split_once(':')) else {
         report.error = Some(format!("无效会话 {key}"));
         return report;
     };
@@ -621,16 +623,27 @@ pub fn send_recorded(
     if parts.is_empty() {
         return report;
     }
-    let batch = new_batch_id(now_ms());
+    // Owner rule (issue #70): a chat send may wait briefly behind another send in exchange for
+    // one runner per batch and no blind duplicate.
+    let _chain = send_chain();
     let delays: Vec<i64> = vec![delay_ms as i64; parts.len().saturating_sub(1)];
-    let intent = json!({
-        "batch": batch, "k": "intent", "key": key, "epoch": epoch, "purpose": purpose, "messages": parts,
-        "delays": delays, "replyTo": Value::Null, "atUser": Value::Null, "t": now_ms()
+    let fields = json!({
+        "key": key, "epoch": epoch, "purpose": purpose, "messages": parts,
+        "delays": delays, "replyTo": Value::Null, "atUser": Value::Null
     });
-    if let Err(error) = append_record(context, &intent) {
-        report.error = Some(format!("发送意图未能持久记录，未发送：{error}"));
-        return report;
-    }
+    let recorded = match Recorded::begin(context, now_ms, now_ms(), fields) {
+        Ok(recorded) => recorded,
+        Err(BeginError::Busy) => {
+            report.error = Some(BATCH_BUSY.to_string());
+            return report;
+        }
+        Err(BeginError::Intent(error)) => {
+            report.error = Some(format!("发送意图未能持久记录，未发送：{error}"));
+            return report;
+        }
+    };
+    let history = History { ob, kind, id_s };
+    let mut confirmed_ids: Vec<i64> = Vec::new();
     let mut stop: Option<String> = None;
     for (idx, part) in parts.iter().enumerate() {
         if idx > 0 && delay_ms > 0 {
@@ -641,36 +654,32 @@ pub fn send_recorded(
                 stop = Some(format!("发送已取消：{why}"));
             }
         }
+        let mut attempt_ms = 0;
         if stop.is_none() {
-            if let Err(error) = append_record(context, &json!({"batch": batch, "k": "attempt", "idx": idx, "t": now_ms()})) {
-                stop = Some(format!("发送意图未能持久记录，未发送：{error}"));
+            match recorded.attempt(idx, None) {
+                Ok(at) => attempt_ms = at,
+                Err(error) => stop = Some(format!("发送意图未能持久记录，未发送：{error}")),
             }
         }
         if let Some(why) = &stop {
-            let _ = append_record(context, &json!({"batch": batch, "k": "cancelled", "idx": idx, "error": why, "t": now_ms()}));
+            let _ = recorded.cancelled(idx, Some(why));
             report.error.get_or_insert(why.clone());
             continue;
         }
-        match ob.send_one_outcome(&target, part, None, None) {
-            Ok(data) => {
-                report.confirmed += 1;
-                let message_id = data.get("message_id").and_then(Value::as_i64);
-                if let Err(error) = append_record(context, &json!({"batch": batch, "k": "confirmed", "idx": idx, "messageId": message_id, "t": now_ms()})) {
-                    // Preserve the known delivery count, surface its missing durable proof, and
-                    // stop later parts. Recovery retains the attempted item as uncertain.
-                    let why = format!("发送已确认，但确认结果未能持久记录：{error}");
-                    report.error = Some(why.clone());
-                    stop = Some(why);
-                }
+        let outcome = ob.send_one_outcome(&target, part, None, None);
+        let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
+        if let ItemState::Confirmed { message_id, .. } = settled.state {
+            report.confirmed += 1;
+            confirmed_ids.extend(message_id);
+            if let Some(error) = settled.record_error {
+                // Preserve the known delivery count, surface its missing durable proof, and
+                // stop later parts. Recovery retains the attempted item as uncertain.
+                let why = format!("发送已确认，但确认结果未能持久记录：{error}");
+                report.error = Some(why.clone());
+                stop = Some(why);
             }
-            Err(SendError::NotCommitted(error)) => {
-                report.error.get_or_insert(error.clone());
-                let _ = append_record(context, &json!({"batch": batch, "k": "not_committed", "idx": idx, "error": error, "t": now_ms()}));
-            }
-            Err(SendError::Unknown(error)) => {
-                report.error.get_or_insert(error.clone());
-                let _ = append_record(context, &json!({"batch": batch, "k": "unknown", "idx": idx, "error": error, "t": now_ms()}));
-            }
+        } else if let Some(error) = settled.error {
+            report.error.get_or_insert(error);
         }
     }
     report
@@ -1606,4 +1615,95 @@ mod tests {
         }
     }
 
+
+    /// A gateway that loses every send reply and answers login and group history (issue #70).
+    fn issue70_gateway(history: Value) -> (OneBot, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let ob = OneBot::new(&format!("http://{}", listener.local_addr().unwrap()), String::new());
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut paths = Vec::new();
+            while paths.len() < 3 && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_millis(10)); continue; }
+                    Err(e) => panic!("{e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let (mut bytes, mut buf) = (Vec::new(), [0u8; 4096]);
+                let head = loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                        let length: usize = head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                        }).unwrap_or(0);
+                        if bytes.len() >= end + 4 + length { break head; }
+                    }
+                };
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                paths.push(path.clone());
+                let body = match path.as_str() {
+                    "/send_group_msg" => continue, // receipt lost: close without a reply
+                    "/get_login_info" => json!({"status":"ok","retcode":0,"data":{"user_id":10001}}),
+                    "/get_group_msg_history" => json!({"status":"ok","retcode":0,"data":{"messages":history.clone()}}),
+                    _ => json!({"status":"failed","retcode":1404}),
+                }.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            paths
+        });
+        (ob, worker)
+    }
+
+    fn issue70_root(tag: &str) -> (std::path::PathBuf, RuntimeContext) {
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-issue70-{tag}-{}", crate::turn_ledger::mint_id(""))));
+        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        std::fs::write(root.join("config/config.json"), r#"{"consoleToken":"fixture-token"}"#).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        (root, context)
+    }
+
+    #[test]
+    fn issue70_chat_unknown_part_is_checked_against_history_and_never_resent() {
+        let (root, context) = issue70_root("unproven");
+        let (ob, gateway) = issue70_gateway(json!([]));
+        let guard = || -> Result<(), String> { Ok(()) };
+        let report = send_recorded(&context, &ob, "group:42", "chat", "reply", "未证实", 0, &guard);
+        let paths = gateway.join().unwrap();
+        let kinds: Vec<String> = crate::send_outbox::read_records(&context).unwrap().iter().filter_map(|r| r["k"].as_str().map(str::to_string)).collect();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(paths.iter().filter(|p| *p == "/send_group_msg").count(), 1, "an unknown part is never re-sent: {paths:?}");
+        assert!(paths.iter().any(|p| p == "/get_group_msg_history"), "the unknown part was not checked against history: {paths:?}");
+        assert_eq!(report.confirmed, 0);
+        assert!(report.error.is_some(), "{report:?}");
+        assert_eq!(kinds, ["intent", "attempt", "unknown"]);
+    }
+
+    #[test]
+    fn issue70_chat_unknown_part_proven_by_history_is_confirmed_as_verified() {
+        let (root, context) = issue70_root("proven");
+        let at = crate::parity_clock::now_ms() / 1000 + 5;
+        let (ob, gateway) = issue70_gateway(json!([{ "message_id": 4242, "time": at, "sender": {"user_id": 10001},
+            "message": [{"type": "text", "data": {"text": "已送达"}}] }]));
+        let guard = || -> Result<(), String> { Ok(()) };
+        let report = send_recorded(&context, &ob, "group:42", "chat", "reply", "已送达", 0, &guard);
+        let paths = gateway.join().unwrap();
+        let records = crate::send_outbox::read_records(&context).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(paths.iter().filter(|p| *p == "/send_group_msg").count(), 1, "{paths:?}");
+        assert_eq!((report.confirmed, report.error.as_deref()), (1, None), "{report:?}");
+        let kinds: Vec<_> = records.iter().filter_map(|r| r["k"].as_str()).collect();
+        assert_eq!(kinds, ["intent", "attempt", "unknown", "confirmed"]);
+        assert_eq!(records[3]["messageId"], 4242);
+        assert_eq!(records[3]["verified"], true);
+    }
 }
