@@ -638,15 +638,34 @@ pub fn recall_block(cfg: &Value, st: &Value, key: &str) -> String {
     recall_block_with_runtime(&RuntimeContext::legacy(), cfg, st, key)
 }
 
-/// The recall a wake would deliver. Rendering reads memory without counting search hits: a hit is counted
-/// by `record_recall_hits` once the prompt carrying the recall has been delivered.
+/// The memories the conversation's current session generation already carries: the ids of the
+/// installed briefing, kept while the record's generation is the one that briefing was installed
+/// for. A new generation, session or epoch has none; a history-gap refresh (`needsBriefing`, same
+/// generation) keeps them.
+fn held_recall_ids(record: &Value) -> Vec<i64> {
+    let installed = &record["installed"];
+    if installed["generation"].as_u64() != Some(record["generation"].as_u64().unwrap_or(0)) {
+        return Vec::new();
+    }
+    installed["recalled"].as_array().map(|ids| ids.iter().filter_map(Value::as_i64).collect()).unwrap_or_default()
+}
+
+/// The recall the next DSH wake would deliver (the console preview): memories the conversation's
+/// session generation already carries are left out, as in the wake. Rendering reads memory without
+/// counting search hits: a hit is counted by `record_recall_hits` once the prompt carrying the recall
+/// has been delivered.
 pub fn recall_block_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
     st: &Value,
     key: &str,
 ) -> String {
-    recall_block_with(context, cfg, st, key).0
+    let held = match (crate::session_map::lookup(context, key), st["agentToken"].as_str()) {
+        (Ok(Some(sid)), Some(epoch)) => crate::session_map::context_record(context, key, &sid, epoch)
+            .map(|record| held_recall_ids(&record)).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    recall_block_with(context, cfg, st, key, &held).0
 }
 
 /// Count one use of each memory a delivered prompt carried (`recall_block_with`'s ids). A failure is
@@ -671,12 +690,15 @@ pub(crate) fn recall_top_k(cfg: &Value) -> usize {
         .map_or(3, |n| n.round().clamp(1.0, 20.0) as usize)
 }
 
-/// The recall block and the ids of the memories it carries.
+/// The recall block and the ids of the memories it carries. `memory::recall` decides what is
+/// recalled (matches only, never the ids in `held`, which the session generation already carries);
+/// this renders it.
 fn recall_block_with(
     context: &RuntimeContext,
     cfg: &Value,
     st: &Value,
     key: &str,
+    held: &[i64],
 ) -> (String, Vec<i64>) {
     if cfg.get("memory").and_then(|m| m.get("enabled")).and_then(|v| v.as_bool()) == Some(false) {
         return (String::new(), Vec::new());
@@ -712,7 +734,7 @@ fn recall_block_with(
     let rows = if query.is_empty() {
         Vec::new()
     } else {
-        match crate::memory::search_with(&conn, key, is_owner, &query, &[], top_k, false) {
+        match crate::memory::recall(&conn, key, is_owner, &query, top_k, held) {
             Ok(rows) => rows,
             Err(error) => {
                 eprintln!("memory recall search failed: {}", crate::memory::search_error_message(&error));
@@ -1224,7 +1246,7 @@ fn build_inner(
     out.push_str(&wake_line(&st));
     out.push_str(&short_term_block(&st, &cfg));
     out.push_str(&recent_block(&st));
-    let (recall, recalled) = recall_block_with(context, &cfg, &st, key);
+    let (recall, recalled) = recall_block_with(context, &cfg, &st, key, &[]);
     out.push_str(&recall);
     out.push_str(&participation_block(&st));
     out.push_str(&pre_sleep_line(&cfg));
@@ -1887,12 +1909,16 @@ pub(crate) fn prepare_dsh_wake(
     if !full { delta.push_str(&wait_limit_line(cfg)); }
     // Automatic recall for the message being answered, the same block the console preview shows; the
     // briefing's retrieval section remains the on-demand route (`memory_search`).
-    let (recall, recalled) = recall_block_with(context, cfg, st, key);
+    // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
+    // wakes already carried; a new generation, session or epoch starts afresh.
+    let held = held_recall_ids(&record);
+    let (recall, recalled) = recall_block_with(context, cfg, st, key, &held);
     delta.push_str(&recall);
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
     body.push_str(&crate::model_view::strip_from_model_text(&delta, cfg));
     body.push_str(&crate::qq_tools::wake_snapshot(context,cfg,key,epoch)?);
-    let pending = json!({"rpcId":rpc_id,"generation":generation,"revision":revision,"sections":hashes,"full":full});
+    let carried: Vec<i64> = held.iter().chain(&recalled).copied().collect();
+    let pending = json!({"rpcId":rpc_id,"generation":generation,"revision":revision,"sections":hashes,"full":full,"recalled":carried});
     if !crate::session_map::update_context(context,key,sid,epoch,|r| {if r["generation"].as_u64().unwrap_or(0) == generation && (r["needsBriefing"]==true)==needs_briefing { r["pending"]=pending; }})? {
         return Err("wake session or epoch changed before submission".into());
     }
