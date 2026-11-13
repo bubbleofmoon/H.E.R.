@@ -159,7 +159,7 @@ pub fn enabled(cfg: &Value, def: &TaskDef) -> bool {
 
 /// `enabled` and not paused by the owner on the Schedule page.
 pub fn enabled_in(context: &RuntimeContext, cfg: &Value, def: &TaskDef) -> bool {
-    enabled(cfg, def) && !crate::schedule::ScheduleStore::new(context).system_paused(def.id.as_str())
+    enabled(cfg, def) && !crate::schedule::system_job_paused(context, def.id.as_str())
 }
 
 fn limits(cfg: &Value) -> StoreLimits {
@@ -287,6 +287,12 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
     if !install.is_absolute() { return Err("tasks.installRoot must be absolute".into()); }
     let admission_context = context.clone();
     let admission: tasks::Admission = Box::new(move |def, run| {
+        if run.view().source == RunSource::Scheduled && crate::schedule::PAUSABLE_JOBS.contains(&def.id.as_str()) {
+            // Ticket 33: a fresh read of the owner pause, holding the Schedule store lock until the run is marked
+            // running (the executor keeps the returned guard), so a pause that has answered is never overtaken by a
+            // due slot. An unreadable store refuses the start.
+            return crate::schedule::ScheduleStore::new(&admission_context).admit_scheduled(def.id.as_str()).map(Some);
+        }
         if run.view().source != RunSource::Manual || run.view().by.as_deref() != Some("console") {
             return Ok(None);
         }

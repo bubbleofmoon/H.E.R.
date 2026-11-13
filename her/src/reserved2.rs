@@ -159,7 +159,7 @@ mod tests {
         hub.sync_schedule(&cfg, false, now);
         assert!(lists_reply_check(&root), "her reply check is published");
 
-        ScheduleStore::new(&hub.context).request_timer_cancel(key, TimerKind::ReplyCheck, now).unwrap();
+        ScheduleStore::new(&hub.context).request_timer_cancel(key, TimerKind::ReplyCheck, now + 600_000, now).unwrap();
         hub.sync_schedule(&cfg, false, now);
         assert_eq!(hub.drivers[key].sched.reply_check_at, None, "the console cancel clears the timer");
         assert!(!lists_reply_check(&root), "the snapshot no longer lists the cancelled timer");

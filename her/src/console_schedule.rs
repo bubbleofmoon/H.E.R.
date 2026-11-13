@@ -216,7 +216,8 @@ fn timer_action(
         ("sleep", "run") => wake(context, cfg, key, "timeout"),
         ("replyCheck", "cancel") | ("reachOut", "cancel") => {
             let timer = if kind == "replyCheck" { TimerKind::ReplyCheck } else { TimerKind::ReachOut };
-            ScheduleStore::new(context).request_timer_cancel(key, timer, now).map_err(store_error)?;
+            let at = fields.get("at").and_then(Value::as_i64).ok_or((400, "取消需要页面上显示的计时器时间 at".to_string()))?;
+            ScheduleStore::new(context).request_timer_cancel(key, timer, at, now).map_err(store_error)?;
             Ok((200, json!({"ok": true, "id": id, "status": "cancelRequested"})))
         }
         ("sleep", "cancel") => set_sleep(context, key, None),

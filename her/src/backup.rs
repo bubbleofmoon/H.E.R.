@@ -1287,6 +1287,39 @@ mod tests {
         assert_eq!(scheduler.next_run(TaskId::Backup), Some(28_800_000));
     }
 
+    #[test]
+    fn scheduled_backup_is_refused_at_admission_while_paused_or_the_schedule_store_is_unreadable() {
+        let fixture = Fixture::new("schedule-admission");
+        let context = fixture.context();
+        let api = crate::supervisor::task_api(&context, &context.load_config().unwrap()).unwrap();
+        let def = crate::tasks::task_def(TaskId::Backup);
+        let scheduled = |slot: &str| {
+            let Trigger::Started(run) = api.dispatcher.start(def, crate::task_runs::RunSource::Scheduled, None, Some(slot), "scheduler") else {
+                panic!("scheduled backup was not started")
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let view = api.dispatcher.store().get(&run.run_id).unwrap().unwrap();
+                if view.state.is_terminal() {
+                    return view;
+                }
+                assert!(Instant::now() < deadline, "scheduled backup did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        // Paused after the scheduler last refreshed: admission reads the pause afresh.
+        crate::schedule::ScheduleStore::new(&context).set_system_paused("backup", true).unwrap();
+        let paused = scheduled("scheduled:backup:1");
+        assert_eq!(paused.state, crate::task_runs::RunState::Cancelled, "{paused:?}");
+        assert!(paused.reason.as_deref().unwrap_or("").contains("paused"), "{paused:?}");
+
+        fs::write(fixture.0.join("data/schedule.json"), "not json").unwrap();
+        let unreadable = scheduled("scheduled:backup:2");
+        assert_eq!(unreadable.state, crate::task_runs::RunState::Cancelled, "{unreadable:?}");
+        assert!(unreadable.reason.as_deref().unwrap_or("").contains("schedule store unavailable"), "{unreadable:?}");
+    }
+
+
     impl Fixture {
         fn new(name: &str) -> Self {
             let root = crate::install_root::development_root(std::env::temp_dir().join(format!(

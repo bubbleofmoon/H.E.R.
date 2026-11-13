@@ -19,6 +19,14 @@ const FINISHED_ITEM_CAP: usize = 200;
 const TIMER_CANCEL_TTL_MS: i64 = 120_000;
 const TIMERS_REFRESH_MS: i64 = 60_000;
 const MAX_TEXT_CHARS: usize = 500;
+/// HER's timer snapshot older than this is shown as stale and cannot be cancelled against (the hub is not running).
+const STALE_TIMERS_MS: i64 = 2 * TIMERS_REFRESH_MS;
+/// The shortest repeat the store accepts, for the owner and for HER.
+const MIN_REPEAT_MINUTES: u32 = 15;
+/// The model-facing note for a reminder that was cancelled or deleted before its wake ran.
+pub const REMINDER_GONE: &str = "【提醒内容】这条提醒已被取消或删除。\n\n";
+/// Set once an unreadable store has been logged; cleared by the next good read, so a new failure logs again.
+static PAUSE_READ_FAILURE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub const PAUSABLE_JOBS: &[&str] = &["memory-digest", "memory-digest-check", "backup", "upstream-check"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +58,9 @@ impl Repeat {
     pub fn validate(self) -> Result<(), StoreError> {
         match self {
             Repeat::Once => Ok(()),
-            Repeat::Every { minutes: 0 } => Err(StoreError::Invalid("重复间隔必须大于 0".into())),
+            Repeat::Every { minutes } if minutes < MIN_REPEAT_MINUTES => {
+                Err(StoreError::Invalid(format!("重复间隔至少 {MIN_REPEAT_MINUTES} 分钟")))
+            }
             Repeat::Every { .. } => Ok(()),
             Repeat::Daily { hour, minute } => {
                 if hour > 23 || minute > 59 {
@@ -117,6 +127,9 @@ pub struct Item {
     pub run_now: bool,
     #[serde(default)]
     pub last_result: Option<RunResult>,
+    /// When the item became Done or Cancelled; compaction keeps the most recently finished items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +169,11 @@ pub struct TimerView {
 pub struct TimerCancel {
     pub conversation: String,
     pub kind: TimerKind,
+    /// When the owner asked (the request expires `TIMER_CANCEL_TTL_MS` later).
     pub at: i64,
+    /// The timer's time as the owner saw it; the hub cancels only a timer still armed for exactly this time.
+    #[serde(default)]
+    pub timer_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,23 +318,30 @@ fn check_at(at: i64, now: i64) -> Result<(), StoreError> {
     }
 }
 
-/// Keeps the newest history records and the newest finished items.
-fn compact(doc: &mut Document) {
+/// Keeps the newest history records and the most recently finished items. An item finished by the current update
+/// (absent from `finished_before`) is never dropped, so a claim cannot delete the reminder it dispatches.
+fn compact(doc: &mut Document, finished_before: &[String]) {
     let excess = doc.history.len().saturating_sub(HISTORY_CAP);
     if excess > 0 {
         doc.history.drain(..excess);
     }
-    let mut finished: Vec<(i64, String)> = doc
+    let finished = doc.items.iter().filter(|item| is_finished(item.status)).count();
+    if finished <= FINISHED_ITEM_CAP {
+        return;
+    }
+    let mut droppable: Vec<(i64, String)> = doc
         .items
         .iter()
-        .filter(|item| is_finished(item.status))
-        .map(|item| (item.created_at, item.id.clone()))
+        .filter(|item| is_finished(item.status) && finished_before.contains(&item.id))
+        .map(|item| (finish_key(item), item.id.clone()))
         .collect();
-    if finished.len() > FINISHED_ITEM_CAP {
-        finished.sort();
-        let drop: Vec<String> = finished[..finished.len() - FINISHED_ITEM_CAP].iter().map(|(_, id)| id.clone()).collect();
-        doc.items.retain(|item| !drop.contains(&item.id));
-    }
+    droppable.sort();
+    let drop: Vec<String> = droppable.into_iter().take(finished - FINISHED_ITEM_CAP).map(|(_, id)| id).collect();
+    doc.items.retain(|item| !drop.contains(&item.id));
+}
+
+fn finish_key(item: &Item) -> i64 {
+    item.finished_at.or(item.last_result.as_ref().map(|result| result.at)).unwrap_or(item.created_at)
 }
 
 fn timer_name(kind: TimerKind) -> &'static str {
@@ -342,37 +366,46 @@ impl ScheduleStore {
             Err(error) => Err(StoreError::Unavailable(error.to_string())),
             Ok(None) => Ok(Document::empty()),
             Ok(Some(text)) => {
-                let doc: Document = serde_json::from_str(&text)
+                let mut doc: Document = serde_json::from_str(&text)
                     .map_err(|error| StoreError::Unavailable(format!("schedule store invalid: {error}")))?;
                 if doc.version != 1 {
                     return Err(StoreError::Unavailable("schedule store version unsupported".into()));
                 }
+                // A hand-edited or legacy pause of a job that cannot pause (watchdog, manual tasks) is ignored.
+                doc.system_paused.retain(|job| PAUSABLE_JOBS.contains(&job.as_str()));
                 Ok(doc)
             }
         }
     }
 
     fn update<T>(&self, change: impl FnOnce(&mut Document) -> Result<T, StoreError>) -> Result<T, StoreError> {
-        let started = Instant::now();
-        let _gate = loop {
-            match self.context.open_locked_file(RuntimeArea::Data, LOCK_FILE) {
-                Ok(file) => break file,
-                Err(error) if error == "runtime file is already locked" && started.elapsed() < Duration::from_secs(2) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(StoreError::Unavailable(error)),
-            }
-        };
+        let _gate = self.lock()?;
         let mut doc = self.read()?;
         let before = serde_json::to_string(&doc).map_err(|error| StoreError::Unavailable(error.to_string()))?;
+        let finished_before: Vec<String> =
+            doc.items.iter().filter(|item| is_finished(item.status)).map(|item| item.id.clone()).collect();
         let value = change(&mut doc)?;
-        compact(&mut doc);
+        compact(&mut doc, &finished_before);
         let after = serde_json::to_string(&doc).map_err(|error| StoreError::Unavailable(error.to_string()))?;
         if after != before {
             let bytes = serde_json::to_vec_pretty(&doc).map_err(|error| StoreError::Unavailable(error.to_string()))?;
             self.context.write_atomic(RuntimeArea::Data, STORE_FILE, &bytes)?;
         }
         Ok(value)
+    }
+
+    /// The store lock (`locks/schedule.lock`), retried for up to 2 s.
+    fn lock(&self) -> Result<std::fs::File, StoreError> {
+        let started = Instant::now();
+        loop {
+            match self.context.open_locked_file(RuntimeArea::Data, LOCK_FILE) {
+                Ok(file) => return Ok(file),
+                Err(error) if error == "runtime file is already locked" && started.elapsed() < Duration::from_secs(2) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(StoreError::Unavailable(error)),
+            }
+        }
     }
 
     pub fn create(&self, new: NewItem, now: i64) -> Result<Item, StoreError> {
@@ -396,6 +429,7 @@ impl ScheduleStore {
             created_at: now,
             run_now: false,
             last_result: None,
+            finished_at: None,
         };
         let stored = item.clone();
         self.update(|doc| {
@@ -458,6 +492,7 @@ impl ScheduleStore {
                 return Err(finished_conflict());
             }
             item.status = ItemStatus::Cancelled;
+            item.finished_at = Some(now);
             let record = HistoryRecord {
                 at: now,
                 id: item.id.clone(),
@@ -516,6 +551,7 @@ impl ScheduleStore {
                 item.run_now = false;
                 if item.repeat == Repeat::Once {
                     item.status = ItemStatus::Done;
+                    item.finished_at = Some(now);
                 } else if item.next_at <= now {
                     item.next_at = item.repeat.next_after(item.next_at, now).unwrap_or(item.next_at + 60_000);
                 }
@@ -534,9 +570,26 @@ impl ScheduleStore {
         })
     }
 
-    /// Whether the owner paused this system job. A read error counts as not paused, so jobs run as before.
+    /// Whether the owner paused this system job; see [`system_job_paused`].
     pub fn system_paused(&self, job: &str) -> bool {
-        self.read().map(|doc| doc.system_paused.iter().any(|paused| paused == job)).unwrap_or(false)
+        system_job_paused(&self.context, job)
+    }
+
+    /// The owner pause as stored (pausable jobs only). Errors when the store cannot be read.
+    pub fn paused_jobs(&self) -> Result<Vec<String>, StoreError> {
+        Ok(self.read()?.system_paused)
+    }
+
+    /// Scheduled admission of a pausable system job. Reads the owner pause afresh under the store lock and returns
+    /// the lock, which the task executor holds until the run is marked running: a pause that has answered cannot be
+    /// overtaken by a due slot. An unreadable store refuses the start, so an owner pause is never dropped.
+    pub fn admit_scheduled(&self, job: &str) -> Result<std::fs::File, String> {
+        let gate = self.lock().map_err(|error| error.message())?;
+        match self.read() {
+            Ok(doc) if doc.system_paused.iter().any(|paused| paused == job) => Err("paused on the Schedule page".to_string()),
+            Ok(_) => Ok(gate),
+            Err(error) => Err(format!("schedule store unavailable; scheduled start refused: {}", error.message())),
+        }
     }
 
     pub fn set_system_paused(&self, job: &str, paused: bool) -> Result<(), StoreError> {
@@ -552,16 +605,24 @@ impl ScheduleStore {
         })
     }
 
-    pub fn request_timer_cancel(&self, conversation: &str, kind: TimerKind, now: i64) -> Result<(), StoreError> {
+    /// Queue a console cancel of one of HER's reply-check or reach-out timers. `timer_at` is the timer's time as the
+    /// page showed it; the cancel is refused unless the hub's fresh snapshot still lists exactly that timer.
+    pub fn request_timer_cancel(&self, conversation: &str, kind: TimerKind, timer_at: i64, now: i64) -> Result<(), StoreError> {
         if kind == TimerKind::Sleep {
             return Err(StoreError::Invalid("睡眠由唤醒配置管理，不能用取消队列".into()));
         }
         if !valid_conversation(conversation) {
             return Err(StoreError::Invalid("会话标识无效".into()));
         }
+        let (published_at, timers) = self.timers();
+        let seen = now - published_at <= STALE_TIMERS_MS
+            && timers.iter().any(|timer| timer.conversation == conversation && timer.kind == kind && timer.at == timer_at);
+        if !seen {
+            return Err(StoreError::Conflict("该计时器已变化，或 HER 当前没有在运行；请刷新后再试".into()));
+        }
         self.update(|doc| {
             doc.timer_cancels.retain(|cancel| now - cancel.at <= TIMER_CANCEL_TTL_MS);
-            doc.timer_cancels.push(TimerCancel { conversation: conversation.to_string(), kind, at: now });
+            doc.timer_cancels.push(TimerCancel { conversation: conversation.to_string(), kind, at: now, timer_at });
             Ok(())
         })
     }
@@ -660,12 +721,17 @@ impl ScheduleStore {
             });
         }
         let (published_at, timers) = self.timers();
+        // A snapshot the hub stopped refreshing is shown as stale with no actions: the hub may not be running.
+        let stale = now - published_at > STALE_TIMERS_MS;
         for timer in timers {
-            let (action, actions): (&str, Vec<&'static str>) = match timer.kind {
+            let (action, mut actions): (&str, Vec<&'static str>) = match timer.kind {
                 TimerKind::Sleep => ("潜水结束后唤醒", vec!["edit", "cancel", "run"]),
                 TimerKind::ReplyCheck => ("检查是否有人回复", vec!["cancel", "run"]),
                 TimerKind::ReachOut => ("主动冒泡机会", vec!["cancel", "run"]),
             };
+            if stale {
+                actions.clear();
+            }
             entries.push(Entry {
                 id: format!("{}:{}", timer_name(timer.kind), timer.conversation),
                 kind: timer_name(timer.kind),
@@ -674,7 +740,7 @@ impl ScheduleStore {
                 next_run_at: Some(timer.at),
                 repeat: Repeat::Once.describe(),
                 action: action.to_string(),
-                status: "active",
+                status: if stale { "stale" } else { "active" },
                 created_at: None,
                 last_result: None,
                 actions,
@@ -691,6 +757,28 @@ impl ScheduleStore {
     }
 }
 
+/// Whether a system job is paused on the Schedule page. Only pausable jobs can be paused. An unreadable store keeps
+/// every pausable job paused (fail closed: an owner pause is never dropped by a bad file) and is logged once until the
+/// store reads again; the watchdog and manual tasks never depend on the store.
+pub fn system_job_paused(context: &RuntimeContext, job: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    if !PAUSABLE_JOBS.contains(&job) {
+        return false;
+    }
+    match ScheduleStore::new(context).paused_jobs() {
+        Ok(paused) => {
+            PAUSE_READ_FAILURE_LOGGED.store(false, Ordering::Relaxed);
+            paused.iter().any(|name| name == job)
+        }
+        Err(error) => {
+            if !PAUSE_READ_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+                crate::safe_eprintln!("[schedule] store unreadable; pausable system jobs stay paused until it is fixed: {}", error.message());
+            }
+            true
+        }
+    }
+}
+
 /// The model-facing line for a reminder wake: the reminder text, or a note that it was cancelled or deleted.
 /// Empty for other reasons and when the store cannot be read.
 pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
@@ -698,7 +786,7 @@ pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
         return String::new();
     };
     match ScheduleStore::new(context).item(id) {
-        Ok(Some(item)) => {
+        Ok(Some(item)) if item.status != ItemStatus::Cancelled => {
             let label = match item.creator {
                 Creator::Owner => "管理员",
                 Creator::Her => "你自己",
@@ -706,7 +794,7 @@ pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
             };
             format!("【提醒内容】{}\n（由{}设置）\n\n", item.text, label)
         }
-        Ok(None) => "【提醒内容】这条提醒已被取消或删除。\n\n".to_string(),
+        Ok(_) => REMINDER_GONE.to_string(),
         Err(_) => String::new(),
     }
 }
@@ -882,6 +970,8 @@ mod tests {
         assert!(store.create(owner(&format!("private:{}", "1".repeat(19)), "x", at, Repeat::Once), NOW).is_ok());
 
         assert!(matches!(store.create(owner("group:1", "x", at, Repeat::Every { minutes: 0 }), NOW), Err(StoreError::Invalid(_))));
+        assert!(matches!(store.create(owner("group:1", "x", at, Repeat::Every { minutes: 14 }), NOW), Err(StoreError::Invalid(_))));
+        assert!(store.create(owner("group:1", "x", at, Repeat::Every { minutes: 15 }), NOW).is_ok());
         assert!(matches!(store.create(owner("group:1", "x", at, Repeat::Daily { hour: 24, minute: 0 }), NOW), Err(StoreError::Invalid(_))));
         assert!(matches!(store.create(owner("group:1", "x", at, Repeat::Daily { hour: 0, minute: 60 }), NOW), Err(StoreError::Invalid(_))));
         assert!(store.create(owner("group:1", "x", at, Repeat::Daily { hour: 23, minute: 59 }), NOW).is_ok());
@@ -954,6 +1044,7 @@ mod tests {
         let snapshot = || {
             vec![
                 TimerView { conversation: "private:7001".into(), kind: TimerKind::ReachOut, at: at + 2 },
+                TimerView { conversation: "private:7001".into(), kind: TimerKind::ReplyCheck, at: at + 1 },
                 TimerView { conversation: "private:7001".into(), kind: TimerKind::Sleep, at },
             ]
         };
@@ -961,33 +1052,122 @@ mod tests {
         let (published, timers) = store.timers();
         assert_eq!(published, NOW);
         let kinds: Vec<TimerKind> = timers.iter().map(|timer| timer.kind).collect();
-        assert_eq!(kinds, vec![TimerKind::Sleep, TimerKind::ReachOut]);
+        assert_eq!(kinds, vec![TimerKind::Sleep, TimerKind::ReplyCheck, TimerKind::ReachOut]);
 
         // An unchanged snapshot is rewritten only once the refresh period has passed.
         store.publish_timers(snapshot(), NOW + TIMERS_REFRESH_MS - 1).unwrap();
         assert_eq!(store.timers().0, NOW);
         store.publish_timers(snapshot(), NOW + TIMERS_REFRESH_MS).unwrap();
-        assert_eq!(store.timers().0, NOW + TIMERS_REFRESH_MS);
+        let published = NOW + TIMERS_REFRESH_MS;
+        assert_eq!(store.timers().0, published);
 
-        let entries = store.entries(&[], NOW).unwrap();
-        let value = serde_json::to_value(&entries[0]).unwrap();
+        let value = serde_json::to_value(&store.entries(&[], published).unwrap()[0]).unwrap();
         assert_eq!(value["id"], "sleep:private:7001");
         assert_eq!(value["kind"], "sleep");
+        assert_eq!(value["status"], "active");
         assert_eq!(value["actions"], serde_json::json!(["edit", "cancel", "run"]));
-        assert_eq!(value["observedAt"], NOW + TIMERS_REFRESH_MS);
+        assert_eq!(value["observedAt"], published);
 
-        assert!(matches!(store.request_timer_cancel("private:7001", TimerKind::Sleep, NOW), Err(StoreError::Invalid(_))));
-        store.request_timer_cancel("private:7001", TimerKind::ReachOut, NOW).unwrap();
-        let taken = store.take_timer_cancels(NOW).unwrap();
+        // A cancel names the timer the owner saw; a changed or unknown timer is refused.
+        assert!(matches!(store.request_timer_cancel("private:7001", TimerKind::Sleep, at, published), Err(StoreError::Invalid(_))));
+        assert!(matches!(store.request_timer_cancel("private:7001", TimerKind::ReachOut, at + 3, published), Err(StoreError::Conflict(_))));
+        store.request_timer_cancel("private:7001", TimerKind::ReachOut, at + 2, published).unwrap();
+        let taken = store.take_timer_cancels(published).unwrap();
         assert_eq!(taken.len(), 1);
-        assert_eq!(taken[0].kind, TimerKind::ReachOut);
-        assert!(store.take_timer_cancels(NOW).unwrap().is_empty());
+        assert_eq!((taken[0].kind, taken[0].timer_at), (TimerKind::ReachOut, at + 2));
+        assert!(store.take_timer_cancels(published).unwrap().is_empty());
 
         // A cancel request is honoured at exactly the TTL and expires one millisecond later.
-        store.request_timer_cancel("private:7001", TimerKind::ReplyCheck, NOW).unwrap();
-        assert_eq!(store.take_timer_cancels(NOW + TIMER_CANCEL_TTL_MS).unwrap().len(), 1);
-        store.request_timer_cancel("private:7001", TimerKind::ReplyCheck, NOW).unwrap();
-        assert!(store.take_timer_cancels(NOW + TIMER_CANCEL_TTL_MS + 1).unwrap().is_empty());
+        store.request_timer_cancel("private:7001", TimerKind::ReplyCheck, at + 1, published).unwrap();
+        assert_eq!(store.take_timer_cancels(published + TIMER_CANCEL_TTL_MS).unwrap().len(), 1);
+        store.request_timer_cancel("private:7001", TimerKind::ReplyCheck, at + 1, published).unwrap();
+        assert!(store.take_timer_cancels(published + TIMER_CANCEL_TTL_MS + 1).unwrap().is_empty());
+
+        // A snapshot the hub stopped refreshing is stale: no actions, and nothing can be cancelled against it.
+        let edge = published + STALE_TIMERS_MS;
+        assert_eq!(serde_json::to_value(&store.entries(&[], edge).unwrap()[0]).unwrap()["status"], "active");
+        let late = edge + 1;
+        let value = serde_json::to_value(&store.entries(&[], late).unwrap()[0]).unwrap();
+        assert_eq!(value["status"], "stale");
+        assert_eq!(value["actions"], serde_json::json!([]));
+        assert!(matches!(store.request_timer_cancel("private:7001", TimerKind::ReplyCheck, at + 1, late), Err(StoreError::Conflict(_))));
+    }
+
+    #[test]
+    fn unreadable_store_keeps_pausable_jobs_paused_and_ignores_unpausable_entries() {
+        let fixture = Fixture::new();
+        let store = ScheduleStore::new(&fixture.context());
+        let path = fixture.0.join("data/schedule.json");
+        store.set_system_paused("backup", true).unwrap();
+        std::fs::write(&path, "not json").unwrap();
+        assert!(store.system_paused("backup"), "an unreadable store keeps the owner's pause");
+        assert!(store.system_paused("memory-digest"), "and holds every pausable job until it reads again");
+        assert!(!store.system_paused("watchdog"), "the watchdog never depends on the store");
+        assert!(store.admit_scheduled("backup").is_err(), "a scheduled start is refused while the store is unreadable");
+
+        // A hand-edited or legacy pause of a job that cannot pause is ignored on read.
+        std::fs::write(&path, r#"{"version":1,"systemPaused":["watchdog","backup"]}"#).unwrap();
+        assert!(!store.system_paused("watchdog"));
+        assert!(store.system_paused("backup"));
+        assert!(!store.system_paused("memory-digest"), "a readable store releases the jobs it does not pause");
+        let watchdog = SystemJob { id: "watchdog", effect: "看门狗", repeat: "每 1 分钟".into(), next_at: Some(NOW + 60_000), enabled_by_config: true, running: false, last_result: None };
+        let value = serde_json::to_value(&store.entries(&[watchdog], NOW).unwrap()[0]).unwrap();
+        assert_eq!(value["status"], "active");
+        assert_eq!(value["actions"], serde_json::json!(["run"]));
+    }
+
+    #[test]
+    fn scheduled_admission_holds_the_store_lock_so_a_pause_cannot_slip_past() {
+        let fixture = Fixture::new();
+        let store = ScheduleStore::new(&fixture.context());
+        let gate = store.admit_scheduled("backup").expect("an unpaused job is admitted");
+        let context = fixture.context();
+        let pausing = std::thread::spawn(move || ScheduleStore::new(&context).set_system_paused("backup", true));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!pausing.is_finished(), "a pause waits while a scheduled start is being admitted");
+        drop(gate);
+        pausing.join().unwrap().unwrap();
+        let refused = store.admit_scheduled("backup").unwrap_err();
+        assert!(refused.contains("paused"), "{refused}");
+    }
+
+    fn finished_item(id: &str, created_at: i64, finished_at: i64) -> Item {
+        Item { id: id.into(), creator: Creator::Owner, conversation: "group:2".into(), text: "旧".into(), next_at: created_at,
+            repeat: Repeat::Once, status: ItemStatus::Cancelled, created_at, run_now: false, last_result: None, finished_at: Some(finished_at) }
+    }
+
+    #[test]
+    fn compaction_by_finish_time_keeps_the_reminder_finished_in_the_claiming_write() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let mut doc = Document::empty();
+        // The oldest item by creation: a reminder set far ahead. More than the cap of newer items finish before it fires.
+        doc.items.push(Item { id: "rem-ahead".into(), creator: Creator::Owner, conversation: "group:1".into(), text: "半年后的提醒".into(),
+            next_at: NOW + 180 * DAY, repeat: Repeat::Once, status: ItemStatus::Active, created_at: NOW, run_now: false, last_result: None, finished_at: None });
+        for index in 0..FINISHED_ITEM_CAP + 5 {
+            let offset = index as i64;
+            // Created in the reverse of their finish order, so creation time and finish time disagree.
+            doc.items.push(finished_item(&format!("rem-f{index}"), NOW + 1_000 - offset, NOW + DAY + offset));
+        }
+        std::fs::write(fixture.0.join("data/schedule.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+
+        let store = ScheduleStore::new(&context);
+        let claimed = store.claim_due(NOW + 180 * DAY, |_| true).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "rem-ahead");
+        let kept = store.item("rem-ahead").unwrap().expect("the claiming write keeps the reminder it dispatches");
+        assert_eq!(kept.status, ItemStatus::Done);
+        assert_eq!(kept.finished_at, Some(NOW + 180 * DAY));
+        assert_eq!(reminder_line(&context, "reminder:rem-ahead"), "【提醒内容】半年后的提醒\n（由管理员设置）\n\n");
+
+        // The earliest finished items are dropped (by finish time, not creation time), down to the cap.
+        let items = store.items().unwrap();
+        assert_eq!(items.iter().filter(|item| is_finished(item.status)).count(), FINISHED_ITEM_CAP);
+        for gone in 0..6 {
+            assert!(items.iter().all(|item| item.id != format!("rem-f{gone}")), "rem-f{gone} finished earliest");
+        }
+        assert!(items.iter().any(|item| item.id == "rem-f6"));
+        assert!(items.iter().any(|item| item.id == format!("rem-f{}", FINISHED_ITEM_CAP + 4)));
     }
 
     #[test]
@@ -1007,6 +1187,8 @@ mod tests {
         assert_eq!(reminder_line(&context, "replyCheck"), "");
         assert_eq!(reminder_line(&context, "bootstrap"), "");
 
+        store.cancel(&by_her.id, NOW).unwrap();
+        assert_eq!(reminder_line(&context, &format!("reminder:{}", by_her.id)), REMINDER_GONE, "a cancelled reminder is not delivered");
         std::fs::write(fixture.0.join("data/schedule.json"), "not json").unwrap();
         assert_eq!(reminder_line(&context, &format!("reminder:{}", by_owner.id)), "");
     }
