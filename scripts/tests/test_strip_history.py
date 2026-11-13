@@ -528,6 +528,13 @@ class KeyAcl(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertFalse(s_mod.private_dacl(sddl, SID), f'{label} must not count as private')
 
+    def test_dacl_problem_names_the_failed_condition(self):
+        s_mod = load()
+        require(self, s_mod, 'dacl_problem')
+        self.assertIsNone(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})', SID))
+        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-5-21-1-2-3-500)', SID), 'entry is not the current user')
+        self.assertEqual(s_mod.dacl_problem(f'D:AI(A;;FA;;;{SID})', SID), 'not protected')
+
     @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
     def test_load_key_refuses_a_group_readable_file(self):
         s_mod = load()

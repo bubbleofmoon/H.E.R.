@@ -299,16 +299,29 @@ class Stripper:
         return out
 
 
-def private_dacl(sddl, sid):
-    """True when the DACL is protected and holds exactly one non-inherited full-access ACE for sid."""
+def dacl_problem(sddl, sid):
+    """None when the DACL is protected and holds exactly one non-inherited full-access ACE for sid, else the first failed condition."""
     match = re.search(r'D:([A-Z]*)((?:\([^)]*\))*)', sddl)
     if not match or 'P' not in match.group(1):
-        return False
+        return 'not protected'
     aces = re.findall(r'\(([^)]*)\)', match.group(2))
     if len(aces) != 1:
-        return False
-    fields = aces[0].split(';')
-    return len(fields) >= 6 and fields[0] == 'A' and 'ID' not in fields[1] and fields[2] in ('FA', '0x1f01ff') and fields[5] == sid
+        return f'entry count {len(aces)}'
+    fields = aces[0].split(';') + [''] * 6
+    if fields[0] != 'A':
+        return 'entry is not an allow entry'
+    if 'ID' in fields[1]:
+        return 'entry is inherited'
+    if fields[2] not in ('FA', '0x1f01ff'):
+        return 'entry is not full access'
+    if fields[5] != sid:
+        return 'entry is not the current user'
+    return None
+
+
+def private_dacl(sddl, sid):
+    """True when dacl_problem finds no problem."""
+    return dacl_problem(sddl, sid) is None
 
 
 def _windows_sid():
@@ -323,10 +336,13 @@ def _windows_sid():
 
 
 def _windows_sddl(path):
+    """The file's SDDL with trustee aliases expanded to full SIDs, so an alias account (for example the built-in administrator, `LA`) still matches."""
     env = dict(os.environ, HER_KEY_PATH=str(path))
     try:
         proc = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                               '(Get-Acl -LiteralPath $env:HER_KEY_PATH).Sddl'],
+                               "$s = (Get-Acl -LiteralPath $env:HER_KEY_PATH).Sddl; "
+                               "[regex]::Replace($s, '(?<=;)([A-Z]{2})(?=\\))', { param($m) "
+                               "(New-Object System.Security.Principal.SecurityIdentifier($m.Value)).Value })"],
                               capture_output=True, text=True, timeout=120, env=env)
     except (OSError, subprocess.SubprocessError):
         raise SystemExit('cannot read the key file ACL')
@@ -340,8 +356,9 @@ def check_key_file_private(path):
         if os.stat(path).st_mode & 0o077:
             raise SystemExit('key file is readable by others; restrict it to its owner')
         return
-    if not private_dacl(_windows_sddl(path), _windows_sid()):
-        raise SystemExit('key file access is not restricted to the current user')
+    problem = dacl_problem(_windows_sddl(path), _windows_sid())
+    if problem:
+        raise SystemExit(f'key file access is not restricted to the current user ({problem})')
 
 
 def restrict_key_file(path):
