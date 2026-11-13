@@ -2720,7 +2720,8 @@ fn harness_refusal_records_message_ids_from_recalled_history_and_read_results() 
 #[cfg(windows)]
 #[test]
 fn nonzero_cli_private_output_stays_out_of_trial_logs_errors_and_owner_alerts() {
-    for mode in ["chat", "reserved2"] {
+    // The pinned CLI route is a reserved2 route (docs/agents/dependency-recovery.md); chat mode ignores the pin.
+    for mode in ["reserved2"] {
         let mut rig = Rig::new(
             &format!("cli-private-output-{mode}"),
             Seed {
@@ -2768,6 +2769,46 @@ fn nonzero_cli_private_output_stays_out_of_trial_logs_errors_and_owner_alerts() 
         assert!(rig.texts_to(GROUP_KEY).iter().all(|s| s == ACK));
         assert!(rig.dsh.prompts().is_empty());
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn chat_mode_ignores_a_pinned_cli_backend_and_answers_through_dsh() {
+    let mut rig = Rig::new(
+        "cli-pin-ignored-chat",
+        Seed {
+            mode: "chat",
+            config: json!({"backends":{"sessions":{GROUP_KEY:"private-output-cli"},"list":[{
+                "id":"private-output-cli","kind":"cli","cmd":"powershell.exe",
+                "args":["-NoProfile","-NonInteractive","-Command",
+                    "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText((Join-Path $env:HER_RUNTIME_ROOT 'data/cli-private-probe.txt'), '7'); [Console]::Out.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); [Console]::Error.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); exit 7"]
+            }]}}),
+            ..Seed::default()
+        },
+    );
+    rig.start();
+    rig.push(group_event(
+        81806,
+        1001,
+        "tester",
+        "",
+        vec![text_seg("hello CLI")],
+    ));
+    assert!(wait_for(LONG, || rig
+        .ledger()
+        .iter()
+        .any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert!(
+        rig.ledger().iter().any(|r| r["k"] == "begun" && r["backend"] == "dsh"),
+        "chat mode must run the turn on DSH: {:?}",
+        rig.ledger()
+    );
+    assert!(
+        !rig.root.join("data/cli-private-probe.txt").exists(),
+        "chat mode must not start the pinned CLI"
+    );
+    assert!(rig.data_lines("logs/opencode-trial.jsonl").is_empty());
+    assert!(!rig.dsh.prompts().is_empty(), "DSH must answer the chat turn");
 }
 
 #[test]
