@@ -4,6 +4,7 @@
 //! disposable roots.
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -219,10 +220,6 @@ fn png(r: u8, g: u8, b: u8) -> Vec<u8> {
     out.into_inner()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
-}
-
 struct Console {
     child: Child,
     port: u16,
@@ -232,30 +229,31 @@ impl Console {
         let path = std::env::join_paths(std::iter::once(root.p("fake-bin")).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         )).expect("portable fake-tool PATH");
-        let port = free_port();
-        let mut executable = PathBuf::from(env!("CARGO_BIN_EXE_her"));
-        if cfg!(windows) {
-            // Windows searches beside the executable before PATH for curl.exe.
-            let copy = root.p("fake-bin/her.exe");
-            fs::copy(executable, &copy).unwrap();
-            executable = copy;
-        }
-        let mut command = Command::new(executable);
-        command
-            .args(["--console-serve", "--runtime-root"])
-            .arg(&root.0)
-            .args(["--console-port", &port.to_string()])
-            .env_remove("HER_RUNTIME_ROOT")
-            .env("PATH", path)
-            .env("TICKET20_FAKE_ROOT", &root.0)
-            // The JS 800-2000 ms pre-send pause is covered by unit tests; no real seconds here.
-            .env("HER_STICKER_PAUSE_MS", "0")
-            .current_dir(root.p("cwd"))
-            .stdin(Stdio::null())
-            .stdout(fs::File::create(root.p("console.stdout.log")).unwrap())
-            .stderr(fs::File::create(root.p("console.stderr.log")).unwrap());
-        hide(&mut command);
-        let child = command.spawn().expect("start console");
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(10), |port| {
+            let mut executable = PathBuf::from(env!("CARGO_BIN_EXE_her"));
+            if cfg!(windows) {
+                // Windows searches beside the executable before PATH for curl.exe.
+                let copy = root.p("fake-bin/her.exe");
+                fs::copy(executable, &copy).unwrap();
+                executable = copy;
+            }
+            let mut command = Command::new(executable);
+            command
+                .args(["--console-serve", "--runtime-root"])
+                .arg(&root.0)
+                .args(["--console-port", &port.to_string()])
+                .env_remove("HER_RUNTIME_ROOT")
+                .env("PATH", &path)
+                .env("TICKET20_FAKE_ROOT", &root.0)
+                // The JS 800-2000 ms pre-send pause is covered by unit tests; no real seconds here.
+                .env("HER_STICKER_PAUSE_MS", "0")
+                .current_dir(root.p("cwd"))
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(root.p("console.stdout.log")).unwrap())
+                .stderr(fs::File::create(root.p("console.stderr.log")).unwrap());
+            hide(&mut command);
+            command.spawn().expect("start console")
+        });
         let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

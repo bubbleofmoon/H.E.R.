@@ -4,6 +4,7 @@
 //! model, DSH or TTS service is contacted.
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs;
@@ -224,19 +225,22 @@ struct Console {
 
 impl Console {
     fn start(fx: &Fixture) -> Self {
-        let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .args(["--console-serve", "--runtime-root"])
-            .arg(&fx.root)
-            .args(["--console-port", &port.to_string()])
-            .env_remove("HER_RUNTIME_ROOT")
-            .env("FFPROBE_PATH", &fx.ffprobe)
-            .env("FFMPEG_PATH", &fx.ffmpeg)
-            .env("FAKE_TOOL_LOG", fx.tools.join("log"))
-            .stdout(Stdio::from(fs::File::create(fx.root.join("console.out")).unwrap()))
-            .stderr(Stdio::from(fs::File::create(fx.root.join("console.err")).unwrap()));
-        let mut console = Self { child: command.spawn().expect("start console"), port };
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(20), |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .args(["--console-serve", "--runtime-root"])
+                .arg(&fx.root)
+                .args(["--console-port", &port.to_string()])
+                .env_remove("HER_RUNTIME_ROOT")
+                .env("FFPROBE_PATH", &fx.ffprobe)
+                .env("FFMPEG_PATH", &fx.ffmpeg)
+                .env("FAKE_TOOL_LOG", fx.tools.join("log"))
+                .stdout(Stdio::from(fs::File::create(fx.root.join("console.out")).unwrap()))
+                .stderr(Stdio::from(fs::File::create(fx.root.join("console.err")).unwrap()));
+            crate::support::hide_window(&mut command);
+            command.spawn().expect("start console")
+        });
+        let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             assert!(console.child.try_wait().unwrap().is_none(), "console exited early");

@@ -4,6 +4,7 @@
 //! inside the disposable root; selected-root results and unchanged foreign bytes are asserted.
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 
 use serde_json::{json, Value};
 use std::fs;
@@ -132,33 +133,30 @@ fn legacy_snapshot(root: &Root) -> Vec<(PathBuf, Vec<u8>)> {
     out
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
-}
-
 struct Console {
     child: Child,
     port: u16,
 }
 impl Console {
     fn start(root: &Root) -> Self {
-        let port = free_port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .args(["--console-serve", "--runtime-root"])
-            .arg(&root.0)
-            .args(["--console-port", &port.to_string()])
-            .env_remove("HER_RUNTIME_ROOT")
-            .current_dir(root.p("cwd"))
-            .stdin(Stdio::null())
-            .stdout(fs::File::create(root.p("console.stdout.log")).unwrap())
-            .stderr(fs::File::create(root.p("console.stderr.log")).unwrap());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
-        let child = command.spawn().expect("start console");
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(10), |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .args(["--console-serve", "--runtime-root"])
+                .arg(&root.0)
+                .args(["--console-port", &port.to_string()])
+                .env_remove("HER_RUNTIME_ROOT")
+                .current_dir(root.p("cwd"))
+                .stdin(Stdio::null())
+                .stdout(fs::File::create(root.p("console.stdout.log")).unwrap())
+                .stderr(fs::File::create(root.p("console.stderr.log")).unwrap());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            command.spawn().expect("start console")
+        });
         let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

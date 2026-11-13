@@ -5,11 +5,12 @@
 
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -66,10 +67,6 @@ fn dependencies() -> Value {
     json!({ "dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1" })
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).expect("bind probe port").local_addr().expect("probe addr").port()
-}
-
 fn hide(command: &mut Command) {
     #[cfg(windows)]
     {
@@ -88,24 +85,25 @@ struct Console {
 
 impl Console {
     fn start(root: &Path, dsh_home: &Path) -> Self {
-        let port = free_port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .arg("--console-serve")
-            .arg("--console-port")
-            .arg(port.to_string())
-            .arg("--runtime-root")
-            .arg(root)
-            .env_remove("HER_RUNTIME_ROOT")
-            .env_remove("APPDATA")
-            .env_remove("LOCALAPPDATA")
-            .env_remove("HOME")
-            .env("DSH_HOME", dsh_home)
-            .env("USERPROFILE", dsh_home.join("synthetic-user-profile"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        hide(&mut command);
-        let child = command.spawn().expect("start isolated console");
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .arg("--console-serve")
+                .arg("--console-port")
+                .arg(port.to_string())
+                .arg("--runtime-root")
+                .arg(root)
+                .env_remove("HER_RUNTIME_ROOT")
+                .env_remove("APPDATA")
+                .env_remove("LOCALAPPDATA")
+                .env_remove("HOME")
+                .env("DSH_HOME", dsh_home)
+                .env("USERPROFILE", dsh_home.join("synthetic-user-profile"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            hide(&mut command);
+            command.spawn().expect("start isolated console")
+        });
         let mut console = Console { child, port };
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {

@@ -1,10 +1,13 @@
 //! Runtime configuration behavior through an isolated console process.
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
+#[path = "support/selftest.rs"]
+mod support_selftest;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -86,14 +89,6 @@ fn path_arg(path: &Path) -> &str {
     path.to_str().expect("utf-8 fixture path")
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 struct Console {
     child: Child,
     port: u16,
@@ -101,18 +96,19 @@ struct Console {
 
 impl Console {
     fn start(root: &Path) -> Self {
-        let port = free_port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .arg("--console-serve")
-            .arg("--console-port")
-            .arg(port.to_string())
-            .arg("--runtime-root")
-            .arg(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        isolate_env(&mut command, &unique_dir("console-home"));
-        let child = command.spawn().expect("start isolated console candidate");
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(10), |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .arg("--console-serve")
+                .arg("--console-port")
+                .arg(port.to_string())
+                .arg("--runtime-root")
+                .arg(root)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            isolate_env(&mut command, &unique_dir("console-home"));
+            command.spawn().expect("start isolated console candidate")
+        });
         let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
