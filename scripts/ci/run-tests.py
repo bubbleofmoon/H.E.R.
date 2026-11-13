@@ -36,10 +36,10 @@ args = ap.parse_args()
 if (args.slot_script or args.slot_worktree) and not args.slot_ticket:
     ap.error('--slot-script and --slot-worktree require --slot-ticket')
 try:
-    shard = ci_suite.parse_shard(args.shard) if args.shard else None
+    shard = ci_suite.parse_shard(args.shard) if args.shard is not None else None
 except ValueError as error:
     ap.error(str(error))
-if args.only is not None and args.shard:
+if args.only is not None and args.shard is not None:
     ap.error('--only and --shard cannot be combined')
 if args.filter is not None and not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_:.-]*', args.filter):
     ap.error('--filter takes one libtest name')
@@ -95,6 +95,7 @@ if shard:
     print(f'SHARD {shard[0]}/{shard[1]}: ' + ', '.join(c[0] for c in commands), flush=True)
 scripts_selected = any(name == 'scripts' for name, _ in commands)
 results = []
+passed_by_target = {}
 for name, command in commands:
     print(f'RUN {name}: ' + ('python ' if name == 'scripts' else 'cargo ') + command, flush=True)
     if args.slot_ticket:
@@ -137,7 +138,7 @@ for name, command in commands:
                 except OSError:
                     pass
                 results.append({'target': 'scripts-snapshot', 'command': 'snapshot of her and her-cli', 'invocation': [], 'exit': 1,
-                                'known': [], 'unknown': ['<exit 1>']})
+                                'known': [], 'unknown': ['<exit 1>'], 'tests_run': 0})
                 print('EXIT scripts-snapshot: 1', flush=True)
     failure_lines = []
     fallback_lines = []
@@ -156,9 +157,10 @@ for name, command in commands:
                         failure_lines.extend([f'--- {log.name} ---', *lines[index:]])
                         break
     known, unknown = ci_suite.classify(name, code, ci_suite.failed_tests(all_lines) if code else [], known_entries)
+    passed_by_target[name] = ci_suite.passed_tests(all_lines)
     results.append({'target': name, 'command': command, 'invocation': cmd, 'exit': code,
-                    'known': [{'test': t, 'listed': e['test'], 'ticket': e['ticket']} for t, e in known],
-                    'unknown': unknown})
+                    'known': [{'test': t, 'ticket': e['ticket']} for t, e in known],
+                    'unknown': unknown, 'tests_run': ci_suite.tests_run(all_lines)})
     if code:
         print(f'FAILURE DETAILS {name} (last 200 lines):', flush=True)
         for line in (failure_lines or fallback_lines)[-200:]:
@@ -168,10 +170,11 @@ for name, command in commands:
     (ev / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
 known_lines = [f'{r["target"]}::{k["test"]} {k["ticket"]}' for r in results for k in r['known']]
 unknown_lines = [f'{r["target"]}::{t}' for r in results for t in r['unknown']]
-ran = {r['target'] for r in results}
-hit = {(r['target'], k['listed']) for r in results for k in r['known']}
+# A listed test is now passing only when this run printed `test <name> ... ok` for it.
 passing = [f'{e["target"]}::{e["test"]} {e["ticket"]}' for e in known_entries
-           if e['target'] in ran and (e['target'], e['test']) not in hit]
+           if e['test'] in passed_by_target.get(e['target'], set())]
+if args.filter is not None and not sum(r.get('tests_run', 0) for r in results if r['target'] not in ('build', 'scripts-snapshot')):
+    unknown_lines.append(f'--filter {args.filter}: matched no tests')
 print(f'KNOWN RED ({len(known_lines)}; listed failures that do not fail this run):', flush=True)
 for line in known_lines:
     print('  ' + line, flush=True)

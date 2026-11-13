@@ -39,6 +39,10 @@ if [ "$target" = "$FAKE_FAIL_TARGET" ]; then
   echo "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
   exit 101
 fi
+if [ -n "$FAKE_NO_MATCH" ]; then
+  echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.01s"
+  exit 0
+fi
 echo "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
 exit 0
 '''
@@ -58,7 +62,8 @@ class KnownRedList(unittest.TestCase):
                      'mac harness_e2e boom #40',
                      'linux harness_e2e boom 40',
                      'linux harness_e2e boom #0',
-                     'linux harness_e2e boom #x'):
+                     'linux harness_e2e boom #x',
+                     'linux harness_e2e * #40'):
             with self.subTest(line=line):
                 with self.assertRaises(ci_suite.ListError):
                     ci_suite.parse_known_red(line + '\n')
@@ -108,10 +113,8 @@ class Classify(unittest.TestCase):
     def test_crash_without_names_is_unknown(self):
         self.assertEqual(ci_suite.classify('t', 101, None, self.entries('linux t a #1\n')), ([], ['<exit 101>']))
 
-    def test_whole_target_entry_covers_a_crash(self):
-        known, unknown = ci_suite.classify('t', 101, None, self.entries('linux t * #1\n'))
-        self.assertEqual([test for test, _ in known], ['*'])
-        self.assertEqual(unknown, [])
+    def test_named_failures_with_an_abnormal_exit_are_unknown(self):
+        self.assertEqual(ci_suite.classify('t', 3, ['a'], self.entries('linux t a #1\n')), ([], ['<exit 3>']))
 
     def test_entries_for_other_targets_are_ignored(self):
         self.assertEqual(ci_suite.classify('t', 101, ['a'], self.entries('linux other a #1\n')), ([], ['a']))
@@ -151,10 +154,10 @@ class RunTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_tests(self, *args, known=None, fail_target='harness_e2e', fail_test='boom'):
+    def run_tests(self, *args, known=None, fail_target='harness_e2e', fail_test='boom', no_match=False):
         env = {key: value for key, value in os.environ.items() if key not in ('GITHUB_ACTIONS', 'GITHUB_STEP_SUMMARY')}
         env.update(PATH=str(self.bin) + os.pathsep + os.environ.get('PATH', ''),
-                   FAKE_FAIL_TARGET=fail_target, FAKE_FAIL_TEST=fail_test,
+                   FAKE_FAIL_TARGET=fail_target, FAKE_FAIL_TEST=fail_test, FAKE_NO_MATCH='1' if no_match else '',
                    FAKE_CARGO_LOG=str(self.cargo_log), CARGO_TARGET_DIR=str(self.tmp / 'target'))
         extra = []
         if known is not None:
@@ -177,14 +180,20 @@ class RunTests(unittest.TestCase):
         self.assertIn('harness_e2e::boom #40', out)
         self.assertIn('UNLISTED FAILURES (0)', out)
 
-    def test_unlisted_failure_fails_and_listed_passing_entry_is_reported(self):
-        result = self.run_tests('--only', 'harness_e2e', known='linux harness_e2e other #40\n')
+    def test_now_passing_names_only_listed_tests_seen_passing(self):
+        result = self.run_tests('--only', 'harness_e2e', known='linux harness_e2e ok_one #40\nlinux harness_e2e other #41\n')
         out = result.stdout
         self.assertEqual(result.returncode, 1, out + result.stderr)
         self.assertIn('UNLISTED FAILURES (1', out)
         self.assertIn('harness_e2e::boom', out)
-        now_passing = out.index('KNOWN RED NOW PASSING')
-        self.assertIn('  harness_e2e::other #40', out[now_passing:])
+        now_passing = out[out.index('KNOWN RED NOW PASSING'):out.index('UNLISTED FAILURES')]
+        self.assertIn('harness_e2e::ok_one #40', now_passing)
+        self.assertNotIn('other', now_passing)
+
+    def test_now_passing_is_empty_when_the_target_crashed(self):
+        result = self.run_tests('--only', 'harness_e2e', known='linux harness_e2e ok_one #40\n', fail_test='')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('KNOWN RED NOW PASSING (0)', result.stdout)
 
     def test_failure_without_known_red_list_fails(self):
         result = self.run_tests('--only', 'harness_e2e')
@@ -224,6 +233,18 @@ class RunTests(unittest.TestCase):
         result = self.run_tests('--only', 'scripts', '--filter', 'boom')
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
+    def test_filter_matching_no_test_fails(self):
+        result = self.run_tests('--only', 'harness_e2e', '--filter', 'nothing', fail_target='', no_match=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('--filter nothing: matched no tests', result.stdout)
+
+    def test_empty_shard_is_an_error(self):
+        result = self.run_tests('--only', 'harness_e2e', '--shard', '')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_empty_only_is_an_error(self):
+        self.assertEqual(self.run_tests('--only', '').returncode, 2)
+
     def test_shards_cover_every_target_once_and_always_build(self):
         full = self.run_names(self.run_tests(fail_target='', fail_test='').stdout)
         self.assertIn('scripts', full)
@@ -234,6 +255,16 @@ class RunTests(unittest.TestCase):
             self.assertEqual(names[0], 'build', f'shard {k}/5')
             union.extend(name for name in names if name != 'build')
         self.assertEqual(sorted(union), expected)
+
+
+class Counts(unittest.TestCase):
+    def test_passed_tests_names_only_ok_lines(self):
+        self.assertEqual(ci_suite.passed_tests(['test a ... ok', 'test b ... FAILED', 'test c ... ignored']), {'a'})
+
+    def test_tests_run_sums_passed_and_failed_over_every_summary(self):
+        lines = ['test result: ok. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s',
+                 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s']
+        self.assertEqual(ci_suite.tests_run(lines), 3)
 
 
 if __name__ == '__main__':

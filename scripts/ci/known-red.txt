@@ -1,5 +1,5 @@
 # Known red: failing tests that CI reports under KNOWN RED instead of failing the run.
-# Format: <os> <target> <test> #<ticket>   os: linux | windows | any; test: libtest name, or * for a whole target.
+# Format: <os> <target> <test> #<ticket>   os: linux | windows | any; test: libtest name (no wildcards).
 # Read only by scripts/ci/run-tests.py --known-red (CI); local runs stay strict. Rules: docs/agents/rust-validation.md.
 
 # Hosted Windows runner: administrator rights, timing, file locks

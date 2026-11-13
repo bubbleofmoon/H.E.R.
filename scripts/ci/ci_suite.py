@@ -1,17 +1,20 @@
-"""Helpers for scripts/ci/run-tests.py: the known-red list and the shard split.
+"""Helpers for scripts/ci/run-tests.py: the known-red list, libtest log counts and the shard split.
 
 Known-red list (scripts/ci/known-red.txt), one entry per line, whitespace-separated:
     <os> <target> <test> #<ticket>
-os: linux | windows | any. target: a run-tests.py target name (unit, an her/tests stem, or a
-script target). test: the libtest name as printed in `test <name> ... FAILED`, or `*` for any
-failure of the whole target. ticket: the open issue that tracks the failure. Blank lines and
-lines starting with '#' are ignored; any other malformed line is an error.
+os: linux | windows | any. target: a run-tests.py target name (unit or an her/tests stem). test: the
+libtest name exactly as printed in `test <name> ... FAILED`; there are no wildcards, so a crash, compile
+error, timeout or count mismatch is never known. ticket: the open issue that tracks the failure. Blank
+lines and lines starting with '#' are ignored; any other malformed line is an error.
 """
 import re
 
 OS_NAMES = ('linux', 'windows', 'any')
+TEST_FAILURE_EXIT = 101  # cargo test's exit code when tests failed; anything else is a crash or a harness failure
 FAILED_TEST = re.compile(r'^test (\S+) \.\.\. FAILED$')
+PASSED_TEST = re.compile(r'^test (\S+) \.\.\. ok$')
 FAILED_SUMMARY = re.compile(r'^test result: FAILED\. \d+ passed; (\d+) failed;')
+ANY_SUMMARY = re.compile(r'^test result: \w+\. (\d+) passed; (\d+) failed;')
 # Minutes per target on the hosted Windows runner; unlisted targets weigh DEFAULT_WEIGHT.
 WEIGHTS = {'session_turn_recovery_e2e': 17, 'chat_mode_e2e': 12, 'unit': 12, 'supervisor_dependencies': 9,
            'release_install': 7, 'console_runtime_routes': 4, 'dependency_recovery_e2e': 4, 'health_check': 3,
@@ -36,6 +39,8 @@ def parse_known_red(text):
         os_name, target, test, ticket = fields
         if os_name not in OS_NAMES:
             raise ListError(f'line {number}: os must be linux, windows or any')
+        if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_:.-]*', test):
+            raise ListError(f'line {number}: test must be one libtest name (no wildcards)')
         if not re.fullmatch(r'#[1-9][0-9]*', ticket):
             raise ListError(f'line {number}: ticket must be #<number>')
         entries.append({'os': os_name, 'target': target, 'test': test, 'ticket': ticket})
@@ -56,16 +61,23 @@ def failed_tests(lines):
     return names
 
 
+def passed_tests(lines):
+    return {m.group(1) for m in map(PASSED_TEST.match, lines) if m}
+
+
+def tests_run(lines):
+    """Tests that ran (passed plus failed) across every libtest summary in the log."""
+    return sum(int(m.group(1)) + int(m.group(2)) for m in map(ANY_SUMMARY.match, lines) if m)
+
+
 def classify(target, exit_code, failed, entries):
     """(known, unknown) for one target. known: [(test, entry)]; unknown: test names, or
-    ['<exit N>'] when the failure names no tests (compile error, crash, timeout)."""
+    ['<exit N>'] when the failure is not a plain test failure (compile error, crash, timeout)."""
     if not exit_code:
         return [], []
-    listed = {entry['test']: entry for entry in entries if entry['target'] == target}
-    if '*' in listed:
-        return [(test, listed.get(test, listed['*'])) for test in (failed or ['*'])], []
-    if failed is None:
+    if failed is None or exit_code != TEST_FAILURE_EXIT:
         return [], [f'<exit {exit_code}>']
+    listed = {entry['test']: entry for entry in entries if entry['target'] == target}
     return [(t, listed[t]) for t in failed if t in listed], [t for t in failed if t not in listed]
 
 

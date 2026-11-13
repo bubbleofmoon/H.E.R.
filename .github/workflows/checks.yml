@@ -62,6 +62,7 @@ jobs:
           python -I scripts/tests/test_gh_public.py
           python -I scripts/tests/test_check_repo.py
           python -I scripts/tests/test_ci_suite.py
+          python -I scripts/tests/test_agent_guard.py
           python -I scripts/scan-public.py
           "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
   # Linux test shards run on every pull request and every push to main.
@@ -103,7 +104,8 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ env.CARGO_TARGET_DIR }}
+          # rust-cache joins workspace and target: relative to /tmp/her/her this is /tmp/her-target (CARGO_TARGET_DIR).
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ../../her-target
           key: ubuntu-24.04-shard${{ matrix.shard }}
           cache-on-failure: true
       - name: Build and test shard (known red reported separately)
@@ -165,7 +167,8 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ env.CARGO_TARGET_DIR }}
+          # rust-cache joins workspace and target: relative to C:/her-ci/her this is C:/her-ci-target (CARGO_TARGET_DIR).
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ../../her-ci-target
           key: windows-2022-shard${{ matrix.shard }}
           cache-on-failure: true
       - name: Build and test shard (known red reported separately)

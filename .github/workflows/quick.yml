@@ -61,7 +61,8 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ env.CARGO_TARGET_DIR }}
+          # rust-cache joins workspace and target; relative so it resolves to CARGO_TARGET_DIR on both OSes.
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ inputs.os == 'windows' && '../../her-ci-target' || '../../her-target' }}
           key: quick-${{ inputs.os }}
           cache-on-failure: true
       - name: Build and run the named target
