@@ -22,5 +22,6 @@ Review on two axes and report everything you find; the coordinator filters. Do n
 
 - **Spec:** each acceptance criterion: met / partial / not met, with Rust file:line, and evidence for observable behavior changes. Note tests that cannot detect the failure they claim to cover (for example `contains` where exact text matters, or concurrent writers that touch the same field).
 - **Standards:** correctness defects: lost updates and races, quota or resource leaks, unbounded growth, data loss, errors swallowed or a success reported as failure (or the reverse), weakened or hard-coded tests, and changes outside the ticket's scope that alter other behaviour. Each with file:line and a concrete failure scenario.
+- **Red receipts:** a new test's red receipt must show it failing for the reason the ticket names (the assertion or panic message, not a compile error or an unrelated failure); a test that could pass without the fix is a required finding.
 
 Never speculate about code you have not opened; every claim needs file:line. End with a verdict: mergeable / mergeable after listed fixes / not mergeable, and a numbered list of required fixes.

@@ -33,8 +33,8 @@ never a supplied value.
 Install Rust stable, Python 3, Node.js 24 with its bundled npm and gitleaks 8.30.0. Node supports the synthetic test fixtures. See docs/agents/rust-validation.md for builds
 and the complete unit/integration suite; use isolated fixtures and no real services.
 The checks workflow defines Windows and Linux validation and runs on hosted runners
-for every push and pull request; local gates keep the native, elevated and production
-checks the hosted runners cannot run.
+for every pull request and every push to main; it is the merge gate for everything it runs,
+and local gates keep only the native, elevated and production checks the hosted runners cannot run.
 On the shared development host, use the cargo-slot scripts for every Rust command.
 
 The guard tests itself: `python -I scripts/tests/test_scan_public.py`,

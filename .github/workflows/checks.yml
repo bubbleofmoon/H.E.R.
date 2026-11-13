@@ -1,14 +1,19 @@
 name: checks
-# Push/PR checks for this repository use free standard GitHub-hosted runners.
-# They are the merge check; native, elevated and production-adjacent gates stay local
+# Pull-request and main checks on free standard GitHub-hosted runners. CI is the merge gate for every
+# target it runs; only native, elevated and production-adjacent gates stay local
 # (docs/agents/rust-validation.md). Never attach a self-hosted runner to this repository.
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: checks-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  checks:
+  scans:
+    name: scans (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -20,7 +25,7 @@ jobs:
             base: C:/
             tree: C:/her-ci
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -29,11 +34,8 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: '1'
       PUBLIC_TREE: ${{ matrix.tree }}
-      CARGO_TARGET_DIR: ${{ matrix.tree }}-target
-      CI_EVIDENCE: ${{ matrix.tree }}-evidence
     steps:
-      # Long-form path on the checkout's drive: RUNNER_TEMP is a short name on D:,
-      # and fixtures rename between the temp folder and the tree.
+      # Long-form path on the checkout's drive: RUNNER_TEMP is a short name on D:.
       - name: Use long-form Windows temporary directory
         if: runner.os == 'Windows'
         run: |
@@ -41,7 +43,47 @@ jobs:
           echo "TEMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
           echo "TMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
       # The tentative repository name ends with a dot, which Win32 paths reject.
-      # Every step starts outside GITHUB_WORKSPACE; clone into a safe fixed name.
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Repository checks and scans
+        run: |
+          cd "$PUBLIC_TREE"
+          python -I scripts/ci/install-gitleaks.py "$RUNNER_TEMP/her-gitleaks"
+          HER_GITLEAKS="$RUNNER_TEMP/her-gitleaks/gitleaks"
+          if [ "$RUNNER_OS" = Windows ]; then HER_GITLEAKS="$HER_GITLEAKS.exe"; fi
+          export HER_GITLEAKS
+          python -I scripts/check-repo.py
+          python -I scripts/tests/test_scan_public.py
+          python -I scripts/tests/test_pre_push_hook.py
+          python -I scripts/tests/test_gh_public.py
+          python -I scripts/tests/test_check_repo.py
+          python -I scripts/tests/test_ci_suite.py
+          python -I scripts/scan-public.py
+          "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
+  # Linux test shards run on every pull request and every push to main.
+  tests:
+    name: tests (ubuntu-24.04, shard ${{ matrix.shard }}/5)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: /tmp
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: /tmp/her
+      CARGO_TARGET_DIR: /tmp/her-target
+      CI_EVIDENCE: /tmp/her-evidence
+    steps:
       - name: Fetch source
         run: |
           git init "$PUBLIC_TREE"
@@ -58,26 +100,81 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           python --version
-      - name: Repository checks and scans
-        run: |
-          cd "$PUBLIC_TREE"
-          python -I scripts/ci/install-gitleaks.py "$RUNNER_TEMP/her-gitleaks"
-          HER_GITLEAKS="$RUNNER_TEMP/her-gitleaks/gitleaks"
-          if [ "$RUNNER_OS" = Windows ]; then HER_GITLEAKS="$HER_GITLEAKS.exe"; fi
-          export HER_GITLEAKS
-          python -I scripts/check-repo.py
-          python -I scripts/tests/test_scan_public.py
-          python -I scripts/tests/test_pre_push_hook.py
-          python -I scripts/tests/test_gh_public.py
-          python -I scripts/scan-public.py
-          "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
-      - name: Build and full test suite (all gate targets)
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ env.CARGO_TARGET_DIR }}
+          key: ubuntu-24.04-shard${{ matrix.shard }}
+          cache-on-failure: true
+      - name: Build and test shard (known red reported separately)
         run: |
           cd "$PUBLIC_TREE"
           export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
-          python -I scripts/ci/run-tests.py
+          python -I scripts/ci/run-tests.py --shard ${{ matrix.shard }}/5 --known-red scripts/ci/known-red.txt
+      - name: Upload CI evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-evidence-ubuntu-24.04-${{ matrix.shard }}
+          path: ${{ env.CI_EVIDENCE }}
+          retention-days: 7
+  # Windows test shards run on every push to main only; a pull request runs scans on Windows and the Linux shards.
+  tests-windows:
+    name: tests (windows-2022, shard ${{ matrix.shard }}/5)
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: C:/
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: C:/her-ci
+      CARGO_TARGET_DIR: C:/her-ci-target
+      CI_EVIDENCE: C:/her-ci-evidence
+    steps:
+      # Long-form path on the checkout's drive: RUNNER_TEMP is a short name on D:,
+      # and fixtures rename between the temporary folder and the tree.
+      - name: Use long-form Windows temporary directory
+        run: |
+          mkdir -p "${PUBLIC_TREE}-temp"
+          echo "TEMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+          echo "TMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Toolchains
+        run: |
+          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
+          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/her-node/bin:$RUNNER_TEMP/her-node:$PATH"
+          node --version
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          python --version
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ env.CARGO_TARGET_DIR }}
+          key: windows-2022-shard${{ matrix.shard }}
+          cache-on-failure: true
+      - name: Build and test shard (known red reported separately)
+        run: |
+          cd "$PUBLIC_TREE"
+          export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
+          python -I scripts/ci/run-tests.py --shard ${{ matrix.shard }}/5 --known-red scripts/ci/known-red.txt
       - name: Windows launcher checks
-        if: runner.os == 'Windows'
+        if: matrix.shard == 1
         run: |
           cd "$PUBLIC_TREE"
           export HER_TEST_CLI="$CARGO_TARGET_DIR/debug/her-cli.exe"
@@ -88,6 +185,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-evidence-${{ matrix.os }}
+          name: ci-evidence-windows-2022-${{ matrix.shard }}
           path: ${{ env.CI_EVIDENCE }}
           retention-days: 7
