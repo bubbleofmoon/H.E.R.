@@ -26,7 +26,6 @@ READS = [
     'gh issue view 4 --comments',
     'gh run list --workflow quick.yml --branch her/1-x -L 1',
     "gh pr view 5 --json title --jq '.title | ascii_downcase'",
-    'gh run download 5 -n ci-evidence-ubuntu-24.04-1',
     'gh workflow view quick.yml',
     'git status',
     'git log --oneline -3',
@@ -130,11 +129,22 @@ DENIED_EVERY_ROLE = [
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit -f target=x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x'),
     ('repo', 'gh workflow run quick.yml --ref main -f target=unit'),
+    # fail closed: unparseable commands, ANSI-C quoting and backslash-newline continuations
+    ('wt', 'echo "unterminated'),
+    ('wt', "git $'pu\\x73h' origin HEAD:refs/heads/main"),
+    ('wt', 'git pu\\\nsh origin main'),
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
     ('wt', 'git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit'),
+]
+DENIED_REVIEWER = [
+    # write rules see through paths and quoting
+    ('wt', '/usr/bin/git reset --hard HEAD'),
+    ('wt', "'g''it' reset --hard HEAD"),
+    ('wt', 'git --no-pager reset --hard HEAD'),
+    ('wt', 'gh run download 5 --dir /tmp/x'),
 ]
 
 
@@ -182,6 +192,17 @@ class AgentGuard(unittest.TestCase):
 
     def test_review_and_gate_never_push_commit_or_trigger(self):
         self.expect(DENIED_REVIEW_AND_GATE, ('reviewer', 'gate'), False)
+
+    def test_reviewer_write_rules_see_through_paths_and_quoting(self):
+        self.expect(DENIED_REVIEWER[:3], ('reviewer',), False)
+
+    def test_reviewer_cannot_download_and_gate_can(self):
+        self.expect([DENIED_REVIEWER[3]], ('reviewer',), False)
+        self.expect([DENIED_REVIEWER[3]], ('gate',), True)
+        self.expect([('wt', 'gh run download 5 -n ci-evidence-ubuntu-24.04-1')], ('implementer', 'gate'), True)
+
+    def test_reviewer_reads_git_log(self):
+        self.expect([('wt', 'git log --oneline')], ('reviewer',), True)
 
 
 if __name__ == '__main__':

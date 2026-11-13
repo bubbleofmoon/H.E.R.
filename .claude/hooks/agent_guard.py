@@ -26,6 +26,9 @@ OPERATOR_CHARS = '();<>|&`'
 UNSAFE = re.compile(r'[\n\r`$]')
 GH_GROUPS = {'pr', 'run', 'issue', 'workflow'}
 GH_READ_VERBS = {'view', 'list', 'diff', 'checks', 'status', 'watch', 'download'}
+REVIEWER_GIT_WRITES = {'commit', 'merge', 'rebase', 'reset', 'checkout', 'switch', 'stash', 'restore',
+                       'cherry-pick', 'revert', 'worktree', 'clean', 'tag', 'am', 'apply'}
+REVIEWER_FILE_WRITES = {'cargo', 'rm', 'mv', 'cp', 'chmod', 'chattr', 'truncate'}
 QUICK_INPUTS = {'target': re.compile(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'),
                 'filter': re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.-]*'),
                 'os': re.compile(r'linux|windows')}
@@ -165,12 +168,15 @@ def quick_allowed(found, branch):
     return refs == [branch] and 'target' in inputs
 
 
-def gh_read(found):
+def gh_read(found, role):
     rest = without_repo(found)
-    return len(rest) >= 3 and rest[0] == 'gh' and rest[1] in GH_GROUPS and rest[2] in GH_READ_VERBS
+    verbs = GH_READ_VERBS - {'download'} if role == 'reviewer' else GH_READ_VERBS
+    return len(rest) >= 3 and rest[0] == 'gh' and rest[1] in GH_GROUPS and rest[2] in verbs
 
 
 def check_bash(role, command, hook_cwd):
+    if "$'" in command or re.search(r'\\\r?\n', command):
+        raise Deny('no ANSI-C quoting ($\'...\') and no backslash-newline continuations; write one plain command.')
     plain = simple(command, hook_cwd)
     words, cwd = plain if plain else (None, hook_cwd)
     branch = branch_of(cwd)
@@ -182,9 +188,7 @@ def check_bash(role, command, hook_cwd):
     try:
         flat = flatten(command)
     except ValueError:
-        if re.search(r'git|gh|push|commit', command):
-            raise Deny('cannot parse this command; write it as one plain command.')
-        flat = command.split()
+        raise Deny('cannot parse this command; write it as one plain command.')
     text = command + '\n' + ' '.join(flat)
     names = {base(word) for word in flat}
     wordset = set(flat)
@@ -216,14 +220,14 @@ def check_bash(role, command, hook_cwd):
     if has_git and COMMIT_WORD.search(text):
         raise Deny('workers commit only on their her/<n>-<slug> branch, as one plain command: [cd <worktree> &&] '
                    'git commit [-a] -m <msg> | -F <file> (no chaining, no $); reviews and gates never commit.')
-    if ('gh' in names or GH_WORD.search(text)) and not (words and gh_read(words)):
+    if ('gh' in names or GH_WORD.search(text)) and not (words and gh_read(words, role)):
         raise Deny('gh is read-only for workers: one plain `gh [-R repo] pr|run|issue|workflow '
                    'view|list|diff|checks|status|watch|download ...`; implementers may also run exactly '
                    '`gh workflow run quick.yml --ref <your branch> -f target=<name> [-f filter=<test>] [-f os=linux|windows]`.')
     if role == 'implementer' and re.search(r'(^|[;&|\s])git\s+(merge|rebase|cherry-pick|revert|am|tag)(\s|$)', command):
         raise Deny('workers never merge, rebase or tag; the coordinator merges through a pull request.')
     if role == 'reviewer':
-        if re.search(r'(^|[;&|\s])(git\s+(commit|merge|rebase|reset|checkout|switch|stash|restore|cherry-pick|revert|worktree|clean|tag|am|apply)|cargo|rm|mv|cp|chmod|chattr|truncate)(\s|$)', command):
+        if ('git' in names and wordset & REVIEWER_GIT_WRITES) or names & REVIEWER_FILE_WRITES:
             raise Deny('reviews are read-only (no git writes, builds or file changes); read code and git history only.')
         if re.search(r'(^|[^0-9&>])>{1,2}\s*[^&\s]', command) and not re.search(r'>{1,2}\s*/dev/null', command):
             raise Deny('reviews are read-only; no output redirection to files.')
