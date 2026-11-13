@@ -330,9 +330,49 @@ pub fn delete(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> 
 
 pub fn assign(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
     let (target, wanted) = assignment(body)?;
-    mutate(context, |doc| {
+    let keys: Vec<String> = crate::session_map::all(context)
+        .map_err(|error| (503, error))?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    let (result, changed) = mutate(context, |doc| {
+        let before: Vec<Option<String>> = keys.iter().map(|key| effective_id(doc, key)).collect();
         apply_assignment(doc, target.as_deref(), wanted.as_deref())?;
-        Ok(json!({"ok": true, "default": doc["default"], "overrides": doc["overrides"]}))
+        let view: &Value = doc;
+        let changed: Vec<String> = keys
+            .iter()
+            .zip(before)
+            .filter(|(key, old)| effective_id(view, key) != *old)
+            .map(|(key, _)| key.clone())
+            .collect();
+        Ok((json!({"default": view["default"], "overrides": view["overrides"]}), changed))
+    })?;
+    // The library lock is released before the social gate is taken. A failed re-brief leaves the
+    // assignment saved and is reported.
+    let mut rebriefed = Vec::new();
+    let mut failed = Vec::new();
+    for key in changed {
+        match rebrief(context, &key) {
+            Ok(true) => rebriefed.push(key),
+            Ok(false) => {}
+            Err(error) => failed.push(json!({"conversation": key, "error": error})),
+        }
+    }
+    Ok(json!({"ok": true, "default": result["default"], "overrides": result["overrides"],
+        "rebriefed": rebriefed, "rebriefFailed": failed}))
+}
+
+/// A switch starts a new briefing generation in the conversation's current session (as a
+/// compaction does): its next wake carries a full briefing; memory and history stay. Without a
+/// mapped session the next wake starts a fresh one anyway.
+pub(crate) fn rebrief(context: &RuntimeContext, key: &str) -> Result<bool, String> {
+    let Some(sid) = crate::session_map::lookup(context, key)? else { return Ok(false) };
+    let state = context.read_social_state()?;
+    let Some(epoch) = state["conversations"][key]["agentToken"].as_str().map(str::to_string) else { return Ok(false) };
+    crate::session_map::update_context(context, key, &sid, &epoch, |record| {
+        record["generation"] = json!(record["generation"].as_u64().unwrap_or(0) + 1);
+        record["pending"] = Value::Null;
+        record["needsBriefing"] = json!(true);
     })
 }
 

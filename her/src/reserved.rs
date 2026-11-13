@@ -729,8 +729,12 @@ impl Hub {
         let say = match decision {
             chat::Decision::Say(text) => Some(text),
             chat::Decision::SetRole { name, say } => {
-                console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
-                Some(say)
+                if crate::persona::applies(&self.context) {
+                    Some(crate::persona_command::ROLE_RETIRED.to_string())
+                } else {
+                    console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    Some(say)
+                }
             }
             chat::Decision::SetRoleMode { mode, say } => {
                 console::chat_write_role_state(&self.context, current_role.as_deref(), mode)?;

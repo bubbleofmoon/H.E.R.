@@ -967,8 +967,12 @@ impl Hub {
                 Ok(Outcome::Done)
             }
             Decision::SetRole { name, say } => {
-                crate::console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
-                self.say(cfg, &key, &say);
+                if crate::persona::applies(&self.context) {
+                    self.say(cfg, &key, crate::persona_command::ROLE_RETIRED);
+                } else {
+                    crate::console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    self.say(cfg, &key, &say);
+                }
                 self.settle(inbound_key).await?;
                 Ok(Outcome::Done)
             }

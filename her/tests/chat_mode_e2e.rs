@@ -889,15 +889,15 @@ fn status_role_silent_and_active_commands_have_the_old_texts_and_effects() {
     says(&rig, OWNER_KEY, OWNER, "owner", "/role 不存在的");
     says(&rig, OWNER_KEY, OWNER, "owner", "/status");
     let t = rig.wait_texts(OWNER_KEY, 4);
-    assert_eq!(t[1], "已切换角色：小鲸鱼。");
+    assert_eq!(t[1], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
     assert_eq!(t[2], "角色「不存在的」不存在。角色文件放 qq-bridge/roles/ 目录。");
-    assert_eq!(t[3], "会话 未创建；白名单 通过；角色 小鲸鱼；模式 active");
-    assert_eq!(rig.data_json("current-role.json"), json!({"role": "小鲸鱼", "mode": "active"}));
+    assert_eq!(t[3], "会话 未创建；白名单 通过；角色 无；模式 active");
+    assert!(rig.data_json("current-role.json")["role"].is_null(), "a retired /role writes nothing");
 
     says(&rig, OWNER_KEY, OWNER, "owner", "/role off");
     let t = rig.wait_texts(OWNER_KEY, 5);
-    assert_eq!(t[4], "已清除角色，恢复正常人格。");
-    assert_eq!(rig.data_json("current-role.json"), json!({"role": null, "mode": "active"}));
+    assert_eq!(t[4], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
+    assert!(rig.data_json("current-role.json")["role"].is_null());
 
     // /silent: members are ignored (not even a refusal), the owner still gets answers.
     says(&rig, OWNER_KEY, OWNER, "owner", "/silent");

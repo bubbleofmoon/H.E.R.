@@ -1071,3 +1071,44 @@ fn role_cards_are_imported_once_as_approved_personas() {
     assert!(listed["importedRolesAt"].is_number());
     assert_eq!(rig.console("POST", "/api/personas/import-roles", Some(&json!({}))).0, 409, "import runs once");
 }
+
+#[test]
+fn a_persona_switch_starts_a_new_briefing_generation_in_the_same_session() {
+    let mut rig = Rig::new("switch", Seed::default());
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    let clerk = approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale}))).0, 200);
+    rig.restart(mention(5101, "默认人设"));
+    let first = rig.wait_prompts(1);
+    assert!(first[0].text.contains("【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。") && first[0].text.contains("generation=0】"), "{}", first[0].text);
+
+    let (status, switched) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": clerk})));
+    assert_eq!(status, 200, "{switched}");
+    assert_eq!(switched["rebriefed"], json!([GROUP_KEY]));
+    rig.restart(mention(5102, "覆盖人设"));
+    let second = rig.wait_prompts(2);
+    let text = &second[1].text;
+    assert!(text.contains("【简报 revision=") && text.contains("generation=1】"), "a switch must re-brief in full: {text}");
+    assert!(text.contains("【人设】会计\n你是会计助手，只讲数字。") && !text.contains("【人设】小鲸鱼"), "{text}");
+    assert_eq!(second[1].session, second[0].session, "the switch keeps the session and its memory");
+
+    let (_, cleared) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": null})));
+    assert_eq!(cleared["rebriefed"], json!([GROUP_KEY]));
+    rig.restart(mention(5103, "回到默认"));
+    let third = rig.wait_prompts(3);
+    assert!(third[2].text.contains("generation=2】") && third[2].text.contains("【人设】小鲸鱼"), "{}", third[2].text);
+}
+
+#[test]
+fn a_group_member_cannot_switch_personas_and_gets_the_fixed_refusal() {
+    let mut rig = Rig::new("persona-refusal", Seed::default());
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale.clone()}))).0, 200);
+    rig.restart(mention(7001, "/persona 会计"));
+    let refused = || lock(&rig.gateway).sends.iter().any(|send| send.to_string().contains("人设只能由管理员在私聊或控制台切换。"));
+    assert!(wait_for(LONG, refused), "no fixed refusal: {:?}", lock(&rig.gateway).sends);
+    assert_eq!(rig.data_json("personas.json")["default"], json!(whale));
+    assert_eq!(rig.data_json("personas.json")["overrides"], json!({}));
+    assert!(rig.dsh.prompts().is_empty(), "the command never reaches the model");
+}
