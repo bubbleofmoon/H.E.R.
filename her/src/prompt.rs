@@ -1269,6 +1269,23 @@ pub fn build_text_only_with_runtime(
     self_name: &str,
     self_qq: &str,
 ) -> String {
+    build_text_only_inner(context, key, recent, self_name, self_qq, "")
+}
+
+/// Ticket 33: the pinned-CLI prompt for one wake. A `reminder:<id>` wake carries the reminder content and asks for it
+/// to be said, since the CLI has no tools and its one reply is the delivery; other reasons get the plain prompt.
+pub fn build_text_only_for_wake(context: &RuntimeContext, key: &str, reason: &str, self_name: &str, self_qq: &str) -> String {
+    build_text_only_inner(context, key, &[], self_name, self_qq, reason)
+}
+
+fn build_text_only_inner(
+    context: &RuntimeContext,
+    key: &str,
+    recent: &[String],
+    self_name: &str,
+    self_qq: &str,
+    reason: &str,
+) -> String {
     let st = social_state_for_runtime(context)
         .get("conversations")
         .and_then(|c| c.get(key))
@@ -1322,6 +1339,14 @@ pub fn build_text_only_with_runtime(
         let _ = mode;
     }
 
+    let reminder = crate::schedule::reminder_line(context, reason);
+    if !reminder.is_empty() {
+        out.push('\n');
+        out.push_str(&crate::model_view::strip_from_model_text(&reminder, &cfg));
+        if reminder != crate::schedule::REMINDER_GONE {
+            out.push_str("【提醒】这次不是新消息叫醒你：一条提醒到时间了。你要说的那句话就是把上面【提醒内容】自然地告诉对方；不要提到日程、系统或提醒编号。\n");
+        }
+    }
     out.push_str("\n【输出要求】只输出那句话本身。不要加「回复：」前缀，不要加引号，不要解释。");
     let refs = if recent.is_empty() { crate::model_failure::snapshot_refs(&out).unwrap_or_default() } else { Vec::new() };
     crate::model_failure::remember_prompt(context, key, "cli", &out, refs);
@@ -1416,6 +1441,23 @@ mod tests {
             token_line("abc123"),
             "【会话令牌】abc123（调用二代状态工具时请在参数中带上此令牌）\n\n"
         );
+    }
+
+    #[test]
+    fn text_only_prompt_carries_the_reminder_for_a_reminder_wake() {
+        let (root, context) = runtime_fixture("cli reminder");
+        let now = crate::parity_clock::now_ms();
+        let item = crate::schedule::ScheduleStore::new(&context)
+            .create(crate::schedule::NewItem { creator: crate::schedule::Creator::Owner, conversation: "group:1".into(),
+                text: "记得交周报".into(), at: now + 60_000, repeat: crate::schedule::Repeat::Once }, now)
+            .unwrap();
+        let reminder = build_text_only_for_wake(&context, "group:1", &format!("reminder:{}", item.id), "bot", "9001");
+        let ordinary = build_text_only_for_wake(&context, "group:1", "atMention", "bot", "9001");
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(reminder.contains("【提醒内容】记得交周报"), "{reminder}");
+        assert!(reminder.contains("把上面【提醒内容】自然地告诉对方"), "{reminder}");
+        assert!(reminder.find("【提醒内容】").unwrap() < reminder.find("【输出要求】").unwrap());
+        assert!(!ordinary.contains("【提醒内容】"), "{ordinary}");
     }
 
     #[test]
