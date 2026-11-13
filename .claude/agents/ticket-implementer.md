@@ -10,7 +10,7 @@ hooks:
     - matcher: "Bash|Edit|Write|NotebookEdit"
       hooks:
         - type: command
-          command: "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/agent-guard.sh implementer"
+          command: "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/agent-guard.sh implementer"
           timeout: 10
 ---
 

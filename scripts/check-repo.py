@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Check Markdown/JSON control characters in a Git checkout or a plain snapshot."""
+"""Check Markdown/JSON control characters and tracked hook script modes in a Git checkout or a plain snapshot."""
 from pathlib import Path
+import fnmatch
 import re
 import subprocess
 import sys
 
 CONTROL = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+EXECUTABLE_PATTERNS = ('*.sh', '.githooks/*', '.claude/hooks/*')
+EXECUTABLE_MODE = '100755'
 root = Path(__file__).resolve().parent.parent
 staged = '--staged' in sys.argv
 if staged:
@@ -29,4 +32,21 @@ for path in sorted(paths):
 for finding in findings:
     print(finding)
 print(f'Control-character scan: {len(findings)} findings')
-sys.exit(bool(findings))
+
+# The index holds the modes that git will commit; a checkout made with core.fileMode off can lose
+# the executable bit silently, so the check reads the index and never the working copy.
+# A plain snapshot has no index to read and skips this check.
+mode_findings = []
+if (root / '.git').exists():
+    listing = subprocess.run(['git', 'ls-files', '-s', '-z'], cwd=root, capture_output=True, check=True).stdout
+    for entry in listing.split(b'\0'):
+        if not entry:
+            continue
+        meta, path = entry.decode('utf-8').split('\t', 1)
+        mode = meta.split(' ', 1)[0]
+        if mode != EXECUTABLE_MODE and any(fnmatch.fnmatchcase(path, pattern) for pattern in EXECUTABLE_PATTERNS):
+            mode_findings.append(f'mode: {path} is {mode}, expected {EXECUTABLE_MODE}')
+for finding in mode_findings:
+    print(finding)
+print(f'File-mode scan: {len(mode_findings)} findings')
+sys.exit(bool(findings or mode_findings))
