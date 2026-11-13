@@ -547,11 +547,12 @@ fn recall_is_identifier(term: &str) -> bool {
 }
 
 /// `covered` is the number of distinct message characters the shared terms cover (知道 and 道了
-/// cover three, not four).
+/// cover three, not four). A single shared term is judged by its own length, never by how often
+/// the message repeats it.
 fn recall_qualifies(shared: &[&String], covered: usize) -> bool {
     match shared {
         [] => false,
-        [one] => recall_is_identifier(one) || covered >= RECALL_LONG_TERM_CHARS,
+        [one] => recall_is_identifier(one) || one.chars().filter(|c| recall_counts(*c)).count() >= RECALL_LONG_TERM_CHARS,
         _ => covered >= RECALL_MIN_SHARED_CHARS,
     }
 }
@@ -1360,6 +1361,22 @@ mod tests {
         add_row(&conn, "group:101", "group", "符号", "代号 __a_ 的说明", 1.0, 1);
         let hits = recall(&conn, "group:101", false, "请问 __a_ 怎么办", 3, &[]).unwrap();
         assert!(hits.is_empty(), "{:?}", recalled_subjects(&hits));
+    }
+
+    #[test]
+    fn recall_a_repeated_short_term_does_not_pass_as_a_long_one() {
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "链接", "参考 https 的说明，哈哈 很好玩", 1.0, 1);
+        add_row(&conn, "group:101", "group", "长词", "program 的写法很多", 0.0, 0);
+        for message in ["https https https", "哈哈 哈哈 哈哈", "哈哈哈哈哈哈", "https，https，https，https"] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
+        }
+        // A word of six or more letters alone still recalls, repeated or not.
+        for message in ["program", "program program"] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            assert_eq!(recalled_subjects(&hits), vec!["长词"], "{message:?}");
+        }
     }
 
     #[test]
