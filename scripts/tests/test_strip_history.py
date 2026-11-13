@@ -539,9 +539,14 @@ class KeyAcl(unittest.TestCase):
         s_mod = load()
         require(self, s_mod, 'dacl_problem')
         self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;SY)(A;ID;FR;;;S-1-5-21-1-2-3-500)', 'S-1-5-21-1-2-3-1001'),
-                         'entry count 2: A;;FA;SY A;ID;FR;other-account')
+                         'entry count 2: A;;FA;SY A;ID;FR;domain-rid-500')
         self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;SY)(A;ID;FR;;;S-1-5-21-1-2-3-1001)', 'S-1-5-21-1-2-3-1001'),
                          'entry count 2: A;;FA;SY A;ID;FR;current-user')
+        for trustee, label in [('S-1-5-18', 'S-1-5-18'), ('S-1-5-32-544', 'S-1-5-32-544'),
+                               ('S-1-5-21-1-2-3-500', 'domain-rid-500'), ('S-1-15-2-1', 'other-account')]:
+            with self.subTest(trustee=trustee):
+                self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;{trustee})', 'S-1-5-21-1-2-3-1001'),
+                                 f'entry count 2: A;;FA;SY A;;FA;{label}')
 
     @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
     def test_load_key_refuses_a_group_readable_file(self):

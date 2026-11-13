@@ -300,15 +300,20 @@ class Stripper:
 
 
 def describe_ace(ace, sid):
-    """type;flags;rights;who for one ACE, with who as its alias, current-user or other-account; no SID or object GUID."""
+    """type;flags;rights;who for one ACE: who is the alias or well-known SID, current-user, domain-rid-<RID> (never the domain part) or other-account; no object GUID."""
     fields = ace.split(';')
     if len(fields) < 6:
         return 'malformed'
     who = fields[5]
+    domain_rid = re.fullmatch(r'S-1-5-21-[0-9-]+-([0-9]+)', who)
     if re.fullmatch(r'[A-Z]{2}', who):
         label = who
     elif who == sid:
         label = 'current-user'
+    elif re.fullmatch(r'S-1-[0-9]-[0-9]{1,2}|S-1-5-32-[0-9]{3}|S-1-5-80-0', who):
+        label = who
+    elif domain_rid:
+        label = f'domain-rid-{domain_rid.group(1)}'
     else:
         label = 'other-account'
     return f'{fields[0]};{fields[1]};{fields[2]};{label}'
