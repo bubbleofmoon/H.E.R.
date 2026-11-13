@@ -182,9 +182,9 @@ impl<'a> Recorded<'a> {
     }
 
     /// Look for proof that item `idx`, attempted at `since_ms`, was delivered. One history message
-    /// proves one item: `exclude` plus every id the outbox confirmed in the ten minutes before
-    /// `since_ms` onward are skipped. A confirmation without a message id, or an unreadable outbox,
-    /// proves nothing. Proof appends a verified confirmation (its append result is returned with the id).
+    /// proves one item: every confirmed id is excluded; any confirmation without an id, an unreadable
+    /// outbox, or an unresolved send from another batch in the last 24 hours leaves the item
+    /// unproven. Proof appends a verified confirmation (its append result is returned with the id).
     pub fn confirm_from_history(
         &self,
         idx: usize,
@@ -193,10 +193,8 @@ impl<'a> Recorded<'a> {
         proof: Proof<'_>,
         exclude: &[i64],
     ) -> Option<(i64, Result<(), String>)> {
-        // Ten minutes is wider than the 30-message history: every earlier confirmation that could
-        // share this attempt's whole-second times falls inside the window.
-        let (claimed, unidentified) = confirmed_since(self.context, since_ms - 600_000)?;
-        if unidentified {
+        let (claimed, unidentified) = confirmed_since(self.context)?;
+        if unidentified || other_unresolved_recent(self.context, &self.batch_id, (self.clock)())? {
             return None;
         }
         let mut exclude = exclude.to_vec();
@@ -269,21 +267,46 @@ impl<'a> Recorded<'a> {
     }
 }
 
-/// Message ids of the outbox's `confirmed` records dated at or after `since_ms`, and whether one of
-/// them has no integer message id (it cannot be excluded by id). `None` when the outbox cannot be
-/// read: nothing is then proven.
-fn confirmed_since(context: &RuntimeContext, since_ms: i64) -> Option<(Vec<i64>, bool)> {
+/// Message ids of every `confirmed` record in the outbox, and whether one of them has no integer
+/// message id (it cannot be excluded by id). `None` when the outbox cannot be read: nothing is then
+/// proven.
+fn confirmed_since(context: &RuntimeContext) -> Option<(Vec<i64>, bool)> {
     let records = read_records(context).ok()?;
-    let confirmed: Vec<&Value> = records
-        .iter()
-        .filter(|r| r["k"] == "confirmed" && r["t"].as_i64().unwrap_or(0) >= since_ms)
-        .collect();
+    let confirmed: Vec<&Value> = records.iter().filter(|r| r["k"] == "confirmed").collect();
     let unidentified = confirmed.iter().any(|r| !r["messageId"].is_i64());
     let ids = confirmed
         .iter()
         .filter_map(|r| r["messageId"].as_i64())
         .collect();
     Some((ids, unidentified))
+}
+
+/// Whether a send from another batch is still unresolved (attempted or unknown, with no later
+/// outcome) and its latest attempt is within the last 24 hours. Items of `batch_id` itself are not
+/// counted: they share the target and the send, so one history message proves at most one of them.
+/// `None` when the outbox cannot be read.
+fn other_unresolved_recent(context: &RuntimeContext, batch_id: &str, now_ms: i64) -> Option<bool> {
+    let records = read_records(context).ok()?;
+    let mut batch_ids: Vec<&str> = records.iter().filter_map(|r| r["batch"].as_str()).collect();
+    batch_ids.sort_unstable();
+    batch_ids.dedup();
+    let threshold = now_ms - 86_400_000;
+    let unresolved = batch_ids
+        .into_iter()
+        .filter(|id| *id != batch_id)
+        .filter_map(|id| crate::send_outbox::fold_batch(&records, id))
+        .any(|batch| {
+            batch.items.iter().enumerate().any(|(item, state)| {
+                state.needs_verification()
+                    && batch
+                        .attempt_at
+                        .get(item)
+                        .copied()
+                        .flatten()
+                        .is_some_and(|at| at >= threshold)
+            })
+        });
+    Some(unresolved)
 }
 
 /// Our own message in the target's recent history, dated at or after `since_ms`, that matches
@@ -802,6 +825,124 @@ mod tests {
             settled.state,
             ItemState::Unknown,
             "the exclusion list cannot be read, so nothing is proven: {paths:?}"
+        );
+    }
+
+    fn clock_far() -> i64 {
+        100_000_000_000
+    }
+
+    #[test]
+    fn a_confirmation_eleven_minutes_old_still_claims_its_message() {
+        let (root, context) = root("her-recorded-skew-");
+        // The gateway clock runs ahead: its history message is dated at B's attempt second.
+        let (ob, gateway) = history_gateway(json!([same_text(11, 1000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        crate::send_outbox::append_record(&context, &json!({"batch": "a-batch", "k": "intent", "key": "group:1", "epoch": "e", "messages": ["same"], "t": 340_000})).unwrap();
+        crate::send_outbox::append_record(
+            &context,
+            &json!({"batch": "a-batch", "k": "attempt", "idx": 0, "t": 340_500}),
+        )
+        .unwrap();
+        crate::send_outbox::append_record(
+            &context,
+            &json!({"batch": "a-batch", "k": "confirmed", "idx": 0, "messageId": 11, "t": 340_900}),
+        )
+        .unwrap();
+        let b = same_text_intent(&context, clock_b, 1_000_900);
+        let at = b.attempt(0, None).unwrap();
+        let settled = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(settled.state, ItemState::Unknown, "batch A's confirmation of message 11 is older than ten minutes but still claims it: {paths:?}");
+    }
+
+    #[test]
+    fn another_unresolved_send_in_the_last_day_blocks_history_proof() {
+        let (root, context) = root("her-recorded-competing-");
+        let (ob, gateway) = history_gateway(json!([same_text(11, 1000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        // Batch A attempted one second before B and ended unknown: its message may be the one in history.
+        crate::send_outbox::append_record(&context, &json!({"batch": "a-batch", "k": "intent", "key": "group:1", "epoch": "e", "messages": ["same"], "t": 999_000})).unwrap();
+        crate::send_outbox::append_record(
+            &context,
+            &json!({"batch": "a-batch", "k": "attempt", "idx": 0, "t": 999_900}),
+        )
+        .unwrap();
+        crate::send_outbox::append_record(
+            &context,
+            &json!({"batch": "a-batch", "k": "unknown", "idx": 0, "error": "lost", "t": 999_900}),
+        )
+        .unwrap();
+        let b = same_text_intent(&context, clock_b, 1_000_900);
+        let at = b.attempt(0, None).unwrap();
+        let settled = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            settled.state,
+            ItemState::Unknown,
+            "an unresolved earlier send may own the message: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_send_older_than_a_day_does_not_block_proof() {
+        let (root, context) = root("her-recorded-stale-");
+        let (ob, gateway) = history_gateway(json!([same_text(12, 100_000_000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        // Batch A was attempted 25 hours before B and never resolved; its message is not in history.
+        crate::send_outbox::append_record(&context, &json!({"batch": "a-batch", "k": "intent", "key": "group:1", "epoch": "e", "messages": ["other"], "t": 99_900_000_000i64})).unwrap();
+        crate::send_outbox::append_record(
+            &context,
+            &json!({"batch": "a-batch", "k": "attempt", "idx": 0, "t": 99_910_000_000i64}),
+        )
+        .unwrap();
+        let b = same_text_intent(&context, clock_far, 100_000_000_000);
+        let at = b.attempt(0, None).unwrap();
+        let settled = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            settled.state,
+            ItemState::Confirmed {
+                message_id: Some(12),
+                verified: true
+            },
+            "{paths:?}"
         );
     }
 }
