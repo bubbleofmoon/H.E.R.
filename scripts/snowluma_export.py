@@ -4,13 +4,17 @@
     python -I scripts/snowluma_export.py snapshot --live LIVE_DB --copy COPY_DB
     python -I scripts/snowluma_export.py export --db COPY_DB --out OUT.jsonl [--conv group:<id> ...]
 
-snapshot opens the live store read-only (mode=ro, query_only) and copies it with SQLite's online
-backup, which includes committed WAL pages; it refuses when the live -wal or -shm is missing (a
-read-only open would create one beside the production database) and fails if the live
-directory's file names change. export reads only the copy and writes records ordered by time.
+snapshot opens the live store read-only (mode=ro, query_only, no checkpoint on close where the
+SQLite build allows it) and copies it with SQLite's online backup, which includes committed WAL
+pages. It refuses a copy inside the live store's directory and a live store whose -wal or -shm
+is missing (a read-only open would create one beside the production database). It fails, and
+removes the copy, if the live directory's file names change at open, during or after the backup,
+or on any error, and it seals a good copy with COPY.snapshot.json (SHA-256). export reads only
+a sealed, unchanged copy and writes records ordered by time; lone surrogates become U+FFFD.
 Output stays on the Windows host; strip it before anything reaches the vault.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,7 +26,10 @@ import sys
 REQUIRED = ('message_hash', 'is_group', 'session_id', 'sequence', 'private_direction', 'timestamp', 'data')
 MEDIA = {'image': 'image', 'video': 'video', 'record': 'voice', 'file': 'file', 'flash_file': 'file',
          'mface': 'sticker', 'json': 'card', 'xml': 'card', 'markdown': 'markdown'}
-CQ = re.compile(r'\[CQ:([A-Za-z_]+)((?:,[^,\]]*)*)\]')
+CQ_FULL = re.compile(r'\[CQ:([A-Za-z_]+)((?:,[^,\]]*)*)\]')
+CQ_HEAD = re.compile(r'\[CQ:([A-Za-z_]+)')
+CARD_TYPES = {'json', 'xml', 'markdown'}
+SURROGATE = re.compile(r'[\ud800-\udfff]')
 
 
 def unescape(text):
@@ -30,16 +37,25 @@ def unescape(text):
 
 
 def parse_cq(message):
+    """A card code or an unparsable code ends the message: its payload never becomes text."""
     items, at = [], 0
-    for match in CQ.finditer(message):
-        if match.start() > at:
-            items.append({'type': 'text', 'data': {'text': unescape(message[at:match.start()])}})
+    while True:
+        start = message.find('[CQ:', at)
+        if start < 0:
+            break
+        if start > at:
+            items.append({'type': 'text', 'data': {'text': unescape(message[at:start])}})
+        head, full = CQ_HEAD.match(message, start), CQ_FULL.match(message, start)
+        kind = head.group(1) if head else 'other'
+        if kind in CARD_TYPES or full is None:
+            items.append({'type': kind if kind in CARD_TYPES else 'other', 'data': {}})
+            return items
         data = {}
-        for part in match.group(2).split(',')[1:]:
+        for part in full.group(2).split(',')[1:]:
             name, _, value = part.partition('=')
             data[name] = unescape(value)
-        items.append({'type': match.group(1), 'data': data})
-        at = match.end()
+        items.append({'type': kind, 'data': data})
+        at = full.end()
     if at < len(message):
         items.append({'type': 'text', 'data': {'text': unescape(message[at:])}})
     return items
@@ -66,7 +82,10 @@ def segments(message):
         if kind == 'text':
             segs.append({'k': 'text', 'text': str(data.get('text', ''))})
         elif kind == 'at':
-            segs.append({'k': 'at', 'id': 'all' if str(data.get('qq')) == 'all' else id_text(data.get('qq'))})
+            seg = {'k': 'at', 'id': 'all' if str(data.get('qq')) == 'all' else id_text(data.get('qq'))}
+            if isinstance(data.get('name'), str) and data['name'].strip():
+                seg['name'] = data['name'].strip()   # learned by the stripper, never published
+            segs.append(seg)
         elif kind == 'reply':
             segs.append({'k': 'reply', 'mid': id_text(data.get('id'))})
         elif kind in ('forward', 'node'):
@@ -97,46 +116,94 @@ def normalise(row, event):
             'segs': segments(event.get('message'))}
 
 
+def _sidecars(path):
+    return [path.with_name(path.name + suffix) for suffix in ('-wal', '-shm')]
+
+
+def marker_path(db):
+    return db.with_name(db.name + '.snapshot.json')
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def seal(db, messages):
+    db = Path(db)
+    marker_path(db).write_text(json.dumps({'tool': 'snowluma_export.snapshot', 'sha256': file_sha256(db),
+                                           'messages': messages}) + '\n', encoding='utf-8')
+
+
+def sealed(db):
+    db = Path(db)
+    try:
+        marker = json.loads(marker_path(db).read_text(encoding='utf-8'))
+        return (isinstance(marker, dict) and marker.get('tool') == 'snowluma_export.snapshot'
+                and marker.get('sha256') == file_sha256(db) and not any(p.exists() for p in _sidecars(db)))
+    except (OSError, ValueError):
+        return False
+
+
+def _remove_copy(copy):
+    for leftover in (copy, *_sidecars(copy), copy.with_name(copy.name + '-journal'), marker_path(copy)):
+        try:
+            leftover.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def snapshot(live, copy):
-    live, copy = Path(live), Path(copy)
-    if copy.exists():
+    live, copy = Path(live).resolve(), Path(copy).resolve()
+    live_dir = live.parent
+    if copy.exists() or marker_path(copy).exists():
         print('snapshot refused: copy exists')
         return 2
-    for sidecar in (live.with_name(live.name + '-wal'), live.with_name(live.name + '-shm')):
-        if not sidecar.is_file():
-            print('snapshot refused: live store has no -wal or -shm beside it')
-            return 2
-    before = sorted(os.listdir(live.parent))
-    src = sqlite3.connect(live.resolve().as_uri() + '?mode=ro', uri=True)
-    dst = None
+    if Path(os.path.normcase(copy)).is_relative_to(Path(os.path.normcase(live_dir))):
+        print('snapshot refused: the copy must be outside the live store directory')
+        return 2
+    if not all(p.is_file() for p in _sidecars(live)):
+        print('snapshot refused: live store has no -wal or -shm beside it')
+        return 2
+    before = sorted(os.listdir(live_dir))
+    src = dst = None
+    status, message, count, ckpt = 0, '', 0, 'unavailable'
     try:
+        src = sqlite3.connect(live.as_uri() + '?mode=ro', uri=True)
+        option = getattr(sqlite3, 'SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE', None)
+        if option is not None and hasattr(src, 'setconfig'):
+            src.setconfig(option, True)
+            ckpt = 'applied'
         src.execute('PRAGMA query_only=1')
-        dst = sqlite3.connect(copy)
-        src.backup(dst)
-        dst.execute('PRAGMA journal_mode=DELETE')
+        if sorted(os.listdir(live_dir)) != before:
+            status, message = 1, 'snapshot failed: opening the live store changed its directory'
+        else:
+            dst = sqlite3.connect(copy)
+            src.backup(dst)
+            dst.execute('PRAGMA journal_mode=DELETE')
+            count = dst.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
     except sqlite3.Error:
+        status, message = 1, 'snapshot failed: the live store could not be read or has no messages table'
+    finally:
         if dst is not None:
             dst.close()
-            dst = None
-        for leftover in (copy, copy.with_name(copy.name + '-wal'), copy.with_name(copy.name + '-shm')):
-            if leftover.exists():
-                leftover.unlink()
-        print('snapshot failed: the live store could not be read')
-        return 1
-    finally:
-        src.close()
-        if dst is not None:
-            dst.close()
-    after = sorted(os.listdir(live.parent))
-    if after != before:
-        print('live directory file set changed during snapshot')
-        return 1
-    check = sqlite3.connect(copy)
-    try:
-        count = check.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
-    finally:
-        check.close()
-    print(f'snapshot: messages={count}')
+        if src is not None:
+            src.close()
+    if sorted(os.listdir(live_dir)) != before:
+        status, message = 1, (message + '; ' if message else '') + 'live directory file set changed during snapshot'
+    if not status:
+        try:
+            seal(copy, count)
+        except OSError:
+            status, message = 1, 'snapshot failed: the snapshot marker could not be written'
+    if status:
+        _remove_copy(copy)
+        print(message)
+        return status
+    print(f'snapshot: messages={count} no_ckpt_on_close={ckpt}')
     return 0
 
 
@@ -145,21 +212,25 @@ def export(db, out, convs):
     if out.exists():
         print('export refused: output exists')
         return 2
-    try:
-        conn = sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True)
-    except sqlite3.Error:
-        print('export refused: the store cannot be opened read-only')
+    db = Path(db).resolve()
+    if not sealed(db):
+        print('export refused: --db is not a sealed, unchanged snapshot (run snapshot first)')
         return 2
     try:
-        cols = {r[1] for r in conn.execute('PRAGMA table_info(messages)')}
-        missing = [name for name in REQUIRED if name not in cols]
-        if missing:
-            print('export refused: missing columns ' + ', '.join(missing))
-            return 2
-        rows = conn.execute('SELECT message_hash, is_group, session_id, private_direction, timestamp, data '
-                            'FROM messages ORDER BY timestamp, sequence, message_hash').fetchall()
-    finally:
-        conn.close()
+        conn = sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)
+        try:
+            cols = {r[1] for r in conn.execute('PRAGMA table_info(messages)')}
+            missing = [name for name in REQUIRED if name not in cols]
+            if missing:
+                print('export refused: missing columns ' + ', '.join(missing))
+                return 2
+            rows = conn.execute('SELECT message_hash, is_group, session_id, private_direction, timestamp, data '
+                                'FROM messages ORDER BY timestamp, sequence, message_hash').fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        print('export refused: the snapshot cannot be read')
+        return 2
     counts = Counter()
     records = []
     for row in rows:
@@ -180,18 +251,24 @@ def export(db, out, convs):
             continue
         records.append(record)
     partial = out.with_name(out.name + '.partial')
+    replaced = 0
     try:
         with open(partial, 'w', encoding='utf-8') as handle:
             for record in records:
-                handle.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+                line, n = SURROGATE.subn('\ufffd', json.dumps(record, ensure_ascii=False, separators=(',', ':')))
+                replaced += n
+                handle.write(line + '\n')
         os.replace(partial, out)
-    except OSError:
-        if partial.exists():
+    except (OSError, UnicodeError, ValueError):
+        try:
             partial.unlink()
+        except OSError:
+            pass
         print('export failed: the output could not be written')
         return 1
     print(f"export: rows={counts['rows']} written={len(records)} no_data={counts['no_data']} "
-          f"bad_json={counts['bad_json']} filtered={counts['filtered']} conversations={len({r['conv'] for r in records})} "
+          f"bad_json={counts['bad_json']} filtered={counts['filtered']} surrogates_replaced={replaced} "
+          f"conversations={len({r['conv'] for r in records})} "
           f"in={sum(r['dir'] == 'in' for r in records)} out={sum(r['dir'] == 'out' for r in records)}")
     return 0
 
@@ -202,7 +279,7 @@ def main(argv=None):
     take = commands.add_parser('snapshot', help='copy the live store with the online backup API')
     take.add_argument('--live', required=True)
     take.add_argument('--copy', required=True)
-    dump = commands.add_parser('export', help='write schema v1 records from a copied store')
+    dump = commands.add_parser('export', help='write schema v1 records from a sealed snapshot')
     dump.add_argument('--db', required=True)
     dump.add_argument('--out', required=True)
     dump.add_argument('--conv', action='append', default=[], help='keep only this conversation, group:<id> or private:<id>')

@@ -5,12 +5,15 @@ Every database here is built in a temp directory from invented rows. Ids are sho
 numbers, and the Chinese text is invented. Run: python -I scripts/tests/test_snowluma_export.py
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 from unittest import mock
 import unittest
@@ -29,6 +32,21 @@ DDL = """CREATE TABLE messages (
     sequence_authoritative INTEGER, event_name TEXT, client_sequence INTEGER,
     private_direction INTEGER, random INTEGER, timestamp INTEGER, data TEXT,
     classification_version INTEGER)"""
+
+CHILD = '\n'.join([
+    'import os, sqlite3, sys',
+    'c = sqlite3.connect(sys.argv[1])',
+    "c.execute('PRAGMA journal_mode=WAL')",
+    "c.execute('PRAGMA wal_autocheckpoint=0')",
+    f'c.execute({DDL!r})',
+    "c.execute(\"INSERT INTO messages (message_hash,is_group,session_id,sequence,event_name,private_direction,timestamp,data) VALUES (1,1,'g',1,'message',-1,1000,'{}')\")",
+    'c.commit()',
+    "if sys.argv[2] == 'crash':",
+    '    os._exit(0)',
+    "print('ready', flush=True)",
+    'sys.stdin.readline()',
+    'c.close()',
+])
 
 
 def load(path, name):
@@ -56,6 +74,31 @@ def make_store(path, rows):
                      (hash_, is_group, session, seq, 'message', pd, ts, data))
     conn.commit()
     conn.close()
+
+
+def make_sealed_store(path, rows):
+    make_store(path, rows)
+    module = export_module()
+    if not hasattr(module, 'seal'):
+        raise AssertionError('snowluma_export.py has no seal() yet: the export cannot require a sealed snapshot')
+    module.seal(Path(path), len(rows))
+
+
+def open_wal_store(path, rows):
+    """A WAL store with no checkpoint on commit; the caller keeps the connection open."""
+    writer = sqlite3.connect(path)
+    writer.execute('PRAGMA journal_mode=WAL')
+    writer.execute('PRAGMA wal_autocheckpoint=0')
+    writer.execute(DDL)
+    writer.executemany('INSERT INTO messages (message_hash, is_group, session_id, sequence, event_name, '
+                       'private_direction, timestamp, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                       [(r[0], r[1], r[2], r[3], 'message', r[4], r[5], r[6]) for r in rows])
+    writer.commit()
+    return writer
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def standard_rows():
@@ -97,7 +140,7 @@ class ExportMapping(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'copy.db'
             out = Path(tmp) / 'out.jsonl'
-            make_store(db, standard_rows())
+            make_sealed_store(db, standard_rows())
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
                 code = module.export(db, out, convs=[])
@@ -134,7 +177,7 @@ class CqAndFilters(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'copy.db'
             out = Path(tmp) / 'out.jsonl'
-            make_store(db, standard_rows())
+            make_sealed_store(db, standard_rows())
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
                 code = module.export(db, out, convs=[f'group:{GROUP}'])
@@ -168,7 +211,7 @@ class Snapshot(unittest.TestCase):
                 copy = copy_dir / 'messages.db'
                 self.assertEqual(module.snapshot(live, copy), 0)
                 self.assertEqual(sorted(os.listdir(live_dir)), before, 'the live directory must not change')
-                self.assertEqual(sorted(os.listdir(copy_dir)), ['messages.db'], 'the copy must be a single file')
+                self.assertEqual(sorted(os.listdir(copy_dir)), ['messages.db', 'messages.db.snapshot.json'])
                 check = sqlite3.connect(copy)
                 try:
                     self.assertEqual(check.execute('SELECT COUNT(*) FROM messages').fetchone()[0], 6)
@@ -204,7 +247,7 @@ class StripClean(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'copy.db'
             out = Path(tmp) / 'out.jsonl'
-            make_store(db, standard_rows())
+            make_sealed_store(db, standard_rows())
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(module.export(db, out, convs=[]), 0)
             records = [json.loads(line) for line in out.read_text(encoding='utf-8').splitlines()]
@@ -257,7 +300,7 @@ class FailurePaths(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / 'copy.db'
             out = Path(tmp) / 'out.jsonl'
-            make_store(db, standard_rows())
+            make_sealed_store(db, standard_rows())
 
             def failing_open(path, mode='r', *args, **kwargs):
                 return FailAfterFirstWrite(real_open(path, mode, *args, **kwargs))
@@ -299,6 +342,216 @@ class FailurePaths(unittest.TestCase):
                 self.assertEqual(sorted(os.listdir(live_dir)), before)
             finally:
                 writer.close()
+
+
+class Sealing(unittest.TestCase):
+    def test_export_refuses_an_unsealed_store(self):
+        module = export_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / 'copy.db'
+            out = Path(tmp) / 'out.jsonl'
+            writer = open_wal_store(db, standard_rows())
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = module.export(db, out, convs=[])
+            finally:
+                writer.close()
+            self.assertEqual(code, 2, 'an unsealed store must be refused')
+            self.assertFalse(out.exists(), 'a refused export writes no output')
+
+    def test_export_refuses_a_modified_snapshot(self):
+        module = export_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / 'copy.db'
+            out = Path(tmp) / 'out.jsonl'
+            make_sealed_store(db, standard_rows())
+            conn = sqlite3.connect(db)
+            conn.execute("INSERT INTO messages (message_hash, is_group, session_id, sequence, event_name, "
+                         "private_direction, timestamp, data) VALUES (999, 0, 'p', 99, 'message', 0, 2000, '{}')")
+            conn.commit()
+            conn.close()
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = module.export(db, out, convs=[])
+            self.assertEqual(code, 2, 'a snapshot changed after sealing must be refused')
+            self.assertFalse(out.exists())
+
+
+class Surrogates(unittest.TestCase):
+    def test_lone_surrogate_is_replaced_and_no_partial_remains(self):
+        module = export_module()
+        lone = '{"post_type":"message","message_type":"group","message":[{"type":"text","data":{"text":"\\ud800"}}]}'
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / 'copy.db'
+            out = Path(tmp) / 'out.jsonl'
+            make_sealed_store(db, [(201, 1, GROUP, 1, -1, 1000, lone)])
+            printed = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(printed):
+                    code = module.export(db, out, convs=[])
+            except UnicodeError as error:
+                self.fail(f'export raised {error}: a lone surrogate must become U+FFFD, not an exception')
+            self.assertEqual(code, 0)
+            self.assertIn('\ufffd', out.read_text(encoding='utf-8'))
+            self.assertIn('surrogates_replaced=1', printed.getvalue())
+            self.assertFalse(Path(str(out) + '.partial').exists(), 'no partial file may remain')
+
+
+class CqParsing(unittest.TestCase):
+    def test_cq_card_payload_never_becomes_text(self):
+        module = export_module()
+        segs = module.segments('看[CQ:json,data={"app":"x","prompt":"[秘密]卡片"}]后面')
+        self.assertEqual(segs, [{'k': 'text', 'text': '看'}, {'k': 'media', 'kind': 'card'}])
+
+    def test_unparsable_cq_code_never_becomes_text(self):
+        module = export_module()
+        segs = module.segments('a[CQ:image,file=[x]b')
+        for seg in segs:
+            if seg['k'] == 'text':
+                self.assertNotIn('x', seg['text'], f'payload leaked into text: {segs!r}')
+
+    def test_cq_at_name_is_kept_for_the_stripper(self):
+        module = export_module()
+        self.assertEqual(module.segments('[CQ:at,qq=1001,name=阿强]'),
+                         [{'k': 'at', 'id': '1001', 'name': '阿强'}])
+
+
+class SnapshotRefusals(unittest.TestCase):
+    def test_snapshot_refuses_a_copy_inside_the_live_directory(self):
+        module = export_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / 'live'
+            live_dir.mkdir()
+            live = live_dir / 'messages.db'
+            writer = open_wal_store(live, standard_rows())
+            try:
+                before = sorted(os.listdir(live_dir))
+                for copy in (live_dir / 'sub' / 'x.db', live_dir / 'x.db'):
+                    with self.subTest(copy=str(copy.relative_to(live_dir))):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertEqual(module.snapshot(live, copy), 2)
+                        self.assertFalse(copy.exists(), 'a refused snapshot writes no copy')
+                        self.assertFalse((live_dir / 'sub').exists(), 'no directory may be created')
+                        self.assertEqual(sorted(os.listdir(live_dir)), before)
+            finally:
+                writer.close()
+
+    def test_rejected_snapshot_leaves_no_copy(self):
+        module = export_module()
+        real_listdir = os.listdir
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / 'live'
+            copy_dir = Path(tmp) / 'copy'
+            live_dir.mkdir()
+            copy_dir.mkdir()
+            live = live_dir / 'messages.db'
+            writer = open_wal_store(live, standard_rows())
+            calls = {'live': 0}
+            copy = copy_dir / 'messages.db'
+            marker = copy_dir / 'messages.db.snapshot.json'
+
+            def listdir(path='.'):
+                names = real_listdir(path)
+                if Path(os.fspath(path)).resolve() == live_dir.resolve():
+                    calls['live'] += 1
+                    if calls['live'] >= 2:
+                        return names + ['new.file']
+                return names
+
+            try:
+                with mock.patch.object(module.os, 'listdir', side_effect=listdir), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = module.snapshot(live, copy)
+            finally:
+                writer.close()
+            self.assertEqual(code, 1, 'a changed live directory must reject the snapshot')
+            self.assertFalse(copy.exists(), 'a rejected snapshot leaves no copy')
+            self.assertFalse(marker.exists(), 'a rejected snapshot leaves no marker')
+
+    def test_snapshot_without_messages_table_is_a_clean_refusal(self):
+        module = export_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / 'live'
+            copy_dir = Path(tmp) / 'copy'
+            live_dir.mkdir()
+            copy_dir.mkdir()
+            live = live_dir / 'messages.db'
+            writer = sqlite3.connect(live)
+            try:
+                writer.execute('PRAGMA journal_mode=WAL')
+                writer.execute('CREATE TABLE other (x)')
+                writer.commit()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        code = module.snapshot(live, copy_dir / 'messages.db')
+                except sqlite3.Error as error:
+                    self.fail(f'snapshot raised {error}: a store without a messages table must be a clean refusal')
+                self.assertEqual(code, 1)
+                self.assertEqual(os.listdir(copy_dir), [], 'no copy may remain')
+            finally:
+                writer.close()
+
+
+class SnapshotGate(unittest.TestCase):
+    """Real child processes hold the store. Every child is waited for or killed in a finally."""
+
+    def test_snapshot_of_a_crashed_idle_store_keeps_its_files(self):
+        module = export_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / 'live'
+            copy_dir = Path(tmp) / 'copy'
+            live_dir.mkdir()
+            copy_dir.mkdir()
+            live = live_dir / 'messages.db'
+            subprocess.run([sys.executable, '-I', '-c', CHILD, str(live), 'crash'],
+                           check=True, capture_output=True, timeout=120,
+                           creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            wal, shm = live_dir / 'messages.db-wal', live_dir / 'messages.db-shm'
+            self.assertTrue(wal.is_file() and shm.is_file(), 'a crashed store must keep its -wal and -shm')
+            before_list, before_db, before_wal = sorted(os.listdir(live_dir)), digest(live), digest(wal)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                code = module.snapshot(live, copy_dir / 'messages.db')
+            self.assertEqual(code, 0, printed.getvalue())
+            self.assertEqual(sorted(os.listdir(live_dir)), before_list, 'the live directory must not change')
+            self.assertEqual(digest(live), before_db, 'the live database must not change')
+            self.assertEqual(digest(wal), before_wal, 'the live -wal must not change')
+            check = sqlite3.connect(copy_dir / 'messages.db')
+            try:
+                self.assertEqual(check.execute('SELECT COUNT(*) FROM messages').fetchone()[0], 1)
+            finally:
+                check.close()
+            self.assertIn('no_ckpt_on_close=', printed.getvalue())
+
+    def test_snapshot_while_another_process_holds_the_store(self):
+        module = export_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / 'live'
+            copy_dir = Path(tmp) / 'copy'
+            live_dir.mkdir()
+            copy_dir.mkdir()
+            live = live_dir / 'messages.db'
+            proc = subprocess.Popen([sys.executable, '-I', '-c', CHILD, str(live), 'hold'],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding='utf-8',
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            try:
+                ready = proc.stdout.readline()
+                self.assertEqual(ready.strip(), 'ready', 'the child must hold the store and report ready')
+                before_list = sorted(os.listdir(live_dir))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = module.snapshot(live, copy_dir / 'messages.db')
+                self.assertEqual(code, 0, 'a store held by another process must still snapshot')
+                self.assertEqual(sorted(os.listdir(live_dir)), before_list)
+                proc.stdin.write('\n')
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=60), 0, 'the child must exit cleanly')
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=60)
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
 
 
 if __name__ == '__main__':
