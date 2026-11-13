@@ -688,8 +688,6 @@ fn recall_block_with(
         return (String::new(), Vec::new());
     }
     let top_k = recall_top_k(cfg);
-    let owner = cfg.get("ownerQQ").and_then(|o| o.as_i64()).map(|v| v.to_string()).unwrap_or_default();
-    let is_owner = key == format!("private:{owner}");
 
     let unread_text = st
         .get("unread")
@@ -708,17 +706,18 @@ fn recall_block_with(
     let query_src = if unread_text.is_empty() { recent_text } else { unread_text };
     let query: String = query_src.chars().take(200).collect();
 
-    let conn = match crate::memory::open_ready_for_runtime(context) {
-        Ok(conn) => conn,
+    let store = match crate::memory::MemoryStore::open(context, cfg) {
+        Ok(store) => store,
         Err(_) => {
             eprintln!("memory recall open failed (database unavailable)");
             return (String::new(), Vec::new());
         }
     };
+    let reader = store.for_reader(key);
     let rows = if query.is_empty() {
         Vec::new()
     } else {
-        match crate::memory::recall(&conn, key, is_owner, &query, top_k, held) {
+        match crate::memory::recall(&reader, &query, top_k, held) {
             Ok(rows) => rows,
             Err(error) => {
                 eprintln!("memory recall search failed: {}", crate::memory::search_error_message(&error));
@@ -726,7 +725,7 @@ fn recall_block_with(
             }
         }
     };
-    let (total, terms) = match crate::memory::index_hint(&conn, key, is_owner, &[], 8) {
+    let (total, terms) = match crate::memory::index_hint(&reader, &[], 8) {
         Ok(hint) => hint,
         Err(_) => {
             eprintln!("memory recall index failed (database error)");
