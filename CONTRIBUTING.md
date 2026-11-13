@@ -38,7 +38,7 @@ checks the hosted runners cannot run.
 On the shared development host, use the cargo-slot scripts for every Rust command.
 
 The guard tests itself: `python -I scripts/tests/test_scan_public.py`,
-`python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`
+`python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`
 run against synthetic samples and a stub `gh`, and need gitleaks on `PATH` or `HER_GITLEAKS`.
 
 Fixtures use short synthetic account identifiers. Numeric scan exceptions must
