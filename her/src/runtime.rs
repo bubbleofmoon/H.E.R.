@@ -19,7 +19,6 @@ const LEGACY_RESOURCES: &str = "C:/qqbot/qq-bridge";
 const LEGACY_SOCIAL_STATE: &str = "C:/qqbot/qq-bridge/state/social-v2.json";
 const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
 const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
-static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     pub(crate) static AUTHORITY_WRITE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
@@ -824,32 +823,13 @@ impl RuntimeContext {
         relative: &str,
         input: &mut dyn std::io::Read,
     ) -> Result<(), String> {
-        let target = self
-            .resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let parent = target.parent().ok_or_else(|| "runtime path is unavailable".to_string())?;
-        let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let file_name = target
-            .file_name()
-            .ok_or_else(|| "runtime path is unavailable".to_string())?
-            .to_string_lossy();
-        let temp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), seq));
+        let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|e| runtime_io_error("temp/create", &e))?;
-        if let Err(error) = std::io::copy(input, &mut file).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&temp);
-            return Err(runtime_io_error("temp/write", &error));
-        }
-        drop(file);
-        let checked_target = self
-            .resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let checked_temp = fs::symlink_metadata(&temp)
-            .map_err(|e| runtime_io_error("temp/metadata", &e))?;
+        // Every early return below drops `staged`, which removes the temporary file.
+        let staged = crate::guarded_file::stage(&target, input, None).map_err(|failure| failure.to_string())?;
+        let checked_target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
+        let checked_temp = fs::symlink_metadata(staged.temp()).map_err(|e| runtime_io_error("temp/metadata", &e))?;
         if checked_target != target || is_reparse_point(&checked_temp) || !checked_temp.is_file() {
-            let _ = fs::remove_file(&temp);
             return Err("runtime path is unavailable".to_string());
         }
         // Social writers already own social-v2.lock. The authority gate is always acquired
@@ -862,31 +842,18 @@ impl RuntimeContext {
             AUTHORITY_WRITE_TEST_HOOK.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
             });
-            match self.authority_gate() {
-                Ok(gate) => Some(gate),
-                Err(error) => { let _ = fs::remove_file(&temp); return Err(error); }
-            }
+            Some(self.authority_gate()?)
         } else { None };
-        // Windows readers can briefly deny deletion of the old leaf. Retry only replacement,
-        // retaining the already-fsynced temp; never repeat a mutation or external send.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            // Revalidate confinement on every attempt; path-policy failures are never retried.
-            if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
-                let _ = fs::remove_file(&temp);
-                return Err("runtime path changed class=leaf".into());
-            }
-            match atomic_replace(&temp, &target) {
-                Ok(()) => break,
-                Err(error) if transient_replace_error(&error) && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+        // Retry only the replacement of the already-fsynced temp, never a mutation or external send.
+        // Confinement is revalidated before every attempt; path-policy failures are never retried.
+        staged
+            .commit(&mut || -> Result<(), String> {
+                if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
+                    return Err("runtime path changed class=leaf".to_string());
                 }
-                Err(error) => {
-                    let _ = fs::remove_file(&temp);
-                    return Err(runtime_io_error("leaf/replace", &error));
-                }
-            }
-        }
+                Ok(())
+            })
+            .map_err(|failure| failure.to_string())?;
         // Verify the committed leaf still resolves inside the pinned root.
         self.resolve_path_detailed(area, relative, PathIntent::ReadFile)?;
         Ok(())
@@ -1363,10 +1330,6 @@ pub(crate) fn runtime_io_error(class: &str, error: &std::io::Error) -> String {
     format!("class={class} kind={:?} os={:?}", error.kind(), error.raw_os_error())
 }
 
-fn transient_replace_error(error: &std::io::Error) -> bool {
-    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
-}
-
 pub(crate) const APPEND_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Pure Windows retry policy, also exercised with injected OS errors on other hosts.
@@ -1442,21 +1405,6 @@ pub(crate) fn write_append_all(
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-    if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    fs::rename(source, target)
 }
 
 #[cfg(test)]
@@ -1830,6 +1778,24 @@ mod tests {
         fs::write(root.join("config/config.json"), r#"{"consoleToken":"config-console-token-abcdefghij"}"#).unwrap();
         let cfg = context.load_config().unwrap();
         assert_eq!(context.effective_console_token(&cfg), "config-console-token-abcdefghij", "a configured token wins");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn selected_atomic_writes_sync_the_file_and_the_folder() {
+        let root = fixture_root("guarded-durability");
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let seen = steps.clone();
+        crate::guarded_file::STEP_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move |step: &'static str| -> std::io::Result<()> {
+            seen.borrow_mut().push(step);
+            Ok(())
+        })));
+        let result = context.write_atomic(RuntimeArea::Data, "probe.json", b"{}");
+        crate::guarded_file::STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result.unwrap();
+        assert_eq!(*steps.borrow(), ["temp/sync", "leaf/replace", "dir/sync"]);
+        assert_eq!(fs::read(root.join("data/probe.json")).unwrap(), b"{}");
         cleanup(&root);
     }
 

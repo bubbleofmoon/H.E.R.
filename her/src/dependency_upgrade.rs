@@ -93,22 +93,7 @@ fn save(context: &RuntimeContext, state: &State) -> Result<(), String> {
         RuntimeArea::Data,
         FILE,
         &serde_json::to_vec(state).map_err(|_| "dependency upgrade state cannot serialize")?,
-    )?;
-    sync_parent(context, RuntimeArea::Data, FILE)
-}
-fn sync_parent(context: &RuntimeContext, area: RuntimeArea, file: &str) -> Result<(), String> {
-    // Windows atomic replacement already uses MOVEFILE_WRITE_THROUGH.
-    #[cfg(unix)]
-    {
-        let path = context
-            .resolve_path(area, file, PathIntent::ReadFile)
-            .map_err(str::to_string)?;
-        fs::File::open(path.parent().ok_or("dependency state path has no parent")?)
-            .and_then(|parent| parent.sync_all())
-            .map_err(|_| "dependency state directory could not be synced")?;
-    }
-    let _ = (context, area, file);
-    Ok(())
+    )
 }
 fn name(raw: &str) -> Result<&'static str, String> {
     match raw {
@@ -545,8 +530,7 @@ fn change_pin(
         RuntimeArea::Config,
         "config.json",
         &serde_json::to_vec_pretty(&raw).map_err(|_| "runtime config cannot serialize")?,
-    )?;
-    sync_parent(context, RuntimeArea::Config, "config.json")
+    )
 }
 fn ready_and_healthy(
     context: &RuntimeContext,

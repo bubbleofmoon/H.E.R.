@@ -546,38 +546,7 @@ fn read_marker(path: &Path) -> Option<OwnerMarker> {
 
 fn write_marker(path: &Path, marker: &OwnerMarker) -> io::Result<()> {
     let bytes = serde_json::to_vec(marker).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    write_replace(path, &bytes)
-}
-
-/// Write `bytes` to a sibling temp file, fsync it and rename it over `path`. Windows refuses the rename while a reader
-/// has the target open, so the rename is retried for up to one second.
-pub(crate) fn write_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.{seq}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match std::fs::rename(&tmp, path) {
-                Ok(()) => return Ok(()),
-                Err(error) if cfg!(windows) && Instant::now() < deadline => {
-                    let _ = error;
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    crate::guarded_file::write_atomic(path, &bytes).map_err(io::Error::from)
 }
 
 // ---- desired state ----------------------------------------------------------------------------
@@ -769,7 +738,7 @@ impl DesiredStore {
                 .map_err(|e| format!("lifecycle audit cannot be written: {}", e.kind()))
         };
         append_audit(&mut audit, "intent")?;
-        write_replace(&self.path(), &bytes).map_err(|e| format!("desired state cannot be written: {}", e.kind()))?;
+        crate::guarded_file::write_atomic(&self.path(), &bytes).map_err(|e| format!("desired state cannot be written: {}", io::Error::from(e).kind()))?;
         append_audit(&mut audit, "applied").map_err(|error| format!("desired state changed but {error}"))?;
         Ok(record)
     }
@@ -1145,6 +1114,25 @@ mod tests {
         assert_eq!(std::fs::read(dir.join(format!("{DESIRED_FILE}.corrupt-77"))).unwrap(), b"garbage");
         assert_eq!(store.read(), DesiredRead::Present(record));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_desired_state_is_refused_and_left_alone() {
+        let dir = temp_dir("desired-linked");
+        let outside = temp_dir("desired-linked-outside");
+        let elsewhere = DesiredStore::new(&outside);
+        let kept = elsewhere.write(DesiredState::Running, "cli", "elsewhere", None, 1).unwrap();
+        let before = std::fs::read(elsewhere.path()).unwrap();
+        let store = DesiredStore::new(&dir);
+        std::os::unix::fs::symlink(elsewhere.path(), store.path()).unwrap();
+        let error = store.write(DesiredState::Stopped, "cli", "linked", None, 2).unwrap_err();
+        assert!(error.contains("desired state cannot be written"), "{error}");
+        assert!(std::fs::symlink_metadata(store.path()).unwrap().file_type().is_symlink(), "the link itself stays");
+        assert_eq!(std::fs::read(elsewhere.path()).unwrap(), before, "the link target is untouched");
+        assert_eq!(elsewhere.read(), DesiredRead::Present(kept));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]

@@ -16,7 +16,7 @@
 //! `max_history_bytes`; logs of dropped runs are deleted with them.
 #![allow(dead_code)]
 
-use crate::lifecycle::{lock_with_wait, write_replace};
+use crate::lifecycle::lock_with_wait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -487,7 +487,7 @@ impl StoreRef {
             kept.extend(serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
             kept.push(b'\n');
         }
-        write_replace(&self.history(), &kept)?;
+        crate::guarded_file::write_atomic(&self.history(), &kept)?;
         for run_id in dropped {
             let _ = std::fs::remove_file(self.log_path(run_id));
         }
