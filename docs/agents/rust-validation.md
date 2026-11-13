@@ -55,6 +55,7 @@
 - `.github/workflows/checks.yml` runs on free GitHub-hosted runners for every push and pull request, on Windows and Linux: repository checks, the public scan (which runs gitleaks itself), the guard's own tests, the build and the full integration suite discovered from `her/tests/*.rs`. It is the merge check, and its result is linked from the issue.
 - Local gates stay necessary for what a hosted runner cannot do: native desktop and window checks, elevated scheduler fixtures, production-adjacent paths and the release proof runners. A hosted pass never replaces them.
 - `scripts/ci/run-tests.py` is the single suite runner in CI and locally; it passes `--features parity-clock,release-test-keys` to `release_install`, because a test target whose `required-features` are absent is silently skipped and a skip is not a pass.
+- `scripts/ci/run-script-tests.py` runs after it on the Linux runner against the built `her`: every `scripts/test-*.py` not already a cargo test target, one result line per script and scenario. It fails when a `test-*.py` is neither in its run list nor in its exempt list (the native Windows runners covered by `install_root`), so a script cannot stay unrun; a new script is added to one of the two lists.
 - Fork pull requests wait for a maintainer-approved workflow run, and this repository never gets a self-hosted runner.
 
 ## Elevated tests

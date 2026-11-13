@@ -76,6 +76,12 @@ jobs:
           cd "$PUBLIC_TREE"
           export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
           python -I scripts/ci/run-tests.py
+      - name: Script tests (scripts/test-*.py)
+        if: runner.os == 'Linux'
+        run: |
+          cd "$PUBLIC_TREE"
+          export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
+          python -I scripts/ci/run-script-tests.py
       - name: Windows launcher checks
         if: runner.os == 'Windows'
         run: |
