@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Repository checks on staged Markdown and JSON (control characters).
+py=python; command -v python >/dev/null 2>&1 || py=python3
+exec "$py" -I scripts/check-repo.py --staged

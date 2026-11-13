@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Public guard: a push is refused unless the working tree and everything the push would
+# publish are clean. Install with: git config core.hooksPath .githooks  (see CONTRIBUTING.md)
+#
+# git feeds this hook one line per ref being pushed:
+#     <local ref> <local sha> <remote ref> <remote sha>
+# Every ref is inspected, not just the checked-out one: a clean checkout says nothing about
+# another branch or tag that leaves with the same push. For each ref, the commits the remote
+# does not have yet are listed and their trees are scanned blob by blob, so a value a later
+# commit deletes is still refused, and a tracked blob under a folder the working copy ignores
+# is still scanned, because a committed blob is published. The published text is not only
+# blobs: the message of every outgoing commit, and of an annotated tag object whose ref leaves
+# with this push, is scanned in a second pass, so a clean tree with a sensitive commit or tag
+# message is refused too. Refusal prints only finding kinds and positions, never the matched
+# text. Anything this hook cannot inspect is a refusal too: an unreadable outgoing commit, a
+# message object that cannot be read or a scan that could not run fails closed.
+set -u
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo 'pre-push: not inside a git repository' >&2; exit 1; }
+py=python; command -v python >/dev/null 2>&1 || py=python3
+for guard in scripts/scan-public.py scripts/tests/test_scan_public.py; do
+  [ -f "$root/$guard" ] || { echo "pre-push: the public guard file $guard is missing" >&2; exit 1; }
+done
+
+if ! "$py" -I "$root/scripts/scan-public.py"; then
+  echo 'pre-push: the public scan refused this push (kinds and line numbers above)' >&2
+  exit 1
+fi
+if ! "$py" -I "$root/scripts/tests/test_scan_public.py" >/dev/null; then
+  echo 'pre-push: the public guard tests did not pass' >&2
+  exit 1
+fi
+
+refs=$(cat)
+revs=$(mktemp) || { echo 'pre-push: no temporary file for the outgoing revisions' >&2; exit 1; }
+objects=$(mktemp) || { echo 'pre-push: no temporary file for the outgoing objects' >&2; exit 1; }
+trap 'rm -f "$revs" "$objects"' EXIT
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_ref// /}" ] || continue          # nothing being pushed on this line
+  if [ -z "${local_sha:-}" ]; then
+    echo "pre-push: no local sha for $local_ref" >&2
+    exit 1
+  fi
+  case "$local_sha" in
+    *[!0]*) ;;                     # a real sha: this ref is created or moved
+    *) continue ;;                 # all zeros: the ref is deleted, nothing is published
+  esac
+  if ! git -C "$root" cat-file -e "${local_sha}^{commit}" 2>/dev/null; then
+    echo "pre-push: the outgoing commit of $local_ref cannot be inspected" >&2
+    exit 1
+  fi
+  if [ -n "${remote_sha:-}" ] && git -C "$root" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+    if ! listed=$(git -C "$root" rev-list "$local_sha" --not "$remote_sha" 2>/dev/null); then
+      echo "pre-push: the new commits of $local_ref cannot be listed" >&2
+      exit 1
+    fi
+  elif ! listed=$(git -C "$root" rev-list "$local_sha" 2>/dev/null); then
+    echo "pre-push: the commits of $local_ref cannot be listed" >&2
+    exit 1
+  fi
+  # A tag whose target is another tag would publish the inner tag's message unscanned: refuse it.
+  if [ "$(git -C "$root" cat-file -t "$local_sha" 2>/dev/null)" = tag ] \
+     && [ "$(git -C "$root" cat-file -p "$local_sha" 2>/dev/null | awk '/^type /{print $2; exit}')" != commit ]; then
+    echo "pre-push: $local_ref is a tag of a tag; push only tags of commits" >&2
+    exit 1
+  fi
+  printf '%s\n' "$listed" >>"$revs"
+  # The ref's own object joins the message pass: for a tag ref that is the annotated tag
+  # object, whose message rev-list never reports.
+  printf '%s\n' "$local_sha" >>"$objects"
+  printf '%s\n' "$listed" >>"$objects"
+done <<EOF
+$refs
+EOF
+
+if ! sort -u "$revs" | "$py" -I "$root/scripts/scan-public.py" --revs-from-stdin; then
+  echo 'pre-push: the public scan refused the history this push publishes' >&2
+  exit 1
+fi
+if ! sort -u "$objects" | "$py" -I "$root/scripts/scan-public.py" --objects-from-stdin; then
+  echo 'pre-push: the public scan refused the commit and tag messages this push publishes' >&2
+  exit 1
+fi

@@ -1,0 +1,944 @@
+{
+ "privateIp": [
+  [
+   "0.0.0.0",
+   true
+  ],
+  [
+   "0.1.2.3",
+   true
+  ],
+  [
+   "10.0.0.1",
+   true
+  ],
+  [
+   "100.63.255.255",
+   false
+  ],
+  [
+   "100.64.0.1",
+   true
+  ],
+  [
+   "100.127.255.255",
+   true
+  ],
+  [
+   "100.128.0.1",
+   false
+  ],
+  [
+   "126.255.255.255",
+   false
+  ],
+  [
+   "127.0.0.1",
+   true
+  ],
+  [
+   "127.255.255.255",
+   true
+  ],
+  [
+   "169.253.1.1",
+   false
+  ],
+  [
+   "169.254.1.1",
+   true
+  ],
+  [
+   "172.15.0.1",
+   false
+  ],
+  [
+   "172.16.0.1",
+   true
+  ],
+  [
+   "172.31.255.255",
+   true
+  ],
+  [
+   "172.32.0.1",
+   false
+  ],
+  [
+   "192.0.0.1",
+   true
+  ],
+  [
+   "192.0.1.1",
+   false
+  ],
+  [
+   "192.0.2.1",
+   false
+  ],
+  [
+   "192.167.1.1",
+   false
+  ],
+  [
+   "192.168.0.1",
+   true
+  ],
+  [
+   "198.17.1.1",
+   false
+  ],
+  [
+   "198.18.0.1",
+   true
+  ],
+  [
+   "198.19.255.255",
+   true
+  ],
+  [
+   "198.20.0.1",
+   false
+  ],
+  [
+   "203.0.113.10",
+   false
+  ],
+  [
+   "223.255.255.255",
+   false
+  ],
+  [
+   "224.0.0.1",
+   true
+  ],
+  [
+   "239.255.255.255",
+   true
+  ],
+  [
+   "240.0.0.1",
+   true
+  ],
+  [
+   "255.255.255.255",
+   true
+  ],
+  [
+   "8.8.8.8",
+   false
+  ],
+  [
+   "1.1.1.1",
+   false
+  ],
+  [
+   "93.184.216.34",
+   false
+  ],
+  [
+   "01.2.3.4",
+   true
+  ],
+  [
+   "1.2.3",
+   true
+  ],
+  [
+   "256.1.1.1",
+   true
+  ],
+  [
+   "1.2.3.4.5",
+   true
+  ],
+  [
+   "",
+   true
+  ],
+  [
+   "abc",
+   true
+  ],
+  [
+   "localhost",
+   true
+  ],
+  [
+   "1.2.3.4%eth0",
+   true
+  ],
+  [
+   "::",
+   true
+  ],
+  [
+   "::1",
+   true
+  ],
+  [
+   "::2",
+   false
+  ],
+  [
+   "fc00::1",
+   true
+  ],
+  [
+   "fd12::1",
+   true
+  ],
+  [
+   "fe80::1",
+   true
+  ],
+  [
+   "febf::1",
+   true
+  ],
+  [
+   "fec0::1",
+   true
+  ],
+  [
+   "feff::1",
+   true
+  ],
+  [
+   "fe7f::1",
+   false
+  ],
+  [
+   "ff02::1",
+   true
+  ],
+  [
+   "2001:db8::1",
+   true
+  ],
+  [
+   "2001:db9::1",
+   false
+  ],
+  [
+   "2001:2::1",
+   true
+  ],
+  [
+   "2001:10::1",
+   true
+  ],
+  [
+   "2001:20::1",
+   true
+  ],
+  [
+   "2001:200::1",
+   false
+  ],
+  [
+   "2002:7f00:1::1",
+   true
+  ],
+  [
+   "2002:0808:0808::1",
+   false
+  ],
+  [
+   "2002:c0a8:101::",
+   true
+  ],
+  [
+   "64:ff9b::7f00:1",
+   true
+  ],
+  [
+   "64:ff9b::808:808",
+   false
+  ],
+  [
+   "64:ff9b::c0a8:101",
+   true
+  ],
+  [
+   "64:ff9b:1::1",
+   true
+  ],
+  [
+   "64:ff9b:1:2::3",
+   true
+  ],
+  [
+   "::ffff:127.0.0.1",
+   true
+  ],
+  [
+   "::ffff:7f00:1",
+   true
+  ],
+  [
+   "::ffff:8.8.8.8",
+   false
+  ],
+  [
+   "::ffff:808:808",
+   false
+  ],
+  [
+   "::ffff:0:7f00:1",
+   true
+  ],
+  [
+   "::127.0.0.1",
+   true
+  ],
+  [
+   "::8.8.8.8",
+   false
+  ],
+  [
+   "::808:808",
+   false
+  ],
+  [
+   "::c0a8:101",
+   true
+  ],
+  [
+   "::1:2",
+   true
+  ],
+  [
+   "::2:3:4:5",
+   true
+  ],
+  [
+   "::1:0:0:0:5",
+   true
+  ],
+  [
+   "2606:4700:4700::1111",
+   false
+  ],
+  [
+   "2001:4860:4860::8888",
+   false
+  ],
+  [
+   "2a00:1450:4001::",
+   false
+  ],
+  [
+   "[::1]",
+   true
+  ],
+  [
+   "[2606:4700::1]",
+   false
+  ],
+  [
+   "FE80::1",
+   true
+  ],
+  [
+   "2001:0db8:0:0:0:0:0:1",
+   true
+  ],
+  [
+   "::ffff:0:0",
+   true
+  ],
+  [
+   "1:2:3:4:5:6:7:8",
+   false
+  ],
+  [
+   "fe80::1%eth0",
+   true
+  ],
+  [
+   "0:0:0:0:0:ffff:7f00:1",
+   true
+  ],
+  [
+   "64:ff9b::",
+   false
+  ],
+  [
+   "2002::",
+   false
+  ],
+  [
+   "2002:0:0::1",
+   false
+  ],
+  [
+   "100::",
+   false
+  ],
+  [
+   "2000::",
+   false
+  ],
+  [
+   "3fff::1",
+   false
+  ],
+  [
+   "[::ffff:10.0.0.1]",
+   true
+  ],
+  [
+   "8.8.8.8 ",
+   true
+  ]
+ ],
+ "bingRss": [
+  {
+   "max": 8,
+   "xml": "<rss><channel><item><title>A &amp; B</title><link>https://example.com/a?x=1&amp;y=2</link><description><![CDATA[<b>bold</b> text &quot;q&quot;]]></description></item><item><title></title><link>https://example.com/b</link><description></description></item><item><title>dup</title><link>https://example.com/a?x=1&amp;y=2</link></item><item><title>bad</title><link>javascript:alert(1)</link></item><item><title>cred</title><link>https://user:pw@example.com/</link></item><item><title>nolink</title></item><item><title>&#x4e2d;&#25991;&#0;&#x110000;</title><link>HTTP://Example.COM/Path/../x#7</link><description>a&amp;lt;b &nbsp; c</description></item></channel></rss>",
+   "out": [
+    {
+     "title": "A & B",
+     "url": "https://example.com/a?x=1&y=2",
+     "snippet": "bold text \"q\""
+    },
+    {
+     "title": "https://example.com/b",
+     "url": "https://example.com/b"
+    },
+    {
+     "title": "中文",
+     "url": "http://example.com/x",
+     "snippet": "a&lt;b c"
+    }
+   ]
+  },
+  {
+   "max": 2,
+   "xml": "<item><title>t1</title><link>https://example.com/1</link></item><item><title>t2</title><link>https://example.com/2</link></item><item><title>t3</title><link>https://example.com/3</link></item><item><title>t4</title><link>https://example.com/4</link></item>",
+   "out": [
+    {
+     "title": "t1",
+     "url": "https://example.com/1"
+    },
+    {
+     "title": "t2",
+     "url": "https://example.com/2"
+    }
+   ]
+  },
+  {
+   "max": 8,
+   "xml": "",
+   "out": []
+  },
+  {
+   "max": 8,
+   "xml": "<ITEM>x</ITEM><item><LINK>https://example.com/up</LINK><TITLE>Up</TITLE></item>",
+   "out": [
+    {
+     "title": "Up",
+     "url": "https://example.com/up"
+    }
+   ]
+  },
+  {
+   "max": 8,
+   "xml": "<item><title>xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</title><link>https://e.com/long</link><description>dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd</description></item>",
+   "out": [
+    {
+     "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+     "url": "https://e.com/long",
+     "snippet": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    }
+   ]
+  }
+ ],
+ "bingHtml": [
+  {
+   "max": 8,
+   "html": "<ol><li class=\"b_algo\"><h2><a href=\"https://example.com/a?x=1&amp;y=2\">Title &lt;A&gt;</a></h2><div class=\"b_caption\"><p>Snippet <strong>one</strong></p></div></li><li class=\"b_algo\"><a href=\"https://example.com/b\">x</a></li><li class=\"b_algo\"><h2>no link</h2></li><li class=\"b_algo\"><h2><a href=\"https://example.com/a?x=1&amp;y=2\">dup</a></h2></li></ol>",
+   "out": [
+    {
+     "title": "Title",
+     "url": "https://example.com/a?x=1&y=2",
+     "snippet": "Snippet one"
+    },
+    {
+     "title": "https://example.com/b",
+     "url": "https://example.com/b"
+    }
+   ]
+  },
+  {
+   "max": 1,
+   "html": "<li class=\"b_algo\"><a href=\"http://a.example/\">A</a><p>p1</p></li><li class=\"b_algo\"><a href=\"http://b.example/\">B</a></li>",
+   "out": [
+    {
+     "title": "http://a.example/",
+     "url": "http://a.example/",
+     "snippet": "p1"
+    }
+   ]
+  },
+  {
+   "max": 8,
+   "html": "no results here",
+   "out": []
+  }
+ ],
+ "deepseek": [
+  {
+   "max": 8,
+   "response": {
+    "content": [
+     {
+      "type": "text",
+      "text": "x",
+      "citations": [
+       {
+        "url": "https://example.com/a#1",
+        "cited_text": "  cited A  "
+       },
+       {
+        "url": "https://example.com/a#1",
+        "cited_text": "second"
+       },
+       {
+        "url": "ftp://x/",
+        "cited_text": "bad"
+       },
+       {
+        "url": "https://example.com/c",
+        "cited_text": 5
+       }
+      ]
+     },
+     {
+      "type": "web_search_tool_result",
+      "content": [
+       {
+        "type": "web_search_result",
+        "url": "https://example.com/a#1",
+        "title": " Title A ",
+        "page_age": "2026-01-02T03:04:05Z and more than forty characters long!!!!"
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://example.com/a",
+        "title": "dup after anchor strip"
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://example.com/b#section",
+        "title": "B",
+        "page_age": 0
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://example.com/c",
+        "title": "C",
+        "page_age": 123
+       },
+       {
+        "type": "web_search_result",
+        "url": "javascript:1",
+        "title": "bad"
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://u:p@example.com/",
+        "title": "cred"
+       },
+       {
+        "type": "other",
+        "url": "https://example.com/z"
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://example.com/long",
+        "title": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"
+       }
+      ]
+     }
+    ]
+   },
+   "out": [
+    {
+     "title": "Title A",
+     "url": "https://example.com/a",
+     "snippet": "cited A",
+     "publishedAt": "2026-01-02T03:04:05Z and more than forty"
+    },
+    {
+     "title": "B",
+     "url": "https://example.com/b#section"
+    },
+    {
+     "title": "C",
+     "url": "https://example.com/c",
+     "snippet": "5",
+     "publishedAt": "123"
+    },
+    {
+     "title": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT",
+     "url": "https://example.com/long"
+    }
+   ]
+  },
+  {
+   "max": 2,
+   "response": {
+    "content": [
+     {
+      "type": "web_search_tool_result",
+      "content": [
+       {
+        "type": "web_search_result",
+        "url": "https://a.example/",
+        "title": "A"
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://b.example/",
+        "title": "B"
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://c.example/",
+        "title": "C"
+       }
+      ]
+     }
+    ]
+   },
+   "out": [
+    {
+     "title": "A",
+     "url": "https://a.example/"
+    },
+    {
+     "title": "B",
+     "url": "https://b.example/"
+    }
+   ]
+  },
+  {
+   "max": 8,
+   "response": {
+    "content": [
+     {
+      "type": "text",
+      "text": "no block"
+     }
+    ]
+   },
+   "error": "DeepSeek 没有返回 web_search_tool_result（可能未触发联网搜索）",
+   "code": "NO_RESULT_BLOCK"
+  },
+  {
+   "max": 8,
+   "response": {},
+   "error": "DeepSeek 没有返回 web_search_tool_result（可能未触发联网搜索）",
+   "code": "NO_RESULT_BLOCK"
+  },
+  {
+   "max": 8,
+   "response": {
+    "content": [
+     {
+      "type": "web_search_tool_result",
+      "content": []
+     }
+    ]
+   },
+   "out": []
+  },
+  {
+   "max": 8,
+   "response": {
+    "content": [
+     {
+      "type": "web_search_tool_result",
+      "content": [
+       {
+        "type": "web_search_result",
+        "url": "https://a.example/",
+        "title": null
+       },
+       {
+        "type": "web_search_result",
+        "url": "https://b.example/",
+        "title": 42
+       }
+      ]
+     }
+    ]
+   },
+   "out": [
+    {
+     "title": "",
+     "url": "https://a.example/"
+    },
+    {
+     "title": "42",
+     "url": "https://b.example/"
+    }
+   ]
+  }
+ ],
+ "config": [
+  {
+   "text": "{}",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "not json",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "﻿{\"webSearch\":{\"provider\":\"bing\"}}",
+   "out": {
+    "provider": "bing",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "{\"webSearch\":[]}",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "{\"webSearch\":null}",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "[]",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 5,
+    "maxTokens": 4096,
+    "maxResults": 8,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "{\"webSearch\":{\"provider\":\"deepseek\",\"apiKey\":\"  sk-x  \",\"apiKeyEnv\":\" MY_KEY \",\"baseURL\":\" https://h.example/v1// \",\"model\":\" m \",\"maxUses\":\"3\",\"maxTokens\":100,\"maxResults\":0,\"timeoutMs\":999999}}",
+   "out": {
+    "provider": "deepseek",
+    "apiKey": "sk-x",
+    "apiKeyEnv": "MY_KEY",
+    "baseURL": "https://h.example/v1",
+    "model": "m",
+    "maxUses": 3,
+    "maxTokens": 256,
+    "maxResults": 1,
+    "timeoutMs": 120000
+   }
+  },
+  {
+   "text": "{\"webSearch\":{\"provider\":\"Bing\",\"apiKey\":5,\"apiKeyEnv\":\"\",\"baseURL\":7,\"model\":\"\",\"maxUses\":null,\"maxTokens\":\"abc\",\"maxResults\":2.5,\"timeoutMs\":\"5000\"}}",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 1,
+    "maxTokens": 4096,
+    "maxResults": 3,
+    "timeoutMs": 5000
+   }
+  },
+  {
+   "text": "{\"webSearch\":{\"maxUses\":true,\"maxTokens\":[],\"maxResults\":[7],\"timeoutMs\":{}}}",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 1,
+    "maxTokens": 256,
+    "maxResults": 7,
+    "timeoutMs": 35000
+   }
+  },
+  {
+   "text": "{\"webSearch\":{\"maxUses\":\"0x3\",\"maxResults\":\"1e1\",\"timeoutMs\":\" 6000 \"}}",
+   "out": {
+    "provider": "auto",
+    "apiKey": "",
+    "apiKeyEnv": "DEEPSEEK_API_KEY",
+    "baseURL": "",
+    "model": "deepseek-v4-flash",
+    "maxUses": 3,
+    "maxTokens": 4096,
+    "maxResults": 10,
+    "timeoutMs": 6000
+   }
+  }
+ ],
+ "credentials": [
+  {
+   "name": "DEEPSEEK_API_KEY",
+   "yaml": "refs:\n  DEEPSEEK_API_KEY: sk-abc\n  OTHER: zzz\n",
+   "out": "sk-abc"
+  },
+  {
+   "name": "DEEPSEEK_API_KEY",
+   "yaml": "other:\n  DEEPSEEK_API_KEY: nope\nrefs:\n  OTHER: zzz\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: \"quoted \\\"v\\\" #x\"\n",
+   "out": "quoted \"v\" #x"
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: 'it''s'\n",
+   "out": "it's"
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: 12345\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: true\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: null\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K:\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: sk-1 # comment\n",
+   "out": "sk-1"
+  },
+  {
+   "name": "K",
+   "yaml": "# c\nrefs:   # c\n  # c\n  K:   plain value  \n",
+   "out": "plain value"
+  },
+  {
+   "name": "K",
+   "yaml": "﻿refs:\n  K: bom\n",
+   "out": "bom"
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: a: b\n",
+   "out": ""
+  },
+  {
+   "name": "",
+   "yaml": "refs:\n  K: v\n",
+   "out": ""
+  },
+  {
+   "name": " K ",
+   "yaml": "refs:\n  K: v\n",
+   "out": "v"
+  },
+  {
+   "name": "K",
+   "yaml": "refs: {K: flow}\n",
+   "out": "flow"
+  },
+  {
+   "name": "K",
+   "yaml": "not: [valid",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: 0x1F\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: 1e3\n",
+   "out": ""
+  },
+  {
+   "name": "K",
+   "yaml": "refs:\n  K: sk-1e3\n",
+   "out": "sk-1e3"
+  }
+ ]
+}

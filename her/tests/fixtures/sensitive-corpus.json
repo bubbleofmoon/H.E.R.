@@ -1,0 +1,9361 @@
+{
+ "source": "qq-bridge/src/sensitive.js SENSITIVE_RE",
+ "cases": [
+  {
+   "text": "token=abc",
+   "sensitive": true
+  },
+  {
+   "text": "token=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token=ab",
+   "sensitive": false
+  },
+  {
+   "text": "token=a",
+   "sensitive": false
+  },
+  {
+   "text": "token=",
+   "sensitive": false
+  },
+  {
+   "text": "token=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token:abc",
+   "sensitive": true
+  },
+  {
+   "text": "token:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token:ab",
+   "sensitive": false
+  },
+  {
+   "text": "token:a",
+   "sensitive": false
+  },
+  {
+   "text": "token:",
+   "sensitive": false
+  },
+  {
+   "text": "token:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token：abc",
+   "sensitive": true
+  },
+  {
+   "text": "token：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token：ab",
+   "sensitive": false
+  },
+  {
+   "text": "token：a",
+   "sensitive": false
+  },
+  {
+   "text": "token：",
+   "sensitive": false
+  },
+  {
+   "text": "token：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token = abc",
+   "sensitive": true
+  },
+  {
+   "text": "token = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token = ab",
+   "sensitive": false
+  },
+  {
+   "text": "token = a",
+   "sensitive": false
+  },
+  {
+   "text": "token = ",
+   "sensitive": false
+  },
+  {
+   "text": "token = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token : abc",
+   "sensitive": true
+  },
+  {
+   "text": "token : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token : ab",
+   "sensitive": false
+  },
+  {
+   "text": "token : a",
+   "sensitive": false
+  },
+  {
+   "text": "token : ",
+   "sensitive": false
+  },
+  {
+   "text": "token : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token是abc",
+   "sensitive": true
+  },
+  {
+   "text": "token是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token是ab",
+   "sensitive": false
+  },
+  {
+   "text": "token是a",
+   "sensitive": false
+  },
+  {
+   "text": "token是",
+   "sensitive": false
+  },
+  {
+   "text": "token是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token为abc",
+   "sensitive": true
+  },
+  {
+   "text": "token为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token为ab",
+   "sensitive": false
+  },
+  {
+   "text": "token为a",
+   "sensitive": false
+  },
+  {
+   "text": "token为",
+   "sensitive": false
+  },
+  {
+   "text": "token为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token abc",
+   "sensitive": true
+  },
+  {
+   "text": "token abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token ab",
+   "sensitive": false
+  },
+  {
+   "text": "token a",
+   "sensitive": false
+  },
+  {
+   "text": "token ",
+   "sensitive": false
+  },
+  {
+   "text": "token sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "token  abc",
+   "sensitive": true
+  },
+  {
+   "text": "token  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token  ab",
+   "sensitive": false
+  },
+  {
+   "text": "token  a",
+   "sensitive": false
+  },
+  {
+   "text": "token  ",
+   "sensitive": false
+  },
+  {
+   "text": "token  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"token\"",
+   "sensitive": false
+  },
+  {
+   "text": "'token'",
+   "sensitive": false
+  },
+  {
+   "text": "\"token\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "token",
+   "sensitive": false
+  },
+  {
+   "text": "我的token",
+   "sensitive": false
+  },
+  {
+   "text": "notokenhere",
+   "sensitive": false
+  },
+  {
+   "text": "tokens are things",
+   "sensitive": false
+  },
+  {
+   "text": "xtoken=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "Token=abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token=ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token=a",
+   "sensitive": false
+  },
+  {
+   "text": "Token=",
+   "sensitive": false
+  },
+  {
+   "text": "Token=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token:abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token:ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token:a",
+   "sensitive": false
+  },
+  {
+   "text": "Token:",
+   "sensitive": false
+  },
+  {
+   "text": "Token:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token：abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token：ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token：a",
+   "sensitive": false
+  },
+  {
+   "text": "Token：",
+   "sensitive": false
+  },
+  {
+   "text": "Token：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token = abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token = ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token = a",
+   "sensitive": false
+  },
+  {
+   "text": "Token = ",
+   "sensitive": false
+  },
+  {
+   "text": "Token = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token : abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token : ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token : a",
+   "sensitive": false
+  },
+  {
+   "text": "Token : ",
+   "sensitive": false
+  },
+  {
+   "text": "Token : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token是abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token是ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token是a",
+   "sensitive": false
+  },
+  {
+   "text": "Token是",
+   "sensitive": false
+  },
+  {
+   "text": "Token是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token为abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token为ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token为a",
+   "sensitive": false
+  },
+  {
+   "text": "Token为",
+   "sensitive": false
+  },
+  {
+   "text": "Token为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "Token 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "Token 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "Token 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "Token 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Token abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token a",
+   "sensitive": false
+  },
+  {
+   "text": "Token ",
+   "sensitive": false
+  },
+  {
+   "text": "Token sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "Token  abc",
+   "sensitive": true
+  },
+  {
+   "text": "Token  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Token  ab",
+   "sensitive": false
+  },
+  {
+   "text": "Token  a",
+   "sensitive": false
+  },
+  {
+   "text": "Token  ",
+   "sensitive": false
+  },
+  {
+   "text": "Token  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Token  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Token  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"Token\"",
+   "sensitive": false
+  },
+  {
+   "text": "'Token'",
+   "sensitive": false
+  },
+  {
+   "text": "\"Token\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "Token",
+   "sensitive": false
+  },
+  {
+   "text": "我的Token",
+   "sensitive": false
+  },
+  {
+   "text": "noTokenhere",
+   "sensitive": false
+  },
+  {
+   "text": "Tokens are things",
+   "sensitive": false
+  },
+  {
+   "text": "xToken=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN=abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN=ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN=a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN=",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN:abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN:ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN:a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN:",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN：abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN：ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN：a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN：",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN = abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN = ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN = a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN = ",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN : abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN : ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN : a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN : ",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN是abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN是ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN是a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN是",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN为abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN为ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN为a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN为",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN ",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN  abc",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN  ab",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN  a",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN  ",
+   "sensitive": false
+  },
+  {
+   "text": "TOKEN  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"TOKEN\"",
+   "sensitive": false
+  },
+  {
+   "text": "'TOKEN'",
+   "sensitive": false
+  },
+  {
+   "text": "\"TOKEN\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "TOKEN",
+   "sensitive": false
+  },
+  {
+   "text": "我的TOKEN",
+   "sensitive": false
+  },
+  {
+   "text": "noTOKENhere",
+   "sensitive": false
+  },
+  {
+   "text": "TOKENs are things",
+   "sensitive": false
+  },
+  {
+   "text": "xTOKEN=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "密码=abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码=ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码=a",
+   "sensitive": false
+  },
+  {
+   "text": "密码=",
+   "sensitive": false
+  },
+  {
+   "text": "密码=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码:abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码:ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码:a",
+   "sensitive": false
+  },
+  {
+   "text": "密码:",
+   "sensitive": false
+  },
+  {
+   "text": "密码:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码：abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码：ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码：a",
+   "sensitive": false
+  },
+  {
+   "text": "密码：",
+   "sensitive": false
+  },
+  {
+   "text": "密码：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码 = abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码 = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码 = ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码 = a",
+   "sensitive": false
+  },
+  {
+   "text": "密码 = ",
+   "sensitive": false
+  },
+  {
+   "text": "密码 = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码 = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码 = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码 : abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码 : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码 : ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码 : a",
+   "sensitive": false
+  },
+  {
+   "text": "密码 : ",
+   "sensitive": false
+  },
+  {
+   "text": "密码 : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码 : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码 : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码是abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码是ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码是a",
+   "sensitive": false
+  },
+  {
+   "text": "密码是",
+   "sensitive": false
+  },
+  {
+   "text": "密码是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码为abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码为ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码为a",
+   "sensitive": false
+  },
+  {
+   "text": "密码为",
+   "sensitive": false
+  },
+  {
+   "text": "密码为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "密码 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "密码 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "密码 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "密码 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密码 abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码 ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码 a",
+   "sensitive": false
+  },
+  {
+   "text": "密码 ",
+   "sensitive": false
+  },
+  {
+   "text": "密码 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "密码  abc",
+   "sensitive": true
+  },
+  {
+   "text": "密码  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密码  ab",
+   "sensitive": false
+  },
+  {
+   "text": "密码  a",
+   "sensitive": false
+  },
+  {
+   "text": "密码  ",
+   "sensitive": false
+  },
+  {
+   "text": "密码  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密码  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密码  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"密码\"",
+   "sensitive": false
+  },
+  {
+   "text": "'密码'",
+   "sensitive": false
+  },
+  {
+   "text": "\"密码\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "密码",
+   "sensitive": false
+  },
+  {
+   "text": "我的密码",
+   "sensitive": false
+  },
+  {
+   "text": "no密码here",
+   "sensitive": false
+  },
+  {
+   "text": "密码s are things",
+   "sensitive": false
+  },
+  {
+   "text": "x密码=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "密钥=abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥=ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥=a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥=",
+   "sensitive": false
+  },
+  {
+   "text": "密钥=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥:abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥:ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥:a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥:",
+   "sensitive": false
+  },
+  {
+   "text": "密钥:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥：abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥：ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥：a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥：",
+   "sensitive": false
+  },
+  {
+   "text": "密钥：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 = abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 = ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 = a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 = ",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 : abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 : ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 : a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 : ",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥是abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥是ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥是a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥是",
+   "sensitive": false
+  },
+  {
+   "text": "密钥是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥为abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥为ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥为a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥为",
+   "sensitive": false
+  },
+  {
+   "text": "密钥为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 ",
+   "sensitive": false
+  },
+  {
+   "text": "密钥 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "密钥  abc",
+   "sensitive": true
+  },
+  {
+   "text": "密钥  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "密钥  ab",
+   "sensitive": false
+  },
+  {
+   "text": "密钥  a",
+   "sensitive": false
+  },
+  {
+   "text": "密钥  ",
+   "sensitive": false
+  },
+  {
+   "text": "密钥  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "密钥  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "密钥  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"密钥\"",
+   "sensitive": false
+  },
+  {
+   "text": "'密钥'",
+   "sensitive": false
+  },
+  {
+   "text": "\"密钥\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "密钥",
+   "sensitive": false
+  },
+  {
+   "text": "我的密钥",
+   "sensitive": false
+  },
+  {
+   "text": "no密钥here",
+   "sensitive": false
+  },
+  {
+   "text": "密钥s are things",
+   "sensitive": false
+  },
+  {
+   "text": "x密钥=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "口令=abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令=ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令=a",
+   "sensitive": false
+  },
+  {
+   "text": "口令=",
+   "sensitive": false
+  },
+  {
+   "text": "口令=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令:abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令:ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令:a",
+   "sensitive": false
+  },
+  {
+   "text": "口令:",
+   "sensitive": false
+  },
+  {
+   "text": "口令:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令：abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令：ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令：a",
+   "sensitive": false
+  },
+  {
+   "text": "口令：",
+   "sensitive": false
+  },
+  {
+   "text": "口令：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令 = abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令 = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令 = ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令 = a",
+   "sensitive": false
+  },
+  {
+   "text": "口令 = ",
+   "sensitive": false
+  },
+  {
+   "text": "口令 = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令 = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令 = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令 : abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令 : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令 : ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令 : a",
+   "sensitive": false
+  },
+  {
+   "text": "口令 : ",
+   "sensitive": false
+  },
+  {
+   "text": "口令 : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令 : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令 : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令是abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令是ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令是a",
+   "sensitive": false
+  },
+  {
+   "text": "口令是",
+   "sensitive": false
+  },
+  {
+   "text": "口令是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令为abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令为ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令为a",
+   "sensitive": false
+  },
+  {
+   "text": "口令为",
+   "sensitive": false
+  },
+  {
+   "text": "口令为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "口令 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "口令 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "口令 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "口令 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "口令 abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令 ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令 a",
+   "sensitive": false
+  },
+  {
+   "text": "口令 ",
+   "sensitive": false
+  },
+  {
+   "text": "口令 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "口令  abc",
+   "sensitive": true
+  },
+  {
+   "text": "口令  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "口令  ab",
+   "sensitive": false
+  },
+  {
+   "text": "口令  a",
+   "sensitive": false
+  },
+  {
+   "text": "口令  ",
+   "sensitive": false
+  },
+  {
+   "text": "口令  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "口令  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "口令  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"口令\"",
+   "sensitive": false
+  },
+  {
+   "text": "'口令'",
+   "sensitive": false
+  },
+  {
+   "text": "\"口令\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "口令",
+   "sensitive": false
+  },
+  {
+   "text": "我的口令",
+   "sensitive": false
+  },
+  {
+   "text": "no口令here",
+   "sensitive": false
+  },
+  {
+   "text": "口令s are things",
+   "sensitive": false
+  },
+  {
+   "text": "x口令=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "password=abc",
+   "sensitive": true
+  },
+  {
+   "text": "password=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password=ab",
+   "sensitive": false
+  },
+  {
+   "text": "password=a",
+   "sensitive": false
+  },
+  {
+   "text": "password=",
+   "sensitive": false
+  },
+  {
+   "text": "password=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password:abc",
+   "sensitive": true
+  },
+  {
+   "text": "password:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password:ab",
+   "sensitive": false
+  },
+  {
+   "text": "password:a",
+   "sensitive": false
+  },
+  {
+   "text": "password:",
+   "sensitive": false
+  },
+  {
+   "text": "password:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password：abc",
+   "sensitive": true
+  },
+  {
+   "text": "password：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password：ab",
+   "sensitive": false
+  },
+  {
+   "text": "password：a",
+   "sensitive": false
+  },
+  {
+   "text": "password：",
+   "sensitive": false
+  },
+  {
+   "text": "password：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password = abc",
+   "sensitive": true
+  },
+  {
+   "text": "password = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password = ab",
+   "sensitive": false
+  },
+  {
+   "text": "password = a",
+   "sensitive": false
+  },
+  {
+   "text": "password = ",
+   "sensitive": false
+  },
+  {
+   "text": "password = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password : abc",
+   "sensitive": true
+  },
+  {
+   "text": "password : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password : ab",
+   "sensitive": false
+  },
+  {
+   "text": "password : a",
+   "sensitive": false
+  },
+  {
+   "text": "password : ",
+   "sensitive": false
+  },
+  {
+   "text": "password : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password是abc",
+   "sensitive": true
+  },
+  {
+   "text": "password是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password是ab",
+   "sensitive": false
+  },
+  {
+   "text": "password是a",
+   "sensitive": false
+  },
+  {
+   "text": "password是",
+   "sensitive": false
+  },
+  {
+   "text": "password是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password为abc",
+   "sensitive": true
+  },
+  {
+   "text": "password为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password为ab",
+   "sensitive": false
+  },
+  {
+   "text": "password为a",
+   "sensitive": false
+  },
+  {
+   "text": "password为",
+   "sensitive": false
+  },
+  {
+   "text": "password为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "password 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "password 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "password 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "password 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "password 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "password 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "password 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "password 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "password abc",
+   "sensitive": true
+  },
+  {
+   "text": "password abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password ab",
+   "sensitive": false
+  },
+  {
+   "text": "password a",
+   "sensitive": false
+  },
+  {
+   "text": "password ",
+   "sensitive": false
+  },
+  {
+   "text": "password sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "password  abc",
+   "sensitive": true
+  },
+  {
+   "text": "password  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "password  ab",
+   "sensitive": false
+  },
+  {
+   "text": "password  a",
+   "sensitive": false
+  },
+  {
+   "text": "password  ",
+   "sensitive": false
+  },
+  {
+   "text": "password  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "password  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "password  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"password\"",
+   "sensitive": false
+  },
+  {
+   "text": "'password'",
+   "sensitive": false
+  },
+  {
+   "text": "\"password\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "password",
+   "sensitive": false
+  },
+  {
+   "text": "我的password",
+   "sensitive": false
+  },
+  {
+   "text": "nopasswordhere",
+   "sensitive": false
+  },
+  {
+   "text": "passwords are things",
+   "sensitive": false
+  },
+  {
+   "text": "xpassword=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "passwd=abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd=ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd=a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd=",
+   "sensitive": false
+  },
+  {
+   "text": "passwd=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd:abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd:ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd:a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd:",
+   "sensitive": false
+  },
+  {
+   "text": "passwd:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd：abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd：ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd：a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd：",
+   "sensitive": false
+  },
+  {
+   "text": "passwd：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd = abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd = ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd = a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd = ",
+   "sensitive": false
+  },
+  {
+   "text": "passwd = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd : abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd : ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd : a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd : ",
+   "sensitive": false
+  },
+  {
+   "text": "passwd : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd是abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd是ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd是a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd是",
+   "sensitive": false
+  },
+  {
+   "text": "passwd是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd为abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd为ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd为a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd为",
+   "sensitive": false
+  },
+  {
+   "text": "passwd为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "passwd 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "passwd 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "passwd abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd ",
+   "sensitive": false
+  },
+  {
+   "text": "passwd sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "passwd  abc",
+   "sensitive": true
+  },
+  {
+   "text": "passwd  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "passwd  ab",
+   "sensitive": false
+  },
+  {
+   "text": "passwd  a",
+   "sensitive": false
+  },
+  {
+   "text": "passwd  ",
+   "sensitive": false
+  },
+  {
+   "text": "passwd  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "passwd  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "passwd  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"passwd\"",
+   "sensitive": false
+  },
+  {
+   "text": "'passwd'",
+   "sensitive": false
+  },
+  {
+   "text": "\"passwd\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "passwd",
+   "sensitive": false
+  },
+  {
+   "text": "我的passwd",
+   "sensitive": false
+  },
+  {
+   "text": "nopasswdhere",
+   "sensitive": false
+  },
+  {
+   "text": "passwds are things",
+   "sensitive": false
+  },
+  {
+   "text": "xpasswd=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "secret=abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret=ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret=a",
+   "sensitive": false
+  },
+  {
+   "text": "secret=",
+   "sensitive": false
+  },
+  {
+   "text": "secret=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret:abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret:ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret:a",
+   "sensitive": false
+  },
+  {
+   "text": "secret:",
+   "sensitive": false
+  },
+  {
+   "text": "secret:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret：abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret：ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret：a",
+   "sensitive": false
+  },
+  {
+   "text": "secret：",
+   "sensitive": false
+  },
+  {
+   "text": "secret：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret = abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret = ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret = a",
+   "sensitive": false
+  },
+  {
+   "text": "secret = ",
+   "sensitive": false
+  },
+  {
+   "text": "secret = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret : abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret : ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret : a",
+   "sensitive": false
+  },
+  {
+   "text": "secret : ",
+   "sensitive": false
+  },
+  {
+   "text": "secret : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret是abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret是ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret是a",
+   "sensitive": false
+  },
+  {
+   "text": "secret是",
+   "sensitive": false
+  },
+  {
+   "text": "secret是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret为abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret为ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret为a",
+   "sensitive": false
+  },
+  {
+   "text": "secret为",
+   "sensitive": false
+  },
+  {
+   "text": "secret为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "secret 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "secret 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "secret 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "secret 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "secret abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret a",
+   "sensitive": false
+  },
+  {
+   "text": "secret ",
+   "sensitive": false
+  },
+  {
+   "text": "secret sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "secret  abc",
+   "sensitive": true
+  },
+  {
+   "text": "secret  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "secret  ab",
+   "sensitive": false
+  },
+  {
+   "text": "secret  a",
+   "sensitive": false
+  },
+  {
+   "text": "secret  ",
+   "sensitive": false
+  },
+  {
+   "text": "secret  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "secret  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "secret  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"secret\"",
+   "sensitive": false
+  },
+  {
+   "text": "'secret'",
+   "sensitive": false
+  },
+  {
+   "text": "\"secret\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "secret",
+   "sensitive": false
+  },
+  {
+   "text": "我的secret",
+   "sensitive": false
+  },
+  {
+   "text": "nosecrethere",
+   "sensitive": false
+  },
+  {
+   "text": "secrets are things",
+   "sensitive": false
+  },
+  {
+   "text": "xsecret=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "api_key=abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key=ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key=a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key=",
+   "sensitive": false
+  },
+  {
+   "text": "api_key=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key:abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key:ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key:a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key:",
+   "sensitive": false
+  },
+  {
+   "text": "api_key:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key：abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key：ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key：a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key：",
+   "sensitive": false
+  },
+  {
+   "text": "api_key：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key = abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key = ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key = a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key = ",
+   "sensitive": false
+  },
+  {
+   "text": "api_key = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key : abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key : ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key : a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key : ",
+   "sensitive": false
+  },
+  {
+   "text": "api_key : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key是abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key是ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key是a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key是",
+   "sensitive": false
+  },
+  {
+   "text": "api_key是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key为abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key为ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key为a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key为",
+   "sensitive": false
+  },
+  {
+   "text": "api_key为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "api_key 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "api_key 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api_key abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key ",
+   "sensitive": false
+  },
+  {
+   "text": "api_key sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "api_key  abc",
+   "sensitive": true
+  },
+  {
+   "text": "api_key  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api_key  ab",
+   "sensitive": false
+  },
+  {
+   "text": "api_key  a",
+   "sensitive": false
+  },
+  {
+   "text": "api_key  ",
+   "sensitive": false
+  },
+  {
+   "text": "api_key  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api_key  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api_key  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"api_key\"",
+   "sensitive": false
+  },
+  {
+   "text": "'api_key'",
+   "sensitive": false
+  },
+  {
+   "text": "\"api_key\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "api_key",
+   "sensitive": false
+  },
+  {
+   "text": "我的api_key",
+   "sensitive": false
+  },
+  {
+   "text": "noapi_keyhere",
+   "sensitive": false
+  },
+  {
+   "text": "api_keys are things",
+   "sensitive": false
+  },
+  {
+   "text": "xapi_key=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "api-key=abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key=ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key=a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key=",
+   "sensitive": false
+  },
+  {
+   "text": "api-key=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key:abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key:ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key:a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key:",
+   "sensitive": false
+  },
+  {
+   "text": "api-key:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key：abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key：ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key：a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key：",
+   "sensitive": false
+  },
+  {
+   "text": "api-key：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key = abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key = ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key = a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key = ",
+   "sensitive": false
+  },
+  {
+   "text": "api-key = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key : abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key : ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key : a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key : ",
+   "sensitive": false
+  },
+  {
+   "text": "api-key : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key是abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key是ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key是a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key是",
+   "sensitive": false
+  },
+  {
+   "text": "api-key是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key为abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key为ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key为a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key为",
+   "sensitive": false
+  },
+  {
+   "text": "api-key为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "api-key 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "api-key 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "api-key abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key ",
+   "sensitive": false
+  },
+  {
+   "text": "api-key sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "api-key  abc",
+   "sensitive": true
+  },
+  {
+   "text": "api-key  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "api-key  ab",
+   "sensitive": false
+  },
+  {
+   "text": "api-key  a",
+   "sensitive": false
+  },
+  {
+   "text": "api-key  ",
+   "sensitive": false
+  },
+  {
+   "text": "api-key  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "api-key  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "api-key  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"api-key\"",
+   "sensitive": false
+  },
+  {
+   "text": "'api-key'",
+   "sensitive": false
+  },
+  {
+   "text": "\"api-key\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "api-key",
+   "sensitive": false
+  },
+  {
+   "text": "我的api-key",
+   "sensitive": false
+  },
+  {
+   "text": "noapi-keyhere",
+   "sensitive": false
+  },
+  {
+   "text": "api-keys are things",
+   "sensitive": false
+  },
+  {
+   "text": "xapi-key=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "apikey=abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey=ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey=a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey=",
+   "sensitive": false
+  },
+  {
+   "text": "apikey=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey:abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey:ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey:a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey:",
+   "sensitive": false
+  },
+  {
+   "text": "apikey:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey：abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey：ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey：a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey：",
+   "sensitive": false
+  },
+  {
+   "text": "apikey：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey = abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey = ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey = a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey = ",
+   "sensitive": false
+  },
+  {
+   "text": "apikey = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey : abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey : ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey : a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey : ",
+   "sensitive": false
+  },
+  {
+   "text": "apikey : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey是abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey是ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey是a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey是",
+   "sensitive": false
+  },
+  {
+   "text": "apikey是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey为abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey为ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey为a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey为",
+   "sensitive": false
+  },
+  {
+   "text": "apikey为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "apikey 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "apikey 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "apikey abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey ",
+   "sensitive": false
+  },
+  {
+   "text": "apikey sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "apikey  abc",
+   "sensitive": true
+  },
+  {
+   "text": "apikey  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "apikey  ab",
+   "sensitive": false
+  },
+  {
+   "text": "apikey  a",
+   "sensitive": false
+  },
+  {
+   "text": "apikey  ",
+   "sensitive": false
+  },
+  {
+   "text": "apikey  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "apikey  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "apikey  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"apikey\"",
+   "sensitive": false
+  },
+  {
+   "text": "'apikey'",
+   "sensitive": false
+  },
+  {
+   "text": "\"apikey\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "apikey",
+   "sensitive": false
+  },
+  {
+   "text": "我的apikey",
+   "sensitive": false
+  },
+  {
+   "text": "noapikeyhere",
+   "sensitive": false
+  },
+  {
+   "text": "apikeys are things",
+   "sensitive": false
+  },
+  {
+   "text": "xapikey=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY=abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY=ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY=a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY=",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY:abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY:ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY:a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY:",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY：abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY：ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY：a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY：",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY = abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY = ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY = a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY = ",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY : abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY : ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY : a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY : ",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY是abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY是ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY是a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY是",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY为abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY为ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY为a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY为",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY ",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY  abc",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY  ab",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY  a",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY  ",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEY  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"API_KEY\"",
+   "sensitive": false
+  },
+  {
+   "text": "'API_KEY'",
+   "sensitive": false
+  },
+  {
+   "text": "\"API_KEY\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "API_KEY",
+   "sensitive": false
+  },
+  {
+   "text": "我的API_KEY",
+   "sensitive": false
+  },
+  {
+   "text": "noAPI_KEYhere",
+   "sensitive": false
+  },
+  {
+   "text": "API_KEYs are things",
+   "sensitive": false
+  },
+  {
+   "text": "xAPI_KEY=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "authorization=abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization=ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization=a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization=",
+   "sensitive": false
+  },
+  {
+   "text": "authorization=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization:abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization:ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization:a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization:",
+   "sensitive": false
+  },
+  {
+   "text": "authorization:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization：abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization：ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization：a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization：",
+   "sensitive": false
+  },
+  {
+   "text": "authorization：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization = abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization = ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization = a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization = ",
+   "sensitive": false
+  },
+  {
+   "text": "authorization = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization : abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization : ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization : a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization : ",
+   "sensitive": false
+  },
+  {
+   "text": "authorization : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization是abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization是ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization是a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization是",
+   "sensitive": false
+  },
+  {
+   "text": "authorization是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization为abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization为ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization为a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization为",
+   "sensitive": false
+  },
+  {
+   "text": "authorization为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "authorization 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "authorization 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "authorization abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization ",
+   "sensitive": false
+  },
+  {
+   "text": "authorization sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "authorization  abc",
+   "sensitive": true
+  },
+  {
+   "text": "authorization  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "authorization  ab",
+   "sensitive": false
+  },
+  {
+   "text": "authorization  a",
+   "sensitive": false
+  },
+  {
+   "text": "authorization  ",
+   "sensitive": false
+  },
+  {
+   "text": "authorization  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "authorization  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "authorization  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"authorization\"",
+   "sensitive": false
+  },
+  {
+   "text": "'authorization'",
+   "sensitive": false
+  },
+  {
+   "text": "\"authorization\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "authorization",
+   "sensitive": false
+  },
+  {
+   "text": "我的authorization",
+   "sensitive": false
+  },
+  {
+   "text": "noauthorizationhere",
+   "sensitive": false
+  },
+  {
+   "text": "authorizations are things",
+   "sensitive": false
+  },
+  {
+   "text": "xauthorization=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization=abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization=ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization=a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization=",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization:abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization:ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization:a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization:",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization：abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization：ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization：a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization：",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization = abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization = ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization = a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization = ",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization : abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization : ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization : a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization : ",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization是abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization是ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization是a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization是",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization为abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization为ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization为a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization为",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization ",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization  abc",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization  ab",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization  a",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization  ",
+   "sensitive": false
+  },
+  {
+   "text": "Authorization  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"Authorization\"",
+   "sensitive": false
+  },
+  {
+   "text": "'Authorization'",
+   "sensitive": false
+  },
+  {
+   "text": "\"Authorization\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization",
+   "sensitive": false
+  },
+  {
+   "text": "我的Authorization",
+   "sensitive": false
+  },
+  {
+   "text": "noAuthorizationhere",
+   "sensitive": false
+  },
+  {
+   "text": "Authorizations are things",
+   "sensitive": false
+  },
+  {
+   "text": "xAuthorization=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "bearer=abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer=ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer=a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer=",
+   "sensitive": false
+  },
+  {
+   "text": "bearer=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer:abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer:ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer:a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer:",
+   "sensitive": false
+  },
+  {
+   "text": "bearer:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer：abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer：ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer：a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer：",
+   "sensitive": false
+  },
+  {
+   "text": "bearer：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer = abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer = ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer = a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer = ",
+   "sensitive": false
+  },
+  {
+   "text": "bearer = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer : abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer : ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer : a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer : ",
+   "sensitive": false
+  },
+  {
+   "text": "bearer : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer是abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer是ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer是a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer是",
+   "sensitive": false
+  },
+  {
+   "text": "bearer是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer为abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer为ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer为a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer为",
+   "sensitive": false
+  },
+  {
+   "text": "bearer为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "bearer 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "bearer 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "bearer abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer ",
+   "sensitive": false
+  },
+  {
+   "text": "bearer sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "bearer  abc",
+   "sensitive": true
+  },
+  {
+   "text": "bearer  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "bearer  ab",
+   "sensitive": false
+  },
+  {
+   "text": "bearer  a",
+   "sensitive": false
+  },
+  {
+   "text": "bearer  ",
+   "sensitive": false
+  },
+  {
+   "text": "bearer  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "bearer  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "bearer  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"bearer\"",
+   "sensitive": false
+  },
+  {
+   "text": "'bearer'",
+   "sensitive": false
+  },
+  {
+   "text": "\"bearer\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "bearer",
+   "sensitive": false
+  },
+  {
+   "text": "我的bearer",
+   "sensitive": false
+  },
+  {
+   "text": "nobearerhere",
+   "sensitive": false
+  },
+  {
+   "text": "bearers are things",
+   "sensitive": false
+  },
+  {
+   "text": "xbearer=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "access_key=abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key=ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key=a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key=",
+   "sensitive": false
+  },
+  {
+   "text": "access_key=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key:abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key:ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key:a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key:",
+   "sensitive": false
+  },
+  {
+   "text": "access_key:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key：abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key：ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key：a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key：",
+   "sensitive": false
+  },
+  {
+   "text": "access_key：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key = abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key = ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key = a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key = ",
+   "sensitive": false
+  },
+  {
+   "text": "access_key = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key : abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key : ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key : a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key : ",
+   "sensitive": false
+  },
+  {
+   "text": "access_key : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key是abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key是ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key是a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key是",
+   "sensitive": false
+  },
+  {
+   "text": "access_key是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key为abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key为ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key为a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key为",
+   "sensitive": false
+  },
+  {
+   "text": "access_key为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "access_key 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "access_key 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access_key abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key ",
+   "sensitive": false
+  },
+  {
+   "text": "access_key sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "access_key  abc",
+   "sensitive": true
+  },
+  {
+   "text": "access_key  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access_key  ab",
+   "sensitive": false
+  },
+  {
+   "text": "access_key  a",
+   "sensitive": false
+  },
+  {
+   "text": "access_key  ",
+   "sensitive": false
+  },
+  {
+   "text": "access_key  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access_key  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access_key  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"access_key\"",
+   "sensitive": false
+  },
+  {
+   "text": "'access_key'",
+   "sensitive": false
+  },
+  {
+   "text": "\"access_key\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "access_key",
+   "sensitive": false
+  },
+  {
+   "text": "我的access_key",
+   "sensitive": false
+  },
+  {
+   "text": "noaccess_keyhere",
+   "sensitive": false
+  },
+  {
+   "text": "access_keys are things",
+   "sensitive": false
+  },
+  {
+   "text": "xaccess_key=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "access-key=abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key=ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key=a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key=",
+   "sensitive": false
+  },
+  {
+   "text": "access-key=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key:abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key:ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key:a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key:",
+   "sensitive": false
+  },
+  {
+   "text": "access-key:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key：abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key：ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key：a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key：",
+   "sensitive": false
+  },
+  {
+   "text": "access-key：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key = abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key = ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key = a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key = ",
+   "sensitive": false
+  },
+  {
+   "text": "access-key = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key : abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key : ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key : a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key : ",
+   "sensitive": false
+  },
+  {
+   "text": "access-key : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key是abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key是ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key是a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key是",
+   "sensitive": false
+  },
+  {
+   "text": "access-key是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key为abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key为ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key为a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key为",
+   "sensitive": false
+  },
+  {
+   "text": "access-key为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "access-key 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "access-key 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "access-key abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key ",
+   "sensitive": false
+  },
+  {
+   "text": "access-key sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "access-key  abc",
+   "sensitive": true
+  },
+  {
+   "text": "access-key  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "access-key  ab",
+   "sensitive": false
+  },
+  {
+   "text": "access-key  a",
+   "sensitive": false
+  },
+  {
+   "text": "access-key  ",
+   "sensitive": false
+  },
+  {
+   "text": "access-key  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "access-key  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "access-key  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"access-key\"",
+   "sensitive": false
+  },
+  {
+   "text": "'access-key'",
+   "sensitive": false
+  },
+  {
+   "text": "\"access-key\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "access-key",
+   "sensitive": false
+  },
+  {
+   "text": "我的access-key",
+   "sensitive": false
+  },
+  {
+   "text": "noaccess-keyhere",
+   "sensitive": false
+  },
+  {
+   "text": "access-keys are things",
+   "sensitive": false
+  },
+  {
+   "text": "xaccess-key=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey=abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey=ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey=a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey=",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey:abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey:ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey:a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey:",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey：abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey：ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey：a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey：",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey = abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey = ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey = a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey = ",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey : abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey : ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey : a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey : ",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey是abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey是ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey是a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey是",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey为abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey为ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey为a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey为",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey ",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey  abc",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey  ab",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey  a",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey  ",
+   "sensitive": false
+  },
+  {
+   "text": "accesskey  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"accesskey\"",
+   "sensitive": false
+  },
+  {
+   "text": "'accesskey'",
+   "sensitive": false
+  },
+  {
+   "text": "\"accesskey\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "accesskey",
+   "sensitive": false
+  },
+  {
+   "text": "我的accesskey",
+   "sensitive": false
+  },
+  {
+   "text": "noaccesskeyhere",
+   "sensitive": false
+  },
+  {
+   "text": "accesskeys are things",
+   "sensitive": false
+  },
+  {
+   "text": "xaccesskey=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "credential=abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential=abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential=ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential=a",
+   "sensitive": false
+  },
+  {
+   "text": "credential=",
+   "sensitive": false
+  },
+  {
+   "text": "credential=sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential=x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential=你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential:abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential:abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential:ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential:a",
+   "sensitive": false
+  },
+  {
+   "text": "credential:",
+   "sensitive": false
+  },
+  {
+   "text": "credential:sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential:x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential:你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential：abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential：abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential：ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential：a",
+   "sensitive": false
+  },
+  {
+   "text": "credential：",
+   "sensitive": false
+  },
+  {
+   "text": "credential：sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential：x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential：你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential = abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential = abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential = ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential = a",
+   "sensitive": false
+  },
+  {
+   "text": "credential = ",
+   "sensitive": false
+  },
+  {
+   "text": "credential = sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential = x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential = 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential : abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential : abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential : ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential : a",
+   "sensitive": false
+  },
+  {
+   "text": "credential : ",
+   "sensitive": false
+  },
+  {
+   "text": "credential : sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential : x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential : 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential是abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential是abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential是ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential是a",
+   "sensitive": false
+  },
+  {
+   "text": "credential是",
+   "sensitive": false
+  },
+  {
+   "text": "credential是sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential是x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential是你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential为abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential为abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential为ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential为a",
+   "sensitive": false
+  },
+  {
+   "text": "credential为",
+   "sensitive": false
+  },
+  {
+   "text": "credential为sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential为x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential为你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential 是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential 是 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "credential 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "credential 是 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential 是 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential 是 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential 为 abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential 为 abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "credential 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "credential 为 sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential 为 x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential 为 你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "credential abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential a",
+   "sensitive": false
+  },
+  {
+   "text": "credential ",
+   "sensitive": false
+  },
+  {
+   "text": "credential sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credential  abc",
+   "sensitive": true
+  },
+  {
+   "text": "credential  abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "credential  ab",
+   "sensitive": false
+  },
+  {
+   "text": "credential  a",
+   "sensitive": false
+  },
+  {
+   "text": "credential  ",
+   "sensitive": false
+  },
+  {
+   "text": "credential  sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "credential  x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "credential  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"credential\"",
+   "sensitive": false
+  },
+  {
+   "text": "'credential'",
+   "sensitive": false
+  },
+  {
+   "text": "\"credential\": \"abc\"",
+   "sensitive": true
+  },
+  {
+   "text": "credential",
+   "sensitive": false
+  },
+  {
+   "text": "我的credential",
+   "sensitive": false
+  },
+  {
+   "text": "nocredentialhere",
+   "sensitive": false
+  },
+  {
+   "text": "credentials are things",
+   "sensitive": false
+  },
+  {
+   "text": "xcredential=abcd",
+   "sensitive": true
+  },
+  {
+   "text": "credentials=abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials=你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials:你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials：你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = ",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials = 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : ",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials : 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials是你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials为你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 ",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 是 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 ",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 为 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials ",
+   "sensitive": false
+  },
+  {
+   "text": "credentials sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials 你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  abc",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  abcd1234",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  ab",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  a",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  ",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  sk-aaaaaaaaaa",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  x.y/z",
+   "sensitive": false
+  },
+  {
+   "text": "credentials  你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "\"credentials\"",
+   "sensitive": false
+  },
+  {
+   "text": "'credentials'",
+   "sensitive": false
+  },
+  {
+   "text": "\"credentials\": \"abc\"",
+   "sensitive": false
+  },
+  {
+   "text": "credentials",
+   "sensitive": false
+  },
+  {
+   "text": "我的credentials",
+   "sensitive": false
+  },
+  {
+   "text": "nocredentialshere",
+   "sensitive": false
+  },
+  {
+   "text": "credentialss are things",
+   "sensitive": false
+  },
+  {
+   "text": "xcredentials=abcd",
+   "sensitive": false
+  },
+  {
+   "text": "token=，",
+   "sensitive": false
+  },
+  {
+   "text": "token=ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token=a b",
+   "sensitive": false
+  },
+  {
+   "text": "token='quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token=abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token=123",
+   "sensitive": true
+  },
+  {
+   "text": "token:，",
+   "sensitive": false
+  },
+  {
+   "text": "token:ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token:a b",
+   "sensitive": false
+  },
+  {
+   "text": "token:'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token:\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token:abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token:123",
+   "sensitive": true
+  },
+  {
+   "text": "token：，",
+   "sensitive": false
+  },
+  {
+   "text": "token：ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token：a b",
+   "sensitive": false
+  },
+  {
+   "text": "token：'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token：\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token：abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token：123",
+   "sensitive": true
+  },
+  {
+   "text": "token = ，",
+   "sensitive": false
+  },
+  {
+   "text": "token = ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token = a b",
+   "sensitive": false
+  },
+  {
+   "text": "token = 'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token = \"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token = abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token = 123",
+   "sensitive": true
+  },
+  {
+   "text": "token : ，",
+   "sensitive": false
+  },
+  {
+   "text": "token : ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token : a b",
+   "sensitive": false
+  },
+  {
+   "text": "token : 'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token : \"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token : abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token : 123",
+   "sensitive": true
+  },
+  {
+   "text": "token是，",
+   "sensitive": false
+  },
+  {
+   "text": "token是ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token是a b",
+   "sensitive": false
+  },
+  {
+   "text": "token是'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token是\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token是abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token是123",
+   "sensitive": true
+  },
+  {
+   "text": "token为，",
+   "sensitive": false
+  },
+  {
+   "text": "token为ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token为a b",
+   "sensitive": false
+  },
+  {
+   "text": "token为'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token为\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token为abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token为123",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 ，",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 a b",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 \"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token 是 abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token 是 123",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 ，",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 a b",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 'quoted'",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 \"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token 为 abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token 为 123",
+   "sensitive": true
+  },
+  {
+   "text": "token ，",
+   "sensitive": false
+  },
+  {
+   "text": "token ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token a b",
+   "sensitive": false
+  },
+  {
+   "text": "token 'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token \"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token 123",
+   "sensitive": true
+  },
+  {
+   "text": "token  ，",
+   "sensitive": false
+  },
+  {
+   "text": "token  ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token  a b",
+   "sensitive": false
+  },
+  {
+   "text": "token  'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token  \"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token  abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token  123",
+   "sensitive": true
+  },
+  {
+   "text": "token\tabc",
+   "sensitive": true
+  },
+  {
+   "text": "token\tabcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token\tab",
+   "sensitive": false
+  },
+  {
+   "text": "token\ta",
+   "sensitive": false
+  },
+  {
+   "text": "token\t",
+   "sensitive": false
+  },
+  {
+   "text": "token\tsk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token\tx.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token\t你好世界",
+   "sensitive": false
+  },
+  {
+   "text": "token\t，",
+   "sensitive": false
+  },
+  {
+   "text": "token\tab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token\ta b",
+   "sensitive": false
+  },
+  {
+   "text": "token\t'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token\t\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token\tabc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token\t123",
+   "sensitive": true
+  },
+  {
+   "text": "token='abc",
+   "sensitive": true
+  },
+  {
+   "text": "token='abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token='ab",
+   "sensitive": false
+  },
+  {
+   "text": "token='a",
+   "sensitive": false
+  },
+  {
+   "text": "token='",
+   "sensitive": false
+  },
+  {
+   "text": "token='sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token='x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token='你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token='，",
+   "sensitive": false
+  },
+  {
+   "text": "token='ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token='a b",
+   "sensitive": false
+  },
+  {
+   "text": "token=''quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token='\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token='abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token='123",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"abc",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"ab",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"a",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"，",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"a b",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token=\"abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token=\"123",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"abc",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"ab",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"a",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"，",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"a b",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token: \"abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token: \"123",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"abc",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"ab",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"a",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"，",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"a b",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token\":\"abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token\":\"123",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"abc",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"abcd1234",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"ab",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"a",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"sk-aaaaaaaaaa",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"x.y/z",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"你好世界",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"，",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"ab，c",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"a b",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"'quoted'",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"\"q\"",
+   "sensitive": false
+  },
+  {
+   "text": "token\": \"abc-def_ghi./",
+   "sensitive": true
+  },
+  {
+   "text": "token\": \"123",
+   "sensitive": true
+  },
+  {
+   "text": "C:\\Users\\me\\a.txt",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 C:\\Users\\me\\a.txt 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "C:\\USERS\\ME\\A.TXT",
+   "sensitive": true
+  },
+  {
+   "text": "\"C:\\Users\\me\\a.txt\"",
+   "sensitive": true
+  },
+  {
+   "text": "c:/qqbot/config.json",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 c:/qqbot/config.json 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "C:/QQBOT/CONFIG.JSON",
+   "sensitive": true
+  },
+  {
+   "text": "\"c:/qqbot/config.json\"",
+   "sensitive": true
+  },
+  {
+   "text": "D:\\",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 D:\\ 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"D:\\\"",
+   "sensitive": false
+  },
+  {
+   "text": "D:/x",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 D:/x 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "D:/X",
+   "sensitive": true
+  },
+  {
+   "text": "\"D:/x\"",
+   "sensitive": true
+  },
+  {
+   "text": "C:\\",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 C:\\ 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"C:\\\"",
+   "sensitive": false
+  },
+  {
+   "text": "Z:\\a b",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 Z:\\a b 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "Z:\\A B",
+   "sensitive": true
+  },
+  {
+   "text": "\"Z:\\a b\"",
+   "sensitive": true
+  },
+  {
+   "text": "E:\\folder\\file.txt。",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 E:\\folder\\file.txt。 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "E:\\FOLDER\\FILE.TXT。",
+   "sensitive": true
+  },
+  {
+   "text": "\"E:\\folder\\file.txt。\"",
+   "sensitive": true
+  },
+  {
+   "text": "\\\\server\\share\\f.txt",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 \\\\server\\share\\f.txt 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "\\\\SERVER\\SHARE\\F.TXT",
+   "sensitive": true
+  },
+  {
+   "text": "\"\\\\server\\share\\f.txt\"",
+   "sensitive": true
+  },
+  {
+   "text": "\\\\192.168.1.5\\share\\x.txt",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 \\\\192.168.1.5\\share\\x.txt 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "\\\\192.168.1.5\\SHARE\\X.TXT",
+   "sensitive": true
+  },
+  {
+   "text": "\"\\\\192.168.1.5\\share\\x.txt\"",
+   "sensitive": true
+  },
+  {
+   "text": "\\\\host\\",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 \\\\host\\ 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\\\\HOST\\",
+   "sensitive": false
+  },
+  {
+   "text": "\"\\\\host\\\"",
+   "sensitive": false
+  },
+  {
+   "text": "\\\\\\host\\share",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 \\\\\\host\\share 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "\\\\\\HOST\\SHARE",
+   "sensitive": true
+  },
+  {
+   "text": "\"\\\\\\host\\share\"",
+   "sensitive": true
+  },
+  {
+   "text": "/home/me/.dsh/config",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 /home/me/.dsh/config 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "/HOME/ME/.DSH/CONFIG",
+   "sensitive": true
+  },
+  {
+   "text": "\"/home/me/.dsh/config\"",
+   "sensitive": true
+  },
+  {
+   "text": "/Users/me/x",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 /Users/me/x 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "/USERS/ME/X",
+   "sensitive": true
+  },
+  {
+   "text": "\"/Users/me/x\"",
+   "sensitive": true
+  },
+  {
+   "text": "/etc/passwd",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 /etc/passwd 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "/ETC/PASSWD",
+   "sensitive": true
+  },
+  {
+   "text": "\"/etc/passwd\"",
+   "sensitive": true
+  },
+  {
+   "text": "/var/log/x",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 /var/log/x 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "/VAR/LOG/X",
+   "sensitive": true
+  },
+  {
+   "text": "\"/var/log/x\"",
+   "sensitive": true
+  },
+  {
+   "text": "/root/.ssh",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 /root/.ssh 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "/ROOT/.SSH",
+   "sensitive": true
+  },
+  {
+   "text": "\"/root/.ssh\"",
+   "sensitive": true
+  },
+  {
+   "text": "/home/",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 /home/ 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "/HOME/",
+   "sensitive": true
+  },
+  {
+   "text": "\"/home/\"",
+   "sensitive": true
+  },
+  {
+   "text": "/homework/a",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 /homework/a 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "/HOMEWORK/A",
+   "sensitive": false
+  },
+  {
+   "text": "\"/homework/a\"",
+   "sensitive": false
+  },
+  {
+   "text": "/etc",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 /etc 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "/ETC",
+   "sensitive": false
+  },
+  {
+   "text": "\"/etc\"",
+   "sensitive": false
+  },
+  {
+   "text": "/etcetera/x",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 /etcetera/x 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "/ETCETERA/X",
+   "sensitive": false
+  },
+  {
+   "text": "\"/etcetera/x\"",
+   "sensitive": false
+  },
+  {
+   "text": "file:///C:/x",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 file:///C:/x 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "FILE:///C:/X",
+   "sensitive": true
+  },
+  {
+   "text": "\"file:///C:/x\"",
+   "sensitive": true
+  },
+  {
+   "text": "see C:\\ and more",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 see C:\\ and more 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "SEE C:\\ AND MORE",
+   "sensitive": false
+  },
+  {
+   "text": "\"see C:\\ and more\"",
+   "sensitive": false
+  },
+  {
+   "text": "a:\\b",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 a:\\b 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "A:\\B",
+   "sensitive": true
+  },
+  {
+   "text": "\"a:\\b\"",
+   "sensitive": true
+  },
+  {
+   "text": "ab:\\b",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 ab:\\b 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "AB:\\B",
+   "sensitive": false
+  },
+  {
+   "text": "\"ab:\\b\"",
+   "sensitive": false
+  },
+  {
+   "text": "1C:\\x",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 1C:\\x 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "1C:\\X",
+   "sensitive": false
+  },
+  {
+   "text": "\"1C:\\x\"",
+   "sensitive": false
+  },
+  {
+   "text": "x/home/y",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 x/home/y 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "X/HOME/Y",
+   "sensitive": false
+  },
+  {
+   "text": "\"x/home/y\"",
+   "sensitive": false
+  },
+  {
+   "text": " /home/y",
+   "sensitive": true
+  },
+  {
+   "text": "前缀  /home/y 后缀",
+   "sensitive": true
+  },
+  {
+   "text": " /HOME/Y",
+   "sensitive": true
+  },
+  {
+   "text": "\" /home/y\"",
+   "sensitive": true
+  },
+  {
+   "text": "(/etc/hosts)",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 (/etc/hosts) 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "(/ETC/HOSTS)",
+   "sensitive": true
+  },
+  {
+   "text": "\"(/etc/hosts)\"",
+   "sensitive": true
+  },
+  {
+   "text": "“C:\\x”",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 “C:\\x” 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "“C:\\X”",
+   "sensitive": true
+  },
+  {
+   "text": "\"“C:\\x”\"",
+   "sensitive": true
+  },
+  {
+   "text": "C:盘满了",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 C:盘满了 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"C:盘满了\"",
+   "sensitive": false
+  },
+  {
+   "text": "12:30 吃午饭",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 12:30 吃午饭 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"12:30 吃午饭\"",
+   "sensitive": false
+  },
+  {
+   "text": "a:b",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 a:b 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "A:B",
+   "sensitive": false
+  },
+  {
+   "text": "\"a:b\"",
+   "sensitive": false
+  },
+  {
+   "text": "http://x/y",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 http://x/y 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "HTTP://X/Y",
+   "sensitive": false
+  },
+  {
+   "text": "\"http://x/y\"",
+   "sensitive": false
+  },
+  {
+   "text": "C:/",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 C:/ 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"C:/\"",
+   "sensitive": false
+  },
+  {
+   "text": "C:/ ",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 C:/  后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"C:/ \"",
+   "sensitive": false
+  },
+  {
+   "text": "C:/\"",
+   "sensitive": false
+  },
+  {
+   "text": "前缀 C:/\" 后缀",
+   "sensitive": false
+  },
+  {
+   "text": "\"C:/\"\"",
+   "sensitive": false
+  },
+  {
+   "text": "中C:\\文",
+   "sensitive": true
+  },
+  {
+   "text": "前缀 中C:\\文 后缀",
+   "sensitive": true
+  },
+  {
+   "text": "\"中C:\\文\"",
+   "sensitive": true
+  },
+  {
+   "text": "今天天气不错",
+   "sensitive": false
+  },
+  {
+   "text": "",
+   "sensitive": false
+  },
+  {
+   "text": " ",
+   "sensitive": false
+  },
+  {
+   "text": "hello world",
+   "sensitive": false
+  },
+  {
+   "text": "bearer of bad news",
+   "sensitive": false
+  },
+  {
+   "text": "the secret to happiness is love",
+   "sensitive": false
+  },
+  {
+   "text": "password manager",
+   "sensitive": true
+  },
+  {
+   "text": "密码是 abc",
+   "sensitive": true
+  },
+  {
+   "text": "这个口令为 xyz",
+   "sensitive": true
+  },
+  {
+   "text": "Authorization: Bearer abc.def",
+   "sensitive": true
+  },
+  {
+   "text": "authorization bearer abc",
+   "sensitive": true
+  },
+  {
+   "text": "api key abcd",
+   "sensitive": false
+  },
+  {
+   "text": "api_key abcd",
+   "sensitive": true
+  },
+  {
+   "text": "access key abcd",
+   "sensitive": false
+  },
+  {
+   "text": "credential files",
+   "sensitive": true
+  },
+  {
+   "text": "my token is ok",
+   "sensitive": false
+  }
+ ]
+}

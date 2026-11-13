@@ -1,0 +1,20 @@
+{
+  "type": "user/message",
+  "seq": 9,
+  "time": 1793957768767,
+  "data": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Synthetic HF85 acknowledgement test. Reply with ACK only. Do not use tools."
+      }
+    ],
+    "source": {
+      "kind": "user",
+      "rpcId": "hf85-prompt-request-id"
+    },
+    "role": "user",
+    "id": "e2273352-843e-4aef-af81-e2e36ae5d5fc"
+  },
+  "surfaceOp": "append"
+}

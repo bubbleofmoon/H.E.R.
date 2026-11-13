@@ -1,0 +1,703 @@
+{
+  "source": "frozen qq-bridge/src/memory-store.mjs and memory/schema.mjs",
+  "sql": "\nINSERT INTO memory(owner_type,owner_id,scope,kind,subject,content,source,importance,created_at,archived) VALUES\n('session','group:101','group','fact','own','own-row','import',0.5,1700000000000,0),\n('session','group:303','group','topic','管理员偏好','管理员偏好 Alpha_1','import',0.5,1700000000000,0),\n('session','private:202','private','fact','secret','private-secret','import',0.5,1700000000000,0),\n('person','person:202','group','preference','person','person-row','import',0.5,1700000000000,0),\n('person','person:202','private','fact','person-secret','person-private','import',0.5,1700000000000,0),\n('session','group:303','group','event','archived','archived-row','import',0.5,1700000000000,1);\nINSERT INTO memory_fts(rowid,seg) VALUES(2,'管理 理员 员偏 偏好 alpha_1');\nINSERT INTO team_member VALUES('readers','session','group:101'),('writers','session','group:303'),('writers','person','202');\n",
+  "segments": [
+    {
+      "text": "管理员偏好 Alpha_1.2",
+      "tokens": [
+        "管理",
+        "理员",
+        "员偏",
+        "偏好",
+        "alpha_1.2"
+      ]
+    },
+    {
+      "text": "单 A_B 123",
+      "tokens": [
+        "单",
+        "a_b",
+        "123"
+      ]
+    },
+    {
+      "text": "😊中文测试",
+      "tokens": [
+        "中文",
+        "文测",
+        "测试"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "label": "own",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 0
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "private-and-person",
+      "readerKey": "private:202",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 3,
+          "owner_id": "private:202",
+          "scope": "private",
+          "kind": "fact",
+          "subject": "secret",
+          "content": "private-secret",
+          "hits": 0
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 0
+        }
+      ],
+      "index": {
+        "total": 2,
+        "terms": [
+          "person",
+          "secret"
+        ]
+      }
+    },
+    {
+      "label": "owner",
+      "readerKey": "private:7001",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 1
+        },
+        {
+          "id": 3,
+          "owner_id": "private:202",
+          "scope": "private",
+          "kind": "fact",
+          "subject": "secret",
+          "content": "private-secret",
+          "hits": 1
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 1
+        },
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 0
+        },
+        {
+          "id": 5,
+          "owner_id": "person:202",
+          "scope": "private",
+          "kind": "fact",
+          "subject": "person-secret",
+          "content": "person-private",
+          "hits": 0
+        }
+      ],
+      "index": {
+        "total": 5,
+        "terms": [
+          "own",
+          "person",
+          "person-secret",
+          "secret",
+          "管理员偏好"
+        ]
+      }
+    },
+    {
+      "label": "session:session:group:303",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 2
+        },
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 1
+        }
+      ],
+      "index": {
+        "total": 2,
+        "terms": [
+          "own",
+          "管理员偏好"
+        ]
+      },
+      "grant": {
+        "readerType": "session",
+        "readerId": "group:101",
+        "readType": "session",
+        "readId": "group:303"
+      }
+    },
+    {
+      "label": "fts",
+      "readerKey": "group:101",
+      "query": "管理员偏好 Alpha_1",
+      "kinds": [
+        "topic"
+      ],
+      "memories": [
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 2
+        }
+      ],
+      "index": {
+        "total": 2,
+        "terms": [
+          "own",
+          "管理员偏好"
+        ]
+      }
+    },
+    {
+      "label": "revoked",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 3
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "session:person:202",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 4
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 2
+        }
+      ],
+      "index": {
+        "total": 2,
+        "terms": [
+          "own",
+          "person"
+        ]
+      },
+      "grant": {
+        "readerType": "session",
+        "readerId": "group:101",
+        "readType": "person",
+        "readId": "202"
+      }
+    },
+    {
+      "label": "fts",
+      "readerKey": "group:101",
+      "query": "管理员偏好 Alpha_1",
+      "kinds": [
+        "topic"
+      ],
+      "memories": [],
+      "index": {
+        "total": 2,
+        "terms": [
+          "own",
+          "person"
+        ]
+      }
+    },
+    {
+      "label": "revoked",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 5
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "team:team:writers",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 6
+        },
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 3
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 3
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "own",
+          "person",
+          "管理员偏好"
+        ]
+      },
+      "grant": {
+        "readerType": "team",
+        "readerId": "readers",
+        "readType": "team",
+        "readId": "writers"
+      }
+    },
+    {
+      "label": "fts",
+      "readerKey": "group:101",
+      "query": "管理员偏好 Alpha_1",
+      "kinds": [
+        "topic"
+      ],
+      "memories": [
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 4
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "own",
+          "person",
+          "管理员偏好"
+        ]
+      }
+    },
+    {
+      "label": "revoked",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 7
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "person:session:group:303",
+      "readerKey": "private:202",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 5
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 4
+        },
+        {
+          "id": 3,
+          "owner_id": "private:202",
+          "scope": "private",
+          "kind": "fact",
+          "subject": "secret",
+          "content": "private-secret",
+          "hits": 2
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "person",
+          "secret",
+          "管理员偏好"
+        ]
+      },
+      "grant": {
+        "readerType": "person",
+        "readerId": "person:202",
+        "readType": "session",
+        "readId": "group:303"
+      }
+    },
+    {
+      "label": "fts",
+      "readerKey": "group:101",
+      "query": "管理员偏好 Alpha_1",
+      "kinds": [
+        "topic"
+      ],
+      "memories": [],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "revoked",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 8
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "session:session:*",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 9
+        },
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 6
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 5
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "own",
+          "person",
+          "管理员偏好"
+        ]
+      },
+      "grant": {
+        "readerType": "session",
+        "readerId": "group:101",
+        "readType": "session",
+        "readId": "*"
+      }
+    },
+    {
+      "label": "fts",
+      "readerKey": "group:101",
+      "query": "管理员偏好 Alpha_1",
+      "kinds": [
+        "topic"
+      ],
+      "memories": [
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 7
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "own",
+          "person",
+          "管理员偏好"
+        ]
+      }
+    },
+    {
+      "label": "revoked",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 10
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    },
+    {
+      "label": "session:*:*",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 11
+        },
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 8
+        },
+        {
+          "id": 4,
+          "owner_id": "person:202",
+          "scope": "group",
+          "kind": "preference",
+          "subject": "person",
+          "content": "person-row",
+          "hits": 6
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "own",
+          "person",
+          "管理员偏好"
+        ]
+      },
+      "grant": {
+        "readerType": "session",
+        "readerId": "group:101",
+        "readType": "*",
+        "readId": "*"
+      }
+    },
+    {
+      "label": "fts",
+      "readerKey": "group:101",
+      "query": "管理员偏好 Alpha_1",
+      "kinds": [
+        "topic"
+      ],
+      "memories": [
+        {
+          "id": 2,
+          "owner_id": "group:303",
+          "scope": "group",
+          "kind": "topic",
+          "subject": "管理员偏好",
+          "content": "管理员偏好 Alpha_1",
+          "hits": 9
+        }
+      ],
+      "index": {
+        "total": 3,
+        "terms": [
+          "own",
+          "person",
+          "管理员偏好"
+        ]
+      }
+    },
+    {
+      "label": "revoked",
+      "readerKey": "group:101",
+      "query": "",
+      "kinds": [],
+      "memories": [
+        {
+          "id": 1,
+          "owner_id": "group:101",
+          "scope": "group",
+          "kind": "fact",
+          "subject": "own",
+          "content": "own-row",
+          "hits": 12
+        }
+      ],
+      "index": {
+        "total": 1,
+        "terms": [
+          "own"
+        ]
+      }
+    }
+  ]
+}

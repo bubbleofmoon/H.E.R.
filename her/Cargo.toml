@@ -1,0 +1,97 @@
+[package]
+name = "her"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[[bin]]
+name = "her"
+path = "src/main.rs"
+
+[[bin]]
+name = "her-cli"
+path = "src/cli.rs"
+test = false
+
+[[bin]]
+name = "herupdate"
+path = "src/updater.rs"
+test = false
+
+[[test]]
+name = "release_install"
+path = "tests/release_install.rs"
+required-features = ["release-test-keys"]
+
+[features]
+default = []
+# Synthetic Rust fixtures: advancing epoch via HER_PARITY_EPOCH_MS; off by default.
+parity-clock = []
+# Private controlled-poll seam for the ticket 13 regression only.
+deadlock-regression = []
+# Synthetic signing pins for fake-feed executables only; rejected in release-profile builds.
+release-test-keys = []
+
+[dependencies]
+genai = "=0.7.3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+indexmap = "2"
+regex = "1"
+roxmltree = "0.21.2"
+base64 = "0.22"
+sha2 = "0.10"
+minisign-verify = "=0.3.0"
+getrandom = "0.2"
+sha1 = "0.10"
+hmac = "0.12"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+url = "2"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+
+[dev-dependencies]
+minisign = "=0.10.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+wry = "=0.53.5"
+tao = "=0.34.5"
+tray-icon = "0.21"
+windows = { version = "0.61.3", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Variant",
+] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Dependencies are optimized in test/debug builds too: image decoding/encoding in debug
+# made media tests time out under load. Workspace code stays unoptimized for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 2

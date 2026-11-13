@@ -1,0 +1,17 @@
+title = "Public snapshot scan"
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "RFC 6455 section 1.3 public WebSocket example nonce; not authentication material"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)(her/tests/fixtures/fake-world-faults-selfcheck\.mjs|scripts/test-lifecycle-fake-resident\.py)$''']
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+
+[[allowlists]]
+description = "Synthetic ordered-hex session-token masking probe used by the log-redaction tests; the value is fixed in source, so it is not authentication material"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^0123456789abcdef0123456789abcdef0123456789abcdef$''', '''^0123456789ABCDEF0123456789abcdef0123456789ABCDEF$''']

@@ -1,0 +1,9 @@
+[package]
+name = "her-memory"
+version = "0.1.0"
+edition = "2021"
+
+# M5 前置验证：Rust 直接读写 JS 建的那个记忆库（schema 不动、数据不搬）
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"

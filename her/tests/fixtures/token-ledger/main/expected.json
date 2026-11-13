@@ -1,0 +1,1316 @@
+{
+  "byProvider": {
+    "providers": [
+      {
+        "provider": "official",
+        "samples": 11,
+        "tokensIn": 1363058,
+        "tokensOut": 321424,
+        "cost": 18.15887904
+      },
+      {
+        "provider": "opencode-go",
+        "samples": 1,
+        "tokensIn": 40000,
+        "tokensOut": 5000,
+        "cost": 0.12
+      },
+      {
+        "provider": "unknown",
+        "samples": 2,
+        "tokensIn": 1500,
+        "tokensOut": 130,
+        "cost": 0.001922
+      }
+    ],
+    "totalCost": 18.28080104,
+    "totalSamples": 14
+  },
+  "summary": {
+    "ok": true,
+    "generatedAt": 1792980000000,
+    "priceVersion": "2026-11-04",
+    "currency": "CNY",
+    "symbol": "¥",
+    "nowTier": {
+      "model": "deepseek-flash",
+      "label": "DeepSeek-V4.1-Flash",
+      "tier": "peak",
+      "tierLabel": "高峰时段",
+      "currency": "CNY",
+      "symbol": "¥",
+      "unit": 1000000,
+      "estimated": true,
+      "cacheHit": 0.04,
+      "cacheMiss": 2,
+      "cacheWrite": 2,
+      "output": 8
+    },
+    "priceTable": {
+      "version": "2026-11-04",
+      "currency": "CNY",
+      "symbol": "¥",
+      "unit": 1000000,
+      "peakMultiplier": 2,
+      "peakWindows": [
+        [
+          9,
+          12
+        ],
+        [
+          14,
+          18
+        ]
+      ],
+      "peakWeekdays": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "holidayCount": 66,
+      "models": {
+        "deepseek-flash": {
+          "label": "DeepSeek-V4.1-Flash",
+          "off": {
+            "cacheHit": 0.02,
+            "cacheMiss": 1,
+            "cacheWrite": 1,
+            "output": 4
+          }
+        },
+        "deepseek-v4-flash": {
+          "label": "DeepSeek-V4.1-Flash（旧模型名）",
+          "off": {
+            "cacheHit": 0.02,
+            "cacheMiss": 1,
+            "cacheWrite": 1,
+            "output": 4
+          }
+        },
+        "deepseek-v4-flash-vision-exp": {
+          "label": "DeepSeek-V4.1-Flash（视觉实验名）",
+          "off": {
+            "cacheHit": 0.02,
+            "cacheMiss": 1,
+            "cacheWrite": 1,
+            "output": 4
+          }
+        },
+        "deepseek-v4-pro": {
+          "label": "DeepSeek-V4-Pro-0813",
+          "off": {
+            "cacheHit": 0.15,
+            "cacheMiss": 4.5,
+            "cacheWrite": 4.5,
+            "output": 13.5
+          }
+        },
+        "deepseek-pro": {
+          "label": "DeepSeek-V4-Pro-0813（旧模型名）",
+          "off": {
+            "cacheHit": 0.15,
+            "cacheMiss": 4.5,
+            "cacheWrite": 4.5,
+            "output": 13.5
+          }
+        },
+        "custom-pro": {
+          "label": "custom-pro",
+          "off": {
+            "cacheHit": 0.1,
+            "cacheMiss": 3,
+            "cacheWrite": 3,
+            "output": 9
+          }
+        }
+      }
+    },
+    "totals": {
+      "buckets": {
+        "cacheMiss": 1152631,
+        "cacheHit": 253726,
+        "cacheWrite": 1,
+        "output": 326704,
+        "reasoning": 700
+      },
+      "cost": 18.28501304,
+      "attributedCost": 18.284753040000002,
+      "unattributedCost": 0.0002599999999999998,
+      "byTier": {
+        "peak": 18.280981039999997,
+        "off": 0.004032
+      },
+      "turns": 14,
+      "steps": 17,
+      "conversations": 5,
+      "estimated": true,
+      "totalTokens": 1733062,
+      "inputTokens": 1406358,
+      "cacheHitRate": 0.1804135220192867,
+      "avgCostPerTurn": 1.30607236,
+      "avgCostPerStep": 1.075589002352941
+    },
+    "conversations": [
+      {
+        "key": "group:7003",
+        "sessionIds": [
+          "sess-a-0",
+          "sess-a-1"
+        ],
+        "sessions": 2,
+        "buckets": {
+          "cacheMiss": 1009531,
+          "cacheHit": 203326,
+          "cacheWrite": 1,
+          "output": 301404,
+          "reasoning": 0
+        },
+        "cost": 17.18831904,
+        "unattributedCost": 0,
+        "attributedCost": 17.18831904,
+        "byTier": {
+          "peak": 17.186209039999998,
+          "off": 0.00211
+        },
+        "turns": 7,
+        "steps": 9,
+        "estimated": true,
+        "lastAt": 1793001600000,
+        "firstAt": 1790820000000,
+        "models": [
+          "deepseek-v4-flash",
+          "deepseek-v4-pro",
+          "mystery-model"
+        ]
+      },
+      {
+        "key": "group:509",
+        "sessionIds": [
+          "sess-e-1"
+        ],
+        "sessions": 1,
+        "buckets": {
+          "cacheMiss": 140000,
+          "cacheHit": 50000,
+          "cacheWrite": 0,
+          "output": 25000,
+          "reasoning": 700
+        },
+        "cost": 1.09,
+        "unattributedCost": 0,
+        "attributedCost": 1.09,
+        "byTier": {
+          "peak": 1.09,
+          "off": 0
+        },
+        "turns": 2,
+        "steps": 2,
+        "estimated": false,
+        "lastAt": 1792977060000,
+        "firstAt": 1792976400000,
+        "models": [
+          "custom-pro",
+          "deepseek-flash"
+        ]
+      },
+      {
+        "key": "private:7001",
+        "sessionIds": [
+          "sess-b-1"
+        ],
+        "sessions": 1,
+        "buckets": {
+          "cacheMiss": 1500,
+          "cacheHit": 300,
+          "cacheWrite": 0,
+          "output": 150,
+          "reasoning": 0
+        },
+        "cost": 0.004212,
+        "unattributedCost": 0.0002599999999999998,
+        "attributedCost": 0.003952,
+        "byTier": {
+          "peak": 0.004212,
+          "off": 0
+        },
+        "turns": 2,
+        "steps": 3,
+        "estimated": true,
+        "lastAt": 1792983720000,
+        "firstAt": 1792929600000,
+        "models": [
+          "deepseek-flash"
+        ]
+      },
+      {
+        "key": "未归属:sess-d-1",
+        "sessionIds": [
+          "sess-d-1"
+        ],
+        "sessions": 1,
+        "buckets": {
+          "cacheMiss": 900,
+          "cacheHit": 0,
+          "cacheWrite": 0,
+          "output": 100,
+          "reasoning": 0
+        },
+        "cost": 0.0013,
+        "unattributedCost": 0,
+        "attributedCost": 0.0013,
+        "byTier": {
+          "peak": 0,
+          "off": 0.0013
+        },
+        "turns": 1,
+        "steps": 1,
+        "estimated": true,
+        "lastAt": 1792990800000,
+        "firstAt": 1792990800000,
+        "models": []
+      },
+      {
+        "key": "internal:黑话学习",
+        "sessionIds": [
+          "sess-c-1"
+        ],
+        "sessions": 1,
+        "buckets": {
+          "cacheMiss": 700,
+          "cacheHit": 100,
+          "cacheWrite": 0,
+          "output": 50,
+          "reasoning": 0
+        },
+        "cost": 0.001182,
+        "unattributedCost": 0,
+        "attributedCost": 0.001182,
+        "byTier": {
+          "peak": 0.0005600000000000001,
+          "off": 0.000622
+        },
+        "turns": 2,
+        "steps": 2,
+        "estimated": true,
+        "lastAt": 1792987200000,
+        "firstAt": 1792458060000,
+        "models": [
+          "deepseek-flash"
+        ]
+      }
+    ]
+  },
+  "series24": {
+    "ok": true,
+    "generatedAt": 1792980000000,
+    "currency": "CNY",
+    "symbol": "¥",
+    "hours": 24,
+    "bucketMs": 21600000,
+    "from": 1792908000000,
+    "to": 1792994400000,
+    "buckets": [
+      {
+        "t": 1792908000000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792929600000,
+        "cost": 0.0011819999999999999,
+        "tokens": 1070,
+        "cacheMiss": 900,
+        "cacheHit": 100,
+        "cacheWrite": 0,
+        "output": 70,
+        "turns": 1,
+        "steps": 1,
+        "tier": "off",
+        "keys": [
+          "private:7001"
+        ]
+      },
+      {
+        "t": 1792951200000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792972800000,
+        "cost": 18.255469039999998,
+        "tokens": 1718122,
+        "cacheMiss": 1142431,
+        "cacheHit": 250376,
+        "cacheWrite": 1,
+        "output": 325314,
+        "turns": 7,
+        "steps": 9,
+        "tier": "mixed",
+        "keys": [
+          "group:7003",
+          "private:7001",
+          "internal:黑话学习",
+          "group:509"
+        ]
+      }
+    ],
+    "totals": {
+      "cost": 18.256651039999998,
+      "tokens": 1719192,
+      "turns": 8,
+      "steps": 10
+    },
+    "busiest": {
+      "t": 1792972800000,
+      "cost": 18.255469039999998,
+      "tokens": 1718122
+    },
+    "estimated": true,
+    "countedSamples": 10,
+    "offChartCost": 0.02836200000000133,
+    "offChartTokens": 13870
+  },
+  "series48": {
+    "ok": true,
+    "generatedAt": 1792980000000,
+    "currency": "CNY",
+    "symbol": "¥",
+    "hours": 48,
+    "bucketMs": 21600000,
+    "from": 1792821600000,
+    "to": 1792994400000,
+    "buckets": [
+      {
+        "t": 1792821600000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792843200000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792864800000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792886400000,
+        "cost": 0.001066,
+        "tokens": 1090,
+        "cacheMiss": 700,
+        "cacheHit": 300,
+        "cacheWrite": 0,
+        "output": 90,
+        "turns": 1,
+        "steps": 1,
+        "tier": "off",
+        "keys": [
+          "group:7003"
+        ]
+      },
+      {
+        "t": 1792908000000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792929600000,
+        "cost": 0.0011819999999999999,
+        "tokens": 1070,
+        "cacheMiss": 900,
+        "cacheHit": 100,
+        "cacheWrite": 0,
+        "output": 70,
+        "turns": 1,
+        "steps": 1,
+        "tier": "off",
+        "keys": [
+          "private:7001"
+        ]
+      },
+      {
+        "t": 1792951200000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "off",
+        "keys": []
+      },
+      {
+        "t": 1792972800000,
+        "cost": 18.255469039999998,
+        "tokens": 1718122,
+        "cacheMiss": 1142431,
+        "cacheHit": 250376,
+        "cacheWrite": 1,
+        "output": 325314,
+        "turns": 7,
+        "steps": 9,
+        "tier": "mixed",
+        "keys": [
+          "group:7003",
+          "private:7001",
+          "internal:黑话学习",
+          "group:509"
+        ]
+      }
+    ],
+    "totals": {
+      "cost": 18.25771704,
+      "tokens": 1720282,
+      "turns": 9,
+      "steps": 11
+    },
+    "busiest": {
+      "t": 1792972800000,
+      "cost": 18.255469039999998,
+      "tokens": 1718122
+    },
+    "estimated": true,
+    "countedSamples": 11,
+    "offChartCost": 0.027295999999999765,
+    "offChartTokens": 12780
+  },
+  "series1": {
+    "ok": true,
+    "generatedAt": 1792980000000,
+    "currency": "CNY",
+    "symbol": "¥",
+    "hours": 1,
+    "bucketMs": 300000,
+    "from": 1792976700000,
+    "to": 1792980300000,
+    "buckets": [
+      {
+        "t": 1792976700000,
+        "cost": 0.0007770400000000001,
+        "tokens": 222,
+        "cacheMiss": 131,
+        "cacheHit": 26,
+        "cacheWrite": 1,
+        "output": 64,
+        "turns": 1,
+        "steps": 2,
+        "tier": "peak",
+        "keys": [
+          "group:7003"
+        ]
+      },
+      {
+        "t": 1792977000000,
+        "cost": 0.12,
+        "tokens": 45000,
+        "cacheMiss": 40000,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 5000,
+        "turns": 1,
+        "steps": 1,
+        "tier": "peak",
+        "keys": [
+          "group:509"
+        ]
+      },
+      {
+        "t": 1792977300000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792977600000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792977900000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792978200000,
+        "cost": 17.16,
+        "tokens": 1500000,
+        "cacheMiss": 1000000,
+        "cacheHit": 200000,
+        "cacheWrite": 0,
+        "output": 300000,
+        "turns": 1,
+        "steps": 1,
+        "tier": "peak",
+        "keys": [
+          "group:7003"
+        ]
+      },
+      {
+        "t": 1792978500000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792978800000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792979100000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792979400000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792979700000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      },
+      {
+        "t": 1792980000000,
+        "cost": 0,
+        "tokens": 0,
+        "cacheMiss": 0,
+        "cacheHit": 0,
+        "cacheWrite": 0,
+        "output": 0,
+        "turns": 0,
+        "steps": 0,
+        "tier": "peak",
+        "keys": []
+      }
+    ],
+    "totals": {
+      "cost": 17.28077704,
+      "tokens": 1545222,
+      "turns": 3,
+      "steps": 4
+    },
+    "busiest": {
+      "t": 1792978200000,
+      "cost": 17.16,
+      "tokens": 1500000
+    },
+    "estimated": false,
+    "countedSamples": 4,
+    "offChartCost": 1.0042359999999988,
+    "offChartTokens": 187840
+  },
+  "conversation": {
+    "group:7003": {
+      "ok": true,
+      "generatedAt": 1792980000000,
+      "currency": "CNY",
+      "symbol": "¥",
+      "key": "group:7003",
+      "sessionIds": [
+        "sess-a-0",
+        "sess-a-1"
+      ],
+      "sessions": 2,
+      "buckets": {
+        "cacheMiss": 1009531,
+        "cacheHit": 203326,
+        "cacheWrite": 1,
+        "output": 301404,
+        "reasoning": 0
+      },
+      "cost": 17.18831904,
+      "unattributedCost": 0,
+      "attributedCost": 17.18831904,
+      "byTier": {
+        "peak": 17.186209039999998,
+        "off": 0.00211
+      },
+      "turns": [
+        {
+          "sessionId": "sess-a-1",
+          "key": "group:7003",
+          "turn": 6,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1793001600000,
+          "endedAt": 1793001600000,
+          "model": "mystery-model",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 4000,
+            "cacheHit": 1000,
+            "cacheWrite": 0,
+            "output": 500,
+            "reasoning": 0
+          },
+          "cost": 0.01204,
+          "tier": "peak"
+        },
+        {
+          "sessionId": "sess-a-1",
+          "key": "group:7003",
+          "turn": 5,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1790820000000,
+          "endedAt": 1790820000000,
+          "model": "deepseek-v4-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 800,
+            "cacheHit": 200,
+            "cacheWrite": 0,
+            "output": 60,
+            "reasoning": 0
+          },
+          "cost": 0.001044,
+          "tier": "off"
+        },
+        {
+          "sessionId": "sess-a-1",
+          "key": "group:7003",
+          "turn": 4,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792893600000,
+          "endedAt": 1792893600000,
+          "model": "deepseek-v4-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 700,
+            "cacheHit": 300,
+            "cacheWrite": 0,
+            "output": 90,
+            "reasoning": 0
+          },
+          "cost": 0.001066,
+          "tier": "off"
+        },
+        {
+          "sessionId": "sess-a-1",
+          "key": "group:7003",
+          "turn": 3,
+          "steps": 2,
+          "attempts": 0,
+          "startedAt": 1792996200000,
+          "endedAt": 1792996260000,
+          "model": "deepseek-v4-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 3500,
+            "cacheHit": 1700,
+            "cacheWrite": 0,
+            "output": 650,
+            "reasoning": 0
+          },
+          "cost": 0.012268000000000001,
+          "tier": "peak"
+        },
+        {
+          "sessionId": "sess-a-1",
+          "key": "group:7003",
+          "turn": 2,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792978200000,
+          "endedAt": 1792978200000,
+          "model": "deepseek-v4-pro",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 1000000,
+            "cacheHit": 200000,
+            "cacheWrite": 0,
+            "output": 300000,
+            "reasoning": 0
+          },
+          "cost": 17.16,
+          "tier": "peak"
+        },
+        {
+          "sessionId": "sess-a-1",
+          "key": "group:7003",
+          "turn": 1,
+          "steps": 2,
+          "attempts": 1,
+          "startedAt": 1792976760000,
+          "endedAt": 1792976880000,
+          "model": "deepseek-v4-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 131,
+            "cacheHit": 26,
+            "cacheWrite": 1,
+            "output": 64,
+            "reasoning": 0
+          },
+          "cost": 0.0007770400000000001,
+          "tier": "peak"
+        },
+        {
+          "sessionId": "sess-a-0",
+          "key": "group:7003",
+          "turn": 1,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792458000000,
+          "endedAt": 1792458000000,
+          "model": "deepseek-v4-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 400,
+            "cacheHit": 100,
+            "cacheWrite": 0,
+            "output": 40,
+            "reasoning": 0
+          },
+          "cost": 0.001124,
+          "tier": "peak"
+        }
+      ],
+      "steps": 9,
+      "estimated": true,
+      "lastAt": 1793001600000,
+      "firstAt": 1790820000000,
+      "models": [
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+        "mystery-model"
+      ],
+      "turnLimit": 50
+    },
+    "private:7001": {
+      "ok": true,
+      "generatedAt": 1792980000000,
+      "currency": "CNY",
+      "symbol": "¥",
+      "key": "private:7001",
+      "sessionIds": [
+        "sess-b-1"
+      ],
+      "sessions": 1,
+      "buckets": {
+        "cacheMiss": 1500,
+        "cacheHit": 300,
+        "cacheWrite": 0,
+        "output": 150,
+        "reasoning": 0
+      },
+      "cost": 0.004212,
+      "unattributedCost": 0.0002599999999999998,
+      "attributedCost": 0.003952,
+      "byTier": {
+        "peak": 0.004212,
+        "off": 0
+      },
+      "turns": [
+        {
+          "sessionId": "sess-b-1",
+          "key": "private:7001",
+          "turn": 9,
+          "steps": 2,
+          "attempts": 0,
+          "startedAt": 1792983600000,
+          "endedAt": 1792983720000,
+          "model": "deepseek-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 900,
+            "cacheHit": 250,
+            "cacheWrite": 0,
+            "output": 120,
+            "reasoning": 0
+          },
+          "cost": 0.00277,
+          "tier": "peak"
+        },
+        {
+          "sessionId": "sess-b-1",
+          "key": "private:7001",
+          "turn": 8,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792929600000,
+          "endedAt": 1792929600000,
+          "buckets": {
+            "cacheMiss": 900,
+            "cacheHit": 100,
+            "cacheWrite": 0,
+            "output": 70,
+            "reasoning": 0
+          },
+          "cost": 0.0011819999999999999,
+          "tier": "off"
+        }
+      ],
+      "steps": 3,
+      "estimated": true,
+      "lastAt": 1792983720000,
+      "firstAt": 1792929600000,
+      "models": [
+        "deepseek-flash"
+      ],
+      "turnLimit": 50
+    },
+    "internal:黑话学习": {
+      "ok": true,
+      "generatedAt": 1792980000000,
+      "currency": "CNY",
+      "symbol": "¥",
+      "key": "internal:黑话学习",
+      "sessionIds": [
+        "sess-c-1"
+      ],
+      "sessions": 1,
+      "buckets": {
+        "cacheMiss": 700,
+        "cacheHit": 100,
+        "cacheWrite": 0,
+        "output": 50,
+        "reasoning": 0
+      },
+      "cost": 0.001182,
+      "unattributedCost": 0,
+      "attributedCost": 0.001182,
+      "byTier": {
+        "peak": 0.0005600000000000001,
+        "off": 0.000622
+      },
+      "turns": [
+        {
+          "sessionId": "sess-c-1",
+          "key": "internal:黑话学习",
+          "turn": 2,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792987200000,
+          "endedAt": 1792987200000,
+          "buckets": {
+            "cacheMiss": 500,
+            "cacheHit": 100,
+            "cacheWrite": 0,
+            "output": 30,
+            "reasoning": 0
+          },
+          "cost": 0.000622,
+          "tier": "off"
+        },
+        {
+          "sessionId": "sess-c-1",
+          "key": "internal:黑话学习",
+          "turn": 1,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792458060000,
+          "endedAt": 1792458060000,
+          "model": "deepseek-flash",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 200,
+            "cacheHit": 0,
+            "cacheWrite": 0,
+            "output": 20,
+            "reasoning": 0
+          },
+          "cost": 0.0005600000000000001,
+          "tier": "peak"
+        }
+      ],
+      "steps": 2,
+      "estimated": true,
+      "lastAt": 1792987200000,
+      "firstAt": 1792458060000,
+      "models": [
+        "deepseek-flash"
+      ],
+      "turnLimit": 50
+    },
+    "group:509": {
+      "ok": true,
+      "generatedAt": 1792980000000,
+      "currency": "CNY",
+      "symbol": "¥",
+      "key": "group:509",
+      "sessionIds": [
+        "sess-e-1"
+      ],
+      "sessions": 1,
+      "buckets": {
+        "cacheMiss": 140000,
+        "cacheHit": 50000,
+        "cacheWrite": 0,
+        "output": 25000,
+        "reasoning": 700
+      },
+      "cost": 1.09,
+      "unattributedCost": 0,
+      "attributedCost": 1.09,
+      "byTier": {
+        "peak": 1.09,
+        "off": 0
+      },
+      "turns": [
+        {
+          "sessionId": "sess-e-1",
+          "key": "group:509",
+          "turn": 2,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792977060000,
+          "endedAt": 1792977060000,
+          "model": "deepseek-flash",
+          "provider": "opencode-go",
+          "buckets": {
+            "cacheMiss": 40000,
+            "cacheHit": 0,
+            "cacheWrite": 0,
+            "output": 5000,
+            "reasoning": 700
+          },
+          "cost": 0.12,
+          "tier": "peak"
+        },
+        {
+          "sessionId": "sess-e-1",
+          "key": "group:509",
+          "turn": 1,
+          "steps": 1,
+          "attempts": 0,
+          "startedAt": 1792976400000,
+          "endedAt": 1792976400000,
+          "model": "custom-pro",
+          "provider": "official",
+          "buckets": {
+            "cacheMiss": 100000,
+            "cacheHit": 50000,
+            "cacheWrite": 0,
+            "output": 20000,
+            "reasoning": 0
+          },
+          "cost": 0.9700000000000001,
+          "tier": "peak"
+        }
+      ],
+      "steps": 2,
+      "estimated": false,
+      "lastAt": 1792977060000,
+      "firstAt": 1792976400000,
+      "models": [
+        "custom-pro",
+        "deepseek-flash"
+      ],
+      "turnLimit": 50
+    }
+  },
+  "recent": [
+    {
+      "time": 1793001600000,
+      "key": "group:7003",
+      "sessionId": "sess-a-1",
+      "turn": 6,
+      "step": 1,
+      "retry": 0,
+      "model": "mystery-model",
+      "tokens": 5500,
+      "cacheMiss": 4000,
+      "cacheHit": 1000,
+      "cacheWrite": 0,
+      "output": 500,
+      "reasoning": 0,
+      "cost": 0.01204,
+      "tier": "peak",
+      "estimated": true
+    },
+    {
+      "time": 1792996260000,
+      "key": "group:7003",
+      "sessionId": "sess-a-1",
+      "turn": 3,
+      "step": 2,
+      "retry": 0,
+      "model": "deepseek-v4-flash",
+      "tokens": 2650,
+      "cacheMiss": 1500,
+      "cacheHit": 900,
+      "cacheWrite": 0,
+      "output": 250,
+      "reasoning": 0,
+      "cost": 0.0050360000000000005,
+      "tier": "peak",
+      "estimated": false
+    },
+    {
+      "time": 1792996200000,
+      "key": "group:7003",
+      "sessionId": "sess-a-1",
+      "turn": 3,
+      "step": 1,
+      "retry": 0,
+      "model": "deepseek-v4-flash",
+      "tokens": 3200,
+      "cacheMiss": 2000,
+      "cacheHit": 800,
+      "cacheWrite": 0,
+      "output": 400,
+      "reasoning": 0,
+      "cost": 0.007232000000000001,
+      "tier": "peak",
+      "estimated": false
+    },
+    {
+      "time": 1792990800000,
+      "key": null,
+      "sessionId": "sess-d-1",
+      "turn": 1,
+      "step": 1,
+      "retry": 0,
+      "model": null,
+      "tokens": 1000,
+      "cacheMiss": 900,
+      "cacheHit": 0,
+      "cacheWrite": 0,
+      "output": 100,
+      "reasoning": 0,
+      "cost": 0.0013,
+      "tier": "off",
+      "estimated": true
+    },
+    {
+      "time": 1792987200000,
+      "key": "internal:黑话学习",
+      "sessionId": "sess-c-1",
+      "turn": 2,
+      "step": 1,
+      "retry": 0,
+      "model": null,
+      "tokens": 630,
+      "cacheMiss": 500,
+      "cacheHit": 100,
+      "cacheWrite": 0,
+      "output": 30,
+      "reasoning": 0,
+      "cost": 0.000622,
+      "tier": "off",
+      "estimated": true
+    },
+    {
+      "time": 1792983720000,
+      "key": "private:7001",
+      "sessionId": "sess-b-1",
+      "turn": 9,
+      "step": 2,
+      "retry": 0,
+      "model": "deepseek-flash",
+      "tokens": 390,
+      "cacheMiss": 300,
+      "cacheHit": 50,
+      "cacheWrite": 0,
+      "output": 40,
+      "reasoning": 0,
+      "cost": 0.0009220000000000001,
+      "tier": "peak",
+      "estimated": false
+    },
+    {
+      "time": 1792983600000,
+      "key": "private:7001",
+      "sessionId": "sess-b-1",
+      "turn": 9,
+      "step": 1,
+      "retry": 0,
+      "model": "deepseek-flash",
+      "tokens": 880,
+      "cacheMiss": 600,
+      "cacheHit": 200,
+      "cacheWrite": 0,
+      "output": 80,
+      "reasoning": 0,
+      "cost": 0.0018479999999999998,
+      "tier": "peak",
+      "estimated": false
+    },
+    {
+      "time": 1792978200000,
+      "key": "group:7003",
+      "sessionId": "sess-a-1",
+      "turn": 2,
+      "step": 1,
+      "retry": 0,
+      "model": "deepseek-v4-pro",
+      "tokens": 1500000,
+      "cacheMiss": 1000000,
+      "cacheHit": 200000,
+      "cacheWrite": 0,
+      "output": 300000,
+      "reasoning": 0,
+      "cost": 17.16,
+      "tier": "peak",
+      "estimated": false
+    },
+    {
+      "time": 1792977060000,
+      "key": "group:509",
+      "sessionId": "sess-e-1",
+      "turn": 2,
+      "step": 1,
+      "retry": 0,
+      "model": "deepseek-flash",
+      "tokens": 45000,
+      "cacheMiss": 40000,
+      "cacheHit": 0,
+      "cacheWrite": 0,
+      "output": 5000,
+      "reasoning": 700,
+      "cost": 0.12,
+      "tier": "peak",
+      "estimated": false
+    },
+    {
+      "time": 1792976880000,
+      "key": "group:7003",
+      "sessionId": "sess-a-1",
+      "turn": 1,
+      "step": 1,
+      "retry": 1,
+      "model": "deepseek-v4-flash",
+      "tokens": 52,
+      "cacheMiss": 31,
+      "cacheHit": 6,
+      "cacheWrite": 1,
+      "output": 14,
+      "reasoning": 0,
+      "cost": 0.00017623999999999998,
+      "tier": "peak",
+      "estimated": false
+    }
+  ],
+  "stats": {
+    "file": "C:\\qqbot\\backups\\migration-worktrees\\ticket-22\\her\\tests\\fixtures\\token-ledger\\main\\token-usage.jsonl",
+    "journalLines": 20,
+    "maxLines": 20000,
+    "droppedLines": 0,
+    "sessions": 6,
+    "baselines": 1,
+    "samples": 17,
+    "lastIngestAt": 1792980000000,
+    "lastCompactedAt": 0,
+    "priceVersion": "2026-11-04"
+  }
+}

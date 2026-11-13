@@ -1,0 +1,7 @@
+{
+  "sessions": {
+    "group:7003": "sess-a-1",
+    "private:7001": "sess-b-1",
+    "group:509": "sess-e-1"
+  }
+}

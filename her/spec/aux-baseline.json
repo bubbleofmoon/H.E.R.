@@ -1,0 +1,132 @@
+{
+  "search": [
+    {
+      "result": {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {
+          "tools": {
+            "listChanged": true
+          }
+        },
+        "serverInfo": {
+          "name": "web-search-safe",
+          "version": "0.2.0-r4"
+        }
+      },
+      "jsonrpc": "2.0",
+      "id": 1
+    },
+    {
+      "result": {
+        "tools": [
+          {
+            "name": "web_search",
+            "description": "只读联网搜索：优先使用与 DSH 相同的 DeepSeek 联网搜索（结果更准、不把群里的词发给搜索引擎广告网络），不可用时自动回退 Bing。返回标题/URL/摘要，不执行任何本地操作。适合查网络用语、梗、事实性问题和热点。",
+            "inputSchema": {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string",
+                  "description": "要搜索确认的网络用语/黑话/梗/事实性问题"
+                }
+              },
+              "required": [
+                "query"
+              ]
+            },
+            "execution": {
+              "taskSupport": "forbidden"
+            }
+          },
+          {
+            "name": "web_fetch",
+            "description": "只读抓取 HTTP(S) 网页正文，返回纯文本/HTML 前 50000 字符。禁止访问内网/本机地址，不执行任何本地操作。",
+            "inputSchema": {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "type": "object",
+              "properties": {
+                "url": {
+                  "type": "string",
+                  "description": "要抓取的 http(s) URL"
+                }
+              },
+              "required": [
+                "url"
+              ]
+            },
+            "execution": {
+              "taskSupport": "forbidden"
+            }
+          }
+        ]
+      },
+      "jsonrpc": "2.0",
+      "id": 2
+    },
+    {
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "查询词为空，已拒绝。"
+          }
+        ],
+        "isError": true
+      },
+      "jsonrpc": "2.0",
+      "id": 3
+    },
+    {
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "抓取失败：禁止访问内网/本机地址"
+          }
+        ],
+        "isError": true
+      },
+      "jsonrpc": "2.0",
+      "id": 4
+    }
+  ],
+  "host": [
+    {
+      "result": {
+        "protocolVersion": "2025-03-26",
+        "capabilities": {
+          "tools": {
+            "listChanged": true
+          }
+        },
+        "serverInfo": {
+          "name": "snowluma-host",
+          "version": "0.2.0-r4"
+        }
+      },
+      "jsonrpc": "2.0",
+      "id": 1
+    },
+    {
+      "result": {
+        "tools": [
+          {
+            "name": "snowluma_status",
+            "description": "检查 SnowLuma OneBot 网关是否在线（只读探活 get_login_info）。返回网关可达性、QQ 在线状态与账号信息。网关不可达时返回可操作的提示（本程序不会代你启动 SnowLuma）。",
+            "inputSchema": {
+              "$schema": "http://json-schema.org/draft-07/schema#",
+              "type": "object",
+              "properties": {}
+            },
+            "execution": {
+              "taskSupport": "forbidden"
+            }
+          }
+        ]
+      },
+      "jsonrpc": "2.0",
+      "id": 2
+    }
+  ]
+}

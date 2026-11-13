@@ -1,0 +1,19 @@
+# Runtime state and credentials
+config/
+data/
+logs/
+state/
+backups/
+.dsh/
+SnowLuma/
+node_modules/
+target/
+__pycache__/
+*.pyc
+*.log
+*.zip
+graphify-out/
+.test-fixtures/
+ci-evidence/
+# Private run data (agent usage ledger) stays untracked
+.scratch/

@@ -1,0 +1,93 @@
+name: checks
+# Push/PR checks for this repository use free standard GitHub-hosted runners.
+# They are the merge check; native, elevated and production-adjacent gates stay local
+# (docs/agents/rust-validation.md). Never attach a self-hosted runner to this repository.
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            base: /tmp
+            tree: /tmp/her
+          - os: windows-2022
+            base: C:/
+            tree: C:/her-ci
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.base }}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: ${{ matrix.tree }}
+      CARGO_TARGET_DIR: ${{ matrix.tree }}-target
+      CI_EVIDENCE: ${{ matrix.tree }}-evidence
+    steps:
+      # Long-form path on the checkout's drive: RUNNER_TEMP is a short name on D:,
+      # and fixtures rename between the temp folder and the tree.
+      - name: Use long-form Windows temporary directory
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "${PUBLIC_TREE}-temp"
+          echo "TEMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+          echo "TMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+      # The tentative repository name ends with a dot, which Win32 paths reject.
+      # Every step starts outside GITHUB_WORKSPACE; clone into a safe fixed name.
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Toolchains
+        run: |
+          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
+          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
+          export PATH="$RUNNER_TEMP/her-node/bin:$RUNNER_TEMP/her-node:$PATH"
+          node --version
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          python --version
+      - name: Repository checks and scans
+        run: |
+          cd "$PUBLIC_TREE"
+          python -I scripts/ci/install-gitleaks.py "$RUNNER_TEMP/her-gitleaks"
+          HER_GITLEAKS="$RUNNER_TEMP/her-gitleaks/gitleaks"
+          if [ "$RUNNER_OS" = Windows ]; then HER_GITLEAKS="$HER_GITLEAKS.exe"; fi
+          export HER_GITLEAKS
+          python -I scripts/check-repo.py
+          python -I scripts/tests/test_scan_public.py
+          python -I scripts/tests/test_pre_push_hook.py
+          python -I scripts/tests/test_gh_public.py
+          python -I scripts/scan-public.py
+          "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
+      - name: Build and full test suite (all gate targets)
+        run: |
+          cd "$PUBLIC_TREE"
+          export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
+          python -I scripts/ci/run-tests.py
+      - name: Windows launcher checks
+        if: runner.os == 'Windows'
+        run: |
+          cd "$PUBLIC_TREE"
+          export HER_TEST_CLI="$CARGO_TARGET_DIR/debug/her-cli.exe"
+          export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
+          powershell.exe -NoProfile -File scripts/test-ps-count.ps1
+          powershell.exe -NoProfile -File scripts/test-external-path.ps1
+      - name: Upload CI evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-evidence-${{ matrix.os }}
+          path: ${{ env.CI_EVIDENCE }}
+          retention-days: 7

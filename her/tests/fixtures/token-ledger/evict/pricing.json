@@ -1,0 +1,12 @@
+{
+  "peakMultiplier": 2,
+  "models": {
+    "custom-pro": {
+      "off": {
+        "cacheHit": 0.1,
+        "cacheMiss": 3,
+        "output": 9
+      }
+    }
+  }
+}
