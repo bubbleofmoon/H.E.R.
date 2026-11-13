@@ -9,6 +9,7 @@ RUN nor in EXEMPT fails the run, so a new test script cannot stay unrun.
 import argparse
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -72,7 +73,8 @@ for binary in (exe, cli):
 
 listed = {name for name, _, _ in RUN} | set(EXEMPT)
 on_disk = {path.name for path in scripts.glob('test-*.py')}
-problems = [f'{name}: not in RUN or EXEMPT' for name in sorted(on_disk - listed)]
+problems = [f'{name}: in both RUN and EXEMPT' for name in sorted({name for name, _, _ in RUN} & set(EXEMPT))]
+problems += [f'{name}: not in RUN or EXEMPT' for name in sorted(on_disk - listed)]
 problems += [f'{name}: listed but missing' for name in sorted(listed - on_disk)]
 if problems:
     print('\n'.join(problems), file=sys.stderr)
@@ -84,8 +86,6 @@ env = os.environ.copy()
 env.setdefault('HER_INSTALL_ROOT', str(ev / 'unused-install-root'))
 env.setdefault('HER_TASK_SCHEDULER_FILE', str(ev / 'task-scheduler.xml'))
 env['HER_TEST_CLI'] = str(cli)
-# her/build.ps1 reads USERPROFILE, which Linux does not set.
-env.setdefault('USERPROFILE', str(ev / 'userprofile'))
 
 failed = []
 for name, extra, takes_exe in RUN:
@@ -93,12 +93,28 @@ for name, extra, takes_exe in RUN:
     log = ev / (label.replace(' ', '.').removeprefix('test-').removesuffix('.py') + '.log')
     # No -I: the scripts import their sibling fixture_paths.py from the script directory.
     command = [sys.executable, str(scripts / name), *([str(exe)] if takes_exe else []), *extra]
+    script_env = env
+    if name == 'test-candidate-build.py':
+        # her/build.ps1 reads USERPROFILE, which Linux does not set; no other script gets one.
+        script_env = {**env, 'USERPROFILE': str(ev / 'userprofile')}
     started = time.monotonic()
+    # Own session, so a hung script's whole process group can be stopped.
+    child = subprocess.Popen(command, env=script_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, start_new_session=True)
     try:
-        result = subprocess.run(command, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT)
-        code, output = result.returncode, result.stdout + result.stderr
-    except subprocess.TimeoutExpired as timeout:
-        code, output = 124, (timeout.stdout or b'') + (timeout.stderr or b'') + f'\ntimed out after {TIMEOUT}s\n'.encode()
+        output, _ = child.communicate(timeout=TIMEOUT)
+        code = child.returncode
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            output, _ = child.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            output = b''  # a descendant outside the group still holds the pipe
+        code = 124
+        output += f'\nTIMEOUT: killed after {TIMEOUT}s\n'.encode()
     log.write_bytes(output)
     seconds = time.monotonic() - started
     lines = output.decode('utf-8', errors='replace').splitlines()

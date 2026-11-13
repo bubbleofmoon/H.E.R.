@@ -33,30 +33,37 @@ with tempfile.TemporaryDirectory(prefix='ticket27-start-stop-') as tmp:
     (other/'config/config.json').write_text(json.dumps({'consoleToken':'fixture-token','consolePort':other_port}))
     (other/'data/social-v2.json').write_text('{}')
     (other/'dependencies.json').write_text('{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}')
-    holder=subprocess.Popen([exe,'--console-serve','--console-port',str(other_port),'--runtime-root',str(other)],
-                            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
-    deadline=time.monotonic()+15
-    while True:
-        try:
-            with socket.create_connection(('127.0.0.1',other_port),timeout=.2): break
-        except OSError:
-            assert time.monotonic()<deadline and holder.poll() is None,'synthetic gate holder did not start'
-            time.sleep(.05)
-    stat=Path(f'/proc/{holder.pid}/stat').read_text()
-    identity={'pid':holder.pid,'start':int(stat[stat.rfind(')')+1:].split()[19]),
-              'exe':str(Path(f'/proc/{holder.pid}/exe').resolve())}
-    gate_path=root/'data/logs/rbridge-console.lock'; gate_path.touch()
-    gate=open(gate_path,'r+')
-    fcntl.flock(gate,fcntl.LOCK_EX)
-    Path(str(gate_path)+'.owner.json').write_text(json.dumps({'v':1,'role':'console','identity':identity,
-        'acquiredAt':1,'refreshedAt':1}))
-    libc=ctypes.CDLL(None,use_errno=True)
-    notify=libc.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC)
-    assert notify>=0 and libc.inotify_add_watch(notify,os.fsencode(gate_path),0x20)>=0
-    starter=subprocess.Popen([exe,'--console-serve','--console-port',str(port),'--runtime-root',str(root)],
-                             stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
-    stopper=None
+    holder=starter=stopper=gate=None
+    notify=-1
+    def kill_group(process):
+        if process is None: return
+        try: os.killpg(process.pid,signal.SIGKILL)
+        except ProcessLookupError: pass
+        try: process.wait(timeout=10)
+        except subprocess.TimeoutExpired: pass
     try:
+        holder=subprocess.Popen([exe,'--console-serve','--console-port',str(other_port),'--runtime-root',str(other)],
+                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        deadline=time.monotonic()+15
+        while True:
+            try:
+                with socket.create_connection(('127.0.0.1',other_port),timeout=.2): break
+            except OSError:
+                assert time.monotonic()<deadline and holder.poll() is None,'synthetic gate holder did not start'
+                time.sleep(.05)
+        stat=Path(f'/proc/{holder.pid}/stat').read_text()
+        identity={'pid':holder.pid,'start':int(stat[stat.rfind(')')+1:].split()[19]),
+                  'exe':str(Path(f'/proc/{holder.pid}/exe').resolve())}
+        gate_path=root/'data/logs/rbridge-console.lock'; gate_path.touch()
+        gate=open(gate_path,'r+')
+        fcntl.flock(gate,fcntl.LOCK_EX)
+        Path(str(gate_path)+'.owner.json').write_text(json.dumps({'v':1,'role':'console','identity':identity,
+            'acquiredAt':1,'refreshedAt':1}))
+        libc=ctypes.CDLL(None,use_errno=True)
+        notify=libc.inotify_init1(os.O_NONBLOCK|os.O_CLOEXEC)
+        assert notify>=0 and libc.inotify_add_watch(notify,os.fsencode(gate_path),0x20)>=0
+        starter=subprocess.Popen([exe,'--console-serve','--console-port',str(port),'--runtime-root',str(root)],
+                                 stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
         ready,_,_=select.select([notify],[],[],15)
         assert ready,'console did not reach the held owner gate'
         os.read(notify,4096)
@@ -74,12 +81,8 @@ with tempfile.TemporaryDirectory(prefix='ticket27-start-stop-') as tmp:
                 time.sleep(.05)
         print('stop and console startup serialize at the owner transition')
     finally:
-        gate.close(); os.close(notify)
-        if stopper is not None and stopper.poll() is None:
-            stopper.kill(); stopper.wait(timeout=5)
-        try: os.killpg(starter.pid,signal.SIGKILL)
-        except ProcessLookupError: pass
-        starter.wait(timeout=10)
-        try: os.killpg(holder.pid,signal.SIGKILL)
-        except ProcessLookupError: pass
-        holder.wait(timeout=10)
+        if gate is not None: gate.close()
+        if notify>=0: os.close(notify)
+        if stopper is not None and stopper.poll() is None: kill_group(stopper)
+        kill_group(starter)
+        kill_group(holder)
