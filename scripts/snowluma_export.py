@@ -26,7 +26,7 @@ import sys
 REQUIRED = ('message_hash', 'is_group', 'session_id', 'sequence', 'private_direction', 'timestamp', 'data')
 MEDIA = {'image': 'image', 'video': 'video', 'record': 'voice', 'file': 'file', 'flash_file': 'file',
          'mface': 'sticker', 'json': 'card', 'xml': 'card', 'markdown': 'markdown'}
-CQ_FULL = re.compile(r'\[CQ:([A-Za-z_]+)((?:,[^,\]]*)*)\]')
+CQ_FULL = re.compile(r'\[CQ:([A-Za-z_]+)((?:,[^,\[\]]*)*)\]')
 CQ_HEAD = re.compile(r'\[CQ:([A-Za-z_]+)')
 CARD_TYPES = {'json', 'xml', 'markdown'}
 SURROGATE = re.compile(r'[\ud800-\udfff]')
@@ -192,15 +192,19 @@ def snapshot(live, copy):
             dst.close()
         if src is not None:
             src.close()
-    if sorted(os.listdir(live_dir)) != before:
-        status, message = 1, (message + '; ' if message else '') + 'live directory file set changed during snapshot'
-    if not status:
-        try:
+    succeeded = False
+    try:
+        if sorted(os.listdir(live_dir)) != before:
+            status, message = 1, (message + '; ' if message else '') + 'live directory file set changed during snapshot'
+        if not status:
             seal(copy, count)
-        except OSError:
-            status, message = 1, 'snapshot failed: the snapshot marker could not be written'
+        succeeded = not status
+    except OSError:
+        status, message = 1, 'snapshot failed: the live directory or the snapshot marker could not be verified'
+    finally:
+        if not succeeded:
+            _remove_copy(copy)
     if status:
-        _remove_copy(copy)
         print(message)
         return status
     print(f'snapshot: messages={count} no_ckpt_on_close={ckpt}')
@@ -230,6 +234,9 @@ def export(db, out, convs):
             conn.close()
     except sqlite3.Error:
         print('export refused: the snapshot cannot be read')
+        return 2
+    if not sealed(db):
+        print('export refused: the snapshot changed while it was read')
         return 2
     counts = Counter()
     records = []

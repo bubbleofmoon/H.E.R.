@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 from unittest import mock
 import unittest
 
@@ -99,6 +100,17 @@ def open_wal_store(path, rows):
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def read_ready(proc, seconds):
+    """The child's first stdout line, or None when it does not arrive within the deadline."""
+    box = {}
+    reader = threading.Thread(target=lambda: box.update(line=proc.stdout.readline()), daemon=True)
+    reader.start()
+    reader.join(seconds)
+    if reader.is_alive():
+        return None
+    return box.get('line', '')
 
 
 def standard_rows():
@@ -535,7 +547,8 @@ class SnapshotGate(unittest.TestCase):
                                     text=True, encoding='utf-8',
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             try:
-                ready = proc.stdout.readline()
+                ready = read_ready(proc, 30)
+                self.assertIsNotNone(ready, 'the child did not report ready within 30 s')
                 self.assertEqual(ready.strip(), 'ready', 'the child must hold the store and report ready')
                 before_list = sorted(os.listdir(live_dir))
                 with contextlib.redirect_stdout(io.StringIO()):
@@ -552,6 +565,98 @@ class SnapshotGate(unittest.TestCase):
                 for pipe in (proc.stdin, proc.stdout, proc.stderr):
                     if pipe is not None:
                         pipe.close()
+
+
+class RawBracket(unittest.TestCase):
+    def test_raw_bracket_in_cq_parameters_makes_the_code_unparsable(self):
+        module = export_module()
+        segs = module.segments('a[CQ:image,file=[x]secret]')
+        for seg in segs:
+            if seg['k'] == 'text':
+                self.assertNotIn('secret', seg['text'], f'payload leaked into text: {segs!r}')
+                self.assertNotIn('x', seg['text'], f'payload leaked into text: {segs!r}')
+
+
+class VerifyCleanup(unittest.TestCase):
+    def test_verification_error_removes_the_copy(self):
+        module = export_module()
+        real_listdir = os.listdir
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp) / 'live'
+            copy_dir = Path(tmp) / 'copy'
+            live_dir.mkdir()
+            copy_dir.mkdir()
+            live = live_dir / 'messages.db'
+            copy = copy_dir / 'messages.db'
+            writer = open_wal_store(live, standard_rows())
+            try:
+                calls = {'n': 0}
+
+                def listdir(path='.'):
+                    calls['n'] += 1
+                    if calls['n'] == 3:
+                        raise PermissionError(13, 'denied')
+                    return real_listdir(path)
+
+                try:
+                    with mock.patch.object(module.os, 'listdir', side_effect=listdir), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        code = module.snapshot(live, copy)
+                except PermissionError:
+                    self.fail('the verification error escaped snapshot() and skipped the cleanup')
+            finally:
+                writer.close()
+            self.assertEqual(code, 1, 'a verification error must fail the snapshot')
+            self.assertFalse(copy.exists(), 'the copy must be removed')
+            self.assertFalse(module.marker_path(copy).exists(), 'the marker must be removed')
+
+
+class SealRace(unittest.TestCase):
+    def test_a_change_between_the_seal_check_and_the_read_is_refused(self):
+        module = export_module()
+        real_sealed = module.sealed
+        inserted = {'done': False}
+
+        def sealed_then_insert(path):
+            ok = real_sealed(path)
+            if not inserted['done']:
+                inserted['done'] = True
+                conn = sqlite3.connect(path)
+                conn.execute("INSERT INTO messages (message_hash, is_group, session_id, sequence, event_name, "
+                             "private_direction, timestamp, data) VALUES (998, 0, 'p', 98, 'message', 0, 2000, '{}')")
+                conn.commit()
+                conn.close()
+            return ok
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / 'copy.db'
+            out = Path(tmp) / 'out.jsonl'
+            make_sealed_store(db, standard_rows())
+            with mock.patch.object(module, 'sealed', side_effect=sealed_then_insert), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = module.export(db, out, convs=[])
+            self.assertTrue(inserted['done'], 'the change must happen after the seal check')
+            self.assertEqual(code, 2, 'a snapshot that changed before the read must be refused')
+            self.assertFalse(out.exists(), 'a refused export writes no output')
+
+
+class ReadyWait(unittest.TestCase):
+    def test_readiness_wait_gives_up_after_its_deadline(self):
+        helper = globals().get('read_ready')
+        self.assertTrue(callable(helper), 'read_ready(proc, seconds) does not exist yet')
+        proc = subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(3600)'],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding='utf-8',
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        try:
+            self.assertIsNone(helper(proc, 1), 'a child that never reports ready must time out')
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=60)
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
 
 
 if __name__ == '__main__':

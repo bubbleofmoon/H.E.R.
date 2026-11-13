@@ -59,9 +59,10 @@ def _dropped(ch):
 
 
 def fold(text):
-    """Drop format characters, variation selectors and keycap marks; map every digit and
+    """Compose to NFC; drop format characters, variation selectors and keycap marks; map every digit and
     full-width letters and @.-_#%=&+~ to ASCII; keep Chinese text and punctuation; lone
     surrogates become U+FFFD."""
+    text = unicodedata.normalize('NFC', text)
     out = []
     for ch in text:
         if 0xD800 <= ord(ch) <= 0xDFFF:
@@ -82,9 +83,8 @@ def fold(text):
     return ''.join(out)
 
 
-TAIL = r'[^\s\u4e00-\u9fff，。！、；「」『』【】《》（）]*'
-TLDS = ('com|cn|net|org|tv|io|me|cc|top|xyz|link|ly|gg|app|dev|co|info|biz|site|online|vip|club|ai|so|im|be|to|'
-        'fm|la|ws|live|shop|store|tech|wiki|art|pro|asia|mobi|name|edu|gov|mil|int')
+TAIL = r'(?:[^\s。，！？；（）、「」『』【】《》]|？(?=[A-Za-z_]+=))*'
+QSEP = r'(?:[/／?#]|？(?=[A-Za-z_]+=))'
 HOME_WIN = re.compile(r'(?i)(?<![A-Za-z])[a-z]:[\\/]+users[\\/]+[^\s\\/]+')
 HOME_POSIX = re.compile(r'(?i)(?:/home|/users|/[a-z]/users)/[^\s/]+')
 SCHEME = re.compile(r'(?i)(?<![A-Za-z0-9+.-])[a-z][a-z0-9+.-]{0,30}[:：]\s?(?:[/／]\s?[/／]|\?)' + TAIL)
@@ -93,11 +93,12 @@ EMAIL = re.compile(EMAIL_LOCAL + r'\s?@\s?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+')
 EMAIL_HASH = re.compile(EMAIL_LOCAL + r'\s?#\s?(?:qq|163|126|139|yeah|gmail|outlook|hotmail|foxmail|sina|sohu|'
                         r'yahoo|icloud|live|aliyun)\.(?:com|cn|net)(?:\.cn)?', re.IGNORECASE)
 WWW = re.compile(r'(?i)(?<![A-Za-z0-9.-])www\.' + TAIL)
-IPV4 = re.compile(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d)(?::\d{1,5})?(?:[/／?#]' + TAIL + ')?')
+IPV4 = re.compile(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d)(?::\d{1,5})?(?:' + QSEP + TAIL + ')?')
 HOST_PATH = re.compile(r'(?i)(?<![A-Za-z0-9@.-])(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]{1,23}'
-                       r'(?:(?::\d{1,5})?[/／?#]|:\d{1,5}(?!\d))' + TAIL)
+                       r'(?:(?::\d{1,5})?' + QSEP + r'|:\d{1,5}(?!\d))' + TAIL)
 HOST_DOT = re.compile(r'(?i)(?<![A-Za-z0-9-])[a-z0-9-]+\s*[。点]\s*(?:com|cn|net|org)(?![a-z])')
-HOST_BARE = re.compile(r'(?i)(?<![A-Za-z0-9@.-])(?:[a-z0-9-]+\.)+(?:' + TLDS + r'|[a-z]{2})(?![A-Za-z0-9-])')
+HOST_BARE = re.compile(r'(?i)(?<![A-Za-z0-9@.-])(?:[a-z0-9-]+\.)*(?=[a-z0-9-]*[a-z])[a-z0-9-]{2,}\.[a-z]{2,24}'
+                       r'(?![A-Za-z0-9-])')
 PHONE = re.compile(r'(?<!\d)(?:\+?86[- ]?)?1[3-9]\d(?:[- ]?\d{4}){2}(?!\d)|(?<!\d)0\d{2,3}-\d{7,8}(?!\d)')
 CJK = '\u4e00-\u9fff'
 NUM = r'[\d一二三四五六七八九十百零〇]'
@@ -107,15 +108,18 @@ ADDRESS = re.compile(
     rf'[{CJK}\d]{{1,12}}(?:大道|路|街|巷|弄|胡同)\s*{NUM}+(?:号|弄)(?:\s*{UNIT}(?:号楼|栋|幢|座|单元|层|楼|室))*')
 ESTATE = re.compile(
     rf'[{CJK}]{{2,10}}(?:小区|花园|公寓|大厦|家园|苑)\s*{UNIT}(?:号楼|栋|幢|座|单元|室)(?:\s*{UNIT}(?:号楼|栋|幢|座|单元|层|室|号))*')
-SEP = r'[\s\-._·‐‑‒–—―−]'
+NUMERAL_CHARS = '零〇一二三四五六七八九两幺壹贰叁肆伍陆柒捌玖拾'
+NUMERAL = r'[\d零〇一二三四五六七八九两幺壹贰叁肆伍陆柒捌玖拾]'
+SEP_CHAR = r'(?!\w)[\s\S]'
+SEPS = r'(?:\s{1,6}|(?:' + SEP_CHAR + r'){1,3})?'
 DATE = re.compile(r'(?<!\d)(?:19|20)\d{2}[-./年](?:0?[1-9]|1[0-2])[-./月](?:0?[1-9]|[12]\d|3[01])日?(?!\d)')
 DATE_SPLIT = re.compile('(' + DATE.pattern + ')')
-DIGIT_SEQ = re.compile(r'\d(?:' + SEP + r'{0,3}\d)*[Xx]?')
+DIGIT_SEQ = re.compile(NUMERAL + '(?:' + SEPS + NUMERAL + ')*[Xx]?')
 CJK_NUM = re.compile(r'[零〇一二三四五六七八九两幺](?:[\s\-.,，、·]?[零〇一二三四五六七八九两幺]){4,}')
 MENTION = re.compile(r'@(?!〔)[^\s@〔<]{0,16}')
 MENTION_CODE = re.compile(r'@(?=〔)')
 PLACEHOLDER = re.compile(r'〔[PGMB]-[a-z]{8,10}〕|<(?:链接|邮箱|电话|地址|数字|路径|提及)>')
-NAME_SPLIT = re.compile(r'[\s【】\[\]()（）<>《》「」『』|/\\_~·•,，.。:：;；!！?？+=*#&、-]+')
+NAME_SPLIT = re.compile(r'[^A-Za-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u024f\u4e00-\u9fff\u3400-\u4dbf]+')
 NOT_A_NAME = re.compile(r'[\d\W_]+')
 DECOR_STOP = frozenset({'管理', '管理员', '群主', '群员', '成员', '萌新', '新人', '本人', '官方', 'admin', 'mod', 'bot', 'owner'})
 TEXT_RULES = (('path', HOME_WIN, '<路径>'), ('path', HOME_POSIX, '<路径>'), ('link', SCHEME, '<链接>'),
@@ -124,7 +128,7 @@ TEXT_RULES = (('path', HOME_WIN, '<路径>'), ('path', HOME_POSIX, '<路径>'), 
               ('link', HOST_BARE, '<链接>'), ('address', ADDRESS, '<地址>'), ('address', ESTATE, '<地址>'),
               ('phone', PHONE, '<电话>'))
 # Residual scan: stricter, written apart from the replacement rules where it can be.
-SCAN_DIGITS = re.compile(r'\d(?:' + SEP + r'{0,3}\d)*')
+SCAN_DIGITS = re.compile(NUMERAL + '(?:' + SEPS + NUMERAL + ')*')
 ADJACENT = re.compile(r'\d(?:<数字>|<电话>)|(?:<数字>|<电话>)\d')
 SCAN_RULES = (
     ('cjk-digits', re.compile(r'(?:[零〇一二三四五六七八九两幺][\s\-.,，、·]?){5,}')),
@@ -147,11 +151,14 @@ SEG_KEYS = {'text': {'k', 'text'}, 'at': {'k', 'id'}, 'reply': {'k', 'mid'}, 'fo
             'face': {'k', 'id'}, 'media': {'k', 'kind'}}
 
 
-def name_pattern(names):
+def name_pattern(spellings):
+    forms = set()
+    for spelling in spellings:
+        forms.update((spelling, spelling.lower(), spelling.casefold()))
     items = []
-    for name in sorted(names, key=len, reverse=True):
-        escaped = re.escape(name)
-        items.append(rf'(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])' if name.isascii() else escaped)
+    for form in sorted(forms, key=lambda f: (-len(f), f)):
+        escaped = re.escape(form)
+        items.append(rf'(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])' if form.isascii() else escaped)
     return re.compile('|'.join(items), re.IGNORECASE) if items else None
 
 
@@ -164,19 +171,21 @@ def code(key, space, value):
 class Stripper:
     def __init__(self, key, records):
         self.key, self.counts, self.ids, self.names = key, Counter(), {}, {}
-        self.short_names, self.unsafe_names = set(), set()
+        self.spellings, self.short_names, self.unsafe_names = {}, set(), set()
         for record in records:
             self._learn(record)
         self.counts['short_names_unreplaced'] = len(self.short_names)
         self.counts['unsafe_names_skipped'] = len(self.unsafe_names)
-        self.name_re = name_pattern(self.names)
+        self.name_re = name_pattern(self.spellings)
 
     def field(self, space, raw):
         return code(self.key, space, str(raw))
 
     def _learn_name(self, raw, code_):
         name = fold(str(raw)).strip()
-        for part in ([name, *NAME_SPLIT.split(name)] if name else []):
+        # Decorated names: the whole name, the name without digits, and every part between non-letters.
+        candidates = [name, ''.join(c for c in name if not c.isdigit()), *NAME_SPLIT.split(name)] if name else []
+        for part in candidates:
             part = part.strip()
             if not part:
                 continue
@@ -187,6 +196,7 @@ class Stripper:
                 self.unsafe_names.add(key)
             else:
                 self.names.setdefault(key, code_)
+                self.spellings.setdefault(part, key)
 
     def _learn(self, record):
         kind, _, conv_id = str(record.get('conv') or '').partition(':')
@@ -211,13 +221,14 @@ class Stripper:
     def _digits(self, value):
         def run(match):
             raw = match.group()
+            numerals = [c for c in raw if c.isdigit() or c in NUMERAL_CHARS]
+            if len(numerals) < 5:
+                return raw
             tail = raw[-1] if raw[-1] in 'Xx' else ''
             digits = ''.join(c for c in raw if c.isdigit())
-            if len(digits) < 5:
-                return raw
-            known = self.ids.get(digits)
+            known = self.ids.get(digits) if len(digits) == len(numerals) else None
             self.counts['known_id' if known else 'digit_run'] += 1
-            return (f'〔{known}〕' if known else '<数字>') + (tail if tail and len(digits) < 15 else '')
+            return (f'〔{known}〕' if known else '<数字>') + (tail if tail and len(numerals) < 15 else '')
         pieces = DATE_SPLIT.split(value)
         return ''.join(piece if index % 2 else DIGIT_SEQ.sub(run, piece) for index, piece in enumerate(pieces))
 
@@ -431,8 +442,12 @@ def residuals(text, name_re):
     text = fold(text)
     if ADJACENT.search(text):
         found['adjacent-digits'] += 1
+    if re.search(r'<链接>[/?&＆]|<链接>？(?=[A-Za-z_]{1,24}=)', text):
+        found['link-tail'] += 1
+    if re.search(r'[?&＆][A-Za-z_]{1,24}=', text):
+        found['query-fragment'] += 1
     bare = PLACEHOLDER.sub('\x00', text)
-    if any(sum(c.isdigit() for c in m.group()) >= 5
+    if any(sum(c.isdigit() or c in NUMERAL_CHARS for c in m.group()) >= 5
            for piece in DATE_SPLIT.split(bare)[::2] for m in SCAN_DIGITS.finditer(piece)):
         found['digits'] += 1
     for kind, pattern in SCAN_RULES:

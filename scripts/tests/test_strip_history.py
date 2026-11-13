@@ -570,5 +570,125 @@ class Publication(unittest.TestCase):
             self.assertTrue(not out_dir.exists() or not any(out_dir.iterdir()), 'a scan finding must write nothing')
 
 
+DIGIT_LIKE = re.compile(r'[0-9零〇一二三四五六七八九两幺壹贰叁肆伍陆柒捌玖拾]')
+
+
+class R7Separators(unittest.TestCase):
+    CASES = (
+        '138,0013,8000', '138/0013/8000', '138*0013*8000', '138，0013，8000',
+        '3141    5926    5', '314,159,265', '1三8零0一3八0零0', '壹叁捌零零壹叁捌零零零',
+    )
+
+    def test_every_separated_or_mixed_digit_run_is_replaced(self):
+        s_mod = load()
+        for case in self.CASES:
+            with self.subTest(case=case):
+                stripper, out = strip_one(s_mod, '号码' + case + '好')
+                self.assertEqual(out, '号码<数字>好', f'digit run survived: {out!r}')
+                assert_stripped(self, s_mod, stripper, out, ())
+
+    def test_dates_and_four_digit_years_stay(self):
+        s_mod = load()
+        _, out = strip_one(s_mod, '今天是20' + '26-11-13')
+        self.assertEqual(out, '今天是20' + '26-11-13')
+        _, out = strip_one(s_mod, FOUR_DIGITS + '年')
+        self.assertEqual(out, FOUR_DIGITS + '年')
+
+    def test_residual_scan_counts_commas_spaces_and_mixed_numerals(self):
+        s_mod = load()
+        require(self, s_mod, 'residuals')
+        for text in ('314,159,265', '3    1    4    1    5', '1三8零0一3八0零0'):
+            with self.subTest(text=text):
+                self.assertIn('digits', s_mod.residuals(text, None), f'residual scan missed {text!r}')
+
+
+class R8Urls(unittest.TestCase):
+    CASES = (
+        'https://example.com/s?name=张三&token=AbCdEf123',
+        'example.com/u/张三/key/AbCdEf',
+        'example.com？token=AbCdEf',
+        'example.com/中文?token=abc',
+    )
+
+    def test_url_tails_run_through_cjk_and_query_pairs(self):
+        s_mod = load()
+        for case in self.CASES:
+            with self.subTest(case=case):
+                stripper, out = strip_one(s_mod, '看 ' + case + ' 好的')
+                self.assertEqual(out, '看 <链接> 好的', f'tail survived: {out!r}')
+                assert_stripped(self, s_mod, stripper, out, ('token', 'name', 'AbCdEf', '张三', '中文'))
+
+    def test_residual_scan_flags_a_link_followed_by_a_query(self):
+        s_mod = load()
+        require(self, s_mod, 'residuals')
+        self.assertIn('link-tail', s_mod.residuals('<链接>？token=x', None), 'a link followed by a query pair must be flagged')
+        self.assertIn('link-tail', s_mod.residuals('<链接>&a=b', None), 'a link followed by & must be flagged')
+        self.assertIn('query-fragment', s_mod.residuals('a?name=x', None), 'a query fragment must be flagged')
+
+    def test_ordinary_text_after_a_link_is_not_a_finding(self):
+        s_mod = load()
+        require(self, s_mod, 'residuals')
+        stripper, out = strip_one(s_mod, '看 https://example.com/s？好的')
+        self.assertEqual(out, '看 <链接>？好的', f'stripped text: {out!r}')
+        self.assertEqual(dict(s_mod.residuals(out, None)), {}, 'a link followed by ordinary ？ text must pass the residual scan')
+
+
+class R9BareHosts(unittest.TestCase):
+    def test_letters_only_tlds_of_any_length_are_links(self):
+        s_mod = load()
+        for host in ('example.museum', 'pan.example.cloud', 'zhangsan.moe'):
+            with self.subTest(host=host):
+                stripper, out = strip_one(s_mod, '看 ' + host + ' 好的')
+                self.assertEqual(out, '看 <链接> 好的')
+                assert_stripped(self, s_mod, stripper, out, (host,))
+
+    def test_ordinary_dotted_text_is_unchanged(self):
+        s_mod = load()
+        for text in ('你好.我们', 'e.g. this'):
+            with self.subTest(text=text):
+                _, out = strip_one(s_mod, text)
+                self.assertEqual(out, text)
+
+
+class R10UnicodeNames(unittest.TestCase):
+    def test_casefolded_spellings_of_a_nick_are_removed(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                  'sender': {'id': QQ_A, 'card': '', 'nick': 'Straße'}, 'segs': []}
+        stripper, out = strip_one(s_mod, 'Straße你好 STRASSE', [record])
+        assert_stripped(self, s_mod, stripper, out, ('Straße', 'STRASSE'))
+
+    def test_decomposed_text_matches_a_precomposed_nick(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                  'sender': {'id': QQ_A, 'card': '', 'nick': 'José'}, 'segs': []}
+        stripper, out = strip_one(s_mod, 'José 你好', [record])
+        assert_stripped(self, s_mod, stripper, out, ('José', 'Jose'))
+
+
+class R11DecoratedNames(unittest.TestCase):
+    CASES = (
+        ('card', '小明12345', '小明 你好'),
+        ('card', '张三2024', '张三 你好'),
+        ('card', '✨阿强✨', '阿强 你好'),
+        ('card', '꧁阿伟꧂', '阿伟 你好'),
+        ('card', '李四ゞ', '李四 你好'),
+        ('nick', '小明🌸', '小明 你好'),
+    )
+
+    def test_decorated_names_teach_their_bare_name(self):
+        s_mod = load()
+        for field, value, text in self.CASES:
+            with self.subTest(value=value):
+                sender = {'id': QQ_A, 'card': '', 'nick': ''}
+                sender[field] = value
+                record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                          'sender': sender, 'segs': []}
+                stripper, out = strip_one(s_mod, text, [record])
+                bare = text.split(' ')[0]
+                self.assertNotIn(bare, out, f'bare name survived: {out!r}')
+                self.assertIn('〔P-', out, out)
+
+
 if __name__ == '__main__':
     unittest.main()
