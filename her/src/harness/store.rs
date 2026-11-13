@@ -567,7 +567,7 @@ mod tests {
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
         std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
-        let token = crate::console::ensure_or_rotate_agent_token(&context, "private:8808", false).unwrap();
+        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let mut request = TurnRequest {
             id:"opaque-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), profile:"closed-agent".into(),

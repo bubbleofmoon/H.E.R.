@@ -41,6 +41,13 @@ mod voice_http;
 #[path = "console_access.rs"]
 mod access;
 pub(crate) use access::take_admin_wake;
+pub(crate) use crate::conversation_authority::{
+    ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
+    revoke as revoke_agent_token, token as conversation_token,
+};
+use crate::memory_actions::handle as handle_memory_action;
+#[cfg(test)]
+pub(crate) use crate::memory_actions::tool_action as memory_tool_action;
 
 fn read_json(path: &str) -> Option<Value> {
     std::fs::read_to_string(path)
@@ -1318,7 +1325,7 @@ fn parse_role_management_body(
 
 /// The frozen JS `readBody` object contract: whitespace becomes `{}`, while
 /// malformed JSON and non-object JSON are rejected before handler side effects.
-fn parse_object_body(body: &str) -> Result<Value, (u16, String)> {
+pub(crate) fn parse_object_body(body: &str) -> Result<Value, (u16, String)> {
     if body.trim_matches(social_policy_js_trim_char).is_empty() {
         return Ok(json!({}));
     }
@@ -2781,153 +2788,19 @@ fn write_setting_path(context: &RuntimeContext, path: &str, value: &Value) -> Re
     }
     write_json_atomic_for(context, CONFIG_PATH, &file)
 }
-/// The MCP memory tools use the same authorization and mutations as the HTTP surface.
-/// No console credential is supplied: a session cannot acquire administrator authority.
-pub(crate) fn memory_tool_action(context: &RuntimeContext, action: &str, args: &Value) -> Result<Value, String> {
-    let cfg = context.load_config().map_err(|e| e.to_string())?;
-    let mut body = args.clone();
-    if let Some(obj) = body.as_object_mut() {
-        // Keep old Rust callers usable while exposing the frozen JS parameter names.
-        for (old, new) in [("setting", "settingKey"), ("read_type", "readType"), ("read_id", "readId")] {
-            if !obj.contains_key(new) { if let Some(v) = obj.get(old).cloned() { obj.insert(new.to_string(), v); } }
-        }
-    }
-    let headers = HashMap::from([("x-agent-token".to_string(), args["token"].as_str().unwrap_or("").to_string())]);
-    handle_memory_action(action, &headers, &HashMap::new(), &body.to_string(), &cfg, context).map_err(|(_,error)| error)
+/// Memory routes accept the raw configured console token or a desktop session bound to the
+/// effective credential and current generation; a generated file token confers no memory authority.
+pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &Value, context: &RuntimeContext) -> bool {
+    let expected = cfg.get("consoleToken").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let raw = !expected.is_empty()
+        && headers.get("x-console-token").map(|t| t.trim() == expected).unwrap_or(false);
+    raw || headers.get("x-console-token").is_some_and(|token| {
+        desktop_session_valid(token.trim(), &context.effective_console_token(cfg))
+    })
 }
 
-fn handle_memory_action(
-    action: &str,
-    headers: &std::collections::HashMap<String, String>,
-    query: &HashMap<String, String>,
-    body: &str,
-    cfg: &Value,
-    context: &RuntimeContext,
-) -> Result<Value, (u16, String)> {
-    // Serialize with session reset/token rotation, and re-read configuration after waiting.
-    // SQLite writers and ACL revocation below share this gate with MCP calls.
-    let _gate = if context.is_isolated() {
-        Some(acquire_social_state_gate(context)?)
-    } else {
-        None
-    };
-    let fresh_cfg = if context.is_isolated() {
-        Some(context.load_config().map_err(|e| {
-            if action == "settings-set" && e == "runtime config is invalid" {
-                (400, "selected runtime config is invalid".to_string())
-            } else {
-                (503, e.to_string())
-            }
-        })?)
-    } else { None };
-    let cfg = fresh_cfg.as_ref().unwrap_or(cfg);
-    // JS 的写法：POST 读 body、其它方法用 query 参数。两边都合进来，body 优先。
-    let mut merged = serde_json::Map::new();
-    for (k, v) in query {
-        merged.insert(k.clone(), json!(v));
-    }
-    let parsed_body = if context.is_isolated() {
-        Some(parse_object_body(body)?)
-    } else {
-        serde_json::from_str::<Value>(body).ok()
-    };
-    if let Some(Value::Object(o)) = parsed_body {
-        for (k, v) in o {
-            merged.insert(k, v);
-        }
-    }
-    let b = Value::Object(merged);
-    // Preserve JS memory authority: raw headers match only a nonempty configured token.
-    let expected = cfg
-        .get("consoleToken")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    let console_ok = !expected.is_empty()
-        && headers
-            .get("x-console-token")
-            .map(|t| t.trim() == expected)
-            .unwrap_or(false);
-    // Desktop authority is separate from the raw file token and checks rotation generation.
-    let console_ok = console_ok
-        || headers.get("x-console-token").is_some_and(|token| {
-            desktop_session_valid(token.trim(), &context.effective_console_token(cfg))
-        });
-    let agent_token = headers.get("x-agent-token").cloned().unwrap_or_default();
-    // `acl` 在 key 校验**之前**处理：控制台调用可以不带 key（JS 同序）
-    if action == "acl" {
-        let owner_key = format!(
-            "private:{}",
-            cfg.get("ownerQQ").and_then(|v| v.as_i64()).unwrap_or(0)
-        );
-        let st0 = if context.is_isolated() {
-            context
-                .read_social_state()
-                .map_err(|e| (503, e.to_string()))?
-        } else {
-            load_social_state()
-        };
-        let owner_live = st0
-            .get("conversations")
-            .and_then(|c| c.get(&owner_key))
-            .and_then(|c| c.get("agentToken"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let key0 = b.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let owner_ok = console_ok
-            || (key0 == owner_key && !agent_token.is_empty() && owner_live == agent_token);
-        if !owner_ok {
-            return Err((403, "ACL 操作只允许管理员私聊或控制台".to_string()));
-        }
-        let conn = crate::memory::open_ready_for_runtime(context)
-            .map_err(|e| (500, format!("打开记忆库失败：{e}")))?;
-        let sub = b.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let rt = b.get("readerType").and_then(|v| v.as_str()).unwrap_or("session");
-        let rid = b.get("readerId").and_then(|v| v.as_str()).unwrap_or("");
-        let wt = b.get("readType").and_then(|v| v.as_str()).unwrap_or("*");
-        let wid = b.get("readId").and_then(|v| v.as_str()).unwrap_or("*");
-        if sub == "grant" {
-            let level = b.get("level").and_then(|v| v.as_str()).unwrap_or("read");
-            let id = crate::memory::grant_acl(&conn, rt, rid, wt, wid, level, "console")
-                .map_err(|e| (500, e.to_string()))?;
-            let acl = crate::memory::list_acl_json(&conn).map_err(|e| (500, e.to_string()))?;
-            return Ok(json!({ "ok": true, "id": id, "acl": acl }));
-        }
-        if sub == "revoke" {
-            let removed = crate::memory::revoke_acl(&conn, rt, rid, wt, wid, "console")
-                .map_err(|e| (500, e.to_string()))?;
-            let acl = crate::memory::list_acl_json(&conn).map_err(|e| (500, e.to_string()))?;
-            return Ok(json!({ "ok": true, "removed": removed, "acl": acl }));
-        }
-        let acl = crate::memory::list_acl_json(&conn).map_err(|e| (500, e.to_string()))?;
-        return Ok(json!({ "ok": true, "acl": acl }));
-    }
-    // `settings-*` 只允许管理员私聊（自己的 agent token）；控制台令牌不行 ——
-    // 它等于管理端全权，而"对话式配置"的整个设计前提是**只有管理员能改**。
-    if action == "settings-get" || action == "settings-set" {
-        let owner_key = format!(
-            "private:{}",
-            cfg.get("ownerQQ").and_then(|v| v.as_i64()).unwrap_or(0)
-        );
-        let key0 = b.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        let st0 = if context.is_isolated() {
-            context
-                .read_social_state()
-                .map_err(|e| (503, e.to_string()))?
-        } else {
-            load_social_state()
-        };
-        let owner_live = st0
-            .get("conversations")
-            .and_then(|c| c.get(&owner_key))
-            .and_then(|c| c.get("agentToken"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if !(key0 == owner_key && !agent_token.is_empty() && owner_live == agent_token) {
-            return Err((403, "配置读写只允许管理员私聊".to_string()));
-        }
+/// `settings-get` / `settings-set` for a caller that already proved owner-private authority.
+pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &RuntimeContext) -> Result<Value, (u16, String)> {
         if action == "settings-get" {
             let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             if path.is_empty() {
@@ -2982,143 +2855,6 @@ fn handle_memory_action(
             "hot": true,
             "note": "已立即生效",
         }));
-    }
-    if action == "archive" {
-        let owner_key = format!("private:{}", cfg.get("ownerQQ").and_then(Value::as_i64).unwrap_or(0));
-        let key = b.get("key").and_then(Value::as_str).unwrap_or("");
-        let state = load_social_state_for(context)?;
-        let owner_token = state["conversations"][&owner_key]["agentToken"].as_str().unwrap_or("");
-        if !console_ok && !(key == owner_key && !agent_token.is_empty() && agent_token == owner_token) {
-            return Err((403, "归档操作只允许管理员私聊或控制台".to_string()));
-        }
-        let id = b.get("id").and_then(Value::as_i64).filter(|id| *id > 0).ok_or((400, "id 无效".to_string()))?;
-        let archived = b.get("archived").and_then(Value::as_bool).unwrap_or(true);
-        let conn = crate::memory::open_ready_for_runtime(context).map_err(|e| (500,e))?;
-        let changed = crate::memory::archive_memory(&conn, id, archived, "console").map_err(|e| (500,e.to_string()))?;
-        return Ok(json!({"ok":true,"changed":changed,"id":id,"archived":archived}));
-    }
-    let key = b.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    if key.is_empty() {
-        return Err((400, "key 不能为空".to_string()));
-    }
-    // 会话自己的令牌：state/social-v2.json → conversations[key].agentToken
-    let st = if context.is_isolated() {
-        context
-            .read_social_state()
-            .map_err(|e| (503, e.to_string()))?
-    } else {
-        load_social_state()
-    };
-    let live_token = st
-        .get("conversations")
-        .and_then(|c| c.get(&key))
-        .and_then(|c| c.get("agentToken"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let token_ok = !live_token.is_empty() && !agent_token.is_empty() && live_token == agent_token;
-    // **只有 acl / settings-* 认控制台令牌**，其余动作必须带该会话自己的 agent token。
-    // 这一条是照 JS 来的：控制台令牌在 MCP 进程里也有，若 search/write 也认它，
-    // 任何会话都能借 MCP 读到别的会话语料。
-    let console_only_ok = console_ok && matches!(action, "acl") || console_ok && action.starts_with("settings-");
-    if !token_ok && !console_only_ok {
-        return Err((403, "agent token 无效（必须是该会话自己的令牌）".to_string()));
-    }
-    let owner_key = format!(
-        "private:{}",
-        cfg.get("ownerQQ").and_then(|v| v.as_i64()).unwrap_or(0)
-    );
-    let is_owner = key == owner_key;
-    let scope = if key.starts_with("private:") { "private" } else { "group" };
-    let conn = crate::memory::open_ready_for_runtime(context)
-        .map_err(|e| (500, format!("打开记忆库失败：{e}")))?;
-    match action {
-        "write" => {
-            let content = b.get("content").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-            if content.is_empty() {
-                return Err((400, "content 不能为空".to_string()));
-            }
-            let kind = b.get("kind").and_then(|v| v.as_str()).unwrap_or("fact").to_string();
-            let subject = b.get("subject").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let tags = b.get("tags").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let source = b.get("source").and_then(|v| v.as_str()).unwrap_or("agent").to_string();
-            let importance = b.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
-            let scope_v = b.get("scope").and_then(|v| v.as_str()).unwrap_or(scope).to_string();
-            let input = crate::memory::MemoryInput {
-                owner_type: b.get("ownerType").and_then(|v| v.as_str()).unwrap_or("session"),
-                owner_id: &key,
-                scope: &scope_v,
-                kind: &kind,
-                subject: subject.as_deref(),
-                content: &content,
-                tags: tags.as_deref(),
-                source: &source,
-                importance,
-            };
-            let out = crate::memory::upsert_memory(&conn, &input)
-                .map_err(|e| (500, format!("写入记忆失败：{e}")))?;
-            use sha1::{Digest, Sha1};
-            let hash = format!("{:x}", Sha1::digest(content.as_bytes()));
-            Ok(json!({ "ok": true, "id": out.id, "deduped": out.deduped, "hash": hash }))
-        }
-        "search" => {
-            let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let kinds: Vec<String> = b
-                .get("kinds")
-                .and_then(|v| v.as_str())
-                .map(|s| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect())
-                .unwrap_or_default();
-            // query 参数都是**字符串**，只认 as_i64 会让 limit=3 变成默认 8
-            let limit = b
-                .get("limit")
-                .and_then(|v| {
-                    v.as_f64()
-                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-                })
-                .filter(|n| n.is_finite())
-                .unwrap_or(8.0)
-                .clamp(1.0, 50.0) as usize;
-            let hits = crate::memory::search(&conn, &key, is_owner, &query, &kinds, limit)
-                .map_err(|e| (500, format!("检索失败：{}", crate::memory::search_error_message(&e))))?;
-            Ok(json!({ "ok": true, "count": hits.len(), "memories": hits }))
-        }
-        "forget" => {
-            let Some(number) = b.get("id").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))).filter(|n| n.is_finite()) else {
-                return Err((400, "id 无效".to_string()));
-            };
-            if number.fract() != 0.0 { return Err((403, "无权删除该条（不在可见范围）".to_string())); }
-            let id = number as i64;
-            // 先按可见范围确认这条确实看得见，看不见就当无权删（不是"不存在"）
-            let visible = crate::memory::can_read_id(&conn, &key, is_owner, id)
-                .map_err(|e| (500, format!("检索失败：{e}")))?;
-            if !visible {
-                return Err((403, "无权删除该条（不在可见范围）".to_string()));
-            }
-            let ok = crate::memory::forget_memory(&conn, id, &key)
-                .map_err(|e| (500, format!("删除失败：{e}")))?;
-            Ok(json!({ "ok": ok }))
-        }
-"preview" => {
-            // 只读：把「若现在唤醒会注入的记忆段」原样返回，用于验证注入链路。
-            // 用的是唤醒提示词里同一个 recall_block（不是另写一份），
-            // 否则"预览"和"实际注入"会慢慢走偏，而这个接口的全部意义就是验证后者。
-            // 传的是**该会话的** state（同提示词那条链），不是根 state ——
-            // 传错会让 recall 拿不到 unread/recentMessages，检索词为空，第一层直接空掉。
-            let conv = st
-                .get("conversations")
-                .and_then(|c| c.get(&key))
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let block = crate::prompt::recall_block_with_runtime(context, cfg, &conv, &key);
-            Ok(json!({ "ok": true, "chars": block.encode_utf16().count(), "block": block }))
-        }
-        "index" => {
-            let (total, terms) = crate::memory::index_hint(&conn, &key, is_owner, &[], 12)
-                .map_err(|e| (500, format!("生成索引失败：{e}")))?;
-            Ok(json!({ "ok": true, "total": total, "terms": terms }))
-        }
-        _ => Err((404, format!("未知动作: {action}"))),
-    }
 }
 /// `/api/tokens/by-provider`：**按 provider 分列**的用量（R3）。
 ///
@@ -3956,7 +3692,7 @@ fn load_social_state() -> Value {
     read_json(SOCIAL_STATE).unwrap_or_else(|| json!({ "conversations": {} }))
 }
 
-fn load_social_state_for(
+pub(crate) fn load_social_state_for(
     context: &RuntimeContext,
 ) -> Result<Value, (u16, String)> {
     if context.is_isolated() {
@@ -4756,7 +4492,7 @@ fn current_mode() -> String {
         .unwrap_or_else(|| "reserved2".to_string())
 }
 
-fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
+pub(crate) fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
     if !context.is_isolated() {
         return Ok(current_mode());
     }
@@ -9467,7 +9203,7 @@ static LEGACY_SOCIAL_SEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(())
 
 /// Read-modify-write of the social state for send bookkeeping. Isolated roots go through the
 /// selected state gate (one atomic update); the legacy path serializes in-process.
-fn mutate_social_state_for<T>(
+pub(crate) fn mutate_social_state_for<T>(
     context: &RuntimeContext,
     update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
 ) -> Result<T, (u16, String)> {
@@ -9502,14 +9238,14 @@ pub(crate) fn set_legacy_wait_deadline(context: &RuntimeContext, key: &str, dead
 
 
 /// Fresh agent token (48 hex chars from two OS-seeded ids).
-fn fresh_agent_token() -> String {
+pub(crate) fn fresh_agent_token() -> String {
     format!("{}{}", crate::turn_ledger::mint_id(""), crate::turn_ledger::mint_id(""))
 }
 
 /// A conversation record as the JS bridge creates it lazily on first contact: default wake
 /// configuration (so the chat answers its first @ after a reset), empty message windows and a
 /// fresh agent token. The Rust inbound path never creates conversation records itself.
-fn new_conversation(context: &RuntimeContext) -> Value {
+pub(crate) fn new_conversation(context: &RuntimeContext) -> Value {
     let cfg = context.load_config().unwrap_or_else(|_| json!({}));
     let random = u64::from_str_radix(&crate::turn_ledger::mint_id("")[..8], 16).unwrap_or(0) as f64 / 4_294_967_296.0;
     json!({
@@ -9651,73 +9387,6 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
     }).map_err(|(_, e)| e)
 }
 
-/// The conversation's current agent token, if it has one.
-pub(crate) fn conversation_token(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
-    let state = load_social_state_for(context).map_err(|(_, message)| message)?;
-    Ok(state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|c| c.get("agentToken"))
-        .and_then(Value::as_str)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string))
-}
-
-/// Revoke only the admitted token, preserving any replacement turn's authority.
-pub(crate) fn revoke_agent_token(context: &RuntimeContext, key: &str, expected: &str) -> Result<(), String> {
-    // A timeout of an old turn must never rotate a replacement turn's authority.
-    mutate_social_state_for(context, |state| {
-        if state["conversations"][key]["agentToken"].as_str() == Some(expected) {
-            state["conversations"][key]["agentToken"] = json!(fresh_agent_token());
-        }
-        Ok(())
-    }).map_err(|(_, message)| message)
-}
-
-/// Make sure the conversation has an agent token (creating the conversation record after a
-/// reset removed it), or replace it when `rotate` is set. Rotation is how a cancelled, replaced
-/// or unverifiable turn loses the right to run tools or send: its token stops matching, so every
-/// token-checked route refuses it. Returns the token now in force.
-pub(crate) fn ensure_or_rotate_agent_token(
-    context: &RuntimeContext,
-    key: &str,
-    rotate: bool,
-) -> Result<String, String> {
-    mutate_social_state_for(context, |state| {
-        if !state.is_object() {
-            return Err((500, "runtime data is invalid".to_string()));
-        }
-        let conversations = state
-            .as_object_mut()
-            .expect("object checked above")
-            .entry("conversations".to_string())
-            .or_insert_with(|| json!({}));
-        let conversations = conversations
-            .as_object_mut()
-            .ok_or((500, "runtime data is invalid".to_string()))?;
-        let conversation = conversations
-            .entry(key.to_string())
-            .or_insert_with(|| new_conversation(context));
-        let conversation = conversation
-            .as_object_mut()
-            .ok_or((500, "runtime data is invalid".to_string()))?;
-        let current = conversation
-            .get("agentToken")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(str::to_string);
-        match current {
-            Some(token) if !rotate => Ok(token),
-            _ => {
-                let token = fresh_agent_token();
-                conversation.insert("agentToken".to_string(), json!(token));
-                Ok(token)
-            }
-        }
-    })
-    .map_err(|(_, message)| message)
-}
-
 /// A replaced DSH session starts without the operator's first-wake injection (JS `retireSession`).
 pub(crate) fn mark_conversation_unbootstrapped(context: &RuntimeContext, key: &str) -> Result<(), String> {
     mutate_social_state_for(context, |state| {
@@ -9780,11 +9449,6 @@ pub(crate) fn chat_write_role_state(context: &RuntimeContext, role: Option<&str>
 /// invalidate their generation without requiring a DSH session mapping.
 pub(crate) fn chat_reset_conversation(context: &RuntimeContext, key: &str) -> Result<(), (u16, String)> {
     handle_session_reset_isolated(context, &json!({ "key": key }).to_string()).map(|_| ())
-}
-
-/// The mode name a new session policy is computed from (default `reserved2`).
-pub(crate) fn runtime_mode(context: &RuntimeContext) -> String {
-    current_mode_for(context).unwrap_or_else(|_| "reserved2".to_string())
 }
 
 /// Publish the DSH owner override and retire sessions made under the previous policy.

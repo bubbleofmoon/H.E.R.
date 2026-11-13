@@ -200,7 +200,7 @@ fn call_tool_with_source(name: &str, args: &Value, context: &RuntimeContext) -> 
         "settings_set" => "settings-set",
         _ => return Err(format!("未知工具：{name}")),
     };
-    let source = crate::console::memory_tool_action(context, action, args)?;
+    let source = crate::memory_actions::tool_action(context, action, args)?;
     let result = if matches!(name, "memory_search" | "memory_index") {
         let cfg = context.load_config().map_err(str::to_string)?;
         crate::model_view::strip_chat_with_runtime(context, &source, &cfg)

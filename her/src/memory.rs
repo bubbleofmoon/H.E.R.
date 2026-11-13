@@ -11,6 +11,8 @@ use rusqlite::{params, Connection, OpenFlags, ToSql};
 use std::path::PathBuf;
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+mod store;
+pub use store::{MemoryStore, NewMemory};
 
 pub const DB_PATH: &str = "C:/qqbot/data/memory.db";
 
@@ -82,8 +84,11 @@ pub fn open_at(path: &std::path::Path) -> rusqlite::Result<Connection> {
     Connection::open(path)
 }
 
-/// Complete the frozen schema atomically, including databases interrupted by an older initializer.
-/// Existing rows, grants and FTS entries survive; only a missing FTS table is populated from rows.
+/// Memory schema version (`PRAGMA user_version`). Version 1 is the frozen
+/// `spec/memory-schema.sql` with its FTS index and the default owner grant.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Open the selected runtime's database at `SCHEMA_VERSION`. A newer version refuses to open.
 pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
     let conn = open_for_runtime(context)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -92,7 +97,28 @@ pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, St
     // PRAGMA is then harmless inside the transaction containing every DDL/seed operation.
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
-    atomic(&conn, |conn| {
+    let version = atomic(&conn, migrate).map_err(|e| e.to_string())?;
+    if version != SCHEMA_VERSION {
+        return Err("unsupported memory database version".to_string());
+    }
+    Ok(conn)
+}
+
+/// Bring the schema to `SCHEMA_VERSION` inside one IMMEDIATE transaction and return the version
+/// in force. Version 0 is every database made before versioning, including ones an older
+/// initializer left incomplete: it is completed in place and stamped. A newer version is untouched.
+fn migrate(conn: &Connection) -> rusqlite::Result<i64> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != 0 {
+        return Ok(version);
+    }
+    complete_unversioned(conn)?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(SCHEMA_VERSION)
+}
+
+/// Existing rows, grants and FTS entries survive; only a missing FTS table is populated from rows.
+fn complete_unversioned(conn: &Connection) -> rusqlite::Result<()> {
         let exists = |name: &str| -> rusqlite::Result<bool> {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)", [name], |r| r.get(0))
         };
@@ -117,8 +143,6 @@ pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, St
             conn.execute("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('owner','main','*','*','read',?1)", [now_ms()])?;
         }
         Ok(())
-    }).map_err(|e| e.to_string())?;
-    Ok(conn)
 }
 
 fn atomic<T>(
@@ -1176,6 +1200,57 @@ mod tests {
             1
         );
         conn.prepare("SELECT * FROM role_group_session").unwrap();
+    }
+
+    fn rows(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in ["SELECT * FROM memory", "SELECT * FROM memory_acl", "SELECT * FROM memory_audit",
+                    "SELECT * FROM team", "SELECT * FROM team_member", "SELECT * FROM role_group",
+                    "SELECT * FROM role_group_session", "SELECT rowid, seg FROM memory_fts"] {
+            let mut stmt = conn.prepare(&format!("{sql} ORDER BY rowid")).unwrap();
+            let columns = stmt.column_count();
+            let mapped = stmt.query_map([], |r| (0..columns)
+                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()).unwrap();
+            for row in mapped { out.push(format!("{sql}: {:?}", row.unwrap())); }
+        }
+        out
+    }
+
+    #[test]
+    fn schema_version_stamps_unversioned_database_without_changing_rows() {
+        let (root, context) = isolated_fixture();
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:55", scope: "group", kind: "fact",
+            subject: Some("topic"), content: "versioned marker", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        conn.execute_batch("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('session','group:56','session','group:55','read',1);
+            INSERT INTO team_member(team_id,member_type,member_id) VALUES('t','session','group:55');
+            INSERT INTO memory_audit(at,actor,action,memory_id,detail) VALUES(1,'fixture','write',1,NULL);").unwrap();
+        let before = rows(&conn);
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        assert_eq!(rows(&conn), before, "migration to version 1 must not change rows");
+    }
+
+    #[test]
+    fn schema_version_1_skips_completeness_repair_and_newer_versions_refuse() {
+        let (root, context) = isolated_fixture();
+        drop(open_ready_for_runtime(&context).unwrap());
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch("DROP TABLE role_group_session;").unwrap();
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
+        assert!(conn.prepare("SELECT * FROM role_group_session").is_err(),
+                "a version 1 open must not rerun the unversioned completion");
+        conn.execute_batch("PRAGMA user_version=2;").unwrap();
+        drop(conn);
+        assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     }
 
     struct FixtureRoot(PathBuf);
