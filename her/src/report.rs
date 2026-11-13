@@ -62,7 +62,7 @@ fn parse(args: &[String]) -> Result<Args, &'static str> {
     crate::install_root::check_runtime(&root, false)
         .map_err(|_| "report runtime selection refused")?;
     let meta = fs::symlink_metadata(&root).map_err(|_| "report runtime root is unavailable")?;
-    if !meta.is_dir() || crate::runtime::is_reparse_point(&meta) {
+    if !meta.is_dir() || crate::guarded_file::is_link(&meta) {
         return Err("report runtime root is unavailable");
     }
     let root = fs::canonicalize(root).map_err(|_| "report runtime root is unavailable")?;
@@ -119,7 +119,7 @@ fn snapshot(path: &Path) -> std::io::Result<Snapshot> {
     }
     let file = opts.open(path)?;
     let meta = file.metadata()?;
-    if !meta.is_file() || crate::runtime::is_reparse_point(&meta) {
+    if !meta.is_file() || crate::guarded_file::is_link(&meta) {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
     Ok(Snapshot {

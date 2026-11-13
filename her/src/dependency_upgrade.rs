@@ -587,7 +587,7 @@ fn plain(path: &Path) -> Result<fs::Metadata, String> {
     guard_destination(path)?;
     crate::release_store::directory(path.parent().ok_or("dependency path has no parent")?)?;
     let meta = fs::symlink_metadata(path).map_err(|_| "dependency files are unavailable")?;
-    if redirected(&meta) || !(meta.is_file() || meta.is_dir()) {
+    if crate::guarded_file::is_link(&meta) || !(meta.is_file() || meta.is_dir()) {
         return Err("dependency files must not be redirected".into());
     }
     Ok(meta)

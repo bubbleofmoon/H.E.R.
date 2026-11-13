@@ -74,7 +74,7 @@ fn source_transition(address: &std::net::SocketAddr, shared: bool) -> Result<Fil
         Err(_) => return Err("message source transition directory is unavailable".into()),
     }
     let meta = std::fs::symlink_metadata(&directory).map_err(|_| "message source transition directory is unavailable")?;
-    if !meta.is_dir() || gate_reparse(&meta) { return Err("message source transition directory is redirected".into()); }
+    if !meta.is_dir() || crate::guarded_file::is_link(&meta) { return Err("message source transition directory is redirected".into()); }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -83,20 +83,12 @@ fn source_transition(address: &std::net::SocketAddr, shared: bool) -> Result<Fil
         }
     }
     let key = format!("{:x}", Sha256::digest(address.to_string().as_bytes()));
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600).custom_flags(libc::O_NOFOLLOW); }
-    #[cfg(windows)]
-    { use std::os::windows::fs::OpenOptionsExt; options.custom_flags(0x00200000); }
-    let file = options.open(directory.join(format!("{key}.lock"))).map_err(|_| "message source transition gate is unavailable")?;
-    let meta = file.metadata().map_err(|_| "message source transition gate is unavailable")?;
-    if !meta.is_file() || gate_reparse(&meta) { return Err("message source transition gate is redirected".into()); }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 { return Err("message source transition gate is unsafe".into()); }
-    }
+    use crate::guarded_file::{open_gate, Gate, GateError};
+    let file = open_gate(&directory.join(format!("{key}.lock")), Gate::Private).map_err(|error| match error {
+        GateError::Open(_) => "message source transition gate is unavailable",
+        GateError::Redirected => "message source transition gate is redirected",
+        GateError::Unsafe => "message source transition gate is unsafe",
+    })?;
     let result = if shared { file.try_lock_shared() } else { file.try_lock() };
     result.map_err(|_| "message source is owned by a live runtime or a rollback is in progress")?;
     Ok(file)
@@ -107,8 +99,8 @@ pub struct ConversationGuard { _files: Vec<File> }
 
 #[cfg(unix)]
 mod source_gate {
-    use super::{File, OpenOptions, ConversationGuard};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use super::{File, ConversationGuard};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::path::Path;
 
     pub(super) fn acquire(keys: &[String]) -> Result<ConversationGuard, String> {
@@ -120,19 +112,17 @@ mod source_gate {
             Err(error) => return Err(format!("message source gate directory unavailable: {}", error.kind())),
         }
         let metadata = std::fs::symlink_metadata(dir).map_err(|_| "message source gate directory unavailable")?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != unsafe { libc::geteuid() }
+        if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) || metadata.uid() != unsafe { libc::geteuid() }
             || metadata.mode() & 0o077 != 0 {
             return Err("message source gate directory is unsafe".into());
         }
         let mut files = Vec::<File>::new();
         for key in keys {
-            let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW).open(dir.join(format!("{key}.lock")))
-                .map_err(|error| format!("message source gate unavailable: {}", error.kind()))?;
-            let metadata = file.metadata().map_err(|_| "message source gate cannot be inspected")?;
-            if !metadata.is_file() || metadata.nlink() != 1 || metadata.uid() != unsafe { libc::geteuid() } {
-                return Err("message source gate is unsafe".into());
-            }
+            let file = crate::guarded_file::open_gate(&dir.join(format!("{key}.lock")), crate::guarded_file::Gate::Private)
+                .map_err(|error| match error {
+                    crate::guarded_file::GateError::Open(error) => format!("message source gate unavailable: {}", error.kind()),
+                    _ => "message source gate is unsafe".to_string(),
+                })?;
             match file.try_lock() {
                 Ok(()) => files.push(file),
                 Err(std::fs::TryLockError::WouldBlock) => return Err("another live process owns this message source and conversation".into()),
@@ -281,7 +271,7 @@ fn validate_owner_gate_paths_with(data: &Path, create: bool) -> Result<(), Strin
     for name in ["lifecycle", "logs"] {
         let dir = data.join(name);
         match std::fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.is_dir() && !gate_reparse(&meta) => {}
+            Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
                 std::fs::create_dir(&dir).map_err(|e| format!("gate directory is unavailable: {}", e.kind()))?;
             }
@@ -298,7 +288,7 @@ fn validate_owner_gate_paths_with(data: &Path, create: bool) -> Result<(), Strin
         marker.push(".owner.json");
         for candidate in [path.clone(), PathBuf::from(marker)] {
             match std::fs::symlink_metadata(&candidate) {
-                Ok(meta) if meta.is_file() && !gate_reparse(&meta) => {}
+                Ok(meta) if meta.is_file() && !crate::guarded_file::is_link(&meta) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 _ => return Err("gate file is redirected or unavailable".into()),
             }
@@ -326,16 +316,6 @@ pub fn acquire_quiescent(data: &Path) -> Result<QuiescentGuard, String> {
     Ok(QuiescentGuard { _desired: gate, _owners: owners })
 }
 
-fn gate_reparse(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() { return true; }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 { return true; }
-    }
-    false
-}
-
 /// Hold each ordinary task gate after the desired stop has made its runner cancel.
 /// Callers keep these handles while retiring owners, preventing a queued task from
 /// crossing the stop boundary before the owning process exits.
@@ -345,7 +325,7 @@ pub(crate) fn hold_stopped_task_gates(data: &Path) -> Result<Vec<File>, String> 
     for dir in [&tasks, &locks] {
         match std::fs::symlink_metadata(dir) {
             Err(error) if error.kind() == io::ErrorKind::NotFound && dir == &tasks => return Ok(Vec::new()),
-            Ok(meta) if meta.is_dir() && !gate_reparse(&meta) => {}
+            Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => {}
             _ => return Err("task gate directory is redirected or unavailable".into()),
         }
     }
@@ -368,18 +348,14 @@ pub(crate) fn hold_stopped_task_gates(data: &Path) -> Result<Vec<File>, String> 
         loop {
             match std::fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-                Ok(meta) if meta.is_file() && !gate_reparse(&meta) => {}
+                Ok(meta) if meta.is_file() && !crate::guarded_file::is_link(&meta) => {}
                 _ => return Err("task gate is redirected or unavailable".into()),
             }
-            let mut options = OpenOptions::new();
-            options.read(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
-            }
-            let file = options.open(&path)
-                .map_err(|error| format!("task gate cannot be opened: {}", error.kind()))?;
+            let file = crate::guarded_file::open_gate(&path, crate::guarded_file::Gate::Existing)
+                .map_err(|error| match error {
+                    crate::guarded_file::GateError::Open(error) => format!("task gate cannot be opened: {}", error.kind()),
+                    _ => "task gate is redirected or unavailable".to_string(),
+                })?;
             match file.try_lock() {
                 Ok(()) => { held.push(file); break; }
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
@@ -514,14 +490,8 @@ fn open_lock_file_with(path: &Path, create: bool) -> io::Result<File> {
         }
     }
     // Never truncate: the file may be the legacy lock that an older binary also reads.
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(create).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    options.open(path)
+    let gate = if create { crate::guarded_file::Gate::Create } else { crate::guarded_file::Gate::Existing };
+    Ok(crate::guarded_file::open_gate(path, gate)?)
 }
 
 /// Pin a Linux directory before opening any file underneath it. A later rename

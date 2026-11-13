@@ -10,7 +10,7 @@ pub(crate) const IMAGES: [&str; 3] = ["her.exe", "her-cli.exe", "herupdate.exe"]
 /// Bounded metadata reads for installed checksum lists and detached signatures.
 pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, String> {
     let meta = fs::symlink_metadata(path).map_err(|_| "release metadata unavailable")?;
-    if !meta.is_file() || redirected(&meta) || meta.len() > max as u64 {
+    if !meta.is_file() || crate::guarded_file::is_link(&meta) || meta.len() > max as u64 {
         return Err("release metadata redirected or oversized".into());
     }
     let file = fs::File::open(path).map_err(|_| "release metadata unavailable")?;
@@ -42,18 +42,6 @@ pub(crate) fn version(tag: &str) -> Option<(u64, u64, u64)> {
     ))
 }
 
-pub(crate) fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
-}
-
 pub(crate) fn directory(path: &Path) -> Result<(), String> {
     for part in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
         match fs::symlink_metadata(part) {
@@ -69,7 +57,7 @@ pub(crate) fn directory(path: &Path) -> Result<(), String> {
         }
         let metadata =
             fs::symlink_metadata(part).map_err(|_| "release directory cannot be inspected")?;
-        if !metadata.is_dir() || redirected(&metadata) {
+        if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) {
             return Err("release directory is redirected or not a directory".into());
         }
     }
@@ -106,6 +94,7 @@ pub(crate) fn sums(bytes: &[u8]) -> Result<HashMap<String, String>, String> {
     Ok(hashes)
 }
 
+#[allow(dead_code)] // herupdate compiles release_store without release.rs, the only caller
 pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     directory(path.parent().ok_or("release file has no directory")?)?;
     let mut options = OpenOptions::new();
@@ -129,31 +118,13 @@ pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
     directory(lock.parent().ok_or("release gate has no directory")?)?;
-    if fs::symlink_metadata(&lock).is_ok_and(|meta| !meta.is_file() || redirected(&meta)) {
+    if fs::symlink_metadata(&lock).is_ok_and(|meta| !meta.is_file() || crate::guarded_file::is_link(&meta)) {
         return Err("release install gate is redirected".into());
     }
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
-    }
-    let gate = options
-        .open(lock)
-        .map_err(|_| "release install gate unavailable")?;
-    if redirected(
-        &gate
-            .metadata()
-            .map_err(|_| "release gate metadata unavailable")?,
-    ) {
-        return Err("release install gate is redirected".into());
-    }
+    let gate = crate::guarded_file::open_gate(lock, crate::guarded_file::Gate::Create).map_err(|error| match error {
+        crate::guarded_file::GateError::Open(_) => "release install gate unavailable",
+        _ => "release install gate is redirected",
+    })?;
     gate.try_lock()
         .map_err(|_| "another release installation or restore is running")?;
     Ok(gate)
