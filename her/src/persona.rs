@@ -279,7 +279,9 @@ pub fn list(context: &RuntimeContext) -> Result<Value, Failure> {
         .unwrap_or_default();
     personas.sort_by_key(|p| p["id"].as_str().and_then(|id| id.strip_prefix('p')).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0));
     Ok(json!({"ok": true, "default": doc["default"], "overrides": doc["overrides"],
-        "importedRolesAt": doc["importedRolesAt"], "personas": personas}))
+        "importedRolesAt": doc["importedRolesAt"],
+        "rebriefDue": doc["rebriefDue"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+        "personas": personas}))
 }
 
 pub fn item(context: &RuntimeContext, id: &str) -> Result<Value, Failure> {
@@ -389,28 +391,60 @@ pub fn assign(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
         .into_iter()
         .map(|(key, _)| key)
         .collect();
-    let (result, changed) = mutate(context, authority, |doc| {
+    // Every conversation whose persona changed, plus any whose earlier re-brief failed, is due:
+    // `rebriefDue` {key: stamp} survives a failed or interrupted re-brief, so any later assignment
+    // (repeating the same one included) re-runs it.
+    let (result, due, stamp) = mutate(context, authority, |doc| {
         let before: Vec<Option<String>> = keys.iter().map(|key| effective_id(doc, key)).collect();
         apply_assignment(doc, target.as_deref(), wanted.as_deref())?;
         let view: &Value = doc;
-        let changed: Vec<String> = keys
+        let mut due: Vec<String> = keys
             .iter()
             .zip(before)
             .filter(|(key, old)| effective_id(view, key) != *old)
             .map(|(key, _)| key.clone())
             .collect();
-        Ok((json!({"default": view["default"], "overrides": view["overrides"]}), changed))
+        let waiting: Vec<String> = view["rebriefDue"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+        for key in waiting {
+            if !due.contains(&key) {
+                due.push(key);
+            }
+        }
+        let stamp = view["rebriefSeq"].as_u64().unwrap_or(0) + 1;
+        let result = json!({"default": view["default"], "overrides": view["overrides"]});
+        doc["rebriefSeq"] = json!(stamp);
+        if !doc["rebriefDue"].is_object() {
+            doc["rebriefDue"] = json!({});
+        }
+        for key in &due {
+            doc["rebriefDue"][key.as_str()] = json!(stamp);
+        }
+        Ok((result, due, stamp))
     })?;
-    // The library lock is released before the social gate is taken. A failed re-brief leaves the
-    // assignment saved and is reported.
+    // The library lock and the authority guard are released before the social gate is taken.
     let mut rebriefed = Vec::new();
     let mut failed = Vec::new();
-    for key in changed {
+    let mut settled = Vec::new();
+    for key in due {
         match rebrief(context, &key) {
-            Ok(true) => rebriefed.push(key),
-            Ok(false) => {}
+            Ok(true) => {
+                rebriefed.push(key.clone());
+                settled.push(key);
+            }
+            // No mapped session or a changed epoch: the next wake starts a fresh briefing anyway.
+            Ok(false) => settled.push(key),
             Err(error) => failed.push(json!({"conversation": key, "error": error})),
         }
+    }
+    if !settled.is_empty() {
+        // Best effort: an entry left behind is re-briefed once more by the next assignment. Only
+        // this assignment's stamp is removed, never a newer assignment's.
+        let _ = mutate(context, authority, |doc| {
+            if let Some(waiting) = doc["rebriefDue"].as_object_mut() {
+                waiting.retain(|key, value| !(settled.contains(key) && value.as_u64() == Some(stamp)));
+            }
+            Ok(())
+        });
     }
     Ok(json!({"ok": true, "default": result["default"], "overrides": result["overrides"],
         "rebriefed": rebriefed, "rebriefFailed": failed}))
@@ -533,7 +567,8 @@ pub(crate) fn applies(context: &RuntimeContext) -> bool {
 }
 
 /// `【人设】<name>\n<core>\n\n` for the conversation's persona (override, else default), or empty.
-pub(crate) fn core_block(context: &RuntimeContext, key: &str) -> String {
+/// The core is cut at `limit` UTF-16 units (`role.maxInjectChars`) until #18 owns the prompt budget.
+pub(crate) fn core_block(context: &RuntimeContext, key: &str, limit: usize) -> String {
     if !applies(context) {
         return String::new();
     }
@@ -541,7 +576,8 @@ pub(crate) fn core_block(context: &RuntimeContext, key: &str) -> String {
     let Some(found) = effective_id(&doc, key).and_then(|id| doc["personas"].get(&id).and_then(active).cloned()) else {
         return String::new();
     };
-    format!("【人设】{}\n{}\n\n", found["name"].as_str().unwrap_or(""), found["core"].as_str().unwrap_or(""))
+    let core = crate::social_mem::truncate_text(found["core"].as_str().unwrap_or(""), limit as i64);
+    format!("【人设】{}\n{core}\n\n", found["name"].as_str().unwrap_or(""))
 }
 
 #[cfg(test)]
@@ -640,6 +676,28 @@ mod tests {
         assert_eq!(super::import_roles(&context, open()).unwrap()["imported"].as_array().map(Vec::len), Some(1));
         assert!(super::load(&context).unwrap()["importedRolesAt"].is_number());
         assert_eq!(super::import_roles(&context, open()).unwrap_err().0, 409);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_rebrief_stays_due_and_repeating_the_assignment_retries_it() {
+        let (root, context) = fixture("rebrief");
+        let id = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());
+        super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap();
+        crate::session_map::bind(&context, "group:1", "sid-1", None).unwrap();
+        // The social gate stays busy longer than a re-brief waits: the assignment is saved, its re-brief fails.
+        let held = crate::console::acquire_social_state_gate(&context).unwrap();
+        let first = super::assign(&context, &json!({"default": id}), open()).unwrap();
+        drop(held);
+        assert_eq!(first["rebriefFailed"][0]["conversation"], "group:1", "{first}");
+        assert_eq!(super::list(&context).unwrap()["rebriefDue"], json!(["group:1"]));
+        let generation = || crate::session_map::context_record(&context, "group:1", "sid-1", "fixture-epoch").unwrap()["generation"].clone();
+        assert_eq!(generation(), json!(0));
+        // The same assignment changes nothing, yet re-runs the re-brief that is still due.
+        let again = super::assign(&context, &json!({"default": id}), open()).unwrap();
+        assert_eq!(again["rebriefed"], json!(["group:1"]), "{again}");
+        assert_eq!(generation(), json!(1));
+        assert_eq!(super::list(&context).unwrap()["rebriefDue"], json!([]));
         let _ = std::fs::remove_dir_all(root);
     }
 }
