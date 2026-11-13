@@ -1,8 +1,9 @@
 //! Guarded files: atomic replacement, link checks and gate opens under one durability rule.
 //! An atomic write refuses a linked or non-file target, fsyncs a fresh sibling temporary file,
-//! replaces the target (Windows: write-through, with std's POSIX-semantics rename on access
-//! denied), retries only Windows access/sharing/lock violations for at most one second, then
-//! fsyncs the parent folder (Unix; Windows write-through covers it).
+//! replaces the target, retries only Windows access/sharing/lock violations for at most one second,
+//! then fsyncs the parent folder on Unix. Windows replaces with `MoveFileExW` and write-through; only
+//! when that fails with access denied (a reader that allows deletion holds the target) does it fall
+//! back to std's POSIX-semantics rename, which has no write-through and also replaces a read-only target.
 // herupdate compiles only release_store, install_root, update and handover.
 #![allow(dead_code)]
 
@@ -66,7 +67,7 @@ pub(crate) enum Gate {
     Existing,
     /// Create the gate when it is missing.
     Create,
-    /// Create with mode 0600; on Unix also require the caller's uid and a single hard link.
+    /// Create with mode 0600; on Unix also require the caller's uid, a single hard link and no group/other access.
     Private,
 }
 
@@ -107,7 +108,7 @@ pub(crate) fn open_gate(path: &Path, gate: Gate) -> Result<File, GateError> {
     if gate == Gate::Private {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no preconditions.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
             return Err(GateError::Unsafe);
         }
     }
@@ -244,7 +245,8 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
     stage(path, &mut &bytes[..], None)?.commit(&mut || Ok::<(), String>(()))
 }
 
-/// Persist a folder's entries (Unix). Windows replacements are write-through instead.
+/// Persist a folder's entries (Unix). Windows does nothing here: write-through covers only the
+/// `MoveFileExW` replacement, not the POSIX-semantics fallback.
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -276,7 +278,8 @@ fn replace(temp: &Path, target: &Path) -> io::Result<()> {
         return Err(error);
     }
     // ERROR_ACCESS_DENIED: std's rename retries with POSIX-semantics replacement, which succeeds
-    // while readers that allow deletion still hold the old file.
+    // while readers that allow deletion still hold the old file. This path has no write-through
+    // and also replaces a read-only target.
     fs::rename(temp, target)
 }
 
@@ -413,6 +416,63 @@ mod tests {
         assert_eq!(fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o600);
         fs::hard_link(&private, dir.join("alias.lock")).unwrap();
         assert!(matches!(open_gate(&private, Gate::Private), Err(GateError::Unsafe)));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_gate_refuses_a_group_or_world_accessible_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("private-mode");
+        let gate = dir.join("mode.lock");
+        fs::write(&gate, b"").unwrap();
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(open_gate(&gate, Gate::Private), Err(GateError::Unsafe)));
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o600)).unwrap();
+        open_gate(&gate, Gate::Private).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_replaced_by_a_link_after_staging_is_refused_at_commit() {
+        let dir = temp_dir("commit-link");
+        let outside_dir = temp_dir("commit-link-outside");
+        let outside = outside_dir.join("real.json");
+        fs::write(&outside, b"outside").unwrap();
+        let path = dir.join("state.json");
+        fs::write(&path, b"old").unwrap();
+        let staged = stage(&path, &mut &b"new"[..], None).unwrap();
+        let temp = staged.temp().to_path_buf();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let error = staged.commit(&mut || Ok::<(), String>(())).unwrap_err();
+        assert_eq!(error.class(), "refused", "{error}");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_symlink(), "the link itself stays");
+        assert_eq!(fs::read(&outside).unwrap(), b"outside", "the link target is untouched");
+        assert!(!temp.exists(), "the staged temporary file is removed");
+        assert!(temps(&dir).is_empty());
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(outside_dir);
+    }
+
+    #[test]
+    fn a_before_each_refusal_is_not_retried_and_leaves_no_temp() {
+        let dir = temp_dir("before-each");
+        let path = dir.join("state.json");
+        fs::write(&path, b"old").unwrap();
+        let staged = stage(&path, &mut &b"new"[..], None).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let error = staged
+            .commit(&mut || {
+                calls.set(calls.get() + 1);
+                Err("refused by caller".to_string())
+            })
+            .unwrap_err();
+        assert_eq!(error.class(), "refused", "{error}");
+        assert_eq!(calls.get(), 1, "a refusal is never retried");
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert!(temps(&dir).is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
