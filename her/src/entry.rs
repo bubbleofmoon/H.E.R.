@@ -59,6 +59,7 @@ mod parity_clock;
 mod config;
 mod inbound;
 mod send_outbox;
+mod history_log;
 mod session_map;
 mod session_context;
 mod session_rotation;
@@ -2323,6 +2324,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
             continue;
+        }
+        // Chat history log (#58): every conversation, before self filtering, the allow list and mode dispatch.
+        if !replayed {
+            history_log::record_inbound(&runtime_context, &text);
         }
         let is_message = ev.post_type == "message";
         let is_notice = ev.post_type == "notice";

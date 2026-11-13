@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::{accept, Message};
 
 const GROUP_ID: i64 = 420042;
 const SELF_ID: i64 = 9001;
+const OTHER_GROUP: i64 = 520052;
 const ONEBOT_TOKEN: &str = "ticket07-onebot-token-0001";
 const CONSOLE_TOKEN: &str = "ticket07-console-token-0001";
 
@@ -141,6 +142,8 @@ enum Step {
     /// Send the next live frame only after the history request is actually held.
     AwaitHistory,
     Wait(u64),
+    /// A raw gateway frame, sent exactly as given.
+    Frame(Value),
     Drop,
 }
 
@@ -192,6 +195,23 @@ fn mention_event(message_id: i64, text: &str, time_s: i64) -> Value {
             {"type": "text", "data": {"text": format!(" {text}")}}
         ],
         "raw_message": format!("[CQ:at,qq={SELF_ID}] {text}"),
+        "font": 0
+    })
+}
+
+fn group_frame(group: i64, user: i64, message_id: i64, text: &str) -> Value {
+    json!({
+        "time": now_ms() / 1000,
+        "self_id": SELF_ID,
+        "post_type": "message",
+        "message_type": "group",
+        "sub_type": "normal",
+        "message_id": message_id,
+        "group_id": group,
+        "user_id": user,
+        "sender": {"user_id": user, "nickname": "tester", "card": ""},
+        "message": [{"type": "text", "data": {"text": text}}],
+        "raw_message": text,
         "font": 0
     })
 }
@@ -253,6 +273,11 @@ fn serve_ws(listener: TcpListener, scripts: Vec<Vec<Step>>, gateway: Arc<Mutex<F
                         wait_for(Duration::from_secs(10), || history.started.load(Ordering::SeqCst)),
                         "history request did not start before the post-reconnect frame"
                     );
+                }
+                Step::Frame(event) => {
+                    if socket.send(Message::Text(event.to_string())).is_err() {
+                        break;
+                    }
                 }
                 Step::Wait(ms) => thread::sleep(Duration::from_millis(ms)),
                 Step::Drop => break,
@@ -491,6 +516,17 @@ fn decisions(root: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn history_records(root: &Path) -> Vec<Value> {
+    let Ok(entries) = fs::read_dir(root.join("data/history")) else { return Vec::new() };
+    let mut paths: Vec<PathBuf> = entries.filter_map(|entry| entry.ok().map(|e| e.path())).collect();
+    paths.sort();
+    paths
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .flat_map(|text| text.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).collect::<Vec<_>>())
+        .collect()
+}
+
 fn admin(port: u16) -> Value {
     console_get(port, "/api/inbound/gaps").unwrap_or(Value::Null)
 }
@@ -539,6 +575,10 @@ fn start_with_owner(root: &Path, scripts: Vec<Vec<Step>>, owner: Option<i64>) ->
 }
 
 fn start_with_scope(root: &Path, scripts: Vec<Vec<Step>>, owner: Option<i64>, privates: &[i64]) -> Harness {
+    start_with_config(root, scripts, owner, privates, |_| {})
+}
+
+fn start_with_config(root: &Path, scripts: Vec<Vec<Step>>, owner: Option<i64>, privates: &[i64], patch: impl FnOnce(&mut Value)) -> Harness {
     let ws_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake gateway WebSocket");
     let ws_url = format!("ws://127.0.0.1:{}", ws_listener.local_addr().expect("ws address").port());
     let onebot_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fake OneBot HTTP");
@@ -547,6 +587,7 @@ fn start_with_scope(root: &Path, scripts: Vec<Vec<Step>>, owner: Option<i64>, pr
     let path = root.join("config/config.json");
     let mut cfg: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     cfg["allow"]["private"] = json!(privates);
+    patch(&mut cfg);
     fs::write(path, cfg.to_string()).unwrap();
     let gateway = Arc::new(Mutex::new(FakeGateway::default()));
     {
@@ -1004,4 +1045,57 @@ fn hotfix127_two_restarts_notice_only_new_windows_and_never_retry_private_gaps()
         db.execute("UPDATE inbound_gaps SET next_retry_ms = 0 WHERE conversation LIKE 'group:%'", []).unwrap();
         db.execute("UPDATE inbound_meta SET value = ?1 WHERE key = 'last_seen_ms'", [now_ms() - 1000]).unwrap();
     }
+}
+
+#[test]
+fn history_log_records_unallowed_groups_and_own_echoes_before_the_allow_filter() {
+    let root = TempRoot::new("history-on");
+    let harness = start_with_config(
+        root.path(),
+        vec![vec![
+            Step::Frame(group_frame(OTHER_GROUP, 1002, 7201, "别的群在聊天")),
+            Step::Frame(group_frame(GROUP_ID, SELF_ID, 7202, "自己的回声")),
+            Step::Mention { message_id: 7203, text: "history probe" },
+            Step::Wait(60_000),
+        ]],
+        Some(8808),
+        &[],
+        |cfg| cfg["history"] = json!({"enabled": true}),
+    );
+    let logged = wait_for(Duration::from_secs(30), || history_records(root.path()).len() >= 3);
+    assert!(logged, "the history log did not record the three frames");
+    let records = history_records(root.path());
+    let by_mid = |mid: &str| {
+        records
+            .iter()
+            .find(|record| record["mid"] == mid)
+            .unwrap_or_else(|| panic!("no history record for mid {mid}: {records:?}"))
+    };
+    let other = by_mid("7201");
+    assert_eq!(other["conv"], "group:520052");
+    assert_eq!(other["dir"], "in");
+    assert_eq!(by_mid("7202")["dir"], "out");
+    assert_eq!(by_mid("7203")["segs"][0], json!({"k": "at", "id": "9001"}));
+
+    let journal = root.path().join("data/inbound.db");
+    assert!(wait_for(Duration::from_secs(10), || journal.exists()), "the journal was not created");
+    let db = rusqlite::Connection::open_with_flags(&journal, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open journal read-only");
+    let journaled: i64 = db
+        .query_row("SELECT COUNT(*) FROM inbound_events WHERE conversation = 'group:520052'", [], |row| row.get(0))
+        .expect("count journaled events");
+    assert_eq!(journaled, 0, "the journal stays allow-gated");
+    drop(harness);
+}
+
+#[test]
+fn history_log_is_off_by_default() {
+    let root = TempRoot::new("history-off");
+    let harness = start(
+        root.path(),
+        vec![vec![Step::Mention { message_id: 7301, text: "history default probe" }, Step::Wait(60_000)]],
+    );
+    assert!(wait_for(Duration::from_secs(30), || !decisions(root.path()).is_empty()), "the mention was not decided");
+    assert!(!root.path().join("data/history").exists(), "history is written only when switched on");
+    drop(harness);
 }

@@ -57,7 +57,10 @@ pub fn append_record(context: &RuntimeContext, record: &Value) -> Result<(), Str
     if context.is_isolated() {
         let mut line = serde_json::to_vec(record).map_err(|e| format!("序列化发送账本失败：{e}"))?;
         line.push(b'\n');
-        context.append_bytes_durable(RuntimeArea::Data, ISOLATED_OUTBOX_FILE, &line)
+        context.append_bytes_durable(RuntimeArea::Data, ISOLATED_OUTBOX_FILE, &line)?;
+        // Best-effort history copy after the guarded record is durable; it never fails a send.
+        crate::history_log::record_send(context, record);
+        Ok(())
     } else {
         crate::ledger::append_record_to(LEGACY_OUTBOX_FILE, record)
     }
@@ -462,5 +465,56 @@ mod tests {
         assert_eq!(epoch.len(), 16);
         assert_eq!(epoch, token_epoch("secret-token-value"));
         assert!(!epoch.contains("secret"));
+    }
+
+    fn history_files(root: &std::path::Path) -> Vec<Value> {
+        let Ok(entries) = std::fs::read_dir(root.join("data/history")) else { return Vec::new() };
+        let mut paths: Vec<std::path::PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+        paths.sort();
+        paths
+            .iter()
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn enable_history(root: &std::path::Path) {
+        std::fs::write(
+            root.join("config/config.json"),
+            r#"{"consoleToken":"synthetic-review-token-abcdefghij","history":{"enabled":true}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn history_copy_follows_durable_intents_and_confirmations_only_when_enabled() {
+        let (root, context) = ledger_root("her-outbox-history-");
+        append_record(&context, &intent("b0", "group:1", &["关闭时不记"])).unwrap();
+        assert!(!root.join("data/history").exists());
+        enable_history(&root);
+        append_record(&context, &intent("b2", "group:1", &["早上好", "在吗"])).unwrap();
+        append_record(&context, &json!({ "batch": "b2", "k": "attempt", "idx": 0, "t": 2 })).unwrap();
+        append_record(&context, &json!({ "batch": "b2", "k": "confirmed", "idx": 0, "messageId": 4242, "t": 3 })).unwrap();
+        let lines = history_files(&root);
+        assert_eq!(lines.len(), 3, "intent idx 0, intent idx 1 and the confirmation: {lines:?}");
+        assert_eq!((lines[0]["phase"].clone(), lines[0]["idx"].clone()), (json!("intent"), json!(0)));
+        assert_eq!((lines[1]["phase"].clone(), lines[1]["idx"].clone()), (json!("intent"), json!(1)));
+        assert_eq!((lines[2]["phase"].clone(), lines[2]["mid"].clone()), (json!("confirmed"), json!("4242")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_outbox_append_writes_no_history() {
+        let (root, context) = ledger_root("her-outbox-history-fail-");
+        enable_history(&root);
+        std::fs::create_dir(root.join("data").join(ISOLATED_OUTBOX_FILE)).unwrap();
+        assert!(append_record(&context, &intent("b1", "group:1", &["a"])).is_err());
+        assert!(!root.join("data/history").exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
