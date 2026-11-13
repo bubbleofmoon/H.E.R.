@@ -1336,10 +1336,10 @@ fn selected_fixture_with(
     fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#)
         .expect("write selected mode");
     fs::write(
-        root.join("data/role-map.json"),
-        format!(r#"{{"sessions":{{"group:{GROUP_ID}":"ticket04-selected-dsh-role"}}}}"#),
+        root.join("data/personas.json"),
+        r#"{"format":1,"nextId":2,"default":"p1","overrides":{},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"ticket04-selected-dsh-persona","core":"selected-root persona core"}]}}}"#,
     )
-    .expect("write selected role map");
+    .expect("write selected persona library");
     fs::write(root.join("data/stickers.json"), &options.stickers).expect("write selected stickers");
     if let Some(bytes) = &options.slang_store {
         fs::write(root.join("data/slang.json"), bytes).expect("write selected slang store");
@@ -1595,7 +1595,7 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
         .map(|offset| snapshot_start + offset)
         .expect("actual selected OneBot event in authenticated snapshot");
     assert!(wake_start < snapshot_start && snapshot_start < event_line, "live wake/snapshot ordering changed: {prompt}");
-    assert!(prompt.contains("ticket04-selected-dsh-role"), "selected-root role missing from DSH prompt");
+    assert!(prompt.contains("【人设】ticket04-selected-dsh-persona\nselected-root persona core"), "selected-root persona missing from DSH prompt");
     assert!(prompt.contains(SESSION_TOKEN), "selected session token missing from actual DSH prompt");
     assert_eq!(dsh.ws.as_ref().unwrap().open_frame.pointer("/payload/args/request/address/sessionId").and_then(Value::as_str), Some(SESSION_ID));
 

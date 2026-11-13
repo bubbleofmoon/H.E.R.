@@ -1008,7 +1008,7 @@ impl Hub {
                 } else {
                     inb.user_id.to_string()
                 };
-                let hint = crate::prompt::role_hint_v1(&self.context, cfg, &key);
+                let hint = crate::prompt::identity_hint_v1(&self.context, cfg, &key);
                 let prompt = build_prompt(
                     &hint,
                     is_owner,

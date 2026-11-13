@@ -711,15 +711,10 @@ fn a_group_message_round_trips_with_ack_plain_reply_session_and_records() {
 }
 
 #[test]
-fn owner_prompts_carry_the_admin_tag_and_the_role_hint_in_the_old_layout() {
-    let mut rig = Rig::new(
-        "owner",
-        Seed {
-            roles: vec![("小鲸鱼", "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n")],
-            current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
-            ..Seed::default()
-        },
-    );
+fn owner_prompts_carry_the_admin_tag_and_the_persona_core_in_the_old_layout() {
+    let mut rig = Rig::new("owner", Seed::default());
+    fs::write(rig.root.join("data/personas.json"), json!({"format": 1, "nextId": 2, "default": "p1", "overrides": {}, "importedRolesAt": null,
+        "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [{"version": 1, "approved": true, "name": "小鲸鱼", "core": "你是一只爱聊天的小鲸鱼。"}]}}}).to_string()).unwrap();
     rig.start();
     says(&rig, OWNER_KEY, OWNER, "owner", "私聊你好");
     says(&rig, GROUP_KEY, OWNER, "owner", "群里你好");
@@ -728,8 +723,8 @@ fn owner_prompts_carry_the_admin_tag_and_the_role_hint_in_the_old_layout() {
     let bodies: Vec<String> = rig.dsh.prompts().iter().map(|p| body_of(&p.text).to_string()).collect();
     let private = bodies.iter().find(|b| b.contains("私聊你好")).expect("private prompt");
     let group = bodies.iter().find(|b| b.contains("群里你好")).expect("group prompt");
-    assert_eq!(private, "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】私聊你好", "role hint, blank line, admin tag, text (private has no sender prefix)");
-    assert_eq!(group, "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】owner：群里你好");
+    assert_eq!(private, "【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】私聊你好", "persona core, blank line, admin tag, text");
+    assert_eq!(group, "【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】owner：群里你好");
 }
 
 #[test]

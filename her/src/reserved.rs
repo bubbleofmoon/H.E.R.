@@ -231,7 +231,7 @@ fn context_block(c: &Conversation, cfg: &Value) -> String {
     }
 }
 fn role_prefix(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
-    let hint = crate::prompt::role_hint_v1(context, cfg, key);
+    let hint = crate::prompt::identity_hint_v1(context, cfg, key);
     if hint.is_empty() {
         hint
     } else {
@@ -810,7 +810,7 @@ impl Hub {
         );
         if sc["enabled"] == false {
             let prompt = chat::build_prompt(
-                &crate::prompt::role_hint_v1(&self.context, &cfg, &key),
+                &crate::prompt::identity_hint_v1(&self.context, &cfg, &key),
                 owner,
                 (inb.kind == "group").then_some(if !inb.card.is_empty() {
                     inb.card.as_str()

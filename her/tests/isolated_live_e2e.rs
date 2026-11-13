@@ -592,10 +592,10 @@ fn selected_runtime_fixture(root: &Path, dependencies: &Value) {
     )
     .expect("write selected social state");
     fs::write(
-        root.join("data/role-map.json"),
-        r#"{"sessions":{"group:420042":"fixture-role-from-selected-root"}}"#,
+        root.join("data/personas.json"),
+        r#"{"format":1,"nextId":2,"default":"p1","overrides":{},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"fixture-persona-from-selected-root","core":"selected-root persona core"}]}}}"#,
     )
-    .expect("write selected role map");
+    .expect("write selected persona library");
     fs::write(
         root.join("user/dsh/.credentials.yaml"),
         format!("secret: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\nOPENCODE_GO_API_KEY: \"{MODEL_KEY}\"\n"),
@@ -1146,10 +1146,10 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     state["conversations"]["group:420042"]["recentMessages"] = json!([strip_fixture]);
     fs::write(&state_path, state.to_string()).unwrap();
     fs::write(
-        ambient_root.path().join("data/role-map.json"),
-        r#"{"sessions":{"group:420042":"ticket04-decoy-role"}}"#,
+        ambient_root.path().join("data/personas.json"),
+        r#"{"format":1,"nextId":2,"default":"p1","overrides":{},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"ticket04-decoy-persona","core":"decoy persona core"}]}}}"#,
     )
-    .expect("write distinct decoy runtime role");
+    .expect("write distinct decoy runtime persona");
     let decoy_window = br#"{"windows":{"group:420042":[{"sender":"decoy","text":"preserve decoy window","time":1}]},"consumedAt":{}}"#;
     fs::write(
         ambient_root.path().join("data/slang-windows.json"),
@@ -1310,12 +1310,12 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     let stored: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert!(stored["conversations"]["group:420042"]["recentMessages"].as_array().unwrap().contains(&strip_fixture));
     assert!(
-        received_prompt.contains("fixture-role-from-selected-root"),
-        "fake model received no selected-root role; received prompt={received_prompt:?}"
+        received_prompt.contains("fixture-persona-from-selected-root"),
+        "fake model received no selected-root persona; received prompt={received_prompt:?}"
     );
     assert!(
-        !received_prompt.contains("ticket04-decoy-role"),
-        "fake model received the decoy role; received prompt={received_prompt:?}"
+        !received_prompt.contains("ticket04-decoy-persona"),
+        "fake model received the decoy persona; received prompt={received_prompt:?}"
     );
     let snapshot: Value = serde_json::from_str(received_prompt.split("【本次消息快照】\n")
         .nth(1).expect("CLI model must receive the selected wake snapshot").lines().next().unwrap())

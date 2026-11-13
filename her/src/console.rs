@@ -12580,6 +12580,11 @@ fn route_with_context(
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
     }
+    if context.is_isolated() && crate::console_persona::is_route(&req.path) {
+        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
+        let (status, content_type, body) = crate::console_persona::route(context, &req.method, &req.path, &req.query, &req.body, agent_call);
+        return (status, content_type.to_string(), body);
+    }
     if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
         // Hold the configuration gate until the lifecycle mutation commits. A credential
         // accepted at the front may have been revoked while another writer held this gate.

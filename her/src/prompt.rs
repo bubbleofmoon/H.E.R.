@@ -40,6 +40,10 @@ pub fn role_for_session(key: &str) -> Option<String> {
 }
 
 pub fn role_for_session_with_runtime(context: &RuntimeContext, key: &str) -> Option<String> {
+    // Role cards are retired in companion modes; identity comes from the persona library there.
+    if crate::persona::applies(context) {
+        return None;
+    }
     let map = read_data_json(context, "role-map.json").unwrap_or_else(|| serde_json::json!({}));
 
     if let Some(sessions) = map.get("sessions").and_then(|s| s.as_object()) {
@@ -102,6 +106,18 @@ pub fn role_line_with_runtime(context: &RuntimeContext, key: &str) -> String {
         Some(name) => format!("【当前角色】{name}（完整角色卡请调用 qq_get_prompt 查看）\n\n"),
         None => String::new(),
     }
+}
+
+/// The Identity text of a conversation: the active persona core in companion modes, empty in
+/// closed-agent. The single injection point; #18 moves its briefing call into the Identity layer.
+pub(crate) fn identity_core(context: &RuntimeContext, key: &str) -> String {
+    crate::persona::core_block(context, key)
+}
+
+/// Chat and first-generation prompts: the persona core, else the role card (closed-agent, legacy).
+pub fn identity_hint_v1(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
+    let core = identity_core(context, key);
+    if core.is_empty() { role_hint_v1(context, cfg, key) } else { core.trim_end().to_string() }
 }
 
 /// JS `roleRawContent(key)`: the role card file of the session's role, or an empty string.
@@ -1191,6 +1207,7 @@ fn build_inner(
 
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
+    out.push_str(&identity_core(context, key));
     out.push_str(&identity_line(self_name, self_qq));
     out.push_str(&token_line(token));
     let initial = initial_prompt_line_with_runtime(context, &cfg, key, reason);
@@ -1251,6 +1268,7 @@ pub fn build_text_only_with_runtime(
     let cfg = config_for_runtime(context);
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
+    out.push_str(&identity_core(context, key));
     out.push_str(&identity_line(&crate::model_view::strip_from_model_text(self_name, &cfg), self_qq));
 
     out.push_str("【这次怎么做】\n");
@@ -1476,6 +1494,7 @@ mod tests {
         }}).to_string();
         std::fs::write(root.join("data/social-v2.json"), &state).unwrap();
 
+        std::fs::write(root.join("data/personas.json"), r#"{"format":1,"nextId":2,"default":null,"overrides":{"group:1":"p1"},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"测试人设","core":"测试人设核心。"}]}}}"#).unwrap();
         // The selected-runtime wake hub has no legacy process-local string window.
         let prompt = build_text_only_with_runtime(&context, "group:1", &[], "bot", "9001");
         let explicit = build_text_only_with_runtime(
@@ -1497,7 +1516,7 @@ mod tests {
         assert_eq!(packet["includedUnreadCount"], 12);
         assert_eq!(packet["readThroughSeq"], 12);
         assert_eq!(packet["partial"], true);
-        assert!(prompt.contains("【当前角色】测试角色"), "CLI prompt lost selected role: {prompt}");
+        assert!(prompt.contains("【人设】测试人设\n测试人设核心。"), "CLI prompt lost the selected persona: {prompt}");
         assert!(prompt.contains("【未读】13 条"), "CLI prompt lost selected unread count: {prompt}");
         assert!(!prompt.contains("foreign-conversation"), "CLI prompt crossed conversations: {prompt}");
         assert!(explicit.contains("7777: live-window-message"));
@@ -1693,6 +1712,7 @@ mod tests {
     #[test]
     fn role_hint_v2_selects_v2_sections_and_rewrites_example_spaces() {
         let (root, context) = runtime_fixture("role-hint");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
         std::fs::create_dir_all(root.join("resources/roles")).unwrap();
         std::fs::write(root.join("resources/roles/测试角色.md"), CARD).unwrap();
         let cfg = serde_json::json!({});
@@ -1724,6 +1744,7 @@ mod tests {
     #[test]
     fn role_map_default_empty_string_means_no_role_even_with_a_global_role() {
         let (root, context) = runtime_fixture("role-default");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
         std::fs::write(root.join("data/current-role.json"), r#"{"role":"全局","mode":"active"}"#).unwrap();
         std::fs::write(root.join("data/role-map.json"), r#"{"default":""}"#).unwrap();
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), None);
@@ -1817,8 +1838,8 @@ pub(crate) fn prepare_dsh_wake(
             .map(|line|format!("{line}\n\n")).unwrap_or_default()
     } else { saved_identity };
     let mut sections = BTreeMap::new();
-    sections.insert("identity", format!("{}{}{}", role_line_with_runtime(context,key), live_identity,
-        role_hint_v2(context,cfg,key)));
+    sections.insert("identity", format!("{}{}{}{}", role_line_with_runtime(context,key), identity_core(context,key),
+        live_identity, role_hint_v2(context,cfg,key)));
     sections.insert("operator", crate::initial_prompts::format_injection(context,cfg,key));
     sections.insert("behaviour", format!("{ANTI_AI_LINE}{PROACTIVE_LINE}"));
     sections.insert("stickers", sticker_line_with_runtime(context,cfg));
