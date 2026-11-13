@@ -299,6 +299,21 @@ class Stripper:
         return out
 
 
+def describe_ace(ace, sid):
+    """type;flags;rights;who for one ACE, with who as its alias, current-user or other-account; no SID or object GUID."""
+    fields = ace.split(';')
+    if len(fields) < 6:
+        return 'malformed'
+    who = fields[5]
+    if re.fullmatch(r'[A-Z]{2}', who):
+        label = who
+    elif who == sid:
+        label = 'current-user'
+    else:
+        label = 'other-account'
+    return f'{fields[0]};{fields[1]};{fields[2]};{label}'
+
+
 def dacl_problem(sddl, sid):
     """None when the DACL is protected and holds exactly one non-inherited full-access ACE for sid, else the first failed condition."""
     match = re.search(r'D:([A-Z]*)((?:\([^)]*\))*)', sddl)
@@ -306,7 +321,9 @@ def dacl_problem(sddl, sid):
         return 'not protected'
     aces = re.findall(r'\(([^)]*)\)', match.group(2))
     if len(aces) != 1:
-        return f'entry count {len(aces)}'
+        if not aces:
+            return 'entry count 0'
+        return f'entry count {len(aces)}: ' + ' '.join(describe_ace(ace, sid) for ace in aces)
     fields = aces[0].split(';') + [''] * 6
     if fields[0] != 'A':
         return 'entry is not an allow entry'

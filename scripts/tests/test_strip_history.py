@@ -535,6 +535,14 @@ class KeyAcl(unittest.TestCase):
         self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-5-21-1-2-3-500)', SID), 'entry is not the current user')
         self.assertEqual(s_mod.dacl_problem(f'D:AI(A;;FA;;;{SID})', SID), 'not protected')
 
+    def test_dacl_problem_describes_each_ace_without_identifiers(self):
+        s_mod = load()
+        require(self, s_mod, 'dacl_problem')
+        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;SY)(A;ID;FR;;;S-1-5-21-1-2-3-500)', 'S-1-5-21-1-2-3-1001'),
+                         'entry count 2: A;;FA;SY A;ID;FR;other-account')
+        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;SY)(A;ID;FR;;;S-1-5-21-1-2-3-1001)', 'S-1-5-21-1-2-3-1001'),
+                         'entry count 2: A;;FA;SY A;ID;FR;current-user')
+
     @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
     def test_load_key_refuses_a_group_readable_file(self):
         s_mod = load()
