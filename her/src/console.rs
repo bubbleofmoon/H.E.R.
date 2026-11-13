@@ -24400,6 +24400,43 @@ mod tests {
     }
 
     #[test]
+    fn schedule_writes_recheck_the_console_credential_under_the_config_gate() {
+        const OLD: &str = "fixture-schedule-old-console-token";
+        const NEW: &str = "fixture-schedule-new-console-token";
+        let (root, context) = fixture_runtime("ticket33 schedule revoked", OLD);
+        // The front door accepted the old credential; the rotation completed while the request waited.
+        let front = context.load_config().unwrap();
+        let config_path = root.0.join("config/config.json");
+        let mut raw: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        raw["consoleToken"] = json!(NEW);
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let now = crate::parity_clock::now_ms();
+        let writes = [
+            ("/api/schedule", json!({"conversation": "private:7001", "text": "喝水", "at": now + 3_600_000})),
+            ("/api/schedule/item:rem-fixture/cancel", json!({})),
+            ("/api/schedule/system:backup/pause", json!({"confirm": true})),
+            ("/api/schedule/system:backup/run", json!({"confirm": true, "requestId": "fixture-request-33"})),
+            ("/api/schedule/reachOut:private:7001/cancel", json!({"at": now + 60_000})),
+            ("/api/schedule/replyCheck:private:7001/run", json!({})),
+            ("/api/schedule/sleep:private:7001/cancel", json!({})),
+        ];
+        for (path, body) in writes {
+            let mut request = req("POST", path, Some(OLD));
+            request.body = body.to_string();
+            let (status, _, response) = schedule_routes::route(&context, &front, &request);
+            assert_eq!(status, 401, "{path}: {response}");
+        }
+        assert!(!root.0.join("data/schedule.json").exists(), "nothing was written with the revoked credential");
+        assert!(!std::fs::read_to_string(root.0.join("data/social-v2.json")).unwrap().contains("adminWakes"));
+
+        let mut request = req("POST", "/api/schedule/system:backup/pause", Some(NEW));
+        request.body = json!({"confirm": true}).to_string();
+        let (status, _, response) = schedule_routes::route(&context, &context.load_config().unwrap(), &request);
+        assert_eq!(status, 200, "{response}");
+        assert!(crate::schedule::ScheduleStore::new(&context).system_paused("backup"));
+    }
+
+    #[test]
     fn isolated_social_seen_rechecks_revoked_auth_after_gate_wait() {
         use std::sync::mpsc;
         use std::time::Duration;

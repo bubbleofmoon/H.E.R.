@@ -50,7 +50,7 @@ so the UI opens. Flag contracts: `docs/agents/windows-lifecycle.md`.
   image, account ID or dependency credential appears in HER.
 - Under notify, serve a fake release feed with a newer release. Confirm the app
   banner and enabled **Update available** tray item show the same current/new
-  versions. Confirm the tasks page selects the current update policy and retains
+  versions. Confirm the Schedule page selects the current update policy and retains
   policy edits after reload. Before approval, no candidate is staged or switched.
 - On fresh disposable installations, approve through the console button, app
   banner button and tray item. Each action must use the displayed version and

@@ -1,4 +1,4 @@
-//! Ticket 27: the task page and its JSON routes.
+//! Ticket 27 (renamed by ticket 33): the Schedule page's task routes (`/api/tasks/*`) and the page markup.
 //!
 //! Mounted behind the console front (ticket 24): Host check, console credential, `application/json` and Origin checks
 //! on POST, and the audit record of every administrator write happen before [`route`] is called (phase B wiring). This
@@ -359,8 +359,8 @@ pre{background:#f8f8f8;border:1px solid #ddd;padding:8px;max-height:360px;overfl
 <section id="history" hidden><h3>提醒记录</h3><table id="schedule-history"><thead><tr><th>时间</th><th>项目</th><th>会话</th><th>结果</th></tr></thead><tbody></tbody></table>
 <h2>运行历史</h2><p>筛选 <select id="filter"><option value="">全部</option></select> <button id="more">更早</button></p>
 <table id="runs"><thead><tr><th>运行 ID</th><th>任务</th><th>来源</th><th>状态</th><th>退出码</th><th>原因</th><th>排队</th><th>开始</th><th>结束</th></tr></thead><tbody></tbody></table>
-<h2>日志 <span id="logrun"></span></h2><pre id="log">选择一次运行查看日志</pre>
 </section>
+<h2>日志 <span id="logrun"></span></h2><pre id="log">选择一次运行查看日志</pre>
 <h2>旧计划任务处置</h2><table id="legacy"><thead><tr><th>Windows 任务</th><th>处置</th><th>替代</th><th>说明</th></tr></thead><tbody></tbody></table>
 <script>
 const $=s=>document.querySelector(s);let before=null;
@@ -434,9 +434,9 @@ document.addEventListener('click',async e=>{const control=e.target.closest('[dat
  const l=e.target.closest('[data-log]');if(l){e.preventDefault();showLog(l.dataset.log)}});
 const schedKinds={job:'任务',reminder:'提醒',sleep:'潜水结束',replyCheck:'回复检查',reachOut:'主动冒泡'};
 const schedCreators={system:'系统',owner:'管理员',her:'HER'};
-const schedStatus={active:'待运行',paused:'已暂停',overdue:'已逾期',running:'运行中',disabled:'未启用'};
+const schedStatus={active:'待运行',paused:'已暂停',overdue:'已逾期',running:'运行中',disabled:'未启用',stale:'已过时（HER 未在运行）'};
 const schedLabels={pause:'暂停',resume:'恢复',edit:'编辑',cancel:'取消',run:'立即运行'};
-function schedRow(x){const buttons=x.actions.map(a=>x.kind==='job'&&a==='run'?`<button data-run="${esc(x.id.slice(7))}" data-effect="${esc(x.action)}" ${x.status==='running'?'disabled':''}>${schedLabels.run}</button>`:`<button type="button" data-sched="${esc(x.id)}" data-act="${a}" data-text="${esc(x.action)}">${schedLabels[a]}</button>`).join(' ');
+function schedRow(x){const buttons=x.actions.map(a=>x.kind==='job'&&a==='run'?`<button data-run="${esc(x.id.slice(7))}" data-effect="${esc(x.action)}" ${x.status==='running'?'disabled':''}>${schedLabels.run}</button>`:`<button type="button" data-sched="${esc(x.id)}" data-act="${a}" data-text="${esc(x.action)}" data-at="${esc(x.nextRunAt??'')}">${schedLabels[a]}</button>`).join(' ');
  return `<tr><td>${esc(schedKinds[x.kind]||x.kind)}</td><td>${esc(schedCreators[x.creator]||x.creator)}</td><td>${esc(x.conversation??'')}</td><td>${x.nextRunAt==null?'':t(x.nextRunAt)}</td><td>${esc(x.repeat)}</td><td>${esc(x.action)}</td><td>${esc(schedStatus[x.status]||x.status)}</td><td>${t(x.createdAt)}</td><td>${x.lastResult?esc(x.lastResult.summary)+' '+t(x.lastResult.at):''}</td><td>${buttons}</td></tr>`}
 async function loadSchedule(){try{const j=await api('/api/schedule');if(!j.ok)throw Error(j.error);$('#schedule-upcoming tbody').innerHTML=j.entries.map(schedRow).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
 async function loadScheduleHistory(){try{const j=await api('/api/schedule/history?limit=100');if(!j.ok)throw Error(j.error);$('#schedule-history tbody').innerHTML=j.history.map(r=>`<tr><td>${t(r.at)}</td><td>${esc(r.id)}</td><td>${esc(r.conversation)}</td><td>${esc(r.summary)}${r.late?'（迟到）':''}</td></tr>`).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
@@ -445,7 +445,7 @@ $('#tab-history').onclick=()=>{$('#upcoming').hidden=true;$('#history').hidden=f
 document.addEventListener('click',async e=>{const b=e.target.closest('[data-sched]');if(!b)return;
  const id=b.dataset.sched,act=b.dataset.act,message=$('#schedule-message'),body={};
  if(id.startsWith('system:')){if(!confirm((act==='pause'?'暂停':'恢复')+'系统任务「'+id.slice(7)+'」？'))return;body.confirm=true}
- if(act==='cancel'&&!confirm('取消这条日程？'))return;
+ if(act==='cancel'&&!confirm(id.startsWith('reachOut:')?'跳过这次主动冒泡机会？下一次机会会在它之后重新安排。':'取消这条日程？'))return;if(act==='cancel'&&(id.startsWith('replyCheck:')||id.startsWith('reachOut:')))body.at=Number(b.dataset.at);
  if(act==='edit'){const at=prompt('新的时间（本地，例如 2026-11-14 09:00）','');if(!at)return;const ms=new Date(at.replace(' ','T')).getTime();if(Number.isNaN(ms)){message.textContent='时间格式无效';return}body.at=ms;
   if(id.startsWith('item:')){const text=prompt('提醒内容',b.dataset.text||'');if(text===null)return;body.text=text}}
  b.disabled=true;

@@ -1539,16 +1539,6 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     });
     fs::write(&social_path, serde_json::to_vec(&social).unwrap()).unwrap();
     let timer_at = 4_102_444_800_000_i64;
-    fs::write(
-        root.join("data/schedule-timers.json"),
-        json!({"publishedAt": 1, "timers": [
-            {"conversation": SESSION_KEY, "kind": "sleep", "at": timer_at},
-            {"conversation": SESSION_KEY, "kind": "replyCheck", "at": timer_at + 1},
-            {"conversation": SESSION_KEY, "kind": "reachOut", "at": timer_at + 2}
-        ]})
-        .to_string(),
-    )
-    .unwrap();
     let (port, _) = reserve_distinct_ports();
     let console = ConsoleProcess::start(&root, port, &legacy);
 
@@ -1559,6 +1549,19 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     assert!(page.body.contains("/api/schedule") && page.body.contains("tab-history"));
 
     let now = schedule_list(port, token)["now"].as_i64().unwrap();
+    let publish_timers = |published_at: i64| {
+        fs::write(
+            root.join("data/schedule-timers.json"),
+            json!({"publishedAt": published_at, "timers": [
+                {"conversation": SESSION_KEY, "kind": "sleep", "at": timer_at},
+                {"conversation": SESSION_KEY, "kind": "replyCheck", "at": timer_at + 1},
+                {"conversation": SESSION_KEY, "kind": "reachOut", "at": timer_at + 2}
+            ]})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    publish_timers(now);
     let create = json!({
         "conversation": SESSION_KEY,
         "text": "提醒喝水",
@@ -1583,6 +1586,8 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
             assert!(entry.get(field).is_some(), "{field} missing: {entry}");
         }
     }
+    let too_often = json!({"conversation": SESSION_KEY, "text": "太频繁", "at": now + 3_600_000, "repeat": {"kind": "every", "minutes": 14}});
+    assert_eq!(http_request(port, "POST", "/api/schedule", Some(token), None, Some(&too_often)).unwrap().status, 400, "repeats under 15 minutes are refused");
 
     let action = |target: &str, verb: &str, body: Value| {
         http_request(port, "POST", &format!("/api/schedule/{target}/{verb}"), Some(token), None, Some(&body)).unwrap()
@@ -1593,7 +1598,8 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["status"], "active");
     expect_json(action(&item, "edit", json!({"text": "多喝水"})), 200, "edit reminder");
     assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["action"], "多喝水");
-    expect_json(action(&item, "run", json!({})), 200, "run reminder");
+    let ran = expect_json(action(&item, "run", json!({})), 200, "run reminder");
+    assert_eq!(ran["item"]["runNow"], true, "{ran}");
     expect_json(action(&item, "cancel", json!({})), 200, "cancel reminder");
     assert!(schedule_entry(&schedule_list(port, token), &item).is_none(), "cancelled reminder left Upcoming");
 
@@ -1606,6 +1612,11 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
     assert_ne!(schedule_entry(&schedule_list(port, token), "system:backup").unwrap()["status"], "paused");
     assert_eq!(action("system:watchdog", "pause", json!({"confirm": true})).status, 409);
     assert_eq!(action("system:backup", "cancel", json!({"confirm": true})).status, 409);
+    assert_eq!(action("system:backup", "cancel", json!({})).status, 409, "an unsupported system action is refused before confirm");
+    assert_eq!(action("system:watchdog", "pause", json!({})).status, 409, "a job that cannot pause is refused before confirm");
+    let restart = action("system:console-restart", "run", json!({"confirm": true}));
+    assert_eq!(restart.status, 409, "system run goes through the task trigger: {}", restart.body);
+    assert!(restart.body.contains("/api/restart"), "{}", restart.body);
 
     let reply = expect_json(action("replyCheck:private:7001", "run", json!({})), 200, "run reply check");
     assert_eq!(reply["reason"], "replyCheck", "{reply}");
@@ -1615,17 +1626,33 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
         .unwrap()
         .iter()
         .any(|wake| wake["reason"] == "replyCheck"));
-    expect_json(action("reachOut:private:7001", "cancel", json!({})), 200, "cancel reach out");
+    assert_eq!(action("reachOut:private:7001", "cancel", json!({})).status, 400, "a cancel names the timer the owner saw");
+    assert_eq!(action("reachOut:private:7001", "cancel", json!({"at": timer_at + 3})).status, 409, "a timer that changed is not cancelled");
+    expect_json(action("reachOut:private:7001", "cancel", json!({"at": timer_at + 2})), 200, "cancel reach out");
     let schedule_file: Value = serde_json::from_slice(&fs::read(root.join("data/schedule.json")).unwrap()).unwrap();
     assert!(schedule_file["timerCancels"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|cancel| cancel["kind"] == "reachOut" && cancel["conversation"] == SESSION_KEY));
+        .any(|cancel| cancel["kind"] == "reachOut" && cancel["conversation"] == SESSION_KEY && cancel["timerAt"] == json!(timer_at + 2)));
+    let reach = expect_json(action("reachOut:private:7001", "run", json!({})), 200, "run reach out");
+    assert_eq!(reach["reason"], "proactiveCheck", "{reach}");
+    publish_timers(now - 3 * 60_000);
+    let stale = schedule_entry(&schedule_list(port, token), "replyCheck:private:7001").unwrap();
+    assert_eq!(stale["status"], "stale", "{stale}");
+    assert_eq!(stale["actions"], json!([]));
+    assert_eq!(action("replyCheck:private:7001", "cancel", json!({"at": timer_at + 1})).status, 409, "nothing is cancelled against a stale snapshot");
+    publish_timers(now);
     assert_eq!(action("replyCheck:private:7001", "pause", json!({})).status, 409);
-    expect_json(action("sleep:private:7001", "edit", json!({"at": now + 7_200_000})), 200, "edit sleep");
+    expect_json(action("sleep:private:7001", "edit", json!({"at": timer_at + 3_600_000})), 200, "edit sleep");
     let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
-    assert_ne!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"], "2100-01-01T00:00:00.000Z");
+    assert_eq!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"], "2100-01-01T01:00:00.000Z");
+    let slept = expect_json(action("sleep:private:7001", "run", json!({})), 200, "run sleep");
+    assert_eq!(slept["reason"], "timeout", "{slept}");
+    expect_json(action("sleep:private:7001", "cancel", json!({})), 200, "cancel sleep");
+    let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
+    assert_eq!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["infinite"], true);
+    assert!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"].is_null());
 
     let history = expect_json(
         http_request(port, "GET", "/api/schedule/history", Some(token), None, None).unwrap(),
@@ -1645,19 +1672,34 @@ fn schedule_page_lists_every_entry_type_and_audits_actions() {
         "audit",
     );
     let recorded = audit["entries"].as_array().unwrap();
-    for (path, status) in [
-        ("/api/schedule", 200),
-        ("/api/schedule/system:backup/pause", 400),
-        ("/api/schedule/system:backup/pause", 200),
-        ("/api/schedule/system:watchdog/pause", 409),
-        ("/api/schedule/system:backup/cancel", 409),
-        ("/api/schedule/replyCheck:private:7001/run", 200),
-        ("/api/schedule/reachOut:private:7001/cancel", 200),
-        ("/api/schedule/replyCheck:private:7001/pause", 409),
-        ("/api/schedule/sleep:private:7001/edit", 200),
-    ] {
+    let item_path = |verb: &str| format!("/api/schedule/{item}/{verb}");
+    let expected: Vec<(String, u16)> = vec![
+        ("/api/schedule".into(), 200),
+        ("/api/schedule".into(), 400),
+        (item_path("pause"), 200),
+        (item_path("resume"), 200),
+        (item_path("edit"), 200),
+        (item_path("run"), 200),
+        (item_path("cancel"), 200),
+        ("/api/schedule/system:backup/pause".into(), 400),
+        ("/api/schedule/system:backup/pause".into(), 200),
+        ("/api/schedule/system:watchdog/pause".into(), 409),
+        ("/api/schedule/system:backup/cancel".into(), 409),
+        ("/api/schedule/system:console-restart/run".into(), 409),
+        ("/api/schedule/replyCheck:private:7001/run".into(), 200),
+        ("/api/schedule/replyCheck:private:7001/cancel".into(), 409),
+        ("/api/schedule/reachOut:private:7001/cancel".into(), 400),
+        ("/api/schedule/reachOut:private:7001/cancel".into(), 409),
+        ("/api/schedule/reachOut:private:7001/cancel".into(), 200),
+        ("/api/schedule/reachOut:private:7001/run".into(), 200),
+        ("/api/schedule/replyCheck:private:7001/pause".into(), 409),
+        ("/api/schedule/sleep:private:7001/edit".into(), 200),
+        ("/api/schedule/sleep:private:7001/run".into(), 200),
+        ("/api/schedule/sleep:private:7001/cancel".into(), 200),
+    ];
+    for (path, status) in &expected {
         assert!(
-            recorded.iter().any(|entry| entry["method"] == "POST" && entry["path"] == path && entry["status"] == json!(status)),
+            recorded.iter().any(|entry| entry["method"] == "POST" && entry["path"] == path.as_str() && entry["status"] == json!(status)),
             "POST {path} {status} was not audited"
         );
     }
