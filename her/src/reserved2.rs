@@ -109,6 +109,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_due_reminder_is_claimed_once_after_restart_and_paused_reminders_wait() {
+        use crate::schedule::{Creator, NewItem, Repeat, ScheduleStore};
+        let (root, mut hub) = queued_hub("schedule-reminder").await;
+        let cfg = hub.context.load_config().unwrap();
+        let store = ScheduleStore::new(&hub.context);
+        let now = crate::now_ms() as i64;
+        let at = now + 60_000;
+        let every = store
+            .create(NewItem { creator: Creator::Owner, conversation: "group:420042".into(), text: "喝水".into(), at, repeat: Repeat::Every { minutes: 60 } }, now)
+            .unwrap();
+        let paused = store
+            .create(NewItem { creator: Creator::Owner, conversation: "group:420043".into(), text: "开会".into(), at, repeat: Repeat::Once }, now)
+            .unwrap();
+        store.set_item_paused(&paused.id, true).unwrap();
+        hub.ready.clear();
+
+        // The hub keeps no reminder state: a later clock over the same store file is the restart.
+        let later = now + 3 * 86_400_000;
+        hub.sync_schedule(&cfg, false, later);
+        assert_eq!(hub.ready, vec![("group:420042".to_string(), format!("reminder:{}", every.id))]);
+        hub.ready.clear();
+        hub.sync_schedule(&cfg, false, later + 1_000);
+        assert!(hub.ready.is_empty(), "a claimed repeat is not claimed again");
+        let stored = store.item(&every.id).unwrap().unwrap();
+        assert!(stored.next_at > later, "a missed repeat jumps to the next slot after now");
+        assert!(stored.last_result.unwrap().late);
+
+        store.run_now(&paused.id).unwrap();
+        hub.sync_schedule(&cfg, false, later + 2_000);
+        assert_eq!(hub.ready, vec![("group:420043".to_string(), format!("reminder:{}", paused.id))]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn schedule_publishes_her_timers_and_applies_console_cancels() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-timers").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        hub.ready.clear();
+        hub.drivers.get_mut(key).unwrap().sched.reply_check_at = Some(now + 600_000);
+
+        let lists_reply_check = |root: &std::path::Path| {
+            let published: Value = serde_json::from_slice(&std::fs::read(root.join("data/schedule-timers.json")).unwrap()).unwrap();
+            published["timers"].as_array().unwrap().iter().any(|timer| timer["conversation"] == key && timer["kind"] == "replyCheck")
+        };
+        hub.sync_schedule(&cfg, false, now);
+        assert!(lists_reply_check(&root), "her reply check is published");
+
+        ScheduleStore::new(&hub.context).request_timer_cancel(key, TimerKind::ReplyCheck, now).unwrap();
+        hub.sync_schedule(&cfg, false, now);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, None, "the console cancel clears the timer");
+        assert!(!lists_reply_check(&root), "the snapshot no longer lists the cancelled timer");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn hf135_partial_reset_keeps_maintenance_and_queued_ingress_until_revoked() {
         use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
         let (root,mut hub) = queued_hub("hf135-partial-reset").await;
@@ -2024,6 +2082,70 @@ impl Hub {
         self.live_all || self.groups.iter().any(|k| k == key)
     }
 
+    /// Ticket 33: the Schedule store's side of this hub. Applies the console's timer cancels, publishes this
+    /// hub's in-memory timers for the Schedule page, then claims due reminders for idle conversations.
+    fn sync_schedule(&mut self, cfg: &Value, suspended: bool, now: i64) {
+        let store = crate::schedule::ScheduleStore::new(&self.context);
+        match store.take_timer_cancels(now) {
+            Ok(cancels) => {
+                for cancel in cancels {
+                    let Some(d) = self.drivers.get_mut(&cancel.conversation) else { continue };
+                    match cancel.kind {
+                        crate::schedule::TimerKind::ReplyCheck => d.sched.reply_check_at = None,
+                        crate::schedule::TimerKind::ReachOut => d.sched.proactive_at = None,
+                        crate::schedule::TimerKind::Sleep => {}
+                    }
+                }
+            }
+            Err(error) => println!("[reserved2] schedule cancels: {}", error.message()),
+        }
+        let mut timers = Vec::new();
+        for (key, d) in &self.drivers {
+            if !d.sched.wc.infinite {
+                if let Some(at) = d.sched.wc.sleep_until.as_deref().and_then(crate::wake::parse_iso_ms) {
+                    timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::Sleep, at });
+                }
+            }
+            if let Some(at) = d.sched.reply_check_at {
+                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReplyCheck, at });
+            }
+            if let Some(at) = d.sched.proactive_at {
+                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReachOut, at });
+            }
+        }
+        if let Err(error) = store.publish_timers(timers, now) {
+            println!("[reserved2] schedule timers: {}", error.message());
+        }
+        if suspended {
+            return;
+        }
+        let idle: std::collections::HashSet<String> = self
+            .drivers
+            .iter()
+            .filter(|(key, d)| {
+                let key = key.as_str();
+                self.taken(key)
+                    && console::key_allowed(cfg, key)
+                    && !self.active.contains_key(key)
+                    && !self.recovered.contains_key(key)
+                    && !self.maintenance.contains_key(key)
+                    && !d.sched.is_busy(now)
+                    && !self.ready.iter().any(|(queued, _)| queued.as_str() == key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        match store.claim_due(now, |key| idle.contains(key)) {
+            Ok(items) => {
+                for item in items {
+                    println!("[reserved2] {} 日程提醒到期（{}）", item.conversation, item.id);
+                    let reason = format!("{}{}", crate::schedule::REMINDER_REASON, item.id);
+                    self.ready.push((item.conversation, reason));
+                }
+            }
+            Err(error) => println!("[reserved2] schedule claim: {}", error.message()),
+        }
+    }
+
     fn record(&self, name: &str, value: &Value) -> Result<(), String> {
         crate::append_runtime_json_line(&self.context, name, "", value).map_err(|e| e.to_string())
     }
@@ -2807,6 +2929,7 @@ impl Hub {
         for (key, e) in session::pump_all(&mut self.drivers, now) {
             self.route_driver_event(&cfg, &key, e);
         }
+        self.sync_schedule(&cfg, suspended, now);
         for (key, reason) in std::mem::take(&mut self.ready) {
             if let Some(m)=self.maintenance.get(&key) {
                 m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);

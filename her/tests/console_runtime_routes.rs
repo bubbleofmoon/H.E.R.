@@ -1511,6 +1511,159 @@ fn task_page_and_history_are_available_only_to_the_current_administrator() {
     drop(console);
 }
 
+fn schedule_list(port: u16, token: &str) -> Value {
+    expect_json(http_request(port, "GET", "/api/schedule", Some(token), None, None).unwrap(), 200, "schedule list")
+}
+
+fn schedule_entry(list: &Value, id: &str) -> Option<Value> {
+    list["entries"].as_array().unwrap().iter().find(|entry| entry["id"] == id).cloned()
+}
+
+#[test]
+fn schedule_page_lists_every_entry_type_and_audits_actions() {
+    let workspace = FixtureWorkspace::new("schedule-front");
+    let root = workspace.root("runtime");
+    let token = "fixture-schedule-console-token-abcdefghij";
+    let agent = "fixture-schedule-agent-token-abcdefghij";
+    let legacy = prepare_runtime_root(&root, token, agent, "http://127.0.0.1:1", "http://127.0.0.1:1", None, None);
+    fs::write(root.join("data/mode.json"), br#"{"mode":"reserved2"}"#).unwrap();
+    let social_path = root.join("data/social-v2.json");
+    let mut social: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
+    social["conversations"][SESSION_KEY]["bootstrapSent"] = json!(true);
+    social["conversations"][SESSION_KEY]["wakeConfig"] = json!({
+        "mode": "diving",
+        "infinite": false,
+        "sleepUntil": "2100-01-01T00:00:00.000Z",
+        "confirmedAt": 1,
+        "triggers": {"atMention": true}
+    });
+    fs::write(&social_path, serde_json::to_vec(&social).unwrap()).unwrap();
+    let timer_at = 4_102_444_800_000_i64;
+    fs::write(
+        root.join("data/schedule-timers.json"),
+        json!({"publishedAt": 1, "timers": [
+            {"conversation": SESSION_KEY, "kind": "sleep", "at": timer_at},
+            {"conversation": SESSION_KEY, "kind": "replyCheck", "at": timer_at + 1},
+            {"conversation": SESSION_KEY, "kind": "reachOut", "at": timer_at + 2}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let (port, _) = reserve_distinct_ports();
+    let console = ConsoleProcess::start(&root, port, &legacy);
+
+    assert_eq!(http_request(port, "GET", "/api/schedule", None, None, None).unwrap().status, 401);
+    assert_eq!(http_request(port, "GET", "/api/schedule", Some(token), Some(agent), None).unwrap().status, 403);
+    let page = http_request(port, "GET", "/schedule", Some(token), None, None).unwrap();
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("/api/schedule") && page.body.contains("tab-history"));
+
+    let now = schedule_list(port, token)["now"].as_i64().unwrap();
+    let create = json!({
+        "conversation": SESSION_KEY,
+        "text": "提醒喝水",
+        "at": now + 3_600_000,
+        "repeat": {"kind": "daily", "hour": 9, "minute": 0}
+    });
+    let created = expect_json(
+        http_request(port, "POST", "/api/schedule", Some(token), None, Some(&create)).unwrap(),
+        200,
+        "create reminder",
+    );
+    let item_id = created["item"]["id"].as_str().unwrap().to_string();
+    let item = format!("item:{item_id}");
+
+    let list = schedule_list(port, token);
+    let entries = list["entries"].as_array().unwrap();
+    for kind in ["job", "reminder", "sleep", "replyCheck", "reachOut"] {
+        assert!(entries.iter().any(|entry| entry["kind"] == kind), "missing {kind}: {list}");
+    }
+    for entry in entries {
+        for field in ["id", "kind", "creator", "conversation", "nextRunAt", "repeat", "action", "status", "createdAt", "lastResult", "actions"] {
+            assert!(entry.get(field).is_some(), "{field} missing: {entry}");
+        }
+    }
+
+    let action = |target: &str, verb: &str, body: Value| {
+        http_request(port, "POST", &format!("/api/schedule/{target}/{verb}"), Some(token), None, Some(&body)).unwrap()
+    };
+    expect_json(action(&item, "pause", json!({})), 200, "pause reminder");
+    assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["status"], "paused");
+    expect_json(action(&item, "resume", json!({})), 200, "resume reminder");
+    assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["status"], "active");
+    expect_json(action(&item, "edit", json!({"text": "多喝水"})), 200, "edit reminder");
+    assert_eq!(schedule_entry(&schedule_list(port, token), &item).unwrap()["action"], "多喝水");
+    expect_json(action(&item, "run", json!({})), 200, "run reminder");
+    expect_json(action(&item, "cancel", json!({})), 200, "cancel reminder");
+    assert!(schedule_entry(&schedule_list(port, token), &item).is_none(), "cancelled reminder left Upcoming");
+
+    assert_eq!(action("system:backup", "pause", json!({})).status, 400, "system pause needs confirm");
+    expect_json(action("system:backup", "pause", json!({"confirm": true})), 200, "pause backup");
+    let backup = schedule_entry(&schedule_list(port, token), "system:backup").unwrap();
+    assert_eq!(backup["status"], "paused");
+    assert!(backup["nextRunAt"].is_null());
+    expect_json(action("system:backup", "resume", json!({"confirm": true})), 200, "resume backup");
+    assert_ne!(schedule_entry(&schedule_list(port, token), "system:backup").unwrap()["status"], "paused");
+    assert_eq!(action("system:watchdog", "pause", json!({"confirm": true})).status, 409);
+    assert_eq!(action("system:backup", "cancel", json!({"confirm": true})).status, 409);
+
+    let reply = expect_json(action("replyCheck:private:7001", "run", json!({})), 200, "run reply check");
+    assert_eq!(reply["reason"], "replyCheck", "{reply}");
+    let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
+    assert!(social_after["conversations"][SESSION_KEY]["adminWakes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|wake| wake["reason"] == "replyCheck"));
+    expect_json(action("reachOut:private:7001", "cancel", json!({})), 200, "cancel reach out");
+    let schedule_file: Value = serde_json::from_slice(&fs::read(root.join("data/schedule.json")).unwrap()).unwrap();
+    assert!(schedule_file["timerCancels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cancel| cancel["kind"] == "reachOut" && cancel["conversation"] == SESSION_KEY));
+    assert_eq!(action("replyCheck:private:7001", "pause", json!({})).status, 409);
+    expect_json(action("sleep:private:7001", "edit", json!({"at": now + 7_200_000})), 200, "edit sleep");
+    let social_after: Value = serde_json::from_slice(&fs::read(&social_path).unwrap()).unwrap();
+    assert_ne!(social_after["conversations"][SESSION_KEY]["wakeConfig"]["sleepUntil"], "2100-01-01T00:00:00.000Z");
+
+    let history = expect_json(
+        http_request(port, "GET", "/api/schedule/history", Some(token), None, None).unwrap(),
+        200,
+        "schedule history",
+    );
+    assert!(history["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["id"] == item_id && record["summary"] == "已取消"));
+    assert_eq!(http_request(port, "GET", "/api/tasks/runs", Some(token), None, None).unwrap().status, 200);
+
+    let audit = expect_json(
+        http_request(port, "GET", "/api/audit/recent?limit=100", Some(token), None, None).unwrap(),
+        200,
+        "audit",
+    );
+    let recorded = audit["entries"].as_array().unwrap();
+    for (path, status) in [
+        ("/api/schedule", 200),
+        ("/api/schedule/system:backup/pause", 400),
+        ("/api/schedule/system:backup/pause", 200),
+        ("/api/schedule/system:watchdog/pause", 409),
+        ("/api/schedule/system:backup/cancel", 409),
+        ("/api/schedule/replyCheck:private:7001/run", 200),
+        ("/api/schedule/reachOut:private:7001/cancel", 200),
+        ("/api/schedule/replyCheck:private:7001/pause", 409),
+        ("/api/schedule/sleep:private:7001/edit", 200),
+    ] {
+        assert!(
+            recorded.iter().any(|entry| entry["method"] == "POST" && entry["path"] == path && entry["status"] == json!(status)),
+            "POST {path} {status} was not audited"
+        );
+    }
+    drop(console);
+}
+
 #[test]
 fn one_runtime_root_cannot_have_two_console_processes_even_on_different_ports() {
     let workspace = FixtureWorkspace::new("console-owner");

@@ -228,7 +228,7 @@ pub fn monitor_notices(
     use crate::task_runs::{RunQuery, RunSource, RunState};
     use crate::tasks::{self, TaskId};
     let schedule = daily_schedule(config)?;
-    let on = crate::supervisor::enabled(config, tasks::task_def(TaskId::Backup));
+    let on = crate::supervisor::enabled_in(context, config, tasks::task_def(TaskId::Backup));
     let signature = format!("{}:{on}", crate::config::backup_config(config)?["time"]);
     let notices = update_notices(context, |state| {
         // The first observation and every time/enabled change start now: neither older

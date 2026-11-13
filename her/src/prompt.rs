@@ -1034,6 +1034,9 @@ fn tail(reason: &str, key: &str, pre_sleep_ms: u64) -> String {
         "proactiveCheck" => format!(
             "【主动机会】{key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。"
         ),
+        r if r.starts_with("reminder:") => format!(
+            "【提醒】{key}\n原因：一条提醒到时间了，内容见上方【提醒内容】。\n用发送工具在本会话自然地把提醒告诉对方；不要提到日程、系统或提醒编号。说完后按【沉睡前强制等待】收尾。"
+        ),
         other => format!(
             "【唤醒】{key}\n原因：{other}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。"
         ),
@@ -1233,6 +1236,7 @@ fn build_inner(
     out.push_str(&recall);
     out.push_str(&participation_block(&st));
     out.push_str(&pre_sleep_line(&cfg));
+    out.push_str(&crate::schedule::reminder_line(context, reason));
     out.push_str(&tail(reason, key, pre_sleep_ms(&cfg)));
     let recent = st["recentMessages"].as_array().cloned().unwrap_or_default();
     let carried = &recent[recent.len().saturating_sub(10)..];
@@ -1428,6 +1432,7 @@ mod tests {
         assert!(d.starts_with("【主动机会】"), "proactiveCheck 必须走专属分支，实际：{d}");
         assert!(d.contains("主动冒泡"));
         assert!(!d.contains("【行动前】"));
+        assert!(tail("reminder:rem-1", "group:1", 300_000).starts_with("【提醒】"));
     }
 
     #[test]
@@ -1893,6 +1898,7 @@ pub(crate) fn prepare_dsh_wake(
     let held = held_recall_ids(&record);
     let (recall, recalled) = recall_block_with(context, cfg, st, key, &held);
     delta.push_str(&recall);
+    delta.push_str(&crate::schedule::reminder_line(context, reason));
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
     body.push_str(&crate::model_view::strip_from_model_text(&delta, cfg));
     body.push_str(&crate::qq_tools::wake_snapshot(context,cfg,key,epoch)?);

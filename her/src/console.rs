@@ -41,6 +41,8 @@ mod voice_http;
 #[path = "console_access.rs"]
 mod access;
 pub(crate) use access::take_admin_wake;
+#[path = "console_schedule.rs"]
+mod schedule_routes;
 
 fn read_json(path: &str) -> Option<Value> {
     std::fs::read_to_string(path)
@@ -475,6 +477,7 @@ fn is_bounded_json_post(method: &str, path: &str) -> bool {
     is_role_management_post(method, path)
         || (method == "POST" && path == "/api/socialV2/send-message")
         || (method == "POST" && path.starts_with("/api/tasks/"))
+        || (method == "POST" && (path == "/api/schedule" || path.starts_with("/api/schedule/")))
         || (method == "POST" && path.starts_with("/api/backups/"))
         || (method == "POST" && path.starts_with("/api/releases/"))
         || (method == "POST" && path.starts_with("/api/dependencies/"))
@@ -12579,6 +12582,9 @@ fn route_with_context(
             Ok(value) => (if value["queued"] == true {202} else {200}, "application/json; charset=utf-8".to_string(), value.to_string()),
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
+    }
+    if context.is_isolated() && schedule_routes::is_schedule_path(&req.path) {
+        return schedule_routes::route(context, cfg, req);
     }
     if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
         // Hold the configuration gate until the lifecycle mutation commits. A credential

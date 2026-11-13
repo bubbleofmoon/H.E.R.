@@ -73,6 +73,7 @@ mod lifecycle_cli;
 mod watchdog;
 mod task_runs;
 mod tasks;
+mod schedule;
 mod backup;
 mod restore;
 mod console_tasks;
