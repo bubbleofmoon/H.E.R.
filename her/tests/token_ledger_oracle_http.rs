@@ -3,8 +3,8 @@
 //! Recorded token-ledger fixtures are served by an isolated console process.
 //! Every value is synthetic (fixture tokens, loopback ports, temp roots). No live service, config or endpoint is touched.
 
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide;
 mod support;
 
 use serde_json::{json, Value};
@@ -61,21 +61,6 @@ fn isolated_config() -> Value {
         "dsh": { "baseUrl": "http://127.0.0.1:1", "provider": "fixture", "model": "fixture-model", "reasoningEffort": "high" },
         "pricing": fixture_json("pricing.json")
     })
-}
-
-fn dependencies() -> Value {
-    json!({ "dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:1", "onebot": "http://127.0.0.1:1" })
-}
-
-fn hide(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
 }
 
 struct Console {
@@ -234,7 +219,7 @@ fn isolated_console_serves_the_js_ledger_outputs_for_the_fixture() {
         fs::create_dir_all(path.join(dir)).expect("create runtime dir");
     }
     fs::write(path.join("config/config.json"), serde_json::to_vec_pretty(&isolated_config()).unwrap()).unwrap();
-    fs::write(path.join("dependencies.json"), serde_json::to_vec(&dependencies()).unwrap()).unwrap();
+    crate::support::write_dependencies(path, crate::support::CLOSED, crate::support::CLOSED, crate::support::CLOSED, None);
     fs::write(path.join("data/social-v2.json"), b"{}").unwrap();
     fs::copy(fixture_path("token-usage.jsonl"), path.join("data/token-usage.jsonl")).unwrap();
     fs::copy(fixture_path("sessions.json"), path.join("data/sessions.json")).unwrap();

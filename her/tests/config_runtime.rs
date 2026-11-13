@@ -1,6 +1,6 @@
 //! Runtime configuration behavior through an isolated console process.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window;
 mod support;
 #[path = "support/selftest.rs"]
 mod support_selftest;
@@ -61,19 +61,8 @@ fn write_runtime(root: &Path) {
     fs::write(root.join("config/config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
     fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
     fs::write(root.join("data/mode.json"), r#"{"mode":"simulation","closedAgentPreset":""}"#).unwrap();
-    fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
+    crate::support::write_dependencies(root, crate::support::CLOSED, crate::support::CLOSED, crate::support::CLOSED, None);
 }
-fn hide_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 fn isolate_env(command: &mut Command, home: &Path) {
     command
         .env_remove("HER_RUNTIME_ROOT")

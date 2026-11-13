@@ -2,21 +2,20 @@
 //! Everything is synthetic: a loopback OneBot fake, a fake external `curl` (the only mocked
 //! part of the image path; URL/IP guards, size checks and the routes are the real candidate) and
 //! disposable roots.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide;
 mod support;
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -83,11 +82,7 @@ fn fixture(label: &str, onebot_url: &str, sticker_cfg: Value, stickers: Value) -
     }}});
     fs::write(root.p("data/social-v2.json"), state.to_string()).unwrap();
     fs::write(root.p("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
-    fs::write(
-        root.p("dependencies.json"),
-        json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:2","onebot":onebot_url}).to_string(),
-    )
-    .unwrap();
+    crate::support::write_dependencies(&root.0, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
     if !stickers.is_null() {
         fs::write(root.p("data/stickers.json"), stickers.to_string()).unwrap();
     }
@@ -202,16 +197,6 @@ class Curl { static int Main(string[] args) {
     assert!(output.status.success(), "{} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
 }
 
-fn hide(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 fn png(r: u8, g: u8, b: u8) -> Vec<u8> {
     let mut out = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 2, image::Rgb([r, g, b])))
@@ -308,138 +293,25 @@ fn http(
     Ok((status, serde_json::from_str(body).map_err(|e| format!("{e}: {body}"))?))
 }
 
-#[derive(Clone, Debug)]
-struct Seen {
-    action: String,
-    body: Value,
+struct OneBot(crate::support::FakeGateway);
+
+impl std::ops::Deref for OneBot {
+    type Target = crate::support::FakeGateway;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
-/// Threaded loopback OneBot. `rows` answer `fetch_custom_face_detail` (mutable by the test);
-/// every other action answers from `reply`, defaulting to ok. Each action may be delayed.
-struct OneBot {
-    url: String,
-    rows: Arc<Mutex<Vec<Value>>>,
-    seen: Arc<Mutex<Vec<Seen>>>,
-    replies: Arc<Mutex<HashMap<String, Value>>>,
-    delays: Arc<Mutex<HashMap<String, u64>>>,
-    stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<()>>,
-}
 impl OneBot {
     fn start(rows: Vec<Value>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let mut this = Self {
-            url,
-            rows: Arc::new(Mutex::new(rows)),
-            seen: Arc::default(),
-            replies: Arc::default(),
-            delays: Arc::default(),
-            stop: Arc::default(),
-            worker: None,
-        };
-        let (rows, seen, replies, delays, stop) =
-            (this.rows.clone(), this.seen.clone(), this.replies.clone(), this.delays.clone(), this.stop.clone());
-        let counter = Arc::new(AtomicU64::new(0));
-        let worker = thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let (rows, seen, replies, delays, counter) =
-                            (rows.clone(), seen.clone(), replies.clone(), delays.clone(), counter.clone());
-                        thread::spawn(move || serve(stream, rows, seen, replies, delays, counter));
-                    }
-                    Err(_) => thread::sleep(Duration::from_millis(5)),
-                }
-            }
-        });
-        this.worker = Some(worker);
+        let this = Self(crate::support::FakeGateway::start());
+        this.reply("add_custom_face", json!({"status":"ok","retcode":0,"data":{"emoji_id":"collected-1"}}));
+        this.set_rows(rows);
         this
     }
-    fn seen(&self, action: &str) -> Vec<Value> {
-        self.seen.lock().unwrap().iter().filter(|s| s.action == action).map(|s| s.body.clone()).collect()
-    }
-    fn count(&self, action: &str) -> usize {
-        self.seen(action).len()
-    }
     fn set_rows(&self, rows: Vec<Value>) {
-        *self.rows.lock().unwrap() = rows;
+        self.reply("fetch_custom_face_detail", json!({"status":"ok","retcode":0,"data":rows}));
     }
-    fn reply(&self, action: &str, value: Value) {
-        self.replies.lock().unwrap().insert(action.to_string(), value);
-    }
-    fn delay(&self, action: &str, ms: u64) {
-        self.delays.lock().unwrap().insert(action.to_string(), ms);
-    }
-}
-impl Drop for OneBot {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
-    }
-}
-
-fn serve(
-    stream: TcpStream,
-    rows: Arc<Mutex<Vec<Value>>>,
-    seen: Arc<Mutex<Vec<Seen>>>,
-    replies: Arc<Mutex<HashMap<String, Value>>>,
-    delays: Arc<Mutex<HashMap<String, u64>>>,
-    counter: Arc<AtomicU64>,
-) {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
-    }
-    let Some(path) = line.split_whitespace().nth(1).map(str::to_string) else { return };
-    let mut length = 0usize;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-            break;
-        }
-        if let Some((name, value)) = header.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-    let mut body = vec![0; length];
-    if reader.read_exact(&mut body).is_err() {
-        return;
-    }
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let action = path.trim_start_matches('/').to_string();
-    seen.lock().unwrap().push(Seen { action: action.clone(), body });
-    let delay = delays.lock().unwrap().get(&action).copied().unwrap_or(0);
-    if delay > 0 {
-        thread::sleep(Duration::from_millis(delay));
-    }
-    let id = 91000 + counter.fetch_add(1, Ordering::Relaxed);
-    let response = if let Some(v) = replies.lock().unwrap().get(&action) {
-        v.clone()
-    } else if action == "fetch_custom_face_detail" {
-        json!({"status":"ok","retcode":0,"data":rows.lock().unwrap().clone()})
-    } else if action == "send_group_msg" || action == "send_private_msg" {
-        json!({"status":"ok","retcode":0,"data":{"message_id":id}})
-    } else if action == "add_custom_face" {
-        json!({"status":"ok","retcode":0,"data":{"emoji_id":"collected-1"}})
-    } else {
-        json!({"status":"ok","retcode":0,"data":{}})
-    }
-    .to_string();
-    let stream = reader.get_mut();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-        response.len()
-    );
 }
 
 fn row(id: &str, file: &str, desc: &str) -> Value {

@@ -2,8 +2,7 @@
 //! isolated runtime. Every dependency is a started fake: the OneBot gateway is a loopback HTTP
 //! server, ffprobe/ffmpeg are fake executables (generated wrappers around this test binary, so Unix and Windows). No real QQ,
 //! model, DSH or TTS service is contacted.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
 mod support;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
@@ -178,11 +177,7 @@ fn fixture(label: &str, onebot_url: &str, options: Options) -> Fixture {
     } });
     fs::write(root.join("data/social-v2.json"), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
     fs::write(root.join("data/mode.json"), json!({ "mode": options.mode }).to_string()).unwrap();
-    fs::write(
-        root.join("dependencies.json"),
-        json!({ "dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:2", "onebot": onebot_url }).to_string(),
-    )
-    .unwrap();
+    crate::support::write_dependencies(&root, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
     let tools = root.join("tools");
     let ffprobe = write_fake_tool(&tools, "ffprobe");
     let ffmpeg = write_fake_tool(&tools, "ffmpeg");

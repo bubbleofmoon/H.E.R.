@@ -2,18 +2,16 @@
 //! selected runtime root. Everything is synthetic: a loopback OneBot fake and disposable roots.
 //! Unix decoys reproduce relative `C:/qqbot/...` defaults. Windows foreign sentinels stay
 //! inside the disposable root; selected-root results and unchanged foreign bytes are asserted.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
 mod support;
 
 use serde_json::{json, Value};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,11 +88,7 @@ fn fixture(label: &str, onebot_url: &str, social_extra: Value, extra: Value) -> 
     }});
     fs::write(root.p("data/social-v2.json"), state.to_string()).unwrap();
     fs::write(root.p("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
-    fs::write(
-        root.p("dependencies.json"),
-        json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:2","onebot":onebot_url}).to_string(),
-    )
-    .unwrap();
+    crate::support::write_dependencies(&root.0, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
     install_legacy_decoy(&root);
     let mut root = root;
     root.1 = Some(legacy_snapshot(&root));
@@ -150,11 +144,7 @@ impl Console {
                 .stdin(Stdio::null())
                 .stdout(fs::File::create(root.p("console.stdout.log")).unwrap())
                 .stderr(fs::File::create(root.p("console.stderr.log")).unwrap());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x0800_0000);
-            }
+            crate::support::hide_window(&mut command);
             command.spawn().expect("start console")
         });
         let mut console = Self { child, port };
@@ -218,95 +208,7 @@ fn http(
     Ok((status, serde_json::from_str(body).map_err(|e| format!("{e}: {body}"))?))
 }
 
-/// Loopback OneBot that records every action and answers ok.
-struct OneBot {
-    url: String,
-    seen: Arc<Mutex<Vec<(String, Value)>>>,
-    stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<()>>,
-}
-impl OneBot {
-    fn start() -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let seen: Arc<Mutex<Vec<(String, Value)>>> = Arc::default();
-        let stop = Arc::new(AtomicBool::new(false));
-        let (seen2, stop2) = (seen.clone(), stop.clone());
-        let counter = Arc::new(AtomicU64::new(0));
-        let worker = thread::spawn(move || {
-            while !stop2.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let (seen, counter) = (seen2.clone(), counter.clone());
-                        thread::spawn(move || serve(stream, seen, counter));
-                    }
-                    Err(_) => thread::sleep(Duration::from_millis(5)),
-                }
-            }
-        });
-        Self { url, seen, stop, worker: Some(worker) }
-    }
-    fn seen(&self, action: &str) -> Vec<Value> {
-        self.seen.lock().unwrap().iter().filter(|s| s.0 == action).map(|s| s.1.clone()).collect()
-    }
-    fn wait_for(&self, action: &str, count: usize) -> Vec<Value> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let got = self.seen(action);
-            if got.len() >= count || Instant::now() > deadline {
-                return got;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-impl Drop for OneBot {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(w) = self.worker.take() {
-            let _ = w.join();
-        }
-    }
-}
-
-fn serve(stream: TcpStream, seen: Arc<Mutex<Vec<(String, Value)>>>, counter: Arc<AtomicU64>) {
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
-        return;
-    }
-    let Some(path) = line.split_whitespace().nth(1).map(str::to_string) else { return };
-    let mut length = 0usize;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
-            break;
-        }
-        if let Some((name, value)) = header.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-    let mut body = vec![0; length];
-    if reader.read_exact(&mut body).is_err() {
-        return;
-    }
-    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    let action = path.trim_start_matches('/').to_string();
-    seen.lock().unwrap().push((action, body));
-    let id = 91000 + counter.fetch_add(1, Ordering::Relaxed);
-    let response = json!({"status":"ok","retcode":0,"data":{"message_id":id}}).to_string();
-    let stream = reader.get_mut();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-        response.len()
-    );
-}
+type OneBot = crate::support::FakeGateway;
 
 fn entries(console: &Console) -> Vec<Value> {
     let (status, body) = console.admin("GET", "/api/socialV2/feedback", Value::Null);

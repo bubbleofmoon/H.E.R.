@@ -5,8 +5,8 @@
 //! the public isolated console HTTP route. This proves the bridge-to-console boundary and selected
 //! runtime paths; it does not claim to exercise a real DSH model or its tool planner.
 
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide_process_window;
 mod support;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1131,17 +1131,6 @@ impl Drop for ChildCapture {
             let _ = stderr.join();
         }
     }
-}
-
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
 }
 
 fn child_command(root: &Path, ambient: &Path) -> Command {

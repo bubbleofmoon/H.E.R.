@@ -1,5 +1,4 @@
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::hide_window as hide_process_window;
 mod support;
 
 use serde_json::Value;
@@ -7,11 +6,11 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const CONSOLE_TOKEN: &str = "isolated-console-token-02";
 const OUTSIDE_SENTINEL: &str = "outside-runtime-fixture-sentinel-02";
@@ -123,44 +122,8 @@ impl Drop for OneBotServer {
     }
 }
 
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
-struct TempRoot(PathBuf);
-
-impl Deref for TempRoot {
-    type Target = Path;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fixture_root() -> TempRoot {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock is after epoch")
-        .as_nanos();
-    let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
-        "qqbot-runtime-context-{}-{stamp}",
-        std::process::id()
-    )));
-    fs::create_dir_all(root.join("config")).expect("create isolated config directory");
-    fs::create_dir_all(root.join("data")).expect("create isolated data directory");
-    fs::create_dir_all(root.join("resources")).expect("create isolated resource directory");
+fn fixture_root() -> crate::support::RuntimeRoot {
+    let root = crate::support::RuntimeRoot::new("runtime-context");
     fs::write(
         root.join("config/config.json"),
         format!(
@@ -181,7 +144,7 @@ fn fixture_root() -> TempRoot {
         "isolated-resource-marker",
     )
     .expect("write isolated resource fixture");
-    TempRoot(root)
+    root
 }
 
 fn fake_dependency() -> (TcpListener, String) {
@@ -191,13 +154,7 @@ fn fake_dependency() -> (TcpListener, String) {
 }
 
 fn write_dependencies(root: &Path, onebot: &str, dsh: &str, model: &str) {
-    let value = serde_json::json!({
-        "onebot": onebot,
-        "dsh": dsh,
-        "model": model,
-    });
-    fs::write(root.join("dependencies.json"), value.to_string())
-        .expect("write isolated dependency fixture");
+    crate::support::write_dependencies(root, dsh, model, onebot, None);
 }
 
 fn start_console(root: &Path, port: u16, via_legacy_args: bool) -> ChildGuard {

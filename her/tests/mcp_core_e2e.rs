@@ -4,8 +4,8 @@
 //! the recorded tool schema; these tests pin prompt behavior and the restart,
 //! validity-check, concurrency and persisted-identity contracts.)
 
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide;
 mod support;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -116,16 +116,6 @@ const JS_TOOL_NAMES: [&str; 38] = [
     "qq_list_stickers", "qq_get_sticker_image", "qq_send_sticker", "qq_collect_sticker", "qq_send_voice", "qq_list_voices",
     "qq_get_self_image", "qq_sticker_note", "qq_set_sticker_remark", "qq_get_forward_msg",
 ];
-
-fn hide(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as i64
@@ -355,11 +345,7 @@ fn make_root(label: &str, onebot_port: u16, console_port: u16, extra_config: Val
     r.write_config(&config);
     r.write_state(&json!({"paused": false, "conversations": {GROUP_KEY: conversation(GROUP_TOKEN), OWNER_KEY: conversation(OWNER_TOKEN)}}));
     fs::write(r.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).expect("mode");
-    fs::write(
-        r.0.join("dependencies.json"),
-        json!({"dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:2", "onebot": format!("http://127.0.0.1:{onebot_port}")}).to_string(),
-    )
-    .expect("dependencies");
+    crate::support::write_dependencies(&r.0, "http://127.0.0.1:1", "http://127.0.0.1:2", &format!("http://127.0.0.1:{onebot_port}"), None);
     r
 }
 

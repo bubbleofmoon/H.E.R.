@@ -4,8 +4,7 @@
 //! 全部在选定运行目录内进行，使用本机假 WebSocket 与假 OneBot HTTP。
 //! 不连接真实 QQ、模型或 DSH；发送仅由本机假网关记录，DSH 指向已关闭的本机端口。
 
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::hide_window as hide_process_window;
 mod support;
 
 use serde_json::{json, Value};
@@ -32,31 +31,7 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-struct TempRoot(PathBuf);
-
-impl TempRoot {
-    fn new(name: &str) -> Self {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
-            "her-ticket07-{name}-{}-{}",
-            std::process::id(),
-            now_ms()
-        )));
-        for dir in ["config", "data/logs", "resources", "user/dsh"] {
-            fs::create_dir_all(root.join(dir)).expect("create selected runtime directory");
-        }
-        Self(root)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+type TempRoot = support::RuntimeRoot;
 
 fn write_fixture(root: &Path, ws_url: &str, onebot_url: &str, owner: Option<i64>) {
     fs::write(
@@ -105,17 +80,7 @@ fn write_fixture(root: &Path, ws_url: &str, onebot_url: &str, owner: Option<i64>
         "secret: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
     )
     .expect("write synthetic DSH credential");
-    fs::write(
-        root.join("dependencies.json"),
-        json!({
-            "dsh": "http://127.0.0.1:9",
-            "model": "http://127.0.0.1:9",
-            "onebot": onebot_url,
-            "onebot_ws": ws_url
-        })
-        .to_string(),
-    )
-    .expect("write selected dependencies");
+    crate::support::write_dependencies(root, "http://127.0.0.1:9", "http://127.0.0.1:9", onebot_url, Some(ws_url));
 }
 
 /// 假网关 WebSocket 的脚本步骤。每个连接按顺序执行一组步骤，最后关闭连接以触发 her 重连。
@@ -389,17 +354,6 @@ fn console_get(port: u16, path: &str) -> Option<Value> {
     let text = String::from_utf8_lossy(&raw).to_string();
     let (_, body) = text.split_once("\r\n\r\n")?;
     serde_json::from_str(body).ok()
-}
-
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
 }
 
 fn log_file(root: &Path, name: &str) -> fs::File {

@@ -9,7 +9,9 @@ pub mod install_root;
 pub mod ports;
 pub mod runtime;
 
+#[allow(unused_imports)]
 pub use gateway::FakeGateway;
+#[allow(unused_imports)]
 pub use runtime::{write_dependencies, RuntimeRoot, CLOSED};
 
 use std::process::Command;

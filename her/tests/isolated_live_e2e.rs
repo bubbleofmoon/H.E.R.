@@ -1,6 +1,6 @@
 #![cfg_attr(not(windows), allow(dead_code))] // helpers of the Windows-only CLI test
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide_process_window;
 mod support;
 
 use futures_util::{SinkExt, StreamExt};
@@ -523,17 +523,6 @@ fn serve_ws(
             login_action,
         })
     })
-}
-
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
 }
 
 fn selected_runtime_fixture(root: &Path, dependencies: &Value) {

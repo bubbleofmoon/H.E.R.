@@ -1,5 +1,5 @@
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide_process_window;
 mod support;
 use serde_json::{json, Value};
 use std::fs;
@@ -19,17 +19,6 @@ const AGENT_A: &str = "fixture-agent-token-A";
 const AGENT_B: &str = "fixture-agent-token-B";
 const ONEBOT_A: &str = "fixture-onebot-token-A";
 const ONEBOT_B: &str = "fixture-onebot-token-B";
-
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
 
 struct FixtureRoot(PathBuf);
 
@@ -124,16 +113,7 @@ fn fixture_root(
     )
     .expect("write selected state");
     fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).expect("write selected mode");
-    fs::write(
-        root.join("dependencies.json"),
-        json!({
-            "dsh": "http://127.0.0.1:1",
-            "model": "http://127.0.0.1:2",
-            "onebot": onebot_url
-        })
-        .to_string(),
-    )
-    .expect("write selected dependencies");
+    crate::support::write_dependencies(&root, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
     FixtureRoot(root)
 }
 
