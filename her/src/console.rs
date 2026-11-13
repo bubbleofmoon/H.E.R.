@@ -20520,6 +20520,99 @@ mod tests {
     }
 
     #[test]
+    fn isolated_sticker_send_unknown_is_confirmed_by_our_own_image_in_history() {
+        // The send request reaches the gateway and its connection closes without an answer, so the
+        // outcome is unknown. History then shows our own image after the attempt: the sticker is
+        // confirmed as verified and never sent a second time.
+        use std::io::{BufRead, Read, Write};
+        let key = "private:7001";
+        let token = "fixture-image-proof-agent";
+        let at = crate::parity_clock::now_ms() / 1000 + 5;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut paths: Vec<String> = Vec::new();
+            while !paths.iter().any(|p| p == "/get_friend_msg_history") && std::time::Instant::now() < deadline {
+                let (stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let path = request_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                paths.push(path.clone());
+                let response = match path.as_str() {
+                    // Request received, connection closed without an answer.
+                    "/send_private_msg" => continue,
+                    "/fetch_custom_face_detail" => json!({ "status": "ok", "retcode": 0, "data": [{
+                        "emoji_id": "fixture-sticker", "resId": "fixture-sticker",
+                        "url": "https://fixture.invalid/sticker.gif", "source": "qq" }] }),
+                    "/get_login_info" => json!({ "status": "ok", "retcode": 0, "data": { "user_id": 10001 } }),
+                    "/get_friend_msg_history" => json!({ "status": "ok", "retcode": 0, "data": { "messages": [{
+                        "message_id": 4242, "time": at, "sender": { "user_id": 10001 },
+                        "message": [{ "type": "image", "data": { "file": "fixture.image" } }] }] } }),
+                    _ => json!({ "status": "failed", "retcode": 1404, "wording": "fixture unexpected path" }),
+                }
+                .to_string();
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                reader.get_mut().write_all(wire.as_bytes()).unwrap();
+            }
+            paths
+        });
+        let decoy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        let decoy_url = format!("http://127.0.0.1:{}", decoy.local_addr().unwrap().port());
+        let (root, _) = fixture_runtime("sticker image proof", "fixture-image-proof-console");
+        let context = prepare_sticker_runtime(&root, &url, &decoy_url, "selected-image-proof-token", &json!({
+            "conversations": { (key): {"agentToken":token, "recentMessages":[], "sendTimes":[]} }
+        }));
+        std::fs::write(root.0.join("data/stickers.json"), serde_json::to_vec(&json!([{
+            "id":"fixture-sticker", "url":"https://fixture.invalid/sticker.gif", "source":"fixture"
+        }])).unwrap()).unwrap();
+        let headers = HashMap::from([("x-agent-token".to_string(), token.to_string())]);
+        let result = handle_send_sticker_selected_with_fetch(&context, &headers,
+            &json!({"key":key,"stickerId":"fixture-sticker"}).to_string(), &context.load_config().unwrap(),
+            |_, _| Ok(b"synthetic image".to_vec()));
+        let paths = server.join().unwrap();
+        assert!(result.is_ok(), "an unknown sticker proven by history must succeed: {result:?}");
+        assert_eq!(result.as_ref().unwrap()["result"]["message_id"], 4242);
+        assert_eq!(paths.iter().filter(|p| *p == "/send_private_msg").count(), 1, "never re-sent: {paths:?}");
+        assert!(paths.iter().any(|p| p == "/get_friend_msg_history"), "history was not checked: {paths:?}");
+        let records = crate::send_outbox::read_records(&context).unwrap();
+        let kinds: Vec<_> = records.iter().filter_map(|r| r["k"].as_str()).collect();
+        assert_eq!(kinds, ["intent", "attempt", "unknown", "confirmed"]);
+        assert_eq!((records[3]["messageId"].clone(), records[3]["verified"].clone()), (json!(4242), json!(true)));
+        assert_no_pending_tcp_connection(&decoy);
+    }
+
+    #[test]
     fn isolated_sticker_send_reserves_quota_before_overlapping_fetch() {
         let (url, server) = start_fake_onebot_with_sticker_rows(3, false, vec![json!({
             "emoji_id":"fixture-sticker", "resId":"fixture-sticker",
