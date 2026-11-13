@@ -251,6 +251,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_reach_out_cancel_that_cannot_be_read_defers_the_due_chance_until_it_can() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-reachout-unreadable").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        let store = ScheduleStore::new(&hub.context);
+        hub.ready.clear();
+        let due = now - 1_000;
+        {
+            let d = hub.drivers.get_mut(key).unwrap();
+            d.sched.cfg.proactive_enabled = true;
+            d.sched.pending_wake_at = None;
+            d.sched.pending_wake_key_at = None;
+            d.sched.prompt_running = false;
+            d.sched.prompt_queued = false;
+            d.sched.proactive_at = Some(due);
+        }
+        // The owner skips the due reach-out chance; the cancel is persisted.
+        hub.sync_schedule(&cfg, true, now - 2_000);
+        store.request_timer_cancel(key, TimerKind::ReachOut, due, now - 1_500).unwrap();
+        let persisted = std::fs::read(root.join("data/schedule.json")).unwrap();
+
+        // Unreadable store: the chance is kept as it was, and nothing is announced for it.
+        std::fs::write(root.join("data/schedule.json"), "not json").unwrap();
+        hub.pump_timers(&cfg, now);
+        assert_eq!(hub.drivers[key].sched.proactive_at, Some(due), "the due reach-out is deferred, not re-rolled");
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "proactiveCheck"), "a cancelled reach-out does not fire: {:?}", hub.ready);
+
+        // Readable again: the cancel skips the chance, and the next one is armed after it.
+        std::fs::write(root.join("data/schedule.json"), &persisted).unwrap();
+        hub.pump_timers(&cfg, now);
+        let next = hub.drivers[key].sched.proactive_at.expect("the next chance is armed");
+        assert!(next > due, "the next chance comes after the cancelled one: {next} <= {due}");
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "proactiveCheck"), "a cancelled reach-out never fires: {:?}", hub.ready);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn schedule_reminders_wait_while_dsh_is_down_or_a_wake_is_parked_then_run_late_once() {
         use crate::schedule::{Creator, NewItem, Repeat, ScheduleStore};
         let (root, mut hub) = queued_hub("schedule-dsh-wait").await;
