@@ -266,6 +266,52 @@ type Row = (
     Option<i64>,
 );
 
+/// Read one `Row` (the 17 `memory` columns in the order both queries select them).
+fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get::<_, f64>(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
+        r.get::<_, Option<i64>>(13)?,
+        r.get(14)?,
+        r.get(15)?,
+        r.get::<_, Option<i64>>(16)?,
+    ))
+}
+
+fn hit_from_row(row: Row, score: f64) -> Hit {
+    let (id, owner_id, scope, kind, subject, content, _rank, pinned, importance, hits, created_at, tags, source, last_used_at, owner_type, archived, expires_at) = row;
+    Hit {
+        id,
+        owner_id,
+        scope,
+        kind,
+        subject,
+        content,
+        score,
+        tags,
+        source,
+        importance,
+        pinned,
+        hits,
+        created_at,
+        last_used_at,
+        owner_type,
+        archived,
+        expires_at,
+    }
+}
+
 /// 一条检索结果。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
@@ -305,29 +351,15 @@ pub fn search_error_message(error: &rusqlite::Error) -> String {
     }
 }
 
-/// 检索记忆（对应 JS 的 searchMemory）。命中会自增 `hits`。
-pub fn search(
+/// The rows a reader may see, as a WHERE fragment over `memory m` plus its bound arguments:
+/// not archived, inside the reader's owner scope, of the requested kinds, and never another
+/// session's private rows (no ACL bypasses that). Search and Recall share it.
+fn visibility_filter(
     conn: &Connection,
     reader_key: &str,
     is_owner: bool,
-    query: &str,
     kinds: &[String],
-    limit: usize,
-) -> rusqlite::Result<Vec<Hit>> {
-    search_with(conn, reader_key, is_owner, query, kinds, limit, true)
-}
-
-/// 同 `search`；`count_hits=false` 只读（唤醒提示词渲染用），不改 `hits` / `last_used_at`；
-/// 内容真正送达后由 `record_hits` 按送达的 id 计数。
-pub fn search_with(
-    conn: &Connection,
-    reader_key: &str,
-    is_owner: bool,
-    query: &str,
-    kinds: &[String],
-    limit: usize,
-    count_hits: bool,
-) -> rusqlite::Result<Vec<Hit>> {
+) -> rusqlite::Result<(String, Vec<String>)> {
     let scope = resolve_reader_scope(conn, reader_key, is_owner)?;
 
     let mut where_parts: Vec<String> = vec!["m.archived = 0".to_string()];
@@ -352,7 +384,33 @@ pub fn search_with(
         where_parts.push("(m.scope <> 'private' OR m.owner_id = ?)".to_string());
         args.push(reader_key.to_string());
     }
-    let where_sql = where_parts.join(" AND ");
+    Ok((where_parts.join(" AND "), args))
+}
+
+/// 检索记忆（对应 JS 的 searchMemory）。命中会自增 `hits`。
+pub fn search(
+    conn: &Connection,
+    reader_key: &str,
+    is_owner: bool,
+    query: &str,
+    kinds: &[String],
+    limit: usize,
+) -> rusqlite::Result<Vec<Hit>> {
+    search_with(conn, reader_key, is_owner, query, kinds, limit, true)
+}
+
+/// 同 `search`；`count_hits=false` 只读（唤醒提示词渲染用），不改 `hits` / `last_used_at`；
+/// 内容真正送达后由 `record_hits` 按送达的 id 计数。
+pub fn search_with(
+    conn: &Connection,
+    reader_key: &str,
+    is_owner: bool,
+    query: &str,
+    kinds: &[String],
+    limit: usize,
+    count_hits: bool,
+) -> rusqlite::Result<Vec<Hit>> {
+    let (where_sql, args) = visibility_filter(conn, reader_key, is_owner, kinds)?;
 
     let seg = segment(query)
         .into_iter()
@@ -384,27 +442,7 @@ pub fn search_with(
         for a in &args {
             refs.push(a as &dyn ToSql);
         }
-        let mapped = stmt.query_map(refs.as_slice(), |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get::<_, f64>(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-                r.get(11)?,
-                r.get(12)?,
-                r.get::<_, Option<i64>>(13)?,
-                r.get(14)?,
-                r.get(15)?,
-                r.get::<_, Option<i64>>(16)?,
-            ))
-        })?;
+        let mapped = stmt.query_map(refs.as_slice(), read_row)?;
         for row in mapped {
             rows.push(row?);
         }
@@ -425,27 +463,7 @@ pub fn search_with(
             refs.push(a as &dyn ToSql);
         }
         refs.push(&lim as &dyn ToSql);
-        let mapped = stmt.query_map(refs.as_slice(), |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get::<_, f64>(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-                r.get(11)?,
-                r.get(12)?,
-                r.get::<_, Option<i64>>(13)?,
-                r.get(14)?,
-                r.get(15)?,
-                r.get::<_, Option<i64>>(16)?,
-            ))
-        })?;
+        let mapped = stmt.query_map(refs.as_slice(), read_row)?;
         for row in mapped {
             rows.push(row?);
         }
@@ -454,55 +472,18 @@ pub fn search_with(
     let now = now_ms();
     let mut scored: Vec<Hit> = rows
         .into_iter()
-        .map(
-            |(
-                id,
-                owner_id,
-                scope_s,
-                kind,
-                subject,
-                content,
-                rank,
-                pinned,
-                importance,
-                hits,
-                created_at,
-                tags,
-                source,
-                last_used_at,
-                owner_type,
-                archived,
-                expires_at,
-            )| {
-                let age_days = ((now - created_at) as f64 / 86_400_000.0).max(0.0);
-                let recency = (-age_days / 30.0).exp();
-                let bm = if rank != 0.0 { -rank } else { 0.0 };
-                let score = (if pinned != 0 { 1.0 } else { 0.0 })
-                    + 0.5 * importance
-                    + 0.3 * recency
-                    + 0.2 * bm.tanh()
-                    + 0.05 * ((hits as f64) / 5.0).tanh();
-                Hit {
-                    id,
-                    owner_id,
-                    scope: scope_s,
-                    kind,
-                    subject,
-                    content,
-                    score,
-                    tags,
-                    source,
-                    importance,
-                    pinned,
-                    hits,
-                    created_at,
-                    last_used_at,
-                    owner_type,
-                    archived,
-                    expires_at,
-                }
-            },
-        )
+        .map(|row| {
+            let (rank, pinned, importance, hits, created_at) = (row.6, row.7, row.8, row.9, row.10);
+            let age_days = ((now - created_at) as f64 / 86_400_000.0).max(0.0);
+            let recency = (-age_days / 30.0).exp();
+            let bm = if rank != 0.0 { -rank } else { 0.0 };
+            let score = (if pinned != 0 { 1.0 } else { 0.0 })
+                + 0.5 * importance
+                + 0.3 * recency
+                + 0.2 * bm.tanh()
+                + 0.05 * ((hits as f64) / 5.0).tanh();
+            hit_from_row(row, score)
+        })
         .collect();
 
     scored.sort_by(|a, b| {
@@ -517,6 +498,127 @@ pub fn search_with(
     if count_hits {
         record_hits(conn, &scored.iter().map(|h| h.id).collect::<Vec<_>>())?;
     }
+    Ok(scored)
+}
+
+// ── Recall: the automatic memory recall a wake carries ─────────────────────────
+
+/// At most this many distinct terms of the message enter the match (the message is cut at 200
+/// characters upstream, so this never drops a term of a chat-length message).
+const RECALL_MAX_TERMS: usize = 200;
+/// A memory must share terms worth at least this many characters with the message (fewer when the
+/// whole message has fewer). One shared Chinese bigram (a single two-character word) or a short
+/// common word is not evidence of relevance; two such words, one longer word or one identifier is.
+const RECALL_MIN_SHARED_CHARS: usize = 4;
+/// bm25-ranked candidates read before the relevance bar and the exclusion are applied.
+const RECALL_CANDIDATES: i64 = 60;
+
+/// One index term as Recall compares it: Han, lowercase ASCII, digits, underscore and the dot
+/// `segment` keeps inside a word; a term without a letter, digit or Han character is dropped.
+fn recall_term(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| {
+            ('\u{4e00}'..='\u{9fff}').contains(c)
+                || c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_' || *c == '.'
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('.');
+    cleaned.chars().any(char::is_alphanumeric).then(|| cleaned.to_string())
+}
+
+/// The distinct terms of a message, in message order.
+pub fn recall_terms(text: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    segment(text)
+        .iter()
+        .filter_map(|token| recall_term(token))
+        .filter(|term| seen.insert(term.clone()))
+        .take(RECALL_MAX_TERMS)
+        .collect()
+}
+
+/// An FTS5 expression that matches a row holding any of the terms. Each term is a quoted FTS5
+/// string, so punctuation and operator words in the message are data, never syntax.
+fn recall_match_expression(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Automatic recall for `text` (the message being answered): at most `limit` memories the reader
+/// may see that share enough words with it, best first, without the ids in `exclude` (what the session
+/// generation already holds). A message nothing matches recalls nothing: there is no pinned or
+/// recent padding. Relevance (bm25 and shared terms) leads the score; pin, importance, recency
+/// and past use only add small boosts. Hits are not counted here: the caller counts the items
+/// it actually delivered with `record_hits`.
+pub fn recall(
+    conn: &Connection,
+    reader_key: &str,
+    is_owner: bool,
+    text: &str,
+    limit: usize,
+    exclude: &[i64],
+) -> rusqlite::Result<Vec<Hit>> {
+    let terms = recall_terms(text);
+    if terms.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let (where_sql, args) = visibility_filter(conn, reader_key, is_owner, &[])?;
+    let excluded = if exclude.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<String> = exclude.iter().map(i64::to_string).collect();
+        format!(" AND m.id NOT IN ({})", ids.join(","))
+    };
+    let sql = format!(
+        "SELECT m.id, m.owner_id, m.scope, m.kind, m.subject, m.content,
+                bm25(memory_fts) AS rank, m.pinned, m.importance, m.hits, m.created_at,
+                m.tags, m.source, m.last_used_at, m.owner_type, m.archived, m.expires_at,
+                f.seg
+         FROM memory_fts f JOIN memory m ON m.id = f.rowid
+         WHERE memory_fts MATCH ? AND {where_sql}{excluded}
+         ORDER BY rank LIMIT {RECALL_CANDIDATES}"
+    );
+    let expression = recall_match_expression(&terms);
+    let mut refs: Vec<&dyn ToSql> = vec![&expression as &dyn ToSql];
+    for a in &args {
+        refs.push(a as &dyn ToSql);
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let candidates = stmt
+        .query_map(refs.as_slice(), |r| Ok((read_row(r)?, r.get::<_, String>(17)?)))?
+        .collect::<rusqlite::Result<Vec<(Row, String)>>>()?;
+
+    let term_chars = |term: &str| term.chars().filter(|c| c.is_alphanumeric()).count();
+    let bar = RECALL_MIN_SHARED_CHARS.min(terms.iter().map(|t| term_chars(t)).sum());
+    let now = now_ms();
+    let mut scored: Vec<Hit> = Vec::new();
+    for (row, seg) in candidates {
+        let indexed: std::collections::HashSet<String> =
+            seg.split_whitespace().filter_map(recall_term).collect();
+        let shared: usize = terms.iter().filter(|term| indexed.contains(*term)).map(|t| term_chars(t)).sum();
+        if shared < bar {
+            continue;
+        }
+        let (rank, pinned, importance, hits, created_at) = (row.6, row.7, row.8, row.9, row.10);
+        let age_days = ((now - created_at) as f64 / 86_400_000.0).max(0.0);
+        let relevance = 0.5 * (shared as f64 / 6.0).tanh() + 0.5 * (-rank).max(0.0).tanh();
+        let boost = 0.04 * if pinned != 0 { 1.0 } else { 0.0 }
+            + 0.04 * importance.clamp(0.0, 1.0)
+            + 0.02 * (-age_days / 30.0).exp()
+            + 0.01 * ((hits as f64) / 5.0).tanh();
+        scored.push(hit_from_row(row, relevance + boost));
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    scored.truncate(limit);
     Ok(scored)
 }
 
@@ -958,6 +1060,102 @@ mod tests {
             }).unwrap();
         }
         conn
+    }
+
+    // ── Recall (automatic recall) ───────────────────────────────────────────────
+
+    fn recall_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        for (owner, scope, subject, content, importance, pinned) in [
+            ("group:101", "group", "户外计划", "周末一起去爬山看日出，早上六点出发", 0.3, 0),
+            ("group:101", "group", "备份规则", "数据库备份每天凌晨三点执行并保留七天", 1.0, 1),
+            ("group:101", "group", "饮食习惯", "不吃香菜，喜欢喝无糖的热豆浆", 0.9, 0),
+            ("group:202", "group", "别群计划", "周末一起去爬山的另一个群的约定", 0.5, 0),
+        ] {
+            let id = write_memory(&conn, &MemoryInput {
+                owner_type: "session", owner_id: owner, scope, kind: "fact",
+                subject: Some(subject), content, tags: None, source: "fixture", importance,
+            }).unwrap();
+            conn.execute("UPDATE memory SET pinned=?1 WHERE id=?2", params![pinned, id]).unwrap();
+        }
+        conn
+    }
+
+    fn recalled_subjects(hits: &[Hit]) -> Vec<String> {
+        hits.iter().map(|h| h.subject.clone().unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn recall_finds_a_memory_that_shares_two_words_with_a_chat_length_message() {
+        let conn = recall_fixture();
+        let message = "我觉得这个周末可以一起去爬山吧，天气应该不错呀";
+        assert!(message.chars().count() >= 20);
+        let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["户外计划"], "only the memory that shares words, not the pinned or important rows");
+    }
+
+    #[test]
+    fn recall_finds_a_memory_by_one_shared_identifier() {
+        let conn = recall_fixture();
+        write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:101", scope: "group", kind: "fact",
+            subject: Some("暗号"), content: "zebra148kw 是约好的暗号", tags: None, source: "fixture", importance: 0.1,
+        }).unwrap();
+        let hits = recall(&conn, "group:101", false, "zebra148kw 你还记得吗", 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["暗号"]);
+    }
+
+    #[test]
+    fn recall_of_an_unrelated_message_is_empty_even_with_pinned_and_recent_rows() {
+        let conn = recall_fixture();
+        for message in ["今天的天气真是太好了呀", "hello there general kenobi", "。。。！！！", "", "周末天气怎么样呢"] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
+        }
+    }
+
+    #[test]
+    fn recall_never_repeats_an_item_the_session_generation_already_holds() {
+        let conn = recall_fixture();
+        let message = "周末一起去爬山看日出吧，早上出发";
+        let first = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&first), vec!["户外计划"]);
+        let held: Vec<i64> = first.iter().map(|h| h.id).collect();
+        assert!(recall(&conn, "group:101", false, message, 3, &held).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recall_stays_inside_the_readers_scope() {
+        let conn = recall_fixture();
+        let hits = recall(&conn, "group:101", false, "周末一起去爬山的约定", 5, &[]).unwrap();
+        assert!(hits.iter().all(|h| h.owner_id == "group:101"), "{:?}", recalled_subjects(&hits));
+        let hits = recall(&conn, "group:101", true, "周末一起去爬山的约定", 5, &[]).unwrap();
+        assert_eq!(hits.len(), 2, "the owner reads every group");
+    }
+
+    #[test]
+    fn recall_query_punctuation_and_operators_cannot_break_the_match_expression() {
+        let conn = recall_fixture();
+        for message in [
+            "周末 \"一起去爬山\" OR (NOT 备份) AND * : ^ - + NEAR(a b) 周末一起去爬山",
+            "周末一起去爬山 \"",
+            "' ; DROP TABLE memory; -- 周末一起去爬山",
+        ] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).expect(message);
+            assert_eq!(recalled_subjects(&hits)[..1], ["户外计划"], "{message}");
+        }
+        let long: String = "周末一起去爬山看日出".chars().cycle().take(200).collect();
+        assert_eq!(recalled_subjects(&recall(&conn, "group:101", false, &long, 3, &[]).unwrap())[..1], ["户外计划"]);
+    }
+
+    #[test]
+    fn recall_ranks_by_relevance_before_pin_importance_and_recency() {
+        let conn = recall_fixture();
+        let message = "不吃香菜，喜欢喝热豆浆，数据库备份";
+        let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+        // The pinned, importance 1.0 backup row shares one word; the diet row shares four.
+        assert_eq!(recalled_subjects(&hits).first().map(String::as_str), Some("饮食习惯"));
     }
 
     #[test]

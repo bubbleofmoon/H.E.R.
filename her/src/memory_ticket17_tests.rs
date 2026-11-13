@@ -576,6 +576,76 @@ fn the_dsh_wake_delivers_the_recall_the_preview_shows_and_counts_a_hit_only_when
 }
 
 #[test]
+fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
+    let (_root, context, _state, conn, cfg) = recall_wake_fixture("dsh recall no repeat");
+    let key = RECALL_KEY;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let context = context.with_console_port(listener.local_addr().unwrap().port());
+    let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
+    // One message packet is fetched per wake.
+    let server = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, served_cfg.clone(), served.clone());
+        }
+    });
+    // DSH accepting a wake installs its briefing record (what `session_context::observe` does).
+    let accept = |rpc: &str, seq: i64| {
+        crate::session_context::observe(&context, key, "sid-148", "epoch-148", &json!({
+            "type": "user/message", "seq": seq, "data": {"source": {"rpcId": rpc}},
+        })).unwrap();
+    };
+    let wake = |rpc: &str| {
+        let (text, recalled) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", rpc, "").unwrap();
+        (text, recalled)
+    };
+    let (first_text, first) = wake("rpc-1");
+    assert_eq!(first.len(), 1, "relatedTopK is 1");
+    accept("rpc-1", 1);
+    let (second_text, second) = wake("rpc-2");
+    assert_eq!(second.len(), 1, "the other matching memory is next");
+    assert_ne!(first, second, "an installed recall is not repeated in the generation");
+    let which = |text: &str| ["评测记录一", "评测记录二"].iter().position(|mark| text.contains(mark));
+    assert!(which(&first_text).is_some() && which(&second_text).is_some() && which(&first_text) != which(&second_text),
+        "each wake renders a different memory:\n{first_text}\n{second_text}");
+    accept("rpc-2", 2);
+    let (_, third) = wake("rpc-3");
+    assert!(third.is_empty(), "both memories were delivered in this generation: {third:?}");
+    // A wake DSH never accepted does not hold its memories back.
+    let (_, retry) = wake("rpc-4");
+    assert!(retry.is_empty());
+    server.join().unwrap();
+    assert_eq!(recall_hits(&conn), 0, "preparing wakes counts nothing");
+
+    // Compaction starts a new generation: the briefing is full again and the memories return.
+    crate::session_map::update_context(&context, key, "sid-148", "epoch-148", |r| {
+        r["generation"] = json!(r["generation"].as_u64().unwrap_or(0) + 1);
+        r["pending"] = Value::Null;
+    }).unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let context = context.with_console_port(listener.local_addr().unwrap().port());
+    let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        handle_conn(stream, served_cfg, served);
+    });
+    let (_, fresh) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-5", "").unwrap();
+    server.join().unwrap();
+    assert_eq!(fresh.len(), 1, "a new generation recalls again");
+}
+
+#[test]
+fn a_message_that_matches_no_memory_renders_no_recalled_memory() {
+    let (_root, context, state, _conn, cfg) = recall_wake_fixture("dsh recall unrelated");
+    let key = RECALL_KEY;
+    let mut st = state["conversations"][key].clone();
+    st["unread"][0]["text"] = json!("今天中午吃什么好呢，想不出来");
+    let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &st, key);
+    assert!(!block.contains("\n- [fact"), "no pinned or recent padding: {block}");
+    assert!(!block.contains("【记忆】你可能需要回顾"), "{block}");
+}
+
+#[test]
 fn related_top_k_accepts_only_the_depth_a_wake_executes_and_reads_show_that_depth() {
     let (_root, context) = fixture_runtime("related top k", "fixture-console-token-17");
     context
