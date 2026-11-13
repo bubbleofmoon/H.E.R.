@@ -620,7 +620,14 @@ impl Recorder {
 
     /// Must succeed before `session/prompt` is called.
     pub fn attempt(&self, rpc_id: &str, session_id: &str) -> Result<(), String> {
-        self.put(json!({"k": "attempt", "rpcId": rpc_id, "sessionId": session_id}))
+        self.attempt_with_layers(rpc_id, session_id, None)
+    }
+
+    /// `attempt` carrying a layered briefing's per-layer item counts (`{injected, cut}`, `briefing::Counts`).
+    pub fn attempt_with_layers(&self, rpc_id: &str, session_id: &str, layers: Option<&Value>) -> Result<(), String> {
+        let mut record = json!({"k": "attempt", "rpcId": rpc_id, "sessionId": session_id});
+        if let Some(layers) = layers { record["layers"] = layers.clone(); }
+        self.put(record)
     }
 
     pub fn accepted(&self, rpc_id: &str) -> Result<(), String> {
@@ -1269,5 +1276,23 @@ mod tests {
     fn minted_ids_are_unique() {
         assert_ne!(mint_id("turn-"), mint_id("turn-"));
         assert!(mint_id("rpc-").starts_with("rpc-"));
+    }
+
+    #[test]
+    fn an_attempt_carries_the_briefing_layer_counts_and_folds_unchanged() {
+        let (root, context) = ledger_root("her-ledger-layers-");
+        let turn = Recorder::begin(&context, "group:1", "dsh", "atMention", "e1", &[], None).unwrap();
+        let layers = json!({"injected":{"identity":1,"relationship":0,"conversation":2,"material":1},
+            "cut":{"identity":0,"relationship":0,"conversation":0,"material":0}});
+        turn.attempt_with_layers("r1", "s1", Some(&layers)).unwrap();
+        turn.attempt("r2", "s1").unwrap();
+        let records = read_records(&context).unwrap();
+        let attempts: Vec<&Value> = records.iter().filter(|r| r["k"] == "attempt").collect();
+        assert_eq!(attempts[0]["layers"], layers);
+        assert!(attempts[1].get("layers").is_none(), "an attempt without a layered briefing is unchanged");
+        let turns = fold(&records).0;
+        assert_eq!(turns[0].attempts.len(), 2);
+        assert_eq!(turns[0].state, State::Attempted);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

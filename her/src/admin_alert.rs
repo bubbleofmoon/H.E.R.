@@ -113,6 +113,9 @@ pub enum Budget {
     /// Rust-only owner notices (accepted deviation 22): the same rule on a limiter of their own, so a flood of notices
     /// can never use up the budget of the alerts JS sends.
     Notice,
+    /// Memory-layer alerts (an empty Identity or Relationship, `briefing.rs`): the same rule on a limiter of their
+    /// own, so they never spend the notices' budget.
+    Memory,
 }
 
 /// The limiter shared by every JS-texted alert of this process.
@@ -127,11 +130,18 @@ pub fn notice_limiter() -> &'static Mutex<AlertLimiter> {
     L.get_or_init(|| Mutex::new(AlertLimiter::new()))
 }
 
+/// The limiter of the memory-layer alerts.
+pub fn memory_limiter() -> &'static Mutex<AlertLimiter> {
+    static L: OnceLock<Mutex<AlertLimiter>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(AlertLimiter::new()))
+}
+
 /// Charge `key` to `budget` (pure over the two limiters, so the policy is testable).
 fn admit(js: &mut AlertLimiter, notice: &mut AlertLimiter, budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVerdict {
     match budget {
         Budget::Js => js.check(scope, key, now_ms),
         Budget::Notice => notice.check(scope, key, now_ms),
+        Budget::Memory => memory_limiter().lock().unwrap_or_else(|p| p.into_inner()).check(scope, key, now_ms),
     }
 }
 
@@ -139,6 +149,7 @@ fn admit_global(budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVer
     let mut limiter = match budget {
         Budget::Js => shared_limiter(),
         Budget::Notice => notice_limiter(),
+        Budget::Memory => memory_limiter(),
     }
     .lock()
     .unwrap_or_else(|p| p.into_inner());
@@ -327,6 +338,11 @@ pub fn notify_admin(context: &RuntimeContext, cfg: &Value, kind: &str, text: &st
 /// (one per key per minute, ten per hour) on its own budget.
 pub fn notify_notice(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
     notify_with(context, cfg, Budget::Notice, text, dedupe_key, false, Vec::new())
+}
+
+/// A memory-layer alert (`briefing::alert_empty`): one per key per minute, ten per hour, on its own budget.
+pub fn notify_memory(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
+    notify_with(context, cfg, Budget::Memory, text, dedupe_key, false, Vec::new())
 }
 
 /// Queue an already claimed gap notice. The worker checkpoints uncertainty before
