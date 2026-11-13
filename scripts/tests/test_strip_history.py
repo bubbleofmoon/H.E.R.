@@ -341,6 +341,22 @@ SID = 'S-1-5-21-' + '1-2-3-1001'          # invented user SID
 OTHER_SID = 'S-1-5-21-' + '9-9-9-1002'    # invented second SID
 
 
+FULL_MASK = 0x1F01FF   # full access, as the access mask of a key file ACE
+
+
+def ace(sid, mask=FULL_MASK, flags=0, kind='AccessAllowed'):
+    return {'type': kind, 'flags': flags, 'mask': mask, 'sid': sid}
+
+
+def ci_acl(owner='S-1-5-32-544', aces=None, **changes):
+    """The access list the Windows CI host produces: owner Administrators, OWNER RIGHTS, SYSTEM, Administrators and the user."""
+    if aces is None:
+        aces = [ace('S-1-3-4'), ace('S-1-5-18'), ace('S-1-5-32-544'), ace(SID)]
+    info = {'dacl': True, 'protected': True, 'owner': owner, 'aces': aces}
+    info.update(changes)
+    return info
+
+
 class R1DigitsBeforeNames(unittest.TestCase):
     def test_digit_only_names_are_not_learned(self):
         s_mod = load()
@@ -509,58 +525,89 @@ class SurrogateInput(unittest.TestCase):
 
 
 class KeyAcl(unittest.TestCase):
-    def test_private_dacl_accepts_one_protected_full_access_ace(self):
+    def test_acl_problem_accepts_the_ci_shape(self):
         s_mod = load()
-        require(self, s_mod, 'private_dacl')
-        self.assertTrue(s_mod.private_dacl(f'O:BAD:PAI(A;;FA;;;{SID})', SID))
+        require(self, s_mod, 'acl_problem')
+        require(self, s_mod, 'private_acl')
+        self.assertIsNone(s_mod.acl_problem(ci_acl(), SID))
+        self.assertTrue(s_mod.private_acl(ci_acl(), SID))
 
-    def test_private_dacl_rejects_other_shapes(self):
+    def test_acl_problem_requires_an_owner_the_user_or_a_builtin_controls(self):
         s_mod = load()
-        require(self, s_mod, 'private_dacl')
-        cases = {
-            'not protected': f'D:AI(A;;FA;;;{SID})',
-            'second ACE': f'O:BAD:PAI(A;;FA;;;{SID})(A;;FR;;;BU)',
-            'inheritance flag': f'O:BAD:PAI(A;ID;FA;;;{SID})',
-            'read-only rights': f'O:BAD:PAI(A;;FR;;;{SID})',
-            'other SID': f'O:BAD:PAI(A;;FA;;;{OTHER_SID})',
+        require(self, s_mod, 'acl_problem')
+        for owner in (SID, 'S-1-5-18', 'S-1-5-32-544'):
+            with self.subTest(owner=owner):
+                self.assertIsNone(s_mod.acl_problem(ci_acl(owner=owner), SID))
+        for owner in ('S-1-5-21-1-2-3-500', None):
+            with self.subTest(owner=owner):
+                self.assertEqual(s_mod.acl_problem(ci_acl(owner=owner), SID),
+                                 'owner is not the current user, SYSTEM or Administrators')
+
+    def test_acl_problem_requires_a_readable_protected_list(self):
+        s_mod = load()
+        require(self, s_mod, 'acl_problem')
+        self.assertEqual(s_mod.acl_problem(ci_acl(dacl=False), SID), 'no access list')
+        self.assertEqual(s_mod.acl_problem(ci_acl(protected=False), SID), 'not protected')
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=[]), SID), 'entry count 0')
+
+    def test_acl_problem_refuses_flagged_entries(self):
+        s_mod = load()
+        require(self, s_mod, 'acl_problem')
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=[ace(SID, flags=0x10)]), SID), 'entry has flags')
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=[ace(SID), ace('S-1-5-18', flags=0x10)]), SID), 'entry has flags')
+
+    def test_acl_problem_refuses_deny_and_object_entries(self):
+        s_mod = load()
+        require(self, s_mod, 'acl_problem')
+        for kind in ('AccessDenied', 'AccessAllowedObject', 'AccessAllowedCallback'):
+            with self.subTest(kind=kind):
+                self.assertEqual(s_mod.acl_problem(ci_acl(aces=ci_acl()['aces'] + [ace('S-1-5-18', kind=kind)]), SID),
+                                 'entry is not a plain allow entry')
+
+    def test_acl_problem_refuses_an_unrelated_entry(self):
+        s_mod = load()
+        require(self, s_mod, 'acl_problem')
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=ci_acl()['aces'] + [ace('S-1-5-21-1-2-3-500', mask=0x1)]), SID),
+                         'entry for another account: AccessAllowed;0x1;domain-rid-500')
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=ci_acl()['aces'] + [ace('S-1-5-32-545')]), SID),
+                         'entry for another account: AccessAllowed;0x1f01ff;S-1-5-32-545')
+
+    def test_acl_problem_refuses_malformed_entries(self):
+        s_mod = load()
+        require(self, s_mod, 'acl_problem')
+        bad = {
+            'not a mapping': 'S-1-5-18',
+            'missing sid': {'type': 'AccessAllowed', 'flags': 0, 'mask': FULL_MASK},
+            'string mask': ace(SID, mask='0x1F01FF'),
+            'boolean flags': ace(SID, flags=False),
+            'boolean mask': ace(SID, mask=True),
+            'missing mask': {'type': 'AccessAllowed', 'flags': 0, 'sid': 'S-1-5-18'},
         }
-        for label, sddl in cases.items():
+        for label, entry in bad.items():
             with self.subTest(label=label):
-                self.assertFalse(s_mod.private_dacl(sddl, SID), f'{label} must not count as private')
+                self.assertEqual(s_mod.acl_problem(ci_acl(aces=ci_acl()['aces'] + [entry]), SID), 'malformed entry')
 
-    def test_dacl_problem_names_the_failed_condition(self):
+    def test_acl_problem_refuses_two_entries_for_the_user(self):
         s_mod = load()
-        require(self, s_mod, 'dacl_problem')
-        self.assertIsNone(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})', SID))
-        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-5-21-1-2-3-500)', SID),
-                         'entry for another account: A;;FA;domain-rid-500')
-        self.assertEqual(s_mod.dacl_problem(f'D:AI(A;;FA;;;{SID})', SID), 'not protected')
+        require(self, s_mod, 'acl_problem')
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=ci_acl()['aces'] + [ace(SID)]), SID),
+                         'more than one entry for the current user')
 
-    def test_dacl_problem_describes_each_ace_without_identifiers(self):
+    def test_acl_problem_refuses_a_read_only_or_missing_user_entry(self):
         s_mod = load()
-        require(self, s_mod, 'dacl_problem')
-        require(self, s_mod, 'describe_ace')
-        self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})(A;;FR;;;{SID})', SID),
-                         'entry count 2: A;;FA;current-user A;;FR;current-user')
-        self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})(A;;FR;;;S-1-5-21-1-2-3-500)', SID),
-                         'entry for another account: A;;FR;domain-rid-500')
-        cases = [('A;;FA;;;SY', 'A;;FA;SY'), ('A;ID;FR;;;S-1-5-21-1-2-3-500', 'A;ID;FR;domain-rid-500'),
-                 ('A;;FA;;;S-1-5-18', 'A;;FA;S-1-5-18'), ('A;;FA;;;S-1-5-32-544', 'A;;FA;S-1-5-32-544'),
-                 ('A;;FA;;;S-1-15-2-1', 'A;;FA;other-account'), (f'A;;FA;;;{SID}', 'A;;FA;current-user')]
-        for ace, label in cases:
-            with self.subTest(ace=ace):
-                self.assertEqual(s_mod.describe_ace(ace, SID), label)
+        require(self, s_mod, 'acl_problem')
+        read_only = [ace('S-1-3-4'), ace('S-1-5-18'), ace('S-1-5-32-544'), ace(SID, mask=0x1200A9)]
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=read_only), SID), 'current user lacks full access')
+        privileged_only = [ace('S-1-3-4'), ace('S-1-5-18'), ace('S-1-5-32-544')]
+        self.assertEqual(s_mod.acl_problem(ci_acl(aces=privileged_only), SID), 'current user lacks full access')
 
-    def test_dacl_problem_allows_only_privileged_builtins_beside_the_user(self):
+    def test_describe_entry_prints_labels_never_raw_values(self):
         s_mod = load()
-        require(self, s_mod, 'dacl_problem')
-        privileged = 'O:BAD:PAI(A;;FA;;;S-1-3-4)(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)'
-        self.assertIsNone(s_mod.dacl_problem(f'{privileged}(A;;FA;;;{SID})', SID))
-        self.assertEqual(s_mod.dacl_problem(f'{privileged}(A;;FA;;;{SID})(A;;FR;;;S-1-5-32-545)', SID),
-                         'entry for another account: A;;FR;S-1-5-32-545')
-        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-3-4)(A;;FA;;;S-1-5-18)', SID),
-                         'current user lacks full access')
-        self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})(A;ID;FA;;;S-1-5-18)', SID), 'entry is inherited')
+        require(self, s_mod, 'describe_entry')
+        self.assertEqual(s_mod.describe_entry({'type': 'D:\\keys\\secret', 'flags': 0, 'mask': 1,
+                                               'sid': 'S-1-5-21-1-2-3-500'}, SID),
+                         'other-type;0x1;domain-rid-500')
+        self.assertEqual(s_mod.describe_entry(ace(SID), SID), 'AccessAllowed;0x1f01ff;current-user')
 
     @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
     def test_load_key_refuses_a_group_readable_file(self):
@@ -575,12 +622,12 @@ class KeyAcl(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows ACL check')
     def test_windows_key_file_is_private_after_init(self):
         s_mod = load()
-        require(self, s_mod, '_windows_sddl')
+        require(self, s_mod, '_windows_acl')
         require(self, s_mod, '_windows_sid')
         with tempfile.TemporaryDirectory() as tmp:
             key_file = Path(tmp) / 'history.key'
             s_mod.init_key(key_file)
-            self.assertTrue(s_mod.private_dacl(s_mod._windows_sddl(key_file), s_mod._windows_sid()))
+            self.assertTrue(s_mod.private_acl(s_mod._windows_acl(key_file), s_mod._windows_sid()))
 
     @unittest.skipUnless(os.name == 'nt', 'Windows ACL check')
     def test_windows_inherited_acl_is_refused(self):

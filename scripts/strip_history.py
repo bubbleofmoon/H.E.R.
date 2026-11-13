@@ -19,7 +19,7 @@ Chinese-numeral runs, known names and name parts, and @mentions are replaced, re
 stable. A separate stricter residual scan and a field whitelist must pass, then gitleaks;
 otherwise nothing is written, and a failed publish removes what this run published.
 DIR/NAME.report.json holds counts only. The key file is restricted to the current user (POSIX
-mode 600, Windows protected DACL with full access for the user and the PRIVILEGED_SIDS only, verified before the
+mode 600; on Windows a protected access list owned by the user, SYSTEM or Administrators, granting full access to the user and PRIVILEGED_SIDS only, verified before the
 key is written and on every load), stays on the Windows host and is never committed.
 """
 import argparse
@@ -299,59 +299,83 @@ class Stripper:
         return out
 
 
-def describe_ace(ace, sid):
-    """type;flags;rights;who for one ACE: who is the alias or well-known SID, current-user, domain-rid-<RID> (never the domain part) or other-account; no object GUID."""
-    fields = ace.split(';')
-    if len(fields) < 6:
-        return 'malformed'
-    who = fields[5]
-    domain_rid = re.fullmatch(r'S-1-5-21-[0-9-]+-([0-9]+)', who)
-    if re.fullmatch(r'[A-Z]{2}', who):
-        label = who
-    elif who == sid:
-        label = 'current-user'
-    elif re.fullmatch(r'S-1-[0-9]-[0-9]{1,2}|S-1-5-32-[0-9]{3}|S-1-5-80-0', who):
-        label = who
-    elif domain_rid:
-        label = f'domain-rid-{domain_rid.group(1)}'
-    else:
-        label = 'other-account'
-    return f'{fields[0]};{fields[1]};{fields[2]};{label}'
-
-
 # SYSTEM, Administrators, OWNER RIGHTS: the privileged built-ins OpenSSH for Windows accepts on a private key.
 PRIVILEGED_SIDS = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
+OWNER_SIDS = ('S-1-5-18', 'S-1-5-32-544')
+FULL_ACCESS = 0x1F01FF
+ACE_TYPES = ('AccessAllowed', 'AccessDenied', 'AccessAllowedObject', 'AccessDeniedObject',
+             'AccessAllowedCallback', 'AccessDeniedCallback', 'SystemAudit')
+_ACL_SCRIPT = (
+    "$a = Get-Acl -LiteralPath $env:HER_KEY_PATH; "
+    "$sd = New-Object System.Security.AccessControl.RawSecurityDescriptor($a.Sddl); "
+    "$aces = @(foreach ($e in $sd.DiscretionaryAcl) { [ordered]@{ type = $e.AceType.ToString(); "
+    "flags = [int]$e.AceFlags; mask = $(if ($e -is [System.Security.AccessControl.CommonAce]) { [int64]$e.AccessMask } else { $null }); "
+    "sid = $(if ($e -is [System.Security.AccessControl.KnownAce]) { $e.SecurityIdentifier.Value } else { $null }) } }); "
+    "$owner = $(if ($sd.Owner) { $sd.Owner.Value } else { $null }); "
+    "ConvertTo-Json -Compress -Depth 4 ([ordered]@{ protected = [bool]$a.AreAccessRulesProtected; "
+    "dacl = ($null -ne $sd.DiscretionaryAcl); owner = $owner; aces = $aces })"
+)
 
 
-def dacl_problem(sddl, sid):
-    """None when the DACL is protected, and every ACE is a non-inherited allow entry for sid or a PRIVILEGED_SIDS entry, with exactly one full-access entry for sid; else the first failed condition."""
-    match = re.search(r'D:([A-Z]*)((?:\([^)]*\))*)', sddl)
-    if not match or 'P' not in match.group(1):
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _who_label(trustee, sid):
+    if not isinstance(trustee, str):
+        return 'other-account'
+    if trustee == sid:
+        return 'current-user'
+    if re.fullmatch(r'S-1-[0-9]-[0-9]{1,2}|S-1-5-32-[0-9]{3}|S-1-5-80-0', trustee):
+        return trustee
+    domain_rid = re.fullmatch(r'S-1-5-21-[0-9-]+-([0-9]+)', trustee)
+    if domain_rid:
+        return f'domain-rid-{domain_rid.group(1)}'
+    return 'other-account'
+
+
+def describe_entry(ace, sid):
+    """type;mask;who for one ACE from fixed labels only: a known ACE type, the mask in hex, and the trustee as current-user, a well-known SID, domain-rid-<RID> or other-account."""
+    kind = ace.get('type')
+    type_label = kind if kind in ACE_TYPES else 'other-type'
+    mask = ace.get('mask')
+    mask_label = hex(mask) if _is_int(mask) else 'no-mask'
+    return f"{type_label};{mask_label};{_who_label(ace.get('sid'), sid)}"
+
+
+def acl_problem(info, sid):
+    """None when the key file's access list is private: protected, owned by the current user, SYSTEM or Administrators, and holding only plain allow entries with no flags, for the current user with full access and for PRIVILEGED_SIDS. Else the first failed condition, as a fixed message."""
+    if info.get('dacl') is not True:
+        return 'no access list'
+    if info.get('protected') is not True:
         return 'not protected'
-    aces = re.findall(r'\(([^)]*)\)', match.group(2))
-    if not aces:
+    owner = info.get('owner')
+    if not isinstance(owner, str) or not (owner == sid or owner in OWNER_SIDS):
+        return 'owner is not the current user, SYSTEM or Administrators'
+    aces = info.get('aces')
+    if not isinstance(aces, list) or not aces:
         return 'entry count 0'
-    entries = [ace.split(';') for ace in aces]
-    for ace, fields in zip(aces, entries):
-        if len(fields) < 6:
+    for ace in aces:
+        if (not isinstance(ace, dict) or not isinstance(ace.get('type'), str) or not _is_int(ace.get('flags'))
+                or not _is_int(ace.get('mask')) or not isinstance(ace.get('sid'), str)):
             return 'malformed entry'
-        if fields[0] != 'A':
-            return 'entry is not an allow entry'
-        if 'ID' in fields[1]:
-            return 'entry is inherited'
-        if fields[5] != sid and fields[5] not in PRIVILEGED_SIDS:
-            return 'entry for another account: ' + describe_ace(ace, sid)
-    user = [fields for fields in entries if fields[5] == sid]
-    if len(user) > 1:
-        return f'entry count {len(aces)}: ' + ' '.join(describe_ace(ace, sid) for ace in aces)
-    if not user or user[0][2] not in ('FA', '0x1f01ff'):
+        if ace['type'] != 'AccessAllowed':
+            return 'entry is not a plain allow entry'
+        if ace['flags'] != 0:
+            return 'entry has flags'
+        if ace['sid'] != sid and ace['sid'] not in PRIVILEGED_SIDS:
+            return 'entry for another account: ' + describe_entry(ace, sid)
+    mine = [ace for ace in aces if ace['sid'] == sid]
+    if len(mine) > 1:
+        return 'more than one entry for the current user'
+    if not mine or mine[0]['mask'] != FULL_ACCESS:
         return 'current user lacks full access'
     return None
 
 
-def private_dacl(sddl, sid):
-    """True when dacl_problem finds no problem."""
-    return dacl_problem(sddl, sid) is None
+def private_acl(info, sid):
+    """True when acl_problem finds no problem."""
+    return acl_problem(info, sid) is None
 
 
 def _windows_sid():
@@ -365,20 +389,27 @@ def _windows_sid():
     return sid
 
 
-def _windows_sddl(path):
-    """The file's SDDL with trustee aliases expanded to full SIDs, so an alias account (for example the built-in administrator, `LA`) still matches."""
+def _windows_acl(path):
+    """The key file's access list as a dict from a structured ACL, not SDDL text: the protected flag, whether a DACL exists, the owner SID, and each DACL entry's type, flags, mask and SID."""
     env = dict(os.environ, HER_KEY_PATH=str(path))
     try:
-        proc = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
-                               "$s = (Get-Acl -LiteralPath $env:HER_KEY_PATH).Sddl; "
-                               "[regex]::Replace($s, '(?<=;)([A-Z]{2})(?=\\))', { param($m) "
-                               "(New-Object System.Security.Principal.SecurityIdentifier($m.Value)).Value })"],
+        proc = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', _ACL_SCRIPT],
                               capture_output=True, text=True, timeout=120, env=env)
     except (OSError, subprocess.SubprocessError):
         raise SystemExit('cannot read the key file ACL')
     if proc.returncode != 0:
         raise SystemExit('cannot read the key file ACL')
-    return proc.stdout.strip()
+    try:
+        info = json.loads(proc.stdout)
+    except ValueError:
+        raise SystemExit('cannot read the key file ACL')
+    if not isinstance(info, dict):
+        raise SystemExit('cannot read the key file ACL')
+    aces = info.get('aces')
+    if isinstance(aces, dict):
+        aces = [aces]
+    info['aces'] = aces if isinstance(aces, list) else []
+    return info
 
 
 def check_key_file_private(path):
@@ -386,7 +417,7 @@ def check_key_file_private(path):
         if os.stat(path).st_mode & 0o077:
             raise SystemExit('key file is readable by others; restrict it to its owner')
         return
-    problem = dacl_problem(_windows_sddl(path), _windows_sid())
+    problem = acl_problem(_windows_acl(path), _windows_sid())
     if problem:
         raise SystemExit(f'key file access is not restricted to the current user ({problem})')
 
@@ -435,7 +466,7 @@ def init_key(path):
     try:
         restrict_key_file(path)
         check_key_file_private(path)
-        with open(path, 'w', encoding='ascii') as handle:   # truncating keeps the verified ACL
+        with open(path, 'w', encoding='ascii', newline='\n') as handle:   # truncating keeps the verified ACL
             handle.write(secrets.token_hex(32) + '\n')
     except BaseException:
         try:
