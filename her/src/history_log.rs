@@ -6,15 +6,61 @@
 //! never pruned. A failed append never blocks ingress or fails a send.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 
 pub const DIR: &str = "history";
 
+/// Whether `history.enabled` is the boolean true in an isolated runtime. config.json is read only when its
+/// length or modification time changes, so a disabled log costs one stat per frame.
 pub fn enabled(context: &RuntimeContext) -> bool {
-    context.is_isolated()
-        && context.load_config().map(|cfg| cfg["history"]["enabled"].as_bool() == Some(true)).unwrap_or(false)
+    type FlagCache = HashMap<String, ((u64, SystemTime), bool)>;
+    static CACHE: Mutex<Option<FlagCache>> = Mutex::new(None);
+    if !context.is_isolated() {
+        return false;
+    }
+    let Some(identity) = config_identity(context) else { return false };
+    let scope = scope_key(context);
+    let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some((seen, flag)) = cache.get(&scope) {
+        if *seen == identity {
+            return *flag;
+        }
+    }
+    let flag = read_flag(context);
+    cache.insert(scope, (identity, flag));
+    flag
+}
+
+fn scope_key(context: &RuntimeContext) -> String {
+    context.runtime_root().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+fn config_identity(context: &RuntimeContext) -> Option<(u64, SystemTime)> {
+    let path = context.resolve_path(RuntimeArea::Config, "config.json", PathIntent::ReadOptionalFile).ok()?;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)))
+}
+
+fn read_flag(context: &RuntimeContext) -> bool {
+    #[cfg(test)]
+    CONFIG_READS.lock().unwrap().push(scope_key(context));
+    context.load_config().map(|cfg| cfg["history"]["enabled"].as_bool() == Some(true)).unwrap_or(false)
+}
+
+#[cfg(test)]
+static CONFIG_READS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Config reads of `context`'s runtime so far (test hook for the enablement cache).
+#[cfg(test)]
+fn config_reads(context: &RuntimeContext) -> usize {
+    let scope = scope_key(context);
+    CONFIG_READS.lock().unwrap().iter().filter(|read| **read == scope).count()
 }
 
 fn file_for(ms: i64) -> String {
@@ -41,10 +87,71 @@ fn media_kind(kind: &str) -> &'static str {
     }
 }
 
+const CARD_TYPES: [&str; 3] = ["json", "xml", "markdown"];
+
+fn unescape(text: &str) -> String {
+    text.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]").replace("&amp;", "&")
+}
+
+/// The `,key=value` parts and end offset of a CQ code whose parameters start at `pos`, or None when
+/// the code does not close (`]` never comes, or a `[` appears first).
+fn cq_close(message: &str, mut pos: usize) -> Option<(Vec<&str>, usize)> {
+    let bytes = message.as_bytes();
+    let mut parts = Vec::new();
+    loop {
+        match *bytes.get(pos)? {
+            b']' => return Some((parts, pos + 1)),
+            b',' => {
+                let begin = pos + 1;
+                let len = bytes[begin..].iter().take_while(|b| !matches!(b, b',' | b'[' | b']')).count();
+                parts.push(&message[begin..begin + len]);
+                pos = begin + len;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// CQ-string frame to the same items the array form carries, mirroring `parse_cq` in
+/// scripts/snowluma_export.py: a card or unparsable code ends the message and its payload never
+/// becomes text.
+fn cq_items(message: &str) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = message[at..].find("[CQ:") {
+        let start = at + offset;
+        if start > at {
+            items.push(json!({"type": "text", "data": {"text": unescape(&message[at..start])}}));
+        }
+        let name_start = start + 4;
+        let name_len = message.as_bytes()[name_start..].iter().take_while(|b| b.is_ascii_alphabetic() || **b == b'_').count();
+        let name = &message[name_start..name_start + name_len];
+        let closed = if name.is_empty() { None } else { cq_close(message, name_start + name_len) };
+        if CARD_TYPES.contains(&name) || closed.is_none() {
+            let kind = if CARD_TYPES.contains(&name) { name } else { "other" };
+            items.push(json!({"type": kind, "data": {}}));
+            return items;
+        }
+        let (parts, end) = closed.expect("closed code");
+        let mut data = serde_json::Map::new();
+        for part in parts {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            data.insert(key.to_owned(), json!(unescape(value)));
+        }
+        items.push(json!({"type": name, "data": data}));
+        at = end;
+    }
+    if at < message.len() {
+        items.push(json!({"type": "text", "data": {"text": unescape(&message[at..])}}));
+    }
+    items
+}
+
 fn segments(message: &Value) -> Vec<Value> {
-    let Some(items) = message.as_array() else {
-        // A CQ-string frame stays one text segment; the strip step removes ids and links in text.
-        return message.as_str().filter(|t| !t.is_empty()).map(|t| vec![json!({"k":"text","text":t})]).unwrap_or_default();
+    let items = match message {
+        Value::String(text) => cq_items(text),
+        Value::Array(items) => items.clone(),
+        _ => return Vec::new(),
     };
     items.iter().filter_map(|item| {
         let data = &item["data"];
@@ -70,7 +177,7 @@ pub(crate) fn inbound_record(event: &Value, received_ms: i64) -> Option<Value> {
         "private" => format!("private:{}", if own { id_text(&event["target_id"]) } else { sender_id.clone() }?),
         _ => return None,
     };
-    let t = event["time"].as_i64().filter(|s| *s > 0).map(|s| s * 1000).unwrap_or(received_ms);
+    let t = event["time"].as_i64().filter(|s| *s > 0).and_then(|s| s.checked_mul(1000)).unwrap_or(received_ms);
     Some(json!({
         "v": 1, "src": "ingress", "conv": conv, "dir": if own { "out" } else { "in" },
         "sender": sender_id.map(|id| json!({"id": id, "card": sender["card"].as_str().unwrap_or(""),
@@ -110,15 +217,28 @@ pub(crate) fn send_records(outbox: &Value, now: i64) -> Vec<Value> {
     }
 }
 
+/// Claims the one append-failure warning allowed per minute. False when another failure in that minute
+/// already claimed it; the compare-exchange makes concurrent failures claim it once.
+fn claim_warning(last: &AtomicI64, at_ms: i64) -> bool {
+    let mut seen = last.load(Ordering::Relaxed);
+    loop {
+        if seen != i64::MIN && at_ms.saturating_sub(seen) < 60_000 {
+            return false;
+        }
+        match last.compare_exchange_weak(seen, at_ms, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(current) => seen = current,
+        }
+    }
+}
+
 fn append(context: &RuntimeContext, record: &Value, at_ms: i64) {
     let safe = crate::activity::mask_json_session_tokens(record, &crate::activity::known_session_tokens(context));
     let Ok(mut line) = serde_json::to_vec(&safe) else { return };
     line.push(b'\n');
     if context.append_bytes(RuntimeArea::Data, &file_for(at_ms), &line).is_err() {
         static LAST_WARN: AtomicI64 = AtomicI64::new(i64::MIN);
-        let last = LAST_WARN.load(Ordering::Relaxed);
-        if last == i64::MIN || at_ms.saturating_sub(last) >= 60_000 {
-            LAST_WARN.store(at_ms, Ordering::Relaxed);
+        if claim_warning(&LAST_WARN, at_ms) {
             crate::safe_println!("[history] append failed; ingress and sends continue");
         }
     }
@@ -126,18 +246,18 @@ fn append(context: &RuntimeContext, record: &Value, at_ms: i64) {
 
 /// Ingress hook: called for every non-replayed frame after meta events, before any filter.
 pub fn record_inbound(context: &RuntimeContext, frame: &str) {
+    if !enabled(context) { return; }
     let Ok(event) = serde_json::from_str::<Value>(frame) else { return };
     let received = crate::turn_ledger::now_ms();
     let Some(record) = inbound_record(&event, received) else { return };
-    if enabled(context) { append(context, &record, received); }
+    append(context, &record, received);
 }
 
 /// Send-boundary hook: called by `send_outbox::append_record` after the outbox record is durable.
 pub fn record_send(context: &RuntimeContext, outbox: &Value) {
+    if !enabled(context) { return; }
     let now = crate::turn_ledger::now_ms();
-    let records = send_records(outbox, now);
-    if records.is_empty() || !enabled(context) { return; }
-    for record in &records { append(context, record, now); }
+    for record in &send_records(outbox, now) { append(context, record, now); }
 }
 
 #[cfg(test)]
@@ -156,14 +276,23 @@ mod tests {
     }
 
     fn runtime(tag: &str, enabled: bool) -> Sandbox {
+        runtime_with(tag, json!({"enabled": enabled}))
+    }
+
+    fn runtime_with(tag: &str, history: Value) -> Sandbox {
         let root = crate::install_root::development_root(std::env::temp_dir().join(crate::turn_ledger::mint_id(tag)));
         for dir in ["config", "data", "resources", "user/dsh"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
-        let config = json!({"consoleToken": "synthetic-review-token-abcdefghij", "history": {"enabled": enabled}});
+        let config = json!({"consoleToken": "synthetic-review-token-abcdefghij", "history": history});
         std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
         std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
         std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         Sandbox { root, context }
+    }
+
+    fn sandbox_set_history(sandbox: &Sandbox, history: Value) {
+        let config = json!({"consoleToken": "synthetic-review-token-abcdefghij", "history": history});
+        std::fs::write(sandbox.root.join("config/config.json"), config.to_string()).unwrap();
     }
 
     fn history_lines(root: &std::path::Path) -> Vec<Value> {
@@ -315,5 +444,105 @@ mod tests {
         assert_eq!(file_for(86_399_999), "history/1970-01-01.jsonl");
         assert_eq!(file_for(86_400_000), "history/1970-01-02.jsonl");
         assert_eq!(file_for(-1), "history/1969-12-31.jsonl");
+    }
+
+    #[test]
+    fn a_time_that_cannot_become_milliseconds_falls_back_to_the_receipt_time() {
+        let mut frame = group_frame(41, 1001, "时间过大");
+        frame["time"] = json!(i64::MAX);
+        let record = inbound_record(&frame, 5000).unwrap();
+        assert_eq!(record["t"], 5000);
+        assert_eq!(record["rt"], 5000);
+    }
+
+    #[test]
+    fn cq_string_frames_become_segments_and_never_leak_card_or_url_text() {
+        let mut frame = group_frame(51, 1001, "");
+        frame["message"] = json!(
+            "[CQ:reply,id=-55][CQ:at,qq=9001] 看图[CQ:image,file=a.jpg,url=https://example.com/pic.jpg]\
+             &#91;不是码&#93;[CQ:json,data=&#123;&quot;title&quot;:&quot;synthetic card title&quot;&#125;]\
+             之后的文字 https://example.com/after"
+        );
+        let record = inbound_record(&frame, 5000).unwrap();
+        assert_eq!(
+            record["segs"],
+            json!([
+                {"k": "reply", "mid": "-55"}, {"k": "at", "id": "9001"}, {"k": "text", "text": " 看图"},
+                {"k": "media", "kind": "image"}, {"k": "text", "text": "[不是码]"}, {"k": "media", "kind": "card"}
+            ])
+        );
+        let text = record.to_string();
+        assert!(!text.contains("pic.jpg") && !text.contains("synthetic card title") && !text.contains("之后的文字"), "{text}");
+
+        frame["message"] = json!("前文[CQ:image,file=q.jpg 之后");
+        let record = inbound_record(&frame, 5000).unwrap();
+        assert_eq!(
+            record["segs"],
+            json!([{"k": "text", "text": "前文"}, {"k": "media", "kind": "other"}]),
+            "an unclosed code is one other marker and the text after it is dropped"
+        );
+    }
+
+    #[test]
+    fn a_disabled_log_reads_the_config_once_until_the_file_changes() {
+        let sandbox = runtime("her-history-cache-", false);
+        let frame = group_frame(61, 1001, "未开启").to_string();
+        for _ in 0..50 {
+            record_inbound(&sandbox.context, &frame);
+        }
+        assert!(history_lines(&sandbox.root).is_empty());
+        assert_eq!(config_reads(&sandbox.context), 1, "one config read serves every frame while config.json is unchanged");
+
+        sandbox_set_history(&sandbox, json!({"enabled": true}));
+        record_inbound(&sandbox.context, &frame);
+        assert_eq!(history_lines(&sandbox.root).len(), 1, "a changed config.json is read again and switches the log on");
+        assert_eq!(config_reads(&sandbox.context), 2);
+    }
+
+    #[test]
+    fn one_append_warning_is_claimed_per_minute_even_when_failures_race() {
+        let last = AtomicI64::new(i64::MIN);
+        assert!(claim_warning(&last, 1_000), "the first failure claims the warning");
+        assert!(!claim_warning(&last, 1_500), "a second failure inside the minute stays silent");
+        assert!(!claim_warning(&last, 60_999), "59.999 s after the claim is still inside the minute");
+        assert!(claim_warning(&last, 61_000), "a minute after the claim, the next warning is claimed");
+
+        let raced = AtomicI64::new(i64::MIN);
+        let claimed = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| claim_warning(&raced, 5_000))).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).filter(|claim| *claim).count()
+        });
+        assert_eq!(claimed, 1, "concurrent failures in one minute claim the warning once");
+    }
+
+    #[test]
+    fn only_a_boolean_true_switches_the_log_on() {
+        for value in [json!("true"), json!(1), json!("yes"), json!(null)] {
+            let sandbox = runtime_with("her-history-nonbool-", json!({"enabled": value.clone()}));
+            record_inbound(&sandbox.context, &group_frame(71, 1001, "非布尔").to_string());
+            assert!(history_lines(&sandbox.root).is_empty(), "history.enabled must be the boolean true, not {value}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_runtime_never_turns_the_log_on() {
+        assert!(!enabled(&RuntimeContext::legacy()));
+    }
+
+    #[test]
+    fn session_tokens_are_masked_in_logged_text() {
+        let sandbox = runtime("her-history-token-", true);
+        let token = "abcdef".repeat(8);
+        std::fs::write(
+            sandbox.root.join("data/social-v2.json"),
+            json!({"conversations": {"g1": {"agentToken": token}}}).to_string(),
+        )
+        .unwrap();
+        record_inbound(&sandbox.context, &group_frame(81, 1001, &format!("令牌是 {token} 请保密")).to_string());
+        let lines = history_lines(&sandbox.root);
+        assert_eq!(lines.len(), 1);
+        let logged = lines[0].to_string();
+        assert!(!logged.contains(&token), "the session token must not reach the history log: {logged}");
+        assert!(logged.contains("***"), "the token is replaced by the mask: {logged}");
     }
 }

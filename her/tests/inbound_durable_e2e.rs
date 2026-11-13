@@ -1099,3 +1099,42 @@ fn history_log_is_off_by_default() {
     assert!(!root.path().join("data/history").exists(), "history is written only when switched on");
     drop(harness);
 }
+
+#[test]
+fn replayed_saved_event_is_logged_once() {
+    let root = TempRoot::new("history-replay");
+    let history_on = |cfg: &mut Value| cfg["history"] = json!({"enabled": true});
+    {
+        let mut harness = start_with_config(
+            root.path(),
+            vec![vec![Step::Ordinary { message_id: 9201, text: "history replay probe" }, Step::Wait(60_000)]],
+            Some(8808),
+            &[],
+            history_on,
+        );
+        let port = harness.console_port;
+        assert!(
+            wait_for(Duration::from_secs(30), || {
+                admin(port)["stages"]["received"].as_i64().unwrap_or(0) >= 1
+                    && history_records(root.path()).iter().any(|record| record["mid"] == "9201")
+            }),
+            "the first run never saved the event and logged it"
+        );
+        harness.child.kill().expect("hard-kill first run");
+        let _ = harness.child.wait();
+    }
+    // No redelivery: only the journaled copy can reach the restarted process.
+    let harness = start_with_config(root.path(), vec![vec![Step::Wait(60_000)]], Some(8808), &[], history_on);
+    let config: Value = serde_json::from_slice(&fs::read(root.path().join("config/config.json")).unwrap()).unwrap();
+    let reply = &config["socialV2"]["reply"];
+    let replay_bound = Duration::from_millis(
+        reply["wakeQuietMs"].as_u64().unwrap() + reply["quietMaxMs"].as_u64().unwrap() + 5000,
+    );
+    assert!(
+        wait_for(replay_bound, || turns_executed(root.path()) >= 1),
+        "the saved event was not replayed after restart"
+    );
+    let logged: Vec<Value> = history_records(root.path()).into_iter().filter(|record| record["mid"] == "9201").collect();
+    assert_eq!(logged.len(), 1, "a replayed event must not be logged again: {logged:?}");
+    drop(harness);
+}

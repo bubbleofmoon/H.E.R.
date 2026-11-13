@@ -157,7 +157,7 @@ class SelfScan(unittest.TestCase):
 
 
 class ReadRecords(unittest.TestCase):
-    def test_torn_tail_is_skipped_and_a_bad_middle_line_fails(self):
+    def test_unparseable_lines_are_skipped_and_counted(self):
         s_mod = load()
         good = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in', 'segs': []}
         with tempfile.TemporaryDirectory() as tmp:
@@ -167,19 +167,31 @@ class ReadRecords(unittest.TestCase):
             records = s_mod.read_records([torn], counts)
             self.assertEqual(len(records), 2, 'the two complete lines must be read')
             self.assertEqual(counts['torn_tail'], 1, 'a torn last line without a newline is counted, not fatal')
+            self.assertEqual(counts['bad_lines'], 1, 'the torn last line is also an unparseable line')
 
-            bad = Path(tmp) / 'bad.jsonl'
-            bad.write_text(json.dumps(good) + '\n' + '{not json' + '\n' + json.dumps(good) + '\n', encoding='utf-8')
-            with self.assertRaises(SystemExit) as raised:
-                s_mod.read_records([bad], Counter())
-            self.assertIn('bad.jsonl:2', str(raised.exception))
-            self.assertNotIn(str(tmp), str(raised.exception), 'errors print the file name, never the path')
+            middle = Path(tmp) / 'middle.jsonl'
+            middle.write_text(json.dumps(good) + '\n' + '{not json' + '\n' + json.dumps(good) + '\n', encoding='utf-8')
+            counts = Counter()
+            records = s_mod.read_records([middle], counts)
+            self.assertEqual(len(records), 2, 'an unparseable middle line is skipped and the rest is read')
+            self.assertEqual(counts['bad_lines'], 1)
+            self.assertEqual(counts['torn_tail'], 0, 'only an unterminated last line is a torn tail')
 
             wrong = Path(tmp) / 'wrong.jsonl'
             wrong.write_text(json.dumps({'v': 2}) + '\n' + json.dumps(good) + '\n', encoding='utf-8')
             with self.assertRaises(SystemExit) as raised:
                 s_mod.read_records([wrong], Counter())
             self.assertIn('wrong.jsonl:1', str(raised.exception))
+
+    def test_input_where_every_line_is_bad_is_refused(self):
+        s_mod = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            only_bad = Path(tmp) / 'only-bad.jsonl'
+            only_bad.write_text('{not json\n{also not json\n', encoding='utf-8')
+            with self.assertRaises(SystemExit) as raised:
+                s_mod.read_records([only_bad], Counter())
+            self.assertIn('only-bad.jsonl', str(raised.exception))
+            self.assertNotIn(str(tmp), str(raised.exception), 'errors print the file name, never the path')
 
 
 class KeyFile(unittest.TestCase):
@@ -261,6 +273,25 @@ class StripCli(unittest.TestCase):
             self.assertNotEqual(code, 0, 'a second strip under the same name must refuse to overwrite')
             self.assertEqual((out_dir / 'case.jsonl').read_bytes(), body)
 
+
+    @REQUIRES_SCANNER
+    def test_report_counts_unparseable_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            code, output = cli(['init-key', '--key-file', str(key_file)])
+            self.assertEqual(code, 0, output)
+            first, second = synthetic_records()[:2]
+            source = Path(tmp) / 'in.jsonl'
+            source.write_text(json.dumps(first, ensure_ascii=False) + '\n{not json\n'
+                              + json.dumps(second, ensure_ascii=False) + '\n', encoding='utf-8')
+            out_dir = Path(tmp) / 'out'
+            code, output = cli(['strip', '--key-file', str(key_file), '--input', str(source),
+                                '--out-dir', str(out_dir), '--name', 'bad'])
+            self.assertEqual(code, 0, output)
+            report = json.loads((out_dir / 'bad.report.json').read_text(encoding='utf-8'))
+            self.assertEqual(report['bad_lines'], 1, 'the unparseable middle line is counted in the report')
+            self.assertEqual(report['records_in'], 2, 'the two readable records are stripped')
+            self.assertEqual(report['torn_tail'], 0)
 
     def test_failed_strip_leaves_no_files(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -399,7 +399,9 @@ def init_key(path):
 
 
 def read_records(paths, counts):
-    """Schema v1 records from the input files; a torn last line is counted, any other bad line fails."""
+    """Schema v1 records from the input files. An unparseable line is skipped and counted as bad_lines
+    (an unterminated last line is also counted as torn_tail); input that yields no record but has bad
+    lines is refused, naming the files only."""
     records = []
     for path in paths:
         name = Path(path).name
@@ -414,13 +416,16 @@ def read_records(paths, counts):
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                counts['bad_lines'] += 1
                 if number == len(lines) and not text.endswith('\n'):
                     counts['torn_tail'] += 1
-                    continue
-                raise SystemExit(f'input {name}:{number}: not a JSON record')
+                continue
             if not isinstance(record, dict) or record.get('v') != 1:
                 raise SystemExit(f'input {name}:{number}: not a schema v1 record')
             records.append(record)
+    if not records and counts['bad_lines']:
+        names = ', '.join(Path(path).name for path in paths)
+        raise SystemExit(f'input {names}: no readable schema v1 record ({counts["bad_lines"]} unparseable lines)')
     return records
 
 
@@ -558,7 +563,7 @@ def strip(args, scan=None, secret_scan=None):
             print('strip failed: the output could not be published; nothing was kept', file=sys.stderr)
             return 1
     print(f'strip: records_in={report["records_in"]} records_out={report["records_out"]} '
-          f'torn_tail={report["torn_tail"]} self_scan_findings=0 secret_scan=clean')
+          f'bad_lines={report["bad_lines"]} torn_tail={report["torn_tail"]} self_scan_findings=0 secret_scan=clean')
     return 0
 
 
@@ -569,6 +574,7 @@ def report_for(records, out, stripper, counts):
         'schema': 'her.history-strip.v1',
         'records_in': len(records),
         'records_out': len(out),
+        'bad_lines': counts['bad_lines'],
         'torn_tail': counts['torn_tail'],
         'conversations': {
             'group': len({r['conv'] for r in out if r['conv'] and r['conv'].startswith('group:')}),
