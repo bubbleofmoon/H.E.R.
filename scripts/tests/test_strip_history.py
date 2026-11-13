@@ -4,8 +4,10 @@
 Every value is invented and assembled from parts, so this file passes the public guard.
 Run: HER_GITLEAKS=<gitleaks> python -I scripts/tests/test_strip_history.py
 """
+import argparse
 from collections import Counter
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 STRIP = ROOT / 'scripts' / 'strip_history.py'
@@ -145,7 +148,7 @@ class SelfScan(unittest.TestCase):
         leaked = {'segs': [{'k': 'text', 'text': '号码' + '12345' + '6789' + '，邮箱 a.b@example.com，小明'}]}
         found = s_mod.self_scan(leaked, name_re)
         self.assertEqual(found.get('digits'), 1, found)
-        self.assertEqual(found.get('email'), 1, found)
+        self.assertEqual(found.get('at-sign'), 1, found)
         self.assertEqual(found.get('name'), 1, found)
         clean = {'segs': [{'k': 'text', 'text': '号码' + '1234' + '，' + '<邮箱>' + '，〔P-abcdefgh〕'}]}
         self.assertEqual(dict(s_mod.self_scan(clean, name_re)), {}, 'four digits and placeholders must pass')
@@ -264,17 +267,7 @@ class StripCli(unittest.TestCase):
             key_file = Path(tmp) / 'history.key'
             code, output = cli(['init-key', '--key-file', str(key_file)])
             self.assertEqual(code, 0, output)
-            # A user path is not a text rule, so the strip leaves it and the self-scan must refuse.
-            leaky = [{'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in', 'sender': None,
-                      'mid': '9', 't': 1000, 'segs': [{'k': 'text', 'text': 'see ' + '/Users' + '/fakeuser/x.txt'}]}]
-            source = Path(tmp) / 'leaky.jsonl'
-            source.write_text(json.dumps(leaky[0], ensure_ascii=False) + '\n', encoding='utf-8')
             out_dir = Path(tmp) / 'out'
-            code, output = cli(['strip', '--key-file', str(key_file), '--input', str(source),
-                                '--out-dir', str(out_dir), '--name', 'leaky'])
-            self.assertNotEqual(code, 0, 'a record the self-scan flags must stop the strip: ' + output)
-            self.assertNotIn('fakeuser', output, 'refusals print kinds and positions, never the text')
-            self.assertTrue(not out_dir.exists() or not any(out_dir.iterdir()), 'a refused strip writes nothing')
 
             clean_source = Path(tmp) / 'clean.jsonl'
             clean_source.write_text(json.dumps(synthetic_records()[1], ensure_ascii=False) + '\n', encoding='utf-8')
@@ -283,6 +276,298 @@ class StripCli(unittest.TestCase):
                                 str(Path(tmp) / 'no-such-gitleaks')])
             self.assertNotEqual(code, 0, 'a missing gitleaks binary must fail the strip closed: ' + output)
             self.assertEqual(sorted(x.name for x in out_dir.iterdir()), [], 'a failed secret scan leaves no temp dir or output')
+
+
+def strip_one(s_mod, text, records=None):
+    key = bytes(range(32))
+    stripper = s_mod.Stripper(key, records or [])
+    out = stripper.text(text)
+    return stripper, out
+
+
+def require(test, s_mod, name):
+    test.assertTrue(hasattr(s_mod, name), f'scripts/strip_history.py has no {name} yet')
+
+
+def assert_stripped(test, s_mod, stripper, out, raws):
+    for raw in raws:
+        test.assertNotIn(raw, out, f'raw value {raw!r} survived the strip: {out!r}')
+    leftovers = s_mod.self_scan({'segs': [{'k': 'text', 'text': out}]}, stripper.name_re)
+    test.assertEqual(dict(leftovers), {}, f'self-scan found leftovers in {out!r}')
+    test.assertEqual(stripper.text(out), out, 'stripping the stripped text again must change nothing')
+
+
+def no_findings(*args, **kwargs):
+    return [], None
+
+
+def strip_args(key_file, source, out_dir):
+    return argparse.Namespace(key_file=str(key_file), input=[str(source)], out_dir=str(out_dir),
+                              name='case', gitleaks=None)
+
+
+SID = 'S-1-5-21-' + '1-2-3-1001'          # invented user SID
+OTHER_SID = 'S-1-5-21-' + '9-9-9-1002'    # invented second SID
+
+
+class R1DigitsBeforeNames(unittest.TestCase):
+    def test_digit_only_names_are_not_learned(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                  'sender': {'id': QQ_A, 'card': '1' + '2', 'nick': '66' + '6'}, 'segs': []}
+        stripper, out = strip_one(s_mod, '20' + '12年和' + '66' + '6', [record])
+        self.assertEqual(out, '20' + '12年和' + '66' + '6', 'digit-only names must not replace digits')
+        self.assertNotIn('〔', out)
+        self.assertEqual(stripper.counts['unsafe_names_skipped'], 2)
+
+
+class R2SeparatedDigits(unittest.TestCase):
+    CASES = (
+        '314 ' + '159 ' + '265',
+        '3141-' + '5926-' + '5',
+        '\u200b'.join('3141' + '59265'),
+        '138.' + '0013.' + '8000',
+        '138－' + '0013－' + '8000',
+        ''.join(d + '\ufe0f\u20e3' for d in '3141' + '59265'),
+        '③①④①⑤⑨②⑥⑤',
+        '三一四一五九二六五',
+    )
+
+    def test_separated_digit_runs_are_replaced(self):
+        s_mod = load()
+        for case in self.CASES:
+            with self.subTest(case=case):
+                stripper, out = strip_one(s_mod, '号码' + case + '好')
+                leftovers = s_mod.self_scan({'segs': [{'k': 'text', 'text': out}]}, stripper.name_re)
+                self.assertEqual(dict(leftovers), {}, f'self-scan found leftovers in {out!r}')
+                placeholders = ('<数字>', '〔P-', '<电话>') if case == '138－0013－8000' else ('<数字>', '〔P-')
+                self.assertTrue(any(p in out for p in placeholders), f'digit run not replaced: {out!r}')
+
+    def test_identity_number_with_x_is_replaced_whole(self):
+        s_mod = load()
+        stripper, out = strip_one(s_mod, '号码' + '110105 ' + '1949' + '1231' + ' 002X' + '好')
+        self.assertNotIn('X', out, out)
+        self.assertTrue('<数字>' in out or '〔P-' in out, f'digit run not replaced: {out!r}')
+        leftovers = s_mod.self_scan({'segs': [{'k': 'text', 'text': out}]}, stripper.name_re)
+        self.assertEqual(dict(leftovers), {}, f'self-scan found leftovers in {out!r}')
+
+    def test_valid_date_is_kept(self):
+        s_mod = load()
+        _, out = strip_one(s_mod, '今天是20' + '26-11-13')
+        self.assertEqual(out, '今天是20' + '26-11-13')
+
+
+class R3Links(unittest.TestCase):
+    LINKS = (
+        't.co/x',
+        'youtu.be/x?si=abc',
+        'example.dev/s?token=abc',
+        'example.com?token=abc',
+        'example.com#frag=abc',
+        'host.example:8080',
+        '10.0.0.1:8080/x',
+        'mqqapi://card/show?uin=1',
+        'tg://resolve?domain=x',
+        'magnet:?xt=urn:btih:abc',
+        'https：//example.com/x',
+        'ｈｔｔｐｓ://ｅｘａｍｐｌｅ.com/x',
+        'https://example.com/?q="abc"&token=xyz',
+    )
+
+    def test_each_link_form_is_replaced(self):
+        s_mod = load()
+        for link in self.LINKS:
+            with self.subTest(link=link):
+                stripper, out = strip_one(s_mod, f'看 {link} 好的')
+                self.assertEqual(out, '看 <链接> 好的')
+                assert_stripped(self, s_mod, stripper, out, (link,))
+
+
+class R4Emails(unittest.TestCase):
+    def test_email_forms_are_replaced(self):
+        s_mod = load()
+        cases = (
+            ('邮箱：张三@163.com 好的', '邮箱：<邮箱> 好的'),
+            ('fake＠example.com', '<邮箱>'),
+            ('fake#qq.com', '<邮箱>'),
+            ('fake.user @ example.com', '<邮箱>'),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                stripper, out = strip_one(s_mod, text)
+                self.assertEqual(out, expected)
+                assert_stripped(self, s_mod, stripper, out, ('@', '＠', '163.com', 'example.com'))
+
+
+class R5IndependentScan(unittest.TestCase):
+    def test_residual_kinds_are_reported(self):
+        s_mod = load()
+        require(self, s_mod, 'residuals')
+        cases = (
+            ('3 1 4 1 5', 'digits'),
+            ('a＠b', 'at-sign'),
+            ('x://y', 'scheme'),
+            ('abc.xyz/1', 'host'),
+            ('三一四一五', 'cjk-digits'),
+            ('<数字>7', 'adjacent-digits'),
+            ('/ho' + 'me/fake', 'user-path'),
+        )
+        for text, kind in cases:
+            with self.subTest(kind=kind):
+                found = s_mod.residuals(text, None)
+                self.assertIn(kind, found, f'{kind} not reported for this case: {dict(found)}')
+
+
+class R6Names(unittest.TestCase):
+    def test_card_decoration_is_not_a_name_but_its_parts_are(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                  'sender': {'id': QQ_A, 'card': '【管理】小明-上海', 'nick': ''}, 'segs': []}
+        stripper, out = strip_one(s_mod, '小明在上海，管理一下', [record])
+        self.assertEqual(out.count('〔P-'), 2, out)
+        self.assertIn('管理', out, out)
+        assert_stripped(self, s_mod, stripper, out, ('小明', '上海'))
+
+    def test_latin_nick_matches_in_any_case(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                  'sender': {'id': QQ_A, 'card': '', 'nick': 'Alice'}, 'segs': []}
+        stripper, out = strip_one(s_mod, 'ALICE说', [record])
+        assert_stripped(self, s_mod, stripper, out, ('ALICE',))
+
+    def test_short_latin_nick_matches_only_whole_words(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in',
+                  'sender': {'id': QQ_A, 'card': '', 'nick': 'al'}, 'segs': []}
+        stripper, out = strip_one(s_mod, 'Also al说', [record])
+        self.assertTrue(out.startswith('Also '), out)
+        self.assertIn('〔P-', out, out)
+
+    def test_at_segment_name_is_replaced(self):
+        s_mod = load()
+        record = {'v': 1, 'src': 'ingress', 'conv': f'group:{GROUP}', 'dir': 'in', 'sender': None,
+                  'segs': [{'k': 'at', 'id': QQ_B, 'name': '阿强'}]}
+        stripper, out = strip_one(s_mod, '阿强你好', [record])
+        assert_stripped(self, s_mod, stripper, out, ('阿强',))
+
+    def test_mention_is_replaced(self):
+        s_mod = load()
+        _, out = strip_one(s_mod, '@某某某 你好')
+        self.assertEqual(out, '<提及> 你好')
+
+
+class S7Paths(unittest.TestCase):
+    def test_windows_home_path_loses_the_user_name(self):
+        s_mod = load()
+        stripper, out = strip_one(s_mod, 'see C:' + chr(92) + 'Users' + chr(92) + 'fakeuser' + chr(92) + 'x.txt')
+        self.assertIn('<路径>', out)
+        assert_stripped(self, s_mod, stripper, out, ('fakeuser',))
+
+    def test_posix_home_path_loses_the_user_name(self):
+        s_mod = load()
+        stripper, out = strip_one(s_mod, 'see ' + '/ho' + 'me/fakeuser/x')
+        self.assertIn('<路径>', out)
+        assert_stripped(self, s_mod, stripper, out, ('fakeuser',))
+
+
+class SurrogateInput(unittest.TestCase):
+    def test_lone_surrogate_becomes_replacement_character(self):
+        s_mod = load()
+        _, out = strip_one(s_mod, 'a\ud800b')
+        self.assertEqual(out, 'a\ufffdb')
+
+
+class KeyAcl(unittest.TestCase):
+    def test_private_dacl_accepts_one_protected_full_access_ace(self):
+        s_mod = load()
+        require(self, s_mod, 'private_dacl')
+        self.assertTrue(s_mod.private_dacl(f'O:BAD:PAI(A;;FA;;;{SID})', SID))
+
+    def test_private_dacl_rejects_other_shapes(self):
+        s_mod = load()
+        require(self, s_mod, 'private_dacl')
+        cases = {
+            'not protected': f'D:AI(A;;FA;;;{SID})',
+            'second ACE': f'O:BAD:PAI(A;;FA;;;{SID})(A;;FR;;;BU)',
+            'inheritance flag': f'O:BAD:PAI(A;ID;FA;;;{SID})',
+            'read-only rights': f'O:BAD:PAI(A;;FR;;;{SID})',
+            'other SID': f'O:BAD:PAI(A;;FA;;;{OTHER_SID})',
+        }
+        for label, sddl in cases.items():
+            with self.subTest(label=label):
+                self.assertFalse(s_mod.private_dacl(sddl, SID), f'{label} must not count as private')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
+    def test_load_key_refuses_a_group_readable_file(self):
+        s_mod = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            os.chmod(key_file, 0o644)
+            with self.assertRaises(SystemExit):
+                s_mod.load_key(key_file)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL check')
+    def test_windows_key_file_is_private_after_init(self):
+        s_mod = load()
+        require(self, s_mod, '_windows_sddl')
+        require(self, s_mod, '_windows_sid')
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            self.assertTrue(s_mod.private_dacl(s_mod._windows_sddl(key_file), s_mod._windows_sid()))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL check')
+    def test_windows_inherited_acl_is_refused(self):
+        s_mod = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            subprocess.run(['icacls', str(key_file), '/inheritance:e'], check=True, capture_output=True)
+            with self.assertRaises(SystemExit):
+                s_mod.load_key(key_file)
+
+
+class Publication(unittest.TestCase):
+    def test_rollback_when_the_second_replace_fails(self):
+        s_mod = load()
+        params = inspect.signature(s_mod.strip).parameters
+        self.assertTrue({'scan', 'secret_scan'} <= set(params), 'strip() has no scan and secret_scan hooks yet')
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            source = Path(tmp) / 'clean.jsonl'
+            source.write_text(json.dumps(synthetic_records()[1], ensure_ascii=False) + '\n', encoding='utf-8')
+            out_dir = Path(tmp) / 'out'
+            real_replace, calls = os.replace, []
+
+            def second_fails(src, dst, *args, **kwargs):
+                calls.append(dst)
+                if len(calls) == 1:
+                    return real_replace(src, dst)
+                raise OSError(28, 'no space left')
+
+            with mock.patch.object(s_mod.os, 'replace', side_effect=second_fails):
+                code = s_mod.strip(strip_args(key_file, source, out_dir), secret_scan=no_findings)
+            self.assertEqual(len(calls), 2, 'the test must reach the second publish')
+            self.assertEqual(code, 1, 'a failed second publish must fail the strip')
+            leftovers = sorted(p.name for p in out_dir.iterdir()) if out_dir.exists() else []
+            self.assertEqual(leftovers, [], 'a failed publish must remove what it published')
+
+    def test_scan_finding_writes_nothing(self):
+        s_mod = load()
+        params = inspect.signature(s_mod.strip).parameters
+        self.assertTrue({'scan', 'secret_scan'} <= set(params), 'strip() has no scan and secret_scan hooks yet')
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            source = Path(tmp) / 'clean.jsonl'
+            source.write_text(json.dumps(synthetic_records()[1], ensure_ascii=False) + '\n', encoding='utf-8')
+            out_dir = Path(tmp) / 'out'
+            code = s_mod.strip(strip_args(key_file, source, out_dir),
+                               scan=lambda record, name_re: Counter({'digits': 1}), secret_scan=no_findings)
+            self.assertEqual(code, 1, 'a scan finding must fail the strip')
+            self.assertTrue(not out_dir.exists() or not any(out_dir.iterdir()), 'a scan finding must write nothing')
 
 
 if __name__ == '__main__':

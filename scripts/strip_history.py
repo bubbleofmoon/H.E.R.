@@ -9,12 +9,18 @@ host only; tests use synthetic records.
 Input: schema v1 records, one JSON object per line, from scripts/snowluma_export.py or the
 runtime's data/history/*.jsonl (her/src/history_log.rs): v, src, conv, dir, sender {id, card,
 nick}, convName, t (epoch ms), mid, segs [text | at | reply | forward | face | media], and for
-sends batch, idx, phase. Output DIR/NAME.jsonl keeps the shape: account, group, message and
-batch ids become keyed pseudonyms (HMAC-SHA256, letters only), names are dropped, time is an
-ISO UTC second, and text has links, emails, phone numbers, addresses, known names and ids and
-every run of five or more digits replaced. Media keeps only its kind. DIR/NAME.report.json holds
-counts only. Nothing is written unless the self-scan and the gitleaks secret scan are clean.
-The key file stays on the Windows host and is never committed.
+sends batch, idx, phase. Output DIR/NAME.jsonl keeps the shape: account, group, message and batch ids become keyed
+pseudonyms (HMAC-SHA256, letters only), names are dropped, time is an ISO UTC second. Text is
+first folded (format characters, variation selectors and keycap marks dropped; any digit and
+full-width letters and @ mapped to ASCII; Chinese punctuation kept), then account-home paths,
+links (any scheme, host with path, query or port, IPv4, known TLDs), emails, addresses, phone
+numbers, digit sequences with five or more digits ignoring separators (valid dates kept),
+Chinese-numeral runs, known names and name parts, and @mentions are replaced, repeated until
+stable. A separate stricter residual scan and a field whitelist must pass, then gitleaks;
+otherwise nothing is written, and a failed publish removes what this run published.
+DIR/NAME.report.json holds counts only. The key file is restricted to the current user (POSIX
+mode 600, Windows protected DACL with one full-access ACE for the user, verified before the
+key is written and on every load), stays on the Windows host and is never committed.
 """
 import argparse
 import datetime
@@ -27,6 +33,7 @@ from collections import Counter
 from pathlib import Path
 import re
 import secrets
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -43,12 +50,54 @@ def _load_scan_public():
 
 SCAN = _load_scan_public()
 
-STOP = '\\s<>"\'，。！？、；：）」』】《》'
-URL_SCHEME = re.compile(r'(?i)(?:https?|ftp)://[^' + STOP + r']+')
-URL_WWW = re.compile(r'(?i)(?<![A-Za-z0-9.-])www\.[^' + STOP + r']+')
-EMAIL = re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+')
-URL_BARE = re.compile(r'(?i)(?<![A-Za-z0-9.@-])[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|cn|net|org|tv|io|me|cc|top|xyz|link|ly|gg|app)'
-                      r'(?![A-Za-z0-9-])(?:/[^' + STOP + r']*)?')
+FOLDABLE = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ' '01234' '56789' '@.-_#%=&+~')
+
+
+def _dropped(ch):
+    o = ord(ch)
+    return unicodedata.category(ch) == 'Cf' or 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF or o == 0x20E3
+
+
+def fold(text):
+    """Drop format characters, variation selectors and keycap marks; map every digit and
+    full-width letters and @.-_#%=&+~ to ASCII; keep Chinese text and punctuation; lone
+    surrogates become U+FFFD."""
+    out = []
+    for ch in text:
+        if 0xD800 <= ord(ch) <= 0xDFFF:
+            out.append('\ufffd')
+            continue
+        if _dropped(ch):
+            continue
+        if not ch.isascii():
+            digit = unicodedata.digit(ch, None)
+            if digit is not None:
+                out.append(str(digit))
+                continue
+            folded = unicodedata.normalize('NFKC', ch)
+            if folded and all(c in FOLDABLE for c in folded):
+                out.append(folded)
+                continue
+        out.append(ch)
+    return ''.join(out)
+
+
+TAIL = r'[^\s\u4e00-\u9fff，。！、；「」『』【】《》（）]*'
+TLDS = ('com|cn|net|org|tv|io|me|cc|top|xyz|link|ly|gg|app|dev|co|info|biz|site|online|vip|club|ai|so|im|be|to|'
+        'fm|la|ws|live|shop|store|tech|wiki|art|pro|asia|mobi|name|edu|gov|mil|int')
+HOME_WIN = re.compile(r'(?i)(?<![A-Za-z])[a-z]:[\\/]+users[\\/]+[^\s\\/]+')
+HOME_POSIX = re.compile(r'(?i)(?:/home|/users|/[a-z]/users)/[^\s/]+')
+SCHEME = re.compile(r'(?i)(?<![A-Za-z0-9+.-])[a-z][a-z0-9+.-]{0,30}[:：]\s?(?:[/／]\s?[/／]|\?)' + TAIL)
+EMAIL_LOCAL = r'(?:[A-Za-z0-9._%+-]{1,64}|[\w.+-]{1,12})'
+EMAIL = re.compile(EMAIL_LOCAL + r'\s?@\s?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+')
+EMAIL_HASH = re.compile(EMAIL_LOCAL + r'\s?#\s?(?:qq|163|126|139|yeah|gmail|outlook|hotmail|foxmail|sina|sohu|'
+                        r'yahoo|icloud|live|aliyun)\.(?:com|cn|net)(?:\.cn)?', re.IGNORECASE)
+WWW = re.compile(r'(?i)(?<![A-Za-z0-9.-])www\.' + TAIL)
+IPV4 = re.compile(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d)(?::\d{1,5})?(?:[/／?#]' + TAIL + ')?')
+HOST_PATH = re.compile(r'(?i)(?<![A-Za-z0-9@.-])(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]{1,23}'
+                       r'(?:(?::\d{1,5})?[/／?#]|:\d{1,5}(?!\d))' + TAIL)
+HOST_DOT = re.compile(r'(?i)(?<![A-Za-z0-9-])[a-z0-9-]+\s*[。点]\s*(?:com|cn|net|org)(?![a-z])')
+HOST_BARE = re.compile(r'(?i)(?<![A-Za-z0-9@.-])(?:[a-z0-9-]+\.)+(?:' + TLDS + r'|[a-z]{2})(?![A-Za-z0-9-])')
 PHONE = re.compile(r'(?<!\d)(?:\+?86[- ]?)?1[3-9]\d(?:[- ]?\d{4}){2}(?!\d)|(?<!\d)0\d{2,3}-\d{7,8}(?!\d)')
 CJK = '\u4e00-\u9fff'
 NUM = r'[\d一二三四五六七八九十百零〇]'
@@ -58,15 +107,52 @@ ADDRESS = re.compile(
     rf'[{CJK}\d]{{1,12}}(?:大道|路|街|巷|弄|胡同)\s*{NUM}+(?:号|弄)(?:\s*{UNIT}(?:号楼|栋|幢|座|单元|层|楼|室))*')
 ESTATE = re.compile(
     rf'[{CJK}]{{2,10}}(?:小区|花园|公寓|大厦|家园|苑)\s*{UNIT}(?:号楼|栋|幢|座|单元|室)(?:\s*{UNIT}(?:号楼|栋|幢|座|单元|层|室|号))*')
-DIGITS = re.compile(r'\d{5,}')          # Unicode digits: full-width runs count
-PLACEHOLDER = re.compile(r'〔[PGMB]-[a-z]{8,10}〕|<(?:链接|邮箱|电话|地址|数字)>')
-TEXT_RULES = (('link', URL_SCHEME, '<链接>'), ('link', URL_WWW, '<链接>'), ('email', EMAIL, '<邮箱>'),
-              ('link', URL_BARE, '<链接>'), ('phone', PHONE, '<电话>'), ('address', ADDRESS, '<地址>'),
-              ('address', ESTATE, '<地址>'))
-SCAN_RULES = (('digits', DIGITS),) + tuple((kind, pattern) for kind, pattern, _ in TEXT_RULES)
+SEP = r'[\s\-._·‐‑‒–—―−]'
+DATE = re.compile(r'(?<!\d)(?:19|20)\d{2}[-./年](?:0?[1-9]|1[0-2])[-./月](?:0?[1-9]|[12]\d|3[01])日?(?!\d)')
+DATE_SPLIT = re.compile('(' + DATE.pattern + ')')
+DIGIT_SEQ = re.compile(r'\d(?:' + SEP + r'{0,3}\d)*[Xx]?')
+CJK_NUM = re.compile(r'[零〇一二三四五六七八九两幺](?:[\s\-.,，、·]?[零〇一二三四五六七八九两幺]){4,}')
+MENTION = re.compile(r'@(?!〔)[^\s@〔<]{0,16}')
+MENTION_CODE = re.compile(r'@(?=〔)')
+PLACEHOLDER = re.compile(r'〔[PGMB]-[a-z]{8,10}〕|<(?:链接|邮箱|电话|地址|数字|路径|提及)>')
+NAME_SPLIT = re.compile(r'[\s【】\[\]()（）<>《》「」『』|/\\_~·•,，.。:：;；!！?？+=*#&、-]+')
+NOT_A_NAME = re.compile(r'[\d\W_]+')
+DECOR_STOP = frozenset({'管理', '管理员', '群主', '群员', '成员', '萌新', '新人', '本人', '官方', 'admin', 'mod', 'bot', 'owner'})
+TEXT_RULES = (('path', HOME_WIN, '<路径>'), ('path', HOME_POSIX, '<路径>'), ('link', SCHEME, '<链接>'),
+              ('email', EMAIL, '<邮箱>'), ('email', EMAIL_HASH, '<邮箱>'), ('link', WWW, '<链接>'),
+              ('link', IPV4, '<链接>'), ('link', HOST_PATH, '<链接>'), ('link', HOST_DOT, '<链接>'),
+              ('link', HOST_BARE, '<链接>'), ('address', ADDRESS, '<地址>'), ('address', ESTATE, '<地址>'),
+              ('phone', PHONE, '<电话>'))
+# Residual scan: stricter, written apart from the replacement rules where it can be.
+SCAN_DIGITS = re.compile(r'\d(?:' + SEP + r'{0,3}\d)*')
+ADJACENT = re.compile(r'\d(?:<数字>|<电话>)|(?:<数字>|<电话>)\d')
+SCAN_RULES = (
+    ('cjk-digits', re.compile(r'(?:[零〇一二三四五六七八九两幺][\s\-.,，、·]?){5,}')),
+    ('at-sign', re.compile(r'[@＠]')),
+    ('scheme', re.compile(r'[A-Za-z][:：]\s?(?:[/／]\s?[/／]|\?)')),
+    ('host', re.compile(r'(?i)[a-z0-9-]\.[a-z][a-z0-9-]{1,23}(?::\d|[/／?#])')),
+    ('host', HOST_BARE), ('host', HOST_DOT),
+    ('ipv4', re.compile(r'(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d)')),
+    ('user-path', HOME_WIN), ('user-path', HOME_POSIX),
+    ('address', ADDRESS), ('address', ESTATE),
+)
 CODES = {'acct': ('P', 8), 'group': ('G', 8), 'mid': ('M', 10), 'batch': ('B', 10)}
 MEDIA_KINDS = {'image', 'video', 'voice', 'file', 'sticker', 'card', 'markdown', 'other'}
 SOURCES = ('snowluma', 'ingress', 'send')
+TOP_KEYS = {'v', 'src', 'conv', 'dir', 'sender', 'time', 'mid', 'segs', 'batch', 'idx', 'phase'}
+FORMATS = {'conv': re.compile(r'(?:group:G|private:P)-[a-z]{8}'), 'sender': re.compile(r'P-[a-z]{8}'),
+           'mid': re.compile(r'M-[a-z]{10}'), 'batch': re.compile(r'B-[a-z]{10}'),
+           'time': re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z')}
+SEG_KEYS = {'text': {'k', 'text'}, 'at': {'k', 'id'}, 'reply': {'k', 'mid'}, 'forward': {'k'},
+            'face': {'k', 'id'}, 'media': {'k', 'kind'}}
+
+
+def name_pattern(names):
+    items = []
+    for name in sorted(names, key=len, reverse=True):
+        escaped = re.escape(name)
+        items.append(rf'(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])' if name.isascii() else escaped)
+    return re.compile('|'.join(items), re.IGNORECASE) if items else None
 
 
 def code(key, space, value):
@@ -78,45 +164,90 @@ def code(key, space, value):
 class Stripper:
     def __init__(self, key, records):
         self.key, self.counts, self.ids, self.names = key, Counter(), {}, {}
+        self.short_names, self.unsafe_names = set(), set()
         for record in records:
             self._learn(record)
-        usable = sorted((name for name in self.names if len(name) >= 2), key=len, reverse=True)
-        self.counts['short_names_unreplaced'] = len(self.names) - len(usable)
-        self.name_re = re.compile('|'.join(map(re.escape, usable))) if usable else None
+        self.counts['short_names_unreplaced'] = len(self.short_names)
+        self.counts['unsafe_names_skipped'] = len(self.unsafe_names)
+        self.name_re = name_pattern(self.names)
 
     def field(self, space, raw):
         return code(self.key, space, str(raw))
+
+    def _learn_name(self, raw, code_):
+        name = fold(str(raw)).strip()
+        for part in ([name, *NAME_SPLIT.split(name)] if name else []):
+            part = part.strip()
+            if not part:
+                continue
+            key = part.casefold()
+            if len(part) < 2:
+                self.short_names.add(key)
+            elif NOT_A_NAME.fullmatch(part) or key in DECOR_STOP:
+                self.unsafe_names.add(key)
+            else:
+                self.names.setdefault(key, code_)
 
     def _learn(self, record):
         kind, _, conv_id = str(record.get('conv') or '').partition(':')
         if conv_id:
             self.ids.setdefault(conv_id, self.field('group' if kind == 'group' else 'acct', conv_id))
             if kind == 'group' and record.get('convName'):
-                self.names.setdefault(str(record['convName']).strip(), self.ids[conv_id])
+                self._learn_name(record['convName'], self.ids[conv_id])
         sender = record.get('sender') or {}
         if sender.get('id'):
             sid = str(sender['id'])
             self.ids.setdefault(sid, self.field('acct', sid))
             for name in (sender.get('card'), sender.get('nick')):
-                if name and str(name).strip():
-                    self.names.setdefault(str(name).strip(), self.field('acct', sid))
+                if name:
+                    self._learn_name(name, self.field('acct', sid))
         for seg in record.get('segs') or []:
             if isinstance(seg, dict) and seg.get('k') == 'at' and seg.get('id') not in (None, '', 'all'):
-                self.ids.setdefault(str(seg['id']), self.field('acct', seg['id']))
+                aid = str(seg['id'])
+                self.ids.setdefault(aid, self.field('acct', aid))
+                if seg.get('name'):
+                    self._learn_name(seg['name'], self.field('acct', aid))
 
-    def text(self, value):
+    def _digits(self, value):
+        def run(match):
+            raw = match.group()
+            tail = raw[-1] if raw[-1] in 'Xx' else ''
+            digits = ''.join(c for c in raw if c.isdigit())
+            if len(digits) < 5:
+                return raw
+            known = self.ids.get(digits)
+            self.counts['known_id' if known else 'digit_run'] += 1
+            return (f'〔{known}〕' if known else '<数字>') + (tail if tail and len(digits) < 15 else '')
+        pieces = DATE_SPLIT.split(value)
+        return ''.join(piece if index % 2 else DIGIT_SEQ.sub(run, piece) for index, piece in enumerate(pieces))
+
+    def _pass(self, value):
         for kind, pattern, placeholder in TEXT_RULES:
             value, n = pattern.subn(placeholder, value)
             self.counts[kind] += n
+        value = self._digits(value)
+        value, n = CJK_NUM.subn('<数字>', value)
+        self.counts['cjk_digits'] += n
         if self.name_re:
-            value, n = self.name_re.subn(lambda m: f'〔{self.names[m.group()]}〕', value)
+            def name(match):
+                code_ = self.names.get(match.group().casefold())
+                return f'〔{code_}〕' if code_ else '<提及>'
+            value, n = self.name_re.subn(name, value)
             self.counts['name'] += n
+        value = MENTION_CODE.sub('', value)
+        value, n = MENTION.subn('<提及>', value)
+        self.counts['mention'] += n
+        return value
 
-        def digits(match):
-            known = self.ids.get(unicodedata.normalize('NFKC', match.group()))
-            self.counts['known_id' if known else 'digit_run'] += 1
-            return f'〔{known}〕' if known else '<数字>'
-        return DIGITS.sub(digits, value)
+    def text(self, value):
+        """Fold, then apply every rule until the text no longer changes (at most six passes)."""
+        value = fold(value)
+        for _ in range(6):
+            new = self._pass(value)
+            if new == value:
+                break
+            value = new
+        return value
 
     def segment(self, seg):
         k = seg.get('k')
@@ -157,8 +288,68 @@ class Stripper:
         return out
 
 
+def private_dacl(sddl, sid):
+    """True when the DACL is protected and holds exactly one non-inherited full-access ACE for sid."""
+    match = re.search(r'D:([A-Z]*)((?:\([^)]*\))*)', sddl)
+    if not match or 'P' not in match.group(1):
+        return False
+    aces = re.findall(r'\(([^)]*)\)', match.group(2))
+    if len(aces) != 1:
+        return False
+    fields = aces[0].split(';')
+    return len(fields) >= 6 and fields[0] == 'A' and 'ID' not in fields[1] and fields[2] in ('FA', '0x1f01ff') and fields[5] == sid
+
+
+def _windows_sid():
+    try:
+        proc = subprocess.run(['whoami', '/user', '/fo', 'csv', '/nh'], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit('cannot read the current user SID')
+    sid = proc.stdout.strip().rsplit(',', 1)[-1].strip().strip('"')
+    if proc.returncode != 0 or not re.fullmatch(r'S-1-[0-9-]+', sid):
+        raise SystemExit('cannot read the current user SID')
+    return sid
+
+
+def _windows_sddl(path):
+    env = dict(os.environ, HER_KEY_PATH=str(path))
+    try:
+        proc = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+                               '(Get-Acl -LiteralPath $env:HER_KEY_PATH).Sddl'],
+                              capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit('cannot read the key file ACL')
+    if proc.returncode != 0:
+        raise SystemExit('cannot read the key file ACL')
+    return proc.stdout.strip()
+
+
+def check_key_file_private(path):
+    if os.name != 'nt':
+        if os.stat(path).st_mode & 0o077:
+            raise SystemExit('key file is readable by others; restrict it to its owner')
+        return
+    if not private_dacl(_windows_sddl(path), _windows_sid()):
+        raise SystemExit('key file access is not restricted to the current user')
+
+
+def restrict_key_file(path):
+    if os.name != 'nt':
+        os.chmod(path, 0o600)
+        return
+    sid = _windows_sid()
+    try:
+        proc = subprocess.run(['icacls', str(path), '/inheritance:r', '/grant:r', f'*{sid}:F'],
+                              capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit('key file access could not be restricted')
+    if proc.returncode != 0:
+        raise SystemExit('key file access could not be restricted')
+
+
 def load_key(path):
     try:
+        check_key_file_private(path)
         raw = Path(path).read_text(encoding='ascii').strip()
     except UnicodeDecodeError:
         raise SystemExit('key file must hold 64 hex characters')
@@ -174,14 +365,26 @@ def load_key(path):
 
 
 def init_key(path):
+    """Create the file empty, restrict and verify its access, and only then write the key."""
+    path = Path(path)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         raise SystemExit('key file exists; refusing to replace it')
     except OSError:
         raise SystemExit('key file cannot be created')
-    with os.fdopen(fd, 'w', encoding='ascii') as handle:
-        handle.write(secrets.token_hex(32) + '\n')
+    os.close(fd)
+    try:
+        restrict_key_file(path)
+        check_key_file_private(path)
+        with open(path, 'w', encoding='ascii') as handle:   # truncating keeps the verified ACL
+            handle.write(secrets.token_hex(32) + '\n')
+    except BaseException:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def read_records(paths, counts):
@@ -222,26 +425,67 @@ def strings(value):
             yield from strings(item)
 
 
-def self_scan(record, name_re):
+def residuals(text, name_re):
+    """Leftovers in one stripped text, by kind; independent of the replacement passes."""
     found = Counter()
-    for text in strings(record):
-        bare = PLACEHOLDER.sub(' ', text)
-        for kind, pattern in SCAN_RULES:
-            if pattern.search(bare):
-                found[kind] += 1
-        if any(pattern.search(bare) for pattern in SCAN.USER_PATH_PATTERNS):
-            found['user-path'] += 1
-    if name_re:
-        for seg in record.get('segs') or []:
-            if seg.get('k') == 'text' and name_re.search(PLACEHOLDER.sub(' ', seg['text'])):
-                found['name'] += 1
+    text = fold(text)
+    if ADJACENT.search(text):
+        found['adjacent-digits'] += 1
+    bare = PLACEHOLDER.sub('\x00', text)
+    if any(sum(c.isdigit() for c in m.group()) >= 5
+           for piece in DATE_SPLIT.split(bare)[::2] for m in SCAN_DIGITS.finditer(piece)):
+        found['digits'] += 1
+    for kind, pattern in SCAN_RULES:
+        if pattern.search(bare):
+            found[kind] += 1
+    if 'user-path' not in found and any(pattern.search(bare) for pattern in SCAN.USER_PATH_PATTERNS):
+        found['user-path'] += 1
+    if name_re and name_re.search(bare):
+        found['name'] += 1
+    return found
+
+
+def field_findings(record):
+    found = Counter()
+    for key, value in record.items():
+        if key not in TOP_KEYS:
+            found['field'] += 1
+        elif key in FORMATS and value is not None and not (isinstance(value, str) and FORMATS[key].fullmatch(value)):
+            found['field'] += 1
+    checks = (('v', lambda v: v == 1), ('src', lambda v: v in SOURCES or v is None),
+              ('dir', lambda v: v in ('in', 'out', None)), ('phase', lambda v: v in ('intent', 'confirmed', None)),
+              ('idx', lambda v: v is None or (isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 1000)))
+    for key, ok in checks:
+        if key in record and not ok(record[key]):
+            found['field'] += 1
+    for seg in record.get('segs') or []:
+        if not isinstance(seg, dict) or seg.get('k') not in SEG_KEYS or set(seg) - SEG_KEYS[seg['k']]:
+            found['field'] += 1
+            continue
+        k = seg['k']
+        bad = ((k == 'at' and seg.get('id') not in (None, 'all') and not FORMATS['sender'].fullmatch(str(seg.get('id'))))
+               or (k == 'reply' and seg.get('mid') is not None and not FORMATS['mid'].fullmatch(str(seg['mid'])))
+               or (k == 'face' and seg.get('id') is not None and not re.fullmatch(r'[0-9]{1,4}', str(seg['id'])))
+               or (k == 'media' and seg.get('kind') not in MEDIA_KINDS)
+               or (k == 'text' and not isinstance(seg.get('text'), str)))
+        if bad:
+            found['field'] += 1
+    return found
+
+
+def self_scan(record, name_re):
+    found = field_findings(record)
+    for seg in record.get('segs') or []:
+        if isinstance(seg, dict) and seg.get('k') == 'text' and isinstance(seg.get('text'), str):
+            found.update(residuals(seg['text'], name_re))
     return found
 
 
 NAME_RE = re.compile(r'[A-Za-z0-9._-]+')
 
 
-def strip(args):
+def strip(args, scan=None, secret_scan=None):
+    scan, secret_scan = scan or self_scan, secret_scan or SCAN.secret_findings
     key = load_key(args.key_file)
     if not NAME_RE.fullmatch(args.name):
         raise SystemExit('name must match [A-Za-z0-9._-]+')
@@ -259,7 +503,7 @@ def strip(args):
 
     leftovers, bad = Counter(), []
     for index, record in enumerate(out):
-        found = self_scan(record, stripper.name_re)
+        found = scan(record, stripper.name_re)
         if found:
             leftovers.update(found)
             bad.append(index)
@@ -271,18 +515,33 @@ def strip(args):
 
     with tempfile.TemporaryDirectory(dir=out_dir) as tmp:
         staged_body = Path(tmp) / f'{args.name}.jsonl'
-        with open(staged_body, 'w', encoding='utf-8') as handle:
-            for record in out:
-                handle.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
-        findings, error = SCAN.secret_findings(Path(tmp), ROOT / '.gitleaks.toml', scan_skipped=True)
+        staged_report = Path(tmp) / f'{args.name}.report.json'
+        try:
+            with open(staged_body, 'w', encoding='utf-8') as handle:
+                for record in out:
+                    handle.write(json.dumps(record, ensure_ascii=False, separators=(',', ':')) + '\n')
+        except (OSError, UnicodeError):
+            print('strip failed: the output could not be staged', file=sys.stderr)
+            return 1
+        findings, error = secret_scan(Path(tmp), ROOT / '.gitleaks.toml', scan_skipped=True)
         if error or findings:
             print(f'secret-scan: {error or str(len(findings)) + " findings"}', file=sys.stderr)
             return 1
         report = report_for(records, out, stripper, counts)
-        staged_report = Path(tmp) / f'{args.name}.report.json'
-        staged_report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-        os.replace(staged_body, body_path)
-        os.replace(staged_report, report_path)
+        published = []
+        try:
+            staged_report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+            for staged, final in ((staged_body, body_path), (staged_report, report_path)):
+                os.replace(staged, final)
+                published.append(final)
+        except OSError:
+            for final in published:
+                try:
+                    final.unlink()
+                except OSError:
+                    pass
+            print('strip failed: the output could not be published; nothing was kept', file=sys.stderr)
+            return 1
     print(f'strip: records_in={report["records_in"]} records_out={report["records_out"]} '
           f'torn_tail={report["torn_tail"]} self_scan_findings=0 secret_scan=clean')
     return 0
@@ -304,9 +563,10 @@ def report_for(records, out, stripper, counts):
         'by_src': dict(Counter(r['src'] or 'none' for r in out)),
         'by_dir': dict(Counter(r['dir'] or 'none' for r in out)),
         'replaced': {k: stripper.counts[k] for k in
-                     ('link', 'email', 'phone', 'address', 'name', 'known_id', 'digit_run')},
+                     ('path', 'link', 'email', 'phone', 'address', 'name', 'mention', 'known_id', 'digit_run', 'cjk_digits')},
         'media': {k[len('media_'):]: n for k, n in stripper.counts.items() if k.startswith('media_')},
         'short_names_unreplaced': stripper.counts['short_names_unreplaced'],
+        'unsafe_names_skipped': stripper.counts['unsafe_names_skipped'],
         'first_day': days[0] if days else None,
         'last_day': days[-1] if days else None,
         'self_scan_findings': 0,
