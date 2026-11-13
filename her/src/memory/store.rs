@@ -79,7 +79,7 @@ impl Reader<'_> {
     }
 
     pub fn index(&self, max_terms: usize) -> rusqlite::Result<(i64, Vec<String>)> {
-        super::index_hint(self.conn, &self.key, self.is_owner, &[], max_terms)
+        super::index_hint(self, &[], max_terms)
     }
 
     pub fn write(&self, m: &NewMemory<'_>) -> rusqlite::Result<UpsertOutcome> {
