@@ -16,7 +16,17 @@ pub fn is_persona_command(plain: &str) -> bool {
 pub fn handle(context: &RuntimeContext, key: &str, sender: &str, plain: &str) -> Result<(), String> {
     let cfg = context.load_config().map_err(str::to_string)?;
     let administrator = crate::chat::is_owner_key(&cfg, key) && crate::chat::owner_qq(&cfg) == sender;
-    let reply = if administrator { execute(context, plain) } else { REFUSAL.to_string() };
+    // A change commits only while the sender is still the administrator, checked again under the
+    // configuration gate (the reply guard below protects only the reply).
+    let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+        let gate = crate::console::acquire_social_state_gate(context)?;
+        let latest = context.load_config().map_err(|_| (503, "configuration unavailable".to_string()))?;
+        if !crate::chat::is_owner_key(&latest, key) || crate::chat::owner_qq(&latest) != sender {
+            return Err((403, "administrator changed".to_string()));
+        }
+        Ok(Some(gate))
+    };
+    let reply = if administrator { execute(context, plain, &authority) } else { REFUSAL.to_string() };
     let ob = crate::chat::onebot_of(context, &cfg)?;
     let guard = || -> Result<(), String> {
         let latest = context.load_config().map_err(str::to_string)?;
@@ -37,7 +47,7 @@ pub fn handle(context: &RuntimeContext, key: &str, sender: &str, plain: &str) ->
 }
 
 /// Runs an administrator's command and returns the reply text.
-pub(crate) fn execute(context: &RuntimeContext, plain: &str) -> String {
+pub(crate) fn execute(context: &RuntimeContext, plain: &str, authority: crate::persona::Authority<'_>) -> String {
     let words: Vec<&str> = plain.split_whitespace().collect();
     let listing = match crate::persona::list(context) {
         Ok(listing) => listing,
@@ -62,7 +72,7 @@ pub(crate) fn execute(context: &RuntimeContext, plain: &str) -> String {
         },
         _ => return "用法：/persona、/persona <人设名>、/persona <人设名|off> <group:群号|private:QQ号>".to_string(),
     };
-    match crate::persona::assign(context, &body) {
+    match crate::persona::assign(context, &body, authority) {
         Ok(_) if body.get("default").is_some() => format!("默认人设已切换为「{}」。", words[1]),
         Ok(_) if body["persona"].is_null() => format!("已清除 {} 的人设覆盖。", words[2]),
         Ok(_) => format!("{} 的人设已切换为「{}」。", words[2], words[1]),
@@ -95,12 +105,18 @@ mod tests {
         std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
         std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
         let context = crate::runtime::RuntimeContext::from_root(&root).unwrap();
-        let created = crate::persona::create(&context, &serde_json::json!({"name": "会计", "core": "你是会计助手。"})).unwrap();
-        crate::persona::approve(&context, &serde_json::json!({"id": created["id"], "version": 1})).unwrap();
-        assert_eq!(super::execute(&context, "/persona"), "默认人设：无；可用人设：会计");
-        assert_eq!(super::execute(&context, "/persona 会计"), "默认人设已切换为「会计」。");
+        let open: crate::persona::Authority<'static> = &crate::persona::open_authority;
+        let created = crate::persona::create(&context, &serde_json::json!({"name": "会计", "core": "你是会计助手。"}), open).unwrap();
+        crate::persona::approve(&context, &serde_json::json!({"id": created["id"], "version": 1}), open).unwrap();
+        assert_eq!(super::execute(&context, "/persona", open), "默认人设：无；可用人设：会计");
+        assert_eq!(super::execute(&context, "/persona 会计", open), "默认人设已切换为「会计」。");
         assert_eq!(crate::persona::load(&context).unwrap()["default"], "p1");
-        assert_eq!(super::execute(&context, "/persona 不存在"), "人设「不存在」不存在。");
+        assert_eq!(super::execute(&context, "/persona 不存在", open), "人设「不存在」不存在。");
+        // The owner is re-checked before the change, not only before the reply.
+        let moved = || -> Result<Option<std::fs::File>, (u16, String)> { Err((403, "administrator changed".to_string())) };
+        let before = std::fs::read(root.join("data/personas.json")).unwrap();
+        assert_eq!(super::execute(&context, "/persona off group:1", &moved), "人设切换失败：administrator changed");
+        assert_eq!(std::fs::read(root.join("data/personas.json")).unwrap(), before);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

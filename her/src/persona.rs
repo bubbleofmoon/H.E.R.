@@ -12,11 +12,24 @@ const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const TEXT_MAX: usize = 20_000;
 const NAME_MAX: usize = 40;
 const NAMES_MAX: usize = 10;
+/// Versions kept per persona.
+const VERSIONS_MAX: usize = 50;
+/// The fields a save compares with the latest version.
+const CONTENT: [&str; 8] = ["name", "core", "notes", "compact", "names", "traits", "editMode", "autoRules"];
 /// Parts auto edits may change; the name and the rule set are never auto-editable.
 const PARTS: [&str; 5] = ["core", "notes", "compact", "names", "traits"];
 static GATE: Mutex<()> = Mutex::new(());
 
 type Failure = (u16, String);
+
+/// Checked by every write before the library lock is taken; the returned guard is held until the
+/// write commits (the console: configuration gate + fresh credential; `/persona`: gate + fresh owner).
+pub type Authority<'a> = &'a dyn Fn() -> Result<Option<std::fs::File>, (u16, String)>;
+
+#[cfg(test)]
+pub(crate) fn open_authority() -> Result<Option<std::fs::File>, (u16, String)> {
+    Ok(None)
+}
 
 fn fail(status: u16, message: &str) -> Failure {
     (status, message.to_string())
@@ -45,7 +58,10 @@ pub fn load(context: &RuntimeContext) -> Result<Value, Failure> {
 }
 
 /// One read-modify-write under the process mutex and `locks/personas.lock`.
-fn mutate<T>(context: &RuntimeContext, change: impl FnOnce(&mut Value) -> Result<T, Failure>) -> Result<T, Failure> {
+fn mutate<T>(context: &RuntimeContext, authority: Authority<'_>, change: impl FnOnce(&mut Value) -> Result<T, Failure>) -> Result<T, Failure> {
+    // Order: authority (the social gate) → process mutex → library file lock. The re-brief, which
+    // takes the social gate itself, always runs after this guard is dropped.
+    let _authority = authority()?;
     let _process = GATE.lock().unwrap_or_else(|p| p.into_inner());
     let deadline = std::time::Instant::now() + GATE_WAIT;
     let _file = loop {
@@ -81,8 +97,18 @@ fn latest(persona: &Value) -> Option<&Value> {
     persona["versions"].as_array()?.last()
 }
 
+/// A stored version with what rendering needs: a number, a name and a non-empty core.
+fn complete(v: &Value) -> bool {
+    v["version"].is_u64()
+        && v["name"].as_str().is_some_and(|n| !n.trim().is_empty())
+        && v["core"].as_str().is_some_and(|c| !c.trim().is_empty())
+}
+
+/// The version in effect: `activeVersion`, only when that record is approved and complete. Every
+/// reader (prompt, assignment, auto-approval, names) resolves through here, so a bad stored record
+/// is skipped and never rendered; the file itself is never rewritten to repair it.
 fn active(persona: &Value) -> Option<&Value> {
-    version(persona, persona["activeVersion"].as_u64()?)
+    version(persona, persona["activeVersion"].as_u64()?).filter(|v| v["approved"] == true && complete(v))
 }
 
 /// The active version's name, else the latest version's.
@@ -215,7 +241,21 @@ fn settle(entry: &mut Value, mut next: Value) -> u64 {
         Some(list) => list.push(next),
         None => entry["versions"] = json!([next]),
     }
+    prune(entry);
     number
+}
+
+/// Keeps at most `VERSIONS_MAX` versions: the oldest unapproved go first, then the oldest approved;
+/// the active and the newest version are never dropped.
+fn prune(entry: &mut Value) {
+    let active = entry["activeVersion"].as_u64();
+    let Some(list) = entry["versions"].as_array_mut() else { return };
+    while list.len() > VERSIONS_MAX {
+        let newest = list.last().and_then(|v| v["version"].as_u64());
+        let keep = |v: &Value| v["version"].as_u64().is_some_and(|n| Some(n) == active || Some(n) == newest);
+        let Some(index) = list.iter().position(|v| !keep(v) && v["approved"] != true).or_else(|| list.iter().position(|v| !keep(v))) else { break };
+        list.remove(index);
+    }
 }
 
 pub fn list(context: &RuntimeContext) -> Result<Value, Failure> {
@@ -224,6 +264,7 @@ pub fn list(context: &RuntimeContext) -> Result<Value, Failure> {
         .as_object()
         .map(|all| {
             all.values()
+                .filter(|p| p.is_object())
                 .map(|p| {
                     let pending: Vec<Value> = p["versions"]
                         .as_array()
@@ -247,8 +288,8 @@ pub fn item(context: &RuntimeContext, id: &str) -> Result<Value, Failure> {
     Ok(json!({"ok": true, "persona": found}))
 }
 
-pub fn create(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
-    mutate(context, |doc| {
+pub fn create(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
+    mutate(context, authority, |doc| {
         let next = build(&Value::Null, body, 1, "console")?;
         if name_taken(doc, next["name"].as_str().unwrap_or(""), None) {
             return Err(fail(409, "persona name already exists"));
@@ -259,11 +300,16 @@ pub fn create(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> 
     })
 }
 
-pub fn update(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
+pub fn update(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
     let id = id_of(body)?;
-    mutate(context, |doc| {
-        let base = latest(persona(doc, &id)?).cloned().unwrap_or(Value::Null);
+    mutate(context, authority, |doc| {
+        let found = persona(doc, &id)?;
+        let base = latest(found).cloned().unwrap_or(Value::Null);
         let next = build(&base, body, base["version"].as_u64().unwrap_or(0) + 1, "console")?;
+        // Saving what the latest version already says adds no version.
+        if !base.is_null() && CONTENT.iter().all(|field| next[*field] == base[*field]) {
+            return Ok(json!({"ok": true, "id": id, "version": base["version"], "activeVersion": found["activeVersion"], "unchanged": true}));
+        }
         if name_taken(doc, next["name"].as_str().unwrap_or(""), Some(&id)) {
             return Err(fail(409, "persona name already exists"));
         }
@@ -274,10 +320,18 @@ pub fn update(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> 
 }
 
 /// Approves a version and puts it in effect; approving an older version rolls back.
-pub fn approve(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
+pub fn approve(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
     let id = id_of(body)?;
     let number = body["version"].as_u64().ok_or_else(|| fail(400, "version is required"))?;
-    mutate(context, |doc| {
+    mutate(context, authority, |doc| {
+        let target = version(persona(doc, &id)?, number).ok_or_else(|| fail(404, "version not found"))?;
+        if !complete(target) {
+            return Err(fail(409, "version is damaged"));
+        }
+        // Approval and rollback put this version's name in effect, so it must stay unique.
+        if name_taken(doc, target["name"].as_str().unwrap_or(""), Some(&id)) {
+            return Err(fail(409, "persona name already exists"));
+        }
         let entry = doc["personas"].get_mut(id.as_str()).ok_or_else(|| fail(404, "persona not found"))?;
         let at = now();
         let list = entry["versions"].as_array_mut().ok_or_else(|| fail(503, "persona library is damaged"))?;
@@ -291,9 +345,9 @@ pub fn approve(context: &RuntimeContext, body: &Value) -> Result<Value, Failure>
     })
 }
 
-pub fn duplicate(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
+pub fn duplicate(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
     let id = id_of(body)?;
-    mutate(context, |doc| {
+    mutate(context, authority, |doc| {
         let source = persona(doc, &id)?;
         let from = active(source).or_else(|| latest(source)).cloned().ok_or_else(|| fail(409, "persona has no versions"))?;
         let mut next = build(&from, &json!({"name": body["name"]}), 1, "duplicate")?;
@@ -312,9 +366,9 @@ pub fn duplicate(context: &RuntimeContext, body: &Value) -> Result<Value, Failur
     })
 }
 
-pub fn delete(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
+pub fn delete(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
     let id = id_of(body)?;
-    mutate(context, |doc| {
+    mutate(context, authority, |doc| {
         persona(doc, &id)?;
         let assigned = doc["default"].as_str() == Some(id.as_str())
             || doc["overrides"].as_object().is_some_and(|o| o.values().any(|v| v.as_str() == Some(id.as_str())));
@@ -328,14 +382,14 @@ pub fn delete(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> 
     })
 }
 
-pub fn assign(context: &RuntimeContext, body: &Value) -> Result<Value, Failure> {
+pub fn assign(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
     let (target, wanted) = assignment(body)?;
     let keys: Vec<String> = crate::session_map::all(context)
         .map_err(|error| (503, error))?
         .into_iter()
         .map(|(key, _)| key)
         .collect();
-    let (result, changed) = mutate(context, |doc| {
+    let (result, changed) = mutate(context, authority, |doc| {
         let before: Vec<Option<String>> = keys.iter().map(|key| effective_id(doc, key)).collect();
         apply_assignment(doc, target.as_deref(), wanted.as_deref())?;
         let view: &Value = doc;
@@ -414,17 +468,18 @@ fn apply_assignment(doc: &mut Value, target: Option<&str>, wanted: Option<&str>)
     Ok(())
 }
 
-/// Imports `resources/roles/*.md` once as approved personas (core = card text).
-pub fn import_roles(context: &RuntimeContext) -> Result<Value, Failure> {
+/// Imports `resources/roles/*.md` as approved personas, each core being the card's reserved2 view (as the old v2 hint, uncut). The one run counts only when at least one card was imported.
+pub fn import_roles(context: &RuntimeContext, authority: Authority<'_>) -> Result<Value, Failure> {
     let cards = role_cards(context)?;
-    mutate(context, |doc| {
+    mutate(context, authority, |doc| {
         if !doc["importedRolesAt"].is_null() {
             return Err(fail(409, "role cards were already imported"));
         }
         let mut imported = Vec::new();
         let mut skipped = Vec::new();
         for (name, content) in &cards {
-            let built = build(&Value::Null, &json!({"name": name, "core": content, "names": [name]}), 1, "import");
+            let core = crate::prompt::role_card_v2_text(content);
+            let built = build(&Value::Null, &json!({"name": name, "core": core, "names": [name]}), 1, "import");
             let mut next = match built {
                 Ok(next) if !name_taken(doc, name, None) => next,
                 _ => {
@@ -438,7 +493,9 @@ pub fn import_roles(context: &RuntimeContext) -> Result<Value, Failure> {
             doc["personas"][id.as_str()] = json!({"id": id.clone(), "activeVersion": 1, "versions": [next]});
             imported.push(json!({"id": id, "name": name}));
         }
-        doc["importedRolesAt"] = json!(now());
+        if !imported.is_empty() {
+            doc["importedRolesAt"] = json!(now());
+        }
         Ok(json!({"ok": true, "imported": imported, "skipped": skipped}))
     })
 }
@@ -485,4 +542,104 @@ pub(crate) fn core_block(context: &RuntimeContext, key: &str) -> String {
         return String::new();
     };
     format!("【人设】{}\n{}\n\n", found["name"].as_str().unwrap_or(""), found["core"].as_str().unwrap_or(""))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    fn fixture(label: &str) -> (std::path::PathBuf, crate::runtime::RuntimeContext) {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../backups/ticket 19 persona fixtures")
+            .join(format!("library-{label}-{}-{}", std::process::id(), crate::parity_clock::now_ms()));
+        let root = crate::install_root::development_root(root);
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("config/config.json"), r#"{"consoleToken":"fixture-token","ownerQQ":1,"socialV2":{"wake":{}}}"#).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{"group:1":{"agentToken":"fixture-epoch"}}}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
+        let context = crate::runtime::RuntimeContext::from_root(&root).unwrap();
+        (root, context)
+    }
+
+    fn open() -> super::Authority<'static> {
+        &super::open_authority
+    }
+
+    fn new_id(created: Value) -> String {
+        created["id"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn persona_writes_commit_only_while_the_authority_holds() {
+        let (root, context) = fixture("authority");
+        let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+        assert_eq!(super::create(&context, &json!({"name": "甲", "core": "核心。"}), &revoked).unwrap_err().0, 401);
+        let (status, _, body) = crate::console_persona::route(&context, "POST", "/api/personas/create",
+            &std::collections::HashMap::new(), r#"{"name":"甲","core":"核心。"}"#, false, &revoked);
+        assert_eq!(status, 401, "{body}");
+        assert!(!root.join("data/personas.json").exists(), "nothing was written");
+        let _ = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_an_approved_complete_version_can_be_assigned_or_approved() {
+        let (root, context) = fixture("validation");
+        std::fs::write(root.join("data/personas.json"), r#"{"format":1,"nextId":2,"default":null,"overrides":{},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":2,"versions":[{"version":1,"approved":true,"name":"甲","core":"甲的核心。"},{"version":2,"approved":false,"name":"甲","core":"草稿。"},{"version":3,"approved":false,"name":"甲"}]}}}"#).unwrap();
+        assert_eq!(super::assign(&context, &json!({"default": "p1"}), open()).unwrap_err().0, 409, "an unapproved active version is not in effect");
+        assert_eq!(super::approve(&context, &json!({"id": "p1", "version": 3}), open()).unwrap_err().0, 409, "a version without a core is never put in effect");
+        super::approve(&context, &json!({"id": "p1", "version": 1}), open()).unwrap();
+        assert_eq!(super::assign(&context, &json!({"default": "p1"}), open()).unwrap()["default"], "p1");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_and_rollback_refuse_a_name_another_persona_uses() {
+        let (root, context) = fixture("unique");
+        let a = new_id(super::create(&context, &json!({"name": "甲", "core": "甲的核心。"}), open()).unwrap());
+        super::approve(&context, &json!({"id": a, "version": 1}), open()).unwrap();
+        // A pending rename to 乙: the core changes too, so it waits for approval.
+        assert_eq!(super::update(&context, &json!({"id": a, "name": "乙", "core": "改名后的核心。"}), open()).unwrap()["activeVersion"], 1);
+        let b = new_id(super::create(&context, &json!({"name": "乙", "core": "乙的核心。"}), open()).unwrap());
+        super::approve(&context, &json!({"id": b, "version": 1}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": a, "version": 2}), open()).unwrap_err().0, 409);
+        let names: Vec<Value> = super::list(&context).unwrap()["personas"].as_array().unwrap().iter().map(|p| p["name"].clone()).collect();
+        assert_eq!(names, vec![json!("甲"), json!("乙")]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_identical_save_adds_no_version_and_at_most_fifty_versions_are_kept() {
+        let (root, context) = fixture("versions");
+        let id = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());
+        super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap();
+        assert_eq!(super::update(&context, &json!({"id": id, "notes": "笔记。"}), open()).unwrap()["version"], 2);
+        let again = super::update(&context, &json!({"id": id, "notes": "笔记。"}), open()).unwrap();
+        assert_eq!((again["version"].clone(), again["unchanged"].clone()), (json!(2), json!(true)));
+        // v2 is active (a notes-only edit is in effect at once); 60 core drafts wait for approval.
+        for n in 0..60 {
+            super::update(&context, &json!({"id": id, "core": format!("草稿{n}。")}), open()).unwrap();
+        }
+        let item = super::item(&context, &id).unwrap();
+        let numbers: Vec<u64> = item["persona"]["versions"].as_array().unwrap().iter().filter_map(|v| v["version"].as_u64()).collect();
+        assert_eq!(numbers.len(), 50);
+        assert_eq!(item["persona"]["activeVersion"], 2);
+        assert_eq!((numbers[0], numbers[1], numbers[2], numbers[49]), (1, 2, 15, 62), "the oldest drafts went first: {numbers:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_role_import_that_imports_nothing_can_run_again() {
+        let (root, context) = fixture("import");
+        assert_eq!(super::import_roles(&context, open()).unwrap()["imported"], json!([]));
+        assert!(super::load(&context).unwrap()["importedRolesAt"].is_null(), "nothing imported, so the one run is not used");
+        std::fs::create_dir_all(root.join("resources/roles")).unwrap();
+        std::fs::write(root.join("resources/roles/会计.md"), "你是会计助手，只讲数字。\n").unwrap();
+        assert_eq!(super::import_roles(&context, open()).unwrap()["imported"].as_array().map(Vec::len), Some(1));
+        assert!(super::load(&context).unwrap()["importedRolesAt"].is_number());
+        assert_eq!(super::import_roles(&context, open()).unwrap_err().0, 409);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

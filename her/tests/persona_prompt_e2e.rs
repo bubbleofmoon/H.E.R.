@@ -1067,8 +1067,19 @@ fn role_cards_are_imported_once_as_approved_personas() {
         assert_eq!(version["approved"], json!(true));
         assert_eq!(version["source"], json!("import"));
         assert_eq!(item["persona"]["activeVersion"], json!(1));
-        let card = if persona["name"] == "会计" { CARD_OVERRIDE } else { CARD_SHARED };
-        assert_eq!(version["core"], json!(card.trim()));
+        // Imported like the old reserved2 hint: v2 and untagged sections, no first-generation
+        // command lines, example spaces as commas, uncut.
+        let core = version["core"].as_str().unwrap_or("");
+        if persona["name"] == "会计" {
+            assert_eq!(core, "你是会计助手，只讲数字。");
+        } else {
+            for kept in ["你是一只爱聊天的小鲸鱼。", "只在二代出现。", "你好，世界"] {
+                assert!(core.contains(kept), "{kept} missing: {core}");
+            }
+            for dropped in ["[SILENT]", "用空格分条", "〔二代〕", "〔一代〕", "你好 世界"] {
+                assert!(!core.contains(dropped), "{dropped} kept: {core}");
+            }
+        }
     }
     assert!(listed["importedRolesAt"].is_number());
     assert_eq!(rig.console("POST", "/api/personas/import-roles", Some(&json!({}))).0, 409, "import runs once");

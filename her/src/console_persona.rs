@@ -14,6 +14,7 @@ pub fn is_route(path: &str) -> bool {
 
 pub fn route(
     context: &RuntimeContext, method: &str, path: &str, query: &HashMap<String, String>, body: &str, agent_call: bool,
+    authority: crate::persona::Authority<'_>,
 ) -> (u16, &'static str, String) {
     if agent_call {
         return failure(403, "persona routes are restricted to administrators");
@@ -28,13 +29,13 @@ pub fn route(
         ("GET", "/personas") => return (200, HTML_TYPE, PAGE.to_string()),
         ("GET", "/api/personas") => crate::persona::list(context),
         ("GET", "/api/personas/item") => crate::persona::item(context, query.get("id").map(String::as_str).unwrap_or("")),
-        ("POST", "/api/personas/create") => object().and_then(|b| crate::persona::create(context, &b)),
-        ("POST", "/api/personas/update") => object().and_then(|b| crate::persona::update(context, &b)),
-        ("POST", "/api/personas/duplicate") => object().and_then(|b| crate::persona::duplicate(context, &b)),
-        ("POST", "/api/personas/delete") => object().and_then(|b| crate::persona::delete(context, &b)),
-        ("POST", "/api/personas/approve") => object().and_then(|b| crate::persona::approve(context, &b)),
-        ("POST", "/api/personas/assign") => object().and_then(|b| crate::persona::assign(context, &b)),
-        ("POST", "/api/personas/import-roles") => crate::persona::import_roles(context),
+        ("POST", "/api/personas/create") => object().and_then(|b| crate::persona::create(context, &b, authority)),
+        ("POST", "/api/personas/update") => object().and_then(|b| crate::persona::update(context, &b, authority)),
+        ("POST", "/api/personas/duplicate") => object().and_then(|b| crate::persona::duplicate(context, &b, authority)),
+        ("POST", "/api/personas/delete") => object().and_then(|b| crate::persona::delete(context, &b, authority)),
+        ("POST", "/api/personas/approve") => object().and_then(|b| crate::persona::approve(context, &b, authority)),
+        ("POST", "/api/personas/assign") => object().and_then(|b| crate::persona::assign(context, &b, authority)),
+        ("POST", "/api/personas/import-roles") => crate::persona::import_roles(context, authority),
         _ => Err((404, "unknown persona route".to_string())),
     };
     match result {

@@ -188,7 +188,16 @@ fn convert_example_spaces_to_comma(line: &str) -> String {
 /// JS `currentRoleHintV2(key)`: the second-generation card text with first-generation commands
 /// removed and the example section's space separators rewritten to commas.
 pub fn role_hint_v2(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
-    let raw = role_hint_for_mode(context, cfg, key, crate::role::MODE_V2);
+    v2_card_lines(&role_hint_for_mode(context, cfg, key, crate::role::MODE_V2))
+}
+
+/// The reserved2 view of a whole role card, uncut; persona import stores it as the core.
+pub(crate) fn role_card_v2_text(card: &str) -> String {
+    v2_card_lines(&crate::role::select_role_text(card, crate::role::MODE_V2))
+}
+
+/// Drops first-generation command lines and rewrites the example section's spaces to commas.
+fn v2_card_lines(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
