@@ -136,43 +136,57 @@ fn atomic<T>(
 
 /// 中文按 2 字 bigram、英文/数字按词切分，用空格连接（与 memory/schema.mjs 的 segment 一致）。
 pub fn segment(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut han = String::new();
-    let mut word = String::new();
+    segment_spans(text).into_iter().map(|(token, _, _)| token).collect()
+}
 
-    fn flush_han(han: &mut String, out: &mut Vec<String>) {
+/// `segment` with where each token came from: its start and end (exclusive) as character indexes
+/// of `text`. A Han bigram covers its two characters, so neighbouring bigrams overlap.
+fn segment_spans(text: &str) -> Vec<(String, usize, usize)> {
+    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    let mut han = String::new();
+    let mut han_start = 0usize;
+    let mut word = String::new();
+    let mut word_start = 0usize;
+
+    fn flush_han(han: &mut String, start: usize, out: &mut Vec<(String, usize, usize)>) {
         let chars: Vec<char> = han.chars().collect();
         if chars.len() == 1 {
-            out.push(chars[0].to_string());
+            out.push((chars[0].to_string(), start, start + 1));
         }
-        for w in chars.windows(2) {
-            out.push(w.iter().collect());
+        for (i, w) in chars.windows(2).enumerate() {
+            out.push((w.iter().collect(), start + i, start + i + 2));
         }
         han.clear();
     }
-    fn flush_word(word: &mut String, out: &mut Vec<String>) {
+    fn flush_word(word: &mut String, start: usize, out: &mut Vec<(String, usize, usize)>) {
         if !word.is_empty() {
-            out.push(word.to_lowercase());
+            out.push((word.to_lowercase(), start, start + word.chars().count()));
             word.clear();
         }
     }
 
-    for ch in text.chars() {
+    for (i, ch) in text.chars().enumerate() {
         let is_han = ('\u{4e00}'..='\u{9fff}').contains(&ch);
         let is_word = ch.is_ascii_alphanumeric() || ch == '_' || ch == '.';
         if is_han {
-            flush_word(&mut word, &mut out);
+            flush_word(&mut word, word_start, &mut out);
+            if han.is_empty() {
+                han_start = i;
+            }
             han.push(ch);
         } else if is_word {
-            flush_han(&mut han, &mut out);
+            flush_han(&mut han, han_start, &mut out);
+            if word.is_empty() {
+                word_start = i;
+            }
             word.push(ch);
         } else {
-            flush_han(&mut han, &mut out);
-            flush_word(&mut word, &mut out);
+            flush_han(&mut han, han_start, &mut out);
+            flush_word(&mut word, word_start, &mut out);
         }
     }
-    flush_han(&mut han, &mut out);
-    flush_word(&mut word, &mut out);
+    flush_han(&mut han, han_start, &mut out);
+    flush_word(&mut word, word_start, &mut out);
     out
 }
 
@@ -518,23 +532,27 @@ const RECALL_LONG_TERM_CHARS: usize = 6;
 const RECALL_PAGE: usize = 60;
 const RECALL_MAX_CANDIDATES: usize = 600;
 
-fn recall_term_chars(term: &str) -> usize {
-    term.chars().filter(|c| c.is_alphanumeric()).count()
+/// A character that counts toward the message floor and the shared amount: Han or ASCII
+/// letter or digit (not the dot or underscore that only join a word).
+fn recall_counts(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c) || c.is_ascii_alphanumeric()
 }
 
-/// A single-term evidence: at least four characters with a dot or underscore, or letters mixed
-/// with digits (`zebra148kw`, `v0.2.1`, `foo_bar`).
+/// A single-term evidence: at least four letters or digits, with a dot or underscore or letters
+/// mixed with digits (`zebra148kw`, `v0.2.1`, `foo_bar`; not `__a_`).
 fn recall_is_identifier(term: &str) -> bool {
-    term.chars().count() >= 4
+    term.chars().filter(|c| c.is_ascii_alphanumeric()).count() >= 4
         && (term.contains(['.', '_'])
             || (term.chars().any(|c| c.is_ascii_lowercase()) && term.chars().any(|c| c.is_ascii_digit())))
 }
 
-fn recall_qualifies(shared: &[&String]) -> bool {
+/// `covered` is the number of distinct message characters the shared terms cover (知道 and 道了
+/// cover three, not four).
+fn recall_qualifies(shared: &[&String], covered: usize) -> bool {
     match shared {
         [] => false,
-        [one] => recall_is_identifier(one) || recall_term_chars(one) >= RECALL_LONG_TERM_CHARS,
-        many => many.iter().map(|t| recall_term_chars(t)).sum::<usize>() >= RECALL_MIN_SHARED_CHARS,
+        [one] => recall_is_identifier(one) || covered >= RECALL_LONG_TERM_CHARS,
+        _ => covered >= RECALL_MIN_SHARED_CHARS,
     }
 }
 
@@ -552,15 +570,26 @@ fn recall_term(raw: &str) -> Option<String> {
     cleaned.chars().any(char::is_alphanumeric).then(|| cleaned.to_string())
 }
 
+/// The distinct terms of a message in message order, each with the indexes of the message
+/// characters (`recall_counts`) it covers.
+fn recall_term_spans(text: &str) -> Vec<(String, Vec<usize>)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
+    for (token, start, end) in segment_spans(text) {
+        let Some(term) = recall_term(&token) else { continue };
+        let covered: Vec<usize> = (start..end).filter(|&i| recall_counts(chars[i])).collect();
+        if let Some(seen) = out.iter().position(|(existing, _)| *existing == term) {
+            out[seen].1.extend(covered);
+        } else if out.len() < RECALL_MAX_TERMS {
+            out.push((term, covered));
+        }
+    }
+    out
+}
+
 /// The distinct terms of a message, in message order.
 pub fn recall_terms(text: &str) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    segment(text)
-        .iter()
-        .filter_map(|token| recall_term(token))
-        .filter(|term| seen.insert(term.clone()))
-        .take(RECALL_MAX_TERMS)
-        .collect()
+    recall_term_spans(text).into_iter().map(|(term, _)| term).collect()
 }
 
 /// An FTS5 expression that matches a row holding any of the terms. Each term is a quoted FTS5
@@ -587,7 +616,12 @@ pub fn recall(
     limit: usize,
     exclude: &[i64],
 ) -> rusqlite::Result<Vec<Hit>> {
-    let terms = recall_terms(text);
+    // A message under four letters, digits or Han characters is too short to say what it is about.
+    if text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
+        return Ok(Vec::new());
+    }
+    let spans = recall_term_spans(text);
+    let terms: Vec<String> = spans.iter().map(|(term, _)| term.clone()).collect();
     if terms.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
@@ -631,11 +665,15 @@ pub fn recall(
                 indexed.extend(token.split('.').filter_map(recall_term));
                 indexed.extend(recall_term(token));
             }
-            let shared: Vec<&String> = terms.iter().filter(|term| indexed.contains(*term)).collect();
-            if !recall_qualifies(&shared) {
+            let shared_spans: Vec<&(String, Vec<usize>)> =
+                spans.iter().filter(|(term, _)| indexed.contains(term)).collect();
+            let shared: Vec<&String> = shared_spans.iter().map(|(term, _)| term).collect();
+            let covered: std::collections::HashSet<usize> =
+                shared_spans.iter().flat_map(|(_, positions)| positions.iter().copied()).collect();
+            let shared_chars = covered.len();
+            if !recall_qualifies(&shared, shared_chars) {
                 continue;
             }
-            let shared_chars: usize = shared.iter().map(|t| recall_term_chars(t)).sum();
             let (rank, pinned, importance, hits, created_at) = (row.6, row.7, row.8, row.9, row.10);
             let age_days = ((now - created_at) as f64 / 86_400_000.0).max(0.0);
             // Relevance spans most of [0, 1); the boosts add at most 0.05 in total.
@@ -1269,7 +1307,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
         add_row(&conn, "group:101", "group", "置顶少", "周末，一起，爬山，安排很满，计划另议", 1.0, 1);
-        add_row(&conn, "group:101", "group", "普通多", "周末一起去爬，然后吃早茶", 0.0, 0);
+        add_row(&conn, "group:101", "group", "普通多", "周末一起去爬山看日出，然后吃早茶", 0.0, 0);
         let hits = recall(&conn, "group:101", false, "周末一起去爬山看日出吧", 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["普通多", "置顶少"], "the pinned row shares fewer terms");
     }
@@ -1281,10 +1319,47 @@ mod tests {
         let chars: Vec<char> = (0..200u32).map(|i| char::from_u32(0x4e00 + i * 7).unwrap()).collect();
         let message: String = chars.iter().collect();
         assert_eq!(recall_terms(&message).len(), 199);
-        // The match sits in the last characters, past any short term cap.
-        add_row(&conn, "group:101", "group", "尾部", &format!("{}{}{}，其余无关", chars[195], chars[196], chars[197]), 0.0, 0);
+        // The match (four distinct message characters) sits at the end, past any short term cap.
+        add_row(&conn, "group:101", "group", "尾部", &format!("{}{}{}{}，其余无关", chars[195], chars[196], chars[197], chars[198]), 0.0, 0);
         let hits = recall(&conn, "group:101", false, &message, 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["尾部"]);
+    }
+
+    #[test]
+    fn recall_of_a_message_under_four_characters_recalls_nothing_even_through_overlapping_bigrams() {
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "应答", "我早就知道了，没问题", 1.0, 1);
+        // 知道了 is three characters: its two bigrams overlap and must not count as four.
+        for message in ["知道了", "知道了。", "我知道"] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
+        }
+    }
+
+    #[test]
+    fn recall_measures_what_is_shared_in_distinct_message_characters() {
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "三字", "早就知道了，没问题", 0.0, 0);
+        add_row(&conn, "group:101", "group", "四字", "他知道了吗，我没问", 0.0, 0);
+        // 知道 + 道了 cover three characters; 知道 + 道了 + 了吗 cover four.
+        let hits = recall(&conn, "group:101", false, "知道了吗", 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["四字"], "only the row sharing four distinct characters");
+        let hits = recall(&conn, "group:101", false, "你到底知道了没", 3, &[]).unwrap();
+        assert!(hits.is_empty(), "three shared characters are not enough: {:?}", recalled_subjects(&hits));
+    }
+
+    #[test]
+    fn recall_identifier_counts_only_alphanumeric_characters() {
+        assert!(!recall_is_identifier("__a_"));
+        assert!(!recall_is_identifier("a.b"));
+        assert!(!recall_is_identifier("v4.1"));
+        assert!(recall_is_identifier("zebra148kw"));
+        assert!(recall_is_identifier("v0.2.1"));
+        assert!(recall_is_identifier("foo_bar"));
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "符号", "代号 __a_ 的说明", 1.0, 1);
+        let hits = recall(&conn, "group:101", false, "请问 __a_ 怎么办", 3, &[]).unwrap();
+        assert!(hits.is_empty(), "{:?}", recalled_subjects(&hits));
     }
 
     #[test]
