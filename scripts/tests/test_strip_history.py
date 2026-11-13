@@ -639,6 +639,26 @@ class KeyAcl(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 s_mod.load_key(key_file)
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL check')
+    def test_windows_extra_reader_is_refused(self):
+        s_mod = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            subprocess.run(['icacls', str(key_file), '/grant', '*S-1-5-32-545:R'], check=True, capture_output=True)
+            with self.assertRaises(SystemExit):
+                s_mod.load_key(key_file)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL check')
+    def test_windows_deny_entry_is_refused(self):
+        s_mod = load()
+        with tempfile.TemporaryDirectory() as tmp:
+            key_file = Path(tmp) / 'history.key'
+            s_mod.init_key(key_file)
+            subprocess.run(['icacls', str(key_file), '/deny', '*S-1-5-32-545:W'], check=True, capture_output=True)
+            with self.assertRaises(SystemExit):
+                s_mod.load_key(key_file)
+
 
 class Publication(unittest.TestCase):
     def test_rollback_when_the_second_replace_fails(self):
