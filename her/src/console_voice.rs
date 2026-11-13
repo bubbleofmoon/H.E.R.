@@ -515,16 +515,6 @@ fn should_audit_key(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
     true
 }
 
-/// Outbox records of earlier confirmed sends since `since_ms`: ids that cannot prove this attempt.
-fn recently_confirmed_ids(context: &RuntimeContext, since_ms: i64) -> Vec<i64> {
-    crate::send_outbox::read_records(context)
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| r["k"] == "confirmed" && r["t"].as_i64().unwrap_or(0) >= since_ms)
-        .filter_map(|r| r["messageId"].as_i64())
-        .collect()
-}
-
 /// `sendVoiceV2` plus the outbox discipline: audit, inspect, local volume processing, then
 /// intent -> attempt -> request -> outcome. Returns the delivered voice or the exact failure.
 fn send_voice_core(
@@ -578,8 +568,9 @@ fn send_processed(
     send_path: &Path,
     file_name: &str,
 ) -> Result<Option<i64>, Failure> {
-    use crate::onebot::{SendError, Target};
-    use crate::send_outbox::{append_record, claim_batch, new_batch_id};
+    use crate::onebot::Target;
+    use crate::recorded_send::{BeginError, History, Proof, Recorded, BATCH_BUSY};
+    use crate::send_outbox::ItemState;
     let external_send_path = voice::plain_path(send_path).map_err(Failure::Plain)?;
     // JS `sendChain`: a voice is one more item on the chain every text, burst and sticker send uses.
     let _chain = agent::send_chain();
@@ -589,57 +580,45 @@ fn send_processed(
     }
     let ob = onebot_for_runtime(context, cfg).map_err(Failure::Plain)?;
     let target = if args.kind == "private" { Target::Private(args.id_s.parse().unwrap_or(0)) } else { Target::Group(args.id_s.parse().unwrap_or(0)) };
-    let now = now_ms();
-    let batch_id = new_batch_id(now);
-    let _claim = claim_batch(&batch_id).ok_or_else(|| Failure::Plain("该批次正在进行中，请稍后再试".to_string()))?;
     let label = format!("[语音:{file_name}]");
-    let intent = json!({
-        "batch": batch_id, "k": "intent", "kind": "voice", "key": args.key, "epoch": args.epoch,
-        "messages": [label], "delays": [], "replyTo": Value::Null, "atUser": Value::Null, "t": now
+    let fields = json!({
+        "kind": "voice", "key": args.key, "epoch": args.epoch,
+        "messages": [label], "delays": [], "replyTo": Value::Null, "atUser": Value::Null
     });
-    append_record(context, &intent).map_err(|e| Failure::Plain(format!("发送意图未能持久记录，未发送：{e}")))?;
-    let attempt_ms = now_ms();
-    if let Err(error) = append_record(context, &json!({ "batch": batch_id, "k": "attempt", "idx": 0, "t": attempt_ms })) {
-        let _ = append_record(context, &json!({ "batch": batch_id, "k": "cancelled", "idx": 0, "error": error, "t": now_ms() }));
-        return Err(Failure::Plain(format!("发送意图未能持久记录，未发送：{error}")));
-    }
-    let record = |value: Value| {
-        if let Err(error) = append_record(context, &value) {
-            crate::safe_println!("[voice] send outbox record failed: {error}");
+    let recorded = Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| Failure::Plain(match error {
+        BeginError::Busy => BATCH_BUSY.to_string(),
+        BeginError::Intent(error) => format!("发送意图未能持久记录，未发送：{error}"),
+    }))?;
+    let batch_id = recorded.batch_id().to_string();
+    let attempt_ms = match recorded.attempt(0, None) {
+        Ok(at) => at,
+        Err(error) => {
+            let _ = recorded.cancelled(0, Some(&error));
+            return Err(Failure::Plain(format!("发送意图未能持久记录，未发送：{error}")));
         }
     };
-    match ob.send_record_outcome(&target, &external_send_path) {
-        Ok(data) => {
-            let message_id = value_as_message_id(data.get("message_id"));
-            record(json!({ "batch": batch_id, "k": "confirmed", "idx": 0, "messageId": message_id, "t": now_ms() }));
+    // An unknown send spends nothing (JS commits only after a delivered send); a record segment
+    // of ours in history after the attempt can still confirm it.
+    let history = History { ob: &ob, kind: args.kind, id_s: args.id_s };
+    let outcome = ob.send_record_outcome(&target, &external_send_path);
+    let settled = recorded.settle(0, attempt_ms, outcome, &history, Proof::Segment("record"), &[]);
+    if let Some(error) = &settled.record_error {
+        crate::safe_println!("[voice] send outbox record failed: {error}");
+    }
+    let error = settled.error.unwrap_or_default();
+    match settled.state {
+        ItemState::Confirmed { message_id, .. } => {
             commit_budget(args);
             Ok(message_id)
         }
-        Err(SendError::NotCommitted(error)) => {
-            record(json!({ "batch": batch_id, "k": "not_committed", "idx": 0, "error": error, "t": now_ms() }));
-            Err(Failure::Outcome { outcome: "not_committed", message: error, batch_id })
-        }
-        Err(SendError::Unknown(error)) => {
-            record(json!({ "batch": batch_id, "k": "unknown", "idx": 0, "error": error, "t": now_ms() }));
-            // An unknown send spends nothing (JS commits only after a delivered send); evidence below can still confirm it.
-            let exclude = recently_confirmed_ids(context, attempt_ms);
-            let history = crate::recorded_send::History { ob: &ob, kind: args.kind, id_s: args.id_s };
-            let evidence = crate::recorded_send::history_evidence(&history, attempt_ms, &exclude, crate::recorded_send::Proof::Segment("record"));
-            match evidence {
-                Some(message_id) => {
-                    record(json!({ "batch": batch_id, "k": "confirmed", "idx": 0, "messageId": message_id, "verified": true, "t": now_ms() }));
-                    commit_budget(args);
-                    Ok(Some(message_id))
-                }
-                None => Err(Failure::Outcome {
-                    outcome: "unknown",
-                    message: format!(
-                        "语音发送结果未知（请求已发出但没有收到可信回执：{error}）；不会自动重发，请先在 QQ 里确认这条语音是否已出现，再决定是否重新发送"
-                    ),
-                    batch_id,
-                }),
-            }
-        }
+        ItemState::NotCommitted => Err(Failure::Outcome { outcome: "not_committed", message: error, batch_id }),
+        _ => Err(Failure::Outcome {
+            outcome: "unknown",
+            message: format!(
+                "语音发送结果未知（请求已发出但没有收到可信回执：{error}）；不会自动重发，请先在 QQ 里确认这条语音是否已出现，再决定是否重新发送"
+            ),
+            batch_id,
+        }),
     }
 }
 

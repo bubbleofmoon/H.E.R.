@@ -9066,13 +9066,11 @@ where
     }
     // Sticker batches are visible in the durable outbox but cannot be resumed as text.
     // Do not persist image bytes or the agent token.
-    let batch_id = crate::send_outbox::new_batch_id(now_ms());
-    let _claim = crate::send_outbox::claim_batch(&batch_id)
-        .ok_or((409, "该批次正在进行中，请稍后再试".to_string()))?;
-    crate::send_outbox::append_record(context, &json!({
-        "batch": batch_id, "k": "intent", "kind": "sticker", "key": storage_key,
-        "epoch": epoch, "messages": [format!("[表情包:{sticker_id}]")], "t": now_ms()
-    })).map_err(|error| (503, format!("发送意图未能持久记录，未发送：{error}")))?;
+    let fields = json!({ "kind": "sticker", "key": storage_key, "epoch": epoch, "messages": [format!("[表情包:{sticker_id}]")] });
+    let recorded = crate::recorded_send::Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| match error {
+        crate::recorded_send::BeginError::Busy => (409, crate::recorded_send::BATCH_BUSY.to_string()),
+        crate::recorded_send::BeginError::Intent(error) => (503, format!("发送意图未能持久记录，未发送：{error}")),
+    })?;
     // JS enqueues the sticker on the same `sendChain` as text bubbles, so it can never overtake an
     // in-flight burst, and pauses 800-2000 ms inside the chain before `assertSendAllowed()`.
     // The pause holds no authority or social gate; validity is re-checked below, after it.
@@ -9084,11 +9082,10 @@ where
             if crate::sticker::enabled(&fresh) { Ok(()) } else { Err((409, SEND_CANCELLED_MESSAGE.to_string())) }
         });
     if let Err(stop) = guard {
-        crate::send_outbox::append_record(context, &json!({"batch": batch_id, "k": "cancelled", "idx": 0, "t": now_ms()}))
-            .map_err(|error| (503, format!("发送结果未能持久记录：{error}")))?;
+        recorded.cancelled(0, None).map_err(|error| (503, format!("发送结果未能持久记录：{error}")))?;
         return Err(stop);
     }
-    crate::send_outbox::append_record(context, &json!({"batch": batch_id, "k": "attempt", "idx": 0, "t": now_ms()}))
+    let attempt_ms = recorded.attempt(0, None)
         .map_err(|error| (503, format!("发送意图未能持久记录，未发送：{error}")))?;
     let submission = guarded_sticker_submission(context, &ob, action, &payload, || {
         require_sticker_reservation(context, &storage_key, "stickerSendPending", &reservation).and_then(|_| send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendSticker")).and_then(|_| {
@@ -9099,30 +9096,28 @@ where
     let submission = match submission {
         Ok(submission) => submission,
         Err(stop) => {
-            crate::send_outbox::append_record(context, &json!({"batch": batch_id, "k": "cancelled", "idx": 0, "t": now_ms()}))
-            .map_err(|error| (503, format!("发送结果未能持久记录：{error}")))?;
+            recorded.cancelled(0, None).map_err(|error| (503, format!("发送结果未能持久记录：{error}")))?;
             return Err(stop);
         }
     };
     retain_reservation = true;
     let outcome = submission.and_then(|pending| pending.outcome());
+    // An unknown answer is checked for an image of ours after the attempt before the chain is
+    // released, so a later sticker cannot stand in as its proof. It is never resent.
+    let history = crate::recorded_send::History { ob: &ob, kind, id_s };
+    let settled = recorded.settle(0, attempt_ms, outcome, &history, crate::recorded_send::Proof::Segment("image"), &[]);
     // The chain covers the gateway round trip, as JS awaits the response inside it.
     drop(send_chain);
-    let data = match outcome {
-        Ok(data) => {
-            crate::send_outbox::append_record(context, &json!({"batch": batch_id, "k": "confirmed", "idx": 0, "messageId": value_as_message_id(data.get("message_id")), "t": now_ms()}))
-                .map_err(|error| (503, format!("已发送，但发送结果未能持久记录：{error}")))?;
-            data
-        }
-        Err(error) => {
-            let (kind, detail) = match error {
-                crate::onebot::SendError::NotCommitted(detail) => { retain_reservation = false; ("not_committed", detail) },
-                crate::onebot::SendError::Unknown(detail) => ("unknown", detail),
-            };
-            crate::send_outbox::append_record(context, &json!({"batch": batch_id, "k": kind, "idx": 0, "error": detail, "t": now_ms()}))
-                .map_err(|error| (503, format!("发送结果未能持久记录：{error}")))?;
-            return Err((500, format!("发送表情失败：{detail}")));
-        }
+    let delivered = matches!(settled.state, crate::send_outbox::ItemState::Confirmed { .. });
+    if matches!(settled.state, crate::send_outbox::ItemState::NotCommitted) {
+        retain_reservation = false;
+    }
+    if let Some(error) = settled.record_error {
+        return Err((503, if delivered { format!("已发送，但发送结果未能持久记录：{error}") } else { format!("发送结果未能持久记录：{error}") }));
+    }
+    let data = match settled.state {
+        crate::send_outbox::ItemState::Confirmed { message_id, .. } => settled.data.unwrap_or_else(|| json!({ "message_id": message_id })),
+        _ => return Err((500, format!("发送表情失败：{}", settled.error.unwrap_or_default()))),
     };
     let response = json!({"data": data});
 
@@ -10392,18 +10387,8 @@ fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Resul
     Ok(role.get("mode").and_then(Value::as_str) == Some("silent") && key != owner_key)
 }
 
-fn value_as_message_id(value: Option<&Value>) -> Option<i64> {
-    crate::recorded_send::message_id(value)
-}
-
 #[cfg(test)]
 use crate::recorded_send::history_text_matches;
-
-/// Our own message with this exact text after `since_ms` (`recorded_send::history_evidence`).
-fn verify_sent(ob: &crate::onebot::OneBot, kind: &str, id_s: &str, text: &str, since_ms: i64, exclude: &[i64]) -> Option<i64> {
-    let history = crate::recorded_send::History { ob, kind, id_s };
-    crate::recorded_send::history_evidence(&history, since_ms, exclude, crate::recorded_send::Proof::Text(text))
-}
 
 struct PlanItem {
     idx: usize,
@@ -10441,7 +10426,7 @@ fn run_send_items(
     context: &RuntimeContext,
     cfg: &Value,
     ob: &crate::onebot::OneBot,
-    batch_id: &str,
+    recorded: &crate::recorded_send::Recorded<'_>,
     key: &str,
     kind: &str,
     id_s: &str,
@@ -10454,8 +10439,9 @@ fn run_send_items(
     initial: &Value,
     turn_scope: &str,
 ) -> RunReport {
-    use crate::onebot::{SendError, Target};
-    use crate::send_outbox::{append_record, ItemState};
+    use crate::onebot::Target;
+    use crate::recorded_send::{History, Proof};
+    use crate::send_outbox::ItemState;
     let mut report = RunReport::default();
     let mut previous_sent = None;
     let target = if kind == "private" {
@@ -10463,11 +10449,10 @@ fn run_send_items(
     } else {
         Target::Group(id_s.parse().unwrap_or(0))
     };
-    fn record(context: &RuntimeContext, value: Value, report: &mut RunReport) {
-        if let Err(error) = append_record(context, &value) {
-            crate::safe_println!("[console] send outbox record failed: {error}");
-            report.first_error.get_or_insert(format!("发送结果未能持久记录：{error}"));
-        }
+    let history = History { ob, kind, id_s };
+    fn note(report: &mut RunReport, error: String) {
+        crate::safe_println!("[console] send outbox record failed: {error}");
+        report.first_error.get_or_insert(format!("发送结果未能持久记录：{error}"));
     }
     for (pos, item) in plan.iter().enumerate() {
         if report.stop.is_none() {
@@ -10496,10 +10481,11 @@ fn run_send_items(
                 }
             }
         }
+        let mut attempt_ms = 0;
         if report.stop.is_none() {
-            let attempt = json!({ "batch": batch_id, "k": "attempt", "idx": item.idx, "turnScope": turn_scope, "t": now_ms() });
-            if let Err(error) = append_record(context, &attempt) {
-                report.stop = Some((503, format!("发送意图未能持久记录，未发送：{error}")));
+            match recorded.attempt(item.idx, Some(turn_scope)) {
+                Ok(at) => attempt_ms = at,
+                Err(error) => report.stop = Some((503, format!("发送意图未能持久记录，未发送：{error}"))),
             }
         }
         if let Some(stop) = report.stop.clone() {
@@ -10507,8 +10493,7 @@ fn run_send_items(
                 // One durable decision covers the whole remaining plan, including sparse resumes.
                 // A crash during report/settlement work must never leave a later bubble resumable.
                 let indices: Vec<usize> = plan[pos..].iter().map(|item| item.idx).collect();
-                let discard = json!({ "batch": batch_id, "k": "superseded", "indices": indices, "error": stop.1, "t": now_ms() });
-                let state = match append_record(context, &discard) {
+                let state = match recorded.superseded(&indices, &stop.1) {
                     Ok(()) => ItemState::Superseded,
                     Err(error) => {
                         report.discard_error = Some(format!("待发内容取消决定未能持久记录：{error}"));
@@ -10520,39 +10505,27 @@ fn run_send_items(
                 report.states.extend(indices.into_iter().map(|idx| (idx, state.clone())));
                 break;
             }
-            let cancel = json!({ "batch": batch_id, "k": "cancelled", "idx": item.idx, "error": stop.1, "t": now_ms() });
-            record(context, cancel, &mut report);
+            if let Err(error) = recorded.cancelled(item.idx, Some(&stop.1)) {
+                note(&mut report, error);
+            }
             report.states.push((item.idx, ItemState::Cancelled));
             continue;
         }
-        let attempt_ms = now_ms();
-        match ob.send_one_outcome(&target, &item.text, item.reply, item.at) {
-            Ok(data) => {
-                previous_sent = Some(now_ms());
-                let message_id = value_as_message_id(data.get("message_id"));
-                record(context, json!({ "batch": batch_id, "k": "confirmed", "idx": item.idx, "messageId": message_id, "t": now_ms() }), &mut report);
-                report.states.push((item.idx, ItemState::Confirmed { message_id, verified: false }));
-            }
-            Err(SendError::NotCommitted(error)) => {
-                report.first_error.get_or_insert(error.clone());
-                record(context, json!({ "batch": batch_id, "k": "not_committed", "idx": item.idx, "error": error, "t": now_ms() }), &mut report);
-                report.states.push((item.idx, ItemState::NotCommitted));
-            }
-            Err(SendError::Unknown(error)) => {
-                report.first_error.get_or_insert(error.clone());
-                record(context, json!({ "batch": batch_id, "k": "unknown", "idx": item.idx, "error": error, "t": now_ms() }), &mut report);
-                let mut exclude = already_confirmed.to_vec();
-                exclude.extend(report.confirmed_ids());
-                match verify_sent(ob, kind, id_s, &item.text, attempt_ms, &exclude) {
-                    Some(message_id) => {
-                        previous_sent = Some(now_ms());
-                        record(context, json!({ "batch": batch_id, "k": "confirmed", "idx": item.idx, "messageId": message_id, "verified": true, "t": now_ms() }), &mut report);
-                        report.states.push((item.idx, ItemState::Confirmed { message_id: Some(message_id), verified: true }));
-                    }
-                    None => report.states.push((item.idx, ItemState::Unknown)),
-                }
-            }
+        let mut exclude = already_confirmed.to_vec();
+        exclude.extend(report.confirmed_ids());
+        let outcome = ob.send_one_outcome(&target, &item.text, item.reply, item.at);
+        let settled = recorded.settle(item.idx, attempt_ms, outcome, &history, Proof::Text(&item.text), &exclude);
+        // The gateway detail first, as before: a later record failure must not hide it.
+        if let Some(error) = settled.error {
+            report.first_error.get_or_insert(error);
         }
+        if let Some(error) = settled.record_error {
+            note(&mut report, error);
+        }
+        if matches!(settled.state, ItemState::Confirmed { .. }) {
+            previous_sent = Some(now_ms());
+        }
+        report.states.push((item.idx, settled.state));
     }
     report
 }
@@ -10613,13 +10586,13 @@ fn resume_send_batch(
     token: &str,
     batch_id: &str,
 ) -> Result<(u16, Value), (u16, String)> {
-    use crate::send_outbox::{append_record, fold_batch, progress_json, read_records, token_epoch, ItemState};
+    use crate::send_outbox::{fold_batch, progress_json, read_records, token_epoch, ItemState};
     let epoch = token_epoch(token);
     let initial = load_social_state_for(context)?["conversations"][key].clone();
     // One runner per batch: a concurrent resume (or the original send still running) would
     // otherwise read the same pending item and send it twice.
-    let _claim = crate::send_outbox::claim_batch(batch_id)
-        .ok_or((409, "该批次正在进行中，请稍后再试".to_string()))?;
+    let recorded = crate::recorded_send::Recorded::resume(context, now_ms, batch_id)
+        .ok_or((409, crate::recorded_send::BATCH_BUSY.to_string()))?;
     let _chain = agent::send_chain();
     let records = read_records(context).map_err(|error| (503, error))?;
     let mut batch = fold_batch(&records, batch_id).ok_or((404, "发送批次不存在".to_string()))?;
@@ -10643,11 +10616,12 @@ fn resume_send_batch(
         })
         .collect();
     let now = now_ms();
+    let history = crate::recorded_send::History { ob, kind, id_s };
     for idx in batch.indices_where(|s| s.needs_verification()) {
-        if let Some(message_id) = verify_sent(ob, kind, id_s, &batch.messages[idx], batch.verify_since(idx), &confirmed_ids) {
+        let proof = crate::recorded_send::Proof::Text(&batch.messages[idx]);
+        if let Some((message_id, _)) = recorded.confirm_from_history(idx, batch.verify_since(idx), &history, proof, &confirmed_ids) {
             // One history message can confirm only one item.
             confirmed_ids.push(message_id);
-            let _ = append_record(context, &json!({ "batch": batch_id, "k": "confirmed", "idx": idx, "messageId": message_id, "verified": true, "t": now }));
             states[idx] = ItemState::Confirmed { message_id: Some(message_id), verified: true };
         }
     }
@@ -10681,7 +10655,7 @@ fn resume_send_batch(
     let count = resend.len();
     reserve_send_quota(context, cfg, key, count, now, &epoch)?;
     let plan = plan_for(&batch.messages, batch.reply_to, batch.at_user, &resend);
-    let report = run_send_items(context, cfg, ob, batch_id, key, kind, id_s, &epoch, GuardPolicy::Reserved2, "sendMessage", &plan, &batch.delays, &confirmed_ids, &initial, &turn_scope);
+    let report = run_send_items(context, cfg, ob, &recorded, key, kind, id_s, &epoch, GuardPolicy::Reserved2, "sendMessage", &plan, &batch.delays, &confirmed_ids, &initial, &turn_scope);
     for (idx, state) in &report.states {
         states[*idx] = state.clone();
     }
