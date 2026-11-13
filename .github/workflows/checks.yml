@@ -69,6 +69,7 @@ jobs:
           python -I scripts/tests/test_scan_public.py
           python -I scripts/tests/test_pre_push_hook.py
           python -I scripts/tests/test_gh_public.py
+          python -I scripts/tests/test_check_repo.py
           python -I scripts/scan-public.py
           "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
       - name: Build and full test suite (all gate targets)
