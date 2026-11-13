@@ -302,6 +302,27 @@ fn harness_conversation_facts_and_history_survive_a_bridge_and_console_restart()
 const MODEL_KEY: &str = "synthetic-model-key-67";
 
 fn assert_model_key_is_private(rig: &Rig) {
+    /// Windows ERROR_LOCK_VIOLATION: another handle holds an exclusive byte-range lock on the file.
+    const LOCK_VIOLATION: i32 = 33;
+
+    /// Reads one artifact. A lock violation is retried briefly, since a transient lock (SQLite sidecars, atomic
+    /// replacement) clears; a lock that outlives the retries returns `None`.
+    fn read_artifact(path: &Path) -> Option<Vec<u8>> {
+        for attempt in 0..20 {
+            match fs::read(path) {
+                Ok(bytes) => return Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()), // rotating logs / SQLite sidecars
+                Err(error) if error.raw_os_error() == Some(LOCK_VIOLATION) => {
+                    if attempt < 19 {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Err(error) => panic!("cannot scan runtime artifact {}: {error}", path.display()),
+            }
+        }
+        None
+    }
+
     fn scan(root: &Path, path: &Path) {
         for entry in fs::read_dir(path).unwrap() {
             let path = entry.unwrap().path();
@@ -312,10 +333,16 @@ fn assert_model_key_is_private(rig: &Rig) {
             if path == root.join("config/harness-api-key") {
                 continue;
             }
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue, // rotating logs / SQLite sidecars
-                Err(error) => panic!("cannot scan runtime artifact: {error}"),
+            let Some(bytes) = read_artifact(&path) else {
+                // The running console and live processes hold an exclusive lock on their owner gate files for their
+                // whole lifetime (`lifecycle::OwnerGate`), and Windows refuses reads of a locked file. Those gates hold
+                // no model text; any other file that stays locked is a real scan failure.
+                assert!(
+                    path.extension().is_some_and(|extension| extension == "lock"),
+                    "cannot scan runtime artifact {}: locked by another process",
+                    path.display()
+                );
+                continue;
             };
             assert!(
                 !bytes
@@ -2693,7 +2720,8 @@ fn harness_refusal_records_message_ids_from_recalled_history_and_read_results() 
 #[cfg(windows)]
 #[test]
 fn nonzero_cli_private_output_stays_out_of_trial_logs_errors_and_owner_alerts() {
-    for mode in ["chat", "reserved2"] {
+    // The pinned CLI route is a reserved2 route (docs/agents/dependency-recovery.md); chat mode ignores the pin.
+    for mode in ["reserved2"] {
         let mut rig = Rig::new(
             &format!("cli-private-output-{mode}"),
             Seed {
@@ -2741,6 +2769,46 @@ fn nonzero_cli_private_output_stays_out_of_trial_logs_errors_and_owner_alerts() 
         assert!(rig.texts_to(GROUP_KEY).iter().all(|s| s == ACK));
         assert!(rig.dsh.prompts().is_empty());
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn chat_mode_ignores_a_pinned_cli_backend_and_answers_through_dsh() {
+    let mut rig = Rig::new(
+        "cli-pin-ignored-chat",
+        Seed {
+            mode: "chat",
+            config: json!({"backends":{"sessions":{GROUP_KEY:"private-output-cli"},"list":[{
+                "id":"private-output-cli","kind":"cli","cmd":"powershell.exe",
+                "args":["-NoProfile","-NonInteractive","-Command",
+                    "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText((Join-Path $env:HER_RUNTIME_ROOT 'data/cli-private-probe.txt'), '7'); [Console]::Out.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); [Console]::Error.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); exit 7"]
+            }]}}),
+            ..Seed::default()
+        },
+    );
+    rig.start();
+    rig.push(group_event(
+        81806,
+        1001,
+        "tester",
+        "",
+        vec![text_seg("hello CLI")],
+    ));
+    assert!(wait_for(LONG, || rig
+        .ledger()
+        .iter()
+        .any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert!(
+        rig.ledger().iter().any(|r| r["k"] == "begun" && r["backend"] == "dsh"),
+        "chat mode must run the turn on DSH: {:?}",
+        rig.ledger()
+    );
+    assert!(
+        !rig.root.join("data/cli-private-probe.txt").exists(),
+        "chat mode must not start the pinned CLI"
+    );
+    assert!(rig.data_lines("logs/opencode-trial.jsonl").is_empty());
+    assert!(!rig.dsh.prompts().is_empty(), "DSH must answer the chat turn");
 }
 
 #[test]
