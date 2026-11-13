@@ -1416,7 +1416,12 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
 
     drop(console_reservation); // free the held port on the line before the console spawn
     let mut console = spawn_console(&roots.selected, &roots.ambient, console_port);
-    let health = wait_console_health(console_port);
+    let health = crate::support::ports::wait_owned_health(
+        console.child.as_mut().expect("console child owned"),
+        console_port,
+        Duration::from_secs(12),
+    )
+    .and_then(|()| wait_console_health(console_port));
     let candidate_output = if health.is_ok() {
         let mut candidate = spawn_live_candidate(&roots.selected, &roots.ambient, console_port);
         Some(candidate.wait(Duration::from_secs(38)))
@@ -1814,7 +1819,12 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
 
     drop(console_reservation); // free the held port on the line before the console spawn
     let mut console = spawn_console(&roots.selected, &roots.ambient, console_port);
-    let health = wait_console_health(console_port);
+    let health = crate::support::ports::wait_owned_health(
+        console.child.as_mut().expect("console child owned"),
+        console_port,
+        Duration::from_secs(12),
+    )
+    .and_then(|()| wait_console_health(console_port));
     let candidate = if health.is_ok() {
         let mut candidate = spawn_live_candidate(&roots.selected, &roots.ambient, console_port);
         Some(candidate.wait(Duration::from_secs(38)))

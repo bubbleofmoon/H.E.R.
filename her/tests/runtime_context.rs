@@ -7,6 +7,8 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex};
 use std::thread;
