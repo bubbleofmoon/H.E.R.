@@ -1,6 +1,7 @@
 #![cfg_attr(not(windows), allow(dead_code))] // helpers of the Windows-only CLI test
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -81,14 +82,6 @@ fn bind_ws() -> (TcpListener, String) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback fake WS");
     let address = listener.local_addr().expect("read fake WS address");
     (listener, format!("ws://127.0.0.1:{}", address.port()))
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve explicit console port");
-    listener
-        .local_addr()
-        .expect("read explicit console port")
-        .port()
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), String> {
@@ -726,22 +719,19 @@ fn runtime_command(root: &Path, ambient: &Path) -> Command {
 struct CompanionConsole(Child);
 
 impl CompanionConsole {
-    fn start(root: &Path, console_port: u16, ambient: &Path, epoch: i64) -> Self {
-        let mut command = runtime_command(root, ambient);
-        command
-            .args([
-                "--console-serve",
-                "--console-port",
-                &console_port.to_string(),
-            ])
-            .env("HER_PARITY_EPOCH_MS", epoch.to_string())
-            .stdout(fs::File::create(root.join("data/logs/console-out.log")).unwrap())
-            .stderr(fs::File::create(root.join("data/logs/console-err.log")).unwrap());
-        let console = Self(
+    fn start(root: &Path, ambient: &Path, epoch: i64) -> (Self, u16) {
+        let (child, console_port) = crate::support::ports::start_console(CONSOLE_START_TIMEOUT, |port| {
+            let mut command = runtime_command(root, ambient);
+            command
+                .args(["--console-serve", "--console-port", &port.to_string()])
+                .env("HER_PARITY_EPOCH_MS", epoch.to_string())
+                .stdout(fs::File::create(root.join("data/logs/console-out.log")).unwrap())
+                .stderr(fs::File::create(root.join("data/logs/console-err.log")).unwrap());
             command
                 .spawn()
-                .expect("spawn selected-root companion console"),
-        );
+                .expect("spawn selected-root companion console")
+        });
+        let console = Self(child);
         let deadline = Instant::now() + CONSOLE_START_TIMEOUT;
         loop {
             if let Ok(mut stream) = TcpStream::connect_timeout(
@@ -764,7 +754,7 @@ impl CompanionConsole {
                         serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
                     assert_eq!(health["runtime"]["mode"], "isolated");
                     assert_eq!(health["port"], console_port);
-                    return console;
+                    return (console, console_port);
                 }
             }
             assert!(
@@ -793,7 +783,6 @@ fn isolated_live_companion_console_routes_selected_reply() {
     let dependencies = json!({"dsh":"http://127.0.0.1:1", "model":"http://127.0.0.1:2",
         "onebot":onebot_url, "onebot_ws":"ws://127.0.0.1:3"});
     selected_runtime_fixture(root.path(), &dependencies);
-    let port = free_port();
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -803,7 +792,7 @@ fn isolated_live_companion_console_routes_selected_reply() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (sending, stopping, records) = (sent.clone(), stop.clone(), seen.clone());
     let gateway = thread::spawn(move || serve_onebot(listener, sending, records, stopping));
-    let _console = CompanionConsole::start(root.path(), port, ambient.path(), epoch);
+    let (_console, port) = CompanionConsole::start(root.path(), ambient.path(), epoch);
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -980,7 +969,7 @@ fn run_isolated_preflight_failure(
     )
     .expect("write synthetic ambient credential sentinel");
     let (ws_listener, ws_url) = bind_ws();
-    let console_port = free_port();
+    let console_port_reservation = crate::support::ports::reserve();
     let dependencies = json!({
         "dsh":"http://127.0.0.1:9",
         "model":"http://127.0.0.1:9",
@@ -1005,7 +994,7 @@ fn run_isolated_preflight_failure(
     }
     let sessions_before = fs::read(&session_path).expect("read selected session sentinel");
 
-    let child = spawn_candidate_with_ambient(root.path(), console_port, ambient.path());
+    let child = spawn_candidate_with_ambient(root.path(), console_port_reservation.release(), ambient.path());
     let (output, candidate_error, ws_contacted) = wait_candidate_with_ws_probe(
         child,
         &ws_listener,
@@ -1126,7 +1115,6 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     let (model_listener, model_url) = bind_http();
     let (onebot_listener, onebot_url) = bind_http();
     let (ws_listener, ws_url) = bind_ws();
-    let console_port = free_port();
     let dependencies = json!({
         "dsh":dsh_url,
         "model":model_url,
@@ -1206,7 +1194,7 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
         serve_onebot(onebot_listener, onebot_sent, onebot_records, onebot_stop)
     });
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    let _console = CompanionConsole::start(root.path(), console_port, ambient_root.path(), epoch);
+    let (_console, console_port) = CompanionConsole::start(root.path(), ambient_root.path(), epoch);
     let model_stop = stop.clone();
     let model_thread = thread::spawn(move || serve_model(model_listener, model_stop));
     let dsh_stop = stop.clone();

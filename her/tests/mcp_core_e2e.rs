@@ -6,6 +6,7 @@
 
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
@@ -128,10 +129,6 @@ fn hide(command: &mut Command) {
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_millis() as i64
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0)).expect("reserve port").local_addr().expect("addr").port()
 }
 
 fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
@@ -376,7 +373,7 @@ impl Console {
         Self::start_env(root, port, &[])
     }
 
-    fn start_env(root: &Root, port: u16, envs: &[(&str, String)]) -> Self {
+    fn command(root: &Root, port: u16, envs: &[(&str, String)]) -> Command {
         let executable = if let Some((_, input)) = envs.iter().find(|(key, _)| *key == "TICKET19_CURL_INPUT") {
             // A byte-identical candidate copy puts the external curl fake in Windows'
             // application-directory search position, without changing the shared candidate.
@@ -399,13 +396,29 @@ impl Console {
             command.current_dir(Path::new(input).parent().unwrap());
         }
         hide(&mut command);
-        let child = command.spawn().expect("start console");
-        let console = Self { child, port };
-        let up = wait_for(Duration::from_secs(20), || {
-            http(port, "GET", "/api/health", &[], None).map(|(s, _)| s == 200).unwrap_or(false)
-        });
-        assert!(up, "console did not start");
+        command
+    }
+
+    fn start_env(root: &Root, port: u16, envs: &[(&str, String)]) -> Self {
+        let mut console = Self { child: Self::command(root, port, envs).spawn().expect("start console"), port };
+        crate::support::ports::wait_owned_health(&mut console.child, port, Duration::from_secs(20))
+            .unwrap_or_else(|error| panic!("console did not start: {error}"));
         console
+    }
+
+    fn start_fresh(root: &Root) -> (Self, u16) {
+        Self::start_fresh_env(root, &[])
+    }
+
+    fn start_fresh_env(root: &Root, envs: &[(&str, String)]) -> (Self, u16) {
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(20), |port| {
+            // The selected config names the console port the MCP and live children read.
+            let mut config = root.config();
+            config["consolePort"] = json!(port);
+            root.write_config(&config);
+            Self::command(root, port, envs).spawn().expect("start console")
+        });
+        (Self { child, port }, port)
     }
 }
 
@@ -585,9 +598,8 @@ struct Fixture {
 
 fn fixture(label: &str, extra_config: Value) -> Fixture {
     let onebot = OneBot::start();
-    let console_port = free_port();
-    let root = make_root(label, onebot.port, console_port, extra_config);
-    let console = Console::start(&root, console_port);
+    let root = make_root(label, onebot.port, 0, extra_config);
+    let (console, console_port) = Console::start_fresh(&root);
     let mcp = Mcp::start(&root, console_port, &[]);
     mcp.initialize();
     Fixture { onebot, root, _console: console, console_port, mcp }
@@ -764,7 +776,7 @@ fn media_failures_limits_and_unsafe_references_keep_js_fallback_without_details(
     let revoked=f.mcp.call("qq_get_message_images",json!({"key":GROUP_KEY,"token":"revoked","messageId":"bad"}));
     assert!(is_error(&revoked)); assert_eq!(f.onebot.actions("get_image").len(),2);
     // Even a configured gateway home outside this selected root cannot expose another root.
-    let other=make_root("media-other-root",f.onebot.port,free_port(),json!({}));
+    let other=make_root("media-other-root",f.onebot.port,1,json!({}));
     let foreign=other.path().join("resources/foreign.png");
     let bytes=media_fixtures::still(image::ImageFormat::Png,24,18,false);
     fs::write(&foreign,&bytes).unwrap();
@@ -948,8 +960,7 @@ fn review_concurrent_gateway_media_is_admitted_before_source_acquisition() {
 #[test]
 fn media_sticker_and_face_routes_normalize_downloads_and_hide_bad_data() {
     let onebot=OneBot::start();
-    let port=free_port();
-    let root=make_root("media-sticker",onebot.port,port,json!({}));
+    let root=make_root("media-sticker",onebot.port,0,json!({}));
     let dir=root.path().join("resources/fake-curl"); fs::create_dir_all(&dir).unwrap();
     let source=dir.join("curl.cs"); let exe=dir.join("curl.exe"); let input=dir.join("input.bin");
     fs::write(&source,r#"using System; using System.IO;
@@ -970,7 +981,7 @@ class Curl { static int Main(string[] args) {
     onebot.reply("fetch_custom_face_detail",json!([{"id":"sticker19","url":"http://8.8.8.8/ticket19.gif","desc":"测试贴纸"}]));
     onebot.reply("fetch_face_entity",json!({"url":"http://8.8.8.8/face.gif","q_des":"实体表情"}));
     let bytes=media_fixtures::gif(37,40,30); fs::write(&input,&bytes).unwrap();
-    let console=Console::start_env(&root,port,&[
+    let (console,port)=Console::start_fresh_env(&root,&[
         ("PATH",format!("{};{}",dir.display(),std::env::var("PATH").unwrap_or_default())),
         ("TICKET19_CURL_INPUT",input.display().to_string())
     ]);
@@ -1069,9 +1080,7 @@ fn agent_status_dsh_readiness_tracks_authenticated_settings_describe() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("fake DSH");
     listener.set_nonblocking(true).unwrap();
     let dsh_port = listener.local_addr().unwrap().port();
-    let console_port = free_port();
-    assert_ne!(console_port, dsh_port, "independent fake services need distinct ports");
-    let root = make_root("status-dsh-readiness", onebot.port, console_port, json!({}));
+    let root = make_root("status-dsh-readiness", onebot.port, 0, json!({}));
     let secret = [7u8; 32];
     let credential_dir = root.path().join("user/dsh");
     fs::create_dir_all(&credential_dir).unwrap();
@@ -1141,7 +1150,8 @@ fn agent_status_dsh_readiness_tracks_authenticated_settings_describe() {
             write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         }
     });
-    let _console = Console::start(&root, console_port);
+    let (_console, console_port) = Console::start_fresh(&root);
+    assert_ne!(console_port, dsh_port, "independent fake services need distinct ports");
     let check = |expected: bool| {
         for headers in [
             vec![("x-console-token", CONSOLE_TOKEN), ("x-agent-call", "1")],
@@ -1474,9 +1484,8 @@ fn a_long_wait_does_not_hold_up_other_tool_calls_and_a_second_wait_supersedes_it
 #[test]
 fn read_receipts_do_not_survive_a_console_restart_but_the_persisted_mark_does() {
     let onebot = OneBot::start();
-    let console_port = free_port();
-    let root = make_root("restart", onebot.port, console_port, json!({}));
-    let console = Console::start(&root, console_port);
+    let root = make_root("restart", onebot.port, 0, json!({}));
+    let (console, console_port) = Console::start_fresh(&root);
     let mcp = Mcp::start(&root, console_port, &[]);
     mcp.initialize();
 
@@ -1696,9 +1705,8 @@ fn burst_merges_into_one_durable_message_and_the_duplicate_window_blocks_a_secon
 #[test]
 fn the_session_defaults_from_the_environment_fill_in_after_validation_only() {
     let onebot = OneBot::start();
-    let console_port = free_port();
-    let root = make_root("env-defaults", onebot.port, console_port, json!({}));
-    let _console = Console::start(&root, console_port);
+    let root = make_root("env-defaults", onebot.port, 0, json!({}));
+    let (_console, console_port) = Console::start_fresh(&root);
     let mcp = Mcp::start(&root, console_port, &[("QQ_SESSION_KEY", GROUP_KEY), ("QQ_SESSION_TOKEN", GROUP_TOKEN)]);
     mcp.initialize();
     // key and token are required by the schema, so validation still refuses a call without them ...

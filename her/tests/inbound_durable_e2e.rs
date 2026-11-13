@@ -6,6 +6,7 @@
 
 #[path = "../src/install_root.rs"]
 mod install_root;
+mod support;
 
 use serde_json::{json, Value};
 use std::fs;
@@ -55,14 +56,6 @@ impl Drop for TempRoot {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("reserve loopback port")
-        .local_addr()
-        .expect("read reserved port")
-        .port()
 }
 
 fn write_fixture(root: &Path, ws_url: &str, onebot_url: &str, owner: Option<i64>) {
@@ -558,9 +551,8 @@ fn start_with_scope(root: &Path, scripts: Vec<Vec<Step>>, owner: Option<i64>, pr
         let gateway = gateway.clone();
         thread::spawn(move || serve_onebot(onebot_listener, gateway));
     }
-    let console_port = free_port();
+    let (console, console_port) = crate::support::ports::start_console(Duration::from_secs(20), |port| spawn_console(root, port));
     let child = spawn_candidate(root, console_port);
-    let console = spawn_console(root, console_port);
     Harness { child, console, console_port, gateway, root: root.to_path_buf() }
 }
 
