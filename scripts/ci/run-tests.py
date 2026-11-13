@@ -48,6 +48,10 @@ run_scripts = sys.platform == 'linux' and not args.slot_ticket
 if run_scripts:
     commands.append(('scripts', 'scripts/ci/run-script-tests.py'))
 script_bins = ev / 'script-bins'
+# Only binaries copied by this invocation's build count; an earlier run's copy must never be used.
+snapshot_ok = False
+if run_scripts:
+    shutil.rmtree(script_bins, ignore_errors=True)
 results = []
 for name, command in commands:
     print(f'RUN {name}: ' + ('python ' if name == 'scripts' else 'cargo ') + command, flush=True)
@@ -68,16 +72,30 @@ for name, command in commands:
         if name == 'scripts':
             cmd = [sys.executable, '-I', str(root / command), '--exe', str(script_bins / 'her'), '--evidence', str(ev)]
         with logs[0].open('wb') as out, logs[1].open('wb') as err:
-            result = subprocess.run(cmd, cwd=root / 'her', env=env,
-                                    stdout=out, stderr=err,
-                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        code = result.returncode
+            if name == 'scripts' and not snapshot_ok:
+                err.write(b'scripts: unavailable: no snapshot from this run\n')
+                code = 1
+            else:
+                code = subprocess.run(cmd, cwd=root / 'her', env=env, stdout=out, stderr=err,
+                                      creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0).returncode
         (ev / (name + '.exit.txt')).write_text(str(code) + '\n')
         if name == 'build' and not code and run_scripts:
-            script_bins.mkdir(exist_ok=True)
-            target = Path(env['CARGO_TARGET_DIR']) / 'debug'
-            for binary in ('her', 'her-cli'):
-                shutil.copy2(target / binary, script_bins / binary)
+            try:
+                # Cargo runs in her/, so a relative CARGO_TARGET_DIR is relative to that directory.
+                target = root / 'her' / env['CARGO_TARGET_DIR'] / 'debug'
+                script_bins.mkdir(parents=True, exist_ok=True)
+                for binary in ('her', 'her-cli'):
+                    shutil.copy2(target / binary, script_bins / binary)
+                snapshot_ok = True
+            except OSError as error:
+                message = f'scripts-snapshot: cannot copy the built binaries from {target}: {error}'
+                print(message, flush=True)
+                try:
+                    (ev / 'scripts-snapshot.stderr.log').write_text(message + '\n', encoding='utf-8')
+                except OSError:
+                    pass
+                results.append({'target': 'scripts-snapshot', 'command': 'snapshot of her and her-cli', 'invocation': [], 'exit': 1})
+                print('EXIT scripts-snapshot: 1', flush=True)
     results.append({'target': name, 'command': command, 'invocation': cmd, 'exit': code})
     failure_lines = []
     fallback_lines = []
