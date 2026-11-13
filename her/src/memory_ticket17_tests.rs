@@ -599,9 +599,12 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
         let (text, recalled) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", rpc, "").unwrap();
         (text, recalled)
     };
-    let (first_text, first) = wake("rpc-1");
-    assert_eq!(first.len(), 1, "relatedTopK is 1");
-    accept("rpc-1", 1);
+    let (_, unaccepted) = wake("rpc-1");
+    assert_eq!(unaccepted.len(), 1, "relatedTopK is 1");
+    // A wake DSH never accepted holds nothing back: the next wake carries the same memory.
+    let (first_text, first) = wake("rpc-1b");
+    assert_eq!(first, unaccepted, "an unaccepted recall is carried again");
+    accept("rpc-1b", 1);
     let (second_text, second) = wake("rpc-2");
     assert_eq!(second.len(), 1, "the other matching memory is next");
     assert_ne!(first, second, "an installed recall is not repeated in the generation");
@@ -611,9 +614,6 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     accept("rpc-2", 2);
     let (_, third) = wake("rpc-3");
     assert!(third.is_empty(), "both memories were delivered in this generation: {third:?}");
-    // A wake DSH never accepted does not hold its memories back.
-    let (_, retry) = wake("rpc-4");
-    assert!(retry.is_empty());
     server.join().unwrap();
     assert_eq!(recall_hits(&conn), 0, "preparing wakes counts nothing");
 
@@ -632,6 +632,65 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     let (_, fresh) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-5", "").unwrap();
     server.join().unwrap();
     assert_eq!(fresh.len(), 1, "a new generation recalls again");
+}
+
+/// Serve `n` wake message packets from the console route; returns the context that knows the port.
+fn serve_wake_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let context = context.clone().with_console_port(listener.local_addr().unwrap().port());
+    let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
+    let server = std::thread::spawn(move || {
+        for _ in 0..n {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, served_cfg.clone(), served.clone());
+        }
+    });
+    (context, server)
+}
+
+fn accept_wake(context: &RuntimeContext, rpc: &str, seq: i64) {
+    crate::session_context::observe(context, RECALL_KEY, "sid-148", "epoch-148", &json!({
+        "type": "user/message", "seq": seq, "data": {"source": {"rpcId": rpc}},
+    })).unwrap();
+}
+
+#[test]
+fn a_history_gap_refresh_within_a_generation_keeps_the_memories_already_carried() {
+    let (_root, context, _state, _conn, cfg) = recall_wake_fixture("dsh recall gap refresh");
+    let key = RECALL_KEY;
+    let (context, server) = serve_wake_packets(&context, 2);
+    let (_, first) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-1", "").unwrap();
+    accept_wake(&context, "rpc-1", 1);
+    // A gap in the observed history demands a full briefing without starting a new generation.
+    crate::session_map::update_context(&context, key, "sid-148", "epoch-148", |r| {
+        r["needsBriefing"] = json!(true);
+        r["pending"] = Value::Null;
+    }).unwrap();
+    let (text, second) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-2", "").unwrap();
+    server.join().unwrap();
+    assert!(text.contains("以下各节是本代会话的当前完整简报"), "the refresh is a full briefing:\n{text}");
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first, second, "the same generation does not receive an installed memory again");
+}
+
+#[test]
+fn the_console_preview_shows_what_the_next_wake_would_deliver_after_an_accepted_wake() {
+    let (_root, context, state, _conn, cfg) = recall_wake_fixture("dsh recall preview held");
+    let key = RECALL_KEY;
+    let st = &state["conversations"][key];
+    let which = |text: &str| ["评测记录一", "评测记录二"].iter().position(|mark| text.contains(mark));
+    let before = crate::prompt::recall_block_with_runtime(&context, &cfg, st, key);
+    assert!(which(&before).is_some(), "{before}");
+    let (context, server) = serve_wake_packets(&context, 1);
+    let (delivered, _) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-1", "").unwrap();
+    server.join().unwrap();
+    assert_eq!(which(&delivered), which(&before));
+    // Prepared but not accepted: the preview is unchanged.
+    assert_eq!(which(&crate::prompt::recall_block_with_runtime(&context, &cfg, st, key)), which(&before));
+    accept_wake(&context, "rpc-1", 1);
+    let after = crate::prompt::recall_block_with_runtime(&context, &cfg, st, key);
+    assert!(which(&after).is_some() && which(&after) != which(&before), "the preview skips the memory the generation holds:\n{after}");
 }
 
 #[test]

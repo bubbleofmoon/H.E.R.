@@ -622,15 +622,34 @@ pub fn recall_block(cfg: &Value, st: &Value, key: &str) -> String {
     recall_block_with_runtime(&RuntimeContext::legacy(), cfg, st, key)
 }
 
-/// The recall a wake would deliver. Rendering reads memory without counting search hits: a hit is counted
-/// by `record_recall_hits` once the prompt carrying the recall has been delivered.
+/// The memories the conversation's current session generation already carries: the ids of the
+/// installed briefing, kept while the record's generation is the one that briefing was installed
+/// for. A new generation, session or epoch has none; a history-gap refresh (`needsBriefing`, same
+/// generation) keeps them.
+fn held_recall_ids(record: &Value) -> Vec<i64> {
+    let installed = &record["installed"];
+    if installed["generation"].as_u64() != Some(record["generation"].as_u64().unwrap_or(0)) {
+        return Vec::new();
+    }
+    installed["recalled"].as_array().map(|ids| ids.iter().filter_map(Value::as_i64).collect()).unwrap_or_default()
+}
+
+/// The recall the next DSH wake would deliver (the console preview): memories the conversation's
+/// session generation already carries are left out, as in the wake. Rendering reads memory without
+/// counting search hits: a hit is counted by `record_recall_hits` once the prompt carrying the recall
+/// has been delivered.
 pub fn recall_block_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
     st: &Value,
     key: &str,
 ) -> String {
-    recall_block_with(context, cfg, st, key, &[]).0
+    let held = match (crate::session_map::lookup(context, key), st["agentToken"].as_str()) {
+        (Ok(Some(sid)), Some(epoch)) => crate::session_map::context_record(context, key, &sid, epoch)
+            .map(|record| held_recall_ids(&record)).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    recall_block_with(context, cfg, st, key, &held).0
 }
 
 /// Count one use of each memory a delivered prompt carried (`recall_block_with`'s ids). A failure is
@@ -1869,11 +1888,9 @@ pub(crate) fn prepare_dsh_wake(
     if !full { delta.push_str(&wait_limit_line(cfg)); }
     // Automatic recall for the message being answered, the same block the console preview shows; the
     // briefing's retrieval section remains the on-demand route (`memory_search`).
-    // A full briefing starts the generation's recall afresh; a delta never repeats a memory the
-    // installed briefing's wakes already carried.
-    let held: Vec<i64> = if full { Vec::new() } else {
-        installed["recalled"].as_array().map(|ids| ids.iter().filter_map(Value::as_i64).collect()).unwrap_or_default()
-    };
+    // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
+    // wakes already carried; a new generation, session or epoch starts afresh.
+    let held = held_recall_ids(&record);
     let (recall, recalled) = recall_block_with(context, cfg, st, key, &held);
     delta.push_str(&recall);
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));

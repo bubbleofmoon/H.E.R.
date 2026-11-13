@@ -506,12 +506,37 @@ pub fn search_with(
 /// At most this many distinct terms of the message enter the match (the message is cut at 200
 /// characters upstream, so this never drops a term of a chat-length message).
 const RECALL_MAX_TERMS: usize = 200;
-/// A memory must share terms worth at least this many characters with the message (fewer when the
-/// whole message has fewer). One shared Chinese bigram (a single two-character word) or a short
-/// common word is not evidence of relevance; two such words, one longer word or one identifier is.
+/// Relevance bar: a memory qualifies when it shares two or more distinct terms totalling at least
+/// this many characters with the message (two Chinese words), or exactly one term that is an
+/// identifier or at least `RECALL_LONG_TERM_CHARS` characters long. One shared Chinese bigram or
+/// short common word (`好的`, `https`, `2026`) is not evidence of relevance, however short the
+/// message is.
 const RECALL_MIN_SHARED_CHARS: usize = 4;
-/// bm25-ranked candidates read before the relevance bar and the exclusion are applied.
-const RECALL_CANDIDATES: i64 = 60;
+const RECALL_LONG_TERM_CHARS: usize = 6;
+/// bm25-ranked candidates are read in pages of this size until `limit` of them pass the bar, at
+/// most `RECALL_MAX_CANDIDATES` in all, so a run of near-misses cannot hide a qualifying row.
+const RECALL_PAGE: usize = 60;
+const RECALL_MAX_CANDIDATES: usize = 600;
+
+fn recall_term_chars(term: &str) -> usize {
+    term.chars().filter(|c| c.is_alphanumeric()).count()
+}
+
+/// A single-term evidence: at least four characters with a dot or underscore, or letters mixed
+/// with digits (`zebra148kw`, `v0.2.1`, `foo_bar`).
+fn recall_is_identifier(term: &str) -> bool {
+    term.chars().count() >= 4
+        && (term.contains(['.', '_'])
+            || (term.chars().any(|c| c.is_ascii_lowercase()) && term.chars().any(|c| c.is_ascii_digit())))
+}
+
+fn recall_qualifies(shared: &[&String]) -> bool {
+    match shared {
+        [] => false,
+        [one] => recall_is_identifier(one) || recall_term_chars(one) >= RECALL_LONG_TERM_CHARS,
+        many => many.iter().map(|t| recall_term_chars(t)).sum::<usize>() >= RECALL_MIN_SHARED_CHARS,
+    }
+}
 
 /// One index term as Recall compares it: Han, lowercase ASCII, digits, underscore and the dot
 /// `segment` keeps inside a word; a term without a letter, digit or Han character is dropped.
@@ -580,37 +605,51 @@ pub fn recall(
                 f.seg
          FROM memory_fts f JOIN memory m ON m.id = f.rowid
          WHERE memory_fts MATCH ? AND {where_sql}{excluded}
-         ORDER BY rank LIMIT {RECALL_CANDIDATES}"
+         ORDER BY rank, m.id LIMIT {RECALL_PAGE} OFFSET ?"
     );
     let expression = recall_match_expression(&terms);
-    let mut refs: Vec<&dyn ToSql> = vec![&expression as &dyn ToSql];
-    for a in &args {
-        refs.push(a as &dyn ToSql);
-    }
     let mut stmt = conn.prepare(&sql)?;
-    let candidates = stmt
-        .query_map(refs.as_slice(), |r| Ok((read_row(r)?, r.get::<_, String>(17)?)))?
-        .collect::<rusqlite::Result<Vec<(Row, String)>>>()?;
 
-    let term_chars = |term: &str| term.chars().filter(|c| c.is_alphanumeric()).count();
-    let bar = RECALL_MIN_SHARED_CHARS.min(terms.iter().map(|t| term_chars(t)).sum());
     let now = now_ms();
     let mut scored: Vec<Hit> = Vec::new();
-    for (row, seg) in candidates {
-        let indexed: std::collections::HashSet<String> =
-            seg.split_whitespace().filter_map(recall_term).collect();
-        let shared: usize = terms.iter().filter(|term| indexed.contains(*term)).map(|t| term_chars(t)).sum();
-        if shared < bar {
-            continue;
+    let mut offset = 0usize;
+    while offset < RECALL_MAX_CANDIDATES && scored.len() < limit {
+        let offset_arg = offset as i64;
+        let mut refs: Vec<&dyn ToSql> = vec![&expression as &dyn ToSql];
+        for a in &args {
+            refs.push(a as &dyn ToSql);
         }
-        let (rank, pinned, importance, hits, created_at) = (row.6, row.7, row.8, row.9, row.10);
-        let age_days = ((now - created_at) as f64 / 86_400_000.0).max(0.0);
-        let relevance = 0.5 * (shared as f64 / 6.0).tanh() + 0.5 * (-rank).max(0.0).tanh();
-        let boost = 0.04 * if pinned != 0 { 1.0 } else { 0.0 }
-            + 0.04 * importance.clamp(0.0, 1.0)
-            + 0.02 * (-age_days / 30.0).exp()
-            + 0.01 * ((hits as f64) / 5.0).tanh();
-        scored.push(hit_from_row(row, relevance + boost));
+        refs.push(&offset_arg as &dyn ToSql);
+        let page = stmt
+            .query_map(refs.as_slice(), |r| Ok((read_row(r)?, r.get::<_, String>(17)?)))?
+            .collect::<rusqlite::Result<Vec<(Row, String)>>>()?;
+        let last_page = page.len() < RECALL_PAGE;
+        for (row, seg) in page {
+            // An indexed dotted word (`example.test`) is also its parts, as the FTS tokenizer sees it.
+            let mut indexed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for token in seg.split_whitespace() {
+                indexed.extend(token.split('.').filter_map(recall_term));
+                indexed.extend(recall_term(token));
+            }
+            let shared: Vec<&String> = terms.iter().filter(|term| indexed.contains(*term)).collect();
+            if !recall_qualifies(&shared) {
+                continue;
+            }
+            let shared_chars: usize = shared.iter().map(|t| recall_term_chars(t)).sum();
+            let (rank, pinned, importance, hits, created_at) = (row.6, row.7, row.8, row.9, row.10);
+            let age_days = ((now - created_at) as f64 / 86_400_000.0).max(0.0);
+            // Relevance spans most of [0, 1); the boosts add at most 0.05 in total.
+            let relevance = 0.5 * (shared_chars as f64 / 12.0).tanh() + 0.5 * (-rank).max(0.0).tanh();
+            let boost = 0.02 * if pinned != 0 { 1.0 } else { 0.0 }
+                + 0.015 * importance.clamp(0.0, 1.0)
+                + 0.01 * (-age_days / 30.0).exp()
+                + 0.005 * ((hits as f64) / 5.0).tanh();
+            scored.push(hit_from_row(row, relevance + boost));
+        }
+        if last_page {
+            break;
+        }
+        offset += RECALL_PAGE;
     }
     scored.sort_by(|a, b| {
         b.score
@@ -1156,6 +1195,96 @@ mod tests {
         let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
         // The pinned, importance 1.0 backup row shares one word; the diet row shares four.
         assert_eq!(recalled_subjects(&hits).first().map(String::as_str), Some("饮食习惯"));
+    }
+
+    fn add_row(conn: &Connection, owner: &str, scope: &str, subject: &str, content: &str, importance: f64, pinned: i64) -> i64 {
+        let id = write_memory(conn, &MemoryInput {
+            owner_type: "session", owner_id: owner, scope, kind: "fact",
+            subject: Some(subject), content, tags: None, source: "fixture", importance,
+        }).unwrap();
+        conn.execute("UPDATE memory SET pinned=?1 WHERE id=?2", params![pinned, id]).unwrap();
+        id
+    }
+
+    #[test]
+    fn recall_of_a_very_short_message_recalls_nothing_even_when_a_row_contains_it() {
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "应答", "好的，哈哈，嗯，知道了", 1.0, 1);
+        for message in ["好的", "哈哈", "嗯", "好的。", "ok"] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
+        }
+    }
+
+    #[test]
+    fn recall_one_shared_common_token_is_not_enough() {
+        let conn = recall_fixture();
+        add_row(&conn, "group:101", "group", "链接", "参考 https://example.test/a 里的说明，2026 年计划，haha 好玩", 1.0, 1);
+        for message in ["https", "2026", "haha", "你看这个 https 呀", "2026 怎么样", "haha 笑死我了"] {
+            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
+        }
+        // A long word, or two distinct shared terms, is enough.
+        let hits = recall(&conn, "group:101", false, "example 怎么样", 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["链接"], "a seven-character word alone");
+        let hits = recall(&conn, "group:101", false, "https 和 2026 都有", 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["链接"], "two distinct shared terms totalling four characters");
+    }
+
+    #[test]
+    fn recall_does_not_lose_a_qualifying_row_to_the_candidate_cut() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        // 80 distinct Han characters: every neighbouring pair is a distinct message term.
+        let chars: Vec<char> = (0..80u32).map(|i| char::from_u32(0x4e00 + i * 13).unwrap()).collect();
+        let message: String = chars.iter().collect();
+        // 70 short rows each share exactly one term with the message and outrank the long row by
+        // bm25; each alone is below the relevance bar.
+        for i in 0..70 {
+            add_row(&conn, "group:101", "group", &format!("短{i}"), &format!("{}{}，无关", chars[i], chars[i + 1]), 0.0, 0);
+        }
+        let filler = "无关内容，".repeat(60);
+        add_row(&conn, "group:101", "group", "长", &format!("{}{}，{}{}，{filler}", chars[72], chars[73], chars[75], chars[76]), 0.0, 0);
+        let hits = recall(&conn, "group:101", false, &message, 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["长"]);
+    }
+
+    #[test]
+    fn recall_never_returns_another_sessions_private_row_or_an_archived_row() {
+        let conn = recall_fixture();
+        let private = add_row(&conn, "private:9", "private", "私聊", "周末一起去爬山看日出的私人安排", 1.0, 1);
+        let archived = add_row(&conn, "group:101", "group", "已归档", "周末一起去爬山看日出的旧安排", 1.0, 1);
+        archive_memory(&conn, archived, true, "fixture").unwrap();
+        // Everything is readable to the group by a wildcard grant, except what the hard rules hide.
+        grant_acl(&conn, "session", "group:101", "*", "", "read", "fixture").unwrap();
+        let hits = recall(&conn, "group:101", false, "周末一起去爬山看日出", 10, &[]).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
+        assert!(!ids.contains(&private), "another session's private row: {:?}", recalled_subjects(&hits));
+        assert!(!ids.contains(&archived), "an archived row: {:?}", recalled_subjects(&hits));
+        assert!(hits.iter().any(|h| h.subject.as_deref() == Some("别群计划")), "the grant itself works: {:?}", recalled_subjects(&hits));
+    }
+
+    #[test]
+    fn recall_relevance_outweighs_pin_importance_and_recency() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        add_row(&conn, "group:101", "group", "置顶少", "周末，一起，爬山，安排很满，计划另议", 1.0, 1);
+        add_row(&conn, "group:101", "group", "普通多", "周末一起去爬，然后吃早茶", 0.0, 0);
+        let hits = recall(&conn, "group:101", false, "周末一起去爬山看日出吧", 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["普通多", "置顶少"], "the pinned row shares fewer terms");
+    }
+
+    #[test]
+    fn recall_runs_the_full_width_expression_for_200_distinct_han_characters() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        let chars: Vec<char> = (0..200u32).map(|i| char::from_u32(0x4e00 + i * 7).unwrap()).collect();
+        let message: String = chars.iter().collect();
+        assert_eq!(recall_terms(&message).len(), 199);
+        // The match sits in the last characters, past any short term cap.
+        add_row(&conn, "group:101", "group", "尾部", &format!("{}{}{}，其余无关", chars[195], chars[196], chars[197]), 0.0, 0);
+        let hits = recall(&conn, "group:101", false, &message, 3, &[]).unwrap();
+        assert_eq!(recalled_subjects(&hits), vec!["尾部"]);
     }
 
     #[test]
