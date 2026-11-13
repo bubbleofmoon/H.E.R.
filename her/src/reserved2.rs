@@ -215,6 +215,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_cancels_that_cannot_be_read_defer_due_timers_until_they_can() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-cancel-unreadable").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        let store = ScheduleStore::new(&hub.context);
+        hub.ready.clear();
+        {
+            let d = hub.drivers.get_mut(key).unwrap();
+            d.sched.pending_wake_at = None;
+            d.sched.pending_wake_key_at = None;
+            d.sched.prompt_running = false;
+            d.sched.prompt_queued = false;
+            d.sched.reply_check_at = Some(now - 1_000);
+        }
+        // The owner cancels the due reply check; the cancel is persisted.
+        hub.sync_schedule(&cfg, true, now - 2_000);
+        store.request_timer_cancel(key, TimerKind::ReplyCheck, now - 1_000, now - 1_500).unwrap();
+        let persisted = std::fs::read(root.join("data/schedule.json")).unwrap();
+
+        // The store becomes unreadable: the cancel cannot be taken, so the due timer waits instead of firing.
+        std::fs::write(root.join("data/schedule.json"), "not json").unwrap();
+        hub.pump_timers(&cfg, now);
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "replyCheck"), "an unreadable cancel must not let the timer fire: {:?}", hub.ready);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, Some(now - 1_000), "the due timer is kept for a later tick");
+
+        // The store reads again with the cancel in it: the next tick applies it, and the timer never fires.
+        std::fs::write(root.join("data/schedule.json"), &persisted).unwrap();
+        hub.pump_timers(&cfg, now);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, None, "the cancel is applied on the first readable tick");
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "replyCheck"), "a cancelled reply check never fires: {:?}", hub.ready);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn schedule_reminders_wait_while_dsh_is_down_or_a_wake_is_parked_then_run_late_once() {
         use crate::schedule::{Creator, NewItem, Repeat, ScheduleStore};
         let (root, mut hub) = queued_hub("schedule-dsh-wait").await;
@@ -2193,12 +2229,12 @@ impl Hub {
     /// Ticket 33: apply the console's timer cancels. Runs before the timers are pumped, so a timer cancelled before it
     /// fell due never fires in the tick that takes its cancel. A cancel applies only to the timer the owner saw (same
     /// `timer_at`); one that fired or was re-armed meanwhile is left alone. A reach-out cancel skips that chance.
-    fn apply_timer_cancels(&mut self, now: i64) {
+    fn apply_timer_cancels(&mut self, now: i64) -> bool {
         let cancels = match crate::schedule::ScheduleStore::new(&self.context).take_timer_cancels(now) {
             Ok(cancels) => cancels,
             Err(error) => {
                 self.log_schedule_error("cancels", &error, now);
-                return;
+                return false;
             }
         };
         for cancel in cancels {
@@ -2213,13 +2249,45 @@ impl Hub {
                 crate::schedule::TimerKind::Sleep => {}
             }
         }
+        true
     }
 
-    /// Fire due timers, after applying the console's cancels (in that order).
+    /// Fire due timers, after applying the console's cancels (in that order). When the cancels cannot be read, the due
+    /// reply checks and reach-outs wait for a tick whose cancels can be read, so a cancelled one never fires.
     fn pump_timers(&mut self, cfg: &Value, now: i64) {
-        self.apply_timer_cancels(now);
+        let cancels_ok = self.apply_timer_cancels(now);
+        let deferred: Vec<(String, Option<i64>, Option<i64>)> = if cancels_ok {
+            Vec::new()
+        } else {
+            self.drivers
+                .iter_mut()
+                .filter_map(|(key, d)| {
+                    let reply = d.sched.reply_check_at.filter(|at| *at <= now);
+                    let proactive = d.sched.proactive_at.filter(|at| *at <= now);
+                    if reply.is_none() && proactive.is_none() {
+                        return None;
+                    }
+                    if reply.is_some() {
+                        d.sched.reply_check_at = None;
+                    }
+                    if proactive.is_some() {
+                        d.sched.proactive_at = None;
+                    }
+                    Some((key.clone(), reply, proactive))
+                })
+                .collect()
+        };
         for (key, e) in session::pump_all(&mut self.drivers, now) {
             self.route_driver_event(cfg, &key, e);
+        }
+        for (key, reply, proactive) in deferred {
+            let Some(d) = self.drivers.get_mut(&key) else { continue };
+            if reply.is_some() && d.sched.reply_check_at.is_none() {
+                d.sched.reply_check_at = reply;
+            }
+            if proactive.is_some() && d.sched.proactive_at.is_none() {
+                d.sched.proactive_at = proactive;
+            }
         }
     }
 

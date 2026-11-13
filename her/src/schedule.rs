@@ -19,6 +19,8 @@ const FINISHED_ITEM_CAP: usize = 200;
 const TIMER_CANCEL_TTL_MS: i64 = 120_000;
 const TIMERS_REFRESH_MS: i64 = 60_000;
 const MAX_TEXT_CHARS: usize = 500;
+/// Finished items this recent are never compacted away: a queued reminder's text stays until its wake has run.
+const RECENT_FINISH_MS: i64 = 24 * 3_600_000;
 /// HER's timer snapshot older than this is shown as stale and cannot be cancelled against (the hub is not running).
 const STALE_TIMERS_MS: i64 = 2 * TIMERS_REFRESH_MS;
 /// The shortest repeat the store accepts, for the owner and for HER.
@@ -318,9 +320,10 @@ fn check_at(at: i64, now: i64) -> Result<(), StoreError> {
     }
 }
 
-/// Keeps the newest history records and the most recently finished items. An item finished by the current update
-/// (absent from `finished_before`) is never dropped, so a claim cannot delete the reminder it dispatches.
-fn compact(doc: &mut Document, finished_before: &[String]) {
+/// Keeps the newest history records and the most recently finished items. Items finished in the last day, and any
+/// item finished by the current update, are never dropped, so a queued reminder keeps its text; the cap may be
+/// exceeded while they are kept.
+fn compact(doc: &mut Document, finished_before: &[String], now: i64) {
     let excess = doc.history.len().saturating_sub(HISTORY_CAP);
     if excess > 0 {
         doc.history.drain(..excess);
@@ -332,7 +335,7 @@ fn compact(doc: &mut Document, finished_before: &[String]) {
     let mut droppable: Vec<(i64, String)> = doc
         .items
         .iter()
-        .filter(|item| is_finished(item.status) && finished_before.contains(&item.id))
+        .filter(|item| is_finished(item.status) && finished_before.contains(&item.id) && finish_key(item) < now - RECENT_FINISH_MS)
         .map(|item| (finish_key(item), item.id.clone()))
         .collect();
     droppable.sort();
@@ -385,7 +388,7 @@ impl ScheduleStore {
         let finished_before: Vec<String> =
             doc.items.iter().filter(|item| is_finished(item.status)).map(|item| item.id.clone()).collect();
         let value = change(&mut doc)?;
-        compact(&mut doc, &finished_before);
+        compact(&mut doc, &finished_before, crate::parity_clock::now_ms() as i64);
         let after = serde_json::to_string(&doc).map_err(|error| StoreError::Unavailable(error.to_string()))?;
         if after != before {
             let bytes = serde_json::to_vec_pretty(&doc).map_err(|error| StoreError::Unavailable(error.to_string()))?;
@@ -1144,10 +1147,12 @@ mod tests {
         // The oldest item by creation: a reminder set far ahead. More than the cap of newer items finish before it fires.
         doc.items.push(Item { id: "rem-ahead".into(), creator: Creator::Owner, conversation: "group:1".into(), text: "半年后的提醒".into(),
             next_at: NOW + 180 * DAY, repeat: Repeat::Once, status: ItemStatus::Active, created_at: NOW, run_now: false, last_result: None, finished_at: None });
+        // Finished more than a day ago on the real clock, so they are droppable; the earliest finish is rem-f0.
+        let real = crate::parity_clock::now_ms() as i64;
         for index in 0..FINISHED_ITEM_CAP + 5 {
             let offset = index as i64;
             // Created in the reverse of their finish order, so creation time and finish time disagree.
-            doc.items.push(finished_item(&format!("rem-f{index}"), NOW + 1_000 - offset, NOW + DAY + offset));
+            doc.items.push(finished_item(&format!("rem-f{index}"), NOW + 1_000 - offset, real - 2 * DAY + offset));
         }
         std::fs::write(fixture.0.join("data/schedule.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
 
@@ -1168,6 +1173,51 @@ mod tests {
         }
         assert!(items.iter().any(|item| item.id == "rem-f6"));
         assert!(items.iter().any(|item| item.id == format!("rem-f{}", FINISHED_ITEM_CAP + 4)));
+    }
+
+    #[test]
+    fn recently_finished_items_survive_later_writes_and_older_ones_compact_to_the_cap() {
+        let real = crate::parity_clock::now_ms() as i64;
+        let later_at = real + 3_600_000;
+
+        // Scenario A: more than the cap finished within the last day. An unrelated write keeps every one of them,
+        // and drops the older items that finished more than a day ago.
+        let fixture = Fixture::new();
+        let mut doc = Document::empty();
+        for index in 0..FINISHED_ITEM_CAP + 1 {
+            doc.items.push(finished_item(&format!("rem-r{index}"), real - 2 * DAY, real - 60_000 - index as i64));
+        }
+        for index in 0..60 {
+            doc.items.push(finished_item(&format!("rem-o{index}"), real - 4 * DAY, real - 3 * DAY - index as i64));
+        }
+        std::fs::write(fixture.0.join("data/schedule.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let store = ScheduleStore::new(&fixture.context());
+        store.create(owner("group:9", "无关", later_at, Repeat::Once), real).unwrap();
+        let items = store.items().unwrap();
+        assert_eq!(items.iter().filter(|item| is_finished(item.status)).count(), FINISHED_ITEM_CAP + 1, "every recent finish is kept");
+        for index in 0..FINISHED_ITEM_CAP + 1 {
+            assert!(items.iter().any(|item| item.id == format!("rem-r{index}")), "rem-r{index} is recent and kept");
+        }
+        assert!(items.iter().all(|item| !item.id.starts_with("rem-o")), "items finished more than a day ago are dropped");
+
+        // Scenario B: the recent finishes fit under the cap. Older items are dropped, earliest finish first, down to the cap.
+        let fixture = Fixture::new();
+        let mut doc = Document::empty();
+        for index in 0..150 {
+            doc.items.push(finished_item(&format!("rem-r{index}"), real - 2 * DAY, real - 60_000 - index as i64));
+        }
+        for index in 0..100 {
+            doc.items.push(finished_item(&format!("rem-o{index}"), real - 4 * DAY, real - 3 * DAY - index as i64));
+        }
+        std::fs::write(fixture.0.join("data/schedule.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+        let store = ScheduleStore::new(&fixture.context());
+        store.create(owner("group:9", "无关", later_at, Repeat::Once), real).unwrap();
+        let items = store.items().unwrap();
+        assert_eq!(items.iter().filter(|item| is_finished(item.status)).count(), FINISHED_ITEM_CAP, "older items compact to the cap");
+        assert_eq!(items.iter().filter(|item| item.id.starts_with("rem-r")).count(), 150, "every recent finish is kept");
+        // The oldest finishes (the highest indices) went first; the 50 newest old items remain.
+        assert!(items.iter().any(|item| item.id == "rem-o49"));
+        assert!(items.iter().all(|item| item.id != "rem-o50"), "rem-o50 finished before rem-o49 and is dropped first");
     }
 
     #[test]
