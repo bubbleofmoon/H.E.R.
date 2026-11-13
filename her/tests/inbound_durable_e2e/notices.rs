@@ -35,10 +35,12 @@ fn start_notices_with(root: &Path, groups: &[i64], initial: FakeGateway) -> Harn
             while socket.read().is_ok() {}
         }
     });
-    let console_port = free_port();
+    let (console, console_port) = crate::support::ports::start_console(std::time::Duration::from_secs(20), |port| {
+        spawn_console(root, port)
+    });
     Harness {
         child: spawn_candidate(root, console_port),
-        console: spawn_console(root, console_port),
+        console,
         console_port,
         gateway,
         root: root.to_path_buf(),

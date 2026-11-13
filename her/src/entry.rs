@@ -14,6 +14,8 @@ mod model_view;
 mod model_failure;
 mod mcp_validate;
 mod memory;
+mod conversation_authority;
+mod memory_actions;
 mod pipeline;
 mod harness;
 mod prompt;
@@ -59,6 +61,7 @@ mod parity_clock;
 mod config;
 mod inbound;
 mod send_outbox;
+mod recorded_send;
 mod session_map;
 mod session_context;
 mod session_rotation;
@@ -1144,19 +1147,22 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             .position(|a| a == "--query")
             .and_then(|i| std::env::args().nth(i + 1))
             .unwrap_or_else(|| "管理员偏好".to_string());
-        let is_owner = reader == "private:7001";
         let json_mode = std::env::args().any(|a| a == "--json");
         let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
         let conn = rusqlite::Connection::open(&db_path)?;
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?;
+        // The parity fixture's owner is private:7001.
+        let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
+        let memory_reader = store.for_reader(&reader);
+        let is_owner = memory_reader.is_owner();
         if !json_mode {
             println!("[memory] 库 {} 条，reader={reader} isOwner={is_owner}", total);
         }
-        let scope = memory::resolve_reader_scope(&conn, &reader, is_owner)?;
+        let scope = memory_reader.scope()?;
         if !json_mode {
             println!("[memory] 可见范围 allowAll={} ids={:?}", scope.allow_all, scope.ids);
         }
-        let hits = memory::search(&conn, &reader, is_owner, &query, &[], 5)?;
+        let hits = memory_reader.search(&query, &[], 5)?;
         if std::env::args().any(|a| a == "--json") {
             // 给对拍脚本用：只输出纯 JSON，不要别的行
             let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
@@ -1189,10 +1195,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         let conn = rusqlite::Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
 
-        let mk = |imp: f64| memory::MemoryInput {
+        let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
+        let probe = store.for_reader("private:7001");
+        let mk = |imp: f64| memory::NewMemory {
             owner_type: "session",
-            owner_id: "private:7001",
-            scope: "private",
+            scope: Some("private"),
             kind: "fact",
             subject: Some("rust-write-probe"),
             content: &content,
@@ -1200,9 +1207,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             source: "rust-probe",
             importance: imp,
         };
-        let first = memory::upsert_memory(&conn, &mk(0.6))?;
-        let second = memory::upsert_memory(&conn, &mk(0.7))?;
-        let hits = memory::search(&conn, "private:7001", true, &content, &[], 5)?;
+        let first = probe.write(&mk(0.6))?;
+        let second = probe.write(&mk(0.7))?;
+        let hits = probe.search(&content, &[], 5)?;
         println!("{}", serde_json::to_string(&json!({
             "db": db_path,
             "first": { "id": first.id, "deduped": first.deduped },
@@ -1230,8 +1237,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 .position(|a| a == "--index-hint")
                 .and_then(|i| std::env::args().nth(i + 1))
                 .unwrap_or_else(|| "private:7001".to_string());
-            let is_owner = reader == "private:7001";
-            let (total, terms) = memory::index_hint(&conn, &reader, is_owner, &[], 12)?;
+            let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
+            let (total, terms) = store.for_reader(&reader).index(12)?;
             println!("{}", serde_json::to_string(&json!({
                 "reader": reader, "total": total, "terms": terms,
             }))?);

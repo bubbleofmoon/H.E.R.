@@ -2,8 +2,8 @@
 //! isolated runtime. Every dependency is a started fake: the OneBot gateway is a loopback HTTP
 //! server, ffprobe/ffmpeg are fake executables (generated wrappers around this test binary, so Unix and Windows). No real QQ,
 //! model, DSH or TTS service is contacted.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+mod support;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs;
@@ -177,11 +177,7 @@ fn fixture(label: &str, onebot_url: &str, options: Options) -> Fixture {
     } });
     fs::write(root.join("data/social-v2.json"), serde_json::to_vec_pretty(&state).unwrap()).unwrap();
     fs::write(root.join("data/mode.json"), json!({ "mode": options.mode }).to_string()).unwrap();
-    fs::write(
-        root.join("dependencies.json"),
-        json!({ "dsh": "http://127.0.0.1:1", "model": "http://127.0.0.1:2", "onebot": onebot_url }).to_string(),
-    )
-    .unwrap();
+    crate::support::write_dependencies(&root, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
     let tools = root.join("tools");
     let ffprobe = write_fake_tool(&tools, "ffprobe");
     let ffmpeg = write_fake_tool(&tools, "ffmpeg");
@@ -224,19 +220,22 @@ struct Console {
 
 impl Console {
     fn start(fx: &Fixture) -> Self {
-        let port = TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .args(["--console-serve", "--runtime-root"])
-            .arg(&fx.root)
-            .args(["--console-port", &port.to_string()])
-            .env_remove("HER_RUNTIME_ROOT")
-            .env("FFPROBE_PATH", &fx.ffprobe)
-            .env("FFMPEG_PATH", &fx.ffmpeg)
-            .env("FAKE_TOOL_LOG", fx.tools.join("log"))
-            .stdout(Stdio::from(fs::File::create(fx.root.join("console.out")).unwrap()))
-            .stderr(Stdio::from(fs::File::create(fx.root.join("console.err")).unwrap()));
-        let mut console = Self { child: command.spawn().expect("start console"), port };
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(20), |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .args(["--console-serve", "--runtime-root"])
+                .arg(&fx.root)
+                .args(["--console-port", &port.to_string()])
+                .env_remove("HER_RUNTIME_ROOT")
+                .env("FFPROBE_PATH", &fx.ffprobe)
+                .env("FFMPEG_PATH", &fx.ffmpeg)
+                .env("FAKE_TOOL_LOG", fx.tools.join("log"))
+                .stdout(Stdio::from(fs::File::create(fx.root.join("console.out")).unwrap()))
+                .stderr(Stdio::from(fs::File::create(fx.root.join("console.err")).unwrap()));
+            crate::support::hide_window(&mut command);
+            command.spawn().expect("start console")
+        });
+        let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             assert!(console.child.try_wait().unwrap().is_none(), "console exited early");

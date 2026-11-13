@@ -11,6 +11,8 @@ use rusqlite::{params, Connection, OpenFlags, ToSql};
 use std::path::PathBuf;
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+mod store;
+pub use store::{ForgetError, MemoryStore, NewMemory, Reader};
 
 pub const DB_PATH: &str = "C:/qqbot/data/memory.db";
 
@@ -82,17 +84,48 @@ pub fn open_at(path: &std::path::Path) -> rusqlite::Result<Connection> {
     Connection::open(path)
 }
 
-/// Complete the frozen schema atomically, including databases interrupted by an older initializer.
-/// Existing rows, grants and FTS entries survive; only a missing FTS table is populated from rows.
+/// Memory schema version (`PRAGMA user_version`). Version 1 is the frozen
+/// `spec/memory-schema.sql` with its FTS index and the default owner grant.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Open the selected runtime's database at `SCHEMA_VERSION`. A newer version refuses to open.
 pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
     let conn = open_for_runtime(context)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
+    // A newer schema is refused before the first write: the journal_mode change below rewrites the header.
+    let stored: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if stored > SCHEMA_VERSION {
+        return Err("unsupported memory database version".to_string());
+    }
     // journal_mode cannot change in a transaction. Set it first; the schema's same-mode
     // PRAGMA is then harmless inside the transaction containing every DDL/seed operation.
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
-    atomic(&conn, |conn| {
+    let version = atomic(&conn, migrate).map_err(|e| e.to_string())?;
+    if version != SCHEMA_VERSION {
+        return Err("unsupported memory database version".to_string());
+    }
+    Ok(conn)
+}
+
+/// Bring the schema to `SCHEMA_VERSION` inside one IMMEDIATE transaction and return the version
+/// in force. Version 0 is every database made before versioning, including ones an older
+/// initializer left incomplete: it is completed in place and stamped. A newer version is untouched.
+fn migrate(conn: &Connection) -> rusqlite::Result<i64> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != 0 {
+        return Ok(version);
+    }
+    complete_unversioned(conn)?;
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(SCHEMA_VERSION)
+}
+
+/// Existing rows, grants and FTS entries survive; only a missing FTS table is populated from rows.
+fn complete_unversioned(conn: &Connection) -> rusqlite::Result<()> {
         let exists = |name: &str| -> rusqlite::Result<bool> {
             conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)", [name], |r| r.get(0))
         };
@@ -117,8 +150,6 @@ pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, St
             conn.execute("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('owner','main','*','*','read',?1)", [now_ms()])?;
         }
         Ok(())
-    }).map_err(|e| e.to_string())?;
-    Ok(conn)
 }
 
 fn atomic<T>(
@@ -198,7 +229,7 @@ pub struct ReaderScope {
 }
 
 /// 解析读者能读哪些 owner_id（对应 JS 的 resolveReaderScope）。
-pub fn resolve_reader_scope(
+fn resolve_reader_scope(
     conn: &Connection,
     reader_key: &str,
     is_owner: bool,
@@ -402,7 +433,7 @@ fn visibility_filter(
 }
 
 /// 检索记忆（对应 JS 的 searchMemory）。命中会自增 `hits`。
-pub fn search(
+fn search(
     conn: &Connection,
     reader_key: &str,
     is_owner: bool,
@@ -415,7 +446,7 @@ pub fn search(
 
 /// 同 `search`；`count_hits=false` 只读（唤醒提示词渲染用），不改 `hits` / `last_used_at`；
 /// 内容真正送达后由 `record_hits` 按送达的 id 计数。
-pub fn search_with(
+fn search_with(
     conn: &Connection,
     reader_key: &str,
     is_owner: bool,
@@ -610,13 +641,12 @@ fn recall_match_expression(terms: &[String]) -> String {
 /// and past use only add small boosts. Hits are not counted here: the caller counts the items
 /// it actually delivered with `record_hits`.
 pub fn recall(
-    conn: &Connection,
-    reader_key: &str,
-    is_owner: bool,
+    reader: &Reader<'_>,
     text: &str,
     limit: usize,
     exclude: &[i64],
 ) -> rusqlite::Result<Vec<Hit>> {
+    let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
     // A message under four letters, digits or Han characters is too short to say what it is about.
     if text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
         return Ok(Vec::new());
@@ -762,7 +792,7 @@ pub struct UpsertOutcome {
     pub deduped: bool,
 }
 
-pub fn upsert_memory(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<UpsertOutcome> {
+fn upsert_memory(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<UpsertOutcome> {
     atomic(conn, |conn| upsert_memory_inner(conn, m))
 }
 
@@ -787,8 +817,7 @@ fn upsert_memory_inner(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Resu
 }
 
 /// 删除一条记忆（连同 FTS 行），返回是否真的删掉了。
-#[allow(dead_code)] // P4 MCP 工具会用到
-pub fn forget_memory(conn: &Connection, id: i64, actor: &str) -> rusqlite::Result<bool> {
+fn forget_memory(conn: &Connection, id: i64, actor: &str) -> rusqlite::Result<bool> {
     atomic(conn, |conn| {
         let changed = conn.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![id])?;
@@ -798,7 +827,7 @@ pub fn forget_memory(conn: &Connection, id: i64, actor: &str) -> rusqlite::Resul
 }
 
 /// Exact visibility check without a bounded search or hit-counter side effects.
-pub fn can_read_id(
+fn can_read_id(
     conn: &Connection,
     key: &str,
     is_owner: bool,
@@ -821,7 +850,7 @@ pub fn can_read_id(
         && (allowed.allow_all || allowed.ids.contains(&owner)))
 }
 
-pub fn archive_memory(
+fn archive_memory(
     conn: &Connection,
     id: i64,
     archived: bool,
@@ -879,7 +908,7 @@ pub fn list_acl_json(conn: &Connection) -> rusqlite::Result<Vec<serde_json::Valu
 }
 /// 授权（存在则只更新 level）。
 #[allow(dead_code)] // P4 MCP 工具会用到
-pub fn grant_acl(
+fn grant_acl(
     conn: &Connection,
     reader_type: &str,
     reader_id: &str,
@@ -917,7 +946,7 @@ pub fn grant_acl(
 
 /// 撤销授权。
 #[allow(dead_code)] // P4 MCP 工具会用到
-pub fn revoke_acl(
+fn revoke_acl(
     conn: &Connection,
     reader_type: &str,
     reader_id: &str,
@@ -966,12 +995,11 @@ pub fn list_acl(conn: &Connection) -> rusqlite::Result<Vec<AclRow>> {
 
 /// 索引提示：只返回「库里有什么」的词，不含正文。
 pub fn index_hint(
-    conn: &Connection,
-    reader_key: &str,
-    is_owner: bool,
+    reader: &Reader<'_>,
     exclude: &[String],
     max_terms: usize,
 ) -> rusqlite::Result<(i64, Vec<String>)> {
+    let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
     let scope = resolve_reader_scope(conn, reader_key, is_owner)?;
     let mut where_parts: Vec<String> = vec!["archived = 0".to_string()];
     let mut args: Vec<String> = Vec::new();
@@ -1142,6 +1170,10 @@ mod tests {
 
     // ── Recall (automatic recall) ───────────────────────────────────────────────
 
+    fn reader_for<'a>(conn: &'a Connection, key: &str, is_owner: bool) -> Reader<'a> {
+        Reader { conn, key: key.to_string(), is_owner }
+    }
+
     fn recall_fixture() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
@@ -1169,7 +1201,7 @@ mod tests {
         let conn = recall_fixture();
         let message = "我觉得这个周末可以一起去爬山吧，天气应该不错呀";
         assert!(message.chars().count() >= 20);
-        let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["户外计划"], "only the memory that shares words, not the pinned or important rows");
     }
 
@@ -1180,7 +1212,7 @@ mod tests {
             owner_type: "session", owner_id: "group:101", scope: "group", kind: "fact",
             subject: Some("暗号"), content: "zebra148kw 是约好的暗号", tags: None, source: "fixture", importance: 0.1,
         }).unwrap();
-        let hits = recall(&conn, "group:101", false, "zebra148kw 你还记得吗", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "zebra148kw 你还记得吗", 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["暗号"]);
     }
 
@@ -1188,7 +1220,7 @@ mod tests {
     fn recall_of_an_unrelated_message_is_empty_even_with_pinned_and_recent_rows() {
         let conn = recall_fixture();
         for message in ["今天的天气真是太好了呀", "hello there general kenobi", "。。。！！！", "", "周末天气怎么样呢"] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
         }
     }
@@ -1197,18 +1229,18 @@ mod tests {
     fn recall_never_repeats_an_item_the_session_generation_already_holds() {
         let conn = recall_fixture();
         let message = "周末一起去爬山看日出吧，早上出发";
-        let first = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+        let first = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&first), vec!["户外计划"]);
         let held: Vec<i64> = first.iter().map(|h| h.id).collect();
-        assert!(recall(&conn, "group:101", false, message, 3, &held).unwrap().is_empty());
+        assert!(recall(&reader_for(&conn, "group:101", false), message, 3, &held).unwrap().is_empty());
     }
 
     #[test]
     fn recall_stays_inside_the_readers_scope() {
         let conn = recall_fixture();
-        let hits = recall(&conn, "group:101", false, "周末一起去爬山的约定", 5, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "周末一起去爬山的约定", 5, &[]).unwrap();
         assert!(hits.iter().all(|h| h.owner_id == "group:101"), "{:?}", recalled_subjects(&hits));
-        let hits = recall(&conn, "group:101", true, "周末一起去爬山的约定", 5, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", true), "周末一起去爬山的约定", 5, &[]).unwrap();
         assert_eq!(hits.len(), 2, "the owner reads every group");
     }
 
@@ -1220,18 +1252,18 @@ mod tests {
             "周末一起去爬山 \"",
             "' ; DROP TABLE memory; -- 周末一起去爬山",
         ] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).expect(message);
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).expect(message);
             assert_eq!(recalled_subjects(&hits)[..1], ["户外计划"], "{message}");
         }
         let long: String = "周末一起去爬山看日出".chars().cycle().take(200).collect();
-        assert_eq!(recalled_subjects(&recall(&conn, "group:101", false, &long, 3, &[]).unwrap())[..1], ["户外计划"]);
+        assert_eq!(recalled_subjects(&recall(&reader_for(&conn, "group:101", false), &long, 3, &[]).unwrap())[..1], ["户外计划"]);
     }
 
     #[test]
     fn recall_ranks_by_relevance_before_pin_importance_and_recency() {
         let conn = recall_fixture();
         let message = "不吃香菜，喜欢喝热豆浆，数据库备份";
-        let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
         // The pinned, importance 1.0 backup row shares one word; the diet row shares four.
         assert_eq!(recalled_subjects(&hits).first().map(String::as_str), Some("饮食习惯"));
     }
@@ -1250,7 +1282,7 @@ mod tests {
         let conn = recall_fixture();
         add_row(&conn, "group:101", "group", "应答", "好的，哈哈，嗯，知道了", 1.0, 1);
         for message in ["好的", "哈哈", "嗯", "好的。", "ok"] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
         }
     }
@@ -1260,13 +1292,13 @@ mod tests {
         let conn = recall_fixture();
         add_row(&conn, "group:101", "group", "链接", "参考 https://example.test/a 里的说明，2026 年计划，haha 好玩", 1.0, 1);
         for message in ["https", "2026", "haha", "你看这个 https 呀", "2026 怎么样", "haha 笑死我了"] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
         }
         // A long word, or two distinct shared terms, is enough.
-        let hits = recall(&conn, "group:101", false, "example 怎么样", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "example 怎么样", 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["链接"], "a seven-character word alone");
-        let hits = recall(&conn, "group:101", false, "https 和 2026 都有", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "https 和 2026 都有", 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["链接"], "two distinct shared terms totalling four characters");
     }
 
@@ -1284,7 +1316,7 @@ mod tests {
         }
         let filler = "无关内容，".repeat(60);
         add_row(&conn, "group:101", "group", "长", &format!("{}{}，{}{}，{filler}", chars[72], chars[73], chars[75], chars[76]), 0.0, 0);
-        let hits = recall(&conn, "group:101", false, &message, 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), &message, 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["长"]);
     }
 
@@ -1296,7 +1328,7 @@ mod tests {
         archive_memory(&conn, archived, true, "fixture").unwrap();
         // Everything is readable to the group by a wildcard grant, except what the hard rules hide.
         grant_acl(&conn, "session", "group:101", "*", "", "read", "fixture").unwrap();
-        let hits = recall(&conn, "group:101", false, "周末一起去爬山看日出", 10, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "周末一起去爬山看日出", 10, &[]).unwrap();
         let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
         assert!(!ids.contains(&private), "another session's private row: {:?}", recalled_subjects(&hits));
         assert!(!ids.contains(&archived), "an archived row: {:?}", recalled_subjects(&hits));
@@ -1309,7 +1341,7 @@ mod tests {
         conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
         add_row(&conn, "group:101", "group", "置顶少", "周末，一起，爬山，安排很满，计划另议", 1.0, 1);
         add_row(&conn, "group:101", "group", "普通多", "周末一起去爬山看日出，然后吃早茶", 0.0, 0);
-        let hits = recall(&conn, "group:101", false, "周末一起去爬山看日出吧", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "周末一起去爬山看日出吧", 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["普通多", "置顶少"], "the pinned row shares fewer terms");
     }
 
@@ -1322,7 +1354,7 @@ mod tests {
         assert_eq!(recall_terms(&message).len(), 199);
         // The match (four distinct message characters) sits at the end, past any short term cap.
         add_row(&conn, "group:101", "group", "尾部", &format!("{}{}{}{}，其余无关", chars[195], chars[196], chars[197], chars[198]), 0.0, 0);
-        let hits = recall(&conn, "group:101", false, &message, 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), &message, 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["尾部"]);
     }
 
@@ -1332,7 +1364,7 @@ mod tests {
         add_row(&conn, "group:101", "group", "应答", "我早就知道了，没问题", 1.0, 1);
         // 知道了 is three characters: its two bigrams overlap and must not count as four.
         for message in ["知道了", "知道了。", "我知道"] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
         }
     }
@@ -1343,9 +1375,9 @@ mod tests {
         add_row(&conn, "group:101", "group", "三字", "早就知道了，没问题", 0.0, 0);
         add_row(&conn, "group:101", "group", "四字", "他知道了吗，我没问", 0.0, 0);
         // 知道 + 道了 cover three characters; 知道 + 道了 + 了吗 cover four.
-        let hits = recall(&conn, "group:101", false, "知道了吗", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "知道了吗", 3, &[]).unwrap();
         assert_eq!(recalled_subjects(&hits), vec!["四字"], "only the row sharing four distinct characters");
-        let hits = recall(&conn, "group:101", false, "你到底知道了没", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "你到底知道了没", 3, &[]).unwrap();
         assert!(hits.is_empty(), "three shared characters are not enough: {:?}", recalled_subjects(&hits));
     }
 
@@ -1359,7 +1391,7 @@ mod tests {
         assert!(recall_is_identifier("foo_bar"));
         let conn = recall_fixture();
         add_row(&conn, "group:101", "group", "符号", "代号 __a_ 的说明", 1.0, 1);
-        let hits = recall(&conn, "group:101", false, "请问 __a_ 怎么办", 3, &[]).unwrap();
+        let hits = recall(&reader_for(&conn, "group:101", false), "请问 __a_ 怎么办", 3, &[]).unwrap();
         assert!(hits.is_empty(), "{:?}", recalled_subjects(&hits));
     }
 
@@ -1369,12 +1401,12 @@ mod tests {
         add_row(&conn, "group:101", "group", "链接", "参考 https 的说明，哈哈 很好玩", 1.0, 1);
         add_row(&conn, "group:101", "group", "长词", "program 的写法很多", 0.0, 0);
         for message in ["https https https", "哈哈 哈哈 哈哈", "哈哈哈哈哈哈", "https，https，https，https"] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert!(hits.is_empty(), "{message:?} recalled {:?}", recalled_subjects(&hits));
         }
         // A word of six or more letters alone still recalls, repeated or not.
         for message in ["program", "program program"] {
-            let hits = recall(&conn, "group:101", false, message, 3, &[]).unwrap();
+            let hits = recall(&reader_for(&conn, "group:101", false), message, 3, &[]).unwrap();
             assert_eq!(recalled_subjects(&hits), vec!["长词"], "{message:?}");
         }
     }
@@ -1595,6 +1627,92 @@ mod tests {
             1
         );
         conn.prepare("SELECT * FROM role_group_session").unwrap();
+    }
+
+    fn rows(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in ["SELECT * FROM memory", "SELECT * FROM memory_acl", "SELECT * FROM memory_audit",
+                    "SELECT * FROM team", "SELECT * FROM team_member", "SELECT * FROM role_group",
+                    "SELECT * FROM role_group_session", "SELECT rowid, seg FROM memory_fts"] {
+            let mut stmt = conn.prepare(&format!("{sql} ORDER BY rowid")).unwrap();
+            let columns = stmt.column_count();
+            let mapped = stmt.query_map([], |r| (0..columns)
+                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()).unwrap();
+            for row in mapped { out.push(format!("{sql}: {:?}", row.unwrap())); }
+        }
+        out
+    }
+
+    #[test]
+    fn schema_version_stamps_unversioned_database_without_changing_rows() {
+        let (root, context) = isolated_fixture();
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:55", scope: "group", kind: "fact",
+            subject: Some("topic"), content: "versioned marker", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        conn.execute_batch("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('session','group:56','session','group:55','read',1);
+            INSERT INTO team_member(team_id,member_type,member_id) VALUES('t','session','group:55');
+            INSERT INTO memory_audit(at,actor,action,memory_id,detail) VALUES(1,'fixture','write',1,NULL);").unwrap();
+        let before = rows(&conn);
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        assert_eq!(rows(&conn), before, "migration to version 1 must not change rows");
+    }
+
+    #[test]
+    fn schema_version_1_skips_completeness_repair_and_newer_versions_refuse() {
+        let (root, context) = isolated_fixture();
+        drop(open_ready_for_runtime(&context).unwrap());
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch("DROP TABLE role_group_session;").unwrap();
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
+        assert!(conn.prepare("SELECT * FROM role_group_session").is_err(),
+                "a version 1 open must not rerun the unversioned completion");
+        conn.execute_batch("PRAGMA user_version=2;").unwrap();
+        drop(conn);
+        assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[test]
+    fn schema_version_newer_database_is_refused_before_journal_mode_changes() {
+        let (root, context) = isolated_fixture();
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=2;").unwrap();
+        drop(conn);
+        assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "delete",
+                   "a refused newer database must keep its journal mode");
+    }
+
+    #[test]
+    fn schema_version_migrates_unversioned_database_missing_fts_with_rows_grants_and_audit() {
+        let (root, context) = isolated_fixture();
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:55", scope: "group", kind: "fact",
+            subject: Some("topic"), content: "fts marker", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        conn.execute_batch("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('session','group:56','session','group:55','read',1);
+            INSERT INTO team_member(team_id,member_type,member_id) VALUES('t','session','group:55');
+            INSERT INTO memory_audit(at,actor,action,memory_id,detail) VALUES(1,'fixture','write',1,NULL);").unwrap();
+        let before: Vec<String> = rows(&conn).into_iter().filter(|r| !r.starts_with("SELECT rowid, seg FROM memory_fts")).collect();
+        conn.execute_batch("DROP TABLE memory_fts;").unwrap();
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        let after: Vec<String> = rows(&conn).into_iter().filter(|r| !r.starts_with("SELECT rowid, seg FROM memory_fts")).collect();
+        assert_eq!(after, before, "migration must keep rows, grants and audit unchanged");
+        assert_eq!(conn.query_row("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'marker'", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
+                   "missing FTS must be repopulated from the rows");
     }
 
     struct FixtureRoot(PathBuf);
