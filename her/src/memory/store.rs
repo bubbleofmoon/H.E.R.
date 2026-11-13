@@ -36,6 +36,15 @@ pub struct NewMemory<'a> {
     pub importance: f64,
 }
 
+/// Why `Reader::forget` failed. Both stages run in one transaction, so a failed delete rolls back.
+#[derive(Debug)]
+pub enum ForgetError {
+    /// The visibility check could not be read; nothing was deleted.
+    Check(rusqlite::Error),
+    /// The delete or its index removal failed; the transaction rolled back.
+    Delete(rusqlite::Error),
+}
+
 impl MemoryStore {
     /// The selected runtime's database at the current schema version; the owner is `cfg.ownerQQ`.
     pub fn open(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
@@ -99,13 +108,16 @@ impl Reader<'_> {
 
     /// Delete one memory this conversation can read, checking and deleting in one transaction.
     /// `Ok(None)`: absent or not visible; nothing changed.
-    pub fn forget(&self, id: i64) -> rusqlite::Result<Option<bool>> {
+    pub fn forget(&self, id: i64) -> Result<Option<bool>, ForgetError> {
+        let mut deleting = false;
         super::atomic(self.conn, |conn| {
             if !super::can_read_id(conn, &self.key, self.is_owner, id)? {
                 return Ok(None);
             }
+            deleting = true;
             super::forget_memory(conn, id, &self.key).map(Some)
         })
+        .map_err(|error| if deleting { ForgetError::Delete(error) } else { ForgetError::Check(error) })
     }
 }
 

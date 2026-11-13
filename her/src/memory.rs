@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 mod store;
-pub use store::{MemoryStore, NewMemory, Reader};
+pub use store::{ForgetError, MemoryStore, NewMemory, Reader};
 
 pub const DB_PATH: &str = "C:/qqbot/data/memory.db";
 
@@ -93,6 +93,13 @@ pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, St
     let conn = open_for_runtime(context)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
+    // A newer schema is refused before the first write: the journal_mode change below rewrites the header.
+    let stored: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if stored > SCHEMA_VERSION {
+        return Err("unsupported memory database version".to_string());
+    }
     // journal_mode cannot change in a transaction. Set it first; the schema's same-mode
     // PRAGMA is then harmless inside the transaction containing every DDL/seed operation.
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -785,7 +792,7 @@ pub struct UpsertOutcome {
     pub deduped: bool,
 }
 
-pub fn upsert_memory(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<UpsertOutcome> {
+fn upsert_memory(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Result<UpsertOutcome> {
     atomic(conn, |conn| upsert_memory_inner(conn, m))
 }
 
@@ -810,8 +817,7 @@ fn upsert_memory_inner(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Resu
 }
 
 /// 删除一条记忆（连同 FTS 行），返回是否真的删掉了。
-#[allow(dead_code)] // P4 MCP 工具会用到
-pub fn forget_memory(conn: &Connection, id: i64, actor: &str) -> rusqlite::Result<bool> {
+fn forget_memory(conn: &Connection, id: i64, actor: &str) -> rusqlite::Result<bool> {
     atomic(conn, |conn| {
         let changed = conn.execute("DELETE FROM memory WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![id])?;
@@ -844,7 +850,7 @@ fn can_read_id(
         && (allowed.allow_all || allowed.ids.contains(&owner)))
 }
 
-pub fn archive_memory(
+fn archive_memory(
     conn: &Connection,
     id: i64,
     archived: bool,
@@ -902,7 +908,7 @@ pub fn list_acl_json(conn: &Connection) -> rusqlite::Result<Vec<serde_json::Valu
 }
 /// 授权（存在则只更新 level）。
 #[allow(dead_code)] // P4 MCP 工具会用到
-pub fn grant_acl(
+fn grant_acl(
     conn: &Connection,
     reader_type: &str,
     reader_id: &str,
@@ -940,7 +946,7 @@ pub fn grant_acl(
 
 /// 撤销授权。
 #[allow(dead_code)] // P4 MCP 工具会用到
-pub fn revoke_acl(
+fn revoke_acl(
     conn: &Connection,
     reader_type: &str,
     reader_id: &str,
@@ -1672,6 +1678,41 @@ mod tests {
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[test]
+    fn schema_version_newer_database_is_refused_before_journal_mode_changes() {
+        let (root, context) = isolated_fixture();
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=2;").unwrap();
+        drop(conn);
+        assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "delete",
+                   "a refused newer database must keep its journal mode");
+    }
+
+    #[test]
+    fn schema_version_migrates_unversioned_database_missing_fts_with_rows_grants_and_audit() {
+        let (root, context) = isolated_fixture();
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
+        write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:55", scope: "group", kind: "fact",
+            subject: Some("topic"), content: "fts marker", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        conn.execute_batch("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('session','group:56','session','group:55','read',1);
+            INSERT INTO team_member(team_id,member_type,member_id) VALUES('t','session','group:55');
+            INSERT INTO memory_audit(at,actor,action,memory_id,detail) VALUES(1,'fixture','write',1,NULL);").unwrap();
+        let before: Vec<String> = rows(&conn).into_iter().filter(|r| !r.starts_with("SELECT rowid, seg FROM memory_fts")).collect();
+        conn.execute_batch("DROP TABLE memory_fts;").unwrap();
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
+        let after: Vec<String> = rows(&conn).into_iter().filter(|r| !r.starts_with("SELECT rowid, seg FROM memory_fts")).collect();
+        assert_eq!(after, before, "migration must keep rows, grants and audit unchanged");
+        assert_eq!(conn.query_row("SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'marker'", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
+                   "missing FTS must be repopulated from the rows");
     }
 
     struct FixtureRoot(PathBuf);

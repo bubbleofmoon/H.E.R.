@@ -104,3 +104,22 @@ pub(crate) fn ensure_or_rotate(
 pub(crate) fn mode(context: &RuntimeContext) -> String {
     crate::console::current_mode_for(context).unwrap_or_else(|_| "reserved2".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::owner_conversation;
+
+    #[test]
+    fn owner_conversation_is_present_only_for_an_integer_owner_qq() {
+        for (cfg, expected) in [
+            (json!({"ownerQQ": 1}), Some("private:1")),
+            (json!({}), None),
+            (json!({"ownerQQ": "1"}), None),
+            (json!({"ownerQQ": 1.5}), None),
+        ] {
+            assert_eq!(owner_conversation(&cfg).as_deref(), expected, "{cfg}");
+        }
+    }
+}

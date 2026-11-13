@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::conversation_authority as authority;
-use crate::memory::{MemoryStore, NewMemory};
+use crate::memory::{ForgetError, MemoryStore, NewMemory};
 use crate::runtime::RuntimeContext;
 
 /// The MCP memory tools use the same authorization and mutations as the HTTP surface.
@@ -184,9 +184,11 @@ pub(crate) fn handle(
             if number.fract() != 0.0 { return Err((403, "无权删除该条（不在可见范围）".to_string())); }
             let id = number as i64;
             // 先按可见范围确认这条确实看得见，看不见就当无权删（不是"不存在"）
-            match reader.forget(id).map_err(|e| (500, format!("删除失败：{e}")))? {
-                Some(ok) => Ok(json!({ "ok": ok })),
-                None => Err((403, "无权删除该条（不在可见范围）".to_string())),
+            match reader.forget(id) {
+                Ok(Some(ok)) => Ok(json!({ "ok": ok })),
+                Ok(None) => Err((403, "无权删除该条（不在可见范围）".to_string())),
+                Err(ForgetError::Check(e)) => Err((500, format!("检索失败：{e}"))),
+                Err(ForgetError::Delete(e)) => Err((500, format!("删除失败：{e}"))),
             }
         }
         "preview" => {
