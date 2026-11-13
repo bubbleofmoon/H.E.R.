@@ -182,8 +182,9 @@ impl<'a> Recorded<'a> {
     }
 
     /// Look for proof that item `idx`, attempted at `since_ms`, was delivered. One history message
-    /// proves one item: `exclude` plus every id the outbox confirmed since `since_ms` are skipped.
-    /// Proof appends a verified confirmation (its append result is returned with the id).
+    /// proves one item: `exclude` plus every id the outbox confirmed in the ten minutes before
+    /// `since_ms` onward are skipped. A confirmation without a message id, or an unreadable outbox,
+    /// proves nothing. Proof appends a verified confirmation (its append result is returned with the id).
     pub fn confirm_from_history(
         &self,
         idx: usize,
@@ -192,8 +193,14 @@ impl<'a> Recorded<'a> {
         proof: Proof<'_>,
         exclude: &[i64],
     ) -> Option<(i64, Result<(), String>)> {
+        // Ten minutes is wider than the 30-message history: every earlier confirmation that could
+        // share this attempt's whole-second times falls inside the window.
+        let (claimed, unidentified) = confirmed_since(self.context, since_ms - 600_000)?;
+        if unidentified {
+            return None;
+        }
         let mut exclude = exclude.to_vec();
-        exclude.extend(confirmed_ids_since(self.context, since_ms));
+        exclude.extend(claimed);
         let found = history_evidence(history, since_ms, &exclude, proof)?;
         Some((found, self.confirmed(idx, Some(found), true)))
     }
@@ -262,17 +269,26 @@ impl<'a> Recorded<'a> {
     }
 }
 
-fn confirmed_ids_since(context: &RuntimeContext, since_ms: i64) -> Vec<i64> {
-    read_records(context)
-        .unwrap_or_default()
+/// Message ids of the outbox's `confirmed` records dated at or after `since_ms`, and whether one of
+/// them has no integer message id (it cannot be excluded by id). `None` when the outbox cannot be
+/// read: nothing is then proven.
+fn confirmed_since(context: &RuntimeContext, since_ms: i64) -> Option<(Vec<i64>, bool)> {
+    let records = read_records(context).ok()?;
+    let confirmed: Vec<&Value> = records
         .iter()
         .filter(|r| r["k"] == "confirmed" && r["t"].as_i64().unwrap_or(0) >= since_ms)
+        .collect();
+    let unidentified = confirmed.iter().any(|r| !r["messageId"].is_i64());
+    let ids = confirmed
+        .iter()
         .filter_map(|r| r["messageId"].as_i64())
-        .collect()
+        .collect();
+    Some((ids, unidentified))
 }
 
 /// Our own message in the target's recent history, dated at or after `since_ms`, that matches
-/// `proof` and is not excluded. An unreadable history is "not proven".
+/// `proof` and is not excluded. Exactly one such message is proof; zero or several is not proven,
+/// and an unreadable history is not proven either.
 pub fn history_evidence(
     history: &History<'_>,
     since_ms: i64,
@@ -300,7 +316,7 @@ pub fn history_evidence(
     // identical older message is not proof. Clock skew can only turn a delivered item into
     // "unknown", which is never resent, so the window errs towards no duplicate.
     let threshold_s = since_ms / 1000;
-    messages.iter().rev().find_map(|m| {
+    let mut candidates = messages.iter().rev().filter_map(|m| {
         let sender = message_id(
             m.get("sender")
                 .and_then(|s| s.get("user_id"))
@@ -313,7 +329,9 @@ pub fn history_evidence(
             && proof_matches(m, proof)
             && !exclude.contains(&found))
         .then_some(found)
-    })
+    });
+    let first = candidates.next()?;
+    candidates.next().is_none().then_some(first)
 }
 
 fn proof_matches(message: &Value, proof: Proof<'_>) -> bool {
@@ -536,6 +554,254 @@ mod tests {
         assert!(
             !proof_matches(&json!({"message":[]}), Proof::Text("")),
             "empty text never proves delivery"
+        );
+    }
+
+    fn clock_a() -> i64 {
+        1_000_000
+    }
+
+    fn clock_b() -> i64 {
+        1_000_900
+    }
+
+    fn same_text(id: i64, time: i64) -> Value {
+        json!({"message_id": id, "time": time, "sender": {"user_id": 10001},
+            "message": [{"type": "text", "data": {"text": "same"}}]})
+    }
+
+    /// A gateway that answers login (user 10001) and one history read with `messages`, then stops.
+    fn history_gateway(messages: Value) -> (OneBot, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let ob = OneBot::new(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            String::new(),
+        );
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut paths = Vec::new();
+            while paths.len() < 2 && std::time::Instant::now() < deadline {
+                let stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).unwrap();
+                paths.push(path.clone());
+                let reply = match path.as_str() {
+                    "/get_login_info" => json!({"status": "ok", "retcode": 0, "data": {"user_id": 10001}}),
+                    "/get_group_msg_history" => json!({"status": "ok", "retcode": 0, "data": {"messages": messages.clone()}}),
+                    _ => json!({"status": "failed", "retcode": 1404}),
+                }
+                .to_string();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+            paths
+        });
+        (ob, worker)
+    }
+
+    fn same_text_intent(
+        context: &RuntimeContext,
+        clock: fn() -> i64,
+        created_at: i64,
+    ) -> Recorded<'_> {
+        Recorded::begin(
+            context,
+            clock,
+            created_at,
+            json!({"key": "group:1", "epoch": "e", "messages": ["same"]}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_earlier_confirmation_in_the_same_qq_second_claims_its_message() {
+        let (root, context) = root("her-recorded-claim-a-");
+        let (ob, gateway) = history_gateway(json!([same_text(11, 1000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        let a = same_text_intent(&context, clock_a, 1_000_000);
+        a.attempt(0, None).unwrap();
+        let first = a.settle(
+            0,
+            1_000_000,
+            Ok(json!({"message_id": 11})),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        assert_eq!(
+            first.state,
+            ItemState::Confirmed {
+                message_id: Some(11),
+                verified: false
+            }
+        );
+        drop(a);
+        let b = same_text_intent(&context, clock_b, 1_000_900);
+        let at = b.attempt(0, None).unwrap();
+        let second = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            second.state,
+            ItemState::Unknown,
+            "batch A already claims message 11: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_without_a_message_id_leaves_a_later_unknown_unproven() {
+        let (root, context) = root("her-recorded-claim-b-");
+        let (ob, gateway) = history_gateway(json!([same_text(11, 1000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        let a = same_text_intent(&context, clock_a, 1_000_000);
+        a.attempt(0, None).unwrap();
+        let first = a.settle(
+            0,
+            1_000_000,
+            Ok(json!({})),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        assert_eq!(
+            first.state,
+            ItemState::Confirmed {
+                message_id: None,
+                verified: false
+            }
+        );
+        drop(a);
+        let b = same_text_intent(&context, clock_b, 1_000_900);
+        let at = b.attempt(0, None).unwrap();
+        let second = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            second.state,
+            ItemState::Unknown,
+            "an unidentified confirmation cannot exclude its message: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn two_own_matching_messages_after_the_attempt_prove_nothing() {
+        let (root, context) = root("her-recorded-several-");
+        let (ob, gateway) = history_gateway(json!([same_text(21, 1000), same_text(22, 1000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        let b = same_text_intent(&context, clock_b, 1_000_900);
+        let at = b.attempt(0, None).unwrap();
+        let settled = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            settled.state,
+            ItemState::Unknown,
+            "two candidates cannot say which one is ours: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_outbox_proves_nothing() {
+        let (root, context) = root("her-recorded-unreadable-");
+        let (ob, gateway) = history_gateway(json!([same_text(11, 1000)]));
+        let history = History {
+            ob: &ob,
+            kind: "group",
+            id_s: "1",
+        };
+        std::fs::write(
+            root.join("data")
+                .join(crate::send_outbox::ISOLATED_OUTBOX_FILE),
+            "not json\n",
+        )
+        .unwrap();
+        let b = same_text_intent(&context, clock_b, 1_000_900);
+        let at = b.attempt(0, None).unwrap();
+        let settled = b.settle(
+            0,
+            at,
+            Err(SendError::Unknown("lost".into())),
+            &history,
+            Proof::Text("same"),
+            &[],
+        );
+        let paths = gateway.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            settled.state,
+            ItemState::Unknown,
+            "the exclusion list cannot be read, so nothing is proven: {paths:?}"
         );
     }
 }

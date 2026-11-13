@@ -1625,7 +1625,7 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut paths = Vec::new();
-            while paths.len() < 3 && Instant::now() < deadline {
+            while paths.len() < 4 && Instant::now() < deadline {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(Duration::from_millis(10)); continue; }
