@@ -1,10 +1,13 @@
 //! Runtime configuration behavior through an isolated console process.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window;
+mod support;
+#[path = "support/selftest.rs"]
+mod support_selftest;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -58,19 +61,8 @@ fn write_runtime(root: &Path) {
     fs::write(root.join("config/config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
     fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
     fs::write(root.join("data/mode.json"), r#"{"mode":"simulation","closedAgentPreset":""}"#).unwrap();
-    fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
+    crate::support::write_dependencies(root, crate::support::CLOSED, crate::support::CLOSED, crate::support::CLOSED, None);
 }
-fn hide_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 fn isolate_env(command: &mut Command, home: &Path) {
     command
         .env_remove("HER_RUNTIME_ROOT")
@@ -86,14 +78,6 @@ fn path_arg(path: &Path) -> &str {
     path.to_str().expect("utf-8 fixture path")
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 struct Console {
     child: Child,
     port: u16,
@@ -101,18 +85,19 @@ struct Console {
 
 impl Console {
     fn start(root: &Path) -> Self {
-        let port = free_port();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .arg("--console-serve")
-            .arg("--console-port")
-            .arg(port.to_string())
-            .arg("--runtime-root")
-            .arg(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        isolate_env(&mut command, &unique_dir("console-home"));
-        let child = command.spawn().expect("start isolated console candidate");
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(10), |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .arg("--console-serve")
+                .arg("--console-port")
+                .arg(port.to_string())
+                .arg("--runtime-root")
+                .arg(root)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            isolate_env(&mut command, &unique_dir("console-home"));
+            command.spawn().expect("start isolated console candidate")
+        });
         let mut console = Self { child, port };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
