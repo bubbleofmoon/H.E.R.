@@ -532,21 +532,35 @@ class KeyAcl(unittest.TestCase):
         s_mod = load()
         require(self, s_mod, 'dacl_problem')
         self.assertIsNone(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})', SID))
-        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-5-21-1-2-3-500)', SID), 'entry is not the current user')
+        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-5-21-1-2-3-500)', SID),
+                         'entry for another account: A;;FA;domain-rid-500')
         self.assertEqual(s_mod.dacl_problem(f'D:AI(A;;FA;;;{SID})', SID), 'not protected')
 
     def test_dacl_problem_describes_each_ace_without_identifiers(self):
         s_mod = load()
         require(self, s_mod, 'dacl_problem')
-        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;SY)(A;ID;FR;;;S-1-5-21-1-2-3-500)', 'S-1-5-21-1-2-3-1001'),
-                         'entry count 2: A;;FA;SY A;ID;FR;domain-rid-500')
-        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;SY)(A;ID;FR;;;S-1-5-21-1-2-3-1001)', 'S-1-5-21-1-2-3-1001'),
-                         'entry count 2: A;;FA;SY A;ID;FR;current-user')
-        for trustee, label in [('S-1-5-18', 'S-1-5-18'), ('S-1-5-32-544', 'S-1-5-32-544'),
-                               ('S-1-5-21-1-2-3-500', 'domain-rid-500'), ('S-1-15-2-1', 'other-account')]:
-            with self.subTest(trustee=trustee):
-                self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;SY)(A;;FA;;;{trustee})', 'S-1-5-21-1-2-3-1001'),
-                                 f'entry count 2: A;;FA;SY A;;FA;{label}')
+        require(self, s_mod, 'describe_ace')
+        self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})(A;;FR;;;{SID})', SID),
+                         'entry count 2: A;;FA;current-user A;;FR;current-user')
+        self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})(A;;FR;;;S-1-5-21-1-2-3-500)', SID),
+                         'entry for another account: A;;FR;domain-rid-500')
+        cases = [('A;;FA;;;SY', 'A;;FA;SY'), ('A;ID;FR;;;S-1-5-21-1-2-3-500', 'A;ID;FR;domain-rid-500'),
+                 ('A;;FA;;;S-1-5-18', 'A;;FA;S-1-5-18'), ('A;;FA;;;S-1-5-32-544', 'A;;FA;S-1-5-32-544'),
+                 ('A;;FA;;;S-1-15-2-1', 'A;;FA;other-account'), (f'A;;FA;;;{SID}', 'A;;FA;current-user')]
+        for ace, label in cases:
+            with self.subTest(ace=ace):
+                self.assertEqual(s_mod.describe_ace(ace, SID), label)
+
+    def test_dacl_problem_allows_only_privileged_builtins_beside_the_user(self):
+        s_mod = load()
+        require(self, s_mod, 'dacl_problem')
+        privileged = 'O:BAD:PAI(A;;FA;;;S-1-3-4)(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)'
+        self.assertIsNone(s_mod.dacl_problem(f'{privileged}(A;;FA;;;{SID})', SID))
+        self.assertEqual(s_mod.dacl_problem(f'{privileged}(A;;FA;;;{SID})(A;;FR;;;S-1-5-32-545)', SID),
+                         'entry for another account: A;;FR;S-1-5-32-545')
+        self.assertEqual(s_mod.dacl_problem('O:BAD:PAI(A;;FA;;;S-1-3-4)(A;;FA;;;S-1-5-18)', SID),
+                         'current user lacks full access')
+        self.assertEqual(s_mod.dacl_problem(f'O:BAD:PAI(A;;FA;;;{SID})(A;ID;FA;;;S-1-5-18)', SID), 'entry is inherited')
 
     @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
     def test_load_key_refuses_a_group_readable_file(self):

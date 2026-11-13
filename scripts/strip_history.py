@@ -19,7 +19,7 @@ Chinese-numeral runs, known names and name parts, and @mentions are replaced, re
 stable. A separate stricter residual scan and a field whitelist must pass, then gitleaks;
 otherwise nothing is written, and a failed publish removes what this run published.
 DIR/NAME.report.json holds counts only. The key file is restricted to the current user (POSIX
-mode 600, Windows protected DACL with one full-access ACE for the user, verified before the
+mode 600, Windows protected DACL with full access for the user and the PRIVILEGED_SIDS only, verified before the
 key is written and on every load), stays on the Windows host and is never committed.
 """
 import argparse
@@ -319,25 +319,33 @@ def describe_ace(ace, sid):
     return f'{fields[0]};{fields[1]};{fields[2]};{label}'
 
 
+# SYSTEM, Administrators, OWNER RIGHTS: the privileged built-ins OpenSSH for Windows accepts on a private key.
+PRIVILEGED_SIDS = ('S-1-5-18', 'S-1-5-32-544', 'S-1-3-4')
+
+
 def dacl_problem(sddl, sid):
-    """None when the DACL is protected and holds exactly one non-inherited full-access ACE for sid, else the first failed condition."""
+    """None when the DACL is protected, and every ACE is a non-inherited allow entry for sid or a PRIVILEGED_SIDS entry, with exactly one full-access entry for sid; else the first failed condition."""
     match = re.search(r'D:([A-Z]*)((?:\([^)]*\))*)', sddl)
     if not match or 'P' not in match.group(1):
         return 'not protected'
     aces = re.findall(r'\(([^)]*)\)', match.group(2))
-    if len(aces) != 1:
-        if not aces:
-            return 'entry count 0'
+    if not aces:
+        return 'entry count 0'
+    entries = [ace.split(';') for ace in aces]
+    for ace, fields in zip(aces, entries):
+        if len(fields) < 6:
+            return 'malformed entry'
+        if fields[0] != 'A':
+            return 'entry is not an allow entry'
+        if 'ID' in fields[1]:
+            return 'entry is inherited'
+        if fields[5] != sid and fields[5] not in PRIVILEGED_SIDS:
+            return 'entry for another account: ' + describe_ace(ace, sid)
+    user = [fields for fields in entries if fields[5] == sid]
+    if len(user) > 1:
         return f'entry count {len(aces)}: ' + ' '.join(describe_ace(ace, sid) for ace in aces)
-    fields = aces[0].split(';') + [''] * 6
-    if fields[0] != 'A':
-        return 'entry is not an allow entry'
-    if 'ID' in fields[1]:
-        return 'entry is inherited'
-    if fields[2] not in ('FA', '0x1f01ff'):
-        return 'entry is not full access'
-    if fields[5] != sid:
-        return 'entry is not the current user'
+    if not user or user[0][2] not in ('FA', '0x1f01ff'):
+        return 'current user lacks full access'
     return None
 
 
