@@ -1,7 +1,7 @@
 //! Seam 1: pinned dependency versions through the real supervisor/CLI, disposable fake
 //! dependency programs and a loopback fake npm registry. No real npm registry or DSH is contacted.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
 
@@ -15,6 +15,7 @@ const DSH_VERSION: &str = "0.2.1-rc.2";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 
 fn hidden(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    crate::support::ports::release_held(); // every child starts here: free the fixture's held ports first
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
@@ -189,10 +190,8 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        let reservations: Vec<_> = (0..3)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        let ports = std::array::from_fn(|i| reservations[i].local_addr().unwrap().port());
+        let reservations: Vec<_> = (0..3).map(|_| crate::support::ports::reserve()).collect();
+        let ports = std::array::from_fn(|i| reservations[i].port());
         let system_node = which("node");
         let npm = npm_cli(&system_node);
         let exe = if cfg!(windows) { "node.exe" } else { "node" };
@@ -233,7 +232,6 @@ impl Fixture {
         )
         .unwrap();
         std::fs::write(root.join("dependencies.json"), json!({"onebot":format!("http://127.0.0.1:{}",ports[0]),"dsh":format!("http://127.0.0.1:{}",ports[1]),"model":"http://127.0.0.1:1"}).to_string()).unwrap();
-        drop(reservations);
         let fixture = Self {
             root,
             node: system_node,
@@ -246,6 +244,7 @@ impl Fixture {
             env: Vec::new(),
         };
         fixture.save();
+        reservations.into_iter().for_each(crate::support::ports::hold); // freed by the first hidden() spawn
         fixture
     }
 
