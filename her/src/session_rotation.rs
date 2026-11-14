@@ -1,6 +1,5 @@
-//! Cache-aware idle session rotation. The hub owns the conversation slot; unknown digest RPCs are verified, never blindly replayed.
+//! Cache-aware idle session rotation. The hub owns the conversation slot; the Digest module digests the conversation's stored messages before retirement.
 use crate::{
-    dsh::{self, FollowStream, PromptProbe, Rpc},
     runtime::RuntimeContext,
 };
 use serde_json::{json, Value};
@@ -10,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) struct Plan {
@@ -123,7 +122,6 @@ pub(crate) enum DigestResult {
     Pending,
 }
 
-const DIGEST: &str = "【记忆整理】现在做一次内部整理，不要把这段话说给用户听。回顾这个会话，把以后还会用到的偏好、决定、经验、关系和长期话题用 memory_write 写进长期记忆，一条一句，3~8条，每条200字以内，subject填话题名或人名。完成后直接结束；不要发送QQ消息，不要设置唤醒，不要回复用户。";
 
 pub(crate) fn failure(context: &RuntimeContext, cfg: &Value, plan: &Plan, phase: &str) {
     rotation_notice(context, cfg, &plan.key, phase);
@@ -323,7 +321,7 @@ pub(crate) async fn digest(
     if mapped.is_none() {
         return DigestResult::Pending;
     }
-    match digest_inner(&context, &plan, &cancel).await {
+    match digest_inner(&context, &cfg, &plan, &cancel).await {
         Ok(Some(success)) => {
             if finish(&context, &plan, success, false).is_err() {
                 let _ = report_failure(
@@ -388,19 +386,6 @@ impl DigestFailure {
             settled,
         }
     }
-    fn external(step: &'static str, error: &str) -> Self {
-        let kind = if dsh::is_session_gone(error) {
-            "session-gone"
-        } else if error.contains("被拒") || error.contains("流返回错误") {
-            "rejected"
-        } else if error.contains("超时") || error.contains("timeout") || error.contains("timed out")
-        {
-            "timeout"
-        } else {
-            "transport"
-        };
-        Self::new(step, kind, false)
-    }
 }
 
 fn report_failure(
@@ -442,239 +427,30 @@ fn report_failure(
     Ok(count)
 }
 
-// The legacy memory MCP adapter reports write errors as text with isError:false.
-// Fold only its fixed error prefix into the local verification facts; never log the text.
-fn digest_facts(events: &[Value], ids: &[String]) -> Option<PromptProbe> {
-    let mut probe = dsh::facts_from_events(events, ids)?;
-    if let PromptProbe::Turn(facts) = &mut probe {
-        let turn = facts.dsh_turn;
-        for tool in &mut facts.tools {
-            if !tool.name.ends_with("memory_write") {
-                continue;
-            }
-            if events.iter().any(|event| {
-                let call_id = &event["data"]["message"]["source"]["callId"];
-                let same_id = call_id.as_str().is_some_and(|id| id == tool.call_id)
-                    || (call_id.is_number() && call_id.to_string() == tool.call_id);
-                event["type"] == "tool/result"
-                    && event["data"]["turn"] == turn
-                    && same_id
-                    && event["data"]["message"]["content"]
-                        .as_array()
-                        .is_some_and(|blocks| {
-                            blocks
-                                .iter()
-                                .filter_map(|b| b["text"].as_str())
-                                .any(|text| text.trim_start().starts_with("写入失败："))
-                        })
-            }) {
-                tool.ok = false;
-            }
-        }
-    }
-    Some(probe)
-}
-
-// A tool-only digest may finish with no text. Nonempty output uses the same
-// refusal/error classifiers as ordinary turns, including recovered completions.
-fn digest_completed(facts: &dsh::TurnFacts) -> Result<bool, DigestFailure> {
-    if facts
-        .ended
-        .as_ref()
-        .and_then(|e| e.pointer("/reason/kind"))
-        .and_then(Value::as_str)
-        != Some("completed")
-    {
-        return Err(DigestFailure::new("digest-result", "turn-failed", true));
-    }
-    if facts
-        .tools
-        .iter()
-        .any(|t| t.name.ends_with("memory_write") && (!t.done || !t.ok))
-    {
-        return Err(DigestFailure::new("memory-write", "tool-failed", true));
-    }
-    let text = facts.text.trim();
-    let lower = text.to_ascii_lowercase();
-    let success = text.is_empty()
-        || (!crate::model_failure::Failure::is_refusal(text)
-            && crate::backend::plain_output_failure(text).is_none()
-            && !lower.starts_with("model/backend ")
-            && serde_json::from_str::<Value>(text)
-                .ok()
-                .and_then(|value| crate::backend::json_output_failure(&value))
-                .is_none());
-    if success {
-        Ok(true)
-    } else {
-        Err(DigestFailure::new(
-            "digest-result",
-            "refusal-or-error",
-            true,
-        ))
-    }
-}
-
-async fn digest_inner(
-    context: &RuntimeContext,
-    plan: &Plan,
-    cancel: &AtomicBool,
-) -> Result<Option<bool>, DigestFailure> {
+/// Digest the conversation's stored messages. Memories and the digest cursor commit together, so every
+/// outcome is settled; cancellation returns at once and a late result writes nothing.
+async fn digest_inner(context: &RuntimeContext, cfg: &Value, plan: &Plan, cancel: &Arc<AtomicBool>) -> Result<Option<bool>, DigestFailure> {
     let r = crate::session_map::context_record(context, &plan.key, &plan.sid, &plan.epoch)
         .map_err(|_| DigestFailure::new("context-read", "storage", false))?;
-    let pending = r["rotation"]["phase"] == "pending";
-    if !pending
-        && (cancel.load(Ordering::SeqCst)
-            || r["digestedThrough"].as_i64().unwrap_or(0) >= plan.turn_seq)
-    {
+    if cancel.load(Ordering::SeqCst) || r["digestedThrough"].as_i64().unwrap_or(0) >= plan.turn_seq {
         return Ok(None);
     }
-    let rpc = Rpc::connect_with_runtime(
-        context,
-        context
-            .dependency_url("dsh")
-            .ok_or_else(|| DigestFailure::new("connect", "endpoint-missing", true))?,
-    )
-    .map_err(|_| DigestFailure::new("connect", "credentials", false))?;
-    let rpc_id = if pending {
-        r["rotation"]["rpcId"]
-            .as_str()
-            .ok_or_else(|| DigestFailure::new("rpc-lookup", "identity-missing", false))?
-            .to_string()
-    } else {
-        dsh::mint_request_id()
+    let (context, cfg, key, flag) = (context.clone(), cfg.clone(), plan.key.clone(), cancel.clone());
+    let mut task = tokio::task::spawn_blocking(move || {
+        let model = crate::digest::model_for(&context, &cfg).map_err(|error| crate::digest::DigestError::Model(error.0))?;
+        crate::digest::Digest::new(&context, &cfg, model.as_ref())
+            .run_conversation(&key, &crate::digest::Limits { min_messages: 1, min_interval_ms: 0 }, &flag)
+    });
+    let outcome = loop {
+        tokio::select! {
+            joined = &mut task => break joined.map_err(|_| DigestFailure::new("digest", "worker", true))?,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => if cancel.load(Ordering::SeqCst) { return Ok(None); },
+        }
     };
-    let mut follow = tokio::time::timeout(
-        Duration::from_secs(20),
-        FollowStream::open_with_max(&rpc.base, &rpc.cookie(), &plan.sid, 200),
-    )
-    .await
-    .map_err(|_| DigestFailure::new("follow-open", "timeout", false))?
-    .map_err(|e| DigestFailure::external("follow-open", &e))?;
-    let mut events = follow.snapshot.events.clone();
-    if pending
-        && matches!(
-            digest_facts(&events, &[rpc_id.clone()]),
-            None | Some(PromptProbe::RemovedFromQueue)
-        )
-    {
-        // Absence or removal never permits replay: another identity may already have
-        // written memories. Verify only this persisted RPC, then retire conservatively.
-        let error = match dsh::probe_prompt(&rpc, &plan.sid, &[rpc_id.clone()]).await {
-            PromptProbe::NotFound { proved: false } => {
-                Some(DigestFailure::new("rpc-lookup", "history-truncated", false))
-            }
-            PromptProbe::NotFound { proved: true } | PromptProbe::RemovedFromQueue => Some(
-                DigestFailure::new("rpc-lookup", "identity-unverified", false),
-            ),
-            PromptProbe::SessionGone => {
-                Some(DigestFailure::new("rpc-lookup", "session-gone", true))
-            }
-            PromptProbe::Unreachable(error) => Some(DigestFailure::external("rpc-lookup", &error)),
-            _ => None,
-        };
-        if let Some(error) = error {
-            follow.close().await;
-            return Err(error);
-        }
-    }
-    let mut submission_error = None;
-    if !pending {
-        if !crate::session_map::update_context(context, &plan.key, &plan.sid, &plan.epoch, |r| {
-            r["rotation"] = json!({"phase":"pending","rpcId":rpc_id,"turnSeq":plan.turn_seq});
-        })
-        .map_err(|_| DigestFailure::new("intent-write", "storage", true))?
-        {
-            return Err(DigestFailure::new("intent-write", "session-changed", true));
-        }
-        let submitted = rpc.call_with_rpc_id(
-            "session/prompt",
-            json!({"sessionId":plan.sid,"mode":"queue","content":[{"type":"text","text":DIGEST}]}),
-            &rpc_id,
-        );
-        if submitted.as_ref().is_ok_and(|v| v["accepted"] != true)
-            || submitted
-                .as_ref()
-                .err()
-                .is_some_and(|error| crate::pipeline::definite_refusal(error))
-        {
-            follow.close().await;
-            return Err(DigestFailure::new("prompt", "rejected", true));
-        }
-        submission_error = submitted
-            .as_ref()
-            .err()
-            .map(|error| DigestFailure::external("prompt", error));
-        // A lost response remains pending; the observed source.rpcId proves execution below.
-    }
-    let ids = vec![rpc_id];
-    let budget = if cfg!(test) {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_secs(120)
-    };
-    let deadline = Instant::now() + budget;
-    let mut stopped = false;
-    loop {
-        if let Some(PromptProbe::Turn(facts)) = digest_facts(&events, &ids) {
-            if facts.ended.is_some() {
-                follow.close().await;
-                return digest_completed(&facts).map(Some);
-            }
-        }
-        if cancel.load(Ordering::SeqCst) && !stopped {
-            dsh::stop_session_work(&rpc, &plan.sid)
-                .map_err(|e| DigestFailure::external("cancel", &e))?;
-            stopped = true;
-        }
-        if Instant::now() >= deadline {
-            follow.close().await;
-            return Err(submission_error
-                .unwrap_or_else(|| DigestFailure::new("turn-facts", "timeout", false)));
-        }
-        match follow.next_event(Duration::from_millis(500)).await {
-            Ok(event) => {
-                if event["type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("compaction/"))
-                    || event.get("surfaceOp").is_some()
-                {
-                    crate::session_context::observe(
-                        context,
-                        &plan.key,
-                        &plan.sid,
-                        &plan.epoch,
-                        &event,
-                    )
-                    .map_err(|_| DigestFailure::new("observe", "storage", false))?;
-                }
-                events.push(event);
-            }
-            Err(error) => {
-                let failure = DigestFailure::external("follow-read", &error);
-                if failure.kind != "timeout" {
-                    follow.close().await;
-                    return Err(failure);
-                }
-            }
-        }
-        // A restart may find a queued, removed, refused or not-yet-transmitted intent. Probe it
-        // without resubmission; a partial snapshot's absence proves nothing.
-        if pending && events.len() == follow.snapshot.events.len() {
-            match dsh::probe_prompt(&rpc, &plan.sid, &ids).await {
-                PromptProbe::SessionGone
-                | PromptProbe::RemovedFromQueue
-                | PromptProbe::NotFound { proved: true } => {
-                    follow.close().await;
-                    return Err(DigestFailure::new(
-                        "rpc-lookup",
-                        "identity-unverified",
-                        false,
-                    ));
-                }
-                _ => {}
-            }
-        }
+    match outcome {
+        Ok(_) => Ok(Some(true)),
+        Err(crate::digest::DigestError::Cancelled) => Ok(None),
+        Err(error) => Err(DigestFailure::new(error.step(), error.kind(), true)),
     }
 }
 
