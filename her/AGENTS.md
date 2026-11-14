@@ -13,7 +13,7 @@ Read the topic doc before changing its implementation:
 - MCP protocol, QQ send confirmation, auxiliary servers, generated DSH config and memory permissions: `docs/agents/mcp-memory.md`.
 - Media acquisition, normalization, stickers, required voice duration validation (SILK uses a 100 ms per-packet upper bound) and delivery: `docs/agents/media-transport.md`.
 - DSH credentials, cancellable RPC, retry/failover, relay health and alerts: `docs/agents/dependency-recovery.md`.
-- Releases and installs, dependency startup, ownership, recovery and stop; supervisor lifecycle, health checks, scheduled tasks, digest, backups and task storage: `docs/agents/lifecycle-tasks.md`.
+- Releases and installs, dependency startup, ownership, recovery and stop; supervisor lifecycle, health checks, scheduled tasks, digest, backups, the Schedule store and page and task storage: `docs/agents/lifecycle-tasks.md`.
 - Build slots, isolated targets, fixture clocks, independent QQ login retry-spacing assertions, pending-interaction publication waits and verification evidence: `docs/agents/rust-validation.md`.
 - Public production rules and the `her-cli report` contract (procedures live in the vault): `docs/agents/production-ops.md`.
 - Signed release dependency notices: `THIRD_PARTY_NOTICES.md`.

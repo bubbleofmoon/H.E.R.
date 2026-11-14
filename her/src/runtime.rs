@@ -1105,6 +1105,9 @@ impl RuntimeContext {
                     | ("GET", "/api/recovery-record")
             )
             || (method == "GET" && matches!(path, "/tasks" | "/api/tasks"))
+            || (method == "GET" && matches!(path, "/schedule" | "/api/schedule"))
+            || (method == "POST" && path == "/api/schedule")
+            || (matches!(method, "GET" | "POST") && path.starts_with("/api/schedule/"))
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
             || (method == "POST" && path == "/api/memory/archive")
             || path.strip_prefix("/api/slang/").is_some_and(|tail| {

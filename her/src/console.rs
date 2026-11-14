@@ -41,6 +41,8 @@ mod voice_http;
 #[path = "console_access.rs"]
 mod access;
 pub(crate) use access::take_admin_wake;
+#[path = "console_schedule.rs"]
+mod schedule_routes;
 pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
     revoke as revoke_agent_token, token as conversation_token,
@@ -482,6 +484,7 @@ fn is_bounded_json_post(method: &str, path: &str) -> bool {
     is_role_management_post(method, path)
         || (method == "POST" && path == "/api/socialV2/send-message")
         || (method == "POST" && path.starts_with("/api/tasks/"))
+        || (method == "POST" && (path == "/api/schedule" || path.starts_with("/api/schedule/")))
         || (method == "POST" && path.starts_with("/api/backups/"))
         || (method == "POST" && path.starts_with("/api/releases/"))
         || (method == "POST" && path.starts_with("/api/dependencies/"))
@@ -12142,6 +12145,9 @@ fn route_with_context(
             Ok(value) => (if value["queued"] == true {202} else {200}, "application/json; charset=utf-8".to_string(), value.to_string()),
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
+    }
+    if context.is_isolated() && schedule_routes::is_schedule_path(&req.path) {
+        return schedule_routes::route(context, cfg, req);
     }
     if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
         // Hold the configuration gate until the lifecycle mutation commits. A credential
@@ -24047,6 +24053,43 @@ mod tests {
         assert!(final_state["conversations"][key].get("modelSeenSeqs").map_or(true, |v| v == &json!([])), "the receipt is never persisted");
         assert_eq!(agent::receipts_for(&context, key, &final_state["conversations"][key]), vec![1]);
         drop(root);
+    }
+
+    #[test]
+    fn schedule_writes_recheck_the_console_credential_under_the_config_gate() {
+        const OLD: &str = "fixture-schedule-old-console-token";
+        const NEW: &str = "fixture-schedule-new-console-token";
+        let (root, context) = fixture_runtime("ticket33 schedule revoked", OLD);
+        // The front door accepted the old credential; the rotation completed while the request waited.
+        let front = context.load_config().unwrap();
+        let config_path = root.0.join("config/config.json");
+        let mut raw: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        raw["consoleToken"] = json!(NEW);
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let now = crate::parity_clock::now_ms();
+        let writes = [
+            ("/api/schedule", json!({"conversation": "private:7001", "text": "喝水", "at": now + 3_600_000})),
+            ("/api/schedule/item:rem-fixture/cancel", json!({})),
+            ("/api/schedule/system:backup/pause", json!({"confirm": true})),
+            ("/api/schedule/system:backup/run", json!({"confirm": true, "requestId": "fixture-request-33"})),
+            ("/api/schedule/reachOut:private:7001/cancel", json!({"at": now + 60_000})),
+            ("/api/schedule/replyCheck:private:7001/run", json!({})),
+            ("/api/schedule/sleep:private:7001/cancel", json!({})),
+        ];
+        for (path, body) in writes {
+            let mut request = req("POST", path, Some(OLD));
+            request.body = body.to_string();
+            let (status, _, response) = schedule_routes::route(&context, &front, &request);
+            assert_eq!(status, 401, "{path}: {response}");
+        }
+        assert!(!root.0.join("data/schedule.json").exists(), "nothing was written with the revoked credential");
+        assert!(!std::fs::read_to_string(root.0.join("data/social-v2.json")).unwrap().contains("adminWakes"));
+
+        let mut request = req("POST", "/api/schedule/system:backup/pause", Some(NEW));
+        request.body = json!({"confirm": true}).to_string();
+        let (status, _, response) = schedule_routes::route(&context, &context.load_config().unwrap(), &request);
+        assert_eq!(status, 200, "{response}");
+        assert!(crate::schedule::ScheduleStore::new(&context).system_paused("backup"));
     }
 
     #[test]

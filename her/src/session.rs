@@ -207,6 +207,17 @@ impl Driver {
         let r = self.next_rand01();
         self.sched.schedule_proactive(now, r);
     }
+
+    /// Ticket 33: the owner cancelled the reach-out chance at `at` on the Schedule page. That chance is skipped and
+    /// the next one is armed from it, as if it had passed without firing (never a fresh, possibly sooner, roll from now).
+    pub fn skip_proactive(&mut self, at: i64) {
+        if self.sched.proactive_at != Some(at) {
+            return;
+        }
+        self.sched.proactive_at = None;
+        let roll = self.next_rand01();
+        let _ = self.sched.schedule_proactive(at, roll);
+    }
     /// 把所有已到期的定时器跑一遍，返回该发的唤醒。
     /// 反复调用直到没有更早的截止时刻，保证同一个时间点上的多个定时器都处理。
     pub fn pump(&mut self, now: i64) -> Vec<WakeEvent> {

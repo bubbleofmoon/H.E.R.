@@ -157,6 +157,11 @@ pub fn enabled(cfg: &Value, def: &TaskDef) -> bool {
         .and_then(Value::as_bool).unwrap_or(def.enabled_by_default)
 }
 
+/// `enabled` and not paused by the owner on the Schedule page.
+pub fn enabled_in(context: &RuntimeContext, cfg: &Value, def: &TaskDef) -> bool {
+    enabled(cfg, def) && !crate::schedule::system_job_paused(context, def.id.as_str())
+}
+
 fn limits(cfg: &Value) -> StoreLimits {
     let config = task_config(cfg, "limits");
     let n = |key: &str, default: u64, min: u64, max: u64| {
@@ -282,6 +287,12 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
     if !install.is_absolute() { return Err("tasks.installRoot must be absolute".into()); }
     let admission_context = context.clone();
     let admission: tasks::Admission = Box::new(move |def, run| {
+        if run.view().source == RunSource::Scheduled && crate::schedule::PAUSABLE_JOBS.contains(&def.id.as_str()) {
+            // Ticket 33: a fresh read of the owner pause, holding the Schedule store lock until the run is marked
+            // running (the executor keeps the returned guard), so a pause that has answered is never overtaken by a
+            // due slot. An unreadable store refuses the start.
+            return crate::schedule::ScheduleStore::new(&admission_context).admit_scheduled(def.id.as_str()).map(Some);
+        }
         if run.view().source != RunSource::Manual || run.view().by.as_deref() != Some("console") {
             return Ok(None);
         }
@@ -300,7 +311,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
     let running_check = Box::new(move |def: &TaskDef| def.runs_when_held || !matches!(desired(&running_context), Effective::Act { wants, .. } if !wants.jobs));
     let executor = Arc::new(RuntimeExecutor { context: context.clone(), inner: CommandExecutor::new(tasks::node_resolver(node, install, root), internal, clock.clone()).with_admission(admission).with_running_check(running_check) });
     let dispatcher = Dispatcher::new(store, executor, clock.clone());
-    let mut scheduler = Scheduler::new(|def| enabled(cfg, def), tasks::local_offset_ms(), clock.now_ms());
+    let mut scheduler = Scheduler::new(|def| enabled_in(context, cfg, def), tasks::local_offset_ms(), clock.now_ms());
     crate::backup::refresh_schedule(cfg, &mut scheduler, clock.now_ms())?;
     let scheduler = Arc::new(Mutex::new(scheduler));
     Ok(crate::console_tasks::TasksApi { dispatcher, scheduler, desired: DesiredStore::new(context.data_dir().join("lifecycle")) })
@@ -743,7 +754,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             drop(checked);
             let mut schedule = refresh_scheduler.lock().unwrap_or_else(|p| p.into_inner());
             for def in tasks::REGISTRY {
-                let on = enabled(&cfg, def);
+                let on = enabled_in(&refresh_context, &cfg, def);
                 if schedule.enabled(def.id) != on { schedule.set_enabled(def.id, on, now); }
             }
             if let Err(error) = crate::backup::refresh_schedule(&cfg, &mut schedule, now) {
