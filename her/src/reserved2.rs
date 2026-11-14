@@ -109,6 +109,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_due_reminder_is_claimed_once_after_restart_and_paused_reminders_wait() {
+        use crate::schedule::{Creator, NewItem, Repeat, ScheduleStore};
+        let (root, mut hub) = queued_hub("schedule-reminder").await;
+        let cfg = hub.context.load_config().unwrap();
+        let store = ScheduleStore::new(&hub.context);
+        let now = crate::now_ms() as i64;
+        let at = now + 60_000;
+        let every = store
+            .create(NewItem { creator: Creator::Owner, conversation: "group:420042".into(), text: "喝水".into(), at, repeat: Repeat::Every { minutes: 60 } }, now)
+            .unwrap();
+        let paused = store
+            .create(NewItem { creator: Creator::Owner, conversation: "group:420043".into(), text: "开会".into(), at, repeat: Repeat::Once }, now)
+            .unwrap();
+        store.set_item_paused(&paused.id, true).unwrap();
+        hub.ready.clear();
+
+        // The hub keeps no reminder state: a later clock over the same store file is the restart.
+        let later = now + 3 * 86_400_000;
+        hub.sync_schedule(&cfg, false, later);
+        assert_eq!(hub.ready, vec![("group:420042".to_string(), format!("reminder:{}", every.id))]);
+        hub.ready.clear();
+        hub.sync_schedule(&cfg, false, later + 1_000);
+        assert!(hub.ready.is_empty(), "a claimed repeat is not claimed again");
+        let stored = store.item(&every.id).unwrap().unwrap();
+        assert!(stored.next_at > later, "a missed repeat jumps to the next slot after now");
+        assert!(stored.last_result.unwrap().late);
+
+        store.run_now(&paused.id).unwrap();
+        hub.sync_schedule(&cfg, false, later + 2_000);
+        assert_eq!(hub.ready, vec![("group:420043".to_string(), format!("reminder:{}", paused.id))]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn schedule_publishes_her_timers_and_applies_console_cancels() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-timers").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        hub.ready.clear();
+        hub.drivers.get_mut(key).unwrap().sched.reply_check_at = Some(now + 600_000);
+
+        let lists_reply_check = |root: &std::path::Path| {
+            let published: Value = serde_json::from_slice(&std::fs::read(root.join("data/schedule-timers.json")).unwrap()).unwrap();
+            published["timers"].as_array().unwrap().iter().any(|timer| timer["conversation"] == key && timer["kind"] == "replyCheck")
+        };
+        hub.sync_schedule(&cfg, false, now);
+        assert!(lists_reply_check(&root), "her reply check is published");
+
+        ScheduleStore::new(&hub.context).request_timer_cancel(key, TimerKind::ReplyCheck, now + 600_000, now).unwrap();
+        hub.pump_timers(&cfg, now);
+        hub.sync_schedule(&cfg, false, now);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, None, "the console cancel clears the timer");
+        assert!(!lists_reply_check(&root), "the snapshot no longer lists the cancelled timer");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn schedule_cancel_applies_before_timers_fire_and_only_to_the_timer_seen() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-cancel-order").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        let store = ScheduleStore::new(&hub.context);
+        hub.ready.clear();
+        {
+            let d = hub.drivers.get_mut(key).unwrap();
+            d.sched.pending_wake_at = None;
+            d.sched.pending_wake_key_at = None;
+            d.sched.prompt_running = false;
+            d.sched.prompt_queued = false;
+            d.sched.reply_check_at = Some(now - 1_000);
+        }
+        // Publish what the owner sees (suspended: nothing is claimed), then cancel that due timer.
+        hub.sync_schedule(&cfg, true, now - 2_000);
+        store.request_timer_cancel(key, TimerKind::ReplyCheck, now - 1_000, now - 1_500).unwrap();
+        hub.pump_timers(&cfg, now);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, None);
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "replyCheck"), "a cancelled reply check never fires: {:?}", hub.ready);
+
+        // A cancel names the timer the owner saw: a timer re-armed since is left alone.
+        hub.drivers.get_mut(key).unwrap().sched.reply_check_at = Some(now + 600_000);
+        hub.sync_schedule(&cfg, true, now);
+        store.request_timer_cancel(key, TimerKind::ReplyCheck, now + 600_000, now).unwrap();
+        hub.drivers.get_mut(key).unwrap().sched.reply_check_at = Some(now + 900_000);
+        hub.pump_timers(&cfg, now);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, Some(now + 900_000));
+
+        // Reach-out: the cancelled chance is skipped and the next one is armed from it, never sooner.
+        let chance = now + 600_000;
+        {
+            let d = hub.drivers.get_mut(key).unwrap();
+            d.sched.cfg.proactive_enabled = true;
+            d.sched.proactive_at = Some(chance);
+        }
+        hub.sync_schedule(&cfg, true, now + 1);
+        store.request_timer_cancel(key, TimerKind::ReachOut, chance, now + 1).unwrap();
+        hub.pump_timers(&cfg, now + 1);
+        let next = hub.drivers[key].sched.proactive_at.expect("the next chance is armed");
+        assert!(next > chance, "the next chance comes after the cancelled one: {next} <= {chance}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn schedule_cancels_that_cannot_be_read_defer_due_timers_until_they_can() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-cancel-unreadable").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        let store = ScheduleStore::new(&hub.context);
+        hub.ready.clear();
+        {
+            let d = hub.drivers.get_mut(key).unwrap();
+            d.sched.pending_wake_at = None;
+            d.sched.pending_wake_key_at = None;
+            d.sched.prompt_running = false;
+            d.sched.prompt_queued = false;
+            d.sched.reply_check_at = Some(now - 1_000);
+        }
+        // The owner cancels the due reply check; the cancel is persisted.
+        hub.sync_schedule(&cfg, true, now - 2_000);
+        store.request_timer_cancel(key, TimerKind::ReplyCheck, now - 1_000, now - 1_500).unwrap();
+        let persisted = std::fs::read(root.join("data/schedule.json")).unwrap();
+
+        // The store becomes unreadable: the cancel cannot be taken, so the due timer waits instead of firing.
+        std::fs::write(root.join("data/schedule.json"), "not json").unwrap();
+        hub.pump_timers(&cfg, now);
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "replyCheck"), "an unreadable cancel must not let the timer fire: {:?}", hub.ready);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, Some(now - 1_000), "the due timer is kept for a later tick");
+
+        // The store reads again with the cancel in it: the next tick applies it, and the timer never fires.
+        std::fs::write(root.join("data/schedule.json"), &persisted).unwrap();
+        hub.pump_timers(&cfg, now);
+        assert_eq!(hub.drivers[key].sched.reply_check_at, None, "the cancel is applied on the first readable tick");
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "replyCheck"), "a cancelled reply check never fires: {:?}", hub.ready);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn schedule_reach_out_cancel_that_cannot_be_read_defers_the_due_chance_until_it_can() {
+        use crate::schedule::{ScheduleStore, TimerKind};
+        let (root, mut hub) = queued_hub("schedule-reachout-unreadable").await;
+        let cfg = hub.context.load_config().unwrap();
+        let key = "group:420042";
+        let now = crate::now_ms() as i64;
+        let store = ScheduleStore::new(&hub.context);
+        hub.ready.clear();
+        let due = now - 1_000;
+        {
+            let d = hub.drivers.get_mut(key).unwrap();
+            d.sched.cfg.proactive_enabled = true;
+            d.sched.pending_wake_at = None;
+            d.sched.pending_wake_key_at = None;
+            d.sched.prompt_running = false;
+            d.sched.prompt_queued = false;
+            d.sched.proactive_at = Some(due);
+        }
+        // The owner skips the due reach-out chance; the cancel is persisted.
+        hub.sync_schedule(&cfg, true, now - 2_000);
+        store.request_timer_cancel(key, TimerKind::ReachOut, due, now - 1_500).unwrap();
+        let persisted = std::fs::read(root.join("data/schedule.json")).unwrap();
+
+        // Unreadable store: the chance is kept as it was, and nothing is announced for it.
+        std::fs::write(root.join("data/schedule.json"), "not json").unwrap();
+        hub.pump_timers(&cfg, now);
+        assert_eq!(hub.drivers[key].sched.proactive_at, Some(due), "the due reach-out is deferred, not re-rolled");
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "proactiveCheck"), "a cancelled reach-out does not fire: {:?}", hub.ready);
+
+        // Readable again: the cancel skips the chance, and the next one is armed after it.
+        std::fs::write(root.join("data/schedule.json"), &persisted).unwrap();
+        hub.pump_timers(&cfg, now);
+        let next = hub.drivers[key].sched.proactive_at.expect("the next chance is armed");
+        assert!(next > due, "the next chance comes after the cancelled one: {next} <= {due}");
+        assert!(!hub.ready.iter().any(|(k, r)| k == key && r == "proactiveCheck"), "a cancelled reach-out never fires: {:?}", hub.ready);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn schedule_reminders_wait_while_dsh_is_down_or_a_wake_is_parked_then_run_late_once() {
+        use crate::schedule::{Creator, NewItem, Repeat, ScheduleStore};
+        let (root, mut hub) = queued_hub("schedule-dsh-wait").await;
+        let cfg = hub.context.load_config().unwrap();
+        let store = ScheduleStore::new(&hub.context);
+        let now = crate::now_ms() as i64;
+        let hourly = store
+            .create(NewItem { creator: Creator::Owner, conversation: "group:420042".into(), text: "喝水".into(), at: now + 60_000, repeat: Repeat::Every { minutes: 60 } }, now)
+            .unwrap();
+        let pinned = store
+            .create(NewItem { creator: Creator::Owner, conversation: "group:420043".into(), text: "开会".into(), at: now + 60_000, repeat: Repeat::Once }, now)
+            .unwrap();
+        hub.ready.clear();
+
+        // A parked wake holds the conversation's reminders back.
+        hub.dsh_wait.push("group:420042", now, "atMention".into());
+        hub.dsh_wait.push("group:420043", now, "atMention".into());
+        hub.sync_schedule(&cfg, false, now + 120_000);
+        assert!(hub.ready.is_empty(), "nothing is claimed beside a parked wake: {:?}", hub.ready);
+        hub.dsh_wait.clear();
+
+        // Ten hours of DSH outage: no slot is claimed, except for a conversation with a pinned CLI.
+        crate::dsh_health::observe(&hub.context, &cfg, false, "synthetic outage", true);
+        let mut pinned_cfg = cfg.clone();
+        pinned_cfg["backends"] = json!({"sessions": {"group:420043": "cli-fixture"}});
+        for hour in 1..=10_i64 {
+            hub.sync_schedule(&pinned_cfg, false, now + hour * 3_600_000);
+        }
+        assert_eq!(hub.ready, vec![("group:420043".to_string(), format!("reminder:{}", pinned.id))], "only the pinned CLI conversation is claimed");
+        hub.ready.clear();
+        let waiting = store.item(&hourly.id).unwrap().unwrap();
+        assert!(waiting.last_result.is_none(), "no slot was marked run during the outage");
+        assert_eq!(waiting.next_at, now + 60_000);
+
+        // Recovery: one late run, then nothing more (no catch-up burst).
+        crate::dsh_health::observe(&hub.context, &cfg, true, "", true);
+        let later = now + 10 * 3_600_000 + 1_000;
+        hub.sync_schedule(&cfg, false, later);
+        assert_eq!(hub.ready, vec![("group:420042".to_string(), format!("reminder:{}", hourly.id))]);
+        let ran = store.item(&hourly.id).unwrap().unwrap();
+        assert!(ran.last_result.unwrap().late);
+        assert!(ran.next_at > later);
+        hub.ready.clear();
+        hub.sync_schedule(&cfg, false, later + 1_000);
+        assert!(hub.ready.is_empty(), "missed repeats are not caught up");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn hf135_partial_reset_keeps_maintenance_and_queued_ingress_until_revoked() {
         use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
         let (root,mut hub) = queued_hub("hf135-partial-reset").await;
@@ -1797,6 +2027,8 @@ pub struct Hub {
     slang: crate::slang_learn::SlangLearning,
     /// Member-name and quoted-message lookups (and their caches) for inbound text; built on first use.
     lookups: Option<chat::Lookups>,
+    /// Ticket 33: when a Schedule store error was last logged (at most one line a minute; the hub ticks every 500 ms).
+    schedule_log_at: i64,
 }
 
 impl Hub {
@@ -1849,6 +2081,7 @@ impl Hub {
                 slang
             },
             lookups: None,
+            schedule_log_at: 0,
         }
     }
 
@@ -2022,6 +2255,137 @@ impl Hub {
 
     fn taken(&self, key: &str) -> bool {
         self.live_all || self.groups.iter().any(|k| k == key)
+    }
+
+    /// Ticket 33: a Schedule store error is logged at most once a minute (the hub ticks every 500 ms).
+    fn log_schedule_error(&mut self, what: &str, error: &crate::schedule::StoreError, now: i64) {
+        if now.saturating_sub(self.schedule_log_at) >= 60_000 {
+            self.schedule_log_at = now;
+            println!("[reserved2] schedule {what}: {}", error.message());
+        }
+    }
+
+    /// Ticket 33: apply the console's timer cancels. Runs before the timers are pumped, so a timer cancelled before it
+    /// fell due never fires in the tick that takes its cancel. A cancel applies only to the timer the owner saw (same
+    /// `timer_at`); one that fired or was re-armed meanwhile is left alone. A reach-out cancel skips that chance.
+    fn apply_timer_cancels(&mut self, now: i64) -> bool {
+        let cancels = match crate::schedule::ScheduleStore::new(&self.context).take_timer_cancels(now) {
+            Ok(cancels) => cancels,
+            Err(error) => {
+                self.log_schedule_error("cancels", &error, now);
+                return false;
+            }
+        };
+        for cancel in cancels {
+            let Some(d) = self.drivers.get_mut(&cancel.conversation) else { continue };
+            match cancel.kind {
+                crate::schedule::TimerKind::ReplyCheck => {
+                    if d.sched.reply_check_at == Some(cancel.timer_at) {
+                        d.sched.reply_check_at = None;
+                    }
+                }
+                crate::schedule::TimerKind::ReachOut => d.skip_proactive(cancel.timer_at),
+                crate::schedule::TimerKind::Sleep => {}
+            }
+        }
+        true
+    }
+
+    /// Fire due timers, after applying the console's cancels (in that order). When the cancels cannot be read, the due
+    /// reply checks and reach-outs wait for a tick whose cancels can be read, so a cancelled one never fires.
+    fn pump_timers(&mut self, cfg: &Value, now: i64) {
+        let cancels_ok = self.apply_timer_cancels(now);
+        let deferred: Vec<(String, Option<i64>, Option<i64>)> = if cancels_ok {
+            Vec::new()
+        } else {
+            self.drivers
+                .iter_mut()
+                .filter_map(|(key, d)| {
+                    let reply = d.sched.reply_check_at.filter(|at| *at <= now);
+                    let proactive = d.sched.proactive_at.filter(|at| *at <= now);
+                    if reply.is_none() && proactive.is_none() {
+                        return None;
+                    }
+                    if reply.is_some() {
+                        d.sched.reply_check_at = None;
+                    }
+                    if proactive.is_some() {
+                        d.sched.proactive_at = None;
+                    }
+                    Some((key.clone(), reply, proactive))
+                })
+                .collect()
+        };
+        for (key, e) in session::pump_all(&mut self.drivers, now) {
+            self.route_driver_event(cfg, &key, e);
+        }
+        for (key, reply, proactive) in deferred {
+            let Some(d) = self.drivers.get_mut(&key) else { continue };
+            if reply.is_some() && d.sched.reply_check_at.is_none() {
+                d.sched.reply_check_at = reply;
+            }
+            if proactive.is_some() && d.sched.proactive_at.is_none() {
+                d.sched.proactive_at = proactive;
+            }
+        }
+    }
+
+    /// Ticket 33: publish this hub's in-memory timers for the Schedule page, then claim due reminders for idle
+    /// conversations. A conversation is not idle while DSH is down (unless a CLI is pinned for it) or while a wake of it
+    /// is queued, parked for DSH, held or waiting for a retry: its reminder stays due and runs once, late, when the
+    /// conversation is free, so an outage never piles up a burst of missed repeats.
+    fn sync_schedule(&mut self, cfg: &Value, suspended: bool, now: i64) {
+        let store = crate::schedule::ScheduleStore::new(&self.context);
+        let mut timers = Vec::new();
+        for (key, d) in &self.drivers {
+            if !d.sched.wc.infinite {
+                if let Some(at) = d.sched.wc.sleep_until.as_deref().and_then(crate::wake::parse_iso_ms) {
+                    timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::Sleep, at });
+                }
+            }
+            if let Some(at) = d.sched.reply_check_at {
+                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReplyCheck, at });
+            }
+            if let Some(at) = d.sched.proactive_at {
+                timers.push(crate::schedule::TimerView { conversation: key.clone(), kind: crate::schedule::TimerKind::ReachOut, at });
+            }
+        }
+        if let Err(error) = store.publish_timers(timers, now) {
+            self.log_schedule_error("timers", &error, now);
+        }
+        if suspended {
+            return;
+        }
+        let dsh_down = crate::dsh_health::is_down(&self.context);
+        let idle: std::collections::HashSet<String> = self
+            .drivers
+            .iter()
+            .filter(|(key, d)| {
+                let key = key.as_str();
+                self.taken(key)
+                    && console::key_allowed(cfg, key)
+                    && (!dsh_down || pipeline::pinned_cli_backend(cfg, key).is_some())
+                    && !self.active.contains_key(key)
+                    && !self.recovered.contains_key(key)
+                    && !self.maintenance.contains_key(key)
+                    && !d.sched.is_busy(now)
+                    && !self.ready.iter().any(|(queued, _)| queued.as_str() == key)
+                    && self.dsh_wait.len(key) == 0
+                    && !self.held.contains_key(key)
+                    && !self.retries.contains_key(key)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        match store.claim_due(now, |key| idle.contains(key)) {
+            Ok(items) => {
+                for item in items {
+                    println!("[reserved2] {} 日程提醒到期（{}）", item.conversation, item.id);
+                    let reason = format!("{}{}", crate::schedule::REMINDER_REASON, item.id);
+                    self.ready.push((item.conversation, reason));
+                }
+            }
+            Err(error) => self.log_schedule_error("claim", &error, now),
+        }
     }
 
     fn record(&self, name: &str, value: &Value) -> Result<(), String> {
@@ -2804,9 +3168,8 @@ impl Hub {
             }
             println!("[reserved2] {key} 手动唤醒（{reason}）");
         }
-        for (key, e) in session::pump_all(&mut self.drivers, now) {
-            self.route_driver_event(&cfg, &key, e);
-        }
+        self.pump_timers(&cfg, now);
+        self.sync_schedule(&cfg, suspended, now);
         for (key, reason) in std::mem::take(&mut self.ready) {
             if let Some(m)=self.maintenance.get(&key) {
                 m.cancel.store(true,std::sync::atomic::Ordering::SeqCst);
@@ -2871,7 +3234,7 @@ impl Hub {
                 } else {
                     prompt::build_with_runtime(&self.context, &key, &reason, nick, &self_id.to_string())
                 };
-                let cli_prompt = prompt::build_text_only_with_runtime(&self.context, &key, &[], nick, &self_id.to_string());
+                let cli_prompt = prompt::build_text_only_for_wake(&self.context, &key, &reason, nick, &self_id.to_string());
                 let target = crate::parse_target(&key, &cfg).map_err(|e| e.to_string())?;
                 self.record("logs/rbridge-live-wakes.jsonl", &json!({"ts":now,"key":key,"reason":reason,"shadow":false}))?;
                 Ok::<_, String>((previous, dispatch_token, prompt, cli_prompt, target))
