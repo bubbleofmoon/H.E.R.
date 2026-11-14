@@ -288,11 +288,12 @@ DENIED_EVERY_ROLE = [
     ('wt', 'gh api rate_limit/x'),
     ('wt', 'source scripts/gh-public.sh'),                       # regression
     ('wt', '. scripts/handoff.sh 80 linux b.md'),                # regression
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/her-vault/x.md gpt-6-astra high read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/2/review/codex-self-1.md gpt-6-astra high read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/../x.md gpt-6-astra high read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 /root/her-vault /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {repo} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    # Each row has one violation only: the checkout script and the ticket folder come from {home} and {tickets}.
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} /root/her-vault/x.md gpt-6-astra high read-only'),         # prompt outside the ticket folders
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/2/review/codex-self-1.md gpt-6-astra high read-only'),   # cross-ticket
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/../x.md gpt-6-astra high read-only'),  # traversal
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 /root/her-vault {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),  # workdir is not this worktree
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {repo} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),  # workdir is the repository, not this worktree
     ('wt', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {repo} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
 ]
 DENIED_REVIEW_AND_GATE = [

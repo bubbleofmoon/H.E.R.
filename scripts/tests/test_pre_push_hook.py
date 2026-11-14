@@ -521,6 +521,25 @@ class PushHook(unittest.TestCase):
         self.assertNotIn('Public scan (added)', out)
         self.assertNotIn('Public scan (history)', out)
 
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_failed_ref_read_refuses_the_push_after_partial_output(self):
+        # The ref lines come from one read of stdin. A read that prints a complete, clean line and
+        # then fails must refuse the push: the partial output is not the whole list.
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        partial = self.ref('main')
+        fake_bin = self.tmp / 'fake-cat-bin'
+        fake_bin.mkdir()
+        fake_cat = fake_bin / 'cat'
+        fake_cat.write_text(f'#!/bin/sh\nprintf "%s\\n" "{partial}"\nexit 1\n', encoding='utf-8', newline='\n')
+        fake_cat.chmod(0o755)
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}',
+                              extra={'PATH': f'{fake_bin}{os.pathsep}' + os.environ.get('PATH', '')})
+        self.assertEqual(code, 1, out)
+        self.assertIn('cannot read the refs git sends; nothing is published', out)
+        self.assertNotIn('Public scan (history)', out)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

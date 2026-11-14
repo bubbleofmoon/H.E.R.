@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 CHECK = ROOT / 'scripts' / 'check-repo.py'
@@ -57,6 +58,29 @@ class FileModeCheck(unittest.TestCase):
     def test_executable_hook_passes(self):
         self.stage_hook('+x')
         result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('mode:', result.stdout)
+
+    def test_inherited_git_variables_do_not_point_the_check_at_another_repository(self):
+        # A decoy repository holds the bad mode; the fixture holds the good one. The inherited
+        # variables must not make the check read the decoy's index.
+        decoy = Path(tempfile.mkdtemp(prefix='check-repo-decoy-'))
+        self.addCleanup(shutil.rmtree, decoy, ignore_errors=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env.update(GIT_ENV)
+
+        def decoy_git(*args):
+            subprocess.run(['git', '-C', str(decoy), *args], env=env, check=True, capture_output=True)
+        decoy_git('init', '-q')
+        (decoy / '.githooks').mkdir()
+        (decoy / '.githooks' / 'pre-push').write_text('#!/usr/bin/env bash\nexit 0\n', encoding='utf-8', newline='\n')
+        decoy_git('add', '.githooks/pre-push')
+        decoy_git('update-index', '--chmod=-x', '.githooks/pre-push')
+        self.stage_hook('+x')
+        inherited = {'GIT_DIR': str(decoy / '.git'), 'GIT_WORK_TREE': str(decoy),
+                     'GIT_INDEX_FILE': str(decoy / '.git' / 'index')}
+        with mock.patch.dict(os.environ, inherited):
+            result = self.run_check()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn('mode:', result.stdout)
 
