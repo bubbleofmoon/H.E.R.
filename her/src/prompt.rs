@@ -1561,6 +1561,37 @@ mod tests {
     }
 
     #[test]
+    fn briefing_rules_cover_group_conduct_repeats_and_softening_with_a_sticker_inventory() {
+        let (root, context) = runtime_fixture("ticket21 rules");
+        std::fs::write(
+            root.join("data/stickers.json"),
+            r#"[{"id":"s-one","desc":"摊手","useCount":5},{"id":"s-two","localNote":"捂脸笑","tags":["笑"],"useCount":3},{"id":"s-three","useCount":1}]"#,
+        )
+        .unwrap();
+        let two = serde_json::json!({"socialV2": {"sticker": {"enabled": true, "promptMaxStickers": 2}}});
+        let line = sticker_line_with_runtime(&context, &two);
+        assert!(line.contains("- s-one：摊手\n- s-two：捂脸笑 [笑]"), "{line}");
+        assert!(!line.contains("s-three"), "promptMaxStickers bounds the inventory: {line}");
+        assert!(!line.contains("用过"), "use counts would change the section on every send: {line}");
+        assert!(line.contains("【用表情缓和语气】") && line.contains("stickerId"), "{line}");
+        // A send that only flips the order of use keeps the same two stickers listed: the text does not change.
+        std::fs::write(
+            root.join("data/stickers.json"),
+            r#"[{"id":"s-one","desc":"摊手","useCount":3},{"id":"s-two","localNote":"捂脸笑","tags":["笑"],"useCount":5},{"id":"s-three","useCount":1}]"#,
+        )
+        .unwrap();
+        assert_eq!(sticker_line_with_runtime(&context, &two), line, "a reorder by use alone must not change the section");
+        let all = sticker_line_with_runtime(&context, &serde_json::json!({"socialV2": {"sticker": {"enabled": true, "promptMaxStickers": 3}}}));
+        assert!(all.contains("- s-one：摊手\n- s-three：（无备注，可先看图）\n- s-two：捂脸笑 [笑]"), "listed by stickerId: {all}");
+        assert_eq!(sticker_line_with_runtime(&context, &serde_json::json!({"socialV2": {"sticker": {"enabled": false}}})), "");
+        let p = build_with_runtime(&context, "group:1", "atMention", "Fixture Bot", "7004");
+        for rule in ["【在群里怎么说话】", "【别反复用同一个梗】"] {
+            assert!(p.contains(rule), "{rule} missing: {p}");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn build_contains_core_blocks() {
         let (root, context) = runtime_fixture("build");
         let p = build_with_runtime(&context, "private:不存在的会话", "atMention", "Fixture Bot", "7004");
