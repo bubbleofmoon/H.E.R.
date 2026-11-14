@@ -680,6 +680,8 @@ fn keep_all(items: &[String]) -> usize { items.len() }
 pub(crate) const RECALL_HEADER: &str = "【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：";
 /// The footer line of the recall block, after its items and index hint.
 pub(crate) const RECALL_FOOTER: &str = "（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）";
+/// The most estimated tokens the 【记忆索引】 hint line of the recall block may take (`recall_block_with`).
+pub(crate) const RECALL_HINT_MAX: usize = 60;
 
 /// The recall block and the ids of the memories it carries. `memory::recall` decides what is
 /// recalled (matches only, never the ids in `held`, which the session generation already carries);

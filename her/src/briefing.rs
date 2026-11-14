@@ -385,5 +385,6 @@ mod tests {
         assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-a", "epoch-1", 0, &empty, &notify), vec![Layer::Identity]);
         assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-a", "epoch-1", 0, &empty, &notify), Vec::<Layer>::new(), "once per session");
         assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-b", "epoch-1", 0, &empty, &notify), vec![Layer::Identity], "another session of the same key and generation alerts again");
+        assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-a", "epoch-2", 0, &empty, &notify), vec![Layer::Identity], "another epoch of the same session alerts again");
     }
 }

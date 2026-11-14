@@ -1369,7 +1369,11 @@ fn timing_records_distinguish_normal_and_cancelled_dsh_endings() {
             .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert!(ledger.iter().any(|row| row["k"] == "begun" && row["turn"] == turn_id));
         assert!(ledger.iter().any(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id));
-        assert!(ledger.iter().any(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id && row["layers"]["injected"].is_object()), "the DSH wake attempt carries its per-layer counts");
+        let attempt = ledger.iter().find(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id).expect("the DSH wake attempt is in the ledger");
+        for name in ["identity", "relationship", "conversation", "material"] {
+            assert!(attempt["layers"]["injected"][name].is_u64(), "layers.injected.{name} is an item count: {attempt}");
+            assert!(attempt["layers"]["cut"][name].is_u64(), "layers.cut.{name} is an item count: {attempt}");
+        }
         assert!(!timing.to_string().contains(SEED_TOKEN), "timing leaked an agent token");
     }
 }

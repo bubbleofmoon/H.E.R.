@@ -124,3 +124,55 @@ fn a_strip_that_empties_the_identity_section_is_not_counted_as_delivered_and_ale
     assert_eq!(w.layers.identity, 0, "a section the strip emptied delivers nothing");
     assert_eq!(w.alerted, vec![crate::briefing::Layer::Identity]);
 }
+
+#[test]
+fn the_index_hint_line_stays_within_its_allowance() {
+    let (_root, context, cfg) = layered_wake_fixture("layers index hint", true);
+    let conn = crate::memory::open_for_runtime(&context).unwrap();
+    for n in 0..6 {
+        let subject = format!("{}{n}", "长话题".repeat(30));
+        let content = format!("与当前消息无关的记录{n}");
+        crate::memory::write_memory(&conn, &crate::memory::MemoryInput {
+            owner_type: "session", owner_id: KEY, scope: "group", kind: "fact",
+            subject: Some(&subject), content: &content, tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+    }
+    let state = context.read_social_state().unwrap();
+    let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &state["conversations"][KEY], KEY);
+    assert!(block.contains("【记忆】"), "the fixture recalls its matching memory:\n{block}");
+    if let Some(hint) = block.lines().find(|line| line.starts_with("【记忆索引】")) {
+        let tokens = crate::briefing::estimate_tokens(hint);
+        assert!(tokens <= crate::prompt::RECALL_HINT_MAX, "the index hint takes {tokens} tokens:\n{hint}");
+    }
+}
+
+#[test]
+fn a_stripped_operator_section_delivers_nothing_and_relationship_counts_only_what_is_left() {
+    let (_root, context, mut cfg) = layered_wake_fixture("layers stripped operator", true);
+    cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
+    let operator = crate::initial_prompts::format_injection(&context, &cfg, KEY);
+    assert!(operator.contains("层级背景丁"), "{operator}");
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!([operator]);
+    let (context, server) = serve_packets(&context, 1);
+    let w = wake(&context, &cfg, "rpc-18f");
+    server.join().unwrap();
+    assert!(!w.text.contains("层级背景丁"), "the strip removed the operator text:\n{}", w.text);
+    assert!(w.text.contains("层级印象丙"), "{}", w.text);
+    assert_eq!(w.layers.relationship, 1, "the operator section delivers nothing; only the impression is left: {:?}", w.layers);
+}
+
+#[test]
+fn a_stripped_slang_section_drops_its_conversation_items() {
+    let (_root, context, mut cfg) = layered_wake_fixture("layers stripped slang", true);
+    cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
+    context.write_atomic(RuntimeArea::Data, "slang.json",
+        json!([{"status":"confirmed","content":"层级黑话戊","meaning":"层级含义己","count":3}]).to_string().as_bytes()).unwrap();
+    let slang = crate::slang::build_context(&crate::slang::load_entries_for_runtime(&context), None);
+    assert!(slang.contains("层级黑话戊"), "{slang}");
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!([slang]);
+    let (context, server) = serve_packets(&context, 1);
+    let w = wake(&context, &cfg, "rpc-18g");
+    server.join().unwrap();
+    assert!(!w.text.contains("层级黑话戊"), "the strip removed the slang text:\n{}", w.text);
+    assert_eq!(w.layers.conversation, 3, "topic, thought and participation; the stripped slang delivers nothing: {:?}", w.layers);
+}
