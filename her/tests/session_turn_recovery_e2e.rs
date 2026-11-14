@@ -196,17 +196,11 @@ struct DshInner {
     stream_usage: bool,
     provider: &'static str,
     digest_fault: bool,
-    digest_rpc_reject: bool,
     digest_hold: bool,
     digest_text: &'static str,
     digest_requests: Vec<Value>,
-    digest_memory_error: bool,
-    digest_memory_legacy_error: bool,
     follow_drop: bool,
     follow_history_cap: bool,
-    digest_cancel_reject: bool,
-    active_digests: HashSet<String>,
-    overlapping_prompts: usize,
     archive_fault: bool,
     turn_start_delay_ms: u64,
     sessions: HashMap<String, Sess>,
@@ -255,17 +249,11 @@ impl Dsh {
                 stream_usage: false,
                 provider: "ticket10-provider",
                 digest_fault: false,
-                digest_rpc_reject: false,
                 digest_hold: false,
                 digest_text: "[]",
                 digest_requests: Vec::new(),
-                digest_memory_error: false,
-                digest_memory_legacy_error: false,
                 follow_drop: false,
                 follow_history_cap: false,
-                digest_cancel_reject: false,
-                active_digests: HashSet::new(),
-                overlapping_prompts: 0,
                 archive_fault: false,
                 turn_start_delay_ms: 0,
                 sessions: HashMap::new(),
@@ -389,7 +377,6 @@ impl Dsh {
                 inner.sessions.get_mut(&sid).unwrap().inbox.retain(|item| Some(&item["id"]) != id);
                 Ok(json!({"accepted": true}))
             }
-            "session/cancel" if inner.digest_cancel_reject && sid == "js-origin-session" => Err(("invalid-request".into(), "synthetic cancel refusal".into())),
             "session/cancel" => {
                 if let Some(s) = inner.sessions.get_mut(&sid) {
                     s.cancelled = true;
@@ -406,27 +393,21 @@ impl Dsh {
     fn prompt(self: &Arc<Self>, args: &Value, rpc_id: &str) -> Option<Result<Value, (String, String)>> {
         let sid = args.pointer("/request/sessionId").and_then(Value::as_str).unwrap_or("").to_string();
         let text = args.pointer("/request/content/0/text").and_then(Value::as_str).unwrap_or("").to_string();
-        let digest = text.starts_with("【记忆整理】");
         let (plan, fault) = {
             let mut inner = lock(&self.inner);
             inner.rpc.push(("session/prompt".into(), args.clone()));
-            if !digest && inner.active_digests.contains(&sid) {inner.overlapping_prompts+=1;}
             if inner.sessions.get(&sid).map(|s| s.gone).unwrap_or(true) {
                 inner.prompts.push(PromptRec { session: sid.clone(), rpc_id: rpc_id.into(), text, applied: false });
                 return Some(Err(("session-not-found".into(), "session not found".into())));
             }
-            if digest && inner.digest_rpc_reject {
-                inner.prompts.push(PromptRec { session: sid.clone(), rpc_id: rpc_id.into(), text, applied: false });
-                return Some(Err(("invalid-request".into(), "synthetic digest RPC rejection".into())));
-            }
-            let fault = if digest && inner.digest_fault { Fault::Refuse } else { inner.fault };
+            let fault = inner.fault;
             if fault == Fault::Refuse {
                 inner.prompts.push(PromptRec { session:sid.clone(),rpc_id:rpc_id.into(),text:text.clone(),applied:false });
                 return Some(Ok(json!({"accepted":false})));
             }
             let applied = fault != Fault::HangWithoutApply;
             inner.prompts.push(PromptRec { session: sid.clone(), rpc_id: rpc_id.into(), text: text.clone(), applied });
-            (if digest { Plan {send:None,hold:inner.digest_hold} } else {inner.plan.clone()}, fault)
+            (inner.plan.clone(), fault)
         };
         if fault == Fault::HangWithoutApply {
             return None;
@@ -466,7 +447,6 @@ impl Dsh {
         if delay>0 { thread::sleep(Duration::from_millis(delay)); }
         let turn = {
             let mut inner = lock(&self.inner);
-            if prompt.starts_with("【记忆整理】") {inner.active_digests.insert(sid.into());}
             let sess = inner.sessions.get_mut(sid).expect("session");
             sess.turn_no += 1;
             let turn = sess.turn_no;
@@ -480,7 +460,7 @@ impl Dsh {
             }
             turn
         };
-        if lock(&self.inner).observation_waits && !prompt.starts_with("【记忆整理】") {
+        if lock(&self.inner).observation_waits {
             let token = prompt.lines().find_map(|line| line.strip_prefix("【会话令牌】"))
                 .and_then(|line| line.split_once('（').map(|(token, _)| token.trim())).unwrap();
             let engage = lock(&self.inner).engage_send;
@@ -522,7 +502,6 @@ impl Dsh {
         let cancelled = lock(&self.inner).sessions.get(sid).map(|s| s.cancelled).unwrap_or(true);
         if cancelled {
             let mut inner = lock(&self.inner);
-            inner.active_digests.remove(sid);
             if let Some(sess) = inner.sessions.get_mut(sid) {
                 event(sess, "turn/end", json!({"turn": turn, "reason": {"kind": "aborted"}}));
             }
@@ -531,7 +510,7 @@ impl Dsh {
         // Most lifecycle cases model an agent that closes its turn without acknowledging any
         // unread work. The dedicated missing-close case opts out and checks JS's reminders.
         let close = {let inner=lock(&self.inner); inner.close_turns && !(inner.unclosed_first && turn==1)};
-        if !prompt.starts_with("【记忆整理】") && close {
+        if close {
             let token = prompt.lines().find_map(|line| line.strip_prefix("【会话令牌】"))
                 .and_then(|line| line.split_once('（').map(|(token, _)| token.trim()));
             if let Some(token) = token {
@@ -567,20 +546,12 @@ impl Dsh {
             );
         }
         let mut inner = lock(&self.inner);
-        inner.active_digests.remove(sid);
         let input_tokens = if turn>1 {inner.later_input_tokens.unwrap_or(inner.input_tokens)} else {inner.input_tokens};
         let cached_tokens = inner.cached_tokens;
         let stream_usage = inner.stream_usage;
         let provider = inner.provider;
-        let digest = prompt.starts_with("【记忆整理】");
-        let final_text = if digest { inner.digest_text } else { inner.reply_text };
-        let memory_error = inner.digest_memory_error;
-        let legacy_memory_error = inner.digest_memory_legacy_error;
+        let final_text = inner.reply_text;
         let sess = inner.sessions.get_mut(sid).expect("session");
-        if digest {
-            event(sess, "tool/call", json!({"turn":turn,"step":0,"callId":"digest-memory","name":"memory_write","arguments":"{}"}));
-            event(sess, "tool/result", json!({"turn":turn,"step":0,"message":{"isError":memory_error && !legacy_memory_error,"source":{"callId":"digest-memory"},"content":[{"type":"text","text":if memory_error && legacy_memory_error {"写入失败：synthetic-private-error-text"} else {"ok"}}]}}));
-        }
         event(
             sess,
             "assistant/message",
@@ -3413,7 +3384,6 @@ fn hf85_rotation_never_runs_during_a_turn_even_after_cache_expiry() {
     assert!(wait_for(LONG,||rig.turn_state(1)=="running"));
     let before=rig.dsh.received();
     let digests=rig.dsh.digest_calls();
-    assert_eq!(lock(&rig.dsh.inner).overlapping_prompts,0);
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":1.01}));
     thread::sleep(Duration::from_secs(3));
     assert_eq!(rig.dsh.received(),before,"maintenance submitted a prompt during a running turn");

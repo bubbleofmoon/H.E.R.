@@ -42,7 +42,7 @@ const server = http.createServer((req, res) => {
       prompts++;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ id: 'synthetic', object: 'chat.completion', created: 1, model: 'synthetic-digest-model',
-        choices: [{ index: 0, message: { role: 'assistant', content: '[]' }, finish_reason: 'stop' }],
+        choices: [{ index: 0, message: { role: 'assistant', content: JSON.stringify([{ subject: 'synthetic', content: 'synthetic digest memory' }]) }, finish_reason: 'stop' }],
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
       return;
     }
@@ -106,11 +106,11 @@ try {
   let consoleExit;
   consoleChild.on('error', error => { consoleExit = error.message; });
   consoleChild.on('close', code => { consoleExit = code; children.delete(consoleChild); });
-  const consoleRequest = (method, route, body) => new Promise((resolve, reject) => {
+  const consoleRequest = (method, route, body, extra = {}) => new Promise((resolve, reject) => {
     const text = body ? JSON.stringify(body) : '';
     const request = http.request({ hostname: '127.0.0.1', port: digestPort, path: route, method,
       headers: { 'x-console-token': token, Origin: `http://127.0.0.1:${digestPort}`, 'content-type': 'application/json',
-        'content-length': Buffer.byteLength(text) }, timeout: 2000 }, response => {
+        'content-length': Buffer.byteLength(text), ...extra }, timeout: 2000 }, response => {
       let text = ''; response.on('data', b => text += b);
       response.on('end', () => {
         try { assert(response.statusCode >= 200 && response.statusCode < 300, text); resolve(JSON.parse(text)); }
@@ -137,6 +137,8 @@ try {
   });
   assert.equal(completed.state, 'succeeded'); assert.equal(completed.pid, null);
   assert.equal(prompts, 1);
+    const recalled = await consoleRequest('GET', '/api/memory/search?key=group%3A7&query=synthetic', undefined, { 'x-agent-token': 'synthetic' });
+    assert(JSON.stringify(recalled.memories).includes('synthetic digest memory'), 'the digest stored no memory');
   fs.writeFileSync(path.join(root, 'chains.json'), JSON.stringify({ mcp, digestPrompts: prompts }));
   console.log('PASS generated MCP initialize/list/call, native curl through a loopback adapter, and actual digest model call on a fake relay');
 } finally {
