@@ -266,11 +266,11 @@ fn serve_onebot(mut stream: TcpStream, requests: Arc<Mutex<Vec<(String, Value)>>
 
 // ----- runtime root and processes ------------------------------------------------------------------------------
 
-struct Root(PathBuf);
+struct Root(crate::support::RuntimeRoot);
 
 impl Root {
     fn path(&self) -> &Path {
-        &self.0
+        self.0.path()
     }
     fn state(&self) -> Value {
         serde_json::from_slice(&fs::read(self.0.join("data/social-v2.json")).expect("read state")).expect("state json")
@@ -283,12 +283,6 @@ impl Root {
     }
     fn config(&self) -> Value {
         serde_json::from_slice(&fs::read(self.0.join("config/config.json")).expect("read config")).expect("config json")
-    }
-}
-
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -316,16 +310,7 @@ fn conversation(token: &str) -> Value {
 }
 
 fn make_root(label: &str, onebot_port: u16, console_port: u16, extra_config: Value) -> Root {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let parent = std::env::temp_dir().join("ticket14 mcp fixtures");
-    let parent = crate::install_root::development_root(parent);
-    fs::create_dir_all(&parent).expect("fixture parent");
-    let root = parent.join(format!("{label}-{}-{}-{n}", std::process::id(), now_ms()));
-    let root = crate::install_root::development_root(root);
-    for dir in ["config", "data", "resources"] {
-        fs::create_dir_all(root.join(dir)).expect("fixture dir");
-    }
+    let root = crate::support::RuntimeRoot::new(&format!("ticket14 mcp {label}"));
     let mut config = json!({
         "consoleToken": CONSOLE_TOKEN, "consolePort": console_port, "ownerQQ": 8808,
         "allow": {"groups": [GROUP], "private": ["8808"]},
@@ -364,7 +349,8 @@ impl Console {
             // A byte-identical candidate copy puts the external curl fake in Windows'
             // application-directory search position, without changing the shared candidate.
             let copy = Path::new(input).parent().unwrap().join("her.exe");
-            fs::copy(env!("CARGO_BIN_EXE_her"), &copy).unwrap();
+            // Copy once: a retry or restart must not overwrite an image that a killed console may still hold.
+            if !copy.exists() { fs::copy(env!("CARGO_BIN_EXE_her"), &copy).unwrap(); }
             copy
         } else { PathBuf::from(env!("CARGO_BIN_EXE_her")) };
         let mut command = Command::new(executable);
