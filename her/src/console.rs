@@ -14895,8 +14895,7 @@ mod tests {
         handle_wait_post(&context, &config, &headers, &request).unwrap();
         engage_send(&context, &config, "hi");
         // Admission reads the ledger once; every later read (the backstop's) fails. her/ reads the
-        // whole ledger once per call (only an OS 32/33 retries, and this hook injects error 5), so its
-        // seam is the full-read stage.
+        // whole ledger one-shot (no append_io retry), so its seam is the full-read stage.
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
         let counted = reads.clone();
         crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move |stage| {

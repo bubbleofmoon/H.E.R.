@@ -41,7 +41,8 @@ pub fn token_epoch(token: &str) -> String {
 pub fn read_records(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     let text = if context.is_isolated() {
         context
-            .read_optional_text_detailed(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)?
+            .read_optional_text(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)
+            .map_err(str::to_string)?
             .unwrap_or_default()
     } else {
         match std::fs::read_to_string(LEGACY_OUTBOX_FILE) {

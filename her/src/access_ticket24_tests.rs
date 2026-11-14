@@ -876,23 +876,80 @@ fn gap_ledger_a_torn_ledger_tail_leaves_the_turns_view_answering() {
     assert_eq!(reply["turns"][0]["turnId"], json!(turn.id), "{reply}");
 }
 
-/// Hold the product's exclusive append lock on `data/<file>` from another handle for `hold`, as a candidate
-/// process does while it appends: on Windows the lock is mandatory, so a full read of the file fails with
-/// ERROR_LOCK_VIOLATION (os error 33) until it is released. Returns once the lock is held.
-fn hold_append_lock(root: &FixtureRoot, file: &str, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+/// An exclusive append lock on `data/<file>`, held from another handle as a candidate process holds it while it
+/// appends. On Windows the lock is mandatory, so a full read of the file fails with ERROR_LOCK_VIOLATION (os
+/// error 33) until it is released. The holder releases on `release()`, or, when it was given the conflict counter
+/// of the read under test, as soon as that read has met the lock at least once; it never holds for more than 30 s.
+#[cfg(windows)]
+struct AppendLockHolder {
+    release: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+impl AppendLockHolder {
+    fn release(self) {
+        let _ = self.release.send(());
+        self.thread.join().unwrap();
+    }
+}
+
+#[cfg(windows)]
+fn hold_append_lock(
+    root: &FixtureRoot,
+    file: &str,
+    release_after_conflict: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+) -> AppendLockHolder {
+    use std::sync::atomic::Ordering;
     let path = root.0.join("data").join(file);
+    let (release, released) = std::sync::mpsc::channel::<()>();
     let (locked, ready) = std::sync::mpsc::channel();
-    let holder = std::thread::spawn(move || {
+    let thread = std::thread::spawn(move || {
         let handle = std::fs::OpenOptions::new().read(true).write(true).append(true).open(path).unwrap();
         handle.lock().unwrap();
         locked.send(()).unwrap();
-        std::thread::sleep(hold);
+        let bound = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < bound {
+            let conflicted = release_after_conflict.as_ref().is_some_and(|seen| seen.load(Ordering::SeqCst) >= 1);
+            if conflicted || !matches!(released.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         drop(handle);
     });
     ready.recv().unwrap();
-    holder
+    AppendLockHolder { release, thread }
 }
 
+/// Counts, on this thread, every retry the waiting read makes after meeting a sharing/lock violation.
+#[cfg(windows)]
+struct ReadConflictCount(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(windows)]
+impl Drop for ReadConflictCount {
+    fn drop(&mut self) {
+        crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+}
+
+#[cfg(windows)]
+fn count_read_conflicts() -> ReadConflictCount {
+    use std::sync::atomic::Ordering;
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = seen.clone();
+    crate::runtime::APPEND_IO_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stage| {
+            if stage == "sleep" {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }));
+    });
+    ReadConflictCount(seen)
+}
+
+#[cfg(windows)]
 fn seeded_ledgers(label: &str) -> (FixtureRoot, RuntimeContext, String) {
     let (root, context) = seeded(label, "fixture-turns-lock-token-abcdefghij");
     let turn = crate::turn_ledger::Recorder::begin(&context, GROUP, "dsh", "atMention", "epoch", &[], None).unwrap();
@@ -900,39 +957,60 @@ fn seeded_ledgers(label: &str) -> (FixtureRoot, RuntimeContext, String) {
     (root, context, turn.id.clone())
 }
 
+#[cfg(windows)]
 #[test]
 fn turns_view_waits_out_an_append_lock_on_the_turn_ledger() {
     let (root, context, turn_id) = seeded_ledgers("turns view ledger lock");
-    let holder = hold_append_lock(&root, "turn-ledger.jsonl", std::time::Duration::from_millis(400));
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", Some(conflicts.0.clone()));
     let (status, reply) = admin_request(&context, "GET", "/api/turns", None);
-    holder.join().unwrap();
-    assert_eq!(status, 200, "a lock held for 400 ms must not fail the view: {reply}");
+    holder.release();
+    assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the read never met the lock: {reply}");
+    assert_eq!(status, 200, "a lock released after the read met it must not fail the view: {reply}");
     assert_eq!(reply["turns"][0]["turnId"], json!(turn_id), "{reply}");
 }
 
+#[cfg(windows)]
 #[test]
 fn turns_view_waits_out_an_append_lock_on_the_send_outbox() {
     let (root, context, turn_id) = seeded_ledgers("turns view outbox lock");
-    let holder = hold_append_lock(&root, "send-outbox.jsonl", std::time::Duration::from_millis(400));
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "send-outbox.jsonl", Some(conflicts.0.clone()));
     let (status, reply) = admin_request(&context, "GET", "/api/turns", None);
-    holder.join().unwrap();
-    assert_eq!(status, 200, "a lock held for 400 ms must not fail the view: {reply}");
+    holder.release();
+    assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the read never met the lock: {reply}");
+    assert_eq!(status, 200, "a lock released after the read met it must not fail the view: {reply}");
     assert_eq!(reply["turns"][0]["turnId"], json!(turn_id), "{reply}");
 }
 
-/// Windows only: elsewhere the advisory lock never blocks a read, so there is no lock failure to report.
+#[cfg(windows)]
+#[test]
+fn the_send_outbox_view_waits_out_an_append_lock() {
+    let (root, context, _) = seeded_ledgers("outbox view lock");
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "send-outbox.jsonl", Some(conflicts.0.clone()));
+    let (status, reply) = admin_request(&context, "GET", &format!("/api/socialV2/send-outbox?key={GROUP}"), None);
+    holder.release();
+    assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the read never met the lock: {reply}");
+    assert_eq!(status, 200, "a lock released after the read met it must not fail the view: {reply}");
+    assert_eq!(reply["batches"][0]["batchId"], json!("b1"), "{reply}");
+}
+
 #[cfg(windows)]
 #[test]
 fn turns_view_reports_the_os_error_when_the_append_lock_outlasts_the_retry_bound() {
     let (root, context, _) = seeded_ledgers("turns view lock bound");
-    let hold = crate::runtime::APPEND_CONFLICT_WAIT + std::time::Duration::from_millis(1500);
-    let holder = hold_append_lock(&root, "turn-ledger.jsonl", hold);
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", None);
     let started = std::time::Instant::now();
     let (status, reply) = admin_request(&context, "GET", "/api/turns", None);
     let waited = started.elapsed();
-    holder.join().unwrap();
+    holder.release();
     assert_eq!(status, 503, "{reply}");
     let error = reply["error"].as_str().unwrap_or_default();
+    assert!(error.contains("class=read/file"), "the failing read must be named: {reply}");
     assert!(error.contains("os=Some(33)"), "the lock violation code must reach the caller: {reply}");
-    assert!(waited >= crate::runtime::APPEND_CONFLICT_WAIT, "the read must retry for the whole bound, waited {waited:?}");
+    assert!(!error.contains(&root.0.display().to_string()), "the error must not disclose the runtime root: {reply}");
+    assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the read never met the lock: {reply}");
+    assert!(waited >= crate::runtime::APPEND_CONFLICT_WAIT, "the read must wait out the whole bound, waited {waited:?}");
 }

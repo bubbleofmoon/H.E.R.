@@ -30,16 +30,15 @@ pub fn now_ms() -> i64 {
 /// Read every ledger record in append order. A truncated record (crash mid-append) is skipped with a
 /// warning; any other damaged line is an error: the ledger is evidence (see `runtime::parse_evidence_jsonl`).
 pub fn read_records(context: &RuntimeContext) -> Result<Vec<Value>, String> {
-    // Fixture seam for this full read (its own stage: the tail read's `turn-read` counters and
-    // conflict policy belong to the turn worker). Production never calls the hook.
+    // Fixture seam for this one-shot full read (its own stage: the tail read's `turn-read` counters
+    // and conflict policy belong to the turn worker). Production never calls the hook.
     #[cfg(test)]
     crate::runtime::append_io_test_hook("turn-read-all")
         .map_err(|error| format!("读取回合账本失败：{error}"))?;
     let text = if context.is_isolated() {
-        // Retries a Windows lock violation (32/33) for the two-second append conflict budget; an error
-        // that outlasts it carries the OS code.
         context
-            .read_optional_text_detailed(RuntimeArea::Data, ISOLATED_LEDGER_FILE)?
+            .read_optional_text(RuntimeArea::Data, ISOLATED_LEDGER_FILE)
+            .map_err(str::to_string)?
             .unwrap_or_default()
     } else {
         match std::fs::read_to_string(LEGACY_LEDGER_FILE) {
