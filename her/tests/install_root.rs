@@ -877,7 +877,7 @@ fn production_path_literals_live_only_in_the_layout_module() {
             let path = entry.unwrap().path();
             if path.is_dir() { folders.push(path); continue; }
             if path.extension().is_none_or(|e| e != "rs")
-                || path.file_name().is_some_and(|n| n == "install_root.rs") { continue; }
+                || path == manifest.join("src").join("install_root.rs") { continue; }
             let text = std::fs::read_to_string(&path).unwrap();
             for line in production_path_literals(&text) {
                 findings.push(format!("{}:{line}", path.display()));
