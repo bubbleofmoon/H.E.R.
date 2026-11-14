@@ -127,6 +127,11 @@ fn rollback_active(root: &InstallRoot, restore_gate: Option<&fs::File>) -> bool 
         )
         .is_err()
 }
+/// Only contention on the update-restore gate means a rollback may still be running; any other
+/// gate failure leaves an alert deliverable, so a broken lock path cannot suppress delivery.
+fn restore_gate_contended(root: &InstallRoot) -> bool {
+    release_store::gate_contended(&root.root().join("runtime/data/locks/update-restore.lock"))
+}
 fn recovered_authority(root: &InstallRoot) -> Result<Authority, String> {
     use crate::release_signature;
     // The newest verified recorded selection wins: last-good, or the lost current
@@ -578,16 +583,29 @@ pub fn finish_rollback(root: &InstallRoot, id: &str, status: &str) -> Result<(),
     alert.rollback = status.into();
     store_alert(root, &alert)
 }
+/// `own` is the claiming supervisor's release tag (`None` when it cannot be resolved). A rollback
+/// helper retires the failed release before restoring last-good and holds the update-restore gate
+/// throughout, so while that gate is held (by a rollback, install, restore or dependency upgrade,
+/// this process included) a `pending` alert is never claimed by the release it names as failed, or
+/// by a supervisor that cannot rule that out: its send would be cut off and its claim would hold
+/// the retry spacing against the restored supervisor. Deferring writes nothing. With the gate free
+/// a `pending` alert is stale and every release may claim it.
 pub fn claim_alert(
     root: &InstallRoot,
     now: i64,
-    _own: Option<&str>,
+    own: Option<&str>,
 ) -> Result<Option<UpdateAlert>, String> {
     let _gate = alert_gate(root)?;
     let Some(mut alert) = read_alert(root)? else {
         return Ok(None);
     };
     if alert.delivered || now < alert.retry_after {
+        return Ok(None);
+    }
+    if alert.rollback == "pending"
+        && own.is_none_or(|own| own == alert.failed)
+        && restore_gate_contended(root)
+    {
         return Ok(None);
     }
     alert.retry_after = now.saturating_add(60_000);

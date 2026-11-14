@@ -130,11 +130,19 @@ pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
     Ok(gate)
 }
 
-/// True only when another handle holds the gate; any other outcome (unusable path, redirect,
-/// lock acquired and released again) is false.
-#[allow(dead_code)]
-pub(crate) fn gate_contended(_lock: &Path) -> bool {
-    false
+/// True only when another handle holds the gate (a non-blocking lock attempt reports it would
+/// block). Any other outcome is false: an unusable or redirected path, another lock error, or the
+/// lock acquired, which is released again before returning.
+pub(crate) fn gate_contended(lock: &Path) -> bool {
+    if fs::symlink_metadata(lock)
+        .is_ok_and(|meta| !meta.is_file() || crate::guarded_file::is_link(&meta))
+    {
+        return false;
+    }
+    let Ok(gate) = crate::guarded_file::open_gate(lock, crate::guarded_file::Gate::Create) else {
+        return false;
+    };
+    matches!(gate.try_lock(), Err(fs::TryLockError::WouldBlock))
 }
 
 /// Fsynced root-level state/helper publication under the caller's installation gate.
