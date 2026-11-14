@@ -834,19 +834,50 @@ fn installed_runtime_backups_stay_inside_the_root() {
     assert_eq!(install.backup_destination(&outside, Path::new("../b")).unwrap(), fixture.0.join("qqbot-rust/b"));
 }
 
+/// True when `line` carries `// layout-literal: <reason>` as a real comment (an even number of
+/// unescaped quotes before it) with a non-blank reason.
+fn has_layout_marker(line: &str) -> bool {
+    const MARKER: &str = "// layout-literal:";
+    line.match_indices(MARKER).any(|(at, _)| {
+        let quotes = line[..at].replace("\\\"", "").matches('"').count();
+        quotes % 2 == 0 && !line[at + MARKER.len()..].trim().is_empty()
+    })
+}
+
 /// Lines of `text` that spell a production path: the root, the retired `qqbot-rust` folder or a
-/// profile `.dsh` join. A line carrying `layout-literal:` and its reason keeps one as test data.
+/// profile `.dsh` folder. A line with a `// layout-literal: <reason>` comment keeps one as test data.
 fn production_path_literals(text: &str) -> Vec<usize> {
     let mut lines = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        if line.contains("layout-literal:") { continue; }
+        if has_layout_marker(line) { continue; }
         let mut spelled = line.to_ascii_lowercase().replace('\\', "/");
         while spelled.contains("//") { spelled = spelled.replace("//", "/"); }
-        if ["c:/qqbot", "qqbot-rust", "join(\".dsh\")"].iter().any(|n| spelled.contains(n)) {
+        if ["c:/qqbot", "qqbot-rust", "join(\".dsh\")", "/.dsh\"", "\".dsh/", "\".dsh\""]
+            .iter()
+            .any(|n| spelled.contains(n))
+        {
             lines.push(index + 1);
         }
     }
     lines
+}
+
+/// Findings (`path:line`) in every `.rs` file under `folders`, except the layout module itself.
+fn production_path_findings(folders: Vec<PathBuf>, layout_module: &Path) -> Vec<String> {
+    let mut findings = Vec::new();
+    let mut folders = folders;
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { folders.push(path); continue; }
+            if path.extension().is_none_or(|e| e != "rs") || path == layout_module { continue; }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in production_path_literals(&text) {
+                findings.push(format!("{}:{line}", path.display()));
+            }
+        }
+    }
+    findings
 }
 
 #[test]
@@ -860,29 +891,49 @@ fn production_path_scanner_flags_unmarked_spellings_and_skips_marked_ones() {
         r#"let f = home.join(".dsh"); // layout-literal: expected value"#,
         r#"let g = crate::legacy_path!("data");"#,
         r#"let h = "C:\\\\qqbot";"#,
+        r#"let i = "C:/qqbot/data"; // layout-literal:"#,
+        r#"let j = "C:/qqbot/data"; // layout-literal:    "#,
+        r#"let k = "C:/qqbot/layout-literal: x";"#,
+        r#"let l = "C:/qqbot // layout-literal: x";"#,
+        r#"let m = format!("{home}/.dsh");"#,
+        r#"let n = format!("{home}/.dsh"); // layout-literal: expected value"#,
+        r#"let o = PathBuf::from(".dsh/config");"#,
+        r#"let p = PathBuf::from("D:/people/alice/.dsh");"#,
     ]
     .join("\n");
-    assert_eq!(production_path_literals(&text), vec![1, 3, 4, 5, 8]);
+    assert_eq!(production_path_literals(&text), vec![1, 3, 4, 5, 8, 9, 10, 11, 12, 13, 15, 16]);
+}
+
+#[test]
+fn production_path_scan_exempts_only_the_layout_module_file() {
+    let fixture = Fixture::new();
+    let src = fixture.0.join("src");
+    std::fs::create_dir_all(src.join("nested")).unwrap();
+    let spelling = "const A: &str = \"C:/qqbot/data\";\n";
+    let layout_module = src.join("install_root.rs");
+    std::fs::write(&layout_module, spelling).unwrap();
+    std::fs::write(src.join("nested").join("install_root.rs"), spelling).unwrap();
+    std::fs::write(src.join("other.rs"), spelling).unwrap();
+    std::fs::write(src.join("notes.txt"), spelling).unwrap();
+    let mut findings = production_path_findings(vec![src.clone()], &layout_module);
+    findings.sort();
+    assert_eq!(
+        findings,
+        vec![
+            format!("{}:1", src.join("nested").join("install_root.rs").display()),
+            format!("{}:1", src.join("other.rs").display()),
+        ]
+    );
 }
 
 /// One production root (#66): production path spellings live only in the layout module. A line may
-/// keep one as sanitizer test data by carrying `layout-literal:` and its reason.
+/// keep one as sanitizer or test data by carrying `// layout-literal: <reason>`.
 #[test]
 fn production_path_literals_live_only_in_the_layout_module() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut findings = Vec::new();
-    let mut folders = vec![manifest.join("src"), manifest.join("../her-memory/src")];
-    while let Some(folder) = folders.pop() {
-        for entry in std::fs::read_dir(&folder).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() { folders.push(path); continue; }
-            if path.extension().is_none_or(|e| e != "rs")
-                || path == manifest.join("src").join("install_root.rs") { continue; }
-            let text = std::fs::read_to_string(&path).unwrap();
-            for line in production_path_literals(&text) {
-                findings.push(format!("{}:{line}", path.display()));
-            }
-        }
-    }
+    let findings = production_path_findings(
+        vec![manifest.join("src"), manifest.join("../her-memory/src")],
+        &manifest.join("src").join("install_root.rs"),
+    );
     assert!(findings.is_empty(), "production path literals outside src/install_root.rs: {findings:#?}");
 }

@@ -12,8 +12,8 @@ public issue, comment or commit names those vault paths and nothing else.
   until the owner's move (#67) brings them inside, `C:/qqbot-rust`, the relay folder
   `C:/her-orch/relay` and `~/.dsh` are production too. Production is read-only for
   development: never write any of them or `memory.db`; never change a scheduled task, a
-  service, a token, a release directory or a configuration file there. Development work never stops, starts or replaces
-  a production process.
+  service, a token, a release directory or a configuration file there. Development work
+  never stops, starts or replaces a production process.
 - A production database is read from file metadata only, or from a copy taken with the
   owner's go; it is never opened in place, in any mode. `mode=ro` on a WAL database creates
   `-wal` and `-shm` beside it and leaves them after close, and `immutable=1` reuses existing

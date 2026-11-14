@@ -1741,7 +1741,7 @@ mod tests {
             dsh_home_from(None, Some(OsString::from("D:/people/alice"))),
             Some(PathBuf::from("D:/people/alice").join(".dsh")) // layout-literal: expected value
         );
-        assert_ne!(dsh_home_from(None, None), Some(PathBuf::from("C:/Users/me/.dsh")));
+        assert_ne!(dsh_home_from(None, None), Some(PathBuf::from("D:/people/alice/.dsh"))); // layout-literal: expected value
     }
 
     /// Ticket 24 decision B: an empty `consoleToken` falls back to the hardened `data/console-token`
