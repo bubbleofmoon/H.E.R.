@@ -855,7 +855,7 @@ fn sweep_staging(parent: &Path) -> Result<(), String> {
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        if !metadata.is_dir() || redirected(&metadata) {
+        if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) {
             continue;
         }
         let marker = path.join(".installer.json");
@@ -863,7 +863,7 @@ fn sweep_staging(parent: &Path) -> Result<(), String> {
         let Ok(metadata) = std::fs::symlink_metadata(&marker) else {
             continue;
         };
-        if !metadata.is_file() || redirected(&metadata) {
+        if !metadata.is_file() || crate::guarded_file::is_link(&metadata) {
             continue;
         }
         let Some(owner) = std::fs::read_to_string(&marker)
@@ -879,18 +879,6 @@ fn sweep_staging(parent: &Path) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn redirected(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        metadata.file_type().is_symlink()
-    }
 }
 
 fn record_staging_owner(staging: &Path) -> Result<(), String> {
@@ -1048,13 +1036,7 @@ fn empty_npm_config(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata =
                 std::fs::symlink_metadata(path).map_err(|_| "npm config cannot be inspected")?;
-            #[cfg(windows)]
-            let redirected = {
-                use std::os::windows::fs::MetadataExt;
-                metadata.file_attributes() & 0x400 != 0
-            };
-            #[cfg(not(windows))]
-            let redirected = metadata.file_type().is_symlink();
+            let redirected = crate::guarded_file::is_link(&metadata);
             if redirected || !metadata.is_file() || metadata.len() != 0 {
                 Err("supervisor npm configuration must be a plain empty file".into())
             } else {

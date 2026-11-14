@@ -218,8 +218,11 @@ impl Console {
             let mut executable = PathBuf::from(env!("CARGO_BIN_EXE_her"));
             if cfg!(windows) {
                 // Windows searches beside the executable before PATH for curl.exe.
+                // Copy once: a retry or restart must not overwrite an image that a killed console may still hold.
                 let copy = root.p("fake-bin/her.exe");
-                fs::copy(executable, &copy).unwrap();
+                if !copy.exists() {
+                    fs::copy(&executable, &copy).unwrap();
+                }
                 executable = copy;
             }
             let mut command = Command::new(executable);

@@ -1,6 +1,6 @@
 //! Seam 1: real supervisor/CLI and disposable fake dependency programs.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
 
@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn hidden(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    crate::support::ports::release_held(); // every child starts here: free the fixture's held ports first
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
@@ -108,10 +109,8 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        let reservations: Vec<_> = (0..3)
-            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-            .collect();
-        let ports = std::array::from_fn(|i| reservations[i].local_addr().unwrap().port());
+        let reservations: Vec<_> = (0..3).map(|_| crate::support::ports::reserve()).collect();
+        let ports = std::array::from_fn(|i| reservations[i].port());
         let node = hidden(if cfg!(windows) { "where.exe" } else { "which" })
             .arg("node")
             .output()
@@ -206,7 +205,6 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
         )
         .unwrap();
         std::fs::write(root.join("dependencies.json"), json!({"onebot":format!("http://127.0.0.1:{}",ports[0]),"dsh":format!("http://127.0.0.1:{}",ports[1]),"model":"http://127.0.0.1:1"}).to_string()).unwrap();
-        drop(reservations);
         let fixture = Self {
             root,
             supervisor: None,
@@ -226,6 +224,7 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
             .output()
             .unwrap();
         assert!(task.status.success(), "fixture scheduler: {task:?}");
+        reservations.into_iter().for_each(crate::support::ports::hold);
         fixture
     }
     fn relay(&mut self, mode: &str) -> PathBuf {
@@ -243,8 +242,8 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
         std::fs::write(folder.join("client-key"), "synthetic-relay-secret-80").unwrap();
         std::fs::write(folder.join("auth/login.json"), "synthetic-private-login").unwrap();
         std::fs::write(folder.join("mode"), mode).unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let reservation = crate::support::ports::reserve();
+        let port = reservation.port();
         std::fs::write(
             folder.join("fixture.json"),
             json!({"port":port}).to_string(),
@@ -265,6 +264,7 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
         let mut endpoints: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         endpoints["relay"] = json!(format!("http://127.0.0.1:{port}"));
         std::fs::write(path, endpoints.to_string()).unwrap();
+        crate::support::ports::hold(reservation);
         folder
     }
     fn command(&self, image: &std::path::Path) -> Command {
@@ -1096,6 +1096,7 @@ fn snowluma_failure_stops_dsh_startup_until_later_reconciliation() {
         let mut fixture = Fixture::new();
         #[cfg(feature = "parity-clock")]
         fixture.clock(1_800_000_000_000);
+        crate::support::ports::release_held(); // this test squats the fixture port itself
         let foreign = if failure == "refusal" {
             Some(std::net::TcpListener::bind(("127.0.0.1", fixture.ports[0])).unwrap())
         } else {
@@ -2044,8 +2045,9 @@ fn resolved_foreign_npx_entries_are_preserved_and_refused_only_on_the_selected_p
             serde_json::from_slice(&std::fs::read(fixture.root.join("dsh/fixture.json")).unwrap())
                 .unwrap();
         if !selected_port {
-            let reserve = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            config["port"] = json!(reserve.local_addr().unwrap().port());
+            let reservation = crate::support::ports::reserve();
+            config["port"] = json!(reservation.port());
+            crate::support::ports::hold(reservation);
         }
         std::fs::write(foreign.join("fixture.json"), config.to_string()).unwrap();
         let wrapper = Wrapper::new(&fixture, Some(3000), foreign.join("index.mjs"), true);
@@ -2729,9 +2731,9 @@ fn dependency_api(
 }
 
 fn upgrade_feed(f: &Fixture) -> (Owned, String) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let reservation = crate::support::ports::reserve();
+    let port = reservation.port();
+    crate::support::ports::hold(reservation); // freed by hidden() on the line before the feed starts
     let script = f.root.join("feed.mjs");
     std::fs::write(&script, format!(r#"
 import http from 'node:http'; import fs from 'node:fs';

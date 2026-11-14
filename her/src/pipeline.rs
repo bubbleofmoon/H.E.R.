@@ -1759,16 +1759,18 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             // DSH echoes requestId in data.source.rpcId for exact recovery. A failed write refuses submission.
             let rpc_id = crate::dsh::mint_request_id();
             self.turn_validity(key, &sid)?;
+            let mut layers: Option<serde_json::Value> = None;
             if self.context.is_isolated() && self.cur_turn.is_some() && self.chat.is_none() {
                 follow.track_briefing(&self.context, key, &sid, &self.turn_token)?;
                 if self.current_reason != "wakeReminder" {
                     // A persona switch or compaction can start a new briefing generation while this
                     // wake is prepared; nothing was submitted, so prepare once more.
-                    let prepared = match crate::prompt::prepare_dsh_wake(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt) {
-                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt),
+                    let wake = match crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt) {
+                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt),
                         other => other,
-                    };
-                    (prompt_text, delivered_recall) = prepared?;
+                    }?;
+                    layers = Some(serde_json::json!({"injected": wake.layers.to_json(), "cut": wake.cut.to_json()}));
+                    (prompt_text, delivered_recall) = (wake.text, wake.recalled);
                     // Refusal provenance follows the single packet actually delivered, not the
                     // compatibility full render that was built before session resolution.
                     self.carried_messages.clear();
@@ -1778,7 +1780,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 }
             }
             if let Some(turn) = &self.cur_turn {
-                turn.attempt(&rpc_id, &sid)
+                turn.attempt_with_layers(&rpc_id, &sid, layers.as_ref())
                     .map_err(|e| format!("回合账本写入失败，不提交 prompt：{e}"))?;
             }
             let mut content = vec![serde_json::json!({"type": "text", "text": prompt_text})];
@@ -2564,7 +2566,19 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         crate::activity::append(&self.context, &line);
     }
 
+    /// Chat sends of a turn run off the runtime worker: the chain wait, part delays and gateway
+    /// calls must not starve ingress (issue #82).
     fn send_chat_text(
+        &self,
+        key: &str,
+        sid: &str,
+        purpose: &str,
+        text: &str,
+    ) -> crate::chat::SendReport {
+        crate::recorded_send::off_worker(|| self.send_chat_text_inline(key, sid, purpose, text))
+    }
+
+    fn send_chat_text_inline(
         &self,
         key: &str,
         sid: &str,

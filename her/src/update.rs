@@ -35,7 +35,7 @@ fn verify_images(root: &InstallRoot, tag: &str, sums: &[u8]) -> Result<Vec<u8>, 
     for name in release_store::IMAGES {
         let file = path.join(name);
         let meta = fs::symlink_metadata(&file).map_err(|_| "installed image unavailable")?;
-        if !meta.is_file() || release_store::redirected(&meta) {
+        if !meta.is_file() || crate::guarded_file::is_link(&meta) {
             return Err("installed image is redirected".into());
         }
         let bytes = fs::read(file).map_err(|_| "installed image unreadable")?;
@@ -172,7 +172,7 @@ fn recovered_authority(root: &InstallRoot) -> Result<Authority, String> {
                 let Some(version) = release_store::version(&tag) else {
                     continue;
                 };
-                if meta.is_dir() || release_store::redirected(&meta) {
+                if meta.is_dir() || crate::guarded_file::is_link(&meta) {
                     occupied = true;
                     candidates.push((version, tag.into_owned()));
                 }
@@ -548,7 +548,7 @@ fn read_alert(root: &InstallRoot) -> Result<Option<UpdateAlert>, String> {
         Err(_) => return Err("update alert unavailable".into()),
         Ok(meta) => meta,
     };
-    if !meta.is_file() || release_store::redirected(&meta) {
+    if !meta.is_file() || crate::guarded_file::is_link(&meta) {
         return Err("update alert redirected".into());
     }
     let alert: UpdateAlert =
@@ -619,7 +619,7 @@ fn read_starts(root: &InstallRoot) -> Result<Starts, String> {
         Err(_) => return Err("release start history unavailable".into()),
         Ok(m) => m,
     };
-    if !meta.is_file() || release_store::redirected(&meta) {
+    if !meta.is_file() || crate::guarded_file::is_link(&meta) {
         return Err("release start history redirected".into());
     }
     let starts: Starts =
