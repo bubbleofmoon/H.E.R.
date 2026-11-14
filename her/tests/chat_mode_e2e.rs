@@ -890,7 +890,7 @@ fn status_role_silent_and_active_commands_have_the_old_texts_and_effects() {
     says(&rig, OWNER_KEY, OWNER, "owner", "/status");
     let t = rig.wait_texts(OWNER_KEY, 4);
     assert_eq!(t[1], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
-    assert_eq!(t[2], "角色「不存在的」不存在。角色文件放 qq-bridge/roles/ 目录。");
+    assert_eq!(t[2], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。", "an unknown name gets the same notice");
     assert_eq!(t[3], "会话 未创建；白名单 通过；角色 无；模式 active");
     assert!(rig.data_json("current-role.json")["role"].is_null(), "a retired /role writes nothing");
 
@@ -1324,6 +1324,28 @@ fn reserved_commands_and_disabled_social_use_the_public_chat_fallback() {
         social.0 == 200
     }), "social view never became available: {social:?}");
     assert_eq!(social.1["pendingSummaries"], json!({}), "{social:?}");
+}
+
+#[test]
+fn reserved_role_commands_answer_the_retirement_notice_and_write_nothing() {
+    let mut rig = Rig::new(
+        "reserved-role19",
+        Seed {
+            mode: "reserved",
+            config: json!({"social":{"enabled":false},"ackMessage":""}),
+            roles: vec![("小鲸鱼", "你是小鲸鱼。\n")],
+            ..Seed::default()
+        },
+    );
+    rig.start();
+    for command in ["/role 小鲸鱼", "/role 不存在的", "/role off"] {
+        says(&rig, OWNER_KEY, OWNER, "owner", command);
+    }
+    for text in rig.wait_texts(OWNER_KEY, 3) {
+        assert_eq!(text, "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
+    }
+    assert!(rig.data_json("current-role.json")["role"].is_null(), "a retired /role writes nothing");
+    assert!(rig.dsh.prompts().is_empty(), "no /role form reaches the model");
 }
 
 fn reserved_seed(extra: Value) -> Seed {

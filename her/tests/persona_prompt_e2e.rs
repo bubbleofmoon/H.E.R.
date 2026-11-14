@@ -815,6 +815,22 @@ fn role_cards_are_retired_in_companion_modes() {
     assert!(!prompts[0].text.contains("【当前角色】") && !prompts[0].text.contains("你是一只爱聊天的小鲸鱼"), "{}", prompts[0].text);
 }
 
+#[test]
+fn a_damaged_persona_library_renders_no_persona_and_no_role_card() {
+    let mut rig = Rig::new("persona-damaged", Seed {
+        roles: vec![("小鲸鱼", CARD_SHARED)],
+        current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
+        personas: Some(json!({"format": 99, "personas": {"p1": {"id": "p1"}}})),
+        ..Seed::default()
+    });
+    assert_eq!(rig.console("GET", "/api/personas", None).0, 503);
+    rig.restart(mention(1201, "坏的人设库"));
+    let prompts = rig.wait_prompts(1);
+    let text = &prompts[0].text;
+    assert!(!text.contains("【人设】") && !text.contains("【当前角色】") && !text.contains("你是一只爱聊天的小鲸鱼"), "{text}");
+    assert_eq!(rig.data_json("personas.json")["format"], json!(99), "a damaged library is never repaired");
+}
+
 // ───────────────────────── AC4: first wake, repeat, reset, restart ─────────────────────────
 
 fn count(haystack: &str, needle: &str) -> usize {
@@ -1118,10 +1134,21 @@ fn a_group_member_cannot_switch_personas_and_gets_the_fixed_refusal() {
     let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
     approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
     assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale.clone()}))).0, 200);
-    rig.restart(mention(7001, "/persona 会计"));
+    // A later ordinary mention proves ordering: the command was settled before it and never became input.
+    let mut script = mention(7001, "/persona 会计");
+    script.extend([Step::Wait(1500), Step::Mention { message_id: 7002, text: "后续的普通消息" }]);
+    rig.restart(script);
     let refused = || lock(&rig.gateway).sends.iter().any(|send| send.to_string().contains("人设只能由管理员在私聊或控制台切换。"));
     assert!(wait_for(LONG, refused), "no fixed refusal: {:?}", lock(&rig.gateway).sends);
+    let prompts = rig.wait_prompts(1);
+    assert!(prompts[0].text.contains("后续的普通消息"), "{}", prompts[0].text);
+    assert!(!prompts[0].text.contains("/persona 会计"), "the command never reaches the model: {}", prompts[0].text);
+    thread::sleep(Duration::from_secs(3));
+    // The rig fires its own timed wakes (bootstrap, then wakeReminder), so the count is not the check:
+    // no prompt carries the command, and every prompt is one of those timed wakes.
+    let delivered = rig.dsh.prompts();
+    assert!(delivered.iter().all(|p| !p.text.contains("/persona")), "the command reached the model: {delivered:?}");
+    assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】你已接入 QQ 会话") || p.text.contains("【提醒】你还没有完成回合收尾")), "a turn other than a timed wake ran: {delivered:?}");
     assert_eq!(rig.data_json("personas.json")["default"], json!(whale));
     assert_eq!(rig.data_json("personas.json")["overrides"], json!({}));
-    assert!(rig.dsh.prompts().is_empty(), "the command never reaches the model");
 }

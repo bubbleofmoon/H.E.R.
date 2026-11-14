@@ -941,8 +941,10 @@ impl Hub {
         let role_mode = role_state.get("mode").and_then(Value::as_str).unwrap_or("active").to_string();
         let session = crate::session_map::lookup(&self.context, &key)?;
         let context = self.context.clone();
+        // In companion modes every `/role` form gets the retirement notice, an unknown name included.
+        let retired = crate::persona::applies(&self.context);
         let exists = move |name: &str| {
-            context
+            retired || context
                 .resolve_path(RuntimeArea::Resources, &format!("roles/{name}.md"), PathIntent::ReadFile)
                 .map(|p| p.is_file())
                 .unwrap_or(false)

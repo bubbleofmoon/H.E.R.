@@ -716,8 +716,10 @@ impl Hub {
             session: crate::session_map::lookup(&self.context, &key)?,
             allowed: true,
         };
+        // In companion modes every `/role` form gets the retirement notice, an unknown name included.
+        let retired = crate::persona::applies(&self.context);
         let decision = chat::decide(&facts, &|name| {
-            self.context
+            retired || self.context
                 .resolve_path(
                     RuntimeArea::Resources,
                     &format!("roles/{name}.md"),
