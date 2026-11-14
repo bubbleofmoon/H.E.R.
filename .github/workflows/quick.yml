@@ -80,25 +80,38 @@ jobs:
       - name: Compile check
         if: inputs.target == 'check'
         run: |
-          cd "$PUBLIC_TREE/her"
-          cargo check --workspace --all-targets
+          # Features match the test commands in scripts/ci/run-tests.py; her-memory is its own crate.
+          (cd "$PUBLIC_TREE/her" && cargo check --workspace --all-targets --features parity-clock,release-test-keys)
+          (cd "$PUBLIC_TREE/her-memory" && cargo check --workspace --all-targets)
       - name: Format and clippy (report-only)
         if: inputs.target == 'lint'
         run: |
           mkdir -p "$CI_EVIDENCE"
-          cd "$PUBLIC_TREE/her"
           set +e
-          cargo fmt --all --check
-          echo "fmt check exit $?"
-          cargo clippy --workspace --all-targets 2>&1 | tee "$CI_EVIDENCE/clippy.log"
-          echo "clippy exit ${PIPESTATUS[0]}"
-          # One line per warning; the per-crate "generated N warnings" summaries are not warnings.
-          count=$(grep -E '^warning: ' "$CI_EVIDENCE/clippy.log" | grep -Ecv 'generated [0-9]+ warnings?')
+          lint_crate() {
+            local crate=$1 code count
+            shift
+            (cd "$PUBLIC_TREE/$crate" && cargo fmt --all --check)
+            echo "fmt check $crate exit $?"
+            (cd "$PUBLIC_TREE/$crate" && cargo clippy --workspace --all-targets "$@" 2>&1) | tee "$CI_EVIDENCE/clippy-$crate.log"
+            code=${PIPESTATUS[0]}
+            echo "clippy $crate exit $code"
+            if [ "$code" -ne 0 ]; then
+              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): incomplete, clippy exit $code"
+            else
+              # One line per warning; the per-crate "generated N warnings" summaries are not warnings.
+              count=$(grep -E '^warning: ' "$CI_EVIDENCE/clippy-$crate.log" | grep -Ecv 'generated [0-9]+ warnings?')
+              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): $count"
+            fi
+          }
+          # Features match the test commands in scripts/ci/run-tests.py; her-memory is its own crate.
+          lint_crate her --features parity-clock,release-test-keys
+          lint_crate her-memory
           # Rewrite with cargo fmt and keep the result as a patch for the worker to apply.
-          cargo fmt --all
+          (cd "$PUBLIC_TREE/her" && cargo fmt --all)
+          (cd "$PUBLIC_TREE/her-memory" && cargo fmt --all)
           (cd "$PUBLIC_TREE" && git diff > "$CI_EVIDENCE/fmt.patch")
           echo "fmt patch bytes: $(wc -c < "$CI_EVIDENCE/fmt.patch")"
-          echo "CLIPPY WARNINGS (${RUNNER_OS}): $count"
       - name: Upload fmt patch
         if: always() && inputs.target == 'lint'
         uses: actions/upload-artifact@v4
