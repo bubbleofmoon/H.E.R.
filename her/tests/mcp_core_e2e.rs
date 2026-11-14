@@ -350,7 +350,9 @@ impl Console {
             // application-directory search position, without changing the shared candidate.
             let copy = Path::new(input).parent().unwrap().join("her.exe");
             // Copy once: a retry or restart must not overwrite an image that a killed console may still hold.
-            if !copy.exists() { fs::copy(env!("CARGO_BIN_EXE_her"), &copy).unwrap(); }
+            if !copy.exists() {
+                fs::copy(env!("CARGO_BIN_EXE_her"), &copy).unwrap();
+            }
             copy
         } else { PathBuf::from(env!("CARGO_BIN_EXE_her")) };
         let mut command = Command::new(executable);

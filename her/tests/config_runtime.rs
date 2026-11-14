@@ -78,6 +78,18 @@ fn path_arg(path: &Path) -> &str {
     path.to_str().expect("utf-8 fixture path")
 }
 
+/// Console home directories of one start. Whatever is still in the list is removed on drop, so a start
+/// that panics after its attempts leaves no home behind.
+struct StaleHomes(Vec<PathBuf>);
+
+impl Drop for StaleHomes {
+    fn drop(&mut self) {
+        for home in self.0.drain(..) {
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+}
+
 struct Console {
     child: Child,
     port: u16,
@@ -86,7 +98,7 @@ struct Console {
 
 impl Console {
     fn start(root: &Path) -> Self {
-        let mut homes = Vec::new();
+        let mut homes = StaleHomes(Vec::new());
         let (child, port) = crate::support::ports::start_console(Duration::from_secs(10), |port| {
             let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
             command
@@ -97,11 +109,15 @@ impl Console {
                 .arg(root)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            let home = unique_dir("console-home"); isolate_env(&mut command, &home); homes.push(home);
+            let home = unique_dir("console-home");
+            isolate_env(&mut command, &home);
+            homes.0.push(home);
             command.spawn().expect("start isolated console candidate")
         });
-        let home = homes.pop().expect("started console home");
-        for stale in homes { let _ = fs::remove_dir_all(stale); }
+        let home = homes.0.pop().expect("started console home");
+        for stale in homes.0.drain(..) {
+            let _ = fs::remove_dir_all(stale);
+        }
         let mut console = Self { child, port, home };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

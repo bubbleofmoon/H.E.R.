@@ -169,9 +169,10 @@ thread_local! {
     static HELD: std::cell::RefCell<Vec<Reserved>> = std::cell::RefCell::new(Vec::new());
 }
 
-/// Keeps a reservation bound on this thread until `release_held`. Use it for a port that is written
-/// into fixture files and bound later by a child or grandchild. The target's single child-spawn
-/// helper calls `release_held()` first. Each test runs on its own thread, so holds never cross tests.
+/// Keeps a reservation bound until `release_held`, for a port that is written into fixture files and
+/// bound later by a child or grandchild. Holds are per thread: each test runs on its own thread, and the
+/// first child spawn on that thread frees every held port (the spawn helper calls `release_held()`).
+/// Two fixtures on one thread share that free point.
 pub fn hold(reservation: Reserved) {
     HELD.with(|held| held.borrow_mut().push(reservation));
 }

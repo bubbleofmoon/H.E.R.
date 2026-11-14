@@ -1309,6 +1309,8 @@ fn another_runtime_sweep_preserves_staging_after_npm_exit_until_publication() {
     use std::os::unix::fs::OpenOptionsExt;
 
     let mut fixture = Fixture::new();
+    // The trial's reservations are taken while the first fixture's ports are still held, so the two
+    // fixtures get distinct ports. The first hidden() call frees both sets.
     let mut trial = Fixture::new();
     let ready = fixture.root.join("npm-ready.json");
     let release = fixture.root.join("npm-exit");
