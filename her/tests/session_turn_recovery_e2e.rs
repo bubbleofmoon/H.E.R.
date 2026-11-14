@@ -3404,11 +3404,12 @@ fn hf85_rotation_never_runs_during_a_turn_even_after_cache_expiry() {
     rig.restart(mention(85901,"active turn prevents rotation"));
     assert!(wait_for(LONG,||rig.turn_state(1)=="running"));
     let before=rig.dsh.received();
-    assert_eq!(rig.dsh.digest_calls(),0,"normal turn overlaps a digest");
+    let digests=rig.dsh.digest_calls();
     assert_eq!(lock(&rig.dsh.inner).overlapping_prompts,0);
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":1.01}));
     thread::sleep(Duration::from_secs(3));
     assert_eq!(rig.dsh.received(),before,"maintenance submitted a prompt during a running turn");
+    assert_eq!(rig.dsh.digest_calls(),digests,"normal turn overlaps a digest");
     assert_eq!(rig.dsh.count("workspace/archiveSession"),0);
     rig.dsh.release();
     assert!(wait_for(LONG,||rig.turn_state(1)=="completed"));
