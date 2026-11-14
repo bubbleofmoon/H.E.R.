@@ -1,7 +1,7 @@
 //! Ticket 27: `her lifecycle` and `her tasks` through the real binary on a synthetic root.
 
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+mod support;
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -104,12 +104,10 @@ fn console_owner(dir: &Path, image: &str) -> ConsoleOwner {
     std::fs::write(dir.join("config/config.json"), r#"{"consoleToken":"fixture-token"}"#).unwrap();
     std::fs::write(dir.join("data/social-v2.json"), "{}").unwrap();
     std::fs::write(dir.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
-    let mut child = ConsoleOwner(hidden_command(image)
-        .args(["--console-serve", "--console-port", &port, "--runtime-root"]).arg(dir)
+    let (child, _port) = crate::support::ports::start_console(Duration::from_secs(12), |port| hidden_command(image)
+        .args(["--console-serve", "--console-port", &port.to_string(), "--runtime-root"]).arg(dir)
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let mut child = ConsoleOwner(child);
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
         assert!(child.0.try_wait().unwrap().is_none(), "console exited before ownership");
@@ -227,11 +225,11 @@ fn a_stopped_runtime_refuses_direct_console_startup() {
     std::fs::write(dir.join("data/social-v2.json"), "{}").unwrap();
     std::fs::write(dir.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
     assert_eq!(run(&["lifecycle", "set", "stopped", "--confirm"], &dir).0, 0);
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port().to_string();
-    drop(listener);
+    // The console must refuse before binding. The port is released on the spawn line, so a regressed
+    // console can still bind and stay up, which the deadline below reports.
+    let reservation = crate::support::ports::reserve();
     let mut child = hidden_command(env!("CARGO_BIN_EXE_her"))
-        .args(["--console-serve", "--console-port", &port, "--runtime-root"]).arg(&dir)
+        .args(["--console-serve", "--console-port", &reservation.release().to_string(), "--runtime-root"]).arg(&dir)
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -251,7 +249,7 @@ fn a_stopped_runtime_refuses_direct_console_startup() {
 #[cfg(unix)]
 #[test]
 fn supervisor_reconciles_a_changed_desired_state_without_waiting_for_the_next_schedule() {
-    use std::net::{TcpListener, TcpStream};
+    use std::net::TcpStream;
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
@@ -265,13 +263,13 @@ fn supervisor_reconciles_a_changed_desired_state_without_waiting_for_the_next_sc
     let dir = root("reconcile");
     std::fs::create_dir_all(dir.join("config")).unwrap();
     std::fs::create_dir_all(dir.join("resources")).unwrap();
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let reservation = crate::support::ports::reserve();
+    let port = reservation.port();
     std::fs::write(dir.join("config/config.json"), format!(r#"{{"consoleToken":"fixture-token","backends":{{"mcpRustBridge":true}},"rollout":{{"rustGroups":[]}},"consolePort":{port}}}"#)).unwrap();
     std::fs::write(dir.join("data/social-v2.json"), "{}").unwrap();
     std::fs::write(dir.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
     assert_eq!(run(&["lifecycle", "set", "stopped", "--confirm"], &dir).0, 0);
+    drop(reservation); // the supervisor's console binds it once the desired state is running
     let child = hidden_command(env!("CARGO_BIN_EXE_her"))
         .args(["supervise", "--runtime-root"]).arg(&dir).process_group(0)
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
