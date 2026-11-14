@@ -4601,6 +4601,15 @@ fn sticker_list_public_http_uses_selected_roots_and_js_console_auth() {
     assert!(String::from_utf8_lossy(&persisted_b).contains("beta-sticker"));
     assert!(!String::from_utf8_lossy(&persisted_b).contains("alpha-sticker"));
 }
+/// Ordinary spelling for comparing a path with its verbatim form: strips only the `\\?\` prefix.
+fn ordinary(path: impl AsRef<Path>) -> String {
+    let text = path.as_ref().to_str().unwrap().to_string();
+    match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text),
+    }
+}
+
 #[test]
 fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_console() {
     let workspace = FixtureWorkspace::new("restore-preview");
@@ -4631,6 +4640,8 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     assert_eq!(call("/api/backups/restore/preview", None, None, &body).status, 401);
     assert_eq!(call("/api/backups/restore/preview", Some(token), Some(agent), &body).status, 403);
     let p = expect_json(call("/api/backups/restore/preview", Some(token), None, &body), 200, "restore preview");
+    let expected_archive = ordinary(fs::canonicalize(root.join("backups").join(name)).unwrap());
+    assert_eq!(p["preview"]["archive"], json!(expected_archive), "preview names the archive in ordinary spelling");
     assert_eq!(p["preview"]["replaces"], json!(["data/memory.db"]));
     assert!(p["preview"]["contents"].as_array().unwrap().iter().any(|p| p == "config.json"));
     assert!(p["preview"]["time"].is_i64());
@@ -4647,7 +4658,7 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     let restore_audits: Vec<Value> = audit.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["action"] == "backup.restore").collect();
     assert!(restore_audits.iter().any(|event| event["by"] == "console:administrator"
-        && event["archive"] == json!(root.join("backups").join(name))
+        && event["archive"] == json!(expected_archive)
         && event["scope"] == "memory" && event["result"] == "failed"), "busy console restore audit: {audit}");
     drop(gate);
     fs::write(root.join("backups").join(name), b"broken").unwrap();
