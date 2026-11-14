@@ -38,13 +38,15 @@ const server = http.createServer((req, res) => {
       setTimeout(() => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html><body>synthetic release web content</body></html>'); }, 1000);
       return;
     }
-    const envelope = JSON.parse(Buffer.concat(chunks).toString() || '{}');
-    let value;
-    if (req.url === '/api/session/list') value = { items: [{ sessionId: 'release-digest', updatedAt: Date.now(), projections: { values: { title: 'QQ synthetic digest' } } }] };
-    else if (req.url === '/api/session/prompt') { prompts++; value = { accepted: true }; }
-    else { res.writeHead(400); res.end('{}'); return; }
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ type: 'server-response', rpcId: envelope.rpcId, result: { ok: true, value } }));
+    if (req.url === '/v1/chat/completions') {
+      prompts++;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 'synthetic', object: 'chat.completion', created: 1, model: 'synthetic-digest-model',
+        choices: [{ index: 0, message: { role: 'assistant', content: '[]' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+      return;
+    }
+    res.writeHead(400); res.end('{}'); return;
   });
 });
 await new Promise(r => server.listen(process.argv.includes('--fake-console') ? Number(port) : 0, '127.0.0.1', r));
@@ -93,8 +95,9 @@ try {
   await new Promise(r => reservation.close(r));
   const token = 'synthetic-digest-console';
   fs.writeFileSync(path.join(selected, 'config/config.json'), JSON.stringify({ consoleToken: token, consolePort: digestPort,
-    memory: { autoFlush: { enabled: true } }, tasks: { nodePath: path.join(selected, 'missing-node') } }));
-  fs.writeFileSync(path.join(selected, 'data/social-v2.json'), '{}');
+    memory: { autoFlush: { enabled: true } }, harness: { model: 'synthetic-digest-model' }, tasks: { nodePath: path.join(selected, 'missing-node') } }));
+  fs.writeFileSync(path.join(selected, 'config/harness-api-key'), 'synthetic-digest-key');
+  fs.writeFileSync(path.join(selected, 'data/social-v2.json'), JSON.stringify({ conversations: { 'group:7': { agentToken: 'synthetic', recentMessages: [{ seq: 1, sender: 'synthetic', userId: '5', text: 'synthetic digest evidence', isSelf: false }] } } }));
   fs.writeFileSync(path.join(selected, 'dependencies.json'), JSON.stringify({ dsh: endpoint, model: endpoint, onebot: endpoint }));
   fs.copyFileSync(path.join(runtime, 'user/dsh/.credentials.yaml'), path.join(selected, 'user/dsh/.credentials.yaml'));
   const consoleChild = spawn(exe, ['--console-serve', '--console-port', String(digestPort), '--runtime-root', selected],
@@ -134,9 +137,8 @@ try {
   });
   assert.equal(completed.state, 'succeeded'); assert.equal(completed.pid, null);
   assert.equal(prompts, 1);
-  const state = JSON.parse(fs.readFileSync(path.join(selected, 'data/digest-state.json'))); assert(state.sessions['release-digest']);
   fs.writeFileSync(path.join(root, 'chains.json'), JSON.stringify({ mcp, digestPrompts: prompts }));
-  console.log('PASS generated MCP initialize/list/call, native curl through a loopback adapter, and actual digest prompt on fake DSH');
+  console.log('PASS generated MCP initialize/list/call, native curl through a loopback adapter, and actual digest model call on a fake relay');
 } finally {
   await Promise.all([...children].map(child => new Promise(resolve => { child.once('close', resolve); child.kill(); })));
   server.closeAllConnections(); await new Promise(r => server.close(r));
