@@ -894,6 +894,30 @@ mod tests {
         assert!(matches!(classify_send_reply(502, ""), Err(SendError::Unknown(_))));
     }
 
+    #[test]
+    fn mute_refusal_retcode_100_with_result_120_is_not_committed() {
+        for body in [
+            r#"{"status":"failed","retcode":100,"message":"sendMsg failed: result=120","wording":"x"}"#,
+            r#"{"status":"failed","retcode":100,"wording":"result = 120"}"#,
+            r#"{"status":"failed","retcode":100,"msg":"Result:120"}"#,
+            r#"{"status":"failed","retcode":100,"data":{"result":120}}"#,
+            r#"{"status":"failed","retcode":100,"wording":"result：120"}"#,
+        ] {
+            match classify_send_reply(200, body) {
+                Err(SendError::NotCommitted(_error)) => {} // A2 adds: assert!(is_mute_refusal(&_error), "{body}: {_error}")
+                other => panic!("{body}: {other:?}"),
+            }
+        }
+        for body in [
+            r#"{"status":"failed","retcode":100,"wording":"result=1200"}"#,
+            r#"{"status":"failed","retcode":100,"wording":"result=12"}"#,
+            r#"{"status":"failed","retcode":200,"wording":"result=120"}"#,
+            r#"{"status":"failed","retcode":100,"data":{"result":121}}"#,
+        ] {
+            assert!(matches!(classify_send_reply(200, body), Err(SendError::Unknown(_))), "{body}");
+        }
+    }
+
     fn fake_onebot_server(
         listener: TcpListener,
         expected_host: String,
