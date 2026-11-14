@@ -12146,6 +12146,21 @@ fn route_with_context(
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
     }
+    if context.is_isolated() && crate::console_persona::is_route(&req.path) {
+        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
+        // Writes commit under the configuration gate after a fresh credential check, like release
+        // approval: a credential revoked while this request waited never writes.
+        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+            let gate = config_gate(context)?;
+            let latest = selected_config_for_handler(context)?;
+            if !authorized_in(context, req, &latest) {
+                return Err((401, "console credential was revoked".into()));
+            }
+            Ok(gate)
+        };
+        let (status, content_type, body) = crate::console_persona::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
+        return (status, content_type.to_string(), body);
+    }
     if context.is_isolated() && schedule_routes::is_schedule_path(&req.path) {
         return schedule_routes::route(context, cfg, req);
     }

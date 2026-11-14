@@ -1502,6 +1502,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let result = self.ask_with_failover_inner(key, prompt, timeout, cfg).await;
         if let Err(error) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
+                && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
                 && !error.contains("preset") && !error.contains("预设") {
                 let candidate = self.active_candidate.clone().unwrap_or_else(|| failover::model_chain_for(cfg, key)[0].clone());
                 self.report_backend_failure(cfg, key, "dsh", &candidate.provider, &candidate.model, "", error);
@@ -1762,7 +1763,12 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             if self.context.is_isolated() && self.cur_turn.is_some() && self.chat.is_none() {
                 follow.track_briefing(&self.context, key, &sid, &self.turn_token)?;
                 if self.current_reason != "wakeReminder" {
-                    let wake = crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt)?;
+                    // A persona switch or compaction can start a new briefing generation while this
+                    // wake is prepared; nothing was submitted, so prepare once more.
+                    let wake = match crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt) {
+                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt),
+                        other => other,
+                    }?;
                     layers = Some(serde_json::json!({"injected": wake.layers.to_json(), "cut": wake.cut.to_json()}));
                     (prompt_text, delivered_recall) = (wake.text, wake.recalled);
                     // Refusal provenance follows the single packet actually delivered, not the

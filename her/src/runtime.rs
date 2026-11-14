@@ -1110,6 +1110,8 @@ impl RuntimeContext {
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/schedule/"))
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
             || (method == "POST" && path == "/api/memory/archive")
+            || (method == "GET" && path == "/personas")
+            || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
             || path.strip_prefix("/api/slang/").is_some_and(|tail| {
                 let parts: Vec<&str> = tail.split('/').collect();
                 match (method, parts.as_slice()) {

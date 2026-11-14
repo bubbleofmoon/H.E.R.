@@ -40,6 +40,10 @@ pub fn role_for_session(key: &str) -> Option<String> {
 }
 
 pub fn role_for_session_with_runtime(context: &RuntimeContext, key: &str) -> Option<String> {
+    // Role cards are retired in companion modes; identity comes from the persona library there.
+    if crate::persona::applies(context) {
+        return None;
+    }
     let map = read_data_json(context, "role-map.json").unwrap_or_else(|| serde_json::json!({}));
 
     if let Some(sessions) = map.get("sessions").and_then(|s| s.as_object()) {
@@ -102,6 +106,19 @@ pub fn role_line_with_runtime(context: &RuntimeContext, key: &str) -> String {
         Some(name) => format!("【当前角色】{name}（完整角色卡请调用 qq_get_prompt 查看）\n\n"),
         None => String::new(),
     }
+}
+
+/// The Identity text of a conversation: the active persona core in companion modes, cut at
+/// `role.maxInjectChars`; empty in closed-agent. The single injection point: the layered DSH briefing reaches it
+/// through `briefing::persona_core`.
+pub(crate) fn identity_core(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
+    crate::persona::core_block(context, key, role_inject_limit(cfg))
+}
+
+/// Chat and first-generation prompts: the persona core, else the role card (closed-agent, legacy).
+pub fn identity_hint_v1(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
+    let core = identity_core(context, cfg, key);
+    if core.is_empty() { role_hint_v1(context, cfg, key) } else { core.trim_end().to_string() }
 }
 
 /// JS `roleRawContent(key)`: the role card file of the session's role, or an empty string.
@@ -172,7 +189,16 @@ fn convert_example_spaces_to_comma(line: &str) -> String {
 /// JS `currentRoleHintV2(key)`: the second-generation card text with first-generation commands
 /// removed and the example section's space separators rewritten to commas.
 pub fn role_hint_v2(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
-    let raw = role_hint_for_mode(context, cfg, key, crate::role::MODE_V2);
+    v2_card_lines(&role_hint_for_mode(context, cfg, key, crate::role::MODE_V2))
+}
+
+/// The reserved2 view of a whole role card, uncut; persona import stores it as the core.
+pub(crate) fn role_card_v2_text(card: &str) -> String {
+    v2_card_lines(&crate::role::select_role_text(card, crate::role::MODE_V2))
+}
+
+/// Drops first-generation command lines and rewrites the example section's spaces to commas.
+fn v2_card_lines(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
@@ -1231,6 +1257,7 @@ fn build_inner(
 
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
+    out.push_str(&identity_core(context, &cfg, key));
     out.push_str(&identity_line(self_name, self_qq));
     out.push_str(&token_line(token));
     let initial = initial_prompt_line_with_runtime(context, &cfg, key, reason);
@@ -1309,6 +1336,7 @@ fn build_text_only_inner(
     let cfg = config_for_runtime(context);
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
+    out.push_str(&identity_core(context, &cfg, key));
     out.push_str(&identity_line(&crate::model_view::strip_from_model_text(self_name, &cfg), self_qq));
 
     out.push_str("【这次怎么做】\n");
@@ -1560,6 +1588,7 @@ mod tests {
         }}).to_string();
         std::fs::write(root.join("data/social-v2.json"), &state).unwrap();
 
+        std::fs::write(root.join("data/personas.json"), r#"{"format":1,"nextId":2,"default":null,"overrides":{"group:1":"p1"},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"测试人设","core":"测试人设核心。"}]}}}"#).unwrap();
         // The selected-runtime wake hub has no legacy process-local string window.
         let prompt = build_text_only_with_runtime(&context, "group:1", &[], "bot", "9001");
         let explicit = build_text_only_with_runtime(
@@ -1581,7 +1610,7 @@ mod tests {
         assert_eq!(packet["includedUnreadCount"], 12);
         assert_eq!(packet["readThroughSeq"], 12);
         assert_eq!(packet["partial"], true);
-        assert!(prompt.contains("【当前角色】测试角色"), "CLI prompt lost selected role: {prompt}");
+        assert!(prompt.contains("【人设】测试人设\n测试人设核心。"), "CLI prompt lost the selected persona: {prompt}");
         assert!(prompt.contains("【未读】13 条"), "CLI prompt lost selected unread count: {prompt}");
         assert!(!prompt.contains("foreign-conversation"), "CLI prompt crossed conversations: {prompt}");
         assert!(explicit.contains("7777: live-window-message"));
@@ -1777,6 +1806,7 @@ mod tests {
     #[test]
     fn role_hint_v2_selects_v2_sections_and_rewrites_example_spaces() {
         let (root, context) = runtime_fixture("role-hint");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
         std::fs::create_dir_all(root.join("resources/roles")).unwrap();
         std::fs::write(root.join("resources/roles/测试角色.md"), CARD).unwrap();
         let cfg = serde_json::json!({});
@@ -1808,6 +1838,7 @@ mod tests {
     #[test]
     fn role_map_default_empty_string_means_no_role_even_with_a_global_role() {
         let (root, context) = runtime_fixture("role-default");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
         std::fs::write(root.join("data/current-role.json"), r#"{"role":"全局","mode":"active"}"#).unwrap();
         std::fs::write(root.join("data/role-map.json"), r#"{"default":""}"#).unwrap();
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), None);
@@ -1815,6 +1846,46 @@ mod tests {
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), Some("组角色".to_string()));
         std::fs::write(root.join("data/role-map.json"), "{}").unwrap();
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), Some("全局".to_string()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_an_approved_complete_active_version_is_rendered_and_the_core_is_capped() {
+        let (root, context) = runtime_fixture("persona validation");
+        let cfg = serde_json::json!({});
+        let library = |active: u64, second: &str| format!(r#"{{"format":1,"nextId":2,"default":"p1","overrides":{{}},"importedRolesAt":null,"personas":{{"p1":{{"id":"p1","activeVersion":{active},"versions":[{{"version":1,"approved":true,"name":"测试人设","core":"已批准的核心。"}},{second}]}}}}}}"#);
+        for (active, second) in [
+            (2, r#"{"version":2,"approved":false,"name":"测试人设","core":"未批准的草稿。"}"#),
+            (2, r#"{"version":2,"approved":true,"name":"测试人设","core":""}"#),
+            (2, r#"{"version":2,"approved":"yes","name":"测试人设","core":"字符串批准。"}"#),
+            (3, r#"{"version":2,"approved":true,"name":"测试人设","core":"不在用。"}"#),
+        ] {
+            std::fs::write(root.join("data/personas.json"), library(active, second)).unwrap();
+            assert_eq!(identity_core(&context, &cfg, "group:1"), "", "{second}");
+        }
+        std::fs::write(root.join("data/personas.json"), library(1, r#"{"version":2,"approved":false,"name":"测试人设","core":"草稿。"}"#)).unwrap();
+        assert_eq!(identity_core(&context, &cfg, "group:1"), "【人设】测试人设\n已批准的核心。\n\n");
+        // Bounded by role.maxInjectChars (minimum 1000) until #18 owns the budget.
+        let long = "长".repeat(1500);
+        std::fs::write(root.join("data/personas.json"), library(2, &format!(r#"{{"version":2,"approved":true,"name":"测试人设","core":"{long}"}}"#))).unwrap();
+        let capped = identity_core(&context, &serde_json::json!({"role": {"maxInjectChars": 1000}}), "group:1");
+        assert_eq!(capped, format!("【人设】测试人设\n{}\n\n", "长".repeat(1000)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closed_agent_prompts_keep_the_role_card_and_render_no_persona() {
+        let (root, context) = runtime_fixture("closed-agent persona");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
+        std::fs::create_dir_all(root.join("resources/roles")).unwrap();
+        std::fs::write(root.join("resources/roles/测试角色.md"), CARD).unwrap();
+        std::fs::write(root.join("data/personas.json"), r#"{"format":1,"nextId":2,"default":null,"overrides":{"group:1":"p1"},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"测试人设","core":"测试人设核心。"}]}}}"#).unwrap();
+        let cfg = serde_json::json!({});
+        assert_eq!(identity_core(&context, &cfg, "group:1"), "");
+        let hint = identity_hint_v1(&context, &cfg, "group:1");
+        assert!(!hint.is_empty() && hint == role_hint_v1(&context, &cfg, "group:1"), "{hint}");
+        let prompt = build_text_only_with_runtime(&context, "group:1", &[], "bot", "9001");
+        assert!(prompt.contains("【当前角色】测试角色") && !prompt.contains("【人设】"), "{prompt}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1877,6 +1948,27 @@ mod tests {
     }
 }
 
+/// `prepare_dsh_wake_layered`'s error when the session, epoch or briefing generation changed while the wake
+/// was prepared (a persona switch or compaction). Nothing was submitted; the pipeline prepares once
+/// more and never reports it as a backend failure.
+pub(crate) const WAKE_BRIEFING_CHANGED: &str = "wake session, epoch or briefing generation changed before submission";
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once inside `prepare_dsh_wake_layered` after its sections are rendered (race tests).
+    pub(crate) static AFTER_SECTIONS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn after_sections() {
+    if let Some(hook) = AFTER_SECTIONS.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_sections() {}
+
 /// A prepared DSH wake: its text, the ids of the memories its recall carries (counted only after DSH accepts
 /// it), the items each memory layer injected and lost to the budgets, and the empty layers it alerted.
 pub(crate) struct DshWake {
@@ -1914,6 +2006,14 @@ pub(crate) fn prepare_dsh_wake_layered(
     let state = context.read_social_state()?;
     let st = &state["conversations"][key];
     if st["agentToken"].as_str() != Some(epoch) { return Err("wake epoch changed before briefing".into()); }
+    // Capture the briefing generation before any section is rendered. A persona switch saves the
+    // library before it bumps the generation, so sections rendered after this capture are at least
+    // as new as it; a bump after it fails the pending guard below and the caller prepares again.
+    let record = crate::session_map::context_record(context,key,sid,epoch)?;
+    let generation = record["generation"].as_u64().unwrap_or(0);
+    let installed = &record["installed"];
+    let needs_briefing = record["needsBriefing"] == true;
+    let full = needs_briefing || installed["generation"].as_u64() != Some(generation);
     let identity = read_data_json(context, "identity.json").unwrap_or(json!({}));
     let saved_identity = identity_line(identity["nickname"].as_str().unwrap_or(""), identity["userId"].as_str().unwrap_or(""));
     let live_identity = if saved_identity.is_empty() {
@@ -1928,8 +2028,8 @@ pub(crate) fn prepare_dsh_wake_layered(
     // delta's recall below). Rule sections (no layer) are never cut or counted.
     use crate::briefing::{Layer, Section};
     let assembly = crate::briefing::assemble(vec![
-        Section::parts("identity", Some(Layer::Identity), vec![role_line_with_runtime(context,key), live_identity,
-            role_hint_v2(context,cfg,key), crate::briefing::persona_core(context,key)]),
+        Section::parts("identity", Some(Layer::Identity), vec![role_line_with_runtime(context,key),
+            crate::briefing::persona_core(context,cfg,key), live_identity, role_hint_v2(context,cfg,key)]),
         Section::parts("operator", Some(Layer::Relationship), vec![crate::initial_prompts::format_injection(context,cfg,key)]),
         Section::groups("impressions", Some(Layer::Relationship), vec![impression_group(st,cfg,true)]),
         Section::groups("memory", Some(Layer::Conversation), memory_groups(st,now_ms(),true)),
@@ -1945,14 +2045,10 @@ pub(crate) fn prepare_dsh_wake_layered(
     ], &crate::briefing::Budgets::from_cfg(cfg));
     let mut sections = assembly.sections.clone();
     for text in sections.values_mut() { *text = crate::model_view::strip_from_model_text(text,cfg); }
+    after_sections();
     let hashes: BTreeMap<&str,String> = sections.iter().filter(|(_,v)| !v.is_empty())
         .map(|(k,v)| (*k, format!("{:x}",Sha256::digest(v.as_bytes())))).collect();
     let revision = format!("{:x}",Sha256::digest(serde_json::to_vec(&hashes).map_err(|e|e.to_string())?));
-    let record = crate::session_map::context_record(context,key,sid,epoch)?;
-    let generation = record["generation"].as_u64().unwrap_or(0);
-    let installed = &record["installed"];
-    let needs_briefing = record["needsBriefing"] == true;
-    let full = needs_briefing || installed["generation"].as_u64() != Some(generation);
     let mut body = if full { format!("【简报 revision={revision} generation={generation}】\n以下各节是本代会话的当前完整简报。\n\n") }
         else { format!("【唤醒增量】沿用简报；当前 revision={revision} generation={generation}。仅下列替换/删除改变旧简报。\n\n") };
     for (name,text) in &sections {
@@ -2013,7 +2109,7 @@ pub(crate) fn prepare_dsh_wake_layered(
     let carried: Vec<i64> = held.iter().chain(&recalled).copied().collect();
     let pending = json!({"rpcId":rpc_id,"generation":generation,"revision":revision,"sections":hashes,"full":full,"recalled":carried});
     if !crate::session_map::update_context(context,key,sid,epoch,|r| {if r["generation"].as_u64().unwrap_or(0) == generation && (r["needsBriefing"]==true)==needs_briefing { r["pending"]=pending; }})? {
-        return Err("wake session or epoch changed before submission".into());
+        return Err(WAKE_BRIEFING_CHANGED.into());
     }
     let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);
     Ok(DshWake { text: format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled, layers, cut, alerted })
