@@ -2,7 +2,8 @@ name: quick
 # One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`.
 # Two more targets run cargo directly, each alone (not combined with others): `check` is `cargo check --workspace --all-targets`;
 # `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
-# `cargo fmt --all` result as artifact `fmt-patch` (always, empty when formatted): `gh run download <id> -n fmt-patch`, then `git apply fmt.patch`.
+# `cargo fmt --all` result as artifact `fmt-patch` and the `cargo clippy --fix` result, on a clean tree, as artifact `clippy-fix-patch`
+# (both always uploaded, empty when there is nothing to change): `gh run download <id> -n fmt-patch`, then `git apply fmt.patch`.
 # The CI-first gate is checks.yml on the pull request; this job never gates a merge.
 on:
   workflow_dispatch:
@@ -118,6 +119,26 @@ jobs:
         with:
           name: fmt-patch
           path: ${{ env.CI_EVIDENCE }}/fmt.patch
+          if-no-files-found: error
+          retention-days: 3
+      - name: Clippy suggestions as a patch (report-only)
+        if: inputs.target == 'lint'
+        run: |
+          mkdir -p "$CI_EVIDENCE"
+          : > "$CI_EVIDENCE/clippy-fix.patch"
+          set +e
+          # Start from the clean tree so this patch holds only clippy's own edits, apart from fmt.patch.
+          git -C "$PUBLIC_TREE" checkout -- .
+          (cd "$PUBLIC_TREE/her" && cargo clippy --fix --allow-dirty --allow-no-vcs --features parity-clock,release-test-keys --all-targets)
+          echo "clippy --fix exit $?"
+          (cd "$PUBLIC_TREE" && git diff > "$CI_EVIDENCE/clippy-fix.patch")
+          echo "clippy-fix patch bytes: $(wc -c < "$CI_EVIDENCE/clippy-fix.patch")"
+      - name: Upload clippy-fix patch
+        if: always() && inputs.target == 'lint'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-fix-patch
+          path: ${{ env.CI_EVIDENCE }}/clippy-fix.patch
           if-no-files-found: error
           retention-days: 3
       - name: Upload evidence
