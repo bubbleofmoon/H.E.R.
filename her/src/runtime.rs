@@ -126,6 +126,26 @@ pub(crate) fn parse_evidence_jsonl(text: &str, file: &str, damaged: &str) -> Res
     Ok(records)
 }
 
+/// Why a selected-root read failed: the fixed message callers have always seen, plus the OS error when
+/// the read itself failed.
+struct ReadFailure {
+    message: &'static str,
+    io: Option<std::io::Error>,
+}
+
+impl ReadFailure {
+    fn policy(message: &'static str) -> Self {
+        Self { message, io: None }
+    }
+
+    fn detail(&self) -> String {
+        match &self.io {
+            Some(error) => format!("{} ({})", self.message, runtime_io_error("read/file", error)),
+            None => self.message.to_string(),
+        }
+    }
+}
+
 impl RuntimeContext {
     /// The legacy context is kept for callers which have not opted into a runtime root.
     pub fn legacy() -> Self {
@@ -431,15 +451,26 @@ impl RuntimeContext {
     }
 
     pub fn read_file(&self, area: RuntimeArea, relative: &str) -> Result<Vec<u8>, &'static str> {
-        let path = self.resolve_path(area, relative, PathIntent::ReadFile)?;
+        self.read_file_inner(area, relative).map_err(|failure| failure.message)
+    }
+
+    /// `read_file` keeping the typed OS error. A Windows sharing or lock violation (32/33) is retried
+    /// until the two-second append conflict budget is spent: a file another process appends under its
+    /// exclusive lock (the ledgers, the audit and history logs) is mandatory-locked for that write.
+    fn read_file_inner(&self, area: RuntimeArea, relative: &str) -> Result<Vec<u8>, ReadFailure> {
+        let path = self.resolve_path(area, relative, PathIntent::ReadFile).map_err(ReadFailure::policy)?;
         // Re-resolve immediately before opening to catch a replaced parent/leaf between a prior
         // authorization check and this read. The std filesystem API cannot pin every ancestor
         // handle across Windows junction replacement, so callers still need a trusted runtime root.
-        let checked = self.resolve_path(area, relative, PathIntent::ReadFile)?;
+        let checked = self.resolve_path(area, relative, PathIntent::ReadFile).map_err(ReadFailure::policy)?;
         if checked != path {
-            return Err("runtime path is unavailable");
+            return Err(ReadFailure::policy("runtime path is unavailable"));
         }
-        fs::read(path).map_err(|_| "runtime path is unavailable")
+        let deadline = std::time::Instant::now() + APPEND_CONFLICT_WAIT;
+        append_io(Some(deadline), || fs::read(&path)).map_err(|error| ReadFailure {
+            message: "runtime path is unavailable",
+            io: Some(error),
+        })
     }
 
     pub fn read_text(&self, area: RuntimeArea, relative: &str) -> Result<String, &'static str> {
@@ -454,20 +485,42 @@ impl RuntimeContext {
         area: RuntimeArea,
         relative: &str,
     ) -> Result<Option<String>, &'static str> {
+        self.read_optional_text_inner(area, relative).map_err(|failure| failure.message)
+    }
+
+    /// `read_optional_text` whose error also names the OS error (`class=read/file kind=… os=…`) when
+    /// the read itself failed, e.g. a lock violation that outlasted the retry budget. For callers that
+    /// pass the message on (the console's 503 body).
+    pub(crate) fn read_optional_text_detailed(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+    ) -> Result<Option<String>, String> {
+        self.read_optional_text_inner(area, relative).map_err(|failure| failure.detail())
+    }
+
+    fn read_optional_text_inner(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+    ) -> Result<Option<String>, ReadFailure> {
         if !self.is_isolated() {
-            return Err("optional runtime reads require an isolated context");
+            return Err(ReadFailure::policy("optional runtime reads require an isolated context"));
         }
-        let path = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
-        let checked = self.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
+        let path = self.resolve_path(area, relative, PathIntent::ReadOptionalFile).map_err(ReadFailure::policy)?;
+        let checked = self.resolve_path(area, relative, PathIntent::ReadOptionalFile).map_err(ReadFailure::policy)?;
         if checked != path {
-            return Err("runtime path is unavailable");
+            return Err(ReadFailure::policy("runtime path is unavailable"));
         }
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => self
-                .read_text(area, relative)
-                .map(Some),
-            _ => Err("runtime path is unavailable"),
+            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => {
+                let bytes = self.read_file_inner(area, relative)?;
+                String::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|_| ReadFailure::policy("runtime file is invalid"))
+            }
+            _ => Err(ReadFailure::policy("runtime path is unavailable")),
         }
     }
 
