@@ -29,9 +29,11 @@ scripts/gh-public and scripts/handoff are the coordinator's alone; they, and cod
 a command that has a wrapper, a $ or a backtick.
 Polling GitHub gets its own refusal message for implementers and gates: gh with --watch or `gh run watch`, and gh run
 by `watch` (a wrapper) or inside a while/until/for loop, unless the command is one plain gh call. The guard also
-refuses the plain ways of running a ci-wait program (by path, through python in any spelling, after a wrapper, or
-named anywhere in a command with a wrapper, $ or python); only coordinators wait for CI (docs/agents/coordinator.md
-"GitHub API budget"). Not seen: a glob, a copy under another name, a name built inside python (the T1 class).
+refuses the plain ways of running a ci-wait program (by path, through python, through any program that is not a
+reader and is given a file named ci-wait*, after a wrapper, or named anywhere in a command with a wrapper, $ or
+python); a quoted argument of a plain reader is data. Only coordinators wait for CI (docs/agents/coordinator.md
+"GitHub API budget"). Not seen: a launcher given only a module or another name, a glob, a copy under another name, a
+name built inside python (the T1 class).
 A worker's shell is not a sandbox. For implementers and gates this stops mistakes and plain attempts only; the
 containment boundary is #85. python runs unrestricted for them.
 Tests: scripts/tests/test_agent_guard.py.
@@ -63,6 +65,7 @@ BRANCH_LIST_FLAGS = {'-a', '-r', '-v', '-vv', '--all', '--remotes', '--verbose'}
 READ_ONLY_COMMANDS = {'git', 'gh', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'find', 'stat', 'file', 'diff', 'cmp',
                       'sha256sum', 'sort', 'uniq', 'cut', 'tr', 'jq', 'date', 'pwd', 'echo', 'basename',
                       'dirname', 'realpath'}
+INSPECTORS = READ_ONLY_COMMANDS | {'sed', 'awk', 'nl', 'od', 'less', 'more', 'md5sum', 'sha1sum', 'sha512sum', 'xxd', 'strings'}
 READ_ONLY_BARE = re.compile(r"[A-Za-z0-9_@%+=:,./~^'\"-]+")   # an unquoted word; quoted text arrives as letters
 READ_ONLY_STDERR = ('2>/dev/null', '2>&1')
 READ_ONLY_REFUSAL = ('read-only roles run only simple read commands; use the Read, Grep and Glob tools. Allowed: one '
@@ -106,7 +109,7 @@ ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=.*', re.S)
 SEGMENT_BREAKS = OPERATOR_CHARS + '\n'
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'function'}
 LOOP_WORDS = {'while', 'until', 'for'}
-PYTHON_NAME = re.compile(r'pyw?|pypy[0-9.]*|pythonw?[0-9.]*')
+PYTHON_NAME = re.compile(r'pyw?|pypy[0-9.]*|pythonw?|pythonw?[0-9][0-9.]*[a-z]*(-[a-z]+)?')   # python3.13t, python3-dbg
 POLL_DENIED = ('polling GitHub is refused (one API limit is shared by every agent): no --watch, no gh run watch, and '
                'no gh repeated by a while/until/for loop or by watch. Dispatch quick.yml once, read its run id once and '
                'hand it back; the coordinator waits (docs/agents/implementer-protocol.md "Test loop").')
@@ -597,9 +600,13 @@ def gh_read(found, role):
 
 
 def runs_ci_wait(words):
-    """A command that runs a CI waiter: a program named ci-wait*, or python (any spelling) with ci-wait in an argument."""
-    return ('ci-wait' in base(words[0])
-            or (bool(PYTHON_NAME.fullmatch(base(words[0]))) and any('ci-wait' in word.lower() for word in words[1:])))
+    """A command that runs a CI waiter: a program named ci-wait*, any program but a reader given a file named ci-wait*
+    (`uv run scripts/ci-wait.py`), or python (any spelling) with ci-wait in an argument."""
+    first = base(words[0])
+    if first in INSPECTORS:
+        return False                                  # a reader's arguments are data
+    return ('ci-wait' in first or any(base(word).startswith('ci-wait') for word in words[1:])
+            or (bool(PYTHON_NAME.fullmatch(first)) and any('ci-wait' in word.lower() for word in words[1:])))
 
 
 def gh_polls(segs, flat, plain_gh):
@@ -692,8 +699,9 @@ def check_bash(role, command, hook_cwd):
                    '-Name <name> -WorkDir <worktree> -PromptFile C:/her-orch/<n>/review/codex-self-<k>.md -Model gpt-6-astra '
                    '-Effort high -Sandbox read-only); <n> is your branch\'s ticket and the prompt is no link. '
                    'To read the script, use the Read tool.')
-    if any(runs_ci_wait(seg) for seg, _ in segs) or ('ci-wait' in text.lower() and (
-            indirect or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs))):
+    plain_reader = bool(words) and not indirect and base(words[0]) in READ_ONLY_COMMANDS     # its quoted arguments are data
+    if not plain_reader and (any(runs_ci_wait(seg) for seg, _ in segs) or ('ci-wait' in text.lower() and (
+            indirect or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs)))):
         raise Deny(CI_WAIT_DENIED)
     if ('gh' in names or GH_WORD.search(text)) and gh_polls(segs, flat, bool(words) and base(words[0]) == 'gh'):
         raise Deny(POLL_DENIED)       # before the push and commit words: `gh run list --event push` is polling when repeated

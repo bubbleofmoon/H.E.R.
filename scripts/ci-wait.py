@@ -26,7 +26,8 @@ workflow) share one cached list and one --timeout; with more than one, or with -
 "[<label>]" and one "run <id>: <result>" line each, and the exit is 1 if any run failed, else 5, else 4, else 3,
 else 0. Two limits: the runs are waited for in turn, so a later run's failure is reported only after the earlier
 runs finish or the timeout ends; and a run that is no longer among the 40 newest of its workflow ends the whole
-wait with exit 2 and no summary (wait for the other runs again without it).
+wait with exit 2 and no summary, or, when an earlier run already failed, with exit 1 and a summary that names it "not
+available" (wait for the other runs again without it).
 Cache and lock: ~/.cache/her-ci-wait (mode 0700), on Windows %LOCALAPPDATA%\her-ci-wait; against a local test
 server the folder is her-ci-wait-test instead, unless HER_CI_WAIT_DIR names one.
 Auth: GH_TOKEN, else `gh auth token`, read only by a waiter that is about to call. A local test server
@@ -67,7 +68,7 @@ FILTER = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_:.-]*)?")
 EVENTS = ("push", "pull_request")
 LABEL = re.compile(r"[A-Za-z0-9._:/-]{1,64}")
 MAX_TIMEOUT = 24 * 3600.0
-OUTCOMES = {0: "success", 1: "failure", 3: "cancelled or another conclusion", 4: "still running (not a result)",
+OUTCOMES = {0: "success", 1: "failure", 2: "not available (usage error, see stderr; not a result)", 3: "cancelled or another conclusion", 4: "still running (not a result)",
             5: "GitHub unavailable (not a result)"}
 RUN_FIELDS = ("id", "display_title", "head_branch", "head_sha", "event", "status", "conclusion", "html_url", "created_at")
 FAILED = ("failure", "timed_out", "startup_failure")
@@ -701,9 +702,11 @@ def wait(argv):
         except Exception as e:           # an earlier failure keeps its code; this run is "not a result"
             print(f"ci-wait: internal error ({type(e).__name__}); not a result", flush=True)
             code = 5
-        if code == 2:
+        if code == 2 and not any(known == 1 for _, known in results):
             return 2
         results.append((run_id, code))
+        if code == 2:                    # the usage error is on stderr; an earlier failure keeps its exit code and summary
+            break
     if len(ids) > 1 or a.label is not None:
         print(f"[{a.label or 'ci-wait'}]", flush=True)
         for run_id, code in results:

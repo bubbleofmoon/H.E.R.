@@ -574,6 +574,14 @@ CI_WAIT_REFUSED = [   # #90: only coordinators (no guard) wait for CI
     ('wt', 'cat scripts/ci-wait.py | python3 - --run 42'),
     ('wt', 'pyw scripts/ci-wait.py --run 42'),
     ('wt', 'pypy3 scripts/ci-wait.py --run 42'),
+    ('wt', 'python3.13t scripts/ci-wait.py --run 42'),
+    ('wt', 'python3-dbg scripts/ci-wait.py --run 42'),
+    ('wt', 'uv run scripts/ci-wait.py --run 42'),
+    ('wt', 'poetry run python scripts/ci-wait.py --run 42'),
+    ('wt', 'coverage run scripts/ci-wait.py --run 42'),
+    ('wt', 'parallel python3 scripts/ci-wait.py ::: 42'),
+    ('wt', 'cat scripts/ci-wait.py | python3.13t -'),
+    ('wt', 'cat scripts/ci-wait.py | python3-dbg -'),
 ]
 CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the script stay allowed for implementers and gates
     ('wt', 'python3 -I scripts/tests/test_ci_wait.py'),
@@ -582,6 +590,12 @@ CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the scr
     ('wt', 'grep -n LOCAL_API scripts/ci-wait.py'),
     ('wt', 'git diff -- scripts/ci-wait.py'),
     ('wt', 'sha256sum scripts/ci-wait.py'),
+    ('wt', "git log --grep 'ci-wait timeout'"),
+    ('wt', "git log --grep 'python timeout'"),
+    ('wt', "gh issue list --search 'ci-wait timeout'"),
+    ('wt', 'grep -rn "python -I scripts/ci-wait.py" docs'),
+    ('wt', 'sed -n 1,5p scripts/ci-wait.py'),
+    ('wt', 'wc -l scripts/ci-wait.py | head -1'),
 ]
 WATCH_WRAPS = [
     ('wt', 'watch -n 600 codex exec x'),
@@ -802,6 +816,11 @@ class AgentGuard(unittest.TestCase):
 
     def test_watch_is_a_wrapper(self):
         self.expect(WATCH_WRAPS, ('implementer', 'gate'), False)
+        for role in ('implementer', 'gate'):
+            for (where, command), message in zip(WATCH_WRAPS, ('Codex runs only', 'only the coordinator hands off')):
+                with self.subTest(role=role, command=command):                 # the wrapper rule refuses it, not another rule
+                    code, err = self.guard(role, where, command)
+                    self.assertIn(message, err)
 
 
 if __name__ == '__main__':

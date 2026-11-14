@@ -488,6 +488,16 @@ class CiWait(unittest.TestCase):
                 code, out, err = self.wait(*argv, '--timeout', '1')
                 self.assertEqual(code, 2, out + err)
 
+    def test_an_earlier_failure_survives_a_later_run_that_is_too_old(self):
+        self.server.runs = lambda: [self.make_run(12, conclusion='failure'), self.make_run(11)]
+        code, out, err = self.wait('--run', '12', '--run', '3', '--label', '90-c', '--timeout', '20')
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('not among the 40 newest', err)
+        self.assertEqual(out.strip().splitlines()[-3:], [
+            '[90-c]', 'run 12: failure', 'run 3: not available (usage error, see stderr; not a result)'], out)
+        code, out, err = self.wait('--run', '3', '--run', '12', '--timeout', '20')           # no earlier failure: usage error
+        self.assertEqual(code, 2, out + err)
+
     def test_several_results_combine_failure_first(self):
         module = load_module()
         for codes, expected in (([0, 0], 0), ([0, 3], 3), ([3, 4], 4), ([4, 5], 5), ([5, 1, 0], 1), ([0], 0), ([4], 4)):
@@ -516,10 +526,10 @@ class CiWait(unittest.TestCase):
         shutil.rmtree(self.cache)
         before = len(self.list_calls())
         self.server.limit_until = time.time() + 60
-        code, out, err = self.wait(*WAIT, '--timeout', '0.3')
+        code, out, err = self.wait(*WAIT, '--once')
         self.assertEqual(code, 5, out + err)
         self.assertEqual(len(self.list_calls()) - before, 1, self.list_calls())
-        code, out, err = self.wait('--workflow', 'checks.yml', '--sha', SHA_A, '--timeout', '0.3')   # another workflow, same window
+        code, out, err = self.wait('--workflow', 'checks.yml', '--sha', SHA_A, '--once')   # another workflow, same window
         self.assertEqual(code, 5, out + err)
         self.assertEqual(len(self.list_calls()) - before, 1, self.list_calls())
 
