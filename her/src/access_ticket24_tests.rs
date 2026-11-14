@@ -875,3 +875,64 @@ fn gap_ledger_a_torn_ledger_tail_leaves_the_turns_view_answering() {
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["turns"][0]["turnId"], json!(turn.id), "{reply}");
 }
+
+/// Hold the product's exclusive append lock on `data/<file>` from another handle for `hold`, as a candidate
+/// process does while it appends: on Windows the lock is mandatory, so a full read of the file fails with
+/// ERROR_LOCK_VIOLATION (os error 33) until it is released. Returns once the lock is held.
+fn hold_append_lock(root: &FixtureRoot, file: &str, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+    let path = root.0.join("data").join(file);
+    let (locked, ready) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let handle = std::fs::OpenOptions::new().read(true).write(true).append(true).open(path).unwrap();
+        handle.lock().unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(hold);
+        drop(handle);
+    });
+    ready.recv().unwrap();
+    holder
+}
+
+fn seeded_ledgers(label: &str) -> (FixtureRoot, RuntimeContext, String) {
+    let (root, context) = seeded(label, "fixture-turns-lock-token-abcdefghij");
+    let turn = crate::turn_ledger::Recorder::begin(&context, GROUP, "dsh", "atMention", "epoch", &[], None).unwrap();
+    crate::send_outbox::append_record(&context, &json!({"batch": "b1", "k": "intent", "key": GROUP, "epoch": "epoch", "messages": ["a"], "delays": [], "t": 1})).unwrap();
+    (root, context, turn.id.clone())
+}
+
+#[test]
+fn turns_view_waits_out_an_append_lock_on_the_turn_ledger() {
+    let (root, context, turn_id) = seeded_ledgers("turns view ledger lock");
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", std::time::Duration::from_millis(400));
+    let (status, reply) = admin_request(&context, "GET", "/api/turns", None);
+    holder.join().unwrap();
+    assert_eq!(status, 200, "a lock held for 400 ms must not fail the view: {reply}");
+    assert_eq!(reply["turns"][0]["turnId"], json!(turn_id), "{reply}");
+}
+
+#[test]
+fn turns_view_waits_out_an_append_lock_on_the_send_outbox() {
+    let (root, context, turn_id) = seeded_ledgers("turns view outbox lock");
+    let holder = hold_append_lock(&root, "send-outbox.jsonl", std::time::Duration::from_millis(400));
+    let (status, reply) = admin_request(&context, "GET", "/api/turns", None);
+    holder.join().unwrap();
+    assert_eq!(status, 200, "a lock held for 400 ms must not fail the view: {reply}");
+    assert_eq!(reply["turns"][0]["turnId"], json!(turn_id), "{reply}");
+}
+
+/// Windows only: elsewhere the advisory lock never blocks a read, so there is no lock failure to report.
+#[cfg(windows)]
+#[test]
+fn turns_view_reports_the_os_error_when_the_append_lock_outlasts_the_retry_bound() {
+    let (root, context, _) = seeded_ledgers("turns view lock bound");
+    let hold = crate::runtime::APPEND_CONFLICT_WAIT + std::time::Duration::from_millis(1500);
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", hold);
+    let started = std::time::Instant::now();
+    let (status, reply) = admin_request(&context, "GET", "/api/turns", None);
+    let waited = started.elapsed();
+    holder.join().unwrap();
+    assert_eq!(status, 503, "{reply}");
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(error.contains("os=Some(33)"), "the lock violation code must reach the caller: {reply}");
+    assert!(waited >= crate::runtime::APPEND_CONFLICT_WAIT, "the read must retry for the whole bound, waited {waited:?}");
+}
