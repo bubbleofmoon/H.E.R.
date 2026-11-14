@@ -480,6 +480,8 @@ struct Sent {
 
 enum Failure {
     Plain(String),
+    /// Definite local or gateway refusal (#46 mute): 403, never unknown delivery.
+    Refused(String),
     Outcome { outcome: &'static str, message: String, batch_id: String },
 }
 
@@ -487,6 +489,7 @@ impl Failure {
     fn reply(self) -> (u16, Value) {
         match self {
             Failure::Plain(message) => (500, json!({ "ok": false, "error": message })),
+            Failure::Refused(message) => (403, json!({ "ok": false, "error": message })),
             Failure::Outcome { outcome, message, batch_id } => (
                 500,
                 json!({ "ok": false, "error": message, "outcome": outcome, "batchId": batch_id, "verified": false }),
@@ -524,6 +527,9 @@ fn send_voice_core(
     args: &SendArgs<'_>,
 ) -> Result<Sent, Failure> {
     let file_name = args.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if let Some(mute) = crate::group_mute::active(context, args.key) {
+        return Err(Failure::Refused(mute.refusal_text(crate::parity_clock::now_ms())));
+    }
     if should_audit_key(context, cfg, args.key) {
         let subject = format!("[语音:{file_name}]");
         if crate::pipeline::configured_outbound_violation(cfg, &subject, &known_tokens(context)).is_some() {
@@ -576,7 +582,7 @@ fn send_processed(
     let _chain = agent::send_chain();
     if let Some((epoch, policy)) = args.guard {
         send_guard_for(context, cfg, args.key, epoch, policy, "sendVoice")
-            .map_err(|(_, message)| Failure::Plain(message))?;
+            .map_err(|(status, message)| if status == 403 { Failure::Refused(message) } else { Failure::Plain(message) })?;
     }
     let ob = onebot_for_runtime(context, cfg).map_err(Failure::Plain)?;
     let target = if args.kind == "private" { Target::Private(args.id_s.parse().unwrap_or(0)) } else { Target::Group(args.id_s.parse().unwrap_or(0)) };
@@ -585,11 +591,11 @@ fn send_processed(
         "kind": "voice", "key": args.key, "epoch": args.epoch,
         "messages": [label], "delays": [], "replyTo": Value::Null, "atUser": Value::Null
     });
-    let recorded = Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| Failure::Plain(match error {
-        BeginError::Busy => BATCH_BUSY.to_string(),
-        BeginError::Intent(error) => format!("发送意图未能持久记录，未发送：{error}"),
-        BeginError::Muted(text) => text,
-    }))?;
+    let recorded = Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| match error {
+        BeginError::Busy => Failure::Plain(BATCH_BUSY.to_string()),
+        BeginError::Intent(error) => Failure::Plain(format!("发送意图未能持久记录，未发送：{error}")),
+        BeginError::Muted(text) => Failure::Refused(text),
+    })?;
     let batch_id = recorded.batch_id().to_string();
     let attempt_ms = match recorded.attempt(0, None) {
         Ok(at) => at,
@@ -612,6 +618,11 @@ fn send_processed(
             commit_budget(args);
             Ok(message_id)
         }
+        ItemState::NotCommitted if crate::onebot::is_mute_refusal(&error) => Err(Failure::Refused(
+            crate::group_mute::active(context, args.key)
+                .map(|mute| mute.refusal_text(crate::parity_clock::now_ms()))
+                .unwrap_or(error),
+        )),
         ItemState::NotCommitted => Err(Failure::Outcome { outcome: "not_committed", message: error, batch_id }),
         _ => Err(Failure::Outcome {
             outcome: "unknown",
@@ -786,6 +797,9 @@ pub(super) fn operator_send(
         return err(500, message);
     }
     let canonical_key = canonical_v2_key(&key).unwrap_or_else(|| key.clone());
+    if let Err((status, error)) = mute_send_denial(context, cfg, &canonical_key, "") {
+        return err(status, error);
+    }
     let args = SendArgs {
         key: &canonical_key, kind: &kind, id_s: &id_s, file: &file, audio, guard: None, epoch: String::new(),
         budget_scope: scope, budget_at: Some(now),
@@ -898,6 +912,9 @@ pub(super) fn ai_send(context: &RuntimeContext, cfg: &Value, headers: &HashMap<S
         None => return err(400, format!("无效的会话 key：{key}")),
     };
     let epoch = crate::send_outbox::token_epoch(&token);
+    if let Err((status, error)) = mute_send_denial(context, cfg, &storage_key, &token) {
+        return err(status, error);
+    }
     let args = SendArgs {
         key: &storage_key, kind, id_s, file: &file, audio, guard: Some((&epoch, GuardPolicy::Reserved2)), epoch: epoch.clone(),
         budget_scope: scope, budget_at: None,

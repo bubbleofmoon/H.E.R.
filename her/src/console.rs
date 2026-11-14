@@ -5536,8 +5536,23 @@ fn note_engagement_ended(out: &mut Value) {
 
 /// #46: a send to a group where QQ has muted her is refused here, before quota, quote or gateway
 /// work. The result says until when; an open turn is marked ended so it closes as a clean sleep.
-pub(crate) fn mute_send_denial(_context: &RuntimeContext, _cfg: &Value, _key: &str, _token: &str) -> Result<(), (u16, String)> {
-    Ok(())
+pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
+    let Some(mute) = crate::group_mute::active(context, key) else { return Ok(()) };
+    if !token.is_empty() {
+        let epoch = crate::send_outbox::token_epoch(token);
+        let marked = load_social_state_for(context).and_then(|state| {
+            let Some(conv) = state["conversations"].get(key).cloned() else { return Ok(()) };
+            match turn_wait_budget(context, cfg, key, &epoch, &conv)? {
+                Some((turn, _)) => mark_turn_budget_ended(context, key, token, &turn),
+                None => Ok(()),
+            }
+        });
+        if let Err((status, error)) = marked {
+            crate::safe_eprintln!("[send] {key} 禁言拒发时标记回合结束失败（{status}）：{error}");
+        }
+    }
+    crate::activity::append(context, &format!("{key} [send] 禁言中，本地拒发，未调用网关"));
+    Err((403, mute.refusal_text(crate::parity_clock::now_ms())))
 }
 
 fn wait_console_generation() -> &'static str {
@@ -8638,6 +8653,7 @@ where
         return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
     }
     let storage_key = projection_storage_key(&key)?;
+    mute_send_denial(context, cfg, &storage_key, token)?;
     let Some((kind, id_s)) = storage_key.split_once(':') else {
         return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
     };
@@ -8847,6 +8863,13 @@ where
     }
     if let Some(error) = settled.record_error {
         return Err((503, if delivered { format!("已发送，但发送结果未能持久记录：{error}") } else { format!("发送结果未能持久记录：{error}") }));
+    }
+    if matches!(settled.state, crate::send_outbox::ItemState::NotCommitted)
+        && settled.error.as_deref().is_some_and(crate::onebot::is_mute_refusal)
+    {
+        // #46: settle has already learned the mute; answer as a definite local refusal, never 500 (unknown).
+        mute_send_denial(context, cfg, &storage_key, token)?;
+        return Err((403, format!("发送表情失败：{}", settled.error.unwrap_or_default())));
     }
     let data = match settled.state {
         crate::send_outbox::ItemState::Confirmed { message_id, .. } => settled.data.unwrap_or_else(|| json!({ "message_id": message_id })),
@@ -10038,6 +10061,9 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
     if silent_blocks_send(context, cfg, key).map_err(|_| cancelled())? {
         return Err(cancelled());
     }
+    if let Some(mute) = crate::group_mute::active(context, key) {
+        return Err((403, mute.refusal_text(crate::parity_clock::now_ms())));
+    }
     Ok(())
 }
 
@@ -10253,6 +10279,7 @@ fn resume_send_batch(
     // One runner per batch: a concurrent resume (or the original send still running) would
     // otherwise read the same pending item and send it twice.
     let recorded = crate::recorded_send::Recorded::resume(context, now_ms, batch_id)
+        .map(|recorded| recorded.with_key(key))
         .ok_or((409, crate::recorded_send::BATCH_BUSY.to_string()))?;
     let _chain = agent::send_chain();
     let records = read_records(context).map_err(|error| (503, error))?;
@@ -10468,6 +10495,9 @@ fn send_message_inner(
     }
     if !session_allowed(cfg, &key) {
         return Err((403, "目标不在当前模式允许范围内".to_string()));
+    }
+    if let Some(storage) = canonical_v2_key(&key) {
+        mute_send_denial(context, cfg, &storage, &token)?;
     }
     if let Some(batch_id) = resume_batch {
         let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;

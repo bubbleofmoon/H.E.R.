@@ -674,6 +674,11 @@ fn send_recorded_inline(
                 stop = Some(format!("发送已取消：{why}"));
             }
         }
+        if stop.is_none() {
+            if let Some(mute) = crate::group_mute::active(context, key) {
+                stop = Some(mute.refusal_text(crate::parity_clock::now_ms()));
+            }
+        }
         let mut attempt_ms = 0;
         if stop.is_none() {
             match recorded.attempt(idx, None) {

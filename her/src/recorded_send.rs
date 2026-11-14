@@ -104,6 +104,8 @@ pub struct Recorded<'a> {
     context: &'a RuntimeContext,
     clock: fn() -> i64,
     batch_id: String,
+    /// The conversation key, so a mute refusal at settle time is learned (#46).
+    key: Option<String>,
     _claim: BatchClaim,
 }
 
@@ -117,6 +119,10 @@ impl<'a> Recorded<'a> {
         created_at: i64,
         fields: Value,
     ) -> Result<Self, BeginError> {
+        let key = fields.get("key").and_then(Value::as_str).map(str::to_owned);
+        if let Some(mute) = key.as_deref().and_then(|k| crate::group_mute::active(context, k)) {
+            return Err(BeginError::Muted(mute.refusal_text(crate::parity_clock::now_ms())));
+        }
         let batch_id = new_batch_id(created_at);
         let claim = claim_batch(&batch_id).ok_or(BeginError::Busy)?;
         let mut intent = Map::new();
@@ -131,6 +137,7 @@ impl<'a> Recorded<'a> {
             context,
             clock,
             batch_id,
+            key,
             _claim: claim,
         })
     }
@@ -142,8 +149,15 @@ impl<'a> Recorded<'a> {
             context,
             clock,
             batch_id: batch_id.to_string(),
+            key: None,
             _claim: claim,
         })
+    }
+
+    /// The conversation of a resumed batch, so a mute refusal during the resume is learned too.
+    pub fn with_key(mut self, key: &str) -> Self {
+        self.key = Some(key.to_string());
+        self
     }
 
     pub fn batch_id(&self) -> &str {
@@ -247,6 +261,11 @@ impl<'a> Recorded<'a> {
                 }
             }
             Err(SendError::NotCommitted(error)) => {
+                if crate::onebot::is_mute_refusal(&error) {
+                    if let Some(key) = &self.key {
+                        crate::group_mute::learn_from_refusal(self.context, key);
+                    }
+                }
                 let record_error = self
                     .append("not_committed", idx, &[("error", json!(error))])
                     .err();
