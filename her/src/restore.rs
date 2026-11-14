@@ -10,6 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn ordinary_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
 struct Staging(PathBuf);
 impl Staging {
     fn new() -> Result<Self, String> {
@@ -2300,5 +2304,12 @@ mod tests {
         ] {
             assert!(audit.contains(by));
         }
+    }
+
+    #[test]
+    fn ordinary_path_drops_the_verbatim_prefix_or_keeps_it_visibly() {
+        assert_eq!(ordinary_path(Path::new(r"\\?\C:\x\backups\a.zip")), r"C:\x\backups\a.zip");
+        assert_eq!(ordinary_path(Path::new(r"\\?\UNC\srv\share\a.zip")), r"\\srv\share\a.zip");
+        assert_eq!(ordinary_path(Path::new(r"\\?\GLOBALROOT\x")), r"\\?\GLOBALROOT\x");
     }
 }
