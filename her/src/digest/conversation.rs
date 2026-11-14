@@ -99,7 +99,7 @@ impl<'a> Digest<'a> {
         let max_chars = max_input_chars(self.cfg);
         let mut skips = 0;
         let batch = loop {
-            let Some(batch) = evidence::read(self.context, self.cfg, key, space, cursor, max_chars)
+            let Some(batch) = evidence::read(self.context, self.cfg, key, space, cursor, max_chars, limits.min_messages.max(1))
                 .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
             if batch.messages > 0 { break batch; }
             // Rows that render no message (commands, HER's frames, blanked raw text): move past them without the model.
