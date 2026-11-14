@@ -36,6 +36,19 @@ pub struct NewMemory<'a> {
     pub importance: f64,
 }
 
+/// Digest progress of one conversation in one sequence space.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DigestCursor {
+    /// Last consumed sequence; 0 before the first digest.
+    pub through: i64,
+    /// When a digest last moved the cursor (ms); 0 never.
+    pub digested_at: i64,
+    /// Creation time (ms) of the last HER harness reply a digest consumed; 0 none yet.
+    pub replies_ms: i64,
+    /// When the last model call or answer failed (ms); 0 when the last attempt succeeded.
+    pub failed_at: i64,
+}
+
 /// Why `Reader::forget` failed. Both stages run in one transaction, so a failed delete rolls back.
 #[derive(Debug)]
 pub enum ForgetError {
@@ -106,33 +119,43 @@ impl Reader<'_> {
         })
     }
 
-    /// Digest progress in one sequence space (`msg`, `inbound`): (through sequence, updated at ms).
-    pub fn digest_cursor(&self, space: &str) -> rusqlite::Result<Option<(i64, i64)>> {
+    /// Digest progress in one sequence space (`msg`, `inbound`); `None` before any digest or failure.
+    pub fn digest_cursor(&self, space: &str) -> rusqlite::Result<Option<DigestCursor>> {
         use rusqlite::OptionalExtension;
-        self.conn.query_row("SELECT through_seq, updated_at FROM digest_cursor WHERE conversation=?1 AND space=?2",
-            rusqlite::params![self.key, space], |r| Ok((r.get(0)?, r.get(1)?))).optional()
+        self.conn.query_row("SELECT through_seq, updated_at, replies_ms, failed_at FROM digest_cursor WHERE conversation=?1 AND space=?2",
+            rusqlite::params![self.key, space],
+            |r| Ok(DigestCursor { through: r.get(0)?, digested_at: r.get(1)?, replies_ms: r.get(2)?, failed_at: r.get(3)? })).optional()
     }
 
-    /// Write a digest's memories and advance its cursor in one transaction. `Ok(None)`: the cursor is no
-    /// longer `expected` (another run digested first); nothing is written.
-    pub fn write_digest(&self, space: &str, expected: Option<i64>, through: i64, memories: &[NewMemory<'_>])
+    /// Write a digest's memories and move its cursor to `through` (HER's replies to `replies_ms`) in one
+    /// transaction; a success clears the failure time. `Ok(None)`: the stored sequence (0 when there is none)
+    /// is no longer `expected` because another run digested first; nothing is written.
+    pub fn write_digest(&self, space: &str, expected: i64, through: i64, replies_ms: i64, memories: &[NewMemory<'_>])
         -> rusqlite::Result<Option<Vec<UpsertOutcome>>> {
         super::atomic(self.conn, |conn| {
             use rusqlite::OptionalExtension;
             let current: Option<i64> = conn.query_row("SELECT through_seq FROM digest_cursor WHERE conversation=?1 AND space=?2",
                 rusqlite::params![self.key, space], |r| r.get(0)).optional()?;
-            if current != expected {
+            if current.unwrap_or(0) != expected {
                 return Ok(None);
             }
             let mut written = Vec::with_capacity(memories.len());
             for memory in memories {
                 written.push(self.write(memory)?);
             }
-            conn.execute("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at) VALUES(?1,?2,?3,?4)
-                ON CONFLICT(conversation,space) DO UPDATE SET through_seq=excluded.through_seq, updated_at=excluded.updated_at",
-                rusqlite::params![self.key, space, through, super::now_ms()])?;
+            conn.execute("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at,replies_ms,failed_at) VALUES(?1,?2,?3,?4,?5,0)
+                ON CONFLICT(conversation,space) DO UPDATE SET through_seq=excluded.through_seq, updated_at=excluded.updated_at,
+                replies_ms=excluded.replies_ms, failed_at=0",
+                rusqlite::params![self.key, space, through, super::now_ms(), replies_ms])?;
             Ok(Some(written))
         })
+    }
+
+    /// Record that a digest's model call or answer failed now; its progress stays as it was.
+    pub fn digest_failed(&self, space: &str) -> rusqlite::Result<()> {
+        self.conn.execute("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at,replies_ms,failed_at) VALUES(?1,?2,0,0,0,?3)
+            ON CONFLICT(conversation,space) DO UPDATE SET failed_at=excluded.failed_at",
+            rusqlite::params![self.key, space, super::now_ms()]).map(|_| ())
     }
 
     /// Delete one memory this conversation can read, checking and deleting in one transaction.
@@ -262,13 +285,39 @@ mod tests {
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
         assert_eq!(reader.digest_cursor("msg").unwrap(), None);
-        assert_eq!(reader.write_digest("msg", None, 4, &[new("digested")]).unwrap().map(|w| w.len()), Some(1));
-        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.0), Some(4));
-        assert!(reader.write_digest("msg", None, 9, &[new("stale")]).unwrap().is_none(), "a stale expected cursor writes nothing");
+        assert_eq!(reader.write_digest("msg", 0, 4, 7, &[new("digested")]).unwrap().map(|w| w.len()), Some(1));
+        let stored = reader.digest_cursor("msg").unwrap().unwrap();
+        assert_eq!((stored.through, stored.replies_ms, stored.failed_at), (4, 7, 0));
+        assert!(reader.write_digest("msg", 0, 9, 7, &[new("stale")]).unwrap().is_none(), "a stale expected cursor writes nothing");
         let rows: i64 = store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1);
-        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.0), Some(4));
+        reader.digest_failed("msg").unwrap();
+        let failed = reader.digest_cursor("msg").unwrap().unwrap();
+        assert!(failed.through == 4 && failed.failed_at > 0, "a failure keeps the progress: {failed:?}");
+        assert_eq!(reader.write_digest("msg", 4, 6, 8, &[]).unwrap().map(|w| w.len()), Some(0));
+        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| (c.through, c.failed_at)), Some((6, 0)), "a success clears the failure");
         assert_eq!(store.for_reader("group:1").digest_cursor("msg").unwrap(), None, "cursors are per conversation");
         assert_eq!(reader.digest_cursor("inbound").unwrap(), None, "cursors are per sequence space");
+    }
+
+    #[test]
+    fn a_fault_after_the_memory_insert_rolls_back_the_memories_and_the_cursor() {
+        let store = store(Some(OWNER));
+        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
+            subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
+        let reader = store.for_reader("group:3");
+        reader.write_digest("msg", 0, 4, 0, &[new("kept")]).unwrap();
+        let counts = || -> (i64, i64) {
+            (store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap(),
+             store.conn.query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0)).unwrap())
+        };
+        let before = counts();
+        // The cursor statement fails after this digest's memory rows were inserted.
+        store.conn.execute_batch("CREATE TEMP TRIGGER digest_fault_insert BEFORE INSERT ON digest_cursor BEGIN SELECT RAISE(ABORT, 'injected'); END;
+            CREATE TEMP TRIGGER digest_fault_update BEFORE UPDATE ON digest_cursor BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(reader.write_digest("msg", 4, 9, 0, &[new("lost one"), new("lost two")]).is_err());
+        assert_eq!(counts(), before, "a failed cursor commit kept memory rows");
+        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.through), Some(4), "a failed commit moved the cursor");
     }
 }

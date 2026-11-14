@@ -66,12 +66,12 @@ impl<'a> Digest<'a> {
         let reader = store.for_reader(key);
         let space = evidence::space(self.context);
         let stored = reader.digest_cursor(space).map_err(|_| DigestError::Storage)?;
-        if let Some((_, at)) = stored {
-            if limits.min_interval_ms > 0 && crate::parity_clock::now_ms() - at < limits.min_interval_ms {
+        if let Some(cursor) = stored {
+            if limits.min_interval_ms > 0 && crate::parity_clock::now_ms() - cursor.digested_at < limits.min_interval_ms {
                 return Ok(Outcome::Quiet);
             }
         }
-        let Some(batch) = evidence::read(self.context, self.cfg, key, space, stored, max_input_chars(self.cfg))
+        let Some(batch) = evidence::read(self.context, self.cfg, key, space, stored.map(|c| (c.through, c.digested_at)), max_input_chars(self.cfg))
             .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
         if batch.messages < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
         if cancel.load(Ordering::SeqCst) { return Err(DigestError::Cancelled); }
@@ -83,7 +83,7 @@ impl<'a> Digest<'a> {
             owner_type: "session", scope: None, kind: "inference", subject: subject.as_deref(), content,
             tags: None, source: &source, importance: 0.5,
         }).collect();
-        match reader.write_digest(space, stored.map(|(through, _)| through), batch.through, &memories).map_err(|_| DigestError::Storage)? {
+        match reader.write_digest(space, stored.map_or(0, |c| c.through), batch.through, stored.map_or(0, |c| c.replies_ms), &memories).map_err(|_| DigestError::Storage)? {
             Some(written) => Ok(Outcome::Written { through: batch.through, memories: written.len() }),
             None => Ok(Outcome::Quiet),
         }

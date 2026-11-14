@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 mod store;
-pub use store::{ForgetError, MemoryStore, NewMemory, Reader};
+pub use store::{DigestCursor, ForgetError, MemoryStore, NewMemory, Reader};
 
 pub const DB_PATH: &str = "C:/qqbot/data/memory.db";
 
@@ -90,6 +90,7 @@ const SCHEMA_VERSION: i64 = 2;
 /// Version 2: the Digest's progress per conversation and sequence space, written with its memories.
 pub(crate) const DIGEST_CURSOR_V2: &str = "CREATE TABLE IF NOT EXISTS digest_cursor (
   conversation TEXT NOT NULL, space TEXT NOT NULL, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  replies_ms INTEGER NOT NULL DEFAULT 0, failed_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (conversation, space));";
 
 /// Open the selected runtime's database at `SCHEMA_VERSION`. A newer version refuses to open.
@@ -1698,7 +1699,29 @@ mod tests {
         drop(conn);
         let conn = open_ready_for_runtime(&context).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
-        conn.prepare("SELECT conversation, space, through_seq, updated_at FROM digest_cursor").unwrap();
+        conn.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, failed_at FROM digest_cursor").unwrap();
+    }
+
+    #[test]
+    fn schema_version_2_keeps_every_row_and_grant_of_a_populated_version_1_database() {
+        let (root, context) = isolated_fixture();
+        drop(open_ready_for_runtime(&context).unwrap());
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch("DROP TABLE digest_cursor; PRAGMA user_version=1; PRAGMA wal_autocheckpoint=0;").unwrap();
+        write_memory(&conn, &MemoryInput {
+            owner_type: "session", owner_id: "group:55", scope: "group", kind: "fact",
+            subject: Some("topic"), content: "version one marker", tags: None, source: "fixture", importance: 0.5,
+        }).unwrap();
+        conn.execute_batch("INSERT INTO memory_acl(reader_type,reader_id,read_type,read_id,level,created_at) VALUES('session','group:56','session','group:55','read',1);
+            INSERT INTO team_member(team_id,member_type,member_id) VALUES('t','session','group:55');
+            INSERT INTO memory_audit(at,actor,action,memory_id,detail) VALUES(1,'fixture','write',1,NULL);").unwrap();
+        let before = rows(&conn);
+        // The version 1 writer stays open with its rows still in the WAL, as a crashed older bridge leaves them.
+        let migrated = open_ready_for_runtime(&context).unwrap();
+        assert_eq!(migrated.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(rows(&migrated), before, "migration to version 2 must not change rows");
+        migrated.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, failed_at FROM digest_cursor").unwrap();
+        drop((migrated, conn));
     }
 
     #[test]
