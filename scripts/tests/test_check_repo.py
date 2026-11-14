@@ -44,8 +44,9 @@ class FileModeCheck(unittest.TestCase):
         self.git('update-index', f'--chmod={mode_flag}', '.githooks/pre-push')
 
     def run_check(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}   # the fixture's repository only
         return subprocess.run([sys.executable, '-I', str(self.repo / 'scripts' / 'check-repo.py')],
-                              cwd=self.repo, capture_output=True, text=True)
+                              cwd=self.repo, capture_output=True, text=True, env=env)
 
     def test_non_executable_hook_fails(self):
         self.stage_hook('-x')
