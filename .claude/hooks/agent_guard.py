@@ -15,7 +15,7 @@ scripts/handoff.sh|ps1 is the coordinator's alone.
   no .git, stream or 8.3 part); planners and reviewers run git only with read verbs and nothing at a command position
   that builds, formats or writes files;
 - Codex starts only as the implementer's self-review through /root/her/scripts/codex-task.sh or
-  C:/her/scripts/codex-task.ps1 with gpt-6.1-sol, high and read-only.
+  C:/her/scripts/codex-task.ps1 with gpt-6-astra, high and read-only.
 Command words are matched at command positions: after operators, unquoted newlines, assignments, shell keywords
 (if then else elif do while until ! { eval builtin coproc function), wrappers and find -exec, and inside quoted strings.
 So `cat scripts/codex-task.sh` stays allowed, and a quoted multi-word pattern that names a tool is refused for
@@ -311,7 +311,7 @@ def codex_allowed(found):
         found = found[1:]
     if found and found[0] == CODEX_SH:
         return (len(found) in (7, 8) and bool(CODEX_NAME.fullmatch(found[1]))
-                and found[4:7] == ['gpt-6.1-sol', 'high', 'read-only']
+                and found[4:7] == ['gpt-6-astra', 'high', 'read-only']
                 and (len(found) == 7 or bool(CODEX_MINUTES.fullmatch(found[7]))))
     if found and base(found[0]) in ('powershell', 'pwsh'):
         i = 1
@@ -329,7 +329,7 @@ def codex_allowed(found):
                 return False
             pairs[key] = value
         return (CODEX_PS_PARAMS - {'-timeoutminutes'} <= set(pairs)
-                and pairs['-model'] == 'gpt-6.1-sol' and pairs['-effort'] == 'high' and pairs['-sandbox'] == 'read-only'
+                and pairs['-model'] == 'gpt-6-astra' and pairs['-effort'] == 'high' and pairs['-sandbox'] == 'read-only'
                 and bool(CODEX_NAME.fullmatch(pairs['-name']))
                 and ('-timeoutminutes' not in pairs or bool(CODEX_MINUTES.fullmatch(pairs['-timeoutminutes']))))
     return False
@@ -403,8 +403,8 @@ def check_bash(role, command, hook_cwd):
         raise Deny('use the build slot (scripts/cargo-slot.ps1 on Windows, scripts/cargo-slot.sh on Linux); never create or remove its lock by hand.')
     if commands & CODEX_NAMES:
         raise Deny('Codex runs only as the implementer\'s read-only self-review: [cd <worktree> &&] /root/her/scripts/codex-task.sh '
-                   '<name> <worktree> <prompt> gpt-6.1-sol high read-only [minutes] (Windows: powershell -NoProfile -File '
-                   'C:/her/scripts/codex-task.ps1 -Name <name> -WorkDir <worktree> -PromptFile <prompt> -Model gpt-6.1-sol '
+                   '<name> <worktree> <prompt> gpt-6-astra high read-only [minutes] (Windows: powershell -NoProfile -File '
+                   'C:/her/scripts/codex-task.ps1 -Name <name> -WorkDir <worktree> -PromptFile <prompt> -Model gpt-6-astra '
                    '-Effort high -Sandbox read-only). To read the script, use the Read tool.')
     if re.search(r'(>|rm |mv |cp .* |sed -i|tee ).*/root/js-baseline-01|/root/her/backups/js-rust-baseline-01', command) \
             and not re.match(r'\s*(cat|ls|sha256sum|grep|head|tail|node|diff|find)\s', command):

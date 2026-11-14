@@ -54,7 +54,7 @@ A plan that touches the guard, the agents or the Codex form carries these threat
 
 ## Review and gates
 
-- Review, never by the planner or implementer: Codex in every merge gate (`gpt-6.1-sol` at `high` via `scripts/codex-task.ps1` / `.sh`, hidden, never `gpt-6-astra`); add a `ticket-reviewer` on Fable for risk areas (any size) and on Opus for other M/L work; a low-risk S ticket gets Codex only. Reviews check the diff and that it follows the plan; verify each finding in the code before it becomes a required fix. Gates are `merge-gate`: CI is the gate for every target it runs, and local gates run only the native list in `docs/agents/rust-validation.md`; reviews and gates apply `CODING_STANDARDS.md`. The self-review form is pinned (`implementer-protocol.md` "Self-review"); check that `review/` holds no `.cleanup.txt` before the gate.
+- Review, never by the planner or implementer: Codex in every merge gate (`gpt-6-astra` at `high` via `scripts/codex-task.ps1` / `.sh`, hidden, never `gpt-6.1-sol`); add a `ticket-reviewer` on Fable for risk areas (any size) and on Opus for other M/L work; a low-risk S ticket gets Codex only. Reviews check the diff and that it follows the plan; verify each finding in the code before it becomes a required fix. Gates are `merge-gate`: CI is the gate for every target it runs, and local gates run only the native list in `docs/agents/rust-validation.md`; reviews and gates apply `CODING_STANDARDS.md`. The self-review form is pinned (`implementer-protocol.md` "Self-review"); check that `review/` holds no `.cleanup.txt` before the gate.
 
 ## Flow
 
