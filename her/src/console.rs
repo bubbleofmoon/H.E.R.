@@ -6887,7 +6887,7 @@ pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority:
     let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
     let _authority = authority()?;
     let mut state = load_social_state_for(context)?;
-    let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
+    let result = crate::wake_words::undo_in(Some(context), &mut state, &key, id, now_ms())?;
     write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
     Ok(result)
 }

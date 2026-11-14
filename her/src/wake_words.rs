@@ -15,6 +15,13 @@ pub(crate) const LOG_MAX: usize = 20;
 const NAMES_MAX: usize = 10;
 const NAME_MAX: usize = 40;
 const LISTS: [&str; 2] = ["keywords", "dropNames"];
+/// `keywords` keeps at most this many words (`wake::normalize_wake_config`).
+const KEYWORDS_MAX: usize = 50;
+
+/// The most words a wake-config write keeps in `list`; an undo never restores past it.
+fn list_max(list: &str) -> usize {
+    if list == "dropNames" { NAMES_MAX } else { KEYWORDS_MAX }
+}
 
 /// Trimmed non-empty strings of a JSON list; anything else is an empty list.
 fn strings(value: &Value) -> Vec<String> {
@@ -114,16 +121,14 @@ pub(crate) fn record(conversation: &mut Value, before: &Value, after: &Value, by
 /// while every added word is still there and every removed word still absent (otherwise a newer change
 /// is in the way), and only when she can still be woken afterwards. A refusal changes nothing and never
 /// creates a record. The undo is logged itself (`by: "undo"`, `undoes: id`).
+#[cfg(test)]
 pub(crate) fn undo(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
     undo_in(None, state, key, id, at)
 }
 
-/// `undo` that also counts the persona names of `context` as wake triggers. Stub until the fix.
-pub(crate) fn undo_in(_context: Option<&RuntimeContext>, state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
-    undo_entry(state, key, id, at)
-}
-
-fn undo_entry(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
+/// `undo` that also counts the persona names `context` gives `key` (not dropped ones) as wake triggers,
+/// as the ingress does; without a context only the stored triggers count.
+pub(crate) fn undo_in(context: Option<&RuntimeContext>, state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
     let conversation = state
         .get_mut("conversations")
         .and_then(|all| all.get_mut(key))
@@ -148,9 +153,17 @@ fn undo_entry(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (
         }
         words.retain(|w| !added.contains(w));
         words.extend(removed);
+        if words.len() > list_max(list) {
+            return Err((409, format!("undoing this entry would put more than {} words in {list}", list_max(list))));
+        }
         next["triggers"][list] = json!(words);
     }
-    if !crate::wake::is_wakeable(&crate::session::wake_config_from_json(Some(&next)), at) {
+    let mut wakes = next.clone();
+    if let Some(context) = context {
+        let keywords = effective(context, key, &strings(&next["triggers"]["keywords"]), &strings(&next["triggers"]["dropNames"]));
+        wakes["triggers"]["keywords"] = json!(keywords);
+    }
+    if !crate::wake::is_wakeable(&crate::session::wake_config_from_json(Some(&wakes)), at) {
         return Err((409, "undoing this entry would leave no way to wake her".to_string()));
     }
     let (added, removed) = change(&before, &next);
