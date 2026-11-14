@@ -613,9 +613,22 @@ pub(crate) fn core_block(context: &RuntimeContext, key: &str, limit: usize) -> S
     format!("【人设】{}\n{core}\n\n", found["name"].as_str().unwrap_or(""))
 }
 
-/// The wake words the conversation's persona declares. Stub until Run B2.
-pub(crate) fn wake_names(_context: &RuntimeContext, _key: &str) -> Vec<String> {
-    Vec::new()
+/// The wake words the conversation's persona declares (`wake_words.rs`): the active version's `names`,
+/// or its name when a version has no list; empty outside companion modes, without an assigned persona
+/// or with a damaged library.
+pub(crate) fn wake_names(context: &RuntimeContext, key: &str) -> Vec<String> {
+    if !applies(context) {
+        return Vec::new();
+    }
+    let Ok(doc) = load(context) else { return Vec::new() };
+    let Some(found) = effective_id(&doc, key).and_then(|id| doc["personas"].get(&id).and_then(active).cloned()) else {
+        return Vec::new();
+    };
+    let listed: Vec<&str> = match found["names"].as_array() {
+        Some(names) => names.iter().filter_map(Value::as_str).collect(),
+        None => found["name"].as_str().into_iter().collect(),
+    };
+    listed.into_iter().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()
 }
 
 #[cfg(test)]

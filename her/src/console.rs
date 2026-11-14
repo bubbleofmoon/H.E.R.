@@ -6855,6 +6855,10 @@ pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(
             if let Some(keywords) = kept {
                 fresh["triggers"]["keywords"] = Value::Array(keywords);
             }
+            // Persona names she turned off survive every reset to the defaults (`wake_words.rs`).
+            if let Some(names) = old.pointer("/triggers/dropNames").and_then(Value::as_array).filter(|k| !k.is_empty()).cloned() {
+                fresh["triggers"]["dropNames"] = Value::Array(names);
+            }
             for field in ["lastWakeAt", "wakeCount", "noActionCount", "confirmedAt"] {
                 fresh[field] = old.get(field).filter(|v| v.as_f64().is_some_and(|n| n != 0.0)).cloned().unwrap_or(json!(0));
             }
@@ -6870,6 +6874,22 @@ pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(
         refresh(&mut state)?;
         write_social_state_for(context, &state).map_err(|e| (500, e))
     }
+}
+
+/// `POST /api/personas/wake-words/undo` (`console_persona.rs`, administrators only): under the persona
+/// route's authority (the social gate after a fresh credential check) reverts one logged wake-word
+/// change (`wake_words::undo`); a refusal writes nothing.
+pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+    let key = body["conversation"]
+        .as_str()
+        .and_then(crate::initial_prompts::canonical_key)
+        .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
+    let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
+    let _authority = authority()?;
+    let mut state = load_social_state_for(context)?;
+    let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
+    write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
+    Ok(result)
 }
 /// 本进程内"已见过的转发 id"（按会话）。JS 用内存 Set，Rust 用它兜住嵌套转发：
 /// 外层消息里的嵌套 id 只在上层读取时才被登记，之后 AI 要单独读它就靠这份记录。
@@ -9361,8 +9381,10 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
             let limit = cfg.pointer("/socialV2/wake/noActionLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(3);
             if no_action >= limit {
                 let keywords = conv["wakeConfig"]["triggers"]["keywords"].clone();
+                let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
                 conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
                 if keywords.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["keywords"] = keywords; }
+                if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
                 conv["bootstrapSent"] = json!(true);
             }
         }
@@ -9370,7 +9392,9 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
         if closed {
             crate::wake::ensure_wakeable(&mut conv["wakeConfig"], cfg, now, rand01());
         } else if u64::from(miss) >= max {
+            let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
             conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
+            if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
         }
         Ok((!closed && u64::from(miss) < max, stamp))
     }).map_err(|(_, e)| e)

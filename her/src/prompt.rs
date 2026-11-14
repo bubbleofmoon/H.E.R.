@@ -2042,6 +2042,7 @@ pub(crate) fn prepare_dsh_wake_layered(
         Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
         Section::parts("sleep", None, vec![pre_sleep_line(cfg)]),
         Section::parts("retrieval", None, vec!["【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string()]),
+        Section::parts("wakeWords", None, vec![crate::wake_words::briefing_line(context,key,st)]),
     ], &crate::briefing::Budgets::from_cfg(cfg));
     let mut sections = assembly.sections.clone();
     for text in sections.values_mut() { *text = crate::model_view::strip_from_model_text(text,cfg); }

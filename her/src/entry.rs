@@ -173,6 +173,9 @@ struct Triggers {
     name_mention: bool,
     #[serde(default)]
     keywords: Vec<String>,
+    /// Persona names she turned off (`wake_words.rs`).
+    #[serde(rename = "dropNames", default)]
+    drop_names: Vec<String>,
     #[serde(default)]
     question: bool,
     #[serde(default)]
@@ -2536,13 +2539,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // 与 JS 一致：**状态里没有这个会话就直接跳过**。
         // 之前这里 unwrap_or_default() 会给未知会话套上默认触发器（@/概率 0.05），
         // 于是重放出来的唤醒数比 JS 多一截 —— 数据对不上的第一来源就是这个。
-        let Some(tr) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
+        let Some(mut tr) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
             .and_then(|v| serde_json::from_value::<SocialState>(v).ok())
             .and_then(|s| s.conversations.get(&key).and_then(|c| c.wake_config.clone()))
             .map(|w| w.triggers)
         else {
             continue;
         };
+        // The persona's names wake her like keywords, except the ones she dropped.
+        tr.keywords = wake_words::effective(&runtime_context, &key, &tr.keywords, &tr.drop_names);
 
         // 入站持久化（ticket 07）：保存成功后才进入唤醒；同一事件身份的重复到达不产生第二次工作。
         let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);

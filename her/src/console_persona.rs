@@ -1,4 +1,4 @@
-//! Persona library console routes (`/personas`, `/api/personas*`). Mounted behind the console
+//! Persona library and persona wake-word console routes (`/personas`, `/api/personas*`). Mounted behind the console
 //! front (Host, credential, JSON and Origin checks, audit); storage and validation live in `persona.rs`.
 
 use crate::runtime::RuntimeContext;
@@ -36,6 +36,8 @@ pub fn route(
         ("POST", "/api/personas/approve") => object().and_then(|b| crate::persona::approve(context, &b, authority)),
         ("POST", "/api/personas/assign") => object().and_then(|b| crate::persona::assign(context, &b, authority)),
         ("POST", "/api/personas/import-roles") => crate::persona::import_roles(context, authority),
+        ("GET", "/api/personas/wake-words") => crate::wake_words::view(context, query.get("conversation").map(String::as_str).unwrap_or("")),
+        ("POST", "/api/personas/wake-words/undo") => object().and_then(|b| crate::console::undo_wake_words(context, &b, authority)),
         _ => Err((404, "unknown persona route".to_string())),
     };
     match result {
@@ -70,6 +72,10 @@ const PAGE: &str = r##"<!doctype html>
 <label>Auto rules (JSON) <input id="autoRules" size="80"></label>
 <p><button id="save">Save as new version</button> <button id="duplicate">Duplicate with this name</button> <button id="delete">Delete</button></p>
 <h2>Versions</h2><table id="versions"><thead><tr><th>Version</th><th>Source</th><th>Approved</th><th>Core</th><th>Tokens (core / compact)</th><th></th></tr></thead><tbody></tbody></table>
+<h2>Wake words</h2>
+<p><label>Conversation <input id="wwConv" placeholder="group:123"></label> <button id="wwLoad">Load</button></p>
+<pre id="ww"></pre>
+<table id="wwLog"><thead><tr><th>ID</th><th>At</th><th>By</th><th>Added</th><th>Removed</th><th></th></tr></thead><tbody></tbody></table>
 <script>
 const $=s=>document.querySelector(s);
 const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
@@ -87,6 +93,8 @@ $('#delete').onclick=async()=>{if(confirm('Delete persona '+$('#id').value+'?'))
 $('#import').onclick=async()=>{await api('/api/personas/import-roles',{});list()};
 $('#setDefault').onclick=async()=>{const v=$('#default').value.trim();await api('/api/personas/assign',{default:v||null});list()};
 $('#setOverride').onclick=async()=>{const v=$('#convPersona').value.trim();await api('/api/personas/assign',{conversation:$('#conv').value.trim(),persona:v||null});list()};
+async function wakeWords(){const conv=$('#wwConv').value.trim();const j=await api('/api/personas/wake-words?conversation='+encodeURIComponent(conv));if(!j.ok)return;$('#ww').textContent=JSON.stringify({personaNames:j.personaNames,keywords:j.keywords,dropNames:j.dropNames,effective:j.effective},null,1);const tb=$('#wwLog tbody');tb.replaceChildren();for(const e of j.log.slice().reverse()){const tr=document.createElement('tr');const b=document.createElement('button');b.textContent='Undo';b.onclick=async()=>{await api('/api/personas/wake-words/undo',{conversation:conv,id:e.id});wakeWords()};const td=document.createElement('td');td.append(b);tr.append(cell(e.id),cell(new Date(e.at).toISOString()),cell(e.by),cell(JSON.stringify(e.added)),cell(JSON.stringify(e.removed)),td);tb.append(tr)}}
+$('#wwLoad').onclick=wakeWords;
 list();
 </script></body></html>
 "##;

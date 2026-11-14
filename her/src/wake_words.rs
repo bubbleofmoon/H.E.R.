@@ -1,38 +1,185 @@
-//! Persona wake words (GLOSSARY "Persona"). Stub until Run B2.
+//! Persona wake words (GLOSSARY "Persona"): in reserved2 the names the conversation's active persona
+//! declares wake her like configured keywords, switch with the persona (read from the library at every
+//! ingress) and can be turned off one by one (`triggers.dropNames`). Every change of a conversation's
+//! `keywords` or `dropNames` through the wake-config route is logged in its `wakeWordLog` as the words
+//! added and removed (newest `LOG_MAX`) and can be undone from the console. Contract:
+//! `docs/agents/prompts-modes.md` (Persona wake words).
 
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Value};
 
 /// Entries kept in a conversation's `wakeWordLog`.
 pub(crate) const LOG_MAX: usize = 20;
+/// `dropNames` keeps at most this many names of at most `NAME_MAX` characters (Unicode scalar values;
+/// persona names are limited to 40 UTF-16 units, so every persona name fits).
+const NAMES_MAX: usize = 10;
+const NAME_MAX: usize = 40;
+const LISTS: [&str; 2] = ["keywords", "dropNames"];
 
-pub(crate) fn effective(_context: &RuntimeContext, _key: &str, keywords: &[String], _dropped: &[String]) -> Vec<String> {
-    keywords.to_vec()
+/// Trimmed non-empty strings of a JSON list; anything else is an empty list.
+fn strings(value: &Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
-pub(crate) fn drop_names_input(_input: Option<&Value>, _current: Option<&Value>) -> Option<Vec<Value>> {
-    None
+/// `word` is in `list`, compared case-insensitively.
+fn listed(list: &[String], word: &str) -> bool {
+    let word = word.to_lowercase();
+    list.iter().any(|item| item.to_lowercase() == word)
 }
 
-pub(crate) fn words_of(_wake_config: &Value) -> Value {
-    json!({"keywords": [], "dropNames": []})
+/// The words that wake her in `key`: the persona's names she has not dropped, then her own keywords,
+/// without duplicates (compared case-insensitively, the first spelling kept).
+pub(crate) fn effective(context: &RuntimeContext, key: &str, keywords: &[String], dropped: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in crate::persona::wake_names(context, key) {
+        if !listed(dropped, &name) && !listed(&out, &name) {
+            out.push(name);
+        }
+    }
+    for word in keywords {
+        if !word.trim().is_empty() && !listed(&out, word) {
+            out.push(word.clone());
+        }
+    }
+    out
 }
 
-pub(crate) fn record(_conversation: &mut Value, _before: &Value, _after: &Value, _by: &str, _at: i64) -> Option<u64> {
-    None
+/// `triggers.dropNames` for a wake-config write: the input list when one is given (a non-list clears
+/// it), else the current list; `None` when neither has one. Names are trimmed, empty ones dropped, at
+/// most `NAMES_MAX` of at most `NAME_MAX` characters.
+pub(crate) fn drop_names_input(input: Option<&Value>, current: Option<&Value>) -> Option<Vec<Value>> {
+    let source = input.or(current)?;
+    Some(strings(source).into_iter().take(NAMES_MAX).map(|name| Value::String(name.chars().take(NAME_MAX).collect())).collect())
 }
 
-pub(crate) fn undo(_state: &mut Value, _key: &str, _id: u64, _at: i64) -> Result<Value, (u16, String)> {
-    Err((501, "not implemented".to_string()))
+/// `{keywords, dropNames}` of a wake configuration, as trimmed string lists.
+pub(crate) fn words_of(wake_config: &Value) -> Value {
+    let triggers = &wake_config["triggers"];
+    json!({"keywords": strings(&triggers["keywords"]), "dropNames": strings(&triggers["dropNames"])})
 }
 
-pub(crate) fn view(_context: &RuntimeContext, _conversation: &str) -> Result<Value, (u16, String)> {
-    Err((501, "not implemented".to_string()))
+/// The words of `from` that `other` lacks (exact match), in `from`'s order.
+fn missing(from: &[String], other: &[String]) -> Vec<String> {
+    from.iter().filter(|word| !other.contains(*word)).cloned().collect()
 }
 
-pub(crate) fn briefing_line(_context: &RuntimeContext, _key: &str, _conversation: &Value) -> String {
-    String::new()
+/// What changed between two wake configurations: (`{keywords, dropNames}` added, the same removed).
+fn change(before: &Value, after: &Value) -> (Value, Value) {
+    let (old, new) = (words_of(before), words_of(after));
+    let (mut added, mut removed) = (json!({}), json!({}));
+    for list in LISTS {
+        let (was, now) = (strings(&old[list]), strings(&new[list]));
+        added[list] = json!(missing(&now, &was));
+        removed[list] = json!(missing(&was, &now));
+    }
+    (added, removed)
 }
+
+fn nothing(added: &Value, removed: &Value) -> bool {
+    [added, removed].iter().all(|side| LISTS.iter().all(|list| side[*list].as_array().map_or(true, Vec::is_empty)))
+}
+
+/// Appends `entry` with the next id to `conversation.wakeWordLog`, keeping the newest `LOG_MAX`.
+fn append(conversation: &mut Value, mut entry: Value) -> Option<u64> {
+    if !conversation.is_object() {
+        return None;
+    }
+    if !conversation["wakeWordLog"].is_array() {
+        conversation["wakeWordLog"] = json!([]);
+    }
+    let list = conversation["wakeWordLog"].as_array_mut()?;
+    let id = list.iter().filter_map(|e| e["id"].as_u64()).max().unwrap_or(0) + 1;
+    entry["id"] = json!(id);
+    list.push(entry);
+    let excess = list.len().saturating_sub(LOG_MAX);
+    list.drain(..excess);
+    Some(id)
+}
+
+/// Logs the words added to and removed from `keywords` and `dropNames` between two wake configurations
+/// as `{id, at, by, added, removed}` (ids count up per conversation). Returns the new id, or `None`
+/// when no word was added or removed.
+pub(crate) fn record(conversation: &mut Value, before: &Value, after: &Value, by: &str, at: i64) -> Option<u64> {
+    let (added, removed) = change(before, after);
+    if nothing(&added, &removed) {
+        return None;
+    }
+    append(conversation, json!({"at": at, "by": by, "added": added, "removed": removed}))
+}
+
+/// Undoes log entry `id` of `key`: its added words are taken out and its removed words put back, only
+/// while every added word is still there and every removed word still absent (otherwise a newer change
+/// is in the way), and only when she can still be woken afterwards. A refusal changes nothing and never
+/// creates a record. The undo is logged itself (`by: "undo"`, `undoes: id`).
+pub(crate) fn undo(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
+    let conversation = state
+        .get_mut("conversations")
+        .and_then(|all| all.get_mut(key))
+        .filter(|c| c.is_object())
+        .ok_or_else(|| (404, "conversation not found".to_string()))?;
+    let entry = conversation["wakeWordLog"]
+        .as_array()
+        .and_then(|log| log.iter().find(|e| e["id"].as_u64() == Some(id)))
+        .cloned()
+        .ok_or_else(|| (404, "log entry not found".to_string()))?;
+    let before = conversation["wakeConfig"].clone();
+    if !before["triggers"].is_object() {
+        return Err((409, "the conversation has no wake configuration".to_string()));
+    }
+    let mut next = before.clone();
+    for list in LISTS {
+        let added = strings(&entry["added"][list]);
+        let removed = strings(&entry["removed"][list]);
+        let mut words = strings(&before["triggers"][list]);
+        if added.iter().any(|w| !words.contains(w)) || removed.iter().any(|w| words.contains(w)) {
+            return Err((409, "the wake words changed after this entry; undo the newer entries first".to_string()));
+        }
+        words.retain(|w| !added.contains(w));
+        words.extend(removed);
+        next["triggers"][list] = json!(words);
+    }
+    if !crate::wake::is_wakeable(&crate::session::wake_config_from_json(Some(&next)), at) {
+        return Err((409, "undoing this entry would leave no way to wake her".to_string()));
+    }
+    let (added, removed) = change(&before, &next);
+    let words = words_of(&next);
+    conversation["wakeConfig"] = next;
+    let new_id = append(conversation, json!({"at": at, "by": "undo", "undoes": id, "added": added, "removed": removed}));
+    Ok(json!({"ok": true, "conversation": key, "id": new_id, "undid": id, "wakeWords": words}))
+}
+
+/// `GET /api/personas/wake-words?conversation=`: the persona's names, her keywords and dropped names,
+/// the words in effect and the change log, oldest first.
+pub(crate) fn view(context: &RuntimeContext, conversation: &str) -> Result<Value, (u16, String)> {
+    let key = crate::initial_prompts::canonical_key(conversation)
+        .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
+    let state = context.read_social_state().map_err(|_| (503, "social state is unavailable".to_string()))?;
+    let conv = &state["conversations"][key.as_str()];
+    let words = words_of(&conv["wakeConfig"]);
+    let keywords = strings(&words["keywords"]);
+    let dropped = strings(&words["dropNames"]);
+    Ok(json!({"ok": true, "conversation": key, "personaNames": crate::persona::wake_names(context, &key),
+        "keywords": keywords, "dropNames": dropped, "effective": effective(context, &key, &keywords, &dropped),
+        "log": conv["wakeWordLog"].as_array().cloned().unwrap_or_default()}))
+}
+
+/// The briefing's `【名字唤醒】` rule section: which persona names wake her in `key`, which she turned
+/// off and how to change them; empty when her persona declares no names.
+pub(crate) fn briefing_line(context: &RuntimeContext, key: &str, conversation: &Value) -> String {
+    let names = crate::persona::wake_names(context, key);
+    if names.is_empty() {
+        return String::new();
+    }
+    let dropped = strings(&conversation["wakeConfig"]["triggers"]["dropNames"]);
+    let (off, on): (Vec<String>, Vec<String>) = names.into_iter().partition(|name| listed(&dropped, name));
+    let on = if on.is_empty() { "（都已关闭）".to_string() } else { on.join("、") };
+    let off = if off.is_empty() { String::new() } else { format!("你已关闭：{}。", off.join("、")) };
+    format!("【名字唤醒】群里有人说到这些名字会唤醒你（来自当前人设）：{on}。{off}想关掉某个名字，就用 qq_set_wake_config 把要关掉的名字完整写进 triggers.dropNames（空列表全部恢复）；triggers.keywords 是你自己另加的唤醒词。每次改动都会记下来，管理员可以撤销。\n\n")
+}
+
 
 #[cfg(test)]
 mod tests {
