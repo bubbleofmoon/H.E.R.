@@ -103,14 +103,16 @@ impl<'a> Digest<'a> {
                 .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
             if batch.messages > 0 { break batch; }
             // Rows that render no message (commands, HER's frames, blanked raw text): move past them without the model.
-            if (batch.through, batch.replies) == (cursor.through, (cursor.replies_ms, cursor.replies_seq)) || skips == MAX_SKIPS {
+            if batch.through == cursor.through || skips == MAX_SKIPS {
                 return Ok(Outcome::Quiet);
             }
             if hold.held() { return Err(DigestError::Cancelled); }
-            if reader.write_digest(space, cursor.through, batch.through, batch.replies, &[]).map_err(|_| DigestError::Storage)?.is_none() {
+            // HER's replies wait for a batch that reaches the model; only the rows move.
+            let kept = (cursor.replies_ms, cursor.replies_seq);
+            if reader.write_digest(space, cursor.through, batch.through, kept, &[]).map_err(|_| DigestError::Storage)?.is_none() {
                 return Ok(Outcome::Quiet);
             }
-            (cursor.through, (cursor.replies_ms, cursor.replies_seq)) = (batch.through, batch.replies);
+            cursor.through = batch.through;
             skips += 1;
         };
         if batch.pending < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
