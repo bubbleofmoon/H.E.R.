@@ -833,3 +833,56 @@ fn installed_runtime_backups_stay_inside_the_root() {
     assert_eq!(install.backup_destination(&outside, Path::new("backups")).unwrap(), outside.join("backups"));
     assert_eq!(install.backup_destination(&outside, Path::new("../b")).unwrap(), fixture.0.join("qqbot-rust/b"));
 }
+
+/// Lines of `text` that spell a production path: the root, the retired `qqbot-rust` folder or a
+/// profile `.dsh` join. A line carrying `layout-literal:` and its reason keeps one as test data.
+fn production_path_literals(text: &str) -> Vec<usize> {
+    let mut lines = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.contains("layout-literal:") { continue; }
+        let mut spelled = line.to_ascii_lowercase().replace('\\', "/");
+        while spelled.contains("//") { spelled = spelled.replace("//", "/"); }
+        if ["c:/qqbot", "qqbot-rust", "join(\".dsh\")"].iter().any(|n| spelled.contains(n)) {
+            lines.push(index + 1);
+        }
+    }
+    lines
+}
+
+#[test]
+fn production_path_scanner_flags_unmarked_spellings_and_skips_marked_ones() {
+    let text = [
+        r#"const A: &str = "C:/qqbot/data";"#,
+        r#"const B: &str = "C:/qqbot/data"; // layout-literal: expected value"#,
+        r#"const C: &str = "c:\\QQBOT\\state";"#,
+        r#"let d = base.join("qqbot-rust");"#,
+        r#"let e = home.join(".dsh");"#,
+        r#"let f = home.join(".dsh"); // layout-literal: expected value"#,
+        r#"let g = crate::legacy_path!("data");"#,
+        r#"let h = "C:\\\\qqbot";"#,
+    ]
+    .join("\n");
+    assert_eq!(production_path_literals(&text), vec![1, 3, 4, 5, 8]);
+}
+
+/// One production root (#66): production path spellings live only in the layout module. A line may
+/// keep one as sanitizer test data by carrying `layout-literal:` and its reason.
+#[test]
+fn production_path_literals_live_only_in_the_layout_module() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut findings = Vec::new();
+    let mut folders = vec![manifest.join("src"), manifest.join("../her-memory/src")];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() { folders.push(path); continue; }
+            if path.extension().is_none_or(|e| e != "rs")
+                || path.file_name().is_some_and(|n| n == "install_root.rs") { continue; }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in production_path_literals(&text) {
+                findings.push(format!("{}:{line}", path.display()));
+            }
+        }
+    }
+    assert!(findings.is_empty(), "production path literals outside src/install_root.rs: {findings:#?}");
+}
