@@ -121,7 +121,8 @@ fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Outpu
                         leaked = true;
                         break;
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        *reason += &format!("; child did not exit after kill (could not be polled: {e})");
                         leaked = true;
                         break;
                     }
