@@ -1373,6 +1373,11 @@ fn timing_records_distinguish_normal_and_cancelled_dsh_endings() {
             .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert!(ledger.iter().any(|row| row["k"] == "begun" && row["turn"] == turn_id));
         assert!(ledger.iter().any(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id));
+        let attempt = ledger.iter().find(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id).expect("the DSH wake attempt is in the ledger");
+        for name in ["identity", "relationship", "conversation", "material"] {
+            assert!(attempt["layers"]["injected"][name].is_u64(), "layers.injected.{name} is an item count: {attempt}");
+            assert!(attempt["layers"]["cut"][name].is_u64(), "layers.cut.{name} is an item count: {attempt}");
+        }
         assert!(!timing.to_string().contains(SEED_TOKEN), "timing leaked an agent token");
     }
 }
@@ -3138,7 +3143,7 @@ fn hf85_briefing_changes_replace_remove_and_clock_does_not_resend_memory() {
     let changed=rig.dsh.applied()[2].text.clone();
     assert!(changed.contains("【替换简报节 operator】") && changed.contains("new-operator-85"));
     assert!(!changed.contains("old-operator-85") && !changed.contains("【反AI味】"));
-    assert!(changed.contains("【替换简报节 memory】") && changed.contains("new-thought-85") && changed.contains("new-impression-85"));
+    assert!(changed.contains("【替换简报节 memory】") && changed.contains("new-thought-85") && changed.contains("【替换简报节 impressions】") && changed.contains("new-impression-85"), "impressions are the Relationship layer's own section: {changed}");
     assert!(changed.contains("【替换简报节 stickers】") && changed.contains("new-sticker-85"));
     assert!(changed.contains("【替换简报节 sending】") && changed.contains("new-send-rule-85"));
     fs::write(rig.root.join("data/initial-prompts.json"),"{}").unwrap();
@@ -3148,7 +3153,7 @@ fn hf85_briefing_changes_replace_remove_and_clock_does_not_resend_memory() {
     assert_eq!(rig.console("POST","/api/socialV2/wake",Some(&json!({"key":GROUP_KEY}))).0,200);
     assert!(wait_for(LONG,||rig.turn_state(3)=="completed"));
     let removed=rig.dsh.applied()[3].text.clone();
-    assert!(removed.contains("【删除简报节 operator】") && removed.contains("【删除简报节 memory】"),"{removed}");
+    assert!(removed.contains("【删除简报节 operator】") && removed.contains("【删除简报节 memory】") && removed.contains("【删除简报节 impressions】"),"{removed}");
     assert!(removed.contains("【删除简报节 stickers】"));
     assert!(removed.contains("【替换简报节 sending】") && removed.contains("文本输出不会发送到 QQ"), "removing the optional hint must retain delivery rules");
     assert!(rig.onebot_sends().is_empty(),"final model text was forwarded");

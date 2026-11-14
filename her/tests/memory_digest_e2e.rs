@@ -1,10 +1,10 @@
 //! Memory digest jobs through the real console, with a synthetic runtime and a loopback model relay.
+mod support;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -120,22 +120,19 @@ fn completion(content: &str) -> (u16, String) {
 }
 
 struct Rig {
-    root: PathBuf,
+    root: crate::support::RuntimeRoot,
     port: u16,
     child: Option<Child>,
+    reservation: Option<crate::support::ports::Reserved>, // held until the first console spawn; restarts reuse the port
 }
 impl Rig {
     fn new(model: &Model, auto: Value, social: Value) -> Self {
-        let root =
-            std::env::temp_dir().join(format!("her-digest-{}-{}", std::process::id(), now()));
-        for folder in ["config", "data", "resources", "user/dsh"] {
-            std::fs::create_dir_all(root.join(folder)).unwrap();
-        }
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let root = crate::support::RuntimeRoot::new("digest");
+        let reservation = crate::support::ports::reserve();
+        let port = reservation.port();
         std::fs::write(root.join("config/config.json"), json!({"consoleToken":"fixture-digest-token","consolePort":port,
             "ownerQQ":9001,"memory":{"autoFlush":auto},"harness":{"model":"digest-fixture-model"},
-            "tasks":{"nodePath":root.join("nonexistent-node.exe"),"installRoot":root}}).to_string()).unwrap();
+            "tasks":{"nodePath":root.join("nonexistent-node.exe"),"installRoot":root.path()}}).to_string()).unwrap();
         std::fs::write(root.join("config/harness-api-key"), "fixture-digest-key").unwrap();
         std::fs::write(root.join("data/social-v2.json"), social.to_string()).unwrap();
         std::fs::write(
@@ -160,11 +157,11 @@ impl Rig {
             CREATE VIRTUAL TABLE memory_fts USING fts5(seg, tokenize='unicode61');").unwrap();
         db.execute("INSERT INTO memory(owner_type,owner_id,scope,kind,content,source,created_at) VALUES('session','group:42','group','fact',?1,'manual',1)",[CHAT]).unwrap();
         drop(db);
-        drop(listener);
         Self {
             root,
             port,
             child: None,
+            reservation: Some(reservation),
         }
     }
     fn start(&mut self) {
@@ -174,6 +171,7 @@ impl Rig {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000);
         }
+        drop(self.reservation.take()); // free the console port on the line before its first spawn
         self.child = Some(
             cmd.args([
                 "--console-serve",
@@ -181,7 +179,7 @@ impl Rig {
                 &self.port.to_string(),
                 "--runtime-root",
             ])
-            .arg(&self.root)
+            .arg(self.root.path())
             .env("DSH_HOME", self.root.join("ambient-decoy"))
             .env("DSH_LAUNCH_TOKEN", "ambient_fake_launch_token")
             .env("MEMORY_DB_PATH", self.root.join("must-not-create.db"))
@@ -287,7 +285,6 @@ impl Drop for Rig {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 

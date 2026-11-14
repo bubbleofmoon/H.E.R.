@@ -140,3 +140,44 @@ fn probe_health(port: u16) -> Option<(u16, Value)> {
         .ok()?;
     Some((status, serde_json::from_str(body).ok()?))
 }
+
+/// A started child that is killed and reaped on drop. Wrap a child in it right after it starts, so
+/// a panic in later setup in the same test cannot leak it.
+pub struct OwnedChild(pub Child);
+
+impl std::ops::Deref for OwnedChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+thread_local! {
+    static HELD: std::cell::RefCell<Vec<Reserved>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Keeps a reservation bound until `release_held`, for a port that is written into fixture files and
+/// bound later by a child or grandchild. Holds are per thread: each test runs on its own thread, and the
+/// first child spawn on that thread frees every held port (the spawn helper calls `release_held()`).
+/// Two fixtures on one thread share that free point.
+pub fn hold(reservation: Reserved) {
+    HELD.with(|held| held.borrow_mut().push(reservation));
+}
+
+/// Frees every port this thread holds through `hold`.
+pub fn release_held() {
+    HELD.with(|held| held.borrow_mut().clear());
+}

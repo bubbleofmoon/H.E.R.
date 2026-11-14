@@ -1,6 +1,6 @@
 //! Supervisor spec seam 1: paired binaries and a loopback release source.
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+mod support;
 #[path = "../src/process_identity.rs"]
 mod process_identity;
 #[path = "support/release_signing.rs"]
@@ -889,10 +889,7 @@ impl Fixture {
             "<!doctype html><body>fixture console</body>",
         )
         .unwrap();
-        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reservation.local_addr().unwrap().port();
-        drop(reservation);
-        let mut child = Child(
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(15), |port| {
             self.command(&[
                 "--console-serve",
                 "--runtime-root",
@@ -903,8 +900,9 @@ impl Fixture {
             .stdout(Stdio::null())
             .stderr(fs::File::create(self.root.join("console.stderr")).unwrap())
             .spawn()
-            .unwrap(),
-        );
+            .unwrap()
+        });
+        let mut child = Child(child);
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             assert!(
@@ -1165,10 +1163,7 @@ fn native_install_leaves_a_running_old_image_locked_and_untouched() {
     fs::copy(env!("CARGO_BIN_EXE_her-cli"), &old).unwrap();
     drop(fs::OpenOptions::new().write(true).open(&old).unwrap());
     let before = fs::read(&old).unwrap();
-    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = reservation.local_addr().unwrap().port();
-    drop(reservation);
-    let mut resident = Child(
+    let (child, port) = crate::support::ports::start_console(Duration::from_secs(15), |port| {
         Command::new(&old)
             .creation_flags(0x08000000)
             .env_remove("HER_INSTALL_ROOT")
@@ -1180,8 +1175,9 @@ fn native_install_leaves_a_running_old_image_locked_and_untouched() {
             .stdout(Stdio::null())
             .stderr(fs::File::create(f.root.join("native.stderr")).unwrap())
             .spawn()
-            .unwrap(),
-    );
+            .unwrap()
+    });
+    let mut resident = Child(child);
     let deadline = Instant::now() + Duration::from_secs(15);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(
