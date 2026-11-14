@@ -148,18 +148,36 @@ pub fn matches(
     compare(process, program, script).unwrap_or_else(Match::Unknown)
 }
 
-/// Whether any argument (or the value of an `--option=value`) resolves to `expected`.
+/// Whether any argument (or the value of an `--option=value`, or any operand after `--`) names
+/// `expected`. An operand that cannot be resolved (its working folder may have changed) still
+/// counts when its file name is the script's, so an unresolved entry stays unknown, never foreign.
 fn names_script(process: &Process, expected: &std::path::Path) -> bool {
+    let mut operands = false;
     process.args.iter().skip(1).any(|arg| {
-        let candidate = match arg.strip_prefix('-') {
-            Some(option) => match option.split_once('=') {
-                Some((_, value)) => value,
-                None => return false,
-            },
-            None => arg.as_str(),
+        let candidate = if operands {
+            arg.as_str()
+        } else if arg == "--" {
+            operands = true;
+            return false;
+        } else {
+            match arg.strip_prefix('-') {
+                Some(option) => match option.split_once('=') {
+                    Some((_, value)) => value,
+                    None => return false,
+                },
+                None => arg.as_str(),
+            }
         };
-        resolve_script(process, std::path::Path::new(candidate))
-            .is_ok_and(|actual| same_exe(&actual.to_string_lossy(), &expected.to_string_lossy()))
+        let candidate = std::path::Path::new(candidate);
+        match resolve_script(process, candidate) {
+            Ok(actual) => same_exe(&actual.to_string_lossy(), &expected.to_string_lossy()),
+            Err(_) => match (candidate.file_name(), expected.file_name()) {
+                (Some(left), Some(right)) => {
+                    same_exe(&left.to_string_lossy(), &right.to_string_lossy())
+                }
+                _ => false,
+            },
+        }
     })
 }
 

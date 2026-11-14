@@ -378,3 +378,61 @@ fn matches_relative_script_but_never_a_program_or_argument_lookalike() {
         "mismatch"
     );
 }
+
+#[test]
+fn an_unclassifiable_switch_is_unknown_for_the_script_it_names_and_foreign_for_any_other() {
+    let mut f = Fixture::node("switch", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::write(f.root.join("other.js"), "").unwrap();
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    std::fs::remove_file(f.root.join("ready")).unwrap();
+    // --no-deprecation is a valid node switch the matcher cannot classify.
+    f.child = hidden(&program)
+        .args(["--no-deprecation", "entry.js", "her-process-fixture-05"])
+        .current_dir(&f.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait_ready();
+    let pid = f.child.id().to_string();
+    for (script, expected) in [("entry.js", "unknown"), ("other.js", "mismatch")] {
+        let result = f.run(&[
+            "match",
+            "--pid",
+            &pid,
+            "--program",
+            &program,
+            "--script",
+            script,
+        ]);
+        assert_eq!(result["state"], expected, "{script}: {result}");
+    }
+    // An operand that no longer resolves but carries the script's file name stays unknown.
+    std::fs::create_dir(f.root.join("sub")).unwrap();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("sub/entry.js")).unwrap();
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    std::fs::remove_file(f.root.join("ready")).unwrap();
+    f.child = hidden(&program)
+        .args(["--no-deprecation", "sub/entry.js", "her-process-fixture-05"])
+        .current_dir(&f.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait_ready();
+    std::fs::rename(f.root.join("sub"), f.root.join("moved")).unwrap();
+    let moved = f.root.join("moved/entry.js");
+    let result = f.run(&[
+        "match",
+        "--pid",
+        &f.child.id().to_string(),
+        "--program",
+        &program,
+        "--script",
+        moved.to_str().unwrap(),
+    ]);
+    assert_eq!(result["state"], "unknown", "{result}");
+}

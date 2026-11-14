@@ -1683,6 +1683,8 @@ fn checkpoint(
         states[name]["reason"] = json!(reason);
         states[name]["healthySince"] = Value::Null;
         states[name]["refusalSince"] = Value::Null;
+        // Independent of the alert fingerprint, which an earlier build may already have persisted.
+        log_refusal(context, name, reason);
         if states[name]["fingerprint"] != reason {
             states[name]["fingerprint"] = json!(reason);
             Some((name.to_string(), reason.to_string()))
@@ -1706,7 +1708,6 @@ fn checkpoint(
     }
     deliver_outage_notice(context, cfg, states, name)?;
     if let Some((key, reason)) = notice {
-        log_refusal(context, &key, &reason);
         alert(context, cfg, &key, &reason);
     }
     Ok(())
@@ -1910,9 +1911,21 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
     }
 }
 
-/// A refused start never spawns the dependency, so its own log would otherwise not exist.
+/// A refused start never spawns the dependency, so its own log would otherwise not exist. Each
+/// distinct refusal is written once per supervisor process, not on every reconcile pass.
 fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
     use std::io::Write;
+    static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if seen.iter().any(|(n, r)| n == name && r == reason) {
+            return;
+        }
+        if seen.len() >= 256 {
+            seen.clear();
+        }
+        seen.push((name.to_string(), reason.to_string()));
+    }
     let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
     if let Err(error) = dependency_log(context, name, "err")
         .and_then(|mut file| file.write_all(line.as_bytes()).map_err(|e| e.to_string()))
