@@ -7,17 +7,27 @@ Comments, pushes and progress elsewhere never wake it. Run it hidden in the back
 signal, so start it again after acting on the baton.
 
 usage: python -I scripts/issue_watch.py --machine windows|linux|owner [--repo bubbleofmoon/H.E.R.]
-                                        [--state <file>] [--interval 60] [--once]
+                                        [--state <file>] [--interval 180] [--once]
 The default state file is ~/.her-baton-watch-<machine>-<owner>-<repo>.json (each part %XX-encoded except letters, digits, '.' and '_'), one per repository, replaced atomically, so watching
 another repository never makes this one's held issues look new.
 --once polls a single time and prints the newly held issues ("no batons" when none are new).
-A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time. Exit 0 after printing; 2 on an API failure, a --once poll GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
+--interval is at least 180 seconds, and every wait, a short rate-limit wait included, lasts at least one interval.
+A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time; a 403 naming a secondary rate limit without either header waits 180 s. Exit 0 after printing; 2 on an API failure, a --once poll GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
 """
 import argparse, http.client, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 REPO = re.compile(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)")
 RATE_LIMIT_CAP = 3600
 PAGE = 100
+MIN_INTERVAL = 180
+
+
+def interval_arg(value):
+    """--interval in whole seconds, at least MIN_INTERVAL (docs/agents/coordinator.md "GitHub API budget")."""
+    seconds = int(value)
+    if seconds < MIN_INTERVAL:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_INTERVAL} seconds")
+    return seconds
 
 
 def token():
@@ -55,15 +65,21 @@ def fetch(url, tok, etag):
     except urllib.error.HTTPError as e:
         if e.code == 304:
             return etag, None, None
+        try:
+            body = e.read()
+        except (OSError, http.client.HTTPException):
+            body = b""
         if e.code in (403, 429):
             wait = rate_limit_wait(e.headers)
+            if wait is None and e.code == 403 and b"rate limit" in body.lower():
+                wait = MIN_INTERVAL      # a secondary rate limit without headers: GitHub asks for at least a minute
             if wait is not None:
                 print(f"GitHub API rate limit ({e.code}); waiting {wait} s", file=sys.stderr)
                 return etag, None, wait
         if e.code >= 500 or e.code == 429:
             print(f"GitHub API {e.code}; retrying next interval", file=sys.stderr)
             return etag, None, 0
-        print(f"GitHub API {e.code} for {url}: {e.read()[:300]!r}", file=sys.stderr)
+        print(f"GitHub API {e.code} for {url}: {body[:300]!r}", file=sys.stderr)
         sys.exit(2)
     except (OSError, http.client.HTTPException) as e:  # URLError, timeouts, resets, dropped connections
         print(f"GitHub API unreachable ({e}); retrying next interval", file=sys.stderr)
@@ -113,7 +129,7 @@ def main(argv=None):
     p.add_argument("--machine", required=True, choices=["windows", "linux", "owner"])
     p.add_argument("--repo", default="bubbleofmoon/H.E.R.")
     p.add_argument("--state", default=None)
-    p.add_argument("--interval", type=int, default=60)
+    p.add_argument("--interval", type=interval_arg, default=MIN_INTERVAL)
     p.add_argument("--once", action="store_true")
     a = p.parse_args(argv)
     try:
@@ -144,7 +160,7 @@ def main(argv=None):
             print("GitHub did not answer; no baton state was read", file=sys.stderr)
             return 2
         if wait is not None:
-            time.sleep(wait or a.interval)
+            time.sleep(max(wait, a.interval))
             continue
         if events or a.once:
             print("\n".join(events) if events else "no batons")
