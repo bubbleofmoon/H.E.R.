@@ -40,14 +40,14 @@ impl Tools {
         conversation: &str,
         generation: &str,
     ) -> Result<Self, String> {
-        let token = crate::console::conversation_token(context, conversation)?
+        let token = crate::conversation_authority::token(context, conversation)?
             .ok_or("harness tool authority is unavailable")?;
         let authority = Authority {
             context: context.clone(),
             conversation: conversation.into(),
             generation: generation.into(),
             token,
-            mode: crate::console::runtime_mode(context),
+            mode: crate::conversation_authority::mode(context),
         };
         authority.check().map_err(String::from)?;
         Ok(Self {
@@ -77,7 +77,7 @@ impl Tools {
 
     pub(super) fn revoke(&self) -> Result<(), String> {
         if let Some(a) = &self.authority {
-            crate::console::revoke_agent_token(&a.context, &a.conversation, &a.token)?;
+            crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token)?;
         }
         Ok(())
     }
@@ -208,16 +208,16 @@ impl Authority {
             .context
             .load_config()
             .map_err(|reason| CheckError::Unavailable(reason.into()))?;
-        let mode = crate::console::runtime_mode(&self.context);
+        let mode = crate::conversation_authority::mode(&self.context);
         if mode != self.mode || !crate::chat::allowed_in_mode(&cfg, &mode, &self.conversation) {
             return Err(CheckError::Revoked(
                 "harness conversation authority changed",
             ));
         }
-        let token = crate::console::conversation_token(&self.context, &self.conversation)
+        let token = crate::conversation_authority::token(&self.context, &self.conversation)
             .map_err(CheckError::Unavailable)?;
         if token.as_deref() != Some(&self.token)
-            || crate::send_outbox::token_epoch(&self.token) != self.generation
+            || crate::conversation_authority::generation(&self.token) != self.generation
         {
             return Err(CheckError::Revoked(
                 "harness conversation generation changed",

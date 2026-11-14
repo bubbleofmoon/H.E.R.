@@ -5,8 +5,9 @@
 //! the public isolated console HTTP route. This proves the bridge-to-console boundary and selected
 //! runtime paths; it does not claim to exercise a real DSH model or its tool planner.
 
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide_process_window;
+mod support;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -169,14 +170,6 @@ fn bind_http_url() -> (TcpListener, String) {
 fn bind_ws_url() -> (TcpListener, String) {
     let (listener, authority) = bind_loopback();
     (listener, format!("ws://{authority}"))
-}
-
-fn explicit_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("reserve explicit console port")
-        .local_addr()
-        .expect("read console port")
-        .port()
 }
 
 fn secret_text(secret: &[u8; 32]) -> String {
@@ -1140,17 +1133,6 @@ impl Drop for ChildCapture {
     }
 }
 
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 fn child_command(root: &Path, ambient: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
     command
@@ -1412,7 +1394,8 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     let (model_listener, model_url) = bind_http_url();
     let (onebot_listener, onebot_url) = bind_http_url();
     let (onebot_ws_listener, onebot_ws_url) = bind_ws_url();
-    let console_port = explicit_port();
+    let console_reservation = crate::support::ports::reserve();
+    let console_port = console_reservation.port();
     assert_ne!(
         onebot_url, onebot_ws_url.replace("ws://", "http://"),
         "HTTP and WebSocket dependencies need distinct explicitly configured ports"
@@ -1431,8 +1414,14 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     let mut onebot_http_server = spawn_onebot_http(onebot_listener, onebot_sent.clone());
     let mut onebot_ws_server = spawn_onebot_ws(onebot_ws_listener, onebot_sent.clone(), &roots.selected);
 
+    drop(console_reservation); // free the held port on the line before the console spawn
     let mut console = spawn_console(&roots.selected, &roots.ambient, console_port);
-    let health = wait_console_health(console_port);
+    let health = crate::support::ports::wait_owned_health(
+        console.child.as_mut().expect("console child owned"),
+        console_port,
+        Duration::from_secs(12),
+    )
+    .and_then(|()| wait_console_health(console_port));
     let candidate_output = if health.is_ok() {
         let mut candidate = spawn_live_candidate(&roots.selected, &roots.ambient, console_port);
         Some(candidate.wait(Duration::from_secs(38)))
@@ -1801,7 +1790,8 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
     let (config_dsh_listener, config_dsh_url) = bind_http_url();
     let (config_http_listener, config_http_url) = bind_http_url();
     let (config_ws_listener, config_ws_url) = bind_ws_url();
-    let console_port = explicit_port();
+    let console_reservation = crate::support::ports::reserve();
+    let console_port = console_reservation.port();
     options.config_dsh_base = config_dsh_url;
     options.config_onebot_http = config_http_url;
     options.config_onebot_ws = config_ws_url;
@@ -1827,8 +1817,14 @@ fn run_background_scenario(mode: DshMode, mut options: FixtureOptions) -> Scenar
         }
     };
 
+    drop(console_reservation); // free the held port on the line before the console spawn
     let mut console = spawn_console(&roots.selected, &roots.ambient, console_port);
-    let health = wait_console_health(console_port);
+    let health = crate::support::ports::wait_owned_health(
+        console.child.as_mut().expect("console child owned"),
+        console_port,
+        Duration::from_secs(12),
+    )
+    .and_then(|()| wait_console_health(console_port));
     let candidate = if health.is_ok() {
         let mut candidate = spawn_live_candidate(&roots.selected, &roots.ambient, console_port);
         Some(candidate.wait(Duration::from_secs(38)))
