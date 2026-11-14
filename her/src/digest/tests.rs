@@ -424,9 +424,11 @@ fn filtered_rows_never_consume_her_replies() {
     journal_message_at(&context, "group:77", 2, group_text(5002, "/status"), t0 + 10);
     journal_message_at(&context, "group:77", 3, group_text(5002, &"字".repeat(400)), t0 + 20);
     journal_message_at(&context, "group:77", 4, group_text(5002, "第四句"), t0 + 30);
+    journal_message_at(&context, "group:77", 5, group_text(5002, "第五句"), t0 + 40);
+    // Replies the cap defers wait for the next message: the seq 5 message takes them in a later digest.
     let mut reached = false;
-    for _ in 0..4 {
-        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 4, .. })) {
+    for _ in 0..6 {
+        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 5, .. })) {
             reached = true;
             break;
         }
