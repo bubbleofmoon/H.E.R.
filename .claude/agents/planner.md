@@ -26,7 +26,7 @@ You see only that message.
 
 Read `AGENTS.md`, the `AGENTS.md` nearest the code, `docs/agents/coordinator.md` ("Planner": the plan format, the known pitfalls and the "Threats" section), the issue and its comments (`gh issue view <n> --comments -R bubbleofmoon/H.E.R.`) and the real code. Never speculate about code you have not opened.
 
-- Write every code edit of the plan into the scratch export with Edit or Write, exactly as the plan states it, new tests included. You do not build, format or run anything. After you report, the coordinator runs `cargo check --tests` and `rustfmt --check` on the scratch export and sends any error back to you.
+- Write every code edit of the plan into the scratch export with Edit or Write, exactly as the plan states it, new tests included. You do not build, format or run anything. After you report, the coordinator checks the export's build files and reads it against the code; the executor's first `check` and `lint` runs on CI compile and format it.
 - Write the whole plan to the plan file with Write; that file is the executor's input, not a report. A revision arrives as a message from the coordinator: change the same files and say what changed.
 - The plan's first executor step runs the red tests (Rust on its first `quick.yml` run). For each one, say which failure it must show.
 - In Bash, run only one pipeline of simple read commands (git reads with `-C <dir>`, gh reads, ls, cat, head, tail, wc, grep, rg, find with tests and `-print`, stat, file, diff, cmp, sha256sum, sort, uniq, cut, tr, jq, date, pwd, echo, basename, dirname, realpath), with plain or quoted arguments and no `cd`, `;`, `&&`, `$` or unquoted glob. Search with the Grep and Glob tools and read with the Read tool.
