@@ -376,6 +376,18 @@ class WrapperCase(unittest.TestCase):
                 self.assert_no_gh(out, f'{kind} {group}')
                 self.assertIn('refusal=missing-title', out, f'{kind} {group}')
 
+    @REQUIRES_HOST
+    def test_a_missing_scanner_is_its_own_refusal(self):
+        for kind in KINDS:
+            self.mark.unlink(missing_ok=True)
+            self.env['HER_GITLEAKS'] = str(self.tmp / 'no-such-gitleaks')
+            code, out = self.run_wrapper(kind, '--body-file', str(self.body), 'issue', 'comment', '166',
+                                         '--repo', PUBLIC_REPO)
+            self.assertEqual(code, 3, f'{kind}: {out}')
+            self.assertIn('refusal=scanner-missing', out)
+            self.assertNotIn('refusal=scan-findings', out)
+            self.assert_no_gh(out, kind)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

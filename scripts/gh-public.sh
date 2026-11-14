@@ -21,7 +21,7 @@
 # gh publishes exactly the text that was scanned and is never left prompting for a body.
 #
 # A refusal prints a fixed kind and the argument position, never a supplied value, and exits
-# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings. Install
+# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings, 3 when gitleaks cannot be found (refusal=scanner-missing, which says nothing about the text). Install
 # gitleaks first (scripts/ci/install-gitleaks.py or set HER_GITLEAKS); a scan that cannot run
 # the secret check refuses too.
 set -u
@@ -39,6 +39,15 @@ resolve() { # prints a comparable path for an existing file, or nothing
   local file=$1
   [ -f "$file" ] || return 0
   (cd "$(dirname "$file")" && printf '%s/%s\n' "$(pwd)" "$(basename "$file")")
+}
+scan_refusal() { # <scan exit code> <field> <argument position>
+  if [ "$1" -eq 3 ]; then
+    echo "gh-public: refusal=scanner-missing field=$2 argument-position=$3 (set HER_GITLEAKS to the pinned gitleaks: docs/agents/rust-validation.md)" >&2
+    exit 3
+  fi
+  echo "gh-public: refusal=scan-findings field=$2 argument-position=$3" >&2
+  echo 'gh-public: refused (public scan findings above; matched text is never shown)' >&2
+  exit 1
 }
 
 [ $# -ge 1 ] || refuse usage 0
@@ -134,20 +143,16 @@ case "$subcommand" in
     [ -n "$title_text" ] || refuse missing-title 0 ;;      # gh would prompt for an unscanned title
 esac
 
-"$py" -I "$scan" --stdin <"$body" || {
-  echo "gh-public: refusal=scan-findings field=body-file argument-position=$body_position" >&2
-  echo 'gh-public: refused (public scan findings above; matched text is never shown)' >&2
-  exit 1
-}
+"$py" -I "$scan" --stdin <"$body"
+code=$?
+[ $code -eq 0 ] || scan_refusal "$code" body-file "$body_position"
 count=${#field_names[@]}
 i=0
 while [ $i -lt $count ]; do
   # The whole value goes to the scan, every line of it: no line-oriented trimming.
-  printf '%s\n' "${field_texts[$i]}" | "$py" -I "$scan" --stdin || {
-    echo "gh-public: refusal=scan-findings field=${field_names[$i]} argument-position=${field_positions[$i]}" >&2
-    echo 'gh-public: refused (public scan findings above; matched text is never shown)' >&2
-    exit 1
-  }
+  printf '%s\n' "${field_texts[$i]}" | "$py" -I "$scan" --stdin
+  code=$?
+  [ $code -eq 0 ] || scan_refusal "$code" "${field_names[$i]}" "${field_positions[$i]}"
   i=$((i + 1))
 done
 

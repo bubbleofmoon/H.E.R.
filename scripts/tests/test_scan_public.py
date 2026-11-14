@@ -138,9 +138,9 @@ class TextMode(unittest.TestCase):
         line = self.kind_lines(out)[0]
         self.assertIn('<stdin>:2', line.replace('\r', ''), line)
 
-    def test_missing_gitleaks_is_a_finding(self):
+    def test_missing_gitleaks_exits_3(self):
         code, out = run(['--stdin'], CLEAN_TEXT, {'HER_GITLEAKS': str(ROOT / 'no-such-gitleaks')})
-        self.assertEqual(code, 1, out)
+        self.assertEqual(code, 3, out)
         self.assertIn('secret-scan', out)
 
 

@@ -32,7 +32,7 @@ revision it is given, including a blob whose path sits under a directory the tre
 skips locally, because a committed blob is published even when the working copy ignores
 it. Exceptions are read from the checkout being pushed: a reviewed synthetic value stays
 synthetic in an older revision of the same path. A git or scan error is itself a finding,
-so history mode fails closed. Exit code 0 means zero findings.
+so history mode fails closed. Exit code 0 means zero findings, 3 means gitleaks could not be found (the other findings are still printed), 1 any other finding.
 
 Message mode covers the other half of what a push publishes: the message of every commit and
 annotated tag object it is given. A clean tree with a sensitive commit or tag message is
@@ -86,6 +86,9 @@ CHAT_PATTERNS = (
 )
 
 
+MISSING_SCANNER = 'secret-scan <scan>:0: gitleaks not found (set HER_GITLEAKS or install it with scripts/ci/install-gitleaks.py)'
+
+
 def gitleaks_path():
     override = os.environ.get('HER_GITLEAKS')
     if override:
@@ -102,7 +105,7 @@ def secret_findings(source, config, scan_skipped=False):
     """
     exe = gitleaks_path()
     if exe is None:
-        return [], 'secret-scan <scan>:0: gitleaks not found (set HER_GITLEAKS or install it with scripts/ci/install-gitleaks.py)'
+        return [], MISSING_SCANNER
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / 'gitleaks.json'
         command = [str(exe), 'detect', '--no-git']
@@ -410,6 +413,8 @@ def main():
     print(f'Public scan ({mode}): {len(findings)} findings ({summary}); '
           f'{counters["reviewed"]} reviewed digit runs and {counters["paths reviewed"]} reviewed '
           f'account-home lines; {summary_extra}')
+    if MISSING_SCANNER in findings:
+        return 3      # no secret scanner: a setup problem, not a statement about the text
     return bool(findings)
 
 
