@@ -1485,6 +1485,29 @@ fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
 }
 
 #[test]
+fn reserved_muted_group_answers_a_message_the_scan_held_after_the_mute_ends() {
+    let mut rig = Rig::new("reserved-muted-scan", reserved_seed(json!({})));
+    rig.start();
+    assert_eq!(
+        rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
+        200
+    );
+    // In an active group ingress only stores the message; the scan turns it into a job. The mute lands
+    // right after ingress, so the scan guard is what holds it.
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 held by the scan");
+    assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["lastActiveMessageAt"].as_i64().unwrap_or(0) > 0),
+        "ingress never stored the message");
+    seed_group_mute(&rig, now_ms() + 600_000);
+    assert!(
+        !wait_for(Duration::from_secs(8), || !rig.dsh.prompts().is_empty()),
+        "a muted group got a model turn: {:?}",
+        rig.dsh.prompts()
+    );
+    seed_group_mute(&rig, 0);
+    assert!(rig.wait_prompts(1)[0].text.contains("held by the scan"), "the held message was answered after the lift");
+}
+
+#[test]
 fn reserved_proactive_participation_wraps_up_and_silent_farewell_exits() {
     let mut rig = Rig::new(
         "reserved-proactive15",
