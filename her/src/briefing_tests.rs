@@ -176,3 +176,21 @@ fn a_stripped_slang_section_drops_its_conversation_items() {
     assert!(!w.text.contains("层级黑话戊"), "the strip removed the slang text:\n{}", w.text);
     assert_eq!(w.layers.conversation, 3, "topic, thought and participation; the stripped slang delivers nothing: {:?}", w.layers);
 }
+
+#[test]
+fn a_strip_that_empties_the_recall_block_delivers_no_memory_and_holds_none() {
+    let (_root, context, mut cfg) = layered_wake_fixture("layers stripped recall", true);
+    cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
+    let state = context.read_social_state().unwrap();
+    let block = crate::prompt::recall_block_with_runtime(&context, &cfg, &state["conversations"][KEY], KEY);
+    assert!(block.contains("层级材料戊"), "{block}");
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!([block]);
+    let (context, server) = serve_packets(&context, 1);
+    let w = wake(&context, &cfg, "rpc-18h");
+    server.join().unwrap();
+    assert!(!w.text.contains("层级材料戊"), "the strip removed the recall block:\n{}", w.text);
+    assert_eq!(w.layers.material, 0, "a recall block the strip empties delivers no memory: {:?}", w.layers);
+    assert!(w.recalled.is_empty(), "no recalled id is carried: {:?}", w.recalled);
+    let record = crate::session_map::context_record(&context, KEY, "sid-18", "epoch-18").unwrap();
+    assert_eq!(record["pending"]["recalled"], json!([]), "a stripped recall holds no memory for the generation");
+}
