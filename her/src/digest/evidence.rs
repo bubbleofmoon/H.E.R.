@@ -23,6 +23,8 @@ pub(super) struct Batch {
     pub pending: usize,
     /// Position (creation ms, event sequence) of the last HER reply consumed (journal space); the stored value otherwise.
     pub replies: (i64, i64),
+    /// The reply position this read started from; a skip that consumes no model call keeps it.
+    pub from: (i64, i64),
 }
 
 pub(super) fn space(context: &RuntimeContext) -> &'static str {
@@ -176,7 +178,7 @@ fn social(context: &RuntimeContext, key: &str, cursor: DigestCursor, max_chars: 
         out.release();
     }
     if through == 0 { return Ok(None); }
-    Ok(Some(Batch { input: out.text, first, through, messages: count, pending, replies: (cursor.replies_ms, cursor.replies_seq) }))
+    Ok(Some(Batch { input: out.text, first, through, messages: count, pending, replies: (cursor.replies_ms, cursor.replies_seq), from: (cursor.replies_ms, cursor.replies_seq) }))
 }
 
 fn journal_line(raw: &str, owner: &str, seq: i64, view: &Value) -> Option<String> {
@@ -276,5 +278,5 @@ fn journal(context: &RuntimeContext, cfg: &Value, key: &str, cursor: DigestCurso
         }
     }
     if through == 0 { return Ok(None); } // defensive: the first row always has its room
-    Ok(Some(Batch { input: out.text, first, through, messages, pending, replies: progress }))
+    Ok(Some(Batch { input: out.text, first, through, messages, pending, replies: progress, from: start }))
 }

@@ -107,12 +107,13 @@ impl<'a> Digest<'a> {
                 return Ok(Outcome::Quiet);
             }
             if hold.held() { return Err(DigestError::Cancelled); }
-            // HER's replies wait for a batch that reaches the model; only the rows move.
-            let kept = (cursor.replies_ms, cursor.replies_seq);
+            // HER's replies wait for a batch that reaches the model; the rows move, and the replies keep the position this read started from.
+            let kept = batch.from;
             if reader.write_digest(space, cursor.through, batch.through, kept, &[]).map_err(|_| DigestError::Storage)?.is_none() {
                 return Ok(Outcome::Quiet);
             }
             cursor.through = batch.through;
+            (cursor.replies_ms, cursor.replies_seq) = kept;
             skips += 1;
         };
         if batch.pending < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
