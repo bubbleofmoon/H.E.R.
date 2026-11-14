@@ -1472,11 +1472,12 @@ fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
         200
     );
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued before the ban");
-    // The message is admitted and its job is delayed; the mute lands before the job is due.
-    assert!(wait_for(LONG, || {
-        let Ok(db) = rusqlite::Connection::open_with_flags(rig.root.join("data/inbound.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false };
-        db.query_row("SELECT count(*) FROM inbound_events WHERE conversation = ?1", [GROUP_KEY], |row| row.get::<_, i64>(0)).unwrap_or(0) >= 1
-    }), "the message was never admitted");
+    // The scheduler scan turns the stored message into a delayed job and records `lastActiveMessageAt` in the
+    // same pass. Once that is visible the job is pending (due six seconds later), so the mute below can only
+    // be held by the dispatch guard, not by the scan guard or by ingress.
+    assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["lastActiveMessageAt"].as_i64().unwrap_or(0) > 0),
+        "the scan never queued the message");
+    assert!(rig.dsh.prompts().is_empty(), "the delayed job ran before the mute: {:?}", rig.dsh.prompts());
     seed_group_mute(&rig, now_ms() + 600_000);
     assert!(
         !wait_for(Duration::from_secs(14), || !rig.dsh.prompts().is_empty()),
