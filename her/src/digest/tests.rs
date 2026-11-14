@@ -93,6 +93,7 @@ fn cursor(root: &Root, key: &str, space: &str) -> Option<i64> {
 }
 
 const CFG: fn() -> Value = || json!({"consoleToken":"digest-unit","ownerQQ":9001});
+const CAPPED: fn() -> Value = || json!({"consoleToken":"digest-unit","ownerQQ":9001,"memory":{"digest":{"maxInputChars":1000}}});
 
 #[test]
 fn reserved2_digest_writes_inferences_with_bridge_provenance_from_a_fake_model() {
@@ -437,4 +438,77 @@ fn a_failed_batch_waits_the_minimum_interval_before_it_is_retried() {
     assert_eq!(run(&context, &model, "group:42", &spaced), Ok(Outcome::Quiet), "a failed batch was retried at once");
     assert_eq!(model.inputs().len(), 1);
     assert!(rows(&root).is_empty());
+}
+
+#[test]
+fn her_own_lines_never_take_the_room_of_the_next_message() {
+    let (root, context) = fixture(None, CAPPED(), "http://127.0.0.1:1");
+    let mut messages: Vec<Value> = (0..5).map(|_| json!({"sender":"我","text":"答".repeat(200),"isSelf":true})).collect();
+    messages.push(json!({"seq":1,"sender":"甲","userId":"5001","text":"第一句","isSelf":false}));
+    social(&root, "group:42", Value::Array(messages));
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 1, memories: 0 }));
+    let inputs = model.inputs();
+    assert!(inputs[0].contains("#1 甲：第一句") && inputs[0].chars().count() <= 1000, "{}", inputs[0]);
+}
+
+#[test]
+fn her_replies_before_the_next_message_never_take_its_room() {
+    let (root, context) = fixture(Some("chat"), CAPPED(), "http://127.0.0.1:1");
+    let t0 = crate::parity_clock::now_ms() - 3_600_000;
+    journal_message_at(&context, "group:77", 1, group_text(5002, "第一句"), t0);
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 1, memories: 0 }));
+    let replies: Vec<String> = (1..=4).map(|n| format!("回复{n}{}", "啊".repeat(296))).collect();
+    let timed: Vec<(i64, &str)> = replies.iter().map(|r| (t0 + 5, r.as_str())).collect();
+    harness_replies(&root, &context, "group:77", &timed);
+    journal_message_at(&context, "group:77", 2, group_text(5002, "第二句"), t0 + 10);
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 2, memories: 0 }));
+    journal_message_at(&context, "group:77", 3, group_text(5002, "第三句"), t0 + 20);
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
+    let inputs = model.inputs();
+    assert_eq!(inputs.len(), 3, "a replies-only batch skipped the model");
+    assert!(inputs[1].contains("#2 乙：第二句"), "{}", inputs[1]);
+    for n in 1..=4 {
+        let marker = format!("回复{n}");
+        assert_eq!(inputs.iter().filter(|i| i.contains(&marker)).count(), 1, "{marker} must reach exactly one digest");
+    }
+}
+
+#[test]
+fn a_cap_between_two_replies_of_one_millisecond_defers_the_second() {
+    let (root, context) = fixture(Some("chat"), CAPPED(), "http://127.0.0.1:1");
+    let t0 = crate::parity_clock::now_ms() - 3_600_000;
+    let long = "字".repeat(400);
+    journal_message_at(&context, "group:77", 1, group_text(5002, &long), t0);
+    journal_message_at(&context, "group:77", 2, group_text(5002, &long), t0 + 10);
+    let (a, b) = (format!("回复甲{}", "啊".repeat(297)), format!("回复乙{}", "啊".repeat(297)));
+    harness_replies(&root, &context, "group:77", &[(t0 + 5, a.as_str()), (t0 + 5, b.as_str())]);
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 1, memories: 0 }));
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 2, memories: 0 }));
+    let inputs = model.inputs();
+    for reply in ["回复甲", "回复乙"] {
+        assert_eq!(inputs.iter().filter(|i| i.contains(reply)).count(), 1, "{reply} must reach exactly one digest");
+    }
+}
+
+#[test]
+fn the_backlog_counts_past_one_journal_page() {
+    let (_root, context) = fixture(Some("chat"), CFG(), "http://127.0.0.1:1");
+    let journal = crate::inbound::Journal::open(&context).unwrap();
+    let now = crate::parity_clock::now_ms();
+    let mut keys = Vec::new();
+    for n in 1..=2069 {
+        let text = if n == 1 || n > 2000 { format!("第{n}句") } else { "/status".to_string() };
+        let key = format!("private:9001|message:{n}");
+        journal.record_received(&key, "private:9001", &private_text(9001, &text).to_string(), now).unwrap();
+        keys.push(key);
+    }
+    journal.mark_handled(&keys, now).unwrap();
+    drop(journal);
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, "private:9001", &Limits { min_messages: 70, min_interval_ms: 0 }),
+        Ok(Outcome::Written { through: 2000, memories: 0 }), "a backlog of 70 across two pages was judged quiet");
+    assert_eq!(model.inputs().len(), 1);
 }
