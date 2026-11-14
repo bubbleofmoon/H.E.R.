@@ -251,10 +251,24 @@ async fn hf123_cli_protocol_console_failure_is_terminal_and_content_free() {
     }
 }
 
+#[tokio::test]
+async fn hf46_cli_protocol_mute_403_is_a_clean_sleep() {
+    hf123_cli_protocol_with_mute(0, std::time::Duration::ZERO, Some(403), true).await;
+}
+
 async fn hf123_cli_protocol_with_outcome(
     revisions: usize,
     response_delay: std::time::Duration,
     failure_status: Option<u16>,
+) {
+    hf123_cli_protocol_with_mute(revisions, response_delay, failure_status, false).await;
+}
+
+async fn hf123_cli_protocol_with_mute(
+    revisions: usize,
+    response_delay: std::time::Duration,
+    failure_status: Option<u16>,
+    muted: bool,
 ) {
     use serde_json::{json, Value};
     use std::io::Write;
@@ -276,6 +290,12 @@ async fn hf123_cli_protocol_with_outcome(
         .to_string(),
     )
     .unwrap();
+    if muted {
+        let mut groups = serde_json::Map::new();
+        groups.insert("group:42".to_string(), json!({"personalUntil": crate::parity_clock::now_ms() + 600_000,
+            "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        std::fs::write(root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    }
     let context = RuntimeContext::from_root(&root)
         .unwrap()
         .with_console_port(port);
@@ -366,7 +386,11 @@ async fn hf123_cli_protocol_with_outcome(
         paths.iter().all(|p| *p == "/api/socialV2/send-message"),
         "CLI must share the authenticated tool route: {paths:?}"
     );
-    if let Some(status) = failure_status {
+    if muted {
+        assert_eq!(result.unwrap(), Some(0), "a mute refusal is a clean sleep, not a failed send");
+        assert_eq!(prompts.len(), 1, "the provider is not replayed");
+        assert_eq!(paths.len(), 1, "no fallback to OneBot");
+    } else if let Some(status) = failure_status {
         assert_eq!(
             result.unwrap_err(),
             format!("CLI reply send failed: HTTP {status}")

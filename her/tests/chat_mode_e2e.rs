@@ -1429,6 +1429,64 @@ fn reserved_probe_returns_to_watching_and_inbound_revives_probing() {
     wait_phase(&rig, "idle");
 }
 
+fn seed_group_mute(rig: &Rig, personal_until: i64) {
+    let mut groups = serde_json::Map::new();
+    groups.insert(GROUP_KEY.to_string(), json!({"personalUntil": personal_until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+    fs::write(rig.root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+}
+
+#[test]
+fn reserved_muted_group_gets_no_probe_until_the_mute_ends() {
+    let mut rig = Rig::new(
+        "reserved-muted-probe",
+        reserved_seed(json!({"idleWindowMs":0,"idleRetryProbability":1,"idleRetryWaitMs":7000})),
+    );
+    seed_group_mute(&rig, now_ms() + 600_000);
+    rig.start();
+    assert_eq!(
+        rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
+        200
+    );
+    // The scheduler scans every five seconds: two scans pass without a probe prompt.
+    assert!(
+        !wait_for(Duration::from_secs(12), || !rig.dsh.prompts().is_empty()),
+        "a muted group got a model turn: {:?}",
+        rig.dsh.prompts()
+    );
+    assert_eq!(reserved_phase(&rig), "active", "the probe did not start");
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
+    seed_group_mute(&rig, 0);
+    wait_phase(&rig, "probing");
+    assert!(rig.wait_prompts(1)[0].text.contains("群里安静了一会儿"));
+}
+
+#[test]
+fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
+    let mut rig = Rig::new(
+        "reserved-muted-queue",
+        reserved_seed(json!({"activeReplyDelayMinMs":6000,"activeReplyDelayMaxMs":6000})),
+    );
+    rig.start();
+    assert_eq!(
+        rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
+        200
+    );
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued before the ban");
+    // The message is admitted and its job is delayed; the mute lands before the job is due.
+    assert!(wait_for(LONG, || {
+        let Ok(db) = rusqlite::Connection::open_with_flags(rig.root.join("data/inbound.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false };
+        db.query_row("SELECT count(*) FROM inbound_events WHERE conversation = ?1", [GROUP_KEY], |row| row.get::<_, i64>(0)).unwrap_or(0) >= 1
+    }), "the message was never admitted");
+    seed_group_mute(&rig, now_ms() + 600_000);
+    assert!(
+        !wait_for(Duration::from_secs(14), || !rig.dsh.prompts().is_empty()),
+        "queued work for a muted group ran a model turn: {:?}",
+        rig.dsh.prompts()
+    );
+    seed_group_mute(&rig, 0);
+    assert!(rig.wait_prompts(1)[0].text.contains("queued before the ban"), "the held job ran after the lift");
+}
+
 #[test]
 fn reserved_proactive_participation_wraps_up_and_silent_farewell_exits() {
     let mut rig = Rig::new(

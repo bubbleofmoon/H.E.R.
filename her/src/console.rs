@@ -16648,6 +16648,9 @@ mod tests {
         start_fake_onebot_with_sticker_rows(request_count, fail_mutations, Vec::new())
     }
 
+    /// `failure_retcode` sentinel: answer retcode 100 with QQ's result=120 (the bot is muted).
+    const MUTED_FIXTURE_RETCODE: i64 = -120;
+
     fn start_fake_onebot_with_sticker_rows(
         request_count: usize,
         fail_mutations: bool,
@@ -16757,6 +16760,8 @@ mod tests {
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let response = if path == "/fetch_custom_face_detail" {
                     json!({ "status": "ok", "retcode": 0, "data": sticker_rows.clone() })
+                } else if failure_retcode == Some(MUTED_FIXTURE_RETCODE) {
+                    json!({ "status": "failed", "retcode": 100, "message": "sendMsg failed: result=120", "wording": "fixture muted" })
                 } else if let Some(retcode) = failure_retcode {
                     json!({ "status": "failed", "retcode": retcode, "wording": "fixture denied" })
                 } else {
@@ -20066,6 +20071,47 @@ mod tests {
         assert_eq!(conv["stickerCollectTimes"], json!([now]));
         assert_eq!(conv["stickerCollectPending"][0]["id"], "other");
         assert_eq!(conv["stickerSendProtected"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_sticker_mute_refusal_survives_an_outbox_write_failure() {
+        let (url, server) = start_fake_onebot_with_retcode(2, Some(MUTED_FIXTURE_RETCODE), vec![json!({
+            "emoji_id":"fixture-sticker", "resId":"fixture-sticker", "url":"https://fixture.invalid/sticker.gif", "source":"qq"
+        })]);
+        let decoy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let decoy_url = format!("http://127.0.0.1:{}", decoy.local_addr().unwrap().port());
+        let key = "group:7001";
+        let token = "sticker-mute-persistence";
+        let (root, _) = fixture_runtime("sticker mute persistence", "fixture-console");
+        let config_path = root.0.join("config/config.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        cfg["allow"]["groups"] = json!(["7001"]);
+        std::fs::write(&config_path, cfg.to_string()).unwrap();
+        let context = prepare_sticker_runtime(&root, &url, &decoy_url, "fixture", &json!({
+            "paused":false, "conversations": { (key): {"agentToken":token,"recentMessages":[],"sendTimes":[]} }
+        }));
+        std::fs::write(root.0.join("data/stickers.json"), serde_json::to_vec(&json!([{
+            "id":"fixture-sticker", "url":"https://fixture.invalid/sticker.gif", "source":"fixture"
+        }])).unwrap()).unwrap();
+        // After the attempt record is written, the outbox becomes unwritable: the refusal's own record fails.
+        let outbox = root.0.join("data/send-outbox.jsonl");
+        STICKER_SUBMISSION_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(move |stage, _| {
+            if stage == "after_guard" {
+                let _ = std::fs::remove_file(&outbox);
+                std::fs::create_dir(&outbox).unwrap();
+            }
+        })));
+        let headers = HashMap::from([("x-agent-token".to_string(), token.to_string())]);
+        let result = handle_send_sticker_selected_with_fetch(&context, &headers,
+            &json!({"key":key,"stickerId":"fixture-sticker"}).to_string(), &context.load_config().unwrap(),
+            |_, _| Ok(b"synthetic image".to_vec()));
+        STICKER_SUBMISSION_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        let (status, text) = result.unwrap_err();
+        assert_eq!(status, 403, "a definite mute refusal stays a 403 even when its record cannot be written: {text}");
+        assert!(text.contains("禁言"), "{text}");
+        let store: Value = serde_json::from_slice(&std::fs::read(root.0.join("data/group-mutes.json")).unwrap()).unwrap();
+        assert_eq!(store["groups"][key]["personalUntil"], json!(-1), "the refusal still taught the mute");
+        let _ = server.join();
     }
 
     #[test]

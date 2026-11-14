@@ -93,6 +93,8 @@ pub enum Change {
     /// Gateway refresh. `None` = not readable, left unchanged. `seen_seq` is the entry's write
     /// counter read before the queries: a newer notice or refusal wins over this result.
     Refreshed { personal_until: Option<i64>, whole_group: Option<bool>, seen_seq: i64 },
+    /// QQ's whole-group notice arrived: no state change, but every refresh that started earlier is stale.
+    Invalidate,
 }
 
 /// The change a `group_ban` notice for her own id makes; `None` for an unknown `sub_type`.
@@ -134,6 +136,7 @@ pub(crate) fn apply_at(context: &RuntimeContext, key: &str, change: Change, oper
     match change {
         Change::Banned(until) => entry["personalUntil"] = json!(until),
         Change::Lifted => entry["personalUntil"] = json!(0),
+        Change::Invalidate => return Ok(None),
         // A refusal never shortens a known mute, but it is newer evidence than any refresh in flight:
         // it still bumps `seq` below.
         Change::Learned => { if before.is_none() { entry["personalUntil"] = json!(-1); } }
@@ -492,6 +495,35 @@ mod tests {
             Ok(None)
         );
         assert!(active_at(&ctx, key, NOW).is_some(), "the older refresh did not clear the mute the refusal confirmed");
+    }
+
+    #[test]
+    fn a_whole_group_notice_invalidates_an_older_refresh() {
+        let (_root, ctx) = fixture("mute-invalidate");
+        let key = "group:1";
+        let seen = seq_of(&ctx, key);
+        assert_eq!(
+            apply_at(&ctx, key, Change::Refreshed { personal_until: None, whole_group: Some(true), seen_seq: seen }, None, NOW),
+            Ok(Some(1))
+        );
+        // A refresh starts, then the whole-group notice arrives; the refresh's answer predates it.
+        let stale = seq_of(&ctx, key);
+        assert_eq!(apply_at(&ctx, key, Change::Invalidate, None, NOW), Ok(None));
+        assert_eq!(
+            apply_at(&ctx, key, Change::Refreshed { personal_until: None, whole_group: Some(false), seen_seq: stale }, None, NOW),
+            Ok(None)
+        );
+        assert!(active_at(&ctx, key, NOW).is_some(), "the older refresh did not clear the mute");
+        // With no entry at all the notice still leaves a mark that drops an older answer.
+        let key = "group:2";
+        let stale = seq_of(&ctx, key);
+        assert_eq!(apply_at(&ctx, key, Change::Invalidate, None, NOW), Ok(None));
+        assert_eq!(seq_of(&ctx, key), stale + 1, "the notice advanced the write counter");
+        assert_eq!(
+            apply_at(&ctx, key, Change::Refreshed { personal_until: None, whole_group: Some(true), seen_seq: stale }, None, NOW),
+            Ok(None)
+        );
+        assert_eq!(active_at(&ctx, key, NOW), None, "the stale answer was dropped");
     }
 
     #[test]

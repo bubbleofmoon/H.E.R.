@@ -179,6 +179,12 @@ const REFUSAL_HTTP_STATUS: [u16; 5] = [400, 401, 403, 404, 426];
 /// The same refusals as `retcode` in the OneBot envelope (1400/1401/1403/1404).
 const REFUSAL_RETCODES: [i64; 4] = [1400, 1401, 1403, 1404];
 
+/// Error text of a failed OneBot send reply; a group-mute refusal carries `MUTE_REFUSAL` (#46).
+fn send_failure_text(v: &serde_json::Value, retcode: i64) -> String {
+    let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
+    format!("OneBot 发送失败：retcode={retcode} {wording}")
+}
+
 /// Marker in a not-committed error for a group-mute refusal (#46).
 pub(crate) const MUTE_REFUSAL: &str = "（被禁言 result=120）";
 
@@ -697,8 +703,7 @@ impl OneBot {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
         let retcode = v.get("retcode").and_then(|r| r.as_i64()).unwrap_or(-1);
         if status != "ok" || retcode != 0 {
-            let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
-            return Err(format!("OneBot 发送失败：retcode={retcode} {wording}"));
+            return Err(send_failure_text(&v, retcode));
         }
         Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
     }
@@ -790,8 +795,7 @@ impl OneBot {
         let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
         let retcode = v.get("retcode").and_then(|r| r.as_i64()).unwrap_or(-1);
         if status != "ok" || retcode != 0 {
-            let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
-            return Err(format!("OneBot 发送失败：retcode={retcode} {wording}"));
+            return Err(send_failure_text(&v, retcode));
         }
         Ok(v.get("data").cloned().unwrap_or(serde_json::Value::Null))
     }
@@ -922,6 +926,18 @@ mod tests {
         }
         assert!(matches!(classify_send_reply(500, "{}"), Err(SendError::Unknown(_))));
         assert!(matches!(classify_send_reply(502, ""), Err(SendError::Unknown(_))));
+    }
+
+    #[test]
+    fn send_failure_text_marks_a_mute_refusal() {
+        let muted: serde_json::Value = serde_json::from_str(r#"{"status":"failed","retcode":100,"message":"sendMsg failed: result=120","wording":"x"}"#).unwrap();
+        let text = send_failure_text(&muted, 100);
+        assert!(is_mute_refusal(&text), "{text}");
+        assert!(text.contains("retcode=100"), "{text}");
+        let other: serde_json::Value = serde_json::from_str(r#"{"status":"failed","retcode":1404,"wording":"nope"}"#).unwrap();
+        assert!(!is_mute_refusal(&send_failure_text(&other, 1404)));
+        let unknown: serde_json::Value = serde_json::from_str(r#"{"status":"failed","retcode":100,"wording":"other"}"#).unwrap();
+        assert!(!is_mute_refusal(&send_failure_text(&unknown, 100)), "retcode 100 without result=120 is not a mute");
     }
 
     #[test]

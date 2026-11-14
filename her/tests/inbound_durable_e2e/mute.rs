@@ -108,6 +108,10 @@ fn a_ban_for_her_mutes_notifies_once_and_a_mention_does_not_wake_until_the_lift(
     let all = decisions(root.path());
     assert_eq!(all.len(), 1, "the muted mention made no wake decision: {all:?}");
     assert_eq!(all[0]["shouldWake"], json!(true), "the mention after the lift did: {all:?}");
+    let social: Value = serde_json::from_slice(&fs::read(root.path().join("data/social-v2.json")).unwrap()).unwrap();
+    let unread = social["conversations"]["group:420042"]["unread"].to_string();
+    assert!(unread.contains("7101") || social["conversations"]["group:420042"]["recentMessages"].to_string().contains("7101"),
+        "the message inside the mute was stored for the first wake after it: {social}");
     let entry = mute_entry(root.path());
     assert_eq!(entry["rev"], json!(1), "the notice for another user did not start an episode: {entry}");
     assert_eq!(entry["personalUntil"], json!(0), "the lift cleared the mute: {entry}");
@@ -115,6 +119,20 @@ fn a_ban_for_her_mutes_notifies_once_and_a_mention_does_not_wake_until_the_lift(
     let notices = owner_texts(&harness, "禁言");
     assert_eq!(notices.len(), 1, "one notice for the episode and none for the lift: {notices:?}");
     assert!(notices[0].contains("420042") && notices[0].contains("1001") && notices[0].contains("10 分钟"), "{notices:?}");
+}
+
+#[test]
+fn mute_fields_do_not_make_an_ordinary_frame_unreadable() {
+    let root = TempRoot::new("mute-null-type");
+    let mut frame = mention_event(7501, "carries a null notice type", now_seconds());
+    frame["notice_type"] = Value::Null;
+    frame["operator_id"] = json!("not a number");
+    frame["duration"] = json!({"unexpected": true});
+    let _harness = start_mute(root.path(), vec![vec![Step::Frame(frame), Step::Wait(60_000)]], FakeGateway::default());
+    assert!(
+        wait_for(Duration::from_secs(30), || decision_count(root.path()) >= 1),
+        "a frame with null or odd mute fields was dropped"
+    );
 }
 
 #[test]

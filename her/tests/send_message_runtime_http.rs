@@ -2052,6 +2052,7 @@ fn a_result_120_refusal_is_not_committed() {
     let root = fixture_root("mute-120", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
     let console = ConsoleProcess::start(&root);
     let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    assert_eq!(first.status, 500, "a partial or failed batch keeps its status: {}", first.body);
     assert_eq!(first.body["notCommitted"], json!([0]), "a muted refusal is definite: {}", first.body);
     assert_eq!(first.body["unknown"], json!([]), "{}", first.body);
     assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refusal gives its reservation back");
