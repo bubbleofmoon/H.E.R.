@@ -1,11 +1,15 @@
 name: quick
 # One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`.
+# Two more targets run cargo directly, each alone (not combined with others): `check` is `cargo check --workspace --all-targets`;
+# `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
+# `cargo fmt --all` result as artifact `fmt-patch` and the `cargo clippy --fix` result, on a clean tree, as artifact `clippy-fix-patch`
+# (both always uploaded, empty when there is nothing to change): `gh run download <id> -n fmt-patch`, then `git apply fmt.patch`.
 # The CI-first gate is checks.yml on the pull request; this job never gates a merge.
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'run-tests.py target name(s), comma-separated (unit, an her/tests stem, scripts)'
+        description: 'run-tests.py target name(s), comma-separated (unit, an her/tests stem, scripts), or alone: lint, check'
         required: true
       filter:
         description: 'optional libtest name filter'
@@ -58,6 +62,7 @@ jobs:
           echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
           rustup toolchain install stable --profile minimal
           rustup default stable
+          if [ "$QUICK_TARGET" = lint ]; then rustup component add rustfmt clippy; fi
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -66,12 +71,76 @@ jobs:
           key: quick-${{ inputs.os }}
           cache-on-failure: true
       - name: Build and run the named target
+        if: inputs.target != 'lint' && inputs.target != 'check'
         run: |
           cd "$PUBLIC_TREE"
           export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
           args=(--only "$QUICK_TARGET")
           if [ -n "$QUICK_FILTER" ]; then args+=(--filter "$QUICK_FILTER"); fi
           python -I scripts/ci/run-tests.py "${args[@]}"
+      - name: Compile check
+        if: inputs.target == 'check'
+        run: |
+          # Features match the test commands in scripts/ci/run-tests.py; her-memory is its own crate.
+          (cd "$PUBLIC_TREE/her" && cargo check --workspace --all-targets --features parity-clock,release-test-keys)
+          (cd "$PUBLIC_TREE/her-memory" && cargo check --workspace --all-targets)
+      - name: Format and clippy (report-only)
+        if: inputs.target == 'lint'
+        run: |
+          mkdir -p "$CI_EVIDENCE"
+          set +e
+          lint_crate() {
+            local crate=$1 code count
+            shift
+            (cd "$PUBLIC_TREE/$crate" && cargo fmt --all --check)
+            echo "fmt check $crate exit $?"
+            (cd "$PUBLIC_TREE/$crate" && cargo clippy --workspace --all-targets "$@" 2>&1) | tee "$CI_EVIDENCE/clippy-$crate.log"
+            code=${PIPESTATUS[0]}
+            echo "clippy $crate exit $code"
+            if [ "$code" -ne 0 ]; then
+              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): incomplete, clippy exit $code"
+            else
+              # One line per warning; the per-crate "generated N warnings" summaries are not warnings.
+              count=$(grep -E '^warning: ' "$CI_EVIDENCE/clippy-$crate.log" | grep -Ecv 'generated [0-9]+ warnings?')
+              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): $count"
+            fi
+          }
+          # Features match the test commands in scripts/ci/run-tests.py; her-memory is its own crate.
+          lint_crate her --features parity-clock,release-test-keys
+          lint_crate her-memory
+          # Rewrite with cargo fmt and keep the result as a patch for the worker to apply.
+          (cd "$PUBLIC_TREE/her" && cargo fmt --all)
+          (cd "$PUBLIC_TREE/her-memory" && cargo fmt --all)
+          (cd "$PUBLIC_TREE" && git diff > "$CI_EVIDENCE/fmt.patch")
+          echo "fmt patch bytes: $(wc -c < "$CI_EVIDENCE/fmt.patch")"
+      - name: Upload fmt patch
+        if: always() && inputs.target == 'lint'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fmt-patch
+          path: ${{ env.CI_EVIDENCE }}/fmt.patch
+          if-no-files-found: error
+          retention-days: 3
+      - name: Clippy suggestions as a patch (report-only)
+        if: inputs.target == 'lint'
+        run: |
+          mkdir -p "$CI_EVIDENCE"
+          : > "$CI_EVIDENCE/clippy-fix.patch"
+          set +e
+          # Start from the clean tree so this patch holds only clippy's own edits, apart from fmt.patch.
+          git -C "$PUBLIC_TREE" checkout -- .
+          (cd "$PUBLIC_TREE/her" && cargo clippy --fix --allow-dirty --allow-no-vcs --features parity-clock,release-test-keys --all-targets)
+          echo "clippy --fix exit $?"
+          (cd "$PUBLIC_TREE" && git diff > "$CI_EVIDENCE/clippy-fix.patch")
+          echo "clippy-fix patch bytes: $(wc -c < "$CI_EVIDENCE/clippy-fix.patch")"
+      - name: Upload clippy-fix patch
+        if: always() && inputs.target == 'lint'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-fix-patch
+          path: ${{ env.CI_EVIDENCE }}/clippy-fix.patch
+          if-no-files-found: error
+          retention-days: 3
       - name: Upload evidence
         if: failure()
         uses: actions/upload-artifact@v4
