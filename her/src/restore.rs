@@ -170,7 +170,7 @@ impl Prepared {
                 continue;
             }
             let meta = fs::symlink_metadata(&ancestor).map_err(|e| e.to_string())?;
-            if crate::backup::redirected(&meta) {
+            if crate::guarded_file::is_link(&meta) {
                 return Err("restore archive path is redirected".into());
             }
         }

@@ -51,6 +51,7 @@ mod voice;
 mod forward_fmt;
 mod preset_prompt;
 mod runtime;
+mod guarded_file;
 mod install_root;
 mod scheduled_task;
 mod release;

@@ -269,7 +269,7 @@ fn fixed_root() -> Result<InstallRoot, String> {
         .map_err(|_| "updater image unavailable")?;
     let metadata = fs::symlink_metadata(root.root().join("herupdate.exe"))
         .map_err(|_| "fixed updater unavailable")?;
-    if !metadata.is_file() || release_store::redirected(&metadata) {
+    if !metadata.is_file() || crate::guarded_file::is_link(&metadata) {
         return Err("fixed updater is redirected".into());
     }
     let expected = fs::canonicalize(root.root().join("herupdate.exe"))
@@ -566,7 +566,7 @@ fn judgment_budget(_root: &InstallRoot, budget: Duration) -> Result<Duration, St
 
 fn remove_link(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path).map_err(|_| "release link unavailable")?;
-    if !release_store::redirected(&metadata) {
+    if !crate::guarded_file::is_link(&metadata) {
         return Err("release link is not a link".into());
     }
     #[cfg(windows)]
@@ -601,7 +601,7 @@ fn switch_link(root: &InstallRoot, name: &str, tag: &str) -> Result<(), String> 
     create_link(&target, &pending)?;
     let had_link = fs::symlink_metadata(&link).is_ok();
     if had_link {
-        if !release_store::redirected(
+        if !crate::guarded_file::is_link(
             &fs::symlink_metadata(&link).map_err(|_| "release link unavailable")?,
         ) {
             return Err("release link is not a link".into());
@@ -801,7 +801,7 @@ fn prune(root: &InstallRoot, platform: &mut dyn Platform) -> Result<(), String> 
         };
         let meta =
             fs::symlink_metadata(entry.path()).map_err(|_| "release metadata unavailable")?;
-        if meta.is_dir() && !release_store::redirected(&meta) {
+        if meta.is_dir() && !crate::guarded_file::is_link(&meta) {
             candidates.push((number, tag.to_string()));
         }
     }
