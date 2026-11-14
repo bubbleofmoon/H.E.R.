@@ -676,6 +676,11 @@ pub(crate) fn recall_top_k(cfg: &Value) -> usize {
 
 fn keep_all(items: &[String]) -> usize { items.len() }
 
+/// The header line of the recall block (`recall_block_with`), before its items.
+pub(crate) const RECALL_HEADER: &str = "【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：";
+/// The footer line of the recall block, after its items and index hint.
+pub(crate) const RECALL_FOOTER: &str = "（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）";
+
 /// The recall block and the ids of the memories it carries. `memory::recall` decides what is
 /// recalled (matches only, never the ids in `held`, which the session generation already carries);
 /// this renders it.
@@ -752,7 +757,7 @@ fn recall_block_with(
 
     let mut lines: Vec<String> = Vec::new();
     if !rows.is_empty() {
-        lines.push("【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：".to_string());
+        lines.push(RECALL_HEADER.to_string());
         lines.extend(items.into_iter().take(rows.len()));
     }
     if total > rows.len() as i64 {
@@ -770,7 +775,7 @@ fn recall_block_with(
             ));
         }
     }
-    lines.push("（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）".to_string());
+    lines.push(RECALL_FOOTER.to_string());
     (format!("{}\n\n", lines.join("\n")), rows.iter().map(|m| m.id).collect())
 }
 
@@ -1921,12 +1926,21 @@ pub(crate) fn prepare_dsh_wake_layered(
     let held = held_recall_ids(&record);
     // Material: the best-ranked recalled memories that fit what Identity and Relationship left of its budget.
     let offered = std::cell::Cell::new(0usize);
+    // The recall block adds its header and footer around the items, and the index hint line (allowance 60
+    // tokens for the 【记忆索引】 hint line); Material's budget covers all of it.
+    let overhead = crate::briefing::estimate_tokens(RECALL_HEADER) + crate::briefing::estimate_tokens(RECALL_FOOTER) + 60;
     let (recall, recalled) = recall_block_with(context, cfg, st, key, &held, &|items: &[String]| {
         offered.set(items.len());
-        assembly.material_fit(items)
+        assembly.material_fit(items, overhead)
     });
-    let mut layers = assembly.counts;
-    layers.material = recalled.len();
+    // What DSH receives: a section emptied by the model-view strip delivers nothing, so it is not counted.
+    let mut delivered = assembly.counts;
+    if sections.get("identity").map_or(true, |t| t.trim().is_empty()) { delivered.identity = 0; }
+    if ["operator", "impressions"].iter().all(|n| sections.get(n).map_or(true, |t| t.trim().is_empty())) {
+        delivered.relationship = 0;
+    }
+    delivered.material = recalled.len();
+    let layers = delivered;
     let mut cut = assembly.cut;
     cut.material = offered.get() - recalled.len();
     delta.push_str(&recall);
@@ -1938,6 +1952,6 @@ pub(crate) fn prepare_dsh_wake_layered(
     if !crate::session_map::update_context(context,key,sid,epoch,|r| {if r["generation"].as_u64().unwrap_or(0) == generation && (r["needsBriefing"]==true)==needs_briefing { r["pending"]=pending; }})? {
         return Err("wake session or epoch changed before submission".into());
     }
-    let alerted = crate::briefing::alert_empty(context, cfg, key, generation, &layers);
+    let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);
     Ok(DshWake { text: format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled, layers, cut, alerted })
 }

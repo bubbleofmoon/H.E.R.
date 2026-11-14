@@ -39,7 +39,8 @@ pub struct Budgets {
 }
 
 impl Budgets {
-    /// Out-of-range or non-integer values use the starting defaults (1500/1500/800/1000 tokens, 5 items).
+    /// Out-of-range or non-integer values use the starting defaults (1500/1500/800/1000 tokens; items: `memory.inject.relatedTopK`
+    /// when that is in range, else 5).
     pub fn from_cfg(cfg: &Value) -> Self {
         let read = |name: &str, default: usize, max: u64| {
             cfg.pointer(&format!("/memory/layers/{name}"))
@@ -47,12 +48,15 @@ impl Budgets {
                 .filter(|n| (1..=max).contains(n))
                 .map_or(default, |n| n as usize)
         };
+        let related_top_k = cfg.pointer("/memory/inject/relatedTopK").and_then(Value::as_u64)
+            .filter(|n| (1..=20).contains(n)).map_or(5, |n| n as usize);
         Budgets {
             identity: read("identityTokens", 1500, 100_000),
             relationship: read("relationshipTokens", 1500, 100_000),
             conversation: read("conversationTokens", 800, 100_000),
             material: read("materialTokens", 1000, 100_000),
-            material_items: read("materialItems", 5, 20),
+            // Material's item cap defaults to the recall depth (`memory.inject.relatedTopK`) when that is set.
+            material_items: read("materialItems", related_top_k, 20),
         }
     }
 }
@@ -163,8 +167,10 @@ pub struct Assembly {
 
 impl Assembly {
     /// How many leading recalled items (best ranked first) fit Material's remaining budget and item cap.
-    pub fn material_fit(&self, items: &[String]) -> usize {
-        let mut used = 0;
+    /// `overhead` is the header, footer and index hint the recall block adds around its items.
+    pub fn material_fit(&self, items: &[String], overhead: usize) -> usize {
+        if overhead > self.material_tokens { return 0; }
+        let mut used = overhead;
         items.iter().take(self.material_items)
             .take_while(|item| { used += estimate_tokens(item); used <= self.material_tokens })
             .count()
@@ -217,21 +223,21 @@ fn empty_protected(counts: &Counts, key: &str, cfg: &Value) -> Vec<Layer> {
     empty
 }
 
-/// Alert the owner when a protected layer injected nothing, once per conversation, session generation and
-/// layer in this process. Returns the layers alerted now.
-pub fn alert_empty(context: &RuntimeContext, cfg: &Value, key: &str, generation: u64, counts: &Counts) -> Vec<Layer> {
+/// Alert the owner when a protected layer injected nothing, once per conversation, session, epoch, generation and
+/// layer in this process; returns the layers whose alert was attempted now.
+pub fn alert_empty(context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str, generation: u64, counts: &Counts) -> Vec<Layer> {
     let scope = context.runtime_root().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    alert_empty_with(&scope, cfg, key, generation, counts, &|text, dedupe| crate::admin_alert::notify_memory(context, cfg, text, dedupe))
+    alert_empty_with(&scope, cfg, key, sid, epoch, generation, counts, &|text, dedupe| crate::admin_alert::notify_memory(context, cfg, text, dedupe))
 }
 
-fn alert_empty_with(scope: &str, cfg: &Value, key: &str, generation: u64, counts: &Counts,
+fn alert_empty_with(scope: &str, cfg: &Value, key: &str, sid: &str, epoch: &str, generation: u64, counts: &Counts,
     notify: &dyn Fn(&str, &str) -> bool) -> Vec<Layer> {
     static RAISED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let mut raised = RAISED.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
     let mut alerted = Vec::new();
     for layer in empty_protected(counts, key, cfg) {
         if raised.len() >= 4096 { raised.clear(); }
-        if raised.insert(format!("{scope}\n{key}\n{generation}\n{}", layer.name())) {
+        if raised.insert(format!("{scope}\n{key}\n{sid}\n{epoch}\n{generation}\n{}", layer.name())) {
             let (label, meaning) = if layer == Layer::Identity { ("身份", "自己是谁") } else { ("关系", "在和谁说话") };
             notify(&format!("会话 {key} 的简报没有注入任何{label}层内容，她可能不知道{meaning}。"),
                 &format!("memory-layer-{}-{key}", layer.name()));
@@ -305,11 +311,23 @@ mod tests {
         let items: Vec<String> = ["- [fact] 第一条", "- [fact] 第二条", "- [fact] 第三条"].map(String::from).to_vec();
         let one = estimate_tokens(&items[0]);
         let mut a = assemble(Vec::new(), &Budgets { material: one * 2, ..defaults() });
-        assert_eq!(a.material_fit(&items), 2);
+        assert_eq!(a.material_fit(&items, 0), 2);
         a.material_items = 1;
-        assert_eq!(a.material_fit(&items), 1);
+        assert_eq!(a.material_fit(&items, 0), 1);
         a.material_tokens = 0;
-        assert_eq!(a.material_fit(&items), 0);
+        assert_eq!(a.material_fit(&items, 0), 0);
+    }
+
+    #[test]
+    fn material_fit_counts_the_recall_block_overhead_against_the_budget() {
+        let ten = "小".repeat(10);
+        let eleven = "小".repeat(11);
+        let items = vec![ten.clone()];
+        let a = assemble(Vec::new(), &Budgets { material: 17, ..defaults() });
+        assert_eq!(a.material_fit(&items, 7), 1, "overhead 7 + a 10-token item fits 17");
+        assert_eq!(a.material_fit(&[eleven], 7), 0, "overhead 7 + an 11-token item does not fit 17");
+        assert_eq!(a.material_fit(&items, 8), 0, "overhead 8 + a 10-token item does not fit 17");
+        assert_eq!(a.material_fit(&items, 18), 0, "an overhead above the budget fits nothing");
     }
 
     #[test]
@@ -319,6 +337,15 @@ mod tests {
         assert_eq!(Budgets::from_cfg(&cfg), Budgets { identity: 900, relationship: 700, conversation: 300, material: 200, material_items: 2 });
         let bad = json!({"memory":{"layers":{"identityTokens":0,"conversationTokens":"300","materialItems":21}}});
         assert_eq!(Budgets::from_cfg(&bad), defaults());
+    }
+
+    #[test]
+    fn material_items_default_to_the_recall_depth_unless_configured() {
+        let depth = |k: u64| json!({"memory":{"inject":{"relatedTopK":k}}});
+        assert_eq!(Budgets::from_cfg(&depth(8)).material_items, 8, "the default follows relatedTopK");
+        assert_eq!(Budgets::from_cfg(&depth(21)).material_items, 5, "an out-of-range relatedTopK uses the starting default");
+        let both = json!({"memory":{"inject":{"relatedTopK":8},"layers":{"materialItems":3}}});
+        assert_eq!(Budgets::from_cfg(&both).material_items, 3, "an explicit materialItems wins");
     }
 
     #[test]
@@ -337,15 +364,26 @@ mod tests {
         let cfg = json!({"ownerQQ": 8808});
         let empty = Counts::default();
         let scope = "briefing-alert-test";
-        assert_eq!(alert_empty_with(scope, &cfg, "group:5", 1, &empty, &notify), vec![Layer::Identity], "relationship is not checked in a group");
-        assert_eq!(alert_empty_with(scope, &cfg, "group:5", 1, &empty, &notify), Vec::<Layer>::new(), "once per generation");
-        assert_eq!(alert_empty_with(scope, &cfg, "group:5", 2, &empty, &notify), vec![Layer::Identity], "a new generation alerts again");
-        assert_eq!(alert_empty_with(scope, &cfg, "private:8808", 1, &empty, &notify), vec![Layer::Identity, Layer::Relationship]);
+        assert_eq!(alert_empty_with(scope, &cfg, "group:5", "s", "e", 1, &empty, &notify), vec![Layer::Identity], "relationship is not checked in a group");
+        assert_eq!(alert_empty_with(scope, &cfg, "group:5", "s", "e", 1, &empty, &notify), Vec::<Layer>::new(), "once per generation");
+        assert_eq!(alert_empty_with(scope, &cfg, "group:5", "s", "e", 2, &empty, &notify), vec![Layer::Identity], "a new generation alerts again");
+        assert_eq!(alert_empty_with(scope, &cfg, "private:8808", "s", "e", 1, &empty, &notify), vec![Layer::Identity, Layer::Relationship]);
         let full = Counts { identity: 1, relationship: 1, conversation: 0, material: 0 };
-        assert_eq!(alert_empty_with(scope, &cfg, "private:8808", 3, &full, &notify), Vec::<Layer>::new(), "empty conversation or material never alerts");
+        assert_eq!(alert_empty_with(scope, &cfg, "private:8808", "s", "e", 3, &full, &notify), Vec::<Layer>::new(), "empty conversation or material never alerts");
         let sent = sent.into_inner();
         assert_eq!(sent.len(), 4, "{sent:?}");
         assert!(sent[0].starts_with("memory-layer-identity-group:5|") && sent[0].contains("身份"), "{sent:?}");
         assert!(sent[3].starts_with("memory-layer-relationship-private:8808|") && sent[3].contains("关系"), "{sent:?}");
+    }
+
+    #[test]
+    fn an_empty_identity_alerts_again_for_another_session_of_the_same_key() {
+        let notify = |_: &str, _: &str| true;
+        let cfg = json!({"ownerQQ": 8808});
+        let empty = Counts::default();
+        let scope = "briefing-alert-session-test";
+        assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-a", "epoch-1", 0, &empty, &notify), vec![Layer::Identity]);
+        assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-a", "epoch-1", 0, &empty, &notify), Vec::<Layer>::new(), "once per session");
+        assert_eq!(alert_empty_with(scope, &cfg, "group:6", "sid-b", "epoch-1", 0, &empty, &notify), vec![Layer::Identity], "another session of the same key and generation alerts again");
     }
 }

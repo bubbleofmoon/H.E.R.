@@ -111,3 +111,16 @@ fn a_wake_with_an_empty_identity_raises_the_owner_alert_once_per_generation() {
     assert_eq!(first.alerted, vec![crate::briefing::Layer::Identity]);
     assert!(again.alerted.is_empty(), "one alert per conversation and session generation");
 }
+
+#[test]
+fn a_strip_that_empties_the_identity_section_is_not_counted_as_delivered_and_alerts() {
+    let (_root, context, mut cfg) = layered_wake_fixture("layers stripped identity", true);
+    cfg.as_object_mut().unwrap().remove("ownerQQ"); // the alert is only logged: no owner message from a unit test
+    cfg["socialV2"]["context"]["stripFromModelText"] = json!([crate::prompt::identity_line("小鲸鱼", "9001")]);
+    let (context, server) = serve_packets(&context, 1);
+    let w = wake(&context, &cfg, "rpc-18e");
+    server.join().unwrap();
+    assert!(!w.text.contains("你在 QQ 上的昵称是"), "the strip removed the identity text:\n{}", w.text);
+    assert_eq!(w.layers.identity, 0, "a section the strip emptied delivers nothing");
+    assert_eq!(w.alerted, vec![crate::briefing::Layer::Identity]);
+}
