@@ -582,6 +582,15 @@ CI_WAIT_REFUSED = [   # #90: only coordinators (no guard) wait for CI
     ('wt', 'parallel python3 scripts/ci-wait.py ::: 42'),
     ('wt', 'cat scripts/ci-wait.py | python3.13t -'),
     ('wt', 'cat scripts/ci-wait.py | python3-dbg -'),
+    # a reader's options that run a program: only the narrow read forms keep quoted ci-wait text as data
+    ('wt', "git -c diff.external='python3 scripts/ci-wait.py --run 42 #' diff --ext-diff HEAD~1 HEAD"),
+    ('wt', "git -c core.pager='python3 scripts/ci-wait.py --run 42' log"),
+    ('wt', "git -c alias.x='!python3 scripts/ci-wait.py --run 42' x"),
+    ('wt', "git -c core.sshCommand='python3 scripts/ci-wait.py --run 42' fetch origin"),
+    ('wt', "git --exec-path='python3 scripts/ci-wait.py --run 42' log"),
+    ('wt', "git grep -O'python3 scripts/ci-wait.py --run 42' x"),
+    ('wt', "git log --ext-diff -p --grep 'python3 scripts/ci-wait.py --run 42'"),
+    ('wt', "rg --pre 'python3 scripts/ci-wait.py --run 42' x ."),
 ]
 CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the script stay allowed for implementers and gates
     ('wt', 'python3 -I scripts/tests/test_ci_wait.py'),

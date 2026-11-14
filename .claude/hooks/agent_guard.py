@@ -31,7 +31,8 @@ Polling GitHub gets its own refusal message for implementers and gates: gh with 
 by `watch` (a wrapper) or inside a while/until/for loop, unless the command is one plain gh call. The guard also
 refuses the plain ways of running a ci-wait program (by path, through python, through any program that is not a
 reader and is given a file named ci-wait*, after a wrapper, or named anywhere in a command with a wrapper, $ or
-python); a quoted argument of a plain reader is data. Only coordinators wait for CI (docs/agents/coordinator.md
+python); a quoted argument of one plain gh read, git log or git grep without an option that runs a program, or of
+grep or rg without --pre, is search text. Only coordinators wait for CI (docs/agents/coordinator.md
 "GitHub API budget"). Not seen: a launcher given only a module or another name, a glob, a copy under another name, a
 name built inside python (the T1 class).
 A worker's shell is not a sandbox. For implementers and gates this stops mistakes and plain attempts only; the
@@ -609,6 +610,24 @@ def runs_ci_wait(words):
             or (bool(PYTHON_NAME.fullmatch(first)) and any('ci-wait' in word.lower() for word in words[1:])))
 
 
+GIT_RUNS_PROGRAMS = ('-c', '-C', '-x', '-O', '--config-env', '--exec-path', '--ext-diff', '--textconv', '--exec', '--upload-pack',
+                     '--receive-pack', '--open-files-in-pager', '--output')
+
+
+def reads_only_text(words):
+    """One of the narrow read forms whose quoted arguments are search text, never a command: `gh` reads, `git log` and
+    `git grep` straight after `git` with no option that runs a program, and grep or rg without --pre."""
+    first = base(words[0])
+    if first == 'gh':
+        return gh_read(words, 'implementer')
+    if first == 'git':
+        return (len(words) > 1 and words[1] in ('log', 'grep')
+                and not any(word.startswith(GIT_RUNS_PROGRAMS) for word in words[1:]))
+    if first in ('grep', 'egrep', 'fgrep', 'rg'):
+        return not any(word.startswith(('--pre', '--hostname-bin')) for word in words[1:])
+    return False
+
+
 def gh_polls(segs, flat, plain_gh):
     """A command that repeats gh calls: gh with a --watch flag or `gh run watch`, or (unless it is one plain gh call,
     whose quoted arguments may hold any words) gh together with `watch` or a while/until/for loop."""
@@ -699,7 +718,7 @@ def check_bash(role, command, hook_cwd):
                    '-Name <name> -WorkDir <worktree> -PromptFile C:/her-orch/<n>/review/codex-self-<k>.md -Model gpt-6-astra '
                    '-Effort high -Sandbox read-only); <n> is your branch\'s ticket and the prompt is no link. '
                    'To read the script, use the Read tool.')
-    plain_reader = bool(words) and not indirect and base(words[0]) in READ_ONLY_COMMANDS     # its quoted arguments are data
+    plain_reader = bool(words) and not indirect and reads_only_text(words)      # its quoted arguments are search text
     if not plain_reader and (any(runs_ci_wait(seg) for seg, _ in segs) or ('ci-wait' in text.lower() and (
             indirect or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs)))):
         raise Deny(CI_WAIT_DENIED)
