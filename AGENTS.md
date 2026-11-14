@@ -24,7 +24,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## Subagent workflow
 
-- Coordinator rules (sizing, the planner, review routing, the merge flow and the Windows coordinator's duties) are in `docs/agents/coordinator.md`; only coordinator sessions read it.
+- Coordinator rules (sizing, the planner, review routing, the merge flow and the Windows coordinator's duties) are in `docs/agents/coordinator.md`; coordinator sessions and planners read it.
 - Hard limits: workers commit to and push only their own ticket branch (`her/<n>-<slug>`, never `main`, never force) and may trigger and read the quick CI job for it; they never open, merge or edit pull requests, rerun or cancel CI, post to GitHub, hand off or touch build slot locks by hand. Planners write only their plan file and scratch export and never build or run code; reviewers and planners run git only as plain read commands; reviews never write; gates never change product code or tests. Codex runs never write git metadata or outside the worktree and build/cache/lock dirs. `.claude/hooks/agent-guard.sh` stops plain attempts but is not a sandbox (python is unrestricted), so these limits hold whether or not a call is blocked.
 - Locally Rust gets only `cargo check` and rustfmt through the build slot; tests run on CI (`quick.yml` on a ticket branch, `checks.yml` on the pull request), apart from native checks a gate names (`docs/agents/rust-validation.md`). Never poll GitHub (`docs/agents/implementer-protocol.md` "Test loop").
 - A case called "bounded" or "unlikely" is a finding: fix it or name a follow-up.
