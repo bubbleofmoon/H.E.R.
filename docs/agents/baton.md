@@ -44,5 +44,5 @@ Read the queue when a session starts and after each handoff, and keep the watche
 
 - Only coordinators merge, and only through a pull request whose CI is green on a head that contains the current `origin/main` (`issue-tracker.md` "Pull requests and merging").
 - Production, its config, tokens, tasks and data are touched only from the Windows machine and only with the owner's go-ahead at the time. Production incident detail stays in the vault.
-- Never write `C:/qqbot`, `C:/qqbot-rust`, `memory.db` or `~/.dsh` from either machine. Production is read-only for development and every production edit is the owner’s own action under the vault operating procedures (`docs/agents/production-ops.md`). Tests never contact real QQ, DSH, model or TTS services.
+- Never write the production root `C:/qqbot` (until #67 also `C:/qqbot-rust`, `C:/her-orch/relay` and `~/.dsh`) or `memory.db` from either machine. Production is read-only for development and every production edit is the owner’s own action under the vault operating procedures (`docs/agents/production-ops.md`). Tests never contact real QQ, DSH, model or TTS services.
 - Never `@`-mention in comments: that notifies real GitHub accounts.

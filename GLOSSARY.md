@@ -80,7 +80,7 @@ The single definition of "running": desired state running, supervisor alive, and
 The exact version of a dependency the supervisor runs; it changes only when the administrator approves an upgrade.
 
 **Install root (安装根目录)**:
-The single folder holding everything production runs: releases, dependencies, the runtime and backups. Development never uses it.
+The single folder holding everything production runs (`C:/qqbot`): releases, dependencies, the runtime with its DSH home and logs, and backups. Development never uses it.
 _Avoid_: production folder, deploy dir
 
 **Harness (运行框架, `harness`)**:

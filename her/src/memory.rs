@@ -14,7 +14,7 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 mod store;
 pub use store::{DigestCursor, ForgetError, MemoryStore, NewMemory, Reader};
 
-pub const DB_PATH: &str = "C:/qqbot/data/memory.db";
+pub const DB_PATH: &str = crate::legacy_path!("data/memory.db");
 
 /// A selected root always owns its database. Legacy MCP/console calls honor an explicit
 /// Rust override, then the frozen JS override, before using the deployment default.

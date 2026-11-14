@@ -10,7 +10,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 - `bubbleofmoon/H.E.R.-vault`, checked out at `C:/her-vault` (Linux `/root/her-vault`), is the vault: specs, raw validation evidence, `.scratch/`, bot memory, chat and session samples, the patched copy of SnowLuma's non-commercial code and production incident detail stay there. No vault material moves into this repository or its history. Coordinators commit to the vault with the repository-level git identity set in the vault checkout by the owner, on both hosts: user name `bubbleofmoon` and the owner's GitHub noreply address.
 - A public ticket, comment or commit names vault files by path only. Post every issue, comment or pull-request body through `scripts/gh-public.sh` / `.ps1`, never a bare `gh` write (`docs/agents/issue-tracker.md`); `.githooks/pre-push` scans everything a push publishes.
 - The scan refuses secrets, digit runs of 7 or more without a reviewed exception, account-home paths and lines that look like quoted chat or session records. It prints a finding's kind and position, never the matched text. Fix the text; do not widen a rule.
-- Production is never a development target: never write `C:/qqbot`, `C:/qqbot-rust` or `~/.dsh`, and never contact real QQ, DSH, model or TTS services from development.
+- Production is never a development target: never write the production root `C:/qqbot` (until the owner's move, #67, also `C:/qqbot-rust`, `C:/her-orch/relay` and `~/.dsh`), and never contact real QQ, DSH, model or TTS services from development.
 
 ## DOX
 

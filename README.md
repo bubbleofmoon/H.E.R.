@@ -101,7 +101,7 @@ Tests use throwaway runtimes and fake QQ gateways, agent hosts and model servers
 
 ## Installing and updating
 
-An installation lives under one install root (default `C:\HER`) with side-by-side releases, a current and a last-good release, and a runtime folder for configuration and data. The update policy is off, notify or auto; updates install beside the running release, are trialled and roll back automatically if the health check fails. Dependency upgrades always need the administrator's approval. Details: [docs/agents/lifecycle-tasks.md](docs/agents/lifecycle-tasks.md) and [docs/agents/windows-lifecycle.md](docs/agents/windows-lifecycle.md).
+An installation lives under one install root (default `C:\qqbot`) with side-by-side releases, a current and a last-good release, and a runtime folder for configuration and data. The update policy is off, notify or auto; updates install beside the running release, are trialled and roll back automatically if the health check fails. Dependency upgrades always need the administrator's approval. Details: [docs/agents/lifecycle-tasks.md](docs/agents/lifecycle-tasks.md) and [docs/agents/windows-lifecycle.md](docs/agents/windows-lifecycle.md).
 
 ## What this repository is, and what stays in the vault
 
