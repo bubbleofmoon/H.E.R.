@@ -1944,27 +1944,31 @@ fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
         map.get(name)
             .is_some_and(|reasons| reasons.iter().any(|seen| seen == reason))
     };
-    let _ = &logged;
-    let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
-    {
-        let mut map = LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
-        let reasons = map.entry(name.to_string()).or_default();
-        if reasons.len() >= 16 {
-            reasons.remove(0);
-        }
-        reasons.push(reason.to_string());
+    if logged(&LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner())) {
+        return;
     }
+    let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
     match dependency_log(context, name, "err")
         .and_then(|mut file| file.write_all(line.as_bytes()).map_err(|e| e.to_string()))
     {
-        Ok(()) => {}
+        Ok(()) => {
+            let mut map = LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
+            map.entry(name.to_string())
+                .or_default()
+                .push(reason.to_string());
+        }
         Err(error) => {
             crate::safe_eprintln!("[dependencies] refusal of {name} could not be logged: {error}");
         }
     }
 }
 
-fn forget_refusals(_name: &str) {}
+fn forget_refusals(name: &str) {
+    LOGGED_REFUSALS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(name);
+}
 
 fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {
     crate::safe_eprintln!("[dependencies] {reason}");

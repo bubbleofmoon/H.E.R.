@@ -130,14 +130,15 @@ pub fn matches(
                 let candidates = operand_candidates(&process.args);
                 // Only the script position can make a launcher; an npm launcher's name anywhere
                 // else is ambiguous (the entry may still be the dependency) and stays unknown.
-                if candidates
-                    .iter()
-                    .any(|operand| is_package_launcher(operand))
-                {
+                if first_plain_operand(&process.args).is_some_and(is_package_launcher) {
                     return Ok(Match::Wrapper);
                 }
                 let expected = resolve_script(process, script)?;
-                return if names_script(process, &candidates, script, &expected) {
+                return if candidates
+                    .iter()
+                    .any(|operand| is_package_launcher(operand))
+                    || names_script(process, &candidates, script, &expected)
+                {
                     Err(reason)
                 } else {
                     Ok(Match::Mismatch(
@@ -177,6 +178,8 @@ fn operand_candidates(args: &[String]) -> Vec<&str> {
     for arg in args.iter().skip(1) {
         if operands {
             found.push(arg.as_str());
+        } else if arg == "--" {
+            operands = true;
         } else if let Some(option) = arg.strip_prefix('-') {
             if let Some((_, value)) = option.split_once('=') {
                 found.push(value);
