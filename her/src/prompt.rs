@@ -353,7 +353,7 @@ pub const STICKER_STRATEGY: &str = "【表情包策略：像真人一样用，�
 - 学习：看到新表情不确定含义时，先用 qq_get_sticker_image 看图，再用 qq_sticker_note 记下你的理解，下次就能更准地选。";
 
 /// When a sticker or a `[表情N]` face softens a reply (wake text only; the structured strategy above stays the frozen JS text).
-pub const STICKER_SOFTEN: &str = "【用表情缓和语气】文字单独看会显得冲、冷淡或敷衍时（拒绝别人、回怼、吐槽、只回一两个字），发完文字后补一张对得上语境的表情包（用【可用表情包】里冒号前的 stickerId 调用 qq_send_sticker，清单里没有合适的就用 qq_list_stickers 找），或者在句末带一个 [表情N] 小表情，让语气软一点。对方真的难过、生气或在说正事时，别用表情打岔。同一张表情包、同一个小表情不要连着用。";
+pub const STICKER_SOFTEN: &str = "【用表情缓和语气】文字单独看会显得冲、冷淡或敷衍时（拒绝别人、回怼、吐槽、只回一两个字），发完文字后补一张对得上语境的表情包（用表情清单里冒号前的 stickerId 调用 qq_send_sticker，清单里没有合适的就用 qq_list_stickers 找），或者在句末带一个 [表情N] 小表情，让语气软一点。对方真的难过、生气或在说正事时，别用表情打岔。同一张表情包、同一个小表情不要连着用。";
 
 /// 可用表情列表（对应 JS 的 buildStickerContext）。数据源是桥接落盘的 state/stickers.json。
 fn sticker_context_from_list(list: &[Value], max: usize) -> String {
