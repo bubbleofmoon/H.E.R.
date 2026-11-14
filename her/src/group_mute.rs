@@ -33,13 +33,20 @@ fn clock(at: i64, now: i64) -> String {
 impl Mute {
     /// Model-facing result of a locally refused send.
     pub fn refusal_text(&self, now: i64) -> String {
-        String::new()
+        let when = match (self.whole_group, self.until) {
+            (false, Some(until)) => { let t = clock(until, now); format!("被禁言至 {t}（muted in this group until {t}）") }
+            _ => "被禁言，结束时间未知（muted in this group, end unknown）".to_string(),
+        };
+        format!("你在这个群{when}，消息没有发出，也不会重发。禁言结束前不要再在这个群发消息。{}", crate::console::END_TURN)
     }
 }
 
 /// Effective mute of one stored entry at `now`. A personal mute ending exactly at `now` is over.
 pub(crate) fn effective(entry: &Value, now: i64) -> Option<Mute> {
-    None
+    let personal = entry["personalUntil"].as_i64().unwrap_or(0);
+    if entry["wholeGroup"] == true { return Some(Mute { until: None, whole_group: true }); }
+    if personal == -1 { return Some(Mute { until: None, whole_group: false }); }
+    (personal > now).then_some(Mute { until: Some(personal), whole_group: false })
 }
 
 fn empty() -> Value { json!({"v": 1, "groups": {}}) }
@@ -67,11 +74,12 @@ fn gate(context: &RuntimeContext) -> Result<std::fs::File, String> {
 }
 
 pub fn active(context: &RuntimeContext, key: &str) -> Option<Mute> {
-    None
+    active_at(context, key, crate::parity_clock::now_ms())
 }
 
 pub(crate) fn active_at(context: &RuntimeContext, key: &str, now: i64) -> Option<Mute> {
-    None
+    if !context.is_isolated() || !key.starts_with("group:") { return None; }
+    effective(&read(context).ok()?["groups"][key], now)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,13 +97,72 @@ pub enum Change {
 
 /// The change a `group_ban` notice for her own id makes; `None` for an unknown `sub_type`.
 pub fn change_from_notice(sub_type: &str, duration: Option<&Value>, now: i64) -> Option<Change> {
-    None
+    match sub_type {
+        "lift_ban" => Some(Change::Lifted),
+        "ban" => {
+            let seconds = duration.and_then(|d| match d {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.trim().parse().ok(),
+                _ => None,
+            });
+            Some(match seconds {
+                Some(0) => Change::Lifted,
+                Some(s) if s > 0 => Change::Banned(now.saturating_add(s.saturating_mul(1000))),
+                _ => Change::Banned(-1),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Apply one change under the gate. Returns the episode revision whose owner notice this call claimed.
 /// A transient read error refuses the change (`Err`); only an invalid file is replaced.
 pub(crate) fn apply_at(context: &RuntimeContext, key: &str, change: Change, operator: Option<i64>, now: i64) -> Result<Option<i64>, String> {
-    Ok(None)
+    if !context.is_isolated() || !key.starts_with("group:") { return Ok(None); }
+    let _gate = gate(context)?;
+    let text = context.read_optional_text(RuntimeArea::Data, FILE).map_err(|e| format!("group-mutes read: {e}"))?;
+    let mut store = match text {
+        None => empty(),
+        Some(text) => serde_json::from_str::<Value>(&text).ok().filter(|v| v["groups"].is_object()).unwrap_or_else(|| {
+            crate::safe_println!("[mute] group-mutes.json is invalid; starting from an empty mute state");
+            empty()
+        }),
+    };
+    let existing = store["groups"].get(key).filter(|v| v.is_object()).cloned();
+    let mut entry = existing.clone().unwrap_or_else(|| json!({"personalUntil": 0, "wholeGroup": false, "rev": 0, "noticedRev": 0, "seq": 0}));
+    let before = effective(&entry, now);
+    match change {
+        Change::Banned(until) => entry["personalUntil"] = json!(until),
+        Change::Lifted => entry["personalUntil"] = json!(0),
+        Change::Learned => { if before.is_some() { return Ok(None); } entry["personalUntil"] = json!(-1); }
+        Change::Refreshed { personal_until, whole_group, seen_seq } => {
+            if entry["seq"].as_i64().unwrap_or(0) != seen_seq { return Ok(None); }
+            if let Some(p) = personal_until {
+                // A mute learned from a refusal may be a whole-group mute the member view does not
+                // show; only a readable whole-group answer may clear it (no learn/clear/notice loop).
+                let learned = entry["personalUntil"].as_i64() == Some(-1);
+                if !(learned && p == 0 && whole_group.is_none()) { entry["personalUntil"] = json!(p); }
+            }
+            if let Some(w) = whole_group { entry["wholeGroup"] = json!(w); }
+        }
+    }
+    let after = effective(&entry, now);
+    // Only a refresh that finds nothing may skip the write. A notice or refusal always bumps `seq`,
+    // so a refresh that started before it can never land a stale answer.
+    if existing.is_none() && after.is_none() && matches!(change, Change::Refreshed { .. }) { return Ok(None); }
+    let mut claim = None;
+    if before.is_none() && after.is_some() {
+        let rev = entry["rev"].as_i64().unwrap_or(0) + 1;
+        entry["rev"] = json!(rev);
+        entry["mutedAt"] = json!(now);
+        entry["operator"] = json!(operator);
+        if entry["noticedRev"].as_i64().unwrap_or(0) < rev { entry["noticedRev"] = json!(rev); claim = Some(rev); }
+    }
+    entry["seq"] = json!(entry["seq"].as_i64().unwrap_or(0) + 1);
+    store["groups"].as_object_mut().expect("checked object").insert(key.to_string(), entry);
+    let bytes = serde_json::to_vec(&store).map_err(|e| e.to_string())?;
+    context.write_atomic(RuntimeArea::Data, FILE, &bytes)?;
+    Ok(claim)
 }
 
 fn notice_text(key: &str, mute: Mute, operator: Option<i64>, now: i64) -> String {
@@ -149,23 +216,39 @@ fn ok_data(envelope: Option<&Value>) -> Option<&Value> {
 /// Read `get_group_member_info` (self) and `get_group_info` replies. Group owners and admins are
 /// exempt from a whole-group mute; an unreadable role counts as not exempt.
 pub(crate) fn parse_refresh(member: Option<&Value>, info: Option<&Value>, now: i64) -> (Option<i64>, Option<bool>) {
-    (None, None)
+    let member = ok_data(member);
+    let personal = member.and_then(|d| integer(&d["shut_up_timestamp"]))
+        .map(|ts| { let ms = ts.saturating_mul(1000); if ms > now { ms } else { 0 } });
+    let exempt = matches!(member.and_then(|d| d["role"].as_str()), Some("owner" | "admin"));
+    let whole = ok_data(info).and_then(|d| integer(&d["group_all_shut"])).map(|v| v != 0 && !exempt);
+    (personal, whole)
 }
 
 pub(crate) fn seq_of(context: &RuntimeContext, key: &str) -> i64 {
-    0
+    read(context).ok().and_then(|s| s["groups"][key]["seq"].as_i64()).unwrap_or(0)
 }
 
 /// Groups whose mute has no known end.
 pub fn unknown_end_groups(context: &RuntimeContext, now: i64) -> Vec<i64> {
-    Vec::new()
+    if !context.is_isolated() { return Vec::new(); }
+    let Ok(store) = read(context) else { return Vec::new() };
+    store["groups"].as_object().into_iter().flatten()
+        .filter(|(_, e)| effective(e, now).is_some_and(|m| m.until.is_none()))
+        .filter_map(|(k, _)| k.strip_prefix("group:")?.parse().ok()).collect()
 }
 
 /// A `group_ban` notice with `user_id` 0 (QQ's whole-group mute or lift). The ingress `Event`
 /// refuses id 0, so only this narrow parse accepts it; every other present identity must be valid.
 /// Returns the group and the (lenient) operator.
 pub fn whole_group_notice(raw: &str) -> Option<(i64, Option<i64>)> {
-    None
+    let v: Value = serde_json::from_str(raw).ok()?;
+    if v["post_type"] != "notice" || v["notice_type"] != "group_ban" { return None; }
+    if crate::protocol_integer(&v["user_id"]) != Some(0) { return None; }
+    for field in ["self_id", "sender_id", "target_id"] {
+        if let Some(x) = v.get(field) { crate::protocol_integer(x).filter(|id| *id > 0)?; }
+    }
+    let group = crate::protocol_integer(&v["group_id"]).filter(|id| *id > 0)?;
+    Some((group, crate::protocol_integer(&v["operator_id"]).filter(|id| *id > 0)))
 }
 
 static REFRESHING: AtomicBool = AtomicBool::new(false);
