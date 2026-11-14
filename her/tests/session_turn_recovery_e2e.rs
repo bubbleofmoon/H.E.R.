@@ -52,6 +52,31 @@ fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// A fixture read or append of a product-owned ledger can collide with the product's exclusive whole-file lock:
+/// on Windows that lock is mandatory, so the fixture's own `ReadFile`/`WriteFile` fails with ERROR_LOCK_VIOLATION
+/// (os error 33) for as long as the product holds it. Retry exactly that error for a short bound; any other
+/// error, or a lock that outlasts the bound, fails the test with the operation named.
+fn retry_lock_violation<T>(what: &str, mut op: impl FnMut() -> std::io::Result<T>) -> T {
+    const BOUND: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + BOUND;
+    loop {
+        match op() {
+            Ok(value) => return value,
+            Err(error) if cfg!(windows) && error.raw_os_error() == Some(33) => {
+                if Instant::now() >= deadline {
+                    panic!("{what}: the file stayed locked by another process for {BOUND:?}: {error}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{what}: {error}"),
+        }
+    }
+}
+
+fn read_locked(path: &Path) -> String {
+    retry_lock_violation(&format!("read {}", path.display()), || fs::read_to_string(path))
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -1409,7 +1434,7 @@ fn scheduling_timer_held_by_recovery_is_released_without_new_ingress() {
     fs::write(path,state.to_string()).unwrap();
     rig.dsh.set_plan(Plan{send:None,hold:false});
     rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(6),||fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap().contains("\"k\":\"held\"")));
+    assert!(wait_for(Duration::from_secs(6),||read_locked(&rig.root.join("data/turn-ledger.jsonl")).contains("\"k\":\"held\"")));
     assert!(rig.dsh.applied().is_empty());
     let resolved=rig.console("POST","/api/turns/resolve",Some(&json!({"turnId":"paused-before-wake","action":"abandon"})));
     assert_eq!(resolved.0,200,"{resolved:?}");
@@ -2028,20 +2053,20 @@ fn a_completed_end_observed_before_the_cap_keeps_completion_while_bookkeeping_wa
     assert!(wait_for(LONG, || rig.root.join("data/collector-bookkeeping-ready").exists()),
         "collector did not observe the completed end");
     let ledger = rig.root.join("data/turn-ledger.jsonl");
-    let before_cap = fs::read_to_string(&ledger).unwrap();
+    let before_cap = read_locked(&ledger);
     assert!(!before_cap.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["k"] == "ended" || row["verdict"] == "cancel-requested"), "{before_cap}");
     assert_eq!(rig.dsh.count("session/cancel"), 0, "completion was observed before cancellation intent");
     assert!(wait_for(LONG, || rig.dsh.count("session/cancel") == 1), "the cap never fired");
     // Token rotation proves the independent cap handler has passed its intent and RPC.
     assert!(wait_for(LONG, || rig.agent_token() != SEED_TOKEN));
-    let while_held = fs::read_to_string(&ledger).unwrap();
+    let while_held = read_locked(&ledger);
     fs::remove_file(hold).unwrap();
     assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
         .unwrap_or_default().contains("[reserved2] group:420042 turn ended:")));
     assert!(!while_held.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["k"] == "ended"), "completion's terminal write is still pending: {while_held}");
-    let records: Vec<Value> = fs::read_to_string(&ledger).unwrap().lines()
+    let records: Vec<Value> = read_locked(&ledger).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     let ends: Vec<_> = records.iter().filter(|row| row["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{records:?}");
@@ -2892,9 +2917,10 @@ fn an_unreadable_send_ledger_pauses_the_finished_turn_and_rotates_the_token() {
     assert!(wait_for(LONG, || rig.onebot_sends().len() == 1), "the model's send did not reach QQ");
     let before = rig.agent_token();
     let outbox = rig.root.join("data/send-outbox.jsonl");
-    let mut file = fs::OpenOptions::new().append(true).open(&outbox).expect("the send ledger exists");
-    std::io::Write::write_all(&mut file, b"{\"k\":\"attempt\",\"batch\":\"b\"}}\n").expect("damage the last line");
-    drop(file);
+    retry_lock_violation("damage the last send-ledger line", || {
+        let mut file = fs::OpenOptions::new().append(true).open(&outbox)?;
+        std::io::Write::write_all(&mut file, b"{\"k\":\"attempt\",\"batch\":\"b\"}}\n")
+    });
     rig.start_candidate(vec![]);
     // The console's own turn view reads the same ledger and refuses while it is torn, so observe the verdict
     // recovery recorded in the turn ledger.

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MEMORY_SCHEMA: &str = r#"
 CREATE TABLE memory (
@@ -141,7 +141,15 @@ impl FakeHttpEndpoint {
             while stop_rx.try_recv().is_err() {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows hands the accepted socket the listener's nonblocking mode.
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         let request = read_http_request(&mut stream);
+                        // A connection that sent no bytes is not a request.
+                        if request.is_empty() {
+                            continue;
+                        }
                         let _ = request_tx.send(request);
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
@@ -203,8 +211,10 @@ impl Drop for FakeHttpEndpoint {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
+    const WINDOW: Duration = Duration::from_secs(3);
+    let deadline = Instant::now() + WINDOW;
     stream
-        .set_read_timeout(Some(Duration::from_secs(3)))
+        .set_read_timeout(Some(Duration::from_millis(50)))
         .expect("set fake endpoint timeout");
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 2048];
@@ -212,6 +222,15 @@ fn read_http_request(stream: &mut TcpStream) -> String {
         let count = match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => count,
+            // No bytes yet: keep waiting within the window (Windows reports a read timeout as TimedOut).
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && Instant::now() < deadline =>
+            {
+                continue;
+            }
             Err(_) => break,
         };
         bytes.extend_from_slice(&chunk[..count]);
