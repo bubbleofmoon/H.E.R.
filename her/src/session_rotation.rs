@@ -353,9 +353,9 @@ pub(crate) async fn digest(
                 Ok(count) => count,
                 Err(()) => return DigestResult::Pending,
             };
-            // One verification retry, then use the existing failed-digest retirement policy.
-            // Archiving retains the source history; the cursor never claims an unknown write.
-            // Unknown model work is NOT replayed: memory_write is not batch-idempotent.
+            // A Digest failure is always settled (memories and cursor commit together); only an unsettled
+            // context read gets one verification retry. Then the failed-digest retirement policy applies;
+            // archiving retains the source history.
             if !error.settled && count < 2 && !cancel.load(Ordering::SeqCst) {
                 return DigestResult::Pending;
             }
@@ -439,7 +439,7 @@ async fn digest_inner(context: &RuntimeContext, cfg: &Value, plan: &Plan, cancel
     let mut task = tokio::task::spawn_blocking(move || {
         let model = crate::digest::model_for(&context, &cfg).map_err(|error| crate::digest::DigestError::Model(error.0))?;
         crate::digest::Digest::new(&context, &cfg, model.as_ref())
-            .run_conversation(&key, &crate::digest::Limits { min_messages: 1, min_interval_ms: 0 }, &flag)
+            .run_conversation(&key, &crate::digest::Limits { min_messages: 1, min_interval_ms: 0 }, &*flag)
     });
     let outcome = loop {
         tokio::select! {

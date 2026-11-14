@@ -388,7 +388,7 @@ fn model_failures_write_nothing_fail_the_run_and_retry_the_same_messages() {
         completion(""),
         completion("[]"),
     ]);
-    let mut rig = Rig::new(&model, json!({}), social(three()));
+    let mut rig = Rig::new(&model, json!({"minIntervalMinutes":0}), social(three()));
     rig.start();
     let first = rig.run("memory-digest", "digest-fail-1");
     assert_eq!(first["state"], "failed", "{first}");

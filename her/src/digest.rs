@@ -7,6 +7,7 @@ mod tests;
 
 pub(crate) use conversation::{Digest, DigestError, Limits, Outcome};
 pub(crate) use model::{model_for, DigestModel, ModelError};
+use conversation::Hold;
 #[cfg(test)]
 pub(crate) use model::install_test_model;
 
@@ -43,6 +44,18 @@ fn held(context: &RuntimeContext, cancel: &AtomicBool) -> bool {
     let desired = crate::lifecycle::DesiredStore::new(context.data_dir().join("lifecycle"));
     cancel.load(Ordering::SeqCst)
         || !matches!(crate::lifecycle::effective(&desired.read(), crate::parity_clock::now_ms()), crate::lifecycle::Effective::Act { wants, .. } if wants.jobs)
+}
+
+/// The job's hold inside the Digest: its cancel flag, or a desired state without jobs (stop, maintenance).
+struct JobHold<'a> {
+    context: &'a RuntimeContext,
+    cancel: &'a AtomicBool,
+}
+
+impl Hold for JobHold<'_> {
+    fn held(&self) -> bool {
+        held(self.context, self.cancel)
+    }
 }
 
 /// Backlog the check task waits for: `contextPct` percent of the social evidence buffer.
@@ -109,6 +122,7 @@ pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel:
     };
     let max = setting(auto, "maxSessionsPerDay", 8.0).max(0.0) as usize;
     let (mut written, mut memories, mut quiet, mut failures) = (0usize, 0usize, 0usize, 0usize);
+    let hold = JobHold { context, cancel };
     for key in keys {
         if is_cancelled() {
             return cancelled();
@@ -119,7 +133,7 @@ pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel:
         if written >= max {
             break;
         }
-        match digest.run_conversation(&key, &limits, cancel) {
+        match digest.run_conversation(&key, &limits, &hold) {
             Ok(Outcome::Quiet) => quiet += 1,
             Ok(Outcome::Written { memories: count, .. }) => {
                 written += 1;

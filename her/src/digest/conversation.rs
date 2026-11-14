@@ -1,6 +1,6 @@
 //! One digest run over one conversation's new evidence.
 use super::{evidence, model::DigestModel};
-use crate::memory::{MemoryStore, NewMemory};
+use crate::memory::{DigestCursor, MemoryStore, NewMemory};
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +11,8 @@ pub(crate) const PROMPT: &str = "你在整理自己对这个会话里的人和�
 const MAX_ITEMS: usize = 8;
 const MAX_CONTENT_CHARS: usize = 200;
 const MAX_SUBJECT_CHARS: usize = 40;
+/// Batches without an incoming message one call moves past (each read consumes at most 2000 rows).
+const MAX_SKIPS: usize = 64;
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Outcome {
@@ -44,6 +46,18 @@ pub(crate) struct Limits {
     pub min_interval_ms: i64,
 }
 
+/// What holds a digest. It is checked right before the model call and right before every write.
+pub(crate) trait Hold {
+    fn held(&self) -> bool;
+}
+
+/// Idle rotation and tests: the cancel flag alone.
+impl Hold for AtomicBool {
+    fn held(&self) -> bool {
+        self.load(Ordering::SeqCst)
+    }
+}
+
 pub(crate) struct Digest<'a> {
     context: &'a RuntimeContext,
     cfg: &'a Value,
@@ -55,35 +69,68 @@ impl<'a> Digest<'a> {
         Self { context, cfg, model }
     }
 
+    /// Conversations in digest order: never digested first, then the longest since its last digest; ties by key.
     pub(crate) fn conversations(&self) -> Result<Vec<String>, DigestError> {
-        evidence::conversations(self.context).map_err(|_| DigestError::Evidence)
+        let keys = evidence::conversations(self.context).map_err(|_| DigestError::Evidence)?;
+        let store = MemoryStore::open(self.context, self.cfg).map_err(|_| DigestError::Storage)?;
+        let space = evidence::space(self.context);
+        let mut ordered = Vec::with_capacity(keys.len());
+        for key in keys {
+            let cursor = store.for_reader(&key).digest_cursor(space).map_err(|_| DigestError::Storage)?;
+            ordered.push((cursor.map_or(0, |c| c.digested_at), key));
+        }
+        ordered.sort();
+        Ok(ordered.into_iter().map(|(_, key)| key).collect())
     }
 
-    /// Digest `key`'s evidence after its cursor. Failure writes nothing and leaves the cursor.
-    pub(crate) fn run_conversation(&self, key: &str, limits: &Limits, cancel: &AtomicBool) -> Result<Outcome, DigestError> {
-        if cancel.load(Ordering::SeqCst) { return Err(DigestError::Cancelled); }
+    /// Digest `key`'s evidence after its cursor. `hold` is checked right before the model call and right
+    /// before every write; a held run returns `Cancelled` and writes nothing more. A failed model call or
+    /// answer writes no memory, keeps the cursor and records the failure time (backoff `min_interval_ms`).
+    pub(crate) fn run_conversation(&self, key: &str, limits: &Limits, hold: &dyn Hold) -> Result<Outcome, DigestError> {
+        if hold.held() { return Err(DigestError::Cancelled); }
         let store = MemoryStore::open(self.context, self.cfg).map_err(|_| DigestError::Storage)?;
         let reader = store.for_reader(key);
         let space = evidence::space(self.context);
-        let stored = reader.digest_cursor(space).map_err(|_| DigestError::Storage)?;
-        if let Some(cursor) = stored {
-            if limits.min_interval_ms > 0 && crate::parity_clock::now_ms() - cursor.digested_at < limits.min_interval_ms {
+        let mut cursor: DigestCursor = reader.digest_cursor(space).map_err(|_| DigestError::Storage)?.unwrap_or_default();
+        let last = cursor.digested_at.max(cursor.failed_at);
+        if limits.min_interval_ms > 0 && last > 0 && crate::parity_clock::now_ms() - last < limits.min_interval_ms {
+            return Ok(Outcome::Quiet);
+        }
+        let max_chars = max_input_chars(self.cfg);
+        let mut skips = 0;
+        let batch = loop {
+            let Some(batch) = evidence::read(self.context, self.cfg, key, space, cursor, max_chars)
+                .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
+            if batch.messages > 0 { break batch; }
+            // Rows that render no message (commands, HER's frames, blanked raw text): move past them without the model.
+            if (batch.through, batch.replies_ms) == (cursor.through, cursor.replies_ms) || skips == MAX_SKIPS {
                 return Ok(Outcome::Quiet);
             }
-        }
-        let Some(batch) = evidence::read(self.context, self.cfg, key, space, stored.unwrap_or_default(), max_input_chars(self.cfg))
-            .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
+            if hold.held() { return Err(DigestError::Cancelled); }
+            if reader.write_digest(space, cursor.through, batch.through, batch.replies_ms, &[]).map_err(|_| DigestError::Storage)?.is_none() {
+                return Ok(Outcome::Quiet);
+            }
+            (cursor.through, cursor.replies_ms) = (batch.through, batch.replies_ms);
+            skips += 1;
+        };
         if batch.pending < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
-        if cancel.load(Ordering::SeqCst) { return Err(DigestError::Cancelled); }
-        let answer = self.model.complete(PROMPT, &batch.input).map_err(|error| DigestError::Model(error.0))?;
-        let items = parse_items(&answer)?;
-        if cancel.load(Ordering::SeqCst) { return Err(DigestError::Cancelled); }
+        if hold.held() { return Err(DigestError::Cancelled); }
+        let answer = self.model.complete(PROMPT, &batch.input).map_err(|error| DigestError::Model(error.0));
+        let items = match answer.and_then(|answer| parse_items(&answer)) {
+            Ok(items) => items,
+            Err(error) => {
+                // Best effort: an unrecorded failure only loses the backoff.
+                let _ = reader.digest_failed(space);
+                return Err(error);
+            }
+        };
         let source = format!("digest:{key}:{space}:{}-{}", batch.first, batch.through);
         let memories: Vec<NewMemory<'_>> = items.iter().map(|(subject, content)| NewMemory {
             owner_type: "session", scope: None, kind: "inference", subject: subject.as_deref(), content,
             tags: None, source: &source, importance: 0.5,
         }).collect();
-        match reader.write_digest(space, stored.map_or(0, |c| c.through), batch.through, batch.replies_ms, &memories).map_err(|_| DigestError::Storage)? {
+        if hold.held() { return Err(DigestError::Cancelled); }
+        match reader.write_digest(space, cursor.through, batch.through, batch.replies_ms, &memories).map_err(|_| DigestError::Storage)? {
             Some(written) => Ok(Outcome::Written { through: batch.through, memories: written.len() }),
             None => Ok(Outcome::Quiet),
         }

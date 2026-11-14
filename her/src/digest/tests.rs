@@ -175,7 +175,7 @@ fn model_failure_and_unusable_output_write_nothing_and_keep_the_cursor() {
     for want in expected {
         assert_eq!(run(&context, &model, "group:42", &ANY), want);
         assert!(rows(&root).is_empty());
-        assert_eq!(MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").digest_cursor("msg").unwrap(), None);
+        assert_eq!(MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").digest_cursor("msg").unwrap().map_or(0, |c| c.through), 0);
     }
     assert_eq!(run(&context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
     let inputs = model.inputs();
