@@ -1260,14 +1260,6 @@ impl Hub {
                 self.pending.push_back(job);
                 continue;
             }
-            if crate::group_mute::active(&context, &job.key).is_some() {
-                // #46: held, not cancelled: it runs on the first pass after the mute ends.
-                if self.mute_noted.insert(job.key.clone()) {
-                    println!("[reserved] {} 禁言中，排队的任务保留到禁言结束", job.key);
-                }
-                self.pending.push_back(job);
-                continue;
-            }
             if crate::dsh_health::is_down(&context) {
                 // DSH is known down: no call is made for waiting work. Its authority was re-checked just above; it is
                 // checked again, with everything else, on the pass that finds DSH back.
