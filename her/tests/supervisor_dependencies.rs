@@ -91,6 +91,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        #[cfg(windows)]
+        disable_debug_privilege();
         let root = install_root::development_root(std::env::temp_dir().join(format!(
                 "her-deps-中文 it's {}-{}",
                 std::process::id(),
@@ -1535,10 +1537,72 @@ fn foreign_port_holders_are_alerted_and_left_running() {
     }
 }
 
+/// An administrator token with SeDebugPrivilege enabled bypasses every process DACL, so the hosted
+/// runner could not model another token's process. Disabling it in the test process also disables
+/// it for the supervisor and its children, which inherit this token.
 #[cfg(windows)]
-fn deny_full_inspection(dsh: &Owned) {
+fn disable_debug_privilege() {
     use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: u32,
+        luid: Luid,
+        attributes: u32,
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut Luid) -> i32;
+        fn AdjustTokenPrivileges(
+            token: *mut c_void,
+            disable_all: i32,
+            new: *const TokenPrivileges,
+            length: u32,
+            previous: *mut c_void,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name: Vec<u16> = "SeDebugPrivilege".encode_utf16().chain(Some(0)).collect();
+        let mut luid = Luid { low: 0, high: 0 };
+        let mut token = std::ptr::null_mut();
+        // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY. A token without the privilege has nothing to disable.
+        if OpenProcessToken(GetCurrentProcess(), 0x20 | 0x8, &mut token) != 0 {
+            if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) != 0 {
+                let disable = TokenPrivileges {
+                    count: 1,
+                    luid,
+                    attributes: 0,
+                };
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &disable,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            CloseHandle(token);
+        }
+    });
+}
+
+/// Replaces the DACL of a process handle we hold, to model a process owned by another token.
+#[cfg(windows)]
+fn set_process_dacl(process: *mut std::ffi::c_void, sddl: &str) {
+    use std::ffi::c_void;
     #[link(name = "advapi32")]
     extern "system" {
         fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -1557,12 +1621,7 @@ fn deny_full_inspection(dsh: &Owned) {
     extern "system" {
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
     }
-    // Model the native access boundary of an elevated process, using only our
-    // fake: VM_READ is denied while limited-query liveness and termination work.
-    let text: Vec<u16> = "D:(D;;0x0010;;;WD)(A;;GA;;;OW)"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    let text: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = std::ptr::null_mut();
     unsafe {
         assert_ne!(
@@ -1574,7 +1633,7 @@ fn deny_full_inspection(dsh: &Owned) {
             ),
             0
         );
-        let changed = SetKernelObjectSecurity(dsh.child.as_raw_handle(), 4, descriptor);
+        let changed = SetKernelObjectSecurity(process, 4, descriptor);
         LocalFree(descriptor);
         assert_ne!(
             changed,
@@ -1583,6 +1642,37 @@ fn deny_full_inspection(dsh: &Owned) {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Denies even limited-information access, so the image path cannot be read; restores on drop so
+/// the fixture can still stop the process.
+#[cfg(windows)]
+struct ImageHidden(*mut std::ffi::c_void);
+#[cfg(windows)]
+impl Drop for ImageHidden {
+    fn drop(&mut self) {
+        set_process_dacl(self.0, "D:(A;;GA;;;WD)");
+    }
+}
+#[cfg(windows)]
+fn deny_image_access(process: &Owned) -> ImageHidden {
+    use std::os::windows::io::AsRawHandle;
+    let handle = process.child.as_raw_handle();
+    // QUERY_INFORMATION, VM_READ and QUERY_LIMITED_INFORMATION are denied; the owner keeps the rest.
+    set_process_dacl(handle, "D:(D;;0x1410;;;WD)(A;;GA;;;OW)");
+    assert!(
+        process_identity::identity_of(process.identity.pid).is_err(),
+        "native image access must actually be denied"
+    );
+    ImageHidden(handle)
+}
+
+#[cfg(windows)]
+fn deny_full_inspection(dsh: &Owned) {
+    // Model the native access boundary of an elevated process, using only our
+    // fake: VM_READ is denied while limited-query liveness and termination work.
+    use std::os::windows::io::AsRawHandle;
+    set_process_dacl(dsh.child.as_raw_handle(), "D:(D;;0x0010;;;WD)(A;;GA;;;OW)");
     assert!(
         process_identity::identify(dsh.identity.pid).is_err(),
         "native full inspection must actually be denied"
@@ -1617,6 +1707,39 @@ fn denied_inspection_reports_an_elevated_or_access_restricted_dependency_and_lea
             .count(),
         1
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_node_process_whose_image_cannot_be_read_does_not_block_dsh_startup() {
+    let mut fixture = Fixture::new();
+    let foreign_dir = fixture.root.join("foreign");
+    std::fs::create_dir(&foreign_dir).unwrap();
+    let program = foreign_dir.join("node.exe");
+    std::fs::copy(
+        fixture.config["dependencies"]["dsh"]["program"]
+            .as_str()
+            .unwrap(),
+        &program,
+    )
+    .unwrap();
+    let script = foreign_dir.join("unrelated.js");
+    std::fs::write(&script, "setInterval(()=>{},1000);").unwrap();
+    let mut foreign = Owned::new(
+        hidden(&program)
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // Like a production node under another token: even its image path cannot be read.
+    let hidden_image = deny_image_access(&foreign);
+    fixture.start();
+    fixture.healthy();
+    assert_eq!(fixture.states()["dsh"]["state"], "started");
+    assert!(foreign.child.try_wait().unwrap().is_none());
+    drop(hidden_image);
 }
 
 #[cfg(windows)]
