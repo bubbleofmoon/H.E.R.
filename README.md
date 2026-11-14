@@ -90,7 +90,7 @@ Human reply timing enforced in code (held sends and a typing indicator), a guard
 
 ## Building and testing
 
-Stable Rust; Windows (MSVC) is the production target, and Linux runs the same test suite. Builds go through the build slots described in [docs/agents/rust-validation.md](docs/agents/rust-validation.md). In short, from `her/`:
+Stable Rust; Windows (MSVC) is the production target, and Linux runs the same test suite. CI compiles, lints, formats and tests every pull request ([docs/agents/rust-validation.md](docs/agents/rust-validation.md)). To build and test by hand, from `her/`:
 
 ```
 cargo test --bin her <filter>            # unit tests
