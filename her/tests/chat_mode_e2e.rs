@@ -663,6 +663,33 @@ fn closed_agent_unresolved_preset_new_session_omits_preset_and_stores_the_empty_
 }
 
 #[test]
+fn a_muted_group_gets_no_turn_and_no_record_until_the_mute_ends() {
+    let mut rig = Rig::new("muted-chat", Seed::default());
+    let mute_path = rig.root.join("data/group-mutes.json");
+    let seed_mute = |until: i64| {
+        let mut groups = serde_json::Map::new();
+        groups.insert(GROUP_KEY.to_string(), json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        fs::write(&mute_path, json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    };
+    seed_mute(now_ms() + 600_000);
+    rig.start();
+    rig.push(group_event(1101, 1001, "tester", "", vec![text_seg("while muted")]));
+    let handled = wait_for(LONG, || {
+        let Ok(db) = rusqlite::Connection::open_with_flags(rig.root.join("data/inbound.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false };
+        db.query_row("SELECT stage FROM inbound_events WHERE event_key = ?1", [format!("group:{GROUP_ID}|message:1101")], |row| row.get::<_, String>(0)).ok().as_deref() == Some("handled")
+    });
+    assert!(handled, "the muted message was never marked handled");
+    assert!(rig.dsh.prompts().is_empty(), "no turn ran for a muted group: {:?}", rig.dsh.prompts());
+    assert!(rig.texts_to(GROUP_KEY).is_empty(), "nothing was sent: {:?}", rig.sends());
+    assert!(rig.data_json("social-v2.json")["conversations"].get(GROUP_KEY).is_none(), "no conversation record was created");
+
+    seed_mute(0);
+    rig.push(group_event(1102, 1001, "tester", "", vec![text_seg("after the mute")]));
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2), vec![ACK.to_string(), "synthetic reply".to_string()]);
+    assert_eq!(rig.dsh.prompts().len(), 1, "only the message after the mute ran a turn");
+}
+
+#[test]
 fn a_new_group_chat_acknowledges_before_rename_and_final_reply() {
     let mut rig = Rig::new("relay-order", Seed::default());
     rig.start();
