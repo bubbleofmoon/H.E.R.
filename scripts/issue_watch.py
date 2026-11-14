@@ -1,16 +1,21 @@
 """Wait until the baton label for one side lands on an open issue, print it and exit.
 
-Protocol: `docs/agents/baton.md`. The watcher asks GitHub for open issues labelled `baton:<side>` once per
-interval with a conditional request; an unchanged result answers 304, which costs nothing against the rate
-limit and wakes nobody. It exits when an issue newly carries the label (or carries it again after losing it).
-Comments, pushes and progress elsewhere never wake it. Run it in the background; its exit is the wake-up signal.
+Protocol: `docs/agents/baton.md` ("Watcher"). The watcher asks GitHub for open issues labelled `baton:<side>` once per
+interval with a conditional request; an unchanged result answers 304, which costs nothing against the rate limit and
+wakes nobody. It exits when an issue newly carries the label (or carries it again after losing it).
+Comments, pushes and progress elsewhere never wake it. Run it hidden in the background; its exit is the wake-up
+signal, so start it again after acting on the baton.
 
-usage: python -I scripts/issue_watch.py --machine windows|linux|owner [--repo bubbleofmoon/H.E.R.-vault]
+usage: python -I scripts/issue_watch.py --machine windows|linux|owner [--repo bubbleofmoon/H.E.R.]
                                         [--state <file>] [--interval 60] [--once]
---once polls a single time and prints the current baton holders ("no batons" when none are new).
-Exit 0 after printing, 2 on an API failure. Auth: GH_TOKEN or `gh auth token`.
+The default state file is ~/.her-baton-watch-<machine>-<owner>-<repo>.json, one per repository, so watching
+another repository never makes this one's held issues look new.
+--once polls a single time and prints the newly held issues ("no batons" when none are new).
+Exit 0 after printing, 2 on an API failure or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
 """
-import argparse, http.client, json, os, subprocess, sys, time, urllib.error, urllib.request
+import argparse, http.client, json, os, re, subprocess, sys, time, urllib.error, urllib.request
+
+REPO = re.compile(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)")
 
 
 def token():
@@ -44,15 +49,38 @@ def fetch(url, tok, etag):
         return etag, None
 
 
-def main():
+def repo_parts(repo):
+    match = REPO.fullmatch(repo)
+    if not match or match.group(2) in (".", ".."):
+        raise ValueError("--repo must be <owner>/<name>")
+    return match.groups()
+
+
+def default_state_path(machine, repo):
+    owner, name = repo_parts(repo)
+    return os.path.join(os.path.expanduser("~"), f".her-baton-watch-{machine}-{owner}-{name}.json")
+
+
+def new_events(holding, issues):
+    now = {i["number"]: i for i in issues if "pull_request" not in i}
+    events = [f"BATON #{n} {i['title']} {i['html_url']}" for n, i in sorted(now.items()) if n not in holding]
+    return events, sorted(now)
+
+
+def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--machine", required=True, choices=["windows", "linux", "owner"])
-    p.add_argument("--repo", default="bubbleofmoon/H.E.R.-vault")
+    p.add_argument("--repo", default="bubbleofmoon/H.E.R.")
     p.add_argument("--state", default=None)
     p.add_argument("--interval", type=int, default=60)
     p.add_argument("--once", action="store_true")
-    a = p.parse_args()
-    state_path = a.state or os.path.join(os.path.expanduser("~"), f".her-baton-watch-{a.machine}.json")
+    a = p.parse_args(argv)
+    try:
+        state_path = a.state or default_state_path(a.machine, a.repo)
+        repo_parts(a.repo)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
     try:
         state = json.load(open(state_path, encoding="utf-8"))
     except (OSError, ValueError):
@@ -64,11 +92,7 @@ def main():
         state["etag"] = etag
         events = []
         if issues is not None:
-            now = {i["number"]: i for i in issues if "pull_request" not in i}
-            for n, i in sorted(now.items()):
-                if n not in state["holding"]:
-                    events.append(f"BATON #{n} {i['title']} {i['html_url']}")
-            state["holding"] = sorted(now)
+            events, state["holding"] = new_events(state["holding"], issues)
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(state, f)
         if events or a.once:
