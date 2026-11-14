@@ -199,6 +199,7 @@ struct DshInner {
     digest_rpc_reject: bool,
     digest_hold: bool,
     digest_text: &'static str,
+    digest_requests: Vec<Value>,
     digest_memory_error: bool,
     digest_memory_legacy_error: bool,
     follow_drop: bool,
@@ -256,7 +257,8 @@ impl Dsh {
                 digest_fault: false,
                 digest_rpc_reject: false,
                 digest_hold: false,
-                digest_text: "synthetic turn complete",
+                digest_text: "[]",
+                digest_requests: Vec::new(),
                 digest_memory_error: false,
                 digest_memory_legacy_error: false,
                 follow_drop: false,
@@ -322,6 +324,31 @@ impl Dsh {
     }
     fn sends(&self) -> Vec<(u16, Value)> {
         lock(&self.inner).sends.clone()
+    }
+    fn digest_calls(&self) -> usize {
+        lock(&self.inner).digest_requests.len()
+    }
+    /// The relay's chat-completions endpoint answers rotation digests (`dependencies.model` is this server).
+    fn model_digest(self: &Arc<Self>, stream: &mut TcpStream, body: &[u8]) {
+        let (fault, hold, text) = {
+            let mut inner = lock(&self.inner);
+            inner.digest_requests.push(serde_json::from_slice(body).unwrap_or(Value::Null));
+            (inner.digest_fault, inner.digest_hold, inner.digest_text)
+        };
+        if hold {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                { let inner = lock(&self.inner); if inner.released || inner.shutting_down { break; } }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        if fault {
+            respond(stream, 500, &json!({"error":{"message":"synthetic-private-error-text"}}));
+            return;
+        }
+        respond(stream, 200, &json!({"id":"fixture","object":"chat.completion","created":1,"model":"ticket10-digest",
+            "choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}));
     }
 
     /// The old turn finally calls its send tool with the token it was given.
@@ -620,6 +647,10 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
         return;
     }
     let Some(request) = read_request(&mut stream) else { return };
+    if request.request_line.split_whitespace().nth(1) == Some("/v1/chat/completions") {
+        world.model_digest(&mut stream, &request.body);
+        return;
+    }
     let Ok(envelope) = serde_json::from_slice::<Value>(&request.body) else { return };
     let method = envelope.get("method").and_then(Value::as_str).unwrap_or("").to_string();
     let rpc_id = envelope.get("rpcId").and_then(Value::as_str).unwrap_or("").to_string();
@@ -964,6 +995,7 @@ impl Rig {
                     "recovery": {"waitSecs": 30}
                 },
                 "slang": {"enabled": false},
+                "harness": {"model": "ticket10-digest"},
                 "rollout": {"enabled": false, "rustGroups": []}
             })
             .to_string(),
@@ -982,6 +1014,7 @@ impl Rig {
         .unwrap();
         fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
         fs::write(root.join("user/dsh/.credentials.yaml"), SECRET).unwrap();
+        fs::write(root.join("config/harness-api-key"), "ticket10-digest-key").unwrap();
         fs::write(
             root.join("dependencies.json"),
             json!({"dsh": dsh_url, "model": dsh_url, "onebot": ob_url, "onebot_ws": ws_url}).to_string(),
@@ -3242,8 +3275,9 @@ fn hf85_idle_rotation_digest_archive_and_next_wake_fresh_briefing() {
     rig.patch_config(|c|c["dsh"]["rotation"]["caps"]["ticket10-model"]=json!(500_000));
     assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"eligible sleeping session was not rotated");
     let calls=rig.dsh.calls("session/prompt");
-    assert_eq!(calls.len(),2,"one wake and one digest only");
-    assert!(calls[1]["request"]["content"][0]["text"].as_str().unwrap().starts_with("【记忆整理】"));
+    assert_eq!(calls.len(),1,"one wake; the digest goes to the relay");
+    assert_eq!(rig.dsh.digest_calls(),1);
+    assert!(lock(&rig.dsh.inner).digest_requests[0].to_string().contains("preserve this recent message"));
     assert!(rig.onebot_sends().is_empty());
     assert!(wait_for(LONG,||fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap_or_default().contains("session rotation")));
     let activity=fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap();
@@ -3251,8 +3285,8 @@ fn hf85_idle_rotation_digest_archive_and_next_wake_fresh_briefing() {
     assert_eq!(lock(&rig.gateway).sends.len(),sent_before,"successful rotation sent a QQ message");
     assert!(activity.contains("500000") && activity.contains("digest=yes"));
     assert_eq!(rig.console("POST","/api/socialV2/wake",Some(&json!({"key":GROUP_KEY}))).0,200);
-    assert!(wait_for(LONG,||rig.dsh.applied().len()==3));
-    let next=rig.dsh.applied()[2].clone();
+    assert!(wait_for(LONG,||rig.dsh.applied().len()==2));
+    let next=rig.dsh.applied()[1].clone();
     assert_ne!(next.session,"js-origin-session");
     assert!(next.text.contains("【简报 revision=") && next.text.contains("preserve this recent message"));
     assert!(next.text.contains("【简报节 sending】\n【发送规则】") && next.text.contains("文本输出不会发送到 QQ"), "rotated session lost delivery rules");
@@ -3275,7 +3309,8 @@ fn hf85_rotation_digest_failure_alerts_once_and_still_archives() {
     thread::sleep(Duration::from_secs(2));
     assert_eq!(lock(&rig.gateway).requests.iter().filter(|(_,b)|b["user_id"].to_string().trim_matches('"')=="8808" && b["message"].to_string().contains("session rotation")).count(),1,"owner alert was not deduplicated");
     assert_eq!(rig.dsh.count("workspace/archiveSession"),1);
-    assert_eq!(rig.dsh.received(),2,"failed digest was resent");
+    assert_eq!(rig.dsh.received(),1);
+    assert_eq!(rig.dsh.digest_calls(),1,"failed digest was resent");
 }
 
 #[test]
@@ -3290,7 +3325,7 @@ fn hf85_rotation_incoming_during_digest_cancels_retirement_and_replies_once() {
     // Ingress and held sends must use the same synthetic wall clock in both processes.
     rig.restart_console_at_epoch();
     rig.restart(vec![]);
-    assert!(wait_for(LONG,||lock(&rig.dsh.inner).active_digests.contains("js-origin-session")),"digest never started");
+    assert!(wait_for(LONG,||rig.dsh.digest_calls()==1),"digest never started");
     lock(&rig.gateway).frames.push(mention_event(85601,"message during digest"));
     assert!(wait_for(LONG,||rig.dsh.applied().iter().any(|p|p.text.contains("message during digest"))),"queued incoming wake did not resume");
     assert!(wait_for(LONG,||rig.onebot_sends().len()==2));
@@ -3334,27 +3369,25 @@ fn hf85_rotation_owner_private_uses_total_input_and_provider_cache_life() {
 
 
 #[test]
-fn hf85_rotation_unknown_digest_admission_survives_restart_without_resubmission() {
+fn hf85_rotation_digest_interrupted_by_restart_writes_nothing_and_runs_once_more() {
     let mut rig=Rig::new("hf85-digest-restart",Opts{seed_session:Some("js-origin-session")});
     lock(&rig.dsh.inner).input_tokens=500_000;
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":5}));
     rig.dsh.set_plan(Plan{send:None,hold:false});
-    rig.start_candidate(mention(85800,"before lost digest admission"));
+    rig.start_candidate(mention(85800,"before interrupted digest"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
     rig.epoch=Some(now_ms()+245_000);
-    rig.dsh.set_fault(Fault::ApplyThenHang);
     lock(&rig.dsh.inner).digest_hold=true;
     rig.restart(vec![]);
-    assert!(wait_for(LONG,||rig.dsh.applied().len()==2 && lock(&rig.dsh.inner).active_digests.contains("js-origin-session")),"digest never reached the fake DSH");
+    assert!(wait_for(LONG,||rig.dsh.digest_calls()==1),"digest never reached the fake relay");
     rig.kill_candidate();
-    rig.dsh.set_fault(Fault::None);
-    // A pending external wake must wait for recovery of the durable maintenance RPC.
-    assert_eq!(rig.console("POST","/api/socialV2/wake",Some(&json!({"key":GROUP_KEY}))).0,200);
+    lock(&rig.dsh.inner).digest_hold=false;
+    rig.dsh.release();
     rig.start_candidate(vec![]);
-    assert!(wait_for(LONG,||rig.dsh.applied().len()==3),"external wake remained stuck after digest recovery");
-    assert_eq!(rig.dsh.applied().iter().filter(|p|p.text.starts_with("【记忆整理】")).count(),1,"unknown digest was blindly resubmitted");
-    assert_eq!(rig.dsh.count("workspace/archiveSession"),0,"queued external wake did not delay rotation");
-    assert_eq!(lock(&rig.dsh.inner).overlapping_prompts,0,"wake was submitted before the old digest stopped");
+    assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"interrupted digest blocked rotation");
+    assert_eq!(rig.dsh.digest_calls(),2,"an interrupted digest wrote nothing and runs once more");
+    let record=rig.sessions_file()["briefings"][GROUP_KEY].clone();
+    assert_eq!(record["digestedThrough"],record["lastTurnSeq"]);
     assert!(rig.onebot_sends().is_empty());
 }
 
@@ -3371,7 +3404,7 @@ fn hf85_rotation_never_runs_during_a_turn_even_after_cache_expiry() {
     rig.restart(mention(85901,"active turn prevents rotation"));
     assert!(wait_for(LONG,||rig.turn_state(1)=="running"));
     let before=rig.dsh.received();
-    assert!(lock(&rig.dsh.inner).active_digests.is_empty(),"normal turn overlaps an unfinished digest");
+    assert_eq!(rig.dsh.digest_calls(),0,"normal turn overlaps a digest");
     assert_eq!(lock(&rig.dsh.inner).overlapping_prompts,0);
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":1.01}));
     thread::sleep(Duration::from_secs(3));
@@ -3411,7 +3444,8 @@ fn hf85_rotation_one_minute_cache_rotates_after_the_turn_closes() {
     rig.start_candidate(mention(86100,"one-minute provider cache"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
     assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"cache life minus one minute should rotate immediately after closing");
-    assert_eq!(rig.dsh.applied().len(),2,"one normal wake and one digest");
+    assert_eq!(rig.dsh.applied().len(),1);
+    assert_eq!(rig.dsh.digest_calls(),1);
     assert!(rig.onebot_sends().is_empty());
 }
 
@@ -3463,28 +3497,9 @@ fn hf85_rotation_uses_the_last_reminder_calls_input_and_closing_evidence() {
     rig.epoch=Some(now_ms()+245_000);
     rig.restart(vec![]);
     assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"last call was a closed reminder at the cap; it must be eligible for rotation");
-    assert_eq!(rig.dsh.applied().iter().filter(|p|p.text.starts_with("【记忆整理】")).count(),1);
+    assert_eq!(rig.dsh.digest_calls(),1);
 }
 
-#[test]
-fn hf85_fix1_digest_rpc_rejection_with_partial_history_unblocks_incoming_wake() {
-    let mut rig = Rig::new("hf85-rpc-rejection", Opts { seed_session: Some("js-origin-session") });
-    lock(&rig.dsh.inner).input_tokens = 500_000;
-    lock(&rig.dsh.inner).digest_rpc_reject = true;
-    rig.patch_config(|c| c["dsh"]["cacheTtlMinutes"] = json!({"ticket10-provider":5}));
-    rig.start_candidate(mention(86400, "before explicit digest rejection"));
-    assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-    rig.dsh.set_truncate(true);
-    rig.epoch = Some(now_ms() + 245_000);
-    rig.restart_console_at_epoch();
-    rig.restart(vec![]);
-    assert!(wait_for(LONG, || rig.dsh.received() == 2), "digest RPC was never submitted");
-    lock(&rig.gateway).frames.push(mention_event(86401, "incoming after digest rejection"));
-    assert!(wait_for(LONG, || rig.turn_state(1) == "completed"), "definite RPC rejection with partial history blocked the incoming wake");
-    assert_eq!(rig.dsh.received(), 3, "a rejected digest must never be probed or resent as unknown");
-    assert!(wait_for(LONG, || rig.onebot_sends().len() == 2), "incoming wake did not reply exactly once");
-    assert_eq!(lock(&rig.gateway).requests.iter().filter(|(_, b)| b["user_id"].to_string().trim_matches('"') == "8808" && b["message"].to_string().contains("session rotation")).count(), 1, "digest failure must alert the owner once");
-}
 
 fn hf85_digest_terminal_case(name: &str, text: &'static str, recover: bool, success: bool) {
     let mut rig = Rig::new(name, Opts { seed_session: Some("js-origin-session") });
@@ -3501,10 +3516,9 @@ fn hf85_digest_terminal_case(name: &str, text: &'static str, recover: bool, succ
     rig.epoch = Some(now_ms() + 245_000);
     rig.restart(vec![]);
     if recover {
-        assert!(wait_for(LONG, || lock(&rig.dsh.inner).active_digests.contains("js-origin-session")));
+        assert!(wait_for(LONG, || rig.dsh.digest_calls() == 1));
         rig.kill_candidate();
         rig.dsh.release();
-        assert!(wait_for(LONG, || lock(&rig.dsh.inner).sessions["js-origin-session"].events.last().is_some_and(|e| e["type"] == "turn/end" && e["data"]["turn"] == 2)));
         rig.start_candidate(vec![]);
     }
     assert!(wait_for(LONG, || rig.dsh.count("workspace/archiveSession") == 1), "digest completion blocked rotation: {name}, recover={recover}");
@@ -3520,7 +3534,8 @@ fn hf85_digest_terminal_case(name: &str, text: &'static str, recover: bool, succ
     rig.restart(vec![]);
     thread::sleep(Duration::from_secs(1));
     assert_eq!(alerts(&rig), if success { 0 } else { 1 }, "restart duplicated the owner alert");
-    assert_eq!(rig.dsh.received(), 2, "digest was resent");
+    assert_eq!(rig.dsh.received(), 1);
+    assert_eq!(rig.dsh.digest_calls(), if recover { 2 } else { 1 }, "digest was resent");
     assert!(rig.onebot_sends().is_empty());
 }
 
@@ -3539,9 +3554,9 @@ fn hf85_fix1_digest_completed_error_fails_live_and_after_restart() {
 }
 
 #[test]
-fn hf85_fix1_digest_empty_final_after_memory_tools_succeeds_live_and_after_restart() {
+fn hf85_fix1_digest_empty_array_succeeds_live_and_after_restart() {
     for recover in [false, true] {
-        hf85_digest_terminal_case("hf85-empty-digest", "", recover, true);
+        hf85_digest_terminal_case("hf85-empty-digest", "[]", recover, true);
     }
 }
 
@@ -3723,7 +3738,7 @@ fn hf85_port_fix3_restart_after_settled_digest_rotates_once_without_redigest() {
             let mut inner = lock(&rig.dsh.inner);
             inner.input_tokens = 500_000;
             inner.digest_hold = true;
-            inner.digest_text = if success { "" } else { r#"{"errorMessage":"upstream unavailable"}"# };
+            inner.digest_text = if success { "[]" } else { r#"{"errorMessage":"upstream unavailable"}"# };
             inner.plan = Plan { send: None, hold: false };
         }
         rig.patch_config(|c| c["dsh"]["cacheTtlMinutes"] = json!({"ticket10-provider":5}));
@@ -3731,7 +3746,7 @@ fn hf85_port_fix3_restart_after_settled_digest_rotates_once_without_redigest() {
         assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
         rig.epoch = Some(now_ms() + 245_000);
         rig.restart(vec![]);
-        assert!(wait_for(LONG, || lock(&rig.dsh.inner).active_digests.contains("js-origin-session")));
+        assert!(wait_for(LONG, || rig.dsh.digest_calls() == 1));
         // Hold the existing OS reset gate: digest persistence can finish, but the hub cannot retire.
         let gate = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .open(rig.root.join("data/locks/closed-agent.lock")).unwrap();
@@ -3749,14 +3764,14 @@ fn hf85_port_fix3_restart_after_settled_digest_rotates_once_without_redigest() {
         drop(gate);
         rig.start_candidate(vec![]);
         assert!(wait_for(LONG, || rig.dsh.count("workspace/archiveSession") == 1), "restart lost the rotation after digest success={success}");
-        assert_eq!(rig.dsh.received(), 2, "restart resubmitted a settled digest");
+        assert_eq!(rig.dsh.received(), 1); assert_eq!(rig.dsh.digest_calls(), 1, "restart re-ran a settled digest");
         let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
         assert_eq!(record["digestedThrough"] == record["lastTurnSeq"], success);
         assert!(rig.sessions_file()["sessions"].get(GROUP_KEY).is_none());
         rig.restart(vec![]);
         thread::sleep(Duration::from_secs(1));
         assert_eq!(rig.dsh.count("workspace/archiveSession"), 1, "restart repeated retirement");
-        assert_eq!(rig.dsh.received(), 2);
+        assert_eq!(rig.dsh.received(), 1); assert_eq!(rig.dsh.digest_calls(), 1, "restart re-ran a settled digest");
         assert_eq!(alerts(&rig), if success { 0 } else { 1 });
         assert!(rig.onebot_sends().is_empty());
     }
@@ -3896,195 +3911,27 @@ fn hf135_pending_fixture(name: &str) -> Rig {
     rig
 }
 
+
+
 #[test]
-fn hf135_unknown_digest_stream_failure_does_not_hold_conversation_forever() {
-    let mut rig = hf135_pending_fixture("hf135-unknown-stream");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        inner.follow_drop = true;
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        event(sess, "user/message", json!({"source":{"rpcId":"hf135-before-restart"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-    }
+fn hf135_pending_dsh_digest_from_an_earlier_release_runs_the_digest_once() {
+    let mut rig = hf135_pending_fixture("hf135-legacy-pending");
     rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1),
-        "unverified pending digest held the maintenance slot forever");
+    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
+    assert_eq!(rig.dsh.received(), 1, "no DSH digest prompt is ever submitted");
+    assert_eq!(rig.dsh.digest_calls(), 1);
     let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-    assert!(record["digestedThrough"].is_null(), "unknown digest advanced the cursor");
-    assert_eq!(rig.dsh.received(), 1, "unknown digest was blindly repeated");
-    let (_, status) = rig.console("GET", "/api/sessions", None);
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["step"], "follow-read");
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["kind"], "transport");
-    lock(&rig.dsh.inner).follow_drop = false;
-    lock(&rig.dsh.inner).truncate = false;
-    assert_eq!(rig.console("POST", "/api/socialV2/wake", Some(&json!({"key":GROUP_KEY}))).0, 200);
-    assert!(wait_for(LONG, || rig.dsh.applied().len() == 2), "session unusable after digest failure");
-    assert_ne!(rig.dsh.applied()[1].session, "js-origin-session");
+    assert_eq!(record["digestedThrough"], record["lastTurnSeq"]);
 }
 
 
-#[test]
-fn hf135_unexecuted_pending_digest_retires_without_replay() {
-    let mut rig = hf135_pending_fixture("hf135-never-executed");
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    assert_eq!(rig.dsh.received(), 1, "pending digests must never submit a replacement RPC");
-    let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-    assert!(record["digestedThrough"].is_null(), "unexecuted digest advanced the cursor");
-    assert!(record["rotation"]["retryCount"].is_null());
-}
-
-#[test]
-fn hf135_failed_memory_write_never_advances_digest_cursor() {
-    for recover in [false, true] {
-        // The final answer is empty/successful; only the actual tool result reports failure.
-        // Use the existing fake-DSH terminal-result scenario, with the failure flag added here.
-        let mut rig = Rig::new("hf135-memory-write", Opts { seed_session: Some("js-origin-session") });
-        {
-            let mut inner = lock(&rig.dsh.inner);
-            inner.input_tokens = 500_000;
-            inner.digest_memory_error = true;
-            inner.digest_memory_legacy_error = recover;
-            inner.digest_text = "";
-            inner.digest_hold = recover;
-            inner.plan = Plan { send: None, hold: false };
-        }
-        rig.patch_config(|c| c["dsh"]["cacheTtlMinutes"] = json!({"ticket10-provider":5}));
-        rig.start_candidate(mention(13510, "memory write failure"));
-        assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-        rig.epoch = Some(now_ms() + 245_000);
-        rig.restart(vec![]);
-        if recover {
-            assert!(wait_for(LONG, || lock(&rig.dsh.inner).active_digests.contains("js-origin-session")));
-            rig.kill_candidate();
-            rig.dsh.release();
-            assert!(wait_for(LONG, || lock(&rig.dsh.inner).sessions["js-origin-session"].events.last().is_some_and(|e| e["type"] == "turn/end" && e["data"]["turn"] == 2)));
-            rig.start_candidate(vec![]);
-        }
-        assert!(wait_for(LONG, || rig.dsh.count("workspace/archiveSession") == 1));
-        let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-        assert!(record["digestedThrough"].is_null(), "failed memory_write was recorded as a successful digest");
-        let (_, status) = rig.console("GET", "/api/sessions", None);
-        assert_eq!(status["rotationFailures"][GROUP_KEY]["step"], "memory-write");
-        assert_eq!(rig.dsh.received(), 2, "partial digest must not be replayed");
-        assert!(rig.onebot_sends().is_empty());
-    }
-}
 
 
-#[test]
-fn hf135_partial_history_preserves_unknown_outcome_without_replaying_memory() {
-    let mut rig = hf135_pending_fixture("hf135-truncated-history");
-    lock(&rig.dsh.inner).truncate = true;
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    let (_, status) = rig.console("GET", "/api/sessions", None);
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["step"], "rpc-lookup");
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["kind"], "history-truncated");
-    assert_eq!(rig.dsh.received(), 1, "partial history cannot prove non-execution");
-    assert!(rig.sessions_file()["briefings"][GROUP_KEY]["digestedThrough"].is_null());
-}
 
 
-#[test]
-fn hf135_follow_open_reports_only_step_and_kind() {
-    let mut rig = hf135_pending_fixture("hf135-open-failure");
-    lock(&rig.dsh.inner).probe = ProbeFault::MethodNotFound;
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(10), || {
-        let (_, status) = rig.console("GET", "/api/sessions", None);
-        status["rotationFailures"][GROUP_KEY]["step"] == "follow-open"
-    }));
-    assert!(wait_for(Duration::from_secs(10), || lock(&rig.gateway).requests.iter().any(|(_, b)| b["message"].to_string().contains("step=follow-open kind=rejected"))));
-    let notices: Vec<_> = lock(&rig.gateway).requests.iter().filter(|(_, b)| b["message"].to_string().contains("session rotation")).cloned().collect();
-    assert_eq!(notices.len(), 1);
-    assert!(!notices[0].1["message"].to_string().contains("method-not-found"));
-    lock(&rig.dsh.inner).probe = ProbeFault::None;
-}
 
 
-#[test]
-fn hf135_restart_keeps_out_of_window_digest_unverified_without_replay() {
-    let mut rig = hf135_pending_fixture("hf135-old-rpc");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        inner.follow_history_cap = true;
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        event(sess, "user/message", json!({"source":{"rpcId":"hf135-before-restart"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-        event(sess, "tool/call", json!({"turn":2,"callId":"saved-memory","name":"memory_write"}));
-        event(sess, "tool/result", json!({"turn":2,"message":{"isError":false,"source":{"callId":"saved-memory"}}}));
-        for step in 0..250 {
-            event(sess, "assistant/message", json!({"turn":2,"step":step,"message":{"content":[{"type":"text","text":"synthetic digest step"}]}}));
-        }
-        event(sess, "turn/end", json!({"turn":2,"reason":{"kind":"completed"}}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1), "restart held an out-of-window digest forever");
-    let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-    assert!(record["digestedThrough"].is_null(), "unverified out-of-window digest advanced the cursor");
-    assert_eq!(rig.dsh.received(), 1, "out-of-window digest was replayed");
-    assert_eq!(rig.sessions_file()["rotationFailures"][GROUP_KEY]["kind"], "history-truncated");
-}
 
 
-#[test]
-fn hf135_unknown_digest_and_broken_cancel_do_not_block_queued_wake() {
-    let mut rig = hf135_pending_fixture("hf135-cancel-unverified");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        inner.follow_drop = true;
-        inner.digest_cancel_reject = true;
-        inner.active_digests.insert("js-origin-session".into());
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        event(sess, "user/message", json!({"source":{"rpcId":"hf135-before-restart"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(10), || rig.sessions_file()["rotationFailures"][GROUP_KEY]["step"] == "follow-read"));
-    assert_eq!(rig.console("POST", "/api/socialV2/wake", Some(&json!({"key":GROUP_KEY}))).0, 200);
-    assert!(wait_for(Duration::from_secs(15), || rig.sessions_file()["sessions"][GROUP_KEY] != "js-origin-session"), "failed DSH cancellation held the old mapping forever");
-    lock(&rig.dsh.inner).follow_drop = false;
-    lock(&rig.dsh.inner).digest_cancel_reject = false;
-    assert!(wait_for(LONG, || rig.dsh.applied().len() == 2), "queued wake was lost while retiring unknown digest");
-    assert_ne!(rig.dsh.applied()[1].session, "js-origin-session");
-    assert_eq!(lock(&rig.dsh.inner).overlapping_prompts, 0);
-    assert_eq!(rig.dsh.applied().iter().filter(|p| p.text.starts_with("【记忆整理】")).count(), 0, "unknown digest was resubmitted");
-    assert_eq!(rig.dsh.late_send(&rig.dsh.applied()[0].text).unwrap().0, 403, "old digest authority survived retirement");
-}
-
-#[test]
-fn hf135_legacy_foreign_rpc_never_replays_a_possibly_written_digest() {
-    let mut rig = hf135_pending_fixture("hf135-legacy-rpc");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        // Legacy envelope/source mismatch: the digest already wrote memory under another ID.
-        event(sess, "user/message", json!({"source":{"rpcId":"legacy-dsh-request-id"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-        event(sess, "tool/call", json!({"turn":2,"callId":"legacy-write","name":"memory_write"}));
-        event(sess, "tool/result", json!({"turn":2,"message":{"isError":false,"source":{"callId":"legacy-write"}}}));
-        event(sess, "turn/end", json!({"turn":2,"reason":{"kind":"completed"}}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    assert_eq!(rig.dsh.received(), 1, "a foreign correlated digest may already have committed memory; replay duplicates it");
-    assert!(rig.sessions_file()["briefings"][GROUP_KEY]["digestedThrough"].is_null());
-    let (_, status) = rig.console("GET", "/api/sessions", None);
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["kind"], "identity-unverified");
-}
 
 
-#[test]
-fn hf135_explicit_queue_removal_never_replays_a_digest() {
-    let mut rig = hf135_pending_fixture("hf135-removed-intent");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        event(inner.sessions.get_mut("js-origin-session").unwrap(), "agent/inbox/spliced",
-            json!({"outcome":"canceled","inserted":[{"source":{"rpcId":"hf135-before-restart"}}]}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    assert_eq!(rig.dsh.received(), 1, "removed digest was replayed under a fresh RPC");
-    assert!(rig.sessions_file()["briefings"][GROUP_KEY]["digestedThrough"].is_null());
-}
