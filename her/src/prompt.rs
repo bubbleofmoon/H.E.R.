@@ -1942,6 +1942,10 @@ pub(crate) fn prepare_dsh_wake_layered(
         offered.set(items.len());
         assembly.material_fit(items, overhead)
     });
+    // The recall block is stripped on its own before anything is counted or held: a block the strip empties
+    // delivers no memory and holds none. A partial strip keeps the ids, as a partly stripped section stays counted.
+    let recall = crate::model_view::strip_from_model_text(&recall, cfg);
+    let recalled = if recall.trim().is_empty() { Vec::new() } else { recalled };
     // What DSH receives: a section the model-view strip emptied delivers nothing, so its items are not counted.
     // A section that is only partly stripped stays counted in full.
     let mut delivered = assembly.counts;
