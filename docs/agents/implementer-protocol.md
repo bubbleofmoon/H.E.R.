@@ -34,8 +34,16 @@ Never speculate about code you have not opened. Read the source before making an
 - **Carry the work through.** Keep working until every acceptance criterion is met with evidence, and only stop when you cannot go on without the coordinator or the owner (credentials, real QQ ids, production actions, scope changes) or before a risky step.
 - **Never** contact real QQ, DSH, model or TTS services, touch production config, tokens or the live binary. A guard hook blocks the most dangerous of these; a blocked call has not taken effect, so do not retry it another way.
 
-- **Test loop.** Run the one target you are changing locally only when it is fast; otherwise commit and push your ticket branch, each as its own plain command (`cd <worktree> && git commit -m <msg>` or `-F <file>`, then `cd <worktree> && HER_GITLEAKS=<path to gitleaks> git push -u origin her/<n>-<slug>`; the pre-push scan runs, and the guard refuses chaining, `$`, `git -C`, `--no-verify` and any other push), then `cd <worktree> && gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test>] [-f os=windows]`, then `gh run list --workflow quick.yml --branch her/<n>-<slug> -L 1` and `gh run watch <id> --exit-status`; quote the run link and the result lines in the report. The full suite runs on the pull request.
+- **Test loop.** Run the one target you are changing locally only when it is fast; otherwise commit and push your ticket branch, each as its own plain command (`cd <worktree> && git commit -m <msg>` or `-F <file>`, then `cd <worktree> && HER_GITLEAKS=<path to gitleaks> git push -u origin her/<n>-<slug>`; the pre-push scan runs, and the guard refuses chaining, `$`, `git -C`, `--no-verify` and any other push), then `cd <worktree> && gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test>] [-f os=windows]`, then `gh run list --workflow quick.yml --branch her/<n>-<slug> -L 1` and `gh run watch <id> --exit-status --interval 60`; quote the run link and the result lines in the report. The full suite runs on the pull request. Poll CI at most once a minute; parallel workers share one GitHub API limit (5000 an hour), and a 403 rate-limit answer is never a test result.
 - **Known pitfalls.** Check each of these before reporting and say in the report that you did: processes and temp files cleaned up on every failure path (process groups killed, try opened before the first spawn); boundary cases of every threshold or limit tested on both sides; paths resolved the way the consuming tool resolves them; no stale artifacts from an earlier run; every new test seen failing for the right reason; line endings and file modes preserved.
+- **Self-review.** Before reporting, run Codex read-only on your branch, at most two rounds:
+  - Write the prompt to `/root/orch/her/<ticket>/review/codex-self-<k>.md` (Windows `C:/her-orch/<ticket>/review/`). Its first lines are `Head: <sha>` and `Base: <sha of origin/main>`. It asks for a two-axis review (spec vs ticket, correctness defects) of `git diff <base>...<head>` in the worktree only, and names no vault path.
+  - Run exactly `cd <worktree> && /root/her/scripts/codex-task.sh <ticket>-self-<k> <worktree> <prompt> gpt-6.1-sol high read-only [minutes]`. On Windows: `powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name <ticket>-self-<k> -WorkDir <worktree> -PromptFile <prompt> -Model gpt-6.1-sol -Effort high -Sandbox read-only [-TimeoutMinutes <1-999>]`.
+  - The guard allows only this form: the integration checkout's script, no other model, effort or sandbox, nothing chained.
+  - Start it with the Bash tool's background option and wait for its `.exit.txt` with a bounded wait.
+  - Write no `<name>.cleanup.txt`.
+  - Verify each finding in the code, and fix the real ones, each swept for its pattern across your change.
+  - Codex is capped at three rounds per ticket, the gate's included.
 
 ## State and evidence
 
@@ -56,7 +64,7 @@ Not verified / not run: <items> or none
 Open or blocked: <items> or none
 ```
 
-Keep it short; no narrative. Write the report to the ticket's own file (Windows `C:/her-orch/<ticket>/report-<run>.md`, Linux `/root/orch/her/<ticket>/report-<run>.md`) and return that path as the last line of your run. Workers never post it and never touch GitHub beyond their ticket branch and `quick.yml` runs: the coordinator reads the report, writes a cleaned summary and posts that through `scripts/gh-public`, naming evidence by path only. A report may state a private path or a vault file; a public comment states paths and never contents.
+Keep it short; no narrative. Your report is your final message: the coordinator saves it to the ticket's report file (Linux `/root/orch/her/<ticket>/report-<run>.md`, Windows `C:/her-orch/<ticket>/report-<run>.md`), and `scripts/codex-task` and `scripts/pi-task` save a run's final message beside its prompt as `<Name>.report.md`. Workers never post it and never touch GitHub beyond their ticket branch and `quick.yml` runs: the coordinator reads the report, writes a cleaned summary and posts that through `scripts/gh-public`, naming evidence by path only. A report may state a private path or a vault file; a public comment states paths and never contents.
 
 ## Ending turns
 

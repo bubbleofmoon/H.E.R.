@@ -38,7 +38,7 @@ and local gates keep only the native, elevated and production checks the hosted 
 On the shared development host, use the cargo-slot scripts for every Rust command.
 
 The guard tests itself: `python -I scripts/tests/test_scan_public.py`,
-`python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`
+`python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`, `python -I scripts/tests/test_handoff.py`
 run against synthetic samples and a stub `gh`, and need gitleaks on `PATH` or `HER_GITLEAKS`. `.githooks/pre-push` and `scripts/gh-public` need it too; without it they refuse with `scanner-missing` (exit 3), not with a finding. Install the pinned version with `python -I scripts/ci/install-gitleaks.py <dir>` and point `HER_GITLEAKS` at it (host paths: `docs/agents/rust-validation.md`).
 
 Fixtures use short synthetic account identifiers. Numeric scan exceptions must

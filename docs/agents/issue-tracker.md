@@ -41,7 +41,7 @@ ready_issues windows
 ready_issues linux
 ```
 
-Read the queue when a session starts and after each handoff; there is no watcher process. Keep your baton while working so a new session can find the work.
+Read the queue when a session starts and after each handoff; between them the baton watcher (`baton.md` "Watcher") wakes a session for batons only, never for readiness or claims. Keep your baton while working so a new session can find the work.
 
 ## Wayfinding operations
 

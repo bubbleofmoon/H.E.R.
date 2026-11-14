@@ -18,6 +18,7 @@
 - The QQ login episode test in `console_runtime_routes` runs with either clock: `--features parity-clock` advances synthetic epochs across supervisor restarts; default builds wait for the persisted host-clock retry deadlines. The fake timestamps deliveries on the corresponding clock, independently of product deadlines, and asserts at least 60 seconds between attempts, including a quiet restart 45 seconds after failure. Both modes assert the same attempts and confirmed deliveries, await delivery separately from observation publication, and retain real 30-second polls for recovery without a restart. Use the feature for repeated target validation; default-mode coverage takes several additional minutes.
 - Fix compile errors in the calls and error handling, never by returning empty responses or removing features.
 - A patch rejected by auto-review or a guard hook has not taken effect; do not repeat the same action through another tool.
+- The Linux coordinator compile-checks a planner's scratch export as ticket `<n>p` (`check --tests`, target `/root/rb-targets/<n>p`, evidence in `/root/orch/her/<n>/scratch-evidence`) after checking its build files (`docs/agents/coordinator.md` "Planner"); planners never build, and planning runs on Linux only for now.
 
 ## Linux host (`/root/her`)
 
