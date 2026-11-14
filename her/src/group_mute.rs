@@ -136,7 +136,8 @@ pub(crate) fn apply_at(context: &RuntimeContext, key: &str, change: Change, oper
     match change {
         Change::Banned(until) => entry["personalUntil"] = json!(until),
         Change::Lifted => entry["personalUntil"] = json!(0),
-        Change::Invalidate => return Ok(None),
+        // No state change: the write below only advances `seq`, which drops every refresh that began earlier.
+        Change::Invalidate => {}
         // A refusal never shortens a known mute, but it is newer evidence than any refresh in flight:
         // it still bumps `seq` below.
         Change::Learned => { if before.is_none() { entry["personalUntil"] = json!(-1); } }
@@ -192,6 +193,13 @@ pub fn record(context: &RuntimeContext, cfg: &Value, key: &str, change: Change, 
         }
         Ok(None) => {}
         Err(error) => crate::safe_println!("[mute] {key} 禁言状态未能保存：{error}"),
+    }
+}
+
+/// QQ's whole-group notice arrived for `key`: every refresh that began before it is stale and is dropped.
+pub fn note_whole_group_notice(context: &RuntimeContext, key: &str) {
+    if let Err(error) = apply_at(context, key, Change::Invalidate, None, crate::parity_clock::now_ms()) {
+        crate::safe_println!("[mute] {key} 全员禁言通知未能使旧的刷新失效：{error}");
     }
 }
 

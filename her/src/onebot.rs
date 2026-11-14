@@ -182,7 +182,8 @@ const REFUSAL_RETCODES: [i64; 4] = [1400, 1401, 1403, 1404];
 /// Error text of a failed OneBot send reply; a group-mute refusal carries `MUTE_REFUSAL` (#46).
 fn send_failure_text(v: &serde_json::Value, retcode: i64) -> String {
     let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
-    format!("OneBot 发送失败：retcode={retcode} {wording}")
+    let marker = if is_mute_reply(v) { MUTE_REFUSAL } else { "" };
+    format!("OneBot 发送失败：retcode={retcode} {wording}{marker}")
 }
 
 /// Marker in a not-committed error for a group-mute refusal (#46).

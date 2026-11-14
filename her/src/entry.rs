@@ -211,8 +211,9 @@ struct Event {
     message_type: String,
     #[serde(default)]
     sub_type: String,
+    /// Lenient like the other mute fields: a null or non-string value must not drop the whole frame.
     #[serde(default)]
-    notice_type: String,
+    notice_type: Option<Value>,
     /// `group_ban` operator. Lenient: a malformed value only loses the name in the owner notice.
     #[serde(default)]
     operator_id: Option<Value>,
@@ -2285,6 +2286,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 if !replayed && self_id > 0 {
                     if let Some((gid, operator)) = group_mute::whole_group_notice(&text) {
                         if allow_groups.iter().any(|g| g == &gid.to_string()) {
+                            // Older refreshes predate this notice: drop them before the new one starts.
+                            let (context, key) = (runtime_context.clone(), format!("group:{gid}"));
+                            if let Err(error) = tokio::task::spawn_blocking(move || group_mute::note_whole_group_notice(&context, &key)).await {
+                                println!("[mute] group:{gid} 全员禁言通知的处理线程失败：{error}");
+                            }
                             group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), self_id, vec![(gid, operator)]);
                         }
                     }
@@ -2400,17 +2406,20 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
         // #46: QQ's mute notice. Before the self filter (it names her own id) and before mode dispatch;
         // it is not journaled and never wakes anyone. A notice for another user is ignored.
-        if is_notice && ev.notice_type == "group_ban" {
+        if is_notice && ev.notice_type.as_ref().and_then(Value::as_str) == Some("group_ban") {
             let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
             if let (false, Some(gid)) = (replayed, ev.group_id) {
                 if me > 0 && ev.user_id == Some(me) && allow_groups.iter().any(|g| g == &gid.to_string()) {
                     let operator = ev.operator_id.as_ref().and_then(protocol_integer).filter(|id| *id > 0);
                     let (context, sub_type, duration, key) = (runtime_context.clone(), ev.sub_type.clone(), ev.duration.clone(), format!("group:{gid}"));
                     // Settled before the next frame: a message right after the ban never wakes her.
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let log_key = format!("group:{gid}");
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
                         let cfg = context.load_config().unwrap_or_else(|_| json!({}));
                         group_mute::on_self_notice(&context, &cfg, &key, &sub_type, duration.as_ref(), operator);
-                    }).await;
+                    }).await {
+                        println!("[mute] {log_key} 禁言通知的处理线程失败：{error}");
+                    }
                 }
             }
             continue;

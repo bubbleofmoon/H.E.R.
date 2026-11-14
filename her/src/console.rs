@@ -8865,15 +8865,20 @@ where
     if matches!(settled.state, crate::send_outbox::ItemState::NotCommitted) {
         retain_reservation = false;
     }
-    if let Some(error) = settled.record_error {
-        return Err((503, if delivered { format!("已发送，但发送结果未能持久记录：{error}") } else { format!("发送结果未能持久记录：{error}") }));
-    }
     if matches!(settled.state, crate::send_outbox::ItemState::NotCommitted)
         && settled.error.as_deref().is_some_and(crate::onebot::is_mute_refusal)
     {
-        // #46: settle has already learned the mute; answer as a definite local refusal, never 500 (unknown).
+        // #46: settle has already learned the mute; answer as a definite local refusal, never 500 or 503
+        // (unknown delivery). A failed record write is reported beside it, not instead of it.
+        if let Some(error) = &settled.record_error {
+            crate::safe_eprintln!("[sticker] {storage_key} 禁言拒绝的发送记录未能写入：{error}");
+            crate::activity::append(context, &format!("{storage_key} [sticker] 禁言拒绝的发送记录未能写入"));
+        }
         mute_send_denial(context, cfg, &storage_key, token)?;
         return Err((403, format!("发送表情失败：{}", settled.error.unwrap_or_default())));
+    }
+    if let Some(error) = settled.record_error {
+        return Err((503, if delivered { format!("已发送，但发送结果未能持久记录：{error}") } else { format!("发送结果未能持久记录：{error}") }));
     }
     let data = match settled.state {
         crate::send_outbox::ItemState::Confirmed { message_id, .. } => settled.data.unwrap_or_else(|| json!({ "message_id": message_id })),

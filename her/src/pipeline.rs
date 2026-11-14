@@ -2308,7 +2308,14 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Some(why) = configured_outbound_violation(&cfg, text, &self.secrets) {
             return Err(format!("被出站哨兵拦下：{why}"));
         }
-        self.ob.send_text(target, text, &self.tune, &mut self.limiter)
+        let sent = self.ob.send_text(target, text, &self.tune, &mut self.limiter);
+        if let Err(error) = &sent {
+            if crate::onebot::is_mute_refusal(error) {
+                // #46: QQ refused with result=120; later sends and wakes for this group stay local.
+                crate::group_mute::learn_from_refusal(&self.context, &target.key());
+            }
+        }
+        sent
     }
 
     /// 完整一轮：投 prompt → 等回复 → 发回 QQ。
@@ -2965,6 +2972,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 error.to_owned()
             })?;
             if status == 429 { return Ok(Some(0)); }
+            if status == 403 && crate::group_mute::active(&self.context, &key).is_some() {
+                // #46: the console refused locally because the group is muted: a clean sleep, not a failed send.
+                println!("[pipeline] {key} 禁言中，CLI 回复未发送");
+                return Ok(Some(0));
+            }
             if !(200..300).contains(&status) || response["ok"] == false {
                 return Err(format!("CLI reply send failed: HTTP {status}"));
             }

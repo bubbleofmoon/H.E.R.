@@ -529,6 +529,8 @@ pub struct Hub {
     dropped: Vec<Job>,
     /// Conversations already announced as waiting for DSH in this outage (one log line each).
     waiting_noted: std::collections::BTreeSet<String>,
+    /// Muted groups already logged for held work (#46); cleared when the mute ends.
+    mute_noted: std::collections::BTreeSet<String>,
     active: BTreeMap<String, Active>,
     groups: Vec<String>,
     all: bool,
@@ -568,6 +570,7 @@ impl Hub {
             pending: VecDeque::new(),
             dropped: Vec::new(),
             waiting_noted: Default::default(),
+            mute_noted: Default::default(),
             active: BTreeMap::new(),
             groups,
             all,
@@ -1063,8 +1066,10 @@ impl Hub {
             self.last_tick = now();
         }
         let context = self.context.clone();
+        self.mute_noted.retain(|key| crate::group_mute::active(&context, key).is_some());
         let mut planned = Vec::new();
         let mut settled = Vec::new();
+        let mut held = Vec::new();
         let state = mutate(&context, |s| {
             for (id, f) in s.flush.iter_mut().filter(|(_, f)| f.status == "pending") {
                 for (key, c) in &s.conversations {
@@ -1090,6 +1095,11 @@ impl Hub {
                 for (key, c) in &mut s.conversations {
                     if !self.allowed(&cfg, key) {
                         leave(c);
+                        continue;
+                    }
+                    // #46: a muted group runs no model turn, so its scheduler does not advance.
+                    if crate::group_mute::active(&context, key).is_some() {
+                        held.push(key.clone());
                         continue;
                     }
                     let mut prompt = None;
@@ -1216,6 +1226,11 @@ impl Hub {
             }
             Ok(s.clone())
         })?;
+        for key in held {
+            if self.mute_noted.insert(key.clone()) {
+                println!("[reserved] {key} 禁言中，不安排主动话题、试探或定时任务，排队的任务保留到禁言结束");
+            }
+        }
         self.journal.mark_handled(settled, now()).await?;
         for (key, prompt, farewell, messages, flush, delay) in planned {
             let media = messages.iter().flat_map(|m| m.media.clone()).collect();
@@ -1242,6 +1257,14 @@ impl Hub {
                 continue;
             }
             if job.due > now() || self.active.contains_key(&job.key) {
+                self.pending.push_back(job);
+                continue;
+            }
+            if crate::group_mute::active(&context, &job.key).is_some() {
+                // #46: held, not cancelled: it runs on the first pass after the mute ends.
+                if self.mute_noted.insert(job.key.clone()) {
+                    println!("[reserved] {} 禁言中，排队的任务保留到禁言结束", job.key);
+                }
                 self.pending.push_back(job);
                 continue;
             }
