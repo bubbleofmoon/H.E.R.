@@ -207,6 +207,14 @@ struct Event {
     message_type: String,
     #[serde(default)]
     sub_type: String,
+    #[serde(default)]
+    notice_type: String,
+    /// `group_ban` operator. Lenient: a malformed value only loses the name in the owner notice.
+    #[serde(default)]
+    operator_id: Option<Value>,
+    /// `group_ban` duration in seconds. Lenient: an unreadable value means the end is unknown.
+    #[serde(default)]
+    duration: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_account_id")]
     group_id: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_account_id")]
@@ -1955,6 +1963,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
     let mut seen = inbound::SeenTracker::default();
+    let mut mute_refresh_armed = false;
+    let mut last_mute_recheck = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
     let mut replay_queue: std::collections::VecDeque<inbound::Replayable> = std::collections::VecDeque::new();
     for item in journal.replayable().await? {
@@ -2207,6 +2217,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 None => break,
             },
             _ = ticker.tick() => {
+                if self_id > 0 && last_mute_recheck.elapsed() >= group_mute::RECHECK_EVERY {
+                    last_mute_recheck = std::time::Instant::now();
+                    let groups: Vec<(i64, Option<i64>)> = group_mute::unknown_end_groups(&runtime_context, parity_clock::now_ms()).into_iter().map(|g| (g, None)).collect();
+                    group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), self_id, groups);
+                }
                 if let Some(hub)=reserved_hub.as_mut(){ if let Err(error)=hub.tick(&self_nick).await {println!("[reserved] scheduler error: {error}");} }
                 if let Some(hub) = reserved2_hub.as_mut() {
                     if let Err(error) = hub.tick(&self_nick, self_id).await { println!("[reserved2] scheduler error: {error}"); }
@@ -2261,7 +2276,17 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 println!("[her] 入站帧含孤立代理项转义，已替换为 U+FFFD 后照常处理");
                 (ev, repaired)
             }
-            Err(_) => continue,
+            Err(_) => {
+                // #46: QQ's whole-group mute notice has user_id 0, which `Event` refuses.
+                if !replayed && self_id > 0 {
+                    if let Some((gid, operator)) = group_mute::whole_group_notice(&text) {
+                        if allow_groups.iter().any(|g| g == &gid.to_string()) {
+                            group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), self_id, vec![(gid, operator)]);
+                        }
+                    }
+                }
+                continue;
+            }
         };
         // 心跳等元事件只记内存，断线时补写一次；其余帧才落盘（不在异步线程里 fsync）。
         if !replayed {
@@ -2269,6 +2294,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             dependency_watch::note_frame(&ev.post_type, &ev.meta_event_type, ev.status.as_ref());
             if let Some(at) = seen.observe(now_ms() as i64, &ev.post_type) {
                 journal.touch_seen(at).await?;
+            }
+        }
+        // #46: once per connection (startup and every reconnect), relearn mute state missed while away.
+        if !mute_refresh_armed {
+            let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
+            if me > 0 {
+                mute_refresh_armed = true;
+                let groups: Vec<(i64, Option<i64>)> = allow_groups.iter().filter_map(|g| g.parse().ok()).map(|g| (g, None)).collect();
+                group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), me, groups);
             }
         }
 
@@ -2359,6 +2393,23 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     println!("[her] identity.json 未能写入：{error}");
                 }
             }
+        }
+        // #46: QQ's mute notice. Before the self filter (it names her own id) and before mode dispatch;
+        // it is not journaled and never wakes anyone. A notice for another user is ignored.
+        if is_notice && ev.notice_type == "group_ban" {
+            let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
+            if let (false, Some(gid)) = (replayed, ev.group_id) {
+                if me > 0 && ev.user_id == Some(me) && allow_groups.iter().any(|g| g == &gid.to_string()) {
+                    let operator = ev.operator_id.as_ref().and_then(protocol_integer).filter(|id| *id > 0);
+                    let (context, sub_type, duration, key) = (runtime_context.clone(), ev.sub_type.clone(), ev.duration.clone(), format!("group:{gid}"));
+                    // Settled before the next frame: a message right after the ban never wakes her.
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let cfg = context.load_config().unwrap_or_else(|_| json!({}));
+                        group_mute::on_self_notice(&context, &cfg, &key, &sub_type, duration.as_ref(), operator);
+                    }).await;
+                }
+            }
+            continue;
         }
         let sender = if is_notice { ev.sender_id.or(ev.user_id) } else { ev.user_id }
             .or_else(|| ev.sender.as_ref().and_then(|s| s.user_id));
@@ -2453,6 +2504,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                         .await?
                         == inbound::Receipt::Duplicate
                 {
+                    continue;
+                }
+                if kind == "group" && group_mute::active(&runtime_context, &key).is_some() {
+                    // #46: muted here, so nothing could be sent; no turn runs for it.
+                    journal.mark_handled(vec![inbound_key], now_ms() as i64).await?;
                     continue;
                 }
                 events += 1;

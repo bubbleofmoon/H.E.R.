@@ -2577,11 +2577,14 @@ impl Hub {
         if is_poke && !replayed {
             crate::activity::append(&self.context, &format!("{key} 拍一拍事件：{preview}"));
         }
-        if state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) {
+        let muted = crate::group_mute::active(&self.context, &key).is_some();
+        if muted || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) {
             if !is_poke && !replayed {
                 crate::activity::append(
                     &self.context,
-                    &if state["paused"] == true {
+                    &if muted {
+                        format!("{key} [reserved2] 禁言中，消息仅入库不唤醒：{preview}")
+                    } else if state["paused"] == true {
                         format!("{key} [reserved2] AI 已暂停，消息仅入库不唤醒：{preview}")
                     } else {
                         format!("{key} [reserved2] 消息已入未读：{preview}")
@@ -3186,6 +3189,11 @@ impl Hub {
                 continue;
             }
             if suspended || !self.taken(&key) || !console::key_allowed(&cfg, &key) {
+                continue;
+            }
+            if crate::group_mute::active(&self.context, &key).is_some() {
+                // #46: no wake while muted; its messages stay unread for the first wake after the mute.
+                println!("[reserved2] {key} 禁言中，唤醒跳过（{reason}）");
                 continue;
             }
             if crate::dsh_health::is_down(&self.context) && pipeline::pinned_cli_backend(&cfg, &key).is_none() {
