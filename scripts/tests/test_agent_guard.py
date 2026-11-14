@@ -6,17 +6,27 @@ Each case feeds one PreToolUse JSON call to `bash agent-guard.sh <role>` and che
 `her/1-x` and a detached worktree, so the current-branch checks see real repository state.
 Run: python -I scripts/tests/test_agent_guard.py
 """
+import importlib.util
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import types
+from unittest import mock
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 GUARD = ROOT / '.claude' / 'hooks' / 'agent-guard.sh'
 BASH = shutil.which('bash')
-ROLES = ('implementer', 'reviewer', 'gate')
+ROLES = ('implementer', 'reviewer', 'gate', 'planner')
+
+
+def load_guard():
+    spec = importlib.util.spec_from_file_location('agent_guard', GUARD.with_name('agent_guard.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 READS = [
     'gh pr view 5 -R bubbleofmoon/H.E.R. --json headRefOid,statusCheckRollup',
@@ -30,6 +40,30 @@ READS = [
     'git status',
     'git log --oneline -3',
     'ls -la',
+    # codex-task reads and the Codex reads of the self-review (S4: a file named like a tool stays readable)
+    'cat scripts/codex-task.sh',
+    'git diff -- scripts/codex-task.sh',
+    'cat scripts/cargo-slot.sh',
+    'grep -n make x',
+    'grep -rn install docs/',
+    'git worktree list',
+    'git --no-pager diff HEAD~1',
+    'git -C /root/her log --oneline -3',
+    'git show HEAD:AGENTS.md',
+    # v4 read-only git and text reads
+    'git status\ngit log --oneline -3',
+    'git rev-list --count HEAD',
+    'git show-ref --heads',
+    'git shortlog -sn HEAD',
+    'git diff-tree -r HEAD',
+    'git name-rev HEAD',
+    'git --version',
+    'git branch',
+    'git branch --list her/*',
+    'git branch -a',
+    'git remote -v',
+    'sed -n 1,5p x',
+    'find . -name x.md',
 ]
 IMPLEMENTER_ALLOWED = [
     ('wt', 'git push origin her/1-x'),
@@ -43,6 +77,11 @@ IMPLEMENTER_ALLOWED = [
     ('repo', 'cd {wt} && git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit -f filter=lifecycle::tests::a -f os=windows'),
     ('wt', 'gh workflow run quick.yml -R bubbleofmoon/H.E.R. --ref her/1-x -f target=harness_e2e'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6.1-sol high read-only'),
+    ('wt', 'bash /root/her/scripts/codex-task.sh 1-self-2 {wt} /root/orch/her/1/review/codex-self-2.md gpt-6.1-sol high read-only 120'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.1-sol -Effort high -Sandbox read-only'),
+    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile p.md -model gpt-6.1-sol -effort high -sandbox read-only -timeoutminutes 90'),
+    ('wt', 'git add scripts/codex-task.sh'),
 ]
 DENIED_EVERY_ROLE = [
     # R1: a second push after an allowed one, other refs, flags
@@ -136,11 +175,56 @@ DENIED_EVERY_ROLE = [
     ('wt', 'echo "unterminated'),
     ('wt', "git $'pu\\x73h' origin HEAD:refs/heads/main"),
     ('wt', 'git pu\\\nsh origin main'),
+    # Codex runs only as the implementer's pinned read-only self-review (every other form is refused)
+    ('wt', 'scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    ('wt', '{wt}/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    ('wt', '/tmp/x/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    ('wt', '/root/her/scripts/../scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol max read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high none'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high workspace-write'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only 0'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only 08'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only 1000'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only 5 extra'),
+    ('wt', '/root/her/scripts/codex-task.sh ../x {wt} p.md gpt-6.1-sol high read-only'),
+    ('wt', 'timeout 60 /root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only > log'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only; git push origin main'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -sandbox none -Sandbox read-only'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -Sandbox:none'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -Sandbox read-only -Command x'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -Sandbox read-only -AddDir C:/x'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Effort high -Sandbox read-only'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -Sandbox read-only -TimeoutMinutes 0'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -NoProfile -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -Sandbox read-only'),
+    ('wt', 'powershell -File {wt}/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.1-sol -Effort high -Sandbox read-only'),
+    ('wt', 'powershell -Command "C:/her/scripts/codex-task.ps1 -Sandbox none"'),
+    ('wt', 'codex exec x'),
+    ('wt', 'codex.cmd exec x'),
+    ('wt', 'npx @openai/codex exec x'),
+    ('wt', 'node /usr/lib/node_modules/@openai/codex/bin/codex.js exec x'),
+    ('wt', 'bash -c "codex exec x"'),
+    ('detached', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    ('repo', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
+    # v4: command positions after newlines, keywords, assignments-free wrappers and find -exec
+    ('wt', 'ls\ncodex exec x'),
+    ('wt', 'if true; then codex exec x; fi'),
+    ('wt', '{{ codex exec x; }}'),
+    ('wt', 'eval codex exec x'),
+    ('wt', 'eval "codex exec x"'),
+    ('wt', 'setsid codex exec x'),
+    ('wt', 'ionice -c3 codex exec x'),
+    ('wt', 'while true; do codex exec x; done'),
+    ('wt', 'cat <<EOF\ncodex exec x\nEOF'),
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
     ('wt', 'git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6.1-sol high read-only'),
 ]
 DENIED_REVIEWER = [
     # write rules see through paths and quoting
@@ -148,6 +232,108 @@ DENIED_REVIEWER = [
     ('wt', "'g''it' reset --hard HEAD"),
     ('wt', 'git --no-pager reset --hard HEAD'),
     ('wt', 'gh run download 5 --dir /tmp/x'),
+]
+PLANNER_WRITES_ALLOWED = ['/root/orch/her/80/plan.md', 'C:/her-orch/80/plan.md', 'C:\\her-orch\\80\\plan.md', 'c:/her-orch/7/plan.md',
+                          '/root/orch/her/80/scratch/her/src/lib.rs', '/root/orch/her/80/scratch/scripts/tests/test_x.py',
+                          'C:/her-orch/80/scratch/her/tests/x.rs', '/root/orch/her/80/scratch/.gitignore']
+PLANNER_WRITES_DENIED = ['/root/orch/her/80/report.md', '/root/orch/her/80/plan.md.bak', '/root/orch/her/80/tmp/plan.md',
+                         '/root/orch/her/80/../81/plan.md', '/root/orch/her/x/plan.md', '/root/orch/her/080/plan.md',
+                         '/root/orch/her/80/Plan.md', '/root/orch/her/80/PROGRESS.md', '/root/orch/her/80/scratch-evidence/x',
+                         '/root/her/AGENTS.md', 'plan.md', '', 'D:/her-orch/80/plan.md', 'C:/her/AGENTS.md',
+                         '/root/orch/her/80/plan.md/x', '/root/orch/her/80/scratch', '/root/orch/her/80/scratch2/x.rs',
+                         '/root/her-wt/80/her/src/lib.rs', '/root/orch/her/80/scratch/.git',
+                         '/root/orch/her/80/scratch/her/.git/config', '/root/orch/her/80/scratch/../plan2.md',
+                         '/root/orch/her/80/scratch//x.rs', '/root/orch/her/80/scratch/./x.rs',
+                         'C:/her-orch/80/scratch/.GIT', 'C:/her-orch/80/scratch/.git.', 'C:/her-orch/80/scratch/.git ',
+                         'C:/her-orch/80/scratch/.git::$DATA', 'C:/her-orch/80/scratch/GIT~1', 'C:/her-orch/80/scratch/her/.Git/config',
+                         'C:\\her-orch\\80\\scratch\\..\\plan.md', 'C:/her-orch/80/scratch/x.rs:stream',
+                         '/root/orch/her/80/scratch/x\n', '//?/C:/her-orch/80/plan.md', 'C:/HER-ORCH/80/plan.md']
+PLANNER_CANNOT_BUILD_OR_FORMAT = [
+    ('wt', '/root/her/scripts/cargo-slot.sh 80p /root/orch/her/80/scratch /root/orch/her/80/scratch-evidence r check --tests'),
+    ('wt', 'bash scripts/cargo-slot.sh 80p /root/orch/her/80/scratch /root/orch/her/80/scratch-evidence r check'),
+    ('wt', 'powershell.exe -NoProfile -File C:/her/scripts/cargo-slot.ps1 80p C:/her-orch/80/scratch C:/her-orch/80/scratch-evidence r "check --tests"'),
+    ('wt', 'cargo check'),
+    ('wt', '/root/.cargo/bin/cargo check --tests'),
+    ('wt', 'timeout 600 cargo check'),
+    ('wt', 'env RUSTC_WRAPPER= cargo check'),
+    ('wt', 'bash -c "cargo check"'),
+    ('wt', 'rustfmt /root/orch/her/80/scratch/her/src/lib.rs'),
+    ('wt', '/root/.cargo/bin/rustfmt --check /root/orch/her/80/scratch/her/src/lib.rs'),
+    ('wt', 'cargo fmt'),
+    ('wt', 'find . -name x.rs -exec rustfmt {{}} ;'),
+]
+READ_ONLY_GIT_DENIED = [
+    ('wt', 'git -C /root/her config core.fsmonitor x'),
+    ('wt', 'git remote set-url origin x'),
+    ('wt', 'git branch -D her/1-x'),
+    ('wt', 'git pull'),
+    ('wt', 'git fetch origin'),
+    ('wt', 'git add -A'),
+    ('wt', 'git rm x'),
+    ('wt', 'git gc'),
+    ('wt', 'git stash'),
+    ('wt', 'git -c core.pager=x log'),
+    ('wt', 'git --git-dir=/x log'),
+    ('wt', 'git --work-tree=/x status'),
+    ('wt', 'git diff --output=/root/orch/her/80/x'),
+    ('wt', 'git diff --ext-diff'),
+    ('wt', 'git grep -O vi x'),
+    ('wt', 'git worktree add /root/orch/her/80/scratch'),
+    ('wt', 'git worktree remove x'),
+    ('wt', 'xargs git config x'),
+    # v4 (and amendments): command positions, assignments, wrappers, listing forms of branch and remote
+    ('wt', 'ls\ngit config x y'),
+    ('wt', 'if true; then git gc; fi'),
+    ('wt', '{{ git add -A; }}'),
+    ('wt', 'GIT_EXTERNAL_DIFF=/x git diff'),
+    ('wt', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=x git log'),
+    ('wt', 'env GIT_DIR=/x git log'),
+    ('wt', 'timeout 5 git log'),
+    ('wt', 'git diff --outp=/x'),
+    ('wt', 'git diff --ext-d'),
+    ('wt', 'git grep --open-f=vi x'),
+    ('wt', 'git branch new-branch'),
+    ('wt', 'git branch -D her/1-x'),
+    ('wt', 'git branch --list -D her/1-x'),
+    ('wt', 'git remote add x y'),
+    ('wt', 'git --version --exec-path=/x'),
+    ('wt', 'git grep -lOsh x'),                                  # amendment 3: bundled -O
+    ('wt', "git diff '' --output=/root/orch/her/80/x"),         # an empty quoted word is an argument, not a break
+]
+READ_ONLY_FILE_WRITES_DENIED = [
+    ('wt', 'ls\nrm x'),
+    ('wt', 'for f in a; do rm x; done'),
+    ('wt', '! cargo check'),
+    ('wt', 'while true; do touch x; done'),
+    ('wt', 'sed -i s/a/b/ x'),
+    ('wt', 'sed -ni p x'),
+    ('wt', 'sed -i.bak s/a/b/ x'),
+    ('wt', 'sed --in-place s/a/b/ x'),
+    ('wt', 'find . -name x -delete'),
+    ('wt', 'find . -fprint /tmp/x'),
+    ('wt', 'rmdir x'),
+    ('wt', 'unlink x'),
+    ('wt', 'patch -p1 -i x.diff'),
+    ('wt', 'tar -xf x.tar'),
+    ('wt', 'unzip x.zip'),
+    ('wt', 'curl -o x https://example.invalid/'),
+    ('wt', 'wget https://example.invalid/'),
+    ('wt', 'rsync a b'),
+    ('wt', 'setsid rm x'),
+    ('wt', 'ionice -c3 rm x'),
+    ('wt', 'taskset 1 touch x'),
+    ('wt', 'flock /tmp/l rm x'),
+    ('wt', 'strace -o x ls'),
+    ('wt', 'script -c "rm x" log'),
+    ('wt', 'doas rm x'),
+    ('wt', 'su -c "rm x"'),
+    ('wt', 'runuser -u x rm y'),
+    ('wt', 'winpty rm x'),
+    ('wt', 'cmd /c start rm x'),
+    ('wt', 'call rm x'),
+    ('wt', 'grep -rn "cargo check" docs/'),
+    ('wt', 'function f {{ rm x; }}'),
+    ('wt', 'cat <<EOF\nrm x\nEOF'),                             # a heredoc body line is a command
 ]
 
 
@@ -177,6 +363,12 @@ class AgentGuard(unittest.TestCase):
                                 text=True, encoding='utf-8', timeout=60)
         return result.returncode, result.stderr
 
+    def tool_call(self, role, tool, path):
+        call = {'tool_name': tool, 'tool_input': {'file_path': path}, 'cwd': str(self.places['wt'])}
+        result = subprocess.run([BASH, str(GUARD), role], input=json.dumps(call), capture_output=True,
+                                text=True, encoding='utf-8', timeout=60)
+        return result.returncode
+
     def expect(self, cases, roles, allowed):
         for role in roles:
             for where, command in cases:
@@ -194,10 +386,82 @@ class AgentGuard(unittest.TestCase):
         self.expect(DENIED_EVERY_ROLE, ROLES, False)
 
     def test_review_and_gate_never_push_commit_or_trigger(self):
-        self.expect(DENIED_REVIEW_AND_GATE, ('reviewer', 'gate'), False)
+        self.expect(DENIED_REVIEW_AND_GATE, ('reviewer', 'gate', 'planner'), False)
 
     def test_reviewer_write_rules_see_through_paths_and_quoting(self):
-        self.expect(DENIED_REVIEWER[:3], ('reviewer',), False)
+        self.expect(DENIED_REVIEWER[:3], ('reviewer', 'planner'), False)
+
+    def test_planner_writes_only_its_plan_file_and_scratch(self):          # first red
+        for path in PLANNER_WRITES_ALLOWED:
+            for tool in ('Write', 'Edit'):
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(self.tool_call('planner', tool, path), 0)
+        for path in PLANNER_WRITES_DENIED:
+            for tool in ('Write', 'Edit'):
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(self.tool_call('planner', tool, path), 2)
+        for path in ('/root/orch/her/80/plan.md', '/root/orch/her/80/scratch/x.ipynb'):
+            self.assertEqual(self.tool_call('planner', 'NotebookEdit', path), 2)
+
+    def test_a_planner_cannot_build_or_format(self):
+        # Gate and implementer build by design; this pins the read-only roles only.
+        self.expect(PLANNER_CANNOT_BUILD_OR_FORMAT, ('planner', 'reviewer'), False)
+
+    def test_read_only_roles_run_git_with_read_verbs_only(self):
+        self.expect(READ_ONLY_GIT_DENIED, ('planner', 'reviewer'), False)
+
+    def test_read_only_roles_change_no_files(self):
+        self.expect(READ_ONLY_FILE_WRITES_DENIED, ('planner', 'reviewer'), False)
+
+    def test_a_quoted_pattern_naming_a_tool_points_to_the_grep_tool(self):
+        for role in ('planner', 'reviewer'):
+            code, err = self.guard(role, 'wt', 'grep -rn "cargo check" docs/')
+            self.assertEqual(code, 2, err)
+            self.assertIn('Grep tool', err)
+
+    def test_other_roles_keep_their_write_rules(self):
+        self.assertEqual(self.tool_call('implementer', 'Write', '/root/her-wt/1/her/src/x.rs'), 0)
+        self.assertEqual(self.tool_call('reviewer', 'Write', '/root/orch/her/80/plan.md'), 2)
+        self.assertEqual(self.tool_call('gate', 'Write', '/root/orch/her/80/plan.md'), 0)
+
+    def test_links_junctions_and_reparse_points_on_the_way_are_refused(self):
+        guard = load_guard()
+
+        def call(path):
+            return {'tool_name': 'Write', 'tool_input': {'file_path': path}}
+
+        def lstat_with_reparse(target):
+            def fake(path):
+                if path == target:
+                    return types.SimpleNamespace(st_file_attributes=0x400)
+                raise FileNotFoundError(path)
+            return fake
+        cases = [   # (path written, the part that is a link, how it is a link)
+            ('/root/orch/her/80/scratch/her/src/x.rs', '/root/orch/her/80/scratch/her', 'islink'),
+            ('/root/orch/her/80/plan.md', '/root/orch/her/80/plan.md', 'islink'),                 # the last part
+            ('C:/her-orch/80/scratch/x.rs', 'C:/her-orch/80/scratch', 'islink'),                    # Windows head
+            ('C:/her-orch/80/scratch/x/config.toml', 'C:/her-orch/80/scratch/x', 'isjunction'),
+            ('C:/her-orch/80/scratch/x/config.toml', 'C:/her-orch/80/scratch/x', 'reparse'),
+        ]
+        for path, link, how in cases:
+            with self.subTest(path=path, how=how), \
+                    mock.patch.object(guard.os.path, 'islink', side_effect=lambda p: how == 'islink' and p == link), \
+                    mock.patch.object(guard.os.path, 'isjunction', side_effect=lambda p: how == 'isjunction' and p == link, create=True), \
+                    mock.patch.object(guard.os, 'lstat', side_effect=lstat_with_reparse(link if how == 'reparse' else None)):
+                with self.assertRaises(guard.Deny):
+                    guard.check('planner', call(path))
+        with mock.patch.object(guard.os.path, 'islink', return_value=False), \
+                mock.patch.object(guard.os.path, 'isjunction', return_value=False, create=True), \
+                mock.patch.object(guard.os, 'lstat', side_effect=FileNotFoundError):
+            guard.check('planner', call('/root/orch/her/80/scratch/her/src/x.rs'))   # no link: allowed
+
+    def test_an_unreadable_part_is_treated_as_a_link(self):
+        guard = load_guard()
+        with mock.patch.object(guard.os.path, 'islink', return_value=False), \
+                mock.patch.object(guard.os.path, 'isjunction', return_value=False, create=True), \
+                mock.patch.object(guard.os, 'lstat', side_effect=PermissionError):
+            with self.assertRaises(guard.Deny):
+                guard.check('planner', {'tool_name': 'Write', 'tool_input': {'file_path': '/root/orch/her/80/plan.md'}})
 
     def test_reviewer_cannot_download_and_gate_can(self):
         self.expect([DENIED_REVIEWER[3]], ('reviewer',), False)
