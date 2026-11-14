@@ -478,6 +478,21 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_while_muted_still_beats_an_older_refresh() {
+        let (_root, ctx) = fixture("mute-refusal-race");
+        let key = "group:1";
+        assert_eq!(apply_at(&ctx, key, Change::Banned(NOW + 60_000), Some(1001), NOW), Ok(Some(1)));
+        let seen = seq_of(&ctx, key);
+        // A send refused with result=120 arrives after the refresh began and confirms the mute.
+        assert_eq!(apply_at(&ctx, key, Change::Learned, None, NOW), Ok(None));
+        assert_eq!(
+            apply_at(&ctx, key, Change::Refreshed { personal_until: Some(0), whole_group: Some(false), seen_seq: seen }, None, NOW),
+            Ok(None)
+        );
+        assert!(active_at(&ctx, key, NOW).is_some(), "the older refresh did not clear the mute the refusal confirmed");
+    }
+
+    #[test]
     fn apply_refuses_on_a_transient_read_error() {
         let (root, ctx) = fixture("mute-read-error");
         let path = root.0.join("data/group-mutes.json");
