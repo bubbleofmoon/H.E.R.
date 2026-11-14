@@ -10,3 +10,7 @@ Read by reviewers and merge gates; each rule is a judgement call no automated ch
 ## Model-facing text
 
 - Chat text that reaches a model (prompts, tool results, extraction inputs) goes through `model_view` filtering (`socialV2.context.stripFromModelText` and the model-text blacklist). Stored data, logs, console views and outgoing messages keep the original chat text relative to model-view filtering. Diagnostic and harness model-text record copies still apply session-token masking (`docs/agents/dependency-recovery.md`, `docs/agents/harness.md`).
+
+## Tests
+
+- A new test's red receipt must show it failing for the reason the ticket names (the assertion or panic message, not a compile error or an unrelated failure); a test that could pass without the fix is a required finding.
