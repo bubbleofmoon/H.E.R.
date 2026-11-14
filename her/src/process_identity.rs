@@ -128,6 +128,8 @@ pub fn matches(
             // script cannot be that dependency.
             Err(reason) => {
                 let candidates = operand_candidates(&process.args);
+                // Only the script position can make a launcher; an npm launcher's name anywhere
+                // else is ambiguous (the entry may still be the dependency) and stays unknown.
                 if candidates
                     .iter()
                     .any(|operand| is_package_launcher(operand))
@@ -175,8 +177,6 @@ fn operand_candidates(args: &[String]) -> Vec<&str> {
     for arg in args.iter().skip(1) {
         if operands {
             found.push(arg.as_str());
-        } else if arg == "--" {
-            operands = true;
         } else if let Some(option) = arg.strip_prefix('-') {
             if let Some((_, value)) = option.split_once('=') {
                 found.push(value);
@@ -186,6 +186,20 @@ fn operand_candidates(args: &[String]) -> Vec<&str> {
         }
     }
     found
+}
+
+/// The first argument that is not a switch (or the first after `--`): where node takes the script.
+fn first_plain_operand(args: &[String]) -> Option<&str> {
+    let mut operands = false;
+    for arg in args.iter().skip(1) {
+        if operands || !arg.starts_with('-') {
+            return Some(arg.as_str());
+        }
+        if arg == "--" {
+            operands = true;
+        }
+    }
+    None
 }
 
 /// Whether any candidate names the configured script. A candidate that cannot be resolved (its
@@ -1131,5 +1145,38 @@ mod os {
 
     pub(super) fn kill_verified(_expected: &ProcessIdentity) -> KillOutcome {
         KillOutcome::Unknown("process identity is not supported on this platform".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn operand_candidates_include_every_operand_after_double_dash_even_with_a_leading_dash() {
+        let found = args(&["node", "--no-deprecation", "--", "-dash.js", "x"]);
+        assert_eq!(operand_candidates(&found), vec!["-dash.js", "x"]);
+    }
+
+    #[test]
+    fn operand_candidates_take_plain_arguments_and_option_values_but_not_bare_switches() {
+        let found = args(&["node", "--no-deprecation", "--require=./p.js", "entry.js"]);
+        assert_eq!(operand_candidates(&found), vec!["./p.js", "entry.js"]);
+    }
+
+    #[test]
+    fn the_script_position_is_the_first_plain_operand_or_the_first_after_double_dash() {
+        let plain = args(&["node", "--no-deprecation", "entry.js", "npm-cli.js"]);
+        assert_eq!(first_plain_operand(&plain), Some("entry.js"));
+        let dashed = args(&["node", "--no-deprecation", "--", "-dash.js"]);
+        assert_eq!(first_plain_operand(&dashed), Some("-dash.js"));
+        assert_eq!(
+            first_plain_operand(&args(&["node", "--no-deprecation"])),
+            None
+        );
     }
 }

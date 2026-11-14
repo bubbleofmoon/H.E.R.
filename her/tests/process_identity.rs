@@ -531,3 +531,35 @@ fn a_linked_script_whose_operand_no_longer_resolves_stays_unknown() {
     // The configured spelling is the link; its resolved target has another file name.
     assert_eq!(match_state(&f, &program, "moved/entry.js"), "unknown");
 }
+
+#[test]
+fn an_npm_launcher_name_after_the_entry_keeps_an_unclassifiable_switch_unknown() {
+    let mut f = Fixture::node("late-launcher", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("other.js")).unwrap();
+    std::fs::write(f.root.join("npm-cli.js"), "").unwrap();
+    // The script is entry.js; npm-cli.js is only an application argument.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "entry.js",
+            "npm-cli.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "unknown");
+    // Another script followed by npm's name: ambiguous, so never foreign and never a wrapper.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "other.js",
+            "npm-cli.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "unknown");
+}

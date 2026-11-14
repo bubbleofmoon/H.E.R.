@@ -1930,11 +1930,10 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
     }
 }
 
-/// Reasons already written to a dependency's err log during its current refusal episode.
+/// Reasons already written to a dependency's err log during its current refusal episode. They are
+/// kept until the dependency leaves the refused state, so no reason logs twice within an episode.
 static LOGGED_REFUSALS: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
-/// Distinct reasons remembered per dependency; the oldest is forgotten first.
-const LOGGED_REFUSALS_PER_DEPENDENCY: usize = 16;
 
 /// A refused start never spawns the dependency, so its own log would otherwise not exist. Each
 /// refusal episode appends one line per distinct reason, not one per reconcile pass. A reason is
@@ -1949,17 +1948,18 @@ fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
         return;
     }
     let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
+    {
+        let mut map = LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
+        let reasons = map.entry(name.to_string()).or_default();
+        if reasons.len() >= 16 {
+            reasons.remove(0);
+        }
+        reasons.push(reason.to_string());
+    }
     match dependency_log(context, name, "err")
         .and_then(|mut file| file.write_all(line.as_bytes()).map_err(|e| e.to_string()))
     {
-        Ok(()) => {
-            let mut map = LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
-            let reasons = map.entry(name.to_string()).or_default();
-            if reasons.len() >= LOGGED_REFUSALS_PER_DEPENDENCY {
-                reasons.remove(0);
-            }
-            reasons.push(reason.to_string());
-        }
+        Ok(()) => {}
         Err(error) => {
             crate::safe_eprintln!("[dependencies] refusal of {name} could not be logged: {error}");
         }
@@ -2335,5 +2335,82 @@ mod os {
             assert!(result.is_err());
             assert!(!listening_inodes(address.port()).unwrap().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod refusal_log_tests {
+    use super::*;
+
+    struct Root(PathBuf);
+    impl Root {
+        fn new(name: &str) -> Self {
+            let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
+                "her-refusal-log-{name}-{}-{}",
+                std::process::id(),
+                crate::parity_clock::now_ms()
+            )));
+            for path in ["config", "data", "resources"] {
+                std::fs::create_dir_all(root.join(path)).unwrap();
+            }
+            std::fs::write(
+                root.join("config/config.json"),
+                r#"{"consoleToken":"refusal-log-fixture"}"#,
+            )
+            .unwrap();
+            std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+            std::fs::write(
+                root.join("dependencies.json"),
+                r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+            )
+            .unwrap();
+            Self(root)
+        }
+        fn context(&self) -> RuntimeContext {
+            RuntimeContext::from_root(&self.0).unwrap()
+        }
+        fn log(&self, name: &str) -> PathBuf {
+            self.0.join(format!("data/logs/dependency-{name}.err.log"))
+        }
+        fn lines(&self, name: &str) -> usize {
+            std::fs::read_to_string(self.log(name))
+                .unwrap_or_default()
+                .lines()
+                .count()
+        }
+    }
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn refusal_log_keeps_every_reason_for_the_whole_episode() {
+        let root = Root::new("episode");
+        let context = root.context();
+        let name = "unit-episode";
+        for number in 0..17 {
+            log_refusal(&context, name, &format!("reason {number}"));
+        }
+        // The first reason again, after sixteen others, is still the same episode.
+        log_refusal(&context, name, "reason 0");
+        assert_eq!(root.lines(name), 17);
+        forget_refusals(name);
+        log_refusal(&context, name, "reason 0");
+        assert_eq!(root.lines(name), 18);
+    }
+
+    #[test]
+    fn refusal_log_retries_a_failed_write_on_the_next_pass() {
+        let root = Root::new("retry");
+        let context = root.context();
+        let name = "unit-retry";
+        // A directory at the log's path makes the append fail.
+        std::fs::create_dir_all(root.log(name)).unwrap();
+        log_refusal(&context, name, "unavailable");
+        std::fs::remove_dir(root.log(name)).unwrap();
+        log_refusal(&context, name, "unavailable");
+        assert_eq!(root.lines(name), 1);
     }
 }
