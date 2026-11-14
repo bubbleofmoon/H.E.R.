@@ -1493,9 +1493,10 @@ fn reserved_muted_group_answers_a_message_the_scan_held_after_the_mute_ends() {
         200
     );
     // In an active group ingress only stores the message; the scan turns it into a job. The mute lands
-    // right after ingress, so the scan guard is what holds it.
+    // right after ingress, so the scan guard is what holds it. (`lastActiveMessageAt` cannot prove ingress
+    // ran: entering the phase through the console sets it too, and a message arriving under a mute is dropped.)
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 held by the scan");
-    assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["lastActiveMessageAt"].as_i64().unwrap_or(0) > 0),
+    assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["recent"].to_string().contains("held by the scan")),
         "ingress never stored the message");
     seed_group_mute(&rig, now_ms() + 600_000);
     assert!(
