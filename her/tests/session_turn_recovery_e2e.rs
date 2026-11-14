@@ -2917,16 +2917,22 @@ fn an_unreadable_send_ledger_pauses_the_finished_turn_and_rotates_the_token() {
     assert!(wait_for(LONG, || rig.onebot_sends().len() == 1), "the model's send did not reach QQ");
     let before = rig.agent_token();
     let outbox = rig.root.join("data/send-outbox.jsonl");
-    retry_lock_violation("damage the last send-ledger line", || {
-        let mut file = fs::OpenOptions::new().append(true).open(&outbox)?;
-        std::io::Write::write_all(&mut file, b"{\"k\":\"attempt\",\"batch\":\"b\"}}\n")
-    });
+    let damage: &[u8] = b"{\"k\":\"attempt\",\"batch\":\"b\"}}\n";
+    let mut file = retry_lock_violation("open the send ledger", || fs::OpenOptions::new().append(true).open(&outbox));
+    let mut written = 0;
+    while written < damage.len() {
+        // Retry each write from the offset already written, so a retry never appends a prefix twice.
+        let count = retry_lock_violation("damage the last send-ledger line", || std::io::Write::write(&mut file, &damage[written..]));
+        assert!(count > 0, "damage the last send-ledger line: the ledger accepted no bytes");
+        written += count;
+    }
+    drop(file);
     rig.start_candidate(vec![]);
     // The console's own turn view reads the same ledger and refuses while it is torn, so observe the verdict
     // recovery recorded in the turn ledger.
     let ledger = rig.root.join("data/turn-ledger.jsonl");
     let records = || -> Vec<Value> {
-        fs::read_to_string(&ledger).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+        read_locked(&ledger).lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
     };
     assert!(
         wait_for(LONG, || records().iter().any(|r| r["k"] == json!("unknown") && r["reason"] == json!("send-unresolved"))),

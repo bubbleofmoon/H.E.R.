@@ -219,6 +219,9 @@ fn read_http_request(stream: &mut TcpStream) -> String {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
+        if Instant::now() >= deadline {
+            break;
+        }
         let count = match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => count,
@@ -227,7 +230,7 @@ fn read_http_request(stream: &mut TcpStream) -> String {
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) && Instant::now() < deadline =>
+                ) =>
             {
                 continue;
             }
