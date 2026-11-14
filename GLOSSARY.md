@@ -80,7 +80,7 @@ The single definition of "running": desired state running, supervisor alive, and
 The exact version of a dependency the supervisor runs; it changes only when the administrator approves an upgrade.
 
 **Install root (安装根目录)**:
-The single folder holding everything production runs: releases, dependencies, the runtime and backups. Development never uses it.
+The single folder holding everything production runs (`C:/qqbot`): releases, dependencies, the runtime with its DSH home and logs, and backups. Development never uses it.
 _Avoid_: production folder, deploy dir
 
 **Harness (运行框架, `harness`)**:
@@ -167,6 +167,9 @@ _Avoid_: profile, persona, user summary
 **Fact (事实) / Inference (推断)**:
 A memory's provenance: a fact is something a person actually said or did, linked to its message; an inference is anything a model wrote, including impression cards and digests, and never becomes a fact.
 _Avoid_: truth, belief, derived memory
+
+**Digest (记忆整理)**:
+The run that reads a conversation's stored messages since its cursor, asks a model what is worth remembering and stores the answer as inferences whose provenance is the conversation and message range; the nightly job, the backlog check and idle rotation all use it.
 
 **Checking digest (核对整理)**:
 The digest pass that first re-checks card lines and inferences against the messages they cite and supersedes those no longer supported, then rebuilds cards within their size cap; it runs where conversations changed.

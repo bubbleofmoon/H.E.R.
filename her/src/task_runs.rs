@@ -1060,7 +1060,7 @@ mod tests {
         let limits = StoreLimits { max_log_bytes: 400, tail_lines: 3, max_line_chars: 40, ..StoreLimits::default() };
         let s = store(&dir, limits);
         let mut run = started(s.claim("backup", RunSource::Manual, Some("req-logs-001"), None, "console", 1));
-        run.log(LogStream::Out, "token=supersecret123 at C:\\qqbot\\config.json and sess-token-0001");
+        run.log(LogStream::Out, "token=supersecret123 at C:\\qqbot\\config.json and sess-token-0001"); // layout-literal: sanitizer fixture
         run.log(LogStream::Err, &"x".repeat(100));
         for i in 0..20 {
             run.log(LogStream::Out, &format!("line {i}"));

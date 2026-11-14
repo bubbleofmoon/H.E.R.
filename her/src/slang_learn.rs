@@ -29,11 +29,11 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::slang;
 
 /// 窗口文件（跨进程共享；主循环写、控制台读）。
-pub const WINDOWS_FILE: &str = "C:/qqbot/qq-bridge/state/slang-windows.json";
+pub const WINDOWS_FILE: &str = crate::legacy_path!("qq-bridge/state/slang-windows.json");
 /// 黑话学习专用 DSH 会话（与 JS 的 `slang-session.json` 同一个文件，方便灰度回滚）。
-pub const SESSION_FILE: &str = "C:/qqbot/qq-bridge/state/slang-session.json";
+pub const SESSION_FILE: &str = crate::legacy_path!("qq-bridge/state/slang-session.json");
 /// 学习会话的目录（与 JS 的 `state/slang-agent` 一致）。
-const SESSION_DIR: &str = "C:/qqbot/qq-bridge/state/slang-agent";
+const SESSION_DIR: &str = crate::legacy_path!("qq-bridge/state/slang-agent");
 /// 窗口最多保留多少条（与 JS 一致）。
 pub const WINDOW_MAX: usize = 80;
 /// 送进提示词的单条消息最长字符数（JS 的 `truncateText(text, 200)`）。

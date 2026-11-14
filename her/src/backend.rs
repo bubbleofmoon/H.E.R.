@@ -182,8 +182,8 @@ impl Backend for CliBackend {
             (out, err)
         } else {
             (
-                std::path::PathBuf::from(format!("C:/qqbot/logs/cli-{stamp}.out")),
-                std::path::PathBuf::from(format!("C:/qqbot/logs/cli-{stamp}.err")),
+                std::path::PathBuf::from(format!("{}/logs/cli-{stamp}.out", crate::legacy_path!())),
+                std::path::PathBuf::from(format!("{}/logs/cli-{stamp}.err", crate::legacy_path!())),
             )
         };
         let mut output_files = CliOutputFiles::new(&self.context, out_path, err_path)?;
@@ -1551,8 +1551,7 @@ pub fn credential_env() -> Vec<(String, String)> {
         Ok(path) => path,
         // Without an explicit path or USERPROFILE there is no credential file to read.
         Err(_) => match std::env::var_os("USERPROFILE") {
-            Some(home) => std::path::PathBuf::from(home)
-                .join(".dsh")
+            Some(home) => crate::install_root::legacy_dsh_home(home)
                 .join(".credentials.yaml")
                 .to_string_lossy()
                 .into_owned(),
@@ -1662,7 +1661,7 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
     let text = if context.is_isolated() {
         context.read_text(RuntimeArea::Data, "social-v2.json").ok()
     } else {
-        std::fs::read_to_string("C:/qqbot/qq-bridge/state/social-v2.json").ok()
+        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json")).ok()
     };
     let Some(text) = text else { return Vec::new() };
     let v: Value = match serde_json::from_str(&text) {

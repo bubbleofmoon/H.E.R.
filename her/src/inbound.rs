@@ -584,6 +584,29 @@ impl Journal {
             .map_err(db_err)
     }
 
+    /// Rows of one conversation after `after_seq`, oldest first: (seq, stage, received_ms, raw).
+    pub fn conversation_events(&self, conversation: &str, after_seq: i64, limit: usize) -> Result<Vec<(i64, String, i64, String)>, String> {
+        let mut stmt = self.conn.prepare("SELECT seq, stage, received_ms, raw FROM inbound_events
+            WHERE conversation = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3").map_err(db_err)?;
+        let rows = stmt.query_map(params![conversation, after_seq, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    /// Conversations with handled or backfilled rows.
+    pub fn event_conversations(&self) -> Result<Vec<String>, String> {
+        let mut stmt = self.conn.prepare("SELECT DISTINCT conversation FROM inbound_events
+            WHERE stage IN ('handled','backfilled') ORDER BY conversation").map_err(db_err)?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(db_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+    }
+
+    /// Highest stored seq of one conversation; 0 when none.
+    pub fn last_seq(&self, conversation: &str) -> Result<i64, String> {
+        self.conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM inbound_events WHERE conversation = ?1",
+            params![conversation], |r| r.get(0)).map_err(db_err)
+    }
+
     /// 连接存活的最后时刻（任何入站帧都会刷新）。断线后用它作为缺口的起点。
     pub fn touch_seen(&self, now: i64) -> Result<(), String> {
         self.conn

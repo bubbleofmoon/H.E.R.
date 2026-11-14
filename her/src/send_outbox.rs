@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
 /// Rust-owned legacy outbox; written only by this process (same pattern as the Rust token ledger).
-pub const LEGACY_OUTBOX_FILE: &str = "C:/qqbot/state/send-outbox-rust.jsonl";
+pub const LEGACY_OUTBOX_FILE: &str = crate::legacy_path!("state/send-outbox-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_OUTBOX_FILE: &str = "send-outbox.jsonl";
 

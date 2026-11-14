@@ -67,14 +67,14 @@ class WrapperCase(unittest.TestCase):
         bin_dir = self.tmp / 'bin'
         bin_dir.mkdir()
         self.mark = self.tmp / 'gh-invoked.txt'
-        (bin_dir / 'gh').write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$GH_STUB_MARK"\nexit 0\n', encoding='utf-8')
+        (bin_dir / 'gh').write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$GH_STUB_MARK"\nexit ${GH_STUB_EXIT:-0}\n', encoding='utf-8')
         (bin_dir / 'gh').chmod(0o755)  # bash skips a non-executable stub and would run the real gh
-        (bin_dir / 'gh.cmd').write_text('@echo off\r\n>"%GH_STUB_MARK%" echo %*\r\nexit /b 0\r\n', encoding='utf-8')
+        (bin_dir / 'gh.cmd').write_text('@echo off\r\n>"%GH_STUB_MARK%" echo %*\r\nif defined GH_STUB_EXIT exit /b %GH_STUB_EXIT%\r\nexit /b 0\r\n', encoding='utf-8')
         self.body = self.tmp / 'body.md'
         self.body.write_text(CLEAN_BODY, encoding='utf-8')
         self.other = self.tmp / 'other.md'
         self.other.write_text(DIRTY_BODY, encoding='utf-8')
-        self.env = dict(os.environ)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         self.env['GH_STUB_MARK'] = str(self.mark)
         self.env['PATH'] = str(bin_dir) + os.pathsep + self.env.get('PATH', '')
         if gitleaks():
@@ -375,6 +375,30 @@ class WrapperCase(unittest.TestCase):
                 self.assertEqual(code, 2, f'{kind} {group}: {out}')
                 self.assert_no_gh(out, f'{kind} {group}')
                 self.assertIn('refusal=missing-title', out, f'{kind} {group}')
+
+    @REQUIRES_HOST
+    def test_a_missing_scanner_is_its_own_refusal(self):
+        for kind in KINDS:
+            self.mark.unlink(missing_ok=True)
+            self.env['HER_GITLEAKS'] = str(self.tmp / 'no-such-gitleaks')
+            code, out = self.run_wrapper(kind, '--body-file', str(self.body), 'issue', 'comment', '166',
+                                         '--repo', PUBLIC_REPO)
+            self.assertEqual(code, 3, f'{kind}: {out}')
+            self.assertIn('refusal=scanner-missing', out)
+            self.assertNotIn('refusal=scan-findings', out)
+            self.assert_no_gh(out, kind)
+
+    @REQUIRES_HOST
+    @REQUIRES_SCANNER
+    def test_a_gh_failure_after_a_clean_scan_exits_4(self):
+        for kind in KINDS:
+            self.mark.unlink(missing_ok=True)
+            self.env['GH_STUB_EXIT'] = '1'
+            code, out = self.run_wrapper(kind, '--body-file', str(self.body), 'issue', 'comment', '166',
+                                         '--repo', PUBLIC_REPO)
+            self.assertEqual(code, 4, f'{kind}: {out}')
+            self.assertIn('refusal=gh-failed', out)
+            self.assertTrue(self.mark.exists(), kind)
 
 
 if __name__ == '__main__':

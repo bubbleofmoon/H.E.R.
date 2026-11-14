@@ -178,7 +178,7 @@ fn dsh_credential(context: &RuntimeContext, name: &str) -> String {
             .filter(|v| !v.is_empty())
             .map(std::path::PathBuf::from)
             .or_else(|| {
-                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|h| std::path::PathBuf::from(h).join(".dsh"))
+                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(crate::install_root::legacy_dsh_home)
             });
         home.and_then(|h| std::fs::read_to_string(h.join(".credentials.yaml")).ok())
     };

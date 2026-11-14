@@ -218,10 +218,10 @@ pub fn assemble(mut sections: Vec<Section>, budgets: &Budgets) -> Assembly {
     }
 }
 
-/// The active persona core for `key` (Identity). Seam for #19: the persona library supplies this text
-/// (`persona::active_core(context, key)`); until then there is none.
-pub fn persona_core(_context: &RuntimeContext, _key: &str) -> String {
-    String::new()
+/// The active persona core for `key` (Identity): the persona library's core block, empty in closed-agent or
+/// when no persona applies.
+pub fn persona_core(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
+    crate::prompt::identity_core(context, cfg, key)
 }
 
 /// Identity is checked in every conversation; Relationship only in the owner's private chat until impression
