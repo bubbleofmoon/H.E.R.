@@ -181,7 +181,9 @@ fn a_ban_inside_the_batch_window_cancels_the_armed_wake() {
     let _harness = start_mute(
         root.path(),
         vec![vec![
-            Step::Mention { message_id: 7401, text: "armed before the ban" },
+            // Ordinary text, not an @-mention: an @-mention is urgent and its wake fires on the next
+            // tick, before the ban frame can be read. Ordinary first contact waits out the batch window.
+            Step::Ordinary { message_id: 7401, text: "armed before the ban" },
             Step::Frame(ban_frame(SELF_ID, "ban", 600)),
             Step::Wait(60_000),
         ]],
