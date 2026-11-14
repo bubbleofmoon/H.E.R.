@@ -6,7 +6,7 @@ Reads the hook JSON on stdin; exit 2 with a reason on stderr blocks the call, ex
 Reviewers and planners (read-only roles) get an allow-list. A Bash call is one pipeline joined only by `|`. Each
 command is an allowed reader by its bare name: git with the plain read verbs, gh reads, ls, cat, head, tail, wc, grep,
 rg, find with tests and -print/-print0, stat, file, diff, cmp, sha256sum, sort, uniq, cut, tr, jq, date, pwd, echo,
-printf, basename, dirname, realpath. Options of these readers that write or run something are refused. Arguments
+basename, dirname, realpath. Options of these readers that write or run something are refused. Arguments
 are plain or quoted; only 2>/dev/null and 2>&1 redirect. Nothing else runs: no `;`, `&`, newline, `$`, backtick,
 substitution, glob, brace or backslash outside quotes. A planner writes only its plan file and files in its scratch
 export (no link, junction or reparse point on the way, no .git, stream or 8.3 part).
@@ -50,7 +50,7 @@ GIT_READ_VERBS = {'log', 'diff', 'show', 'status', 'blame', 'grep', 'ls-files', 
 GIT_READ_DENIED_OPTIONS = re.compile(r'(?:--out|--ext|--op|-O).*', re.S)
 BRANCH_LIST_FLAGS = {'-a', '-r', '-v', '-vv', '--all', '--remotes', '--verbose'}
 READ_ONLY_COMMANDS = {'git', 'gh', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'find', 'stat', 'file', 'diff', 'cmp',
-                      'sha256sum', 'sort', 'uniq', 'cut', 'tr', 'jq', 'date', 'pwd', 'echo', 'printf', 'basename',
+                      'sha256sum', 'sort', 'uniq', 'cut', 'tr', 'jq', 'date', 'pwd', 'echo', 'basename',
                       'dirname', 'realpath'}
 READ_ONLY_BARE = re.compile(r"[A-Za-z0-9_@%+=:,./~^'\"-]+")   # an unquoted word; quoted text arrives as letters
 READ_ONLY_STDERR = ('2>/dev/null', '2>&1')
@@ -59,7 +59,7 @@ READ_ONLY_REFUSAL = ('read-only roles run only simple read commands; use the Rea
                      'ls-tree|rev-parse|rev-list|cat-file|merge-base|describe|for-each-ref|show-ref|shortlog|diff-tree|'
                      'name-rev, branch [--list], remote -v, worktree list, --version), gh reads, ls, cat, head, tail, wc, '
                      'grep, rg, find (tests and -print/-print0), stat, file, diff, cmp, sha256sum, sort, uniq, cut, tr, jq, '
-                     'date, pwd, echo, printf, basename, dirname and realpath; arguments plain or quoted (no $ or '
+                     'date, pwd, echo, basename, dirname and realpath; arguments plain or quoted (no $ or '
                      'backtick in double quotes, no unquoted * ? [ ] { } \\); only 2>/dev/null or 2>&1.')
 FIND_TESTS = {'-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-lname', '-ilname', '-regex', '-iregex',
               '-regextype', '-type', '-xtype', '-size', '-empty', '-newer', '-mtime', '-mmin', '-ctime', '-cmin', '-atime',
@@ -99,6 +99,7 @@ SHOWN = {v: k for k, v in HIDDEN.items()}
 REDIRECT = re.compile(r'&>>?|>>|>&|>\||>|<<<|<<|<&|<>|<')
 REDIRECT_AFTER_BREAK = re.compile(r'([;|&()`\n]+?)(&>>?|>>|>&|>\||>|<<<|<<|<&|<>|<)')
 STDIN_REDIRECTS = ('<', '<<<', '<>')
+NAMED_DESCRIPTOR = re.compile(r'\{[A-Za-z_][A-Za-z0-9_]*\}')   # `{fd}>file` opens a named descriptor, as `2>file` does
 
 
 class Deny(Exception):
@@ -233,8 +234,8 @@ def segments(text, depth=0):
                     close()
                     word = joined.group(2)
             if REDIRECT.fullmatch(word):
-                if current and current[-1].isdigit():
-                    current.pop()                        # the descriptor of `2>file`
+                if current and (current[-1].isdigit() or NAMED_DESCRIPTOR.fullmatch(current[-1])):
+                    current.pop()                        # the descriptor of `2>file` or `{fd}>file`
                 target, target_is_operator = tokens[i] if i < len(tokens) else ('', True)
                 if not target_is_operator:
                     i += 1
@@ -271,21 +272,31 @@ def base(word):
     return name[:-4] if name.endswith('.exe') else name
 
 
-def git_read_only(seg):
+def effective_dir(path, cwd):
+    """The directory a -C value names, with a relative value resolved against the directory before it."""
+    p = path.replace('\\', '/')
+    if not (p.startswith('/') or re.match(r'[A-Za-z]:/', p)) and cwd:
+        p = cwd.replace('\\', '/') + '/' + p
+    return os.path.normpath(p).replace('\\', '/')
+
+
+def git_read_only(seg, cwd):
     """A git segment that only reads.
 
     Accepted: git [-C <dir>] [--no-pager|-P] followed by a read verb; git branch [--list]; git remote [-v];
     git worktree list; git --version. Refused: any argument starting with --out, --ext, --op or -O, any argument
-    holding $, and a grep with a bundled -O.
+    holding $, a -C that resolves under a ticket folder or scratch export, and a grep with a bundled -O.
     """
     if seg[1:] == ['--version']:
         return True
     if any('$' in a for a in seg[1:]):
         return False                          # a variable can carry any option
     i = 1
+    directory = cwd or ''
     while i < len(seg) and seg[i].startswith('-'):
         if seg[i] == '-C' and i + 1 < len(seg):
-            if re.match(r'(?i)(/root/orch/her/|c:/her-orch/)', seg[i + 1].replace('\\', '/')):
+            directory = effective_dir(seg[i + 1], directory)
+            if re.match(r'(?i)(/root/orch/her/|c:/her-orch/)', directory):
                 return False                  # a ticket folder or scratch export is not a repository to read here
             i += 2
         elif seg[i] in ('--no-pager', '-P'):
@@ -331,13 +342,13 @@ def date_read_only(args):
     return True
 
 
-def read_only_reader_allowed(words, role):
+def read_only_reader_allowed(words, role, cwd):
     """One command of a read-only pipeline: an allowed reader by its bare name, without options that write or run."""
     name, args = words[0], words[1:]
     if name not in READ_ONLY_COMMANDS:
         return False
     if name == 'git':
-        return git_read_only(words)
+        return git_read_only(words, cwd)
     if name == 'gh':
         return gh_read(words, role)
     if name == 'find':
@@ -601,7 +612,7 @@ def check_bash(role, command, hook_cwd):
         raise Deny('no ANSI-C quoting ($\'...\') and no backslash-newline continuations; write one plain command.')
     if role in READ_ONLY_ROLES:
         pipeline = read_only_pipeline(command)
-        if not pipeline or not all(read_only_reader_allowed(words, role) for words in pipeline):
+        if not pipeline or not all(read_only_reader_allowed(words, role, hook_cwd) for words in pipeline):
             raise Deny(READ_ONLY_REFUSAL)
         return
     plain = simple(command, hook_cwd)

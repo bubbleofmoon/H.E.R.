@@ -267,6 +267,8 @@ DENIED_EVERY_ROLE = [
     ('wt', 'find scripts -name handoff.sh -exec {{}} 80 linux b.md \';\''),
     ('wt', 'echo $HOME codex'),
     ('wt', "echo a # it's"),
+    ('wt', '{{fd}}>/dev/null codex exec x'),                     # fix round 2: a named descriptor is not a command
+    ('wt', '{{fd}}>/dev/null scripts/handoff.sh 80 linux b.md'),
     ('wt', 'gh run watch 1 --exit-status'),
     ('wt', 'gh run view 1 --watch'),
     ('wt', 'gh pr checks 5 --watch'),
@@ -512,6 +514,11 @@ READ_ONLY_DENIED = [   # expected denied for planner and reviewer; '# regression
     ('wt', "echo a # it's"),
     ('wt', 'git grep -lOsh x'),
     ('wt', 'git diff --output=/root/x'),
+    # fix round 2: printf can assign into an array subscript, which runs command substitution
+    ('wt', "printf -v 'a[$(touch /tmp/x)]' %s x"),
+    # fix round 2: -C values resolved against the effective cwd
+    ('wt', 'git -C /root/./orch/her/80/scratch/x status'),
+    ('wt', 'git -C /root -C orch/her/80/scratch/x log'),
 ]
 
 
@@ -678,6 +685,7 @@ class AgentGuard(unittest.TestCase):
         self.assertIn(['handoff.sh'], words('bash -s 80 linux b.md <<< handoff.sh'))                    # regression (R3)
         self.assertIn(['rm', 'x'], words("echo a # it's\nrm x # it's"))                                 # comments
         self.assertIn(['codex', 'exec', 'x'], words('ls \\ #;codex exec x'))                            # amendment 1
+        self.assertIn(['codex', 'exec', 'x'], words('{fd}>/dev/null codex exec x'))                     # fix round 2 (unit: no format)
 
     def test_segments_never_raise_inside_quoted_patterns(self):                                         # regression
         guard = load_guard()
