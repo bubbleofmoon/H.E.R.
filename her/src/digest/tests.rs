@@ -412,6 +412,34 @@ fn her_replies_deferred_by_the_cap_reach_a_later_digest() {
 }
 
 #[test]
+fn filtered_rows_never_consume_her_replies() {
+    let (root, context) = fixture(Some("chat"), CAPPED(), "http://127.0.0.1:1");
+    let t0 = crate::parity_clock::now_ms() - 3_600_000;
+    journal_message_at(&context, "group:77", 1, group_text(5002, "第一句"), t0);
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 1, memories: 0 }));
+    let replies: Vec<String> = (1..=3).map(|n| format!("回复{n}{}", "啊".repeat(296))).collect();
+    let timed: Vec<(i64, &str)> = replies.iter().map(|r| (t0 + 5, r.as_str())).collect();
+    harness_replies(&root, &context, "group:77", &timed);
+    journal_message_at(&context, "group:77", 2, group_text(5002, "/status"), t0 + 10);
+    journal_message_at(&context, "group:77", 3, group_text(5002, &"字".repeat(400)), t0 + 20);
+    let mut reached = false;
+    for _ in 0..4 {
+        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 3, .. })) {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "the message after the filtered row was never digested");
+    let inputs = model.inputs();
+    assert!(!inputs.is_empty(), "no model call");
+    for n in 1..=3 {
+        let marker = format!("回复{n}");
+        assert_eq!(inputs.iter().filter(|input| input.contains(&marker)).count(), 1, "{marker} must reach exactly one digest");
+    }
+}
+
+#[test]
 fn conversations_are_digested_oldest_cursor_first() {
     let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
     let message = json!([{"seq":1,"sender":"甲","userId":"5001","text":"在吗","isSelf":false}]);
