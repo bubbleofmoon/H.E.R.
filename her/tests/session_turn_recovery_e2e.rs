@@ -3134,7 +3134,7 @@ fn hf85_briefing_changes_replace_remove_and_clock_does_not_resend_memory() {
     let changed=rig.dsh.applied()[2].text.clone();
     assert!(changed.contains("【替换简报节 operator】") && changed.contains("new-operator-85"));
     assert!(!changed.contains("old-operator-85") && !changed.contains("【反AI味】"));
-    assert!(changed.contains("【替换简报节 memory】") && changed.contains("new-thought-85") && changed.contains("new-impression-85"));
+    assert!(changed.contains("【替换简报节 memory】") && changed.contains("new-thought-85") && changed.contains("【替换简报节 impressions】") && changed.contains("new-impression-85"), "impressions are the Relationship layer's own section: {changed}");
     assert!(changed.contains("【替换简报节 stickers】") && changed.contains("new-sticker-85"));
     assert!(changed.contains("【替换简报节 sending】") && changed.contains("new-send-rule-85"));
     fs::write(rig.root.join("data/initial-prompts.json"),"{}").unwrap();
