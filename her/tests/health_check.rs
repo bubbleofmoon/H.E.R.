@@ -1,6 +1,8 @@
 //! Health check through seam 1: real CLI, selected roots and loopback fakes.
 #[path = "../src/install_root.rs"]
 mod install_root;
+#[path = "../src/process_identity.rs"]
+mod process_identity;
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -8,6 +10,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use process_identity::{KillOutcome, Liveness, ProcessIdentity};
 
 struct Child(Option<std::process::Child>);
 impl Drop for Child {
@@ -17,6 +21,109 @@ impl Drop for Child {
             let _ = child.wait();
         }
     }
+}
+
+/// How long the rig's cleanup gives each lifecycle CLI call and the owners' exit.
+const CLEANUP_BOUND: Duration = Duration::from_secs(10);
+/// How long a finished child's pipes may stay open: a detached grandchild can inherit them.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// One output pipe read to its end on its own thread; the bytes so far are readable at any time.
+struct Drain {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+impl Drain {
+    fn new<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink = bytes.clone();
+        let reader = pipe.and_then(|mut pipe| {
+            std::thread::Builder::new()
+                .name("fixture-pipe".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => sink
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok()
+        });
+        Self { bytes, reader }
+    }
+    fn closed(&self) -> bool {
+        self.reader.as_ref().map_or(true, |reader| reader.is_finished())
+    }
+    fn bytes(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// Runs `cmd` with both output pipes drained on reader threads, so a child printing more than
+/// one pipe buffer (4 KiB on Windows) cannot block. Waits at most `allow` for the exit, then at
+/// most `PIPE_GRACE` for the pipes to close (a detached grandchild may hold an inherited pipe).
+/// On timeout the child is killed and the error carries what it printed so far. Never panics,
+/// so `Rig::drop` can use it while unwinding.
+fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Output, String> {
+    let mut process = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start: {e}"))?;
+    let stdout = Drain::new(process.stdout.take());
+    let stderr = Drain::new(process.stderr.take());
+    let mut child = Child(Some(process));
+    let limit = Instant::now() + allow;
+    let status = loop {
+        let Some(process) = child.0.as_mut() else {
+            break Err("lost its process handle".to_string());
+        };
+        match process.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < limit => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                break Err(format!(
+                    "exceeded the fixture's {}-second limit",
+                    allow.as_secs()
+                ))
+            }
+            Err(e) => break Err(format!("could not be polled: {e}")),
+        }
+    };
+    // Exited: this only reaps. Still running: killed and reaped before the output is read.
+    drop(child);
+    let grace = Instant::now() + PIPE_GRACE;
+    while !(stdout.closed() && stderr.closed()) && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match status {
+        Ok(status) => Ok(std::process::Output {
+            status,
+            stdout: stdout.bytes(),
+            stderr: stderr.bytes(),
+        }),
+        Err(reason) => Err(format!(
+            "{reason}; partial stdout={}; partial stderr={}",
+            String::from_utf8_lossy(&stdout.bytes()),
+            String::from_utf8_lossy(&stderr.bytes())
+        )),
+    }
+}
+
+/// Cleanup diagnostics; `writeln!` to a possibly closed stderr cannot panic inside `Drop`.
+fn cleanup_note(args: std::fmt::Arguments) {
+    let _ = writeln!(std::io::stderr(), "rig cleanup: {args}");
 }
 
 #[derive(Clone)]
@@ -246,25 +353,11 @@ impl Fixture {
     /// The CLI child must exit within `allow`, so a fixture that lets it wait on a product
     /// deadline says so; every bound stays explicit and every path still ends in a failure.
     fn output_bounded(&self, extra: &[&str], allow: Duration) -> std::process::Output {
-        let child = hidden(env!("CARGO_BIN_EXE_her-cli"))
-            .args(["lifecycle", "assert-running", "--runtime-root"])
+        let mut cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
+        cmd.args(["lifecycle", "assert-running", "--runtime-root"])
             .arg(&self.0)
-            .args(extra)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut child = Child(Some(child));
-        let limit = Instant::now() + allow;
-        while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
-            assert!(
-                Instant::now() < limit,
-                "assert-running exceeded the fixture's {}-second limit",
-                allow.as_secs()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        child.0.take().unwrap().wait_with_output().unwrap()
+            .args(extra);
+        run_bounded(&mut cmd, allow).unwrap_or_else(|error| panic!("assert-running {error}"))
     }
     fn check(&self, extra: &[&str]) -> (i32, Value) {
         self.check_bounded(extra, Duration::from_secs(12))
@@ -1105,24 +1198,13 @@ fn restore_with_fake_peers(never_ready: bool) {
             );
             let text = String::from_utf8_lossy(&preview.stdout);
             let p: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-            let mut child = Child(Some(
-                command()
-                    .arg("--confirm")
-                    .arg(p["preview"]["confirmation"].as_str().unwrap())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            ));
-            let deadline = Instant::now() + Duration::from_secs(150);
-            while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
-                assert!(
-                    Instant::now() < deadline,
-                    "restore exceeded health/rollback budget"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            let mut restore = command();
+            restore
+                .arg("--confirm")
+                .arg(p["preview"]["confirmation"].as_str().unwrap());
+            let output = run_bounded(&mut restore, Duration::from_secs(150)).unwrap_or_else(
+                |error| panic!("restore exceeded health/rollback budget: {error}"),
+            );
             if never_ready {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
