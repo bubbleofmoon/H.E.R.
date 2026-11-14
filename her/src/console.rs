@@ -9606,8 +9606,10 @@ pub(crate) fn stop_and_archive_session(context: &RuntimeContext, cfg: &Value, ke
 /// `GET /api/turns`：回合账本的管理端视图——输入、DSH 回合、工具和发送结果的关联，
 /// 以及因状态不明而暂停的回合（含原因）和会话替换记录。
 fn handle_turns_view(context: &RuntimeContext) -> Result<Value, String> {
-    let records = crate::turn_ledger::read_records(context)?;
-    let outbox = crate::send_outbox::read_records(context)?;
+    // A read-only view on its own request thread: it holds no gate, mutex or chain, so it waits out a
+    // writer's Windows append lock instead of answering 503.
+    let records = crate::turn_ledger::read_records_waiting(context)?;
+    let outbox = crate::send_outbox::read_records_waiting(context)?;
     let (turns, replacements) = crate::turn_ledger::fold(&records);
     let mut rows = Vec::new();
     for (index, turn) in turns.iter().enumerate() {
@@ -10419,7 +10421,8 @@ pub fn send_outbox_view(context: &RuntimeContext, query: &HashMap<String, String
     if key.is_empty() {
         return Err((400, "key 不能为空".to_string()));
     }
-    let records = crate::send_outbox::read_records(context).map_err(|error| (503, error))?;
+    // Read-only view; holds no gate, mutex or chain (see `handle_turns_view`).
+    let records = crate::send_outbox::read_records_waiting(context).map_err(|error| (503, error))?;
     Ok(json!({
         "ok": true,
         "key": key,
