@@ -106,6 +106,35 @@ impl Reader<'_> {
         })
     }
 
+    /// Digest progress in one sequence space (`msg`, `inbound`): (through sequence, updated at ms).
+    pub fn digest_cursor(&self, space: &str) -> rusqlite::Result<Option<(i64, i64)>> {
+        use rusqlite::OptionalExtension;
+        self.conn.query_row("SELECT through_seq, updated_at FROM digest_cursor WHERE conversation=?1 AND space=?2",
+            rusqlite::params![self.key, space], |r| Ok((r.get(0)?, r.get(1)?))).optional()
+    }
+
+    /// Write a digest's memories and advance its cursor in one transaction. `Ok(None)`: the cursor is no
+    /// longer `expected` (another run digested first); nothing is written.
+    pub fn write_digest(&self, space: &str, expected: Option<i64>, through: i64, memories: &[NewMemory<'_>])
+        -> rusqlite::Result<Option<Vec<UpsertOutcome>>> {
+        super::atomic(self.conn, |conn| {
+            use rusqlite::OptionalExtension;
+            let current: Option<i64> = conn.query_row("SELECT through_seq FROM digest_cursor WHERE conversation=?1 AND space=?2",
+                rusqlite::params![self.key, space], |r| r.get(0)).optional()?;
+            if current != expected {
+                return Ok(None);
+            }
+            let mut written = Vec::with_capacity(memories.len());
+            for memory in memories {
+                written.push(self.write(memory)?);
+            }
+            conn.execute("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(conversation,space) DO UPDATE SET through_seq=excluded.through_seq, updated_at=excluded.updated_at",
+                rusqlite::params![self.key, space, through, super::now_ms()])?;
+            Ok(Some(written))
+        })
+    }
+
     /// Delete one memory this conversation can read, checking and deleting in one transaction.
     /// `Ok(None)`: absent or not visible; nothing changed.
     pub fn forget(&self, id: i64) -> Result<Option<bool>, ForgetError> {
@@ -223,5 +252,23 @@ mod tests {
         };
         assert_eq!(row(group.id), ("group:3".to_string(), "group".to_string()));
         assert_eq!(row(private.id), ("private:2".to_string(), "private".to_string()));
+    }
+
+    #[test]
+    fn digest_write_commits_memories_with_its_cursor_and_refuses_a_moved_cursor() {
+        let store = store(Some(OWNER));
+        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
+            subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
+        let reader = store.for_reader("group:3");
+        assert_eq!(reader.digest_cursor("msg").unwrap(), None);
+        assert_eq!(reader.write_digest("msg", None, 4, &[new("digested")]).unwrap().map(|w| w.len()), Some(1));
+        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.0), Some(4));
+        assert!(reader.write_digest("msg", None, 9, &[new("stale")]).unwrap().is_none(), "a stale expected cursor writes nothing");
+        let rows: i64 = store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.0), Some(4));
+        assert_eq!(store.for_reader("group:1").digest_cursor("msg").unwrap(), None, "cursors are per conversation");
+        assert_eq!(reader.digest_cursor("inbound").unwrap(), None, "cursors are per sequence space");
     }
 }

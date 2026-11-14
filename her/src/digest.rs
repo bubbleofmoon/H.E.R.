@@ -1,4 +1,14 @@
 //! Queue memory consolidation in existing QQ sessions; memory_write owns database changes.
+mod conversation;
+mod evidence;
+mod model;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use conversation::{Digest, DigestError, Limits, Outcome};
+pub(crate) use model::{model_for, DigestModel, ModelError};
+#[cfg(test)]
+pub(crate) use model::install_test_model;
 use crate::{
     dsh::{PromptProbe, Rpc},
     runtime::{RuntimeArea, RuntimeContext},

@@ -85,8 +85,12 @@ pub fn open_at(path: &std::path::Path) -> rusqlite::Result<Connection> {
 }
 
 /// Memory schema version (`PRAGMA user_version`). Version 1 is the frozen
-/// `spec/memory-schema.sql` with its FTS index and the default owner grant.
-const SCHEMA_VERSION: i64 = 1;
+/// `spec/memory-schema.sql` with its FTS index and the default owner grant; version 2 adds `digest_cursor`.
+const SCHEMA_VERSION: i64 = 2;
+/// Version 2: the Digest's progress per conversation and sequence space, written with its memories.
+pub(crate) const DIGEST_CURSOR_V2: &str = "CREATE TABLE IF NOT EXISTS digest_cursor (
+  conversation TEXT NOT NULL, space TEXT NOT NULL, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+  PRIMARY KEY (conversation, space));";
 
 /// Open the selected runtime's database at `SCHEMA_VERSION`. A newer version refuses to open.
 pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
@@ -115,13 +119,18 @@ pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, St
 /// in force. Version 0 is every database made before versioning, including ones an older
 /// initializer left incomplete: it is completed in place and stamped. A newer version is untouched.
 fn migrate(conn: &Connection) -> rusqlite::Result<i64> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version != 0 {
-        return Ok(version);
+    let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version == 0 {
+        complete_unversioned(conn)?;
+        version = 1;
+        conn.pragma_update(None, "user_version", version)?;
     }
-    complete_unversioned(conn)?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    Ok(SCHEMA_VERSION)
+    if version == 1 {
+        conn.execute_batch(DIGEST_CURSOR_V2)?;
+        version = 2;
+        conn.pragma_update(None, "user_version", version)?;
+    }
+    Ok(version)
 }
 
 /// Existing rows, grants and FTS entries survive; only a missing FTS table is populated from rows.
@@ -1673,18 +1682,30 @@ mod tests {
         let conn = open_ready_for_runtime(&context).unwrap();
         assert!(conn.prepare("SELECT * FROM role_group_session").is_err(),
                 "a version 1 open must not rerun the unversioned completion");
-        conn.execute_batch("PRAGMA user_version=2;").unwrap();
+        conn.execute_batch("PRAGMA user_version=3;").unwrap();
         drop(conn);
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+    }
+
+    #[test]
+    fn schema_version_2_adds_the_digest_cursor_to_a_version_1_database() {
+        let (root, context) = isolated_fixture();
+        drop(open_ready_for_runtime(&context).unwrap());
+        let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
+        conn.execute_batch("DROP TABLE digest_cursor; PRAGMA user_version=1;").unwrap();
+        drop(conn);
+        let conn = open_ready_for_runtime(&context).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        conn.prepare("SELECT conversation, space, through_seq, updated_at FROM digest_cursor").unwrap();
     }
 
     #[test]
     fn schema_version_newer_database_is_refused_before_journal_mode_changes() {
         let (root, context) = isolated_fixture();
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=2;").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=3;").unwrap();
         drop(conn);
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();

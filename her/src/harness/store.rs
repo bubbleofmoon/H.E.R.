@@ -547,6 +547,33 @@ fn append(
     Ok(())
 }
 
+/// HER's completed harness replies in `conversation` created at or after `since_ms`, oldest first:
+/// (created_ms, text). No database means none. Never creates or migrates storage.
+pub(crate) fn assistant_texts(context: &RuntimeContext, conversation: &str, since_ms: i64) -> Result<Vec<(i64, String)>, String> {
+    let path = context.resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORAGE_ERROR)?;
+    let mut stmt = conn.prepare("SELECT e.created_ms, e.payload FROM events e JOIN turns t ON e.turn_id = t.id
+        WHERE t.conversation = ?1 AND t.state = 'completed' AND e.kind = 'assistant' AND e.created_ms >= ?2 ORDER BY e.seq")
+        .map_err(|_| STORAGE_ERROR)?;
+    let rows = stmt.query_map(params![conversation, since_ms], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (at, payload) = row.map_err(|_| STORAGE_ERROR)?;
+        let payload: Value = serde_json::from_str(&payload).map_err(|_| STORAGE_ERROR)?;
+        let text = payload["text"].as_str().unwrap_or("").trim();
+        if !text.is_empty() {
+            out.push((at, text.to_string()));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
