@@ -2557,7 +2557,19 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         crate::activity::append(&self.context, &line);
     }
 
+    /// Chat sends of a turn run off the runtime worker: the chain wait, part delays and gateway
+    /// calls must not starve ingress (issue #82).
     fn send_chat_text(
+        &self,
+        key: &str,
+        sid: &str,
+        purpose: &str,
+        text: &str,
+    ) -> crate::chat::SendReport {
+        crate::recorded_send::off_worker(|| self.send_chat_text_inline(key, sid, purpose, text))
+    }
+
+    fn send_chat_text_inline(
         &self,
         key: &str,
         sid: &str,
