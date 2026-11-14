@@ -32,7 +32,8 @@ class FileModeCheck(unittest.TestCase):
         shutil.copyfile(CHECK, self.repo / 'scripts' / 'check-repo.py')
 
     def git(self, *args):
-        env = dict(os.environ, **GIT_ENV)
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env.update(GIT_ENV)
         subprocess.run(['git', *args], cwd=self.repo, env=env, check=True, capture_output=True)
 
     def stage_hook(self, mode_flag):

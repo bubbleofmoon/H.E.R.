@@ -33,6 +33,17 @@ GIT_ENV = {
 }
 
 
+def clean_env(**extra):
+    """This process's environment without any GIT_* variable: a hook's git variables must never point a test
+    at another repository."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(extra)
+    return env
+
+
+IDENTITY = ['-c', 'user.name=Guard Test', '-c', 'user.email=guard.test@example.invalid', '-c', 'commit.gpgsign=false']
+
+
 def gitleaks():
     override = os.environ.get('HER_GITLEAKS')
     if override and Path(override).is_file():
@@ -67,17 +78,13 @@ class PushHook(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / rel, target)
         self.git('init', '-q', '-b', 'main')
-        self.git('config', 'user.name', 'Guard Test')
-        self.git('config', 'user.email', 'guard.test@example.invalid')
-        self.git('config', 'commit.gpgsign', 'false')
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def git(self, *args):
-        env = dict(os.environ)
-        env.update(GIT_ENV)
-        proc = subprocess.run(['git', '-C', str(self.repo), *args], capture_output=True, text=True, env=env)
+        proc = subprocess.run(['git', '-C', str(self.repo), *IDENTITY, *args], capture_output=True, text=True,
+                              env=clean_env(**GIT_ENV))
         self.assertEqual(proc.returncode, 0,
                          f'git {" ".join(args)}: {scrub(proc.stdout)}{scrub(proc.stderr)}')
         return proc.stdout.strip()
@@ -97,8 +104,7 @@ class PushHook(unittest.TestCase):
 
     def scan_objects(self, *oids):
         """Runs the message pass directly, so a receipt can name the pass that refused."""
-        env = dict(os.environ)
-        env.update(GIT_ENV)
+        env = clean_env(**GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
         proc = subprocess.run([BASH, str(ROOT / 'scripts' / 'scan-public.py'), '--objects-from-stdin'],
@@ -108,8 +114,7 @@ class PushHook(unittest.TestCase):
 
     def push(self, *lines, extra=None):
         """Run the hook exactly as git does: repository as cwd, ref lines on stdin; `extra` overrides variables."""
-        env = dict(os.environ)
-        env.update(GIT_ENV)
+        env = clean_env(**GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
         env.update(extra or {})

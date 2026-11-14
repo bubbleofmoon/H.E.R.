@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 SCAN = ROOT / 'scripts' / 'scan-public.py'
@@ -48,8 +49,19 @@ FAKE_LEDGER = '{"k":' + '"begun","turn":"t1","key":"group:1","inbound":[]}'
 FAKE_LIVE = '{"ts":' + '1,"key":"private:2","predicate":"notTaken"}'
 
 
+def clean_env(**extra):
+    """This process's environment without any GIT_* variable: git sets some of them for a hook, and a test
+    must never reach another repository through them."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(extra)
+    return env
+
+
+IDENTITY = ['-c', 'user.name=Guard Test', '-c', 'user.email=guard.test@example.invalid', '-c', 'commit.gpgsign=false']
+
+
 def run(args, text=None, env=None):
-    merged = dict(os.environ)
+    merged = clean_env()
     found = gitleaks()
     if found:
         merged['HER_GITLEAKS'] = found
@@ -217,15 +229,13 @@ class AddedMode(unittest.TestCase):
         for name in ('.gitleaks.toml', '.public-scan.json'):
             shutil.copy(ROOT / name, self.repo / name)
         self.git('init', '-q', '-b', 'main')
-        self.git('config', 'user.name', 'Guard Test')
-        self.git('config', 'user.email', 'guard.test@example.invalid')
-        self.git('config', 'commit.gpgsign', 'false')
 
     def tearDown(self):
         shutil.rmtree(self.repo, ignore_errors=True)
 
     def git(self, *args):
-        proc = subprocess.run(['git', '-C', str(self.repo), *args], capture_output=True, text=True)
+        proc = subprocess.run(['git', '-C', str(self.repo), *IDENTITY, *args], capture_output=True, text=True,
+                              env=clean_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout.strip()
 
@@ -288,6 +298,37 @@ class AddedMode(unittest.TestCase):
         code, out = run(['--root', str(self.repo), '--added-from-stdin'], '\n')
         self.assertEqual(code, 0, out)
         self.assertIn('0 commits', out)
+
+
+@REQUIRES_SCANNER
+class GitEnvIsolation(unittest.TestCase):
+    """A test run from a hook inherits GIT_DIR and GIT_WORK_TREE: its temp repositories must still be its own."""
+
+    def test_added_mode_cases_leave_a_decoy_repository_alone(self):
+        decoy = Path(tempfile.mkdtemp(prefix='public-scan-decoy-'))
+        self.addCleanup(shutil.rmtree, decoy, True)
+
+        def git(*args):
+            proc = subprocess.run(['git', '-C', str(decoy), *IDENTITY, *args], capture_output=True, text=True,
+                                  env=clean_env())
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout
+
+        git('init', '-q', '-b', 'decoy')
+        (decoy / 'a.md').write_text('decoy\n', encoding='utf-8')
+        git('add', '--', 'a.md')
+        git('commit', '-qm', 'decoy base')
+
+        def snapshot():
+            return git('for-each-ref', '--format=%(refname) %(objectname)'), (decoy / '.git' / 'config').read_bytes()
+
+        before = snapshot()
+        case = AddedMode('test_a_merge_scans_what_differs_from_each_parent')
+        with mock.patch.dict(os.environ, {'GIT_DIR': str(decoy / '.git'), 'GIT_WORK_TREE': str(decoy)}):
+            result = unittest.TestResult()
+            case.run(result)
+        self.assertTrue(result.wasSuccessful(), result.failures + result.errors)
+        self.assertEqual(snapshot(), before)
 
 
 if __name__ == '__main__':

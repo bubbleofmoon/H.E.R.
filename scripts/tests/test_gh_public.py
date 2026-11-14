@@ -74,7 +74,7 @@ class WrapperCase(unittest.TestCase):
         self.body.write_text(CLEAN_BODY, encoding='utf-8')
         self.other = self.tmp / 'other.md'
         self.other.write_text(DIRTY_BODY, encoding='utf-8')
-        self.env = dict(os.environ)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         self.env['GH_STUB_MARK'] = str(self.mark)
         self.env['PATH'] = str(bin_dir) + os.pathsep + self.env.get('PATH', '')
         if gitleaks():

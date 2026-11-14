@@ -8,6 +8,7 @@ Run: python -I scripts/tests/test_agent_guard.py
 """
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -20,6 +21,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 GUARD = ROOT / '.claude' / 'hooks' / 'agent-guard.sh'
 BASH = shutil.which('bash')
 ROLES = ('implementer', 'reviewer', 'gate', 'planner')
+
+
+def clean_env():
+    """This process's environment without any GIT_* variable, so no git call here reaches another repository."""
+    return {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 
 
 def load_guard():
@@ -347,10 +353,13 @@ class AgentGuard(unittest.TestCase):
         git = ['git', '-c', 'user.name=guard-test', '-c', 'user.email=guard-test@example.invalid',
                '-c', 'init.defaultBranch=main']
         repo = str(cls.places['repo'])
-        subprocess.run([*git, 'init', '-q', repo], check=True)
-        subprocess.run([*git, '-C', repo, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True)
-        subprocess.run([*git, '-C', repo, 'worktree', 'add', '-q', '-b', 'her/1-x', str(cls.places['wt'])], check=True)
-        subprocess.run([*git, '-C', repo, 'worktree', 'add', '-q', '--detach', str(cls.places['detached'])], check=True)
+        env = clean_env()
+        subprocess.run([*git, 'init', '-q', repo], check=True, env=env)
+        subprocess.run([*git, '-C', repo, 'commit', '-q', '--allow-empty', '-m', 'init'], check=True, env=env)
+        subprocess.run([*git, '-C', repo, 'worktree', 'add', '-q', '-b', 'her/1-x', str(cls.places['wt'])], check=True,
+                       env=env)
+        subprocess.run([*git, '-C', repo, 'worktree', 'add', '-q', '--detach', str(cls.places['detached'])], check=True,
+                       env=env)
 
     @classmethod
     def tearDownClass(cls):
@@ -360,13 +369,13 @@ class AgentGuard(unittest.TestCase):
         posix = {name: path.as_posix() for name, path in self.places.items()}
         call = {'tool_name': 'Bash', 'tool_input': {'command': command.format(**posix)}, 'cwd': str(self.places[where])}
         result = subprocess.run([BASH, str(GUARD), role], input=json.dumps(call), capture_output=True,
-                                text=True, encoding='utf-8', timeout=60)
+                                text=True, encoding='utf-8', timeout=60, env=clean_env())
         return result.returncode, result.stderr
 
     def tool_call(self, role, tool, path):
         call = {'tool_name': tool, 'tool_input': {'file_path': path}, 'cwd': str(self.places['wt'])}
         result = subprocess.run([BASH, str(GUARD), role], input=json.dumps(call), capture_output=True,
-                                text=True, encoding='utf-8', timeout=60)
+                                text=True, encoding='utf-8', timeout=60, env=clean_env())
         return result.returncode
 
     def expect(self, cases, roles, allowed):

@@ -87,7 +87,7 @@ class HandoffCase(unittest.TestCase):
         (bin_dir / 'gh.cmd').write_text('@"%GH_STUB_PY%" "%~dp0gh_stub.py" %*\r\n', encoding='utf-8')
         self.log = self.tmp / 'gh-calls.jsonl'
         self.body = self.tmp / 'body.md'
-        self.env = dict(os.environ)
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         for var in ('GH_STUB_FAIL', 'GH_STUB_STATE', 'GH_STUB_ISSUE_LABELS', 'GH_STUB_REPO_LABELS'):
             self.env.pop(var, None)
         self.env['GH_STUB_PY'] = sys.executable
