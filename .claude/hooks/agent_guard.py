@@ -39,6 +39,12 @@ import subprocess
 import sys
 
 ROLES = ('implementer', 'reviewer', 'gate', 'planner')
+# The integration checkout whose codex-task script is canonical, and the ticket folder that holds plans and
+# scratch exports. The harness leaves both at their defaults; a test points them at its own copy and a readable
+# folder. An agent's command runs in its own shell, so it cannot change these for the hook.
+HOME_CHECKOUT = os.environ.get('HER_GUARD_HOME', '/root/her').rstrip('/')
+TICKET_ROOT = os.environ.get('HER_GUARD_TICKETS', '/root/orch/her').rstrip('/')
+FORBIDDEN_REPO = re.compile(r'(?i)(' + re.escape(TICKET_ROOT) + r'/|/root/orch/her/|c:/her-orch/)')
 READ_ONLY_ROLES = ('reviewer', 'planner')
 TICKET_BRANCH = re.compile(r'her/[0-9]+-[A-Za-z0-9._-]+')
 OPERATOR_CHARS = '();<>|&`'
@@ -67,7 +73,7 @@ FIND_TESTS = {'-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename',
               '-samefile', '-readable', '-writable', '-executable', '-maxdepth', '-mindepth', '-depth', '-xdev', '-mount',
               '-noleaf', '-daystart', '-follow', '-ignore_readdir_race', '-noignore_readdir_race', '-not', '-and', '-or',
               '-a', '-o', '-true', '-false', '-prune', '-print', '-print0', '-L', '-H', '-P'}
-CODEX_PROMPT = re.compile(r'(?:/root/orch/her|[Cc]:/her-orch)/([1-9][0-9]*)/review/codex-self-[1-9][0-9]*\.md')
+CODEX_PROMPT = re.compile('(?:' + re.escape(TICKET_ROOT) + r'|[Cc]:/her-orch)/([1-9][0-9]*)/review/codex-self-[1-9][0-9]*\.md')
 QUICK_INPUTS = {'target': re.compile(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'),
                 'filter': re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.-]*'),
                 'os': re.compile(r'linux|windows')}
@@ -77,10 +83,10 @@ PUSH_WORD = re.compile(r'\bpush\b')
 COMMIT_WORD = re.compile(r'\bcommit\b')
 GIT_WORD = re.compile(r'\bgit\b')
 GH_WORD = re.compile(r'(?<![\w.-])gh(?![\w.-])')
-PLANNER_WRITE = re.compile(r'(?:/root/orch/her|[Cc]:/her-orch)/[1-9][0-9]*/(?:plan\.md|scratch/.+)')
+PLANNER_WRITE = re.compile('(?:' + re.escape(TICKET_ROOT) + r'|[Cc]:/her-orch)/[1-9][0-9]*/(?:plan\.md|scratch/.+)')
 REPARSE_POINT = 0x400
 CODEX_NAMES = {'codex', 'codex.cmd', 'codex.ps1', 'codex.js', 'codex-task.sh', 'codex-task.ps1'}
-CODEX_SH = '/root/her/scripts/codex-task.sh'
+CODEX_SH = HOME_CHECKOUT + '/scripts/codex-task.sh'
 CODEX_PS1 = 'c:/her/scripts/codex-task.ps1'
 CODEX_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]*')
 CODEX_MINUTES = re.compile(r'[1-9][0-9]{0,2}')
@@ -296,7 +302,7 @@ def git_read_only(seg, cwd):
     while i < len(seg) and seg[i].startswith('-'):
         if seg[i] == '-C' and i + 1 < len(seg):
             directory = effective_dir(seg[i + 1], directory)
-            if re.match(r'(?i)(/root/orch/her/|c:/her-orch/)', directory):
+            if FORBIDDEN_REPO.match(directory):
                 return False                  # a ticket folder or scratch export is not a repository to read here
             i += 2
         elif seg[i] in ('--no-pager', '-P'):

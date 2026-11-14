@@ -7,6 +7,7 @@ fake user path and a fake turn-ledger line. Run: python -I scripts/tests/test_sc
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -275,7 +276,9 @@ class AddedMode(unittest.TestCase):
         # Coverage of the cat-file reading of parents: a missing parent object is unreadable, never absent.
         base = self.commit({'docs/a.md': 'clean\n'}, 'base')
         tip = self.commit({'docs/b.md': 'clean\n'}, 'tip')
-        (self.repo / '.git' / 'objects' / base[:2] / base[2:]).unlink()     # the parent commit object only
+        path = self.repo / '.git' / 'objects' / base[:2] / base[2:]     # the parent commit object only
+        os.chmod(path, stat.S_IWRITE)     # git writes objects read-only on Windows; unlink refuses them there
+        path.unlink()
         code, out = self.added(tip)
         self.assertEqual(code, 0, out)
         self.assertIn('1 commits, 1 whole trees', out)

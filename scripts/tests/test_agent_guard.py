@@ -21,11 +21,23 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 GUARD = ROOT / '.claude' / 'hooks' / 'agent-guard.sh'
 BASH = shutil.which('bash')
 ROLES = ('implementer', 'reviewer', 'gate', 'planner')
+# The hook reads its checkout and ticket folder from HER_GUARD_HOME and HER_GUARD_TICKETS. The tests point them at
+# the tree under test and at a folder any user can read, so the same tables pass from any checkout location.
+TICKET_TEST = (Path(tempfile.gettempdir()).resolve() / 'guard-tickets-test').as_posix()
+TICKET_LITERAL = '/root/orch/her/'
 
 
 def clean_env():
     """This process's environment without any GIT_* variable, so no git call here reaches another repository."""
-    return {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env['HER_GUARD_HOME'] = ROOT.as_posix()
+    env['HER_GUARD_TICKETS'] = TICKET_TEST
+    return env
+
+
+def in_ticket_folder(path):
+    """A table's literal ticket path, moved to the ticket folder the hook is told to use."""
+    return TICKET_TEST + '/' + path[len(TICKET_LITERAL):] if path.startswith(TICKET_LITERAL) else path
 
 
 def load_guard():
@@ -105,12 +117,12 @@ IMPLEMENTER_ALLOWED = [
     ('repo', 'cd {wt} && git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit -f filter=lifecycle::tests::a -f os=windows'),
     ('wt', 'gh workflow run quick.yml -R bubbleofmoon/H.E.R. --ref her/1-x -f target=harness_e2e'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
-    ('wt', 'bash /root/her/scripts/codex-task.sh 1-self-2 {wt} /root/orch/her/1/review/codex-self-2.md gpt-6-astra high read-only 120'),
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6-astra high read-only 120'),
     ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
     ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6-astra -effort high -sandbox read-only -timeoutminutes 90'),
     ('wt', 'git add scripts/codex-task.sh'),
-    ('repo', 'cd {wt} && /root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('repo', 'cd {wt} && {home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
     ('wt', 'git add scripts/handoff.sh'),
     ('wt', 'git add scripts/gh-public.sh'),
 ]
@@ -546,13 +558,14 @@ class AgentGuard(unittest.TestCase):
 
     def guard(self, role, where, command):
         posix = {name: path.as_posix() for name, path in self.places.items()}
+        posix.update(home=ROOT.as_posix(), tickets=TICKET_TEST)
         call = {'tool_name': 'Bash', 'tool_input': {'command': command.format(**posix)}, 'cwd': str(self.places[where])}
         result = subprocess.run([BASH, str(GUARD), role], input=json.dumps(call), capture_output=True,
                                 text=True, encoding='utf-8', timeout=60, env=clean_env())
         return result.returncode, result.stderr
 
     def tool_call(self, role, tool, path):
-        call = {'tool_name': tool, 'tool_input': {'file_path': path}, 'cwd': str(self.places['wt'])}
+        call = {'tool_name': tool, 'tool_input': {'file_path': in_ticket_folder(path)}, 'cwd': str(self.places['wt'])}
         result = subprocess.run([BASH, str(GUARD), role], input=json.dumps(call), capture_output=True,
                                 text=True, encoding='utf-8', timeout=60, env=clean_env())
         return result.returncode
