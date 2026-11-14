@@ -463,6 +463,9 @@ fn send_poke_inner(
     if !target.is_empty() && !target_ok {
         return Err((400, "targetUserId 必须是正整数 QQ 号".to_string()));
     }
+    if let Some(storage) = canonical_v2_key(&key) {
+        mute_send_denial(context, cfg, &storage, &token)?;
+    }
     let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
     if kind == "group" {
         if let Some(reason) = assert_group_member(&ob, id, &target) {
@@ -480,7 +483,8 @@ fn send_poke_inner(
     // The member check was asynchronous in JS and the operator may have changed mode, allow-list or silence
     // meanwhile: confirm once more right before the request.
     let outcome: Result<(), (u16, String)> = (|| {
-        send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendPoke").map_err(|(_, m)| (500, m))?;
+        send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendPoke")
+            .map_err(|(status, m)| (if status == 403 { 403 } else { 500 }, m))?;
         if silent_blocks_send(context, cfg, &key)? {
             return Err((403, "静默模式已开启，当前不允许拍一拍".to_string()));
         }
@@ -490,6 +494,11 @@ fn send_poke_inner(
             ("send_poke", json!({ "user_id": id }))
         };
         let reply = ob.request(action, params).ok_or((500, format!("OneBot {action} 连接失败")))?;
+        if crate::onebot::is_mute_reply(&reply) {
+            crate::group_mute::learn_from_refusal(context, &storage_key);
+            return Err(mute_send_denial(context, cfg, &storage_key, &token).err()
+                .unwrap_or((403, format!("OneBot {action} 被拒绝：禁言中（result=120）"))));
+        }
         if reply.get("status").and_then(Value::as_str) != Some("ok") || reply.get("retcode").and_then(Value::as_i64) != Some(0) {
             let retcode = reply.get("retcode").map(social_policy_js_string).unwrap_or_else(|| "undefined".to_string());
             let wording = reply.get("wording").and_then(Value::as_str).unwrap_or("");
@@ -758,6 +767,7 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     if normalized.is_empty() { return Err((400, "归一化后没有可发送的消息".into())); }
     let (messages, at_user, flavor, policy) = (&normalized, call.at_user, call.flavor, call.policy);
     let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
+    mute_send_denial(context, cfg, key, token)?;
     let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
     let initial = load_social_state_for(context)?["conversations"][key].clone();
     let chain = send_chain();
@@ -853,6 +863,12 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
             return Err(match error {
                 crate::recorded_send::BeginError::Busy => (409, crate::recorded_send::BATCH_BUSY.to_string()),
                 crate::recorded_send::BeginError::Intent(error) => (503, format!("发送意图未能持久记录，未发送：{error}")),
+                crate::recorded_send::BeginError::Muted(text) => {
+                    if flavor == SendFlavor::Message {
+                        release_unsent_tool_claim(context, key, now);
+                    }
+                    mute_send_denial(context, cfg, key, token).err().unwrap_or((403, text))
+                }
             });
         }
     };
@@ -908,6 +924,12 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
         }
         if flavor == SendFlavor::Message {
             out["delays"] = json!(delays);
+        }
+        if crate::group_mute::active(context, key).is_some() {
+            if let Err((_, text)) = mute_send_denial(context, cfg, key, token) {
+                let earlier = out["error"].as_str().unwrap_or("").to_string();
+                out["error"] = json!(if sent == 0 { text } else { format!("{earlier}；{text}") });
+            }
         }
         return Ok((500, out));
     }
@@ -1120,6 +1142,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
         }
     }
     let storage_key = canonical_v2_key(&key).ok_or((400, "key 格式无效".to_string()))?;
+    mute_send_denial(context, cfg, &storage_key, &token)?;
     let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
     let mut resolved_quote = None;
     if reply_present {

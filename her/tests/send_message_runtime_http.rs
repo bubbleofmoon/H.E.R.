@@ -464,6 +464,8 @@ enum Step {
     Drop,
     /// Answer a failed OneBot envelope with this retcode (HTTP 200).
     Failed(i64),
+    /// Retcode 100 with QQ result=120: the bot is muted in the group.
+    Muted,
     /// Answer with this HTTP status and an empty JSON failure envelope.
     HttpStatus(u16),
     /// Deliver (id assigned) but answer only after this many milliseconds.
@@ -550,6 +552,8 @@ fn handle_onebot(
             }
             .to_string(),
         )
+    } else if path == "/get_group_member_list" {
+        Some(json!({ "status": "ok", "retcode": 0, "data": [{ "user_id": 822 }] }).to_string())
     } else if path == "/get_group_member_info" {
         Some(json!({ "status": "ok", "retcode": 0, "data": { "user_id": 822, "card": "被艾特的名片", "nickname": "nick" } }).to_string())
     } else if path == "/get_login_info" {
@@ -585,6 +589,7 @@ fn handle_onebot(
             Step::Failed(retcode) => Some(
                 json!({ "status": "failed", "retcode": retcode, "wording": "fixture failure" }).to_string(),
             ),
+            Step::Muted => Some(json!({ "status": "failed", "retcode": 100, "message": "sendMsg failed: result=120", "wording": "fixture muted" }).to_string()),
             Step::HttpStatus(code) => {
                 http_status = code;
                 Some(json!({ "status": "failed", "retcode": 1400 }).to_string())
@@ -2014,6 +2019,7 @@ fn resume_racing_the_original_send_is_refused_and_never_duplicates() {
     assert_eq!(send_texts(&requests), vec!["一", "二"], "no item is sent twice");
 }
 
+// Retcode 100 without result=120 may have delivered (#46 keeps it unknown); result=120 is covered by a_result_120_refusal_is_not_committed.
 #[test]
 fn failure_retcodes_that_may_have_delivered_are_unknown_and_clear_refusals_stay_not_committed() {
     let onebot = FakeOneBot::start_with(
@@ -2038,6 +2044,124 @@ fn failure_retcodes_that_may_have_delivered_are_unknown_and_clear_refusals_stay_
     assert_eq!(resumed.body["unknown"], json!([2, 3]));
     let requests = onebot.finish();
     assert_eq!(send_texts(&requests), vec!["甲", "乙", "丙", "丁", "甲", "乙"], "unknown items are never resent");
+}
+
+#[test]
+fn a_result_120_refusal_is_not_committed() {
+    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
+    let root = fixture_root("mute-120", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let console = ConsoleProcess::start(&root);
+    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    assert_eq!(first.status, 500, "a partial or failed batch keeps its status: {}", first.body);
+    assert_eq!(first.body["notCommitted"], json!([0]), "a muted refusal is definite: {}", first.body);
+    assert_eq!(first.body["unknown"], json!([]), "{}", first.body);
+    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refusal gives its reservation back");
+    let refused: Vec<String> = read_outbox(&root).iter().filter(|r| r["k"] == "not_committed")
+        .filter_map(|r| r["error"].as_str().map(str::to_string)).collect();
+    assert_eq!(refused, vec!["OneBot 发送失败：retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
+    drop(onebot);
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// Seed `data/group-mutes.json` with one personal mute ending at `personal_until` (ms; -1 = unknown end).
+fn seed_mute(root: &Path, key: &str, personal_until: i64) {
+    let mut groups = serde_json::Map::new();
+    groups.insert(
+        key.to_string(),
+        json!({"personalUntil": personal_until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}),
+    );
+    fs::write(root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+}
+
+#[test]
+fn a_muted_group_is_refused_locally_without_a_onebot_call() {
+    let onebot = FakeOneBot::start(70001, false);
+    let root = fixture_root("muted-local", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    seed_mute(&root, "group:70001", now_millis() + 600_000);
+    let console = ConsoleProcess::start(&root);
+    let refused = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    let error = refused.body["error"].as_str().unwrap_or_default();
+    assert!(error.contains("禁言") && error.contains("muted in this group until"), "{}", refused.body);
+    assert!(refused.body.get("unknown").is_none(), "a local refusal is never unknown delivery: {}", refused.body);
+    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0);
+    assert!(read_outbox(&root).iter().all(|r| r["k"] != "intent"), "no intent for a refused send");
+
+    // The other side of the threshold: a mute that ended one millisecond ago no longer refuses.
+    seed_mute(&root, "group:70001", now_millis() - 1);
+    let sent = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    assert_eq!(sent.status, 200, "{}", sent.body);
+    let requests = onebot.finish();
+    assert_eq!(requests.iter().filter(|r| r.path == "/send_group_msg").count(), 1, "only the post-mute send reached OneBot");
+}
+
+#[test]
+fn a_result_120_refusal_teaches_the_mute_and_the_next_send_stays_local() {
+    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
+    let root = fixture_root("muted-learn", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let console = ConsoleProcess::start(&root);
+    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    assert_eq!(first.body["notCommitted"], json!([0]), "{}", first.body);
+    let second = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["乙"] }));
+    assert_eq!(second.status, 403, "the learned mute refuses the next send locally: {}", second.body);
+    let store: Value = serde_json::from_slice(&fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    assert_eq!(store["groups"]["group:70001"]["personalUntil"], json!(-1));
+    // One content-free owner notice for the new episode.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while onebot.private_request_count.load(std::sync::atomic::Ordering::SeqCst) < 1 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let requests = onebot.finish();
+    let groups: Vec<String> = requests.iter().filter(|r| r.path == "/send_group_msg").map(segment_text).collect();
+    assert_eq!(groups, vec!["甲".to_string()], "the second send never reached OneBot");
+    let notices: Vec<String> = requests.iter().filter(|r| r.path == "/send_private_msg").map(segment_text).collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("70001") && notices[0].contains("禁言"), "{notices:?}");
+    assert!(!notices[0].contains('甲') && !notices[0].contains('乙'), "the notice carries no message content");
+}
+
+#[test]
+fn a_result_120_poke_refusal_is_a_definite_403_and_teaches_the_mute() {
+    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
+    let root = fixture_root("muted-poke", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    hf123_config(&root, |cfg| cfg["socialV2"]["tools"]["sendPoke"] = json!(true));
+    let console = ConsoleProcess::start(&root);
+    let body = json!({"key": "group:70001", "targetUserId": "822"});
+    let first = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A), &body).unwrap();
+    assert_eq!(first.status, 403, "{}", first.body);
+    assert!(first.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", first.body);
+    let store: Value = serde_json::from_slice(&fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    assert_eq!(store["groups"]["group:70001"]["personalUntil"], json!(-1));
+    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refused poke gave its reservation back");
+    let second = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A), &body).unwrap();
+    assert_eq!(second.status, 403, "{}", second.body);
+    let requests = onebot.finish();
+    assert_eq!(requests.iter().filter(|r| r.path == "/group_poke").count(), 1, "the second poke stayed local");
+}
+
+#[test]
+fn a_muted_group_refuses_direct_and_poke_without_any_gateway_request() {
+    let onebot = FakeOneBot::start(70001, false);
+    let root = fixture_root("muted-direct", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    hf123_config(&root, |cfg| {
+        cfg["socialV2"]["tools"]["sendGroup"] = json!(true);
+        cfg["socialV2"]["tools"]["sendPoke"] = json!(true);
+    });
+    seed_mute(&root, "group:70001", now_millis() + 600_000);
+    let console = ConsoleProcess::start(&root);
+    let direct = http_request(console.port, "POST", "/api/send/group", Some(CONSOLE_A), Some(AGENT_A),
+        &json!({"groupId": 70001, "token": AGENT_A, "message": "甲"})).unwrap();
+    assert_eq!(direct.status, 403, "{}", direct.body);
+    assert!(direct.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", direct.body);
+    let poke = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A),
+        &json!({"key": "group:70001", "targetUserId": "711"})).unwrap();
+    assert_eq!(poke.status, 403, "{}", poke.body);
+    assert!(poke.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", poke.body);
+    let requests = onebot.finish();
+    assert!(requests.is_empty(), "no gateway request of any path: {requests:?}");
 }
 
 #[test]
