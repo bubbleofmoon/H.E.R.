@@ -23,6 +23,7 @@ mod briefing;
 mod initial_prompts;
 mod persona;
 mod persona_command;
+mod wake_words;
 mod activity;
 mod feedback;
 mod wake;

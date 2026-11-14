@@ -6842,7 +6842,7 @@ fn handle_social_config_post(
 /// config file while the state gate is held, not taken from the request that triggered the
 /// refresh: config writers are not serialized, so the last refresh to run may belong to an
 /// earlier write, and it must still leave the conversations on what the file says now.
-fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
+pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
     let now = now_ms();
     let refresh = |state: &mut Value| -> Result<(), (u16, String)> {
         let cfg = context.load_config().map_err(|error| (503, error.to_string()))?;

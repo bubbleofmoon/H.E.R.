@@ -613,6 +613,11 @@ pub(crate) fn core_block(context: &RuntimeContext, key: &str, limit: usize) -> S
     format!("【人设】{}\n{core}\n\n", found["name"].as_str().unwrap_or(""))
 }
 
+/// The wake words the conversation's persona declares. Stub until Run B2.
+pub(crate) fn wake_names(_context: &RuntimeContext, _key: &str) -> Vec<String> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
