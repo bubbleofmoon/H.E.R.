@@ -19,8 +19,8 @@ pub(super) struct Batch {
     pub messages: usize,
     /// Incoming messages waiting after the cursor, counted past the input cap: the backlog.
     pub pending: usize,
-    /// Creation time of the last HER reply consumed (journal space); the stored value otherwise.
-    pub replies_ms: i64,
+    /// Position (creation ms, event sequence) of the last HER reply consumed (journal space); the stored value otherwise.
+    pub replies: (i64, i64),
 }
 
 pub(super) fn space(context: &RuntimeContext) -> &'static str {
@@ -126,7 +126,7 @@ fn social(context: &RuntimeContext, key: &str, cursor: DigestCursor, max_chars: 
         }
     }
     if through == 0 { return Ok(None); }
-    Ok(Some(Batch { input: out.text, first, through, messages: count, pending, replies_ms: cursor.replies_ms }))
+    Ok(Some(Batch { input: out.text, first, through, messages: count, pending, replies: (cursor.replies_ms, cursor.replies_seq) }))
 }
 
 fn journal_line(raw: &str, owner: &str, seq: i64, view: &Value) -> Option<String> {
@@ -164,9 +164,8 @@ fn journal(context: &RuntimeContext, cfg: &Value, key: &str, cursor: DigestCurso
     let rows = journal.conversation_events(key, after, ROWS + 1)?;
     let Some(first_at) = rows.first().map(|row| row.2) else { return Ok(None) };
     // HER's replies after their own progress; a conversation's first digest starts at its first row.
-    let replies_after = if cursor.replies_ms > 0 { cursor.replies_ms } else { first_at - 1 };
-    let mut replies = crate::harness::store::assistant_texts(context, key, replies_after + 1)?;
-    replies.sort_by_key(|(at, _)| *at);
+    let replies_after = if cursor.replies_ms > 0 { (cursor.replies_ms, cursor.replies_seq) } else { (first_at - 1, i64::MAX) };
+    let mut replies = crate::harness::store::assistant_texts(context, key, replies_after)?;
     let mut replies = replies.into_iter().peekable();
     let mut out = Lines::new(key, max_chars);
     let (mut first, mut through, mut messages, mut pending, mut replies_ms) = (0, 0, 0usize, 0usize, replies_after);
@@ -179,9 +178,9 @@ fn journal(context: &RuntimeContext, cfg: &Value, key: &str, cursor: DigestCurso
         }
         let rendered = if stage == "handled" || stage == "backfilled" { journal_line(raw, &owner, seq, view) } else { None };
         // HER's replies that came before this row.
-        while !out.full() && replies.peek().is_some_and(|(at, _)| *at < received_ms) {
-            let (at, text) = replies.next().expect("peeked reply");
-            if out.push(&line(view, None, "我", &text)) { replies_ms = at; }
+        while !out.full() && replies.peek().is_some_and(|(at, _, _)| *at < received_ms) {
+            let (at, id, text) = replies.next().expect("peeked reply");
+            if out.push(&line(view, None, "我", &text)) { replies_ms = (at, id); }
         }
         if out.full() {
             pending += usize::from(rendered.is_some());
@@ -197,14 +196,14 @@ fn journal(context: &RuntimeContext, cfg: &Value, key: &str, cursor: DigestCurso
     }
     if reached_end {
         // HER's replies after the last row; only completed turns are stored as replies.
-        for (at, text) in replies {
+        for (at, id, text) in replies {
             if !out.push(&line(view, None, "我", &text)) { break; }
-            replies_ms = at;
+            replies_ms = (at, id);
         }
     }
     if through == 0 {
         if replies_ms == replies_after { return Ok(None); }
         through = after; // only HER's replies fit: the messages wait for the next read
     }
-    Ok(Some(Batch { input: out.text, first, through, messages, pending, replies_ms: replies_ms.max(cursor.replies_ms) }))
+    Ok(Some(Batch { input: out.text, first, through, messages, pending, replies: replies_ms.max((cursor.replies_ms, cursor.replies_seq)) }))
 }

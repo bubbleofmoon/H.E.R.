@@ -213,7 +213,7 @@ fn quiet_young_and_cancelled_runs_never_ask_the_model() {
 fn a_restarted_sequence_is_read_from_the_start() {
     let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
     let cfg = context.load_config().unwrap();
-    MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").write_digest("msg", 0, 50, 0, &[]).unwrap();
+    MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").write_digest("msg", 0, 50, (0, 0), &[]).unwrap();
     social(&root, "group:42", json!([
         {"seq":1,"sender":"甲","userId":"5001","text":"第一句","isSelf":false},
         {"seq":2,"sender":"甲","userId":"5001","text":"第二句","isSelf":false}

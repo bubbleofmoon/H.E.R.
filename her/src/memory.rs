@@ -90,7 +90,7 @@ const SCHEMA_VERSION: i64 = 2;
 /// Version 2: the Digest's progress per conversation and sequence space, written with its memories.
 pub(crate) const DIGEST_CURSOR_V2: &str = "CREATE TABLE IF NOT EXISTS digest_cursor (
   conversation TEXT NOT NULL, space TEXT NOT NULL, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-  replies_ms INTEGER NOT NULL DEFAULT 0, failed_at INTEGER NOT NULL DEFAULT 0,
+  replies_ms INTEGER NOT NULL DEFAULT 0, replies_seq INTEGER NOT NULL DEFAULT 0, failed_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (conversation, space));";
 
 /// Open the selected runtime's database at `SCHEMA_VERSION`. A newer version refuses to open.
@@ -1699,7 +1699,7 @@ mod tests {
         drop(conn);
         let conn = open_ready_for_runtime(&context).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
-        conn.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, failed_at FROM digest_cursor").unwrap();
+        conn.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor").unwrap();
     }
 
     #[test]
@@ -1720,7 +1720,7 @@ mod tests {
         let migrated = open_ready_for_runtime(&context).unwrap();
         assert_eq!(migrated.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
         assert_eq!(rows(&migrated), before, "migration to version 2 must not change rows");
-        migrated.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, failed_at FROM digest_cursor").unwrap();
+        migrated.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor").unwrap();
         drop((migrated, conn));
     }
 

@@ -103,14 +103,14 @@ impl<'a> Digest<'a> {
                 .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
             if batch.messages > 0 { break batch; }
             // Rows that render no message (commands, HER's frames, blanked raw text): move past them without the model.
-            if (batch.through, batch.replies_ms) == (cursor.through, cursor.replies_ms) || skips == MAX_SKIPS {
+            if (batch.through, batch.replies) == (cursor.through, (cursor.replies_ms, cursor.replies_seq)) || skips == MAX_SKIPS {
                 return Ok(Outcome::Quiet);
             }
             if hold.held() { return Err(DigestError::Cancelled); }
-            if reader.write_digest(space, cursor.through, batch.through, batch.replies_ms, &[]).map_err(|_| DigestError::Storage)?.is_none() {
+            if reader.write_digest(space, cursor.through, batch.through, batch.replies, &[]).map_err(|_| DigestError::Storage)?.is_none() {
                 return Ok(Outcome::Quiet);
             }
-            (cursor.through, cursor.replies_ms) = (batch.through, batch.replies_ms);
+            (cursor.through, (cursor.replies_ms, cursor.replies_seq)) = (batch.through, batch.replies);
             skips += 1;
         };
         if batch.pending < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
@@ -130,7 +130,7 @@ impl<'a> Digest<'a> {
             tags: None, source: &source, importance: 0.5,
         }).collect();
         if hold.held() { return Err(DigestError::Cancelled); }
-        match reader.write_digest(space, cursor.through, batch.through, batch.replies_ms, &memories).map_err(|_| DigestError::Storage)? {
+        match reader.write_digest(space, cursor.through, batch.through, batch.replies, &memories).map_err(|_| DigestError::Storage)? {
             Some(written) => Ok(Outcome::Written { through: batch.through, memories: written.len() }),
             None => Ok(Outcome::Quiet),
         }

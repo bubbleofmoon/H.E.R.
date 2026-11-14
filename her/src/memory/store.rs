@@ -45,6 +45,8 @@ pub struct DigestCursor {
     pub digested_at: i64,
     /// Creation time (ms) of the last HER harness reply a digest consumed; 0 none yet.
     pub replies_ms: i64,
+    /// Event sequence of that reply (ties of one millisecond); 0 none yet.
+    pub replies_seq: i64,
     /// When the last model call or answer failed (ms); 0 when the last attempt succeeded.
     pub failed_at: i64,
 }
@@ -122,15 +124,15 @@ impl Reader<'_> {
     /// Digest progress in one sequence space (`msg`, `inbound`); `None` before any digest or failure.
     pub fn digest_cursor(&self, space: &str) -> rusqlite::Result<Option<DigestCursor>> {
         use rusqlite::OptionalExtension;
-        self.conn.query_row("SELECT through_seq, updated_at, replies_ms, failed_at FROM digest_cursor WHERE conversation=?1 AND space=?2",
+        self.conn.query_row("SELECT through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor WHERE conversation=?1 AND space=?2",
             rusqlite::params![self.key, space],
-            |r| Ok(DigestCursor { through: r.get(0)?, digested_at: r.get(1)?, replies_ms: r.get(2)?, failed_at: r.get(3)? })).optional()
+            |r| Ok(DigestCursor { through: r.get(0)?, digested_at: r.get(1)?, replies_ms: r.get(2)?, replies_seq: r.get(3)?, failed_at: r.get(4)? })).optional()
     }
 
     /// Write a digest's memories and move its cursor to `through` (HER's replies to `replies_ms`) in one
     /// transaction; a success clears the failure time. `Ok(None)`: the stored sequence (0 when there is none)
     /// is no longer `expected` because another run digested first; nothing is written.
-    pub fn write_digest(&self, space: &str, expected: i64, through: i64, replies_ms: i64, memories: &[NewMemory<'_>])
+    pub fn write_digest(&self, space: &str, expected: i64, through: i64, replies: (i64, i64), memories: &[NewMemory<'_>])
         -> rusqlite::Result<Option<Vec<UpsertOutcome>>> {
         super::atomic(self.conn, |conn| {
             use rusqlite::OptionalExtension;
@@ -143,10 +145,10 @@ impl Reader<'_> {
             for memory in memories {
                 written.push(self.write(memory)?);
             }
-            conn.execute("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at,replies_ms,failed_at) VALUES(?1,?2,?3,?4,?5,0)
+            conn.execute("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at,replies_ms,replies_seq,failed_at) VALUES(?1,?2,?3,?4,?5,?6,0)
                 ON CONFLICT(conversation,space) DO UPDATE SET through_seq=excluded.through_seq, updated_at=excluded.updated_at,
-                replies_ms=excluded.replies_ms, failed_at=0",
-                rusqlite::params![self.key, space, through, super::now_ms(), replies_ms])?;
+                replies_ms=excluded.replies_ms, replies_seq=excluded.replies_seq, failed_at=0",
+                rusqlite::params![self.key, space, through, super::now_ms(), replies.0, replies.1])?;
             Ok(Some(written))
         })
     }
@@ -285,16 +287,16 @@ mod tests {
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
         assert_eq!(reader.digest_cursor("msg").unwrap(), None);
-        assert_eq!(reader.write_digest("msg", 0, 4, 7, &[new("digested")]).unwrap().map(|w| w.len()), Some(1));
+        assert_eq!(reader.write_digest("msg", 0, 4, (7, 3), &[new("digested")]).unwrap().map(|w| w.len()), Some(1));
         let stored = reader.digest_cursor("msg").unwrap().unwrap();
-        assert_eq!((stored.through, stored.replies_ms, stored.failed_at), (4, 7, 0));
-        assert!(reader.write_digest("msg", 0, 9, 7, &[new("stale")]).unwrap().is_none(), "a stale expected cursor writes nothing");
+        assert_eq!((stored.through, stored.replies_ms, stored.replies_seq, stored.failed_at), (4, 7, 3, 0));
+        assert!(reader.write_digest("msg", 0, 9, (7, 3), &[new("stale")]).unwrap().is_none(), "a stale expected cursor writes nothing");
         let rows: i64 = store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1);
         reader.digest_failed("msg").unwrap();
         let failed = reader.digest_cursor("msg").unwrap().unwrap();
         assert!(failed.through == 4 && failed.failed_at > 0, "a failure keeps the progress: {failed:?}");
-        assert_eq!(reader.write_digest("msg", 4, 6, 8, &[]).unwrap().map(|w| w.len()), Some(0));
+        assert_eq!(reader.write_digest("msg", 4, 6, (8, 1), &[]).unwrap().map(|w| w.len()), Some(0));
         assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| (c.through, c.failed_at)), Some((6, 0)), "a success clears the failure");
         assert_eq!(store.for_reader("group:1").digest_cursor("msg").unwrap(), None, "cursors are per conversation");
         assert_eq!(reader.digest_cursor("inbound").unwrap(), None, "cursors are per sequence space");
@@ -307,7 +309,7 @@ mod tests {
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
-        reader.write_digest("msg", 0, 4, 0, &[new("kept")]).unwrap();
+        reader.write_digest("msg", 0, 4, (0, 0), &[new("kept")]).unwrap();
         let counts = || -> (i64, i64) {
             (store.conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |r| r.get(0)).unwrap(),
              store.conn.query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0)).unwrap())
@@ -316,7 +318,7 @@ mod tests {
         // The cursor statement fails after this digest's memory rows were inserted.
         store.conn.execute_batch("CREATE TEMP TRIGGER digest_fault_insert BEFORE INSERT ON digest_cursor BEGIN SELECT RAISE(ABORT, 'injected'); END;
             CREATE TEMP TRIGGER digest_fault_update BEFORE UPDATE ON digest_cursor BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
-        assert!(reader.write_digest("msg", 4, 9, 0, &[new("lost one"), new("lost two")]).is_err());
+        assert!(reader.write_digest("msg", 4, 9, (0, 0), &[new("lost one"), new("lost two")]).is_err());
         assert_eq!(counts(), before, "a failed cursor commit kept memory rows");
         assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.through), Some(4), "a failed commit moved the cursor");
     }
