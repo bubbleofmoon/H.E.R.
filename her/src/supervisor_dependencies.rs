@@ -1944,9 +1944,7 @@ fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
         map.get(name)
             .is_some_and(|reasons| reasons.iter().any(|seen| seen == reason))
     };
-    if logged(&LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner())) {
-        return;
-    }
+    let _ = &logged;
     let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
     {
         let mut map = LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
@@ -1966,12 +1964,7 @@ fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
     }
 }
 
-fn forget_refusals(name: &str) {
-    LOGGED_REFUSALS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(name);
-}
+fn forget_refusals(_name: &str) {}
 
 fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {
     crate::safe_eprintln!("[dependencies] {reason}");
