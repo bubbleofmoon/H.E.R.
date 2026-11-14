@@ -19,6 +19,7 @@ mod memory_actions;
 mod pipeline;
 mod harness;
 mod prompt;
+mod briefing;
 mod initial_prompts;
 mod activity;
 mod feedback;
