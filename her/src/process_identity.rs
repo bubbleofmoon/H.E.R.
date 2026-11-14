@@ -171,12 +171,7 @@ fn names_script(process: &Process, expected: &std::path::Path) -> bool {
         let candidate = std::path::Path::new(candidate);
         match resolve_script(process, candidate) {
             Ok(actual) => same_exe(&actual.to_string_lossy(), &expected.to_string_lossy()),
-            Err(_) => match (candidate.file_name(), expected.file_name()) {
-                (Some(left), Some(right)) => {
-                    same_exe(&left.to_string_lossy(), &right.to_string_lossy())
-                }
-                _ => false,
-            },
+            Err(_) => false,
         }
     })
 }
