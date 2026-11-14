@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn names_default_to_the_name_and_an_explicit_empty_list_means_none() {
+    fn the_api_defaults_names_to_the_name_and_keeps_an_explicit_empty_list() {
         let (root, context) = fixture("names-default");
         let names = |id: &str| super::load(&context).unwrap()["personas"][id]["versions"][0]["names"].clone();
         let blank = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());

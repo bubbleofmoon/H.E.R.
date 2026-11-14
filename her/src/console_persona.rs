@@ -84,7 +84,7 @@ const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',
 const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':String(t);return td};
 async function list(){const j=await api('/api/personas');if(!j.ok)return;const tb=$('#list tbody');tb.replaceChildren();for(const p of j.personas){const tr=document.createElement('tr');tr.append(cell(p.id),cell(p.name),cell(p.activeVersion),cell(p.pendingVersions.join(', ')),cell(j.default===p.id?'yes':''));tr.onclick=()=>{$('#id').value=p.id;load()};tb.append(tr)}$('#assign').textContent=JSON.stringify({default:j.default,overrides:j.overrides,rebriefDue:j.rebriefDue},null,1)}
 async function load(){const j=await api('/api/personas/item?id='+encodeURIComponent($('#id').value));if(!j.ok)return;const vs=j.persona.versions;const v=vs[vs.length-1];for(const k of ['name','core','notes','compact','editMode'])$('#'+k).value=v[k];$('#names').value=v.names.join(', ');$('#neediness').value=v.traits.neediness;$('#autoRules').value=JSON.stringify(v.autoRules);const tb=$('#versions tbody');tb.replaceChildren();for(const x of vs.slice().reverse()){const tr=document.createElement('tr');const b=document.createElement('button');b.textContent=j.persona.activeVersion===x.version?'Active':'Approve';b.onclick=async()=>{await api('/api/personas/approve',{id:j.persona.id,version:x.version});load();list()};const td=document.createElement('td');td.append(b);tr.append(cell(x.version),cell(x.source),cell(x.approved?'yes':'no'),cell(x.core),cell(x.coreTokens+' / '+x.compactTokens+' (max '+j.budgets.coreTokens+' / '+j.budgets.compactTokens+')'),td);tb.append(tr)}}
-function fields(){let rules;try{rules=JSON.parse($('#autoRules').value||'null')}catch(e){rules=undefined}const names=$('#names').value.split(',').map(s=>s.trim()).filter(Boolean);const f={name:$('#name').value,core:$('#core').value,notes:$('#notes').value,compact:$('#compact').value,traits:{neediness:Number($('#neediness').value||1)},editMode:$('#editMode').value,autoRules:rules};if(names.length)f.names=names;return f}
+function fields(){let rules;try{rules=JSON.parse($('#autoRules').value||'null')}catch(e){rules=undefined}return{name:$('#name').value,core:$('#core').value,notes:$('#notes').value,compact:$('#compact').value,names:$('#names').value.split(',').map(s=>s.trim()).filter(Boolean),traits:{neediness:Number($('#neediness').value||1)},editMode:$('#editMode').value,autoRules:rules}}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);list()};
 $('#load').onclick=load;
 $('#save').onclick=async()=>{const id=$('#id').value.trim();const j=id?await api('/api/personas/update',Object.assign({id},fields())):await api('/api/personas/create',fields());if(j.ok){$('#id').value=j.id;load();list()}};
@@ -98,3 +98,17 @@ $('#wwLoad').onclick=wakeWords;
 list();
 </script></body></html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    /// The save request the page builds (`fields()` in `PAGE`) must leave `names` out when the Names field is
+    /// blank, so a new persona falls back to its name and an update keeps its list; the API contract for an
+    /// explicit `names: []` is `persona::tests`.
+    #[test]
+    fn the_page_sends_names_only_when_the_field_is_not_blank() {
+        let start = super::PAGE.find("function fields(){").expect("the page builds its save request in fields()");
+        let fields = super::PAGE[start..].lines().next().unwrap();
+        assert!(fields.contains("if(names.length)f.names=names"), "names are added to the request only when listed: {fields}");
+        assert!(!fields.contains("names:"), "the request literal must not carry a names list unconditionally: {fields}");
+    }
+}
