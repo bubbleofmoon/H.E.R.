@@ -14,6 +14,9 @@ const NAME_MAX: usize = 40;
 const NAMES_MAX: usize = 10;
 /// Versions kept per persona.
 const VERSIONS_MAX: usize = 50;
+/// Estimated tokens (`briefing::estimate_tokens`) a newly approved core and compact form may use.
+pub const CORE_TOKENS_MAX: usize = 1500;
+pub const COMPACT_TOKENS_MAX: usize = 300;
 /// The fields a save compares with the latest version.
 const CONTENT: [&str; 8] = ["name", "core", "notes", "compact", "names", "traits", "editMode", "autoRules"];
 /// Parts auto edits may change; the name and the rule set are never auto-editable.
@@ -698,6 +701,44 @@ mod tests {
         assert_eq!(again["rebriefed"], json!(["group:1"]), "{again}");
         assert_eq!(generation(), json!(1));
         assert_eq!(super::list(&context).unwrap()["rebriefDue"], json!([]));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_refuses_a_core_or_compact_over_its_budget_but_allows_a_rollback() {
+        let (root, context) = fixture("budget");
+        let at = |core: usize, compact: usize| json!({"name": "甲", "core": "长".repeat(core), "compact": "短".repeat(compact)});
+        let id = new_id(super::create(&context, &at(super::CORE_TOKENS_MAX + 1, 10), open()).unwrap());
+        let refused = super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap_err();
+        assert_eq!(refused.0, 409);
+        assert!(refused.1.contains("1501") && refused.1.contains("1500"), "{}", refused.1);
+        super::update(&context, &json!({"id": id, "core": "长".repeat(super::CORE_TOKENS_MAX)}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 2}), open()).unwrap()["activeVersion"], 2, "exactly the budget is allowed");
+        super::update(&context, &json!({"id": id, "compact": "短".repeat(super::COMPACT_TOKENS_MAX + 1)}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 3}), open()).unwrap_err().0, 409);
+        super::update(&context, &json!({"id": id, "compact": "短".repeat(super::COMPACT_TOKENS_MAX)}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 4}), open()).unwrap()["activeVersion"], 4);
+        // ASCII counts one token per four characters: 6000 letters are 1500 tokens, 6001 are 1501.
+        assert_eq!(crate::briefing::estimate_tokens(&"a".repeat(6000)), 1500);
+        assert_eq!(crate::briefing::estimate_tokens(&"a".repeat(6001)), 1501);
+        // An already approved version over the budget (an imported card) can be put back in effect.
+        std::fs::write(root.join("data/personas.json"), json!({"format": 1, "nextId": 2, "default": null, "overrides": {}, "importedRolesAt": 1,
+            "personas": {"p1": {"id": "p1", "activeVersion": 2, "versions": [
+                {"version": 1, "approved": true, "name": "乙", "core": "长".repeat(2000)},
+                {"version": 2, "approved": true, "name": "乙", "core": "短。"}]}}}).to_string()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": "p1", "version": 1}), open()).unwrap()["activeVersion"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_item_reports_estimated_tokens_per_version() {
+        let (root, context) = fixture("tokens");
+        let id = new_id(super::create(&context, &json!({"name": "甲", "core": "小鲸鱼abcd", "compact": "鲸"}), open()).unwrap());
+        let item = super::item(&context, &id).unwrap();
+        let first = &item["persona"]["versions"][0];
+        assert_eq!((first["coreTokens"].clone(), first["compactTokens"].clone()), (json!(4), json!(1)));
+        assert_eq!(item["budgets"], json!({"coreTokens": 1500, "compactTokens": 300}));
+        assert!(super::load(&context).unwrap()["personas"][id.as_str()]["versions"][0].get("coreTokens").is_none(), "counts are not stored");
         let _ = std::fs::remove_dir_all(root);
     }
 }
