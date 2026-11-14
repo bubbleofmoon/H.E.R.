@@ -18,7 +18,8 @@ macro_rules! legacy_path {
     };
 }
 
-pub const DEFAULT_INSTALL_ROOT: &str = if cfg!(windows) { "C:/HER" } else { "/HER" };
+/// One production root: everything production runs lives inside it (`layout`).
+pub const DEFAULT_INSTALL_ROOT: &str = if cfg!(windows) { legacy_path!() } else { "/qqbot" };
 
 pub struct InstallRoot {
     lexical: PathBuf,
@@ -82,12 +83,13 @@ impl InstallRoot {
     /// Installed runtimes keep backups beside the runtime; legacy roots retain their own base.
     /// Lexical only: loading settings never touches the destination (it may be a slow share).
     pub fn backup_destination(&self, runtime: &Path, configured: &Path) -> Result<PathBuf, String> {
-        let base = if self.protects(runtime)? {
-            self.root()
-        } else {
-            runtime
-        };
+        let installed = self.protects(runtime)?;
+        let base = if installed { self.root() } else { runtime };
         let destination = normalize(&base.join(configured), false)?;
+        // A relative or root-relative destination of the root's own runtime may not climb out of the root.
+        if installed && !configured.is_absolute() && !within(&destination, &self.lexical)? {
+            return Err("relative backup destination must stay inside the install root".into());
+        }
         self.refuse_backup_destination(&destination)?;
         Ok(destination)
     }
@@ -136,6 +138,7 @@ impl InstallRoot {
             ("runtime", "runtime"),
             ("dshHome", "runtime/user/dsh"),
             ("dshWork", "runtime/dsh/work"),
+            ("logs", "runtime/data/logs"),
             ("backups", "backups"),
         ]
         .into_iter()
