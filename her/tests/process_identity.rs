@@ -436,3 +436,99 @@ fn an_unclassifiable_switch_is_unknown_for_the_script_it_names_and_foreign_for_a
     ]);
     assert_eq!(result["state"], "unknown", "{result}");
 }
+
+/// Replaces the fixture's process with `program args...`, run from the fixture folder.
+fn respawn(f: &mut Fixture, program: &str, args: &[&str]) {
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    let _ = std::fs::remove_file(f.root.join("ready"));
+    f.child = hidden(program)
+        .args(args)
+        .current_dir(&f.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait_ready();
+}
+
+fn match_state(f: &Fixture, program: &str, script: &str) -> String {
+    let script = f.root.join(script);
+    let result = f.run(&[
+        "match",
+        "--pid",
+        &f.child.id().to_string(),
+        "--program",
+        program,
+        "--script",
+        script.to_str().unwrap(),
+    ]);
+    result["state"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn a_package_launcher_with_an_unclassifiable_switch_is_a_wrapper_never_foreign() {
+    let mut f = Fixture::node("launcher", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    // A launcher that runs the same body under npm's file name.
+    std::fs::copy(f.root.join("entry.js"), f.root.join("npm-cli.js")).unwrap();
+    respawn(
+        &mut f,
+        &program,
+        &["--no-deprecation", "npm-cli.js", "her-process-fixture-05"],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "wrapper");
+}
+
+#[test]
+fn operands_after_double_dash_and_option_values_keep_an_unclassifiable_switch_unknown() {
+    let mut f = Fixture::node("operands", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("-dash.js")).unwrap();
+    std::fs::write(f.root.join("preload.js"), "").unwrap();
+    std::fs::write(f.root.join("other.js"), "").unwrap();
+    // An operand after `--` may start with a dash.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "--",
+            "-dash.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "-dash.js"), "unknown");
+    assert_eq!(match_state(&f, &program, "other.js"), "mismatch");
+    // An `--option=value` value can name the script.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "--require=./preload.js",
+            "entry.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "preload.js"), "unknown");
+    assert_eq!(match_state(&f, &program, "other.js"), "mismatch");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_script_whose_operand_no_longer_resolves_stays_unknown() {
+    let mut f = Fixture::node("alias", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::create_dir(f.root.join("sub")).unwrap();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("sub/real.js")).unwrap();
+    std::os::unix::fs::symlink("real.js", f.root.join("sub/entry.js")).unwrap();
+    respawn(
+        &mut f,
+        &program,
+        &["--no-deprecation", "sub/entry.js", "her-process-fixture-05"],
+    );
+    std::fs::rename(f.root.join("sub"), f.root.join("moved")).unwrap();
+    // The configured spelling is the link; its resolved target has another file name.
+    assert_eq!(match_state(&f, &program, "moved/entry.js"), "unknown");
+}

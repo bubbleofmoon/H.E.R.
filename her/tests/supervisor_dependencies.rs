@@ -1817,6 +1817,8 @@ fn spaced_node(fixture: &Fixture) -> PathBuf {
     copy
 }
 
+/// A characterisation test: a node path with spaces (the runner's own install under Program
+/// Files) was never what refused DSH, and this pins that it keeps starting.
 #[test]
 fn spaced_node_path_starts_dsh_from_the_legacy_configuration() {
     let mut fixture = Fixture::new();
@@ -1878,17 +1880,39 @@ fn a_refused_dsh_start_leaves_a_log_line_and_an_owner_alert() {
     fixture.wait(|| fixture.states()["dsh"]["state"] == "refused");
     let reason = "script or working directory is unavailable";
     let log = fixture.root.join("data/logs/dependency-dsh.err.log");
-    fixture.wait(|| {
+    let lines = || -> Vec<String> {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
-            .contains(reason)
-    });
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    fixture.wait(|| lines().iter().any(|line| line.contains(reason)));
     fixture.wait(|| {
         std::fs::read_to_string(fixture.root.join("snow/alerts"))
             .unwrap_or_default()
             .contains(reason)
     });
     assert!(!fixture.root.join("dsh/starts").exists());
+    // One `[epoch-ms] refused: <reason>` line per refusal episode, not one per reconcile pass.
+    std::thread::sleep(Duration::from_millis(1500));
+    let first = lines();
+    assert_eq!(first.len(), 1, "{first:?}");
+    let (stamp, text) = first[0][1..].split_once("] refused: ").expect("line shape");
+    assert!(first[0].starts_with('['));
+    stamp.parse::<i64>().expect("epoch-ms stamp");
+    assert!(text.contains(reason), "{text}");
+    // The episode ends when DSH runs again; a later refusal for the same reason logs again.
+    std::fs::copy(
+        fixture.root.join("dsh/index.mjs"),
+        fixture.root.join("dsh/missing.mjs"),
+    )
+    .unwrap();
+    fixture.wait(|| fixture.states()["dsh"]["state"] == "started");
+    std::fs::remove_file(fixture.root.join("dsh/missing.mjs")).unwrap();
+    fixture.wait(|| lines().len() == 2);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(lines().len(), 2, "{:?}", lines());
 }
 
 #[test]
@@ -3930,4 +3954,53 @@ fn unfinished_candidate_retirement_keeps_its_pin_across_restart_until_authority_
             .unwrap_or_default()
             .contains("依赖升级失败")
     });
+}
+
+#[cfg(windows)]
+#[test]
+fn stop_still_refuses_while_a_same_name_process_cannot_be_read() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    fixture.healthy();
+    let foreign_dir = fixture.root.join("foreign");
+    std::fs::create_dir(&foreign_dir).unwrap();
+    let program = foreign_dir.join("node.exe");
+    std::fs::copy(
+        fixture.config["dependencies"]["dsh"]["program"]
+            .as_str()
+            .unwrap(),
+        &program,
+    )
+    .unwrap();
+    let script = foreign_dir.join("unrelated.js");
+    std::fs::write(&script, "setInterval(()=>{},1000);").unwrap();
+    let foreign = Owned::new(
+        hidden(&program)
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let before = fixture.states();
+    let hidden_image = deny_image_access(&foreign);
+    // Only a start may skip an unreadable image; stopping must not act around a process it
+    // cannot identify, so nothing is stopped.
+    let output = fixture
+        .command(&fixture.cli)
+        .args(["stop", "--with-dependencies", "--confirm", "--runtime-root"])
+        .arg(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    for name in ["snowluma", "dsh"] {
+        let identity: process_identity::ProcessIdentity =
+            serde_json::from_value(before[name]["identity"].clone()).unwrap();
+        assert_eq!(
+            process_identity::check_identity(&identity),
+            process_identity::Liveness::Matches,
+            "{name} must not be stopped"
+        );
+    }
+    drop(hidden_image);
 }
