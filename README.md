@@ -90,7 +90,7 @@ Human reply timing enforced in code (held sends and a typing indicator), a guard
 
 ## Building and testing
 
-Stable Rust; Windows (MSVC) is the production target, and Linux runs the same test suite. Builds go through the build slots described in [docs/agents/rust-validation.md](docs/agents/rust-validation.md). In short, from `her/`:
+Stable Rust; Windows (MSVC) is the production target, and Linux runs the same test suite. CI compiles, lints, formats and tests every pull request ([docs/agents/rust-validation.md](docs/agents/rust-validation.md)). To build and test by hand, from `her/`:
 
 ```
 cargo test --bin her <filter>            # unit tests
@@ -101,7 +101,7 @@ Tests use throwaway runtimes and fake QQ gateways, agent hosts and model servers
 
 ## Installing and updating
 
-An installation lives under one install root (default `C:\HER`) with side-by-side releases, a current and a last-good release, and a runtime folder for configuration and data. The update policy is off, notify or auto; updates install beside the running release, are trialled and roll back automatically if the health check fails. Dependency upgrades always need the administrator's approval. Details: [docs/agents/lifecycle-tasks.md](docs/agents/lifecycle-tasks.md) and [docs/agents/windows-lifecycle.md](docs/agents/windows-lifecycle.md).
+An installation lives under one install root (default `C:\qqbot`) with side-by-side releases, a current and a last-good release, and a runtime folder for configuration and data. The update policy is off, notify or auto; updates install beside the running release, are trialled and roll back automatically if the health check fails. Dependency upgrades always need the administrator's approval. Details: [docs/agents/lifecycle-tasks.md](docs/agents/lifecycle-tasks.md) and [docs/agents/windows-lifecycle.md](docs/agents/windows-lifecycle.md).
 
 ## What this repository is, and what stays in the vault
 

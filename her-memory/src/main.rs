@@ -9,7 +9,7 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 use std::time::Instant;
 
-const DB: &str = "C:/qqbot/data/memory.db";
+const DB: &str = "C:/qqbot/data/memory.db"; // layout-literal: her-memory probe (separate crate)
 
 /// 与 memory/schema.mjs 的 segment() 逐字对齐：中文 2 字 bigram + 英文/数字按词。
 fn segment(text: &str) -> String {
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[3] private 记忆共 {all_private} 条；挂在群会话名下的 {leak} 条（应为 0）");
 
     // ④ 一致性快照
-    let snap = "C:/qqbot/logs/her-memory-probe.db";
+    let snap = "C:/qqbot/logs/her-memory-probe.db"; // layout-literal: her-memory probe (separate crate)
     let _ = std::fs::remove_file(snap);
     conn.execute(&format!("VACUUM INTO '{}'", snap), [])?;
     let size = std::fs::metadata(snap)?.len();
@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "privateUnderGroup": leak,
         "snapshotKB": size / 1024
     });
-    std::fs::write("C:/qqbot/logs/her-memory-probe.json", serde_json::to_string_pretty(&summary)?)?;
+    std::fs::write("C:/qqbot/logs/her-memory-probe.json", serde_json::to_string_pretty(&summary)?)?; // layout-literal: her-memory probe (separate crate)
     println!("\n汇总已写 logs/her-memory-probe.json");
     Ok(())
 }

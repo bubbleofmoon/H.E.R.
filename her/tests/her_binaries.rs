@@ -5,14 +5,13 @@ mod install_root;
 use std::process::{Command, Output};
 
 fn binary(name: &str) -> &'static str {
-    match name {
-        "her" => option_env!("CARGO_BIN_EXE_her").expect("HER GUI binary target must exist"),
-        "her-cli" => {
-            option_env!("CARGO_BIN_EXE_her-cli").expect("HER console binary target must exist")
-        }
-        "herupdate" => option_env!("CARGO_BIN_EXE_herupdate").expect("HER updater binary target must exist"),
+    let (path, missing) = match name {
+        "her" => (option_env!("CARGO_BIN_EXE_her"), "HER GUI binary target must exist"),
+        "her-cli" => (option_env!("CARGO_BIN_EXE_her-cli"), "HER console binary target must exist"),
+        "herupdate" => (option_env!("CARGO_BIN_EXE_herupdate"), "HER updater binary target must exist"),
         _ => unreachable!(),
-    }
+    };
+    path.unwrap_or_else(|| panic!("{missing}"))
 }
 
 fn run(name: &str, args: &[&str]) -> Output {

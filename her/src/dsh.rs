@@ -610,7 +610,7 @@ pub async fn demo_create_and_prompt(base: &str, preset: &str) -> Result<(), Stri
         .unwrap_or_default();
     println!("[dsh] 3/5 可用预设：{}", names.join(", "));
 
-    let ws_dir = "C:/qqbot/state/rust-demo";
+    let ws_dir = crate::legacy_path!("state/rust-demo");
     let _ = std::fs::create_dir_all(ws_dir);
     let ws = rpc.call("workspace/create", serde_json::json!({ "path": ws_dir }))?;
     let ws_id = ws

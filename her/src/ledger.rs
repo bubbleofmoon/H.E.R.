@@ -29,14 +29,14 @@ use std::path::Path;
 use crate::pricing::{normalize_usage, price_usage, Buckets, PriceTable};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
-pub const LEDGER_FILE: &str = "C:/qqbot/qq-bridge/state/token-usage.jsonl";
+pub const LEDGER_FILE: &str = crate::legacy_path!("qq-bridge/state/token-usage.jsonl");
 /// Rust 自己的账本。**只写这份**：与 JS 各写各的，避免 Windows 上 append 交错损坏。
 /// 放在 Rust 自己的 state 目录（与 rust-heartbeat / rust-sessions 同处）。
-pub const RUST_LEDGER_FILE: &str = "C:/qqbot/state/token-usage-rust.jsonl";
+pub const RUST_LEDGER_FILE: &str = crate::legacy_path!("state/token-usage-rust.jsonl");
 /// 读取方要合并的全部账本（顺序只影响 `t` 相同的记录谁先重放）。
 pub const LEDGER_FILES: [&str; 2] = [LEDGER_FILE, RUST_LEDGER_FILE];
 /// 活会话表：QQ key ↔ DSH sessionId。账本反查 key 时优先用它。
-pub const SESSIONS_FILE: &str = "C:/qqbot/qq-bridge/state/sessions.json";
+pub const SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
 
 /// Rust 接管后写账本的入口：追加一行到 **Rust 自己的**账本（与 JS `appendLine` 同格式）。
 ///

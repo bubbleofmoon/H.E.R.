@@ -70,6 +70,83 @@ jobs:
           python -I scripts/tests/test_snowluma_export.py
           python -I scripts/scan-public.py
           "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
+  # Formatting and clippy on both OSes; report-only for now (the job stays green, the output is in the log).
+  lint:
+    name: lint (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            base: /tmp
+            tree: /tmp/her
+            target: /tmp/her-target
+            target_rel: ../../her-target
+          - os: windows-2022
+            base: C:/
+            tree: C:/her-ci
+            target: C:/her-ci-target
+            target_rel: ../../her-ci-target
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.base }}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: ${{ matrix.tree }}
+      CARGO_TARGET_DIR: ${{ matrix.target }}
+    steps:
+      - name: Use long-form Windows temporary directory
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "${PUBLIC_TREE}-temp"
+          echo "TEMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+          echo "TMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Toolchains
+        run: |
+          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
+          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # rust-cache joins workspace and target: relative to the tree's her directory this is CARGO_TARGET_DIR.
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ matrix.target_rel }}
+          key: lint-${{ matrix.os }}
+          cache-on-failure: true
+      - name: Format and clippy (report-only)
+        run: |
+          set +e
+          lint_crate() {
+            local crate=$1 code count
+            shift
+            (cd "$PUBLIC_TREE/$crate" && cargo fmt --all --check)
+            echo "fmt check $crate exit $?"
+            (cd "$PUBLIC_TREE/$crate" && cargo clippy --workspace --all-targets "$@" 2>&1) | tee "$RUNNER_TEMP/clippy-$crate.log"
+            code=${PIPESTATUS[0]}
+            echo "clippy $crate exit $code"
+            if [ "$code" -ne 0 ]; then
+              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): incomplete, clippy exit $code"
+            else
+              # One line per warning; the per-crate "generated N warnings" summaries are not warnings.
+              count=$(grep -E '^warning: ' "$RUNNER_TEMP/clippy-$crate.log" | grep -Ecv 'generated [0-9]+ warnings?')
+              echo "CLIPPY WARNINGS $crate (${RUNNER_OS}): $count"
+            fi
+          }
+          # Features match the test commands in scripts/ci/run-tests.py; her-memory is its own crate.
+          lint_crate her --features parity-clock,release-test-keys
+          lint_crate her-memory
   # Linux test shards run on every pull request and every push to main.
   tests:
     name: tests (ubuntu-24.04, shard ${{ matrix.shard }}/5)

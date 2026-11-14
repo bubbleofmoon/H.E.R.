@@ -12,7 +12,7 @@ use crate::runtime::{RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
 
 /// 词库文件的默认位置（与 JS 的 `SLANG_FILE` 一致）。
-pub const SLANG_FILE: &str = "C:/qqbot/qq-bridge/state/slang.json";
+pub const SLANG_FILE: &str = crate::legacy_path!("qq-bridge/state/slang.json");
 
 /// All selected-runtime slang writers use the same cross-process read/modify/write gate.
 pub fn store_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {

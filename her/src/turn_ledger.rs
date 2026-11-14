@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
 /// Rust-owned legacy ledger (same pattern as the send outbox).
-pub const LEGACY_LEDGER_FILE: &str = "C:/qqbot/state/turn-ledger-rust.jsonl";
+pub const LEGACY_LEDGER_FILE: &str = crate::legacy_path!("state/turn-ledger-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_LEDGER_FILE: &str = "turn-ledger.jsonl";
 

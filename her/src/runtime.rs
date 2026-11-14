@@ -14,10 +14,10 @@ use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use crate::guarded_file::{is_link, no_follow};
 
-const LEGACY_CONFIG: &str = "C:/qqbot/qq-bridge/config.json";
-const LEGACY_DATA: &str = "C:/qqbot/qq-bridge/state";
-const LEGACY_RESOURCES: &str = "C:/qqbot/qq-bridge";
-const LEGACY_SOCIAL_STATE: &str = "C:/qqbot/qq-bridge/state/social-v2.json";
+const LEGACY_CONFIG: &str = crate::legacy_path!("qq-bridge/config.json");
+const LEGACY_DATA: &str = crate::legacy_path!("qq-bridge/state");
+const LEGACY_RESOURCES: &str = crate::legacy_path!("qq-bridge");
+const LEGACY_SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
 const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
 #[cfg(test)]
@@ -1146,7 +1146,7 @@ impl RuntimeContext {
 
     fn area_base(&self, area: RuntimeArea) -> Result<PathBuf, &'static str> {
         let base = match (self.mode, area) {
-            (RuntimeMode::Legacy, RuntimeArea::Config) => PathBuf::from("C:/qqbot/qq-bridge"),
+            (RuntimeMode::Legacy, RuntimeArea::Config) => PathBuf::from(crate::legacy_path!("qq-bridge")),
             (RuntimeMode::Legacy, RuntimeArea::Data) => PathBuf::from(LEGACY_DATA),
             (RuntimeMode::Legacy, RuntimeArea::Resources) => PathBuf::from(LEGACY_RESOURCES),
             (RuntimeMode::Legacy, RuntimeArea::DshUser) => match dsh_home() {
@@ -1154,8 +1154,8 @@ impl RuntimeContext {
                 None => return Err("runtime path is unavailable"),
             },
             (RuntimeMode::Legacy, RuntimeArea::DshWork) => return Err("runtime path is unavailable"),
-            (RuntimeMode::Legacy, RuntimeArea::Memory) => PathBuf::from("C:/qqbot/data"),
-            (RuntimeMode::Legacy, RuntimeArea::Logs) => PathBuf::from("C:/qqbot/logs"),
+            (RuntimeMode::Legacy, RuntimeArea::Memory) => PathBuf::from(crate::legacy_path!("data")),
+            (RuntimeMode::Legacy, RuntimeArea::Logs) => PathBuf::from(crate::legacy_path!("logs")),
             (RuntimeMode::Isolated, RuntimeArea::Config) => self.runtime_root.as_ref().unwrap().join("config"),
             (RuntimeMode::Isolated, RuntimeArea::Data | RuntimeArea::Memory) => self.runtime_root.as_ref().unwrap().join("data"),
             (RuntimeMode::Isolated, RuntimeArea::Resources) => self.resources_dir.clone(),
@@ -1176,7 +1176,7 @@ pub(crate) fn dsh_home() -> Option<PathBuf> {
 fn dsh_home_from(dsh_home: Option<OsString>, user_profile: Option<OsString>) -> Option<PathBuf> {
     dsh_home
         .map(PathBuf::from)
-        .or_else(|| user_profile.map(|home| PathBuf::from(home).join(".dsh")))
+        .or_else(|| user_profile.map(crate::install_root::legacy_dsh_home))
 }
 
 fn resolve_legacy_path(base: &Path, relative: &str, intent: PathIntent) -> Result<PathBuf, &'static str> {
@@ -1739,9 +1739,9 @@ mod tests {
         );
         assert_eq!(
             dsh_home_from(None, Some(OsString::from("D:/people/alice"))),
-            Some(PathBuf::from("D:/people/alice").join(".dsh"))
+            Some(PathBuf::from("D:/people/alice").join(".dsh")) // layout-literal: expected value
         );
-        assert_ne!(dsh_home_from(None, None), Some(PathBuf::from("C:/Users/me/.dsh")));
+        assert_ne!(dsh_home_from(None, None), Some(PathBuf::from("D:/people/alice/.dsh"))); // layout-literal: expected value
     }
 
     /// Ticket 24 decision B: an empty `consoleToken` falls back to the hardened `data/console-token`

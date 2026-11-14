@@ -130,6 +130,34 @@ pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
     Ok(gate)
 }
 
+/// Every ancestor of `path` exists as a plain directory (no link or reparse point). Unlike
+/// `directory`, never creates anything.
+fn plain_directory(path: &Path) -> bool {
+    path.ancestors().all(|part| {
+        fs::symlink_metadata(part)
+            .is_ok_and(|meta| meta.is_dir() && !crate::guarded_file::is_link(&meta))
+    })
+}
+
+/// True only when another handle holds the gate (a non-blocking lock attempt reports it would
+/// block). Any other outcome is false: a missing or redirected parent directory (checked like
+/// `installation_gate` but without creating folders), a redirected or non-file gate, another lock
+/// error, or the lock acquired, which is released again before returning.
+pub(crate) fn gate_contended(lock: &Path) -> bool {
+    if !lock.parent().is_some_and(plain_directory) {
+        return false;
+    }
+    if fs::symlink_metadata(lock)
+        .is_ok_and(|meta| !meta.is_file() || crate::guarded_file::is_link(&meta))
+    {
+        return false;
+    }
+    let Ok(gate) = crate::guarded_file::open_gate(lock, crate::guarded_file::Gate::Create) else {
+        return false;
+    };
+    matches!(gate.try_lock(), Err(fs::TryLockError::WouldBlock))
+}
+
 /// Fsynced root-level state/helper publication under the caller's installation gate.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     directory(path.parent().ok_or("release state has no parent")?)?;
@@ -150,4 +178,86 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
 /// Persist directory entries after publishing synced files or release links.
 pub(crate) fn sync_directory(path: &Path) -> Result<(), String> {
     crate::guarded_file::sync_directory(path).map_err(|_| "release directory cannot sync".into())
+}
+
+#[cfg(test)]
+mod gate_claim_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = crate::install_root::development_root(std::env::temp_dir().join(format!(
+                "her-release-store-{name}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn gate_contended_only_when_another_handle_holds_the_gate() {
+        let scratch = Scratch::new("gate");
+        let dir = &scratch.0;
+        let lock = dir.join("gate.lock");
+        let held = installation_gate(&lock).unwrap();
+        let contended = gate_contended(&lock);
+        drop(held);
+        assert!(
+            contended,
+            "a gate held through another handle reads as contended"
+        );
+        assert!(!gate_contended(&lock), "a free gate is not contended");
+        assert!(
+            installation_gate(&lock).is_ok(),
+            "the probe must not leave the gate held"
+        );
+        let planted = dir.join("planted.lock");
+        fs::create_dir(&planted).unwrap();
+        assert!(
+            !gate_contended(&planted),
+            "a directory at the gate path is not contention"
+        );
+        let absent = dir.join("absent").join("gate.lock");
+        assert!(
+            !gate_contended(&absent),
+            "a missing parent directory is not contention"
+        );
+        assert!(
+            !dir.join("absent").exists(),
+            "the probe must not create folders"
+        );
+    }
+
+    /// Unix only: the test helpers make no Windows junction.
+    #[cfg(unix)]
+    #[test]
+    fn gate_contended_ignores_a_lock_under_a_redirected_parent() {
+        let scratch = Scratch::new("redirect");
+        let real = scratch.0.join("real");
+        fs::create_dir(&real).unwrap();
+        let link = scratch.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let held = installation_gate(&real.join("gate.lock")).unwrap();
+        assert!(
+            gate_contended(&real.join("gate.lock")),
+            "control: the held gate is contended through its real path"
+        );
+        assert!(
+            !gate_contended(&link.join("gate.lock")),
+            "a lock under a redirected parent directory is not contention"
+        );
+        drop(held);
+    }
 }
