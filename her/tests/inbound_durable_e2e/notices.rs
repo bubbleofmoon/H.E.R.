@@ -38,6 +38,7 @@ fn start_notices_with(root: &Path, groups: &[i64], initial: FakeGateway) -> Harn
     let (console, console_port) = crate::support::ports::start_console(std::time::Duration::from_secs(20), |port| {
         spawn_console(root, port)
     });
+    let console = crate::support::ports::OwnedChild(console);
     Harness {
         child: spawn_candidate(root, console_port),
         console,
