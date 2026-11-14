@@ -17,7 +17,7 @@ import tempfile
 import time
 import urllib.error
 import warnings
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import unittest
 from unittest import mock
 
@@ -163,11 +163,11 @@ class IssueWatch(unittest.TestCase):
             gc.collect()
         self.assertEqual([w for w in seen if issubclass(w.category, ResourceWarning)], [])
 
-    def http_error(self, code, headers):
+    def http_error(self, code, headers, body=b''):
         message = email.message.Message()
         for key, value in headers.items():
             message[key] = value
-        return urllib.error.HTTPError('https://api.github.com/x', code, 'error', message, io.BytesIO(b''))
+        return urllib.error.HTTPError('https://api.github.com/x', code, 'error', message, io.BytesIO(body))
 
     def test_a_rate_limit_waits_until_the_reset(self):
         reset = str(int(time.time()) + 30)
@@ -188,13 +188,13 @@ class IssueWatch(unittest.TestCase):
         self.assertEqual(stop.exception.code, 2)
 
     def test_the_watcher_sleeps_out_a_rate_limit_then_reports(self):
-        answers = iter([(None, None, 5), (None, [issue(5)], None)])
+        answers = iter([(None, None, 500), (None, [issue(5)], None)])
         self.module.fetch = lambda url, tok, etag: next(answers)
         with mock.patch.object(self.module.time, 'sleep') as sleep:
             code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(code, 0)
         self.assertIn('BATON #5', out)
-        sleep.assert_called_once_with(5)
+        sleep.assert_called_once_with(500)
 
     def test_once_without_an_answer_exits_2(self):
         self.module.fetch = lambda url, tok, etag: (None, None, 0)
@@ -206,6 +206,44 @@ class IssueWatch(unittest.TestCase):
         self.module.fetch = lambda url, tok, etag: (None, [issue(n) for n in range(1, 101)], None)
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(code, 2)
+
+    # --- the shared API budget (#90) ----------------------------------------------------------
+    def test_the_interval_is_at_least_180_seconds(self):
+        self.github.issues = {PUBLIC: []}
+        slept = []
+
+        class Stop(Exception):
+            pass
+
+        def stop(seconds):
+            slept.append(seconds)
+            raise Stop
+
+        with mock.patch.object(self.module.time, 'sleep', stop), self.assertRaises(Stop):
+            self.run_watch('--machine', 'linux', '--repo', PUBLIC)
+        self.assertEqual(slept, [180])
+        for value in ('179', '60', 'x'):
+            with self.subTest(value=value), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                self.run_watch('--machine', 'linux', '--once', '--interval', value)
+            self.assertEqual(caught.exception.code, 2)
+        code, out = self.run_watch('--machine', 'linux', '--once', '--interval', '180')
+        self.assertEqual(code, 0)
+
+    def test_a_short_rate_limit_wait_still_waits_one_interval(self):
+        answers = iter([(None, None, 5), (None, [issue(5)], None)])
+        self.module.fetch = lambda url, tok, etag: next(answers)
+        with mock.patch.object(self.module.time, 'sleep') as sleep:
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(code, 0)
+        self.assertIn('BATON #5', out)
+        sleep.assert_called_once_with(180)
+
+    def test_a_secondary_rate_limit_without_headers_is_waited_out(self):
+        body = b'{"message": "You have exceeded a secondary rate limit."}'
+        with mock.patch.object(self.module.urllib.request, 'urlopen', side_effect=self.http_error(403, {}, body)):
+            etag, issues, wait = self.real_fetch('https://api.github.com/x', 't', None)
+        self.assertIsNone(issues)
+        self.assertEqual(wait, 180)
 
 
 if __name__ == '__main__':
