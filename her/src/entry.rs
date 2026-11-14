@@ -62,6 +62,7 @@ mod parity_clock;
 mod config;
 mod inbound;
 mod send_outbox;
+mod recorded_send;
 mod session_map;
 mod session_context;
 mod session_rotation;

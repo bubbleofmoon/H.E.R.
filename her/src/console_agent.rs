@@ -744,18 +744,14 @@ pub(super) fn resolve_quote_js(
 
 pub(super) const UNRESOLVED_QUOTE: &str = "无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）";
 
-/// The process-wide send order (JS `sendChain`). Poisoning cannot corrupt it: it guards no data.
-static SEND_CHAIN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-pub(super) fn send_chain() -> std::sync::MutexGuard<'static, ()> {
-    SEND_CHAIN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+/// The process-wide send order (JS `sendChain`), owned by the recorded send.
+pub(super) use crate::recorded_send::send_chain;
 
 /// Everything after the request-specific validation: quota reservation (persisted before any request),
 /// quote resolution, the durable intent record, item-by-item sending with the validity check before each
 /// item, and settlement of the conversation state.
 pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCall<'_>) -> Result<(u16, Value), (u16, String)> {
-    use crate::send_outbox::{append_record, token_epoch};
+    use crate::send_outbox::token_epoch;
     let (key, kind, id_s, token) = (call.key, call.kind, call.id_s, call.token);
     let normalized: Vec<String> = call.messages.iter().map(|m| crate::outbound_message::normalize(m))
         .filter(|m| !m.is_empty()).collect();
@@ -844,18 +840,23 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
             }
         }
     }
-    // 3. Record the intent before the first OneBot request.
-    let batch_id = crate::send_outbox::new_batch_id(now);
-    // Held until the batch settles, so a resume cannot run it alongside this send.
-    let _claim = crate::send_outbox::claim_batch(&batch_id).ok_or((409, "该批次正在进行中，请稍后再试".to_string()))?;
-    let intent = json!({
-        "batch": batch_id, "k": "intent", "key": key, "epoch": epoch, "messages": messages,
-        "delays": delays, "replyTo": actual_reply, "atUser": at_user, "turnScope": turn_scope, "t": now
+    // 3. Claim the batch and record the intent before the first OneBot request. The claim is
+    // held until the batch settles, so a resume cannot run it alongside this send.
+    let fields = json!({
+        "key": key, "epoch": epoch, "messages": messages, "delays": delays,
+        "replyTo": actual_reply, "atUser": at_user, "turnScope": turn_scope
     });
-    if let Err(error) = append_record(context, &intent) {
-        release_send_quota(context, key, now, count);
-        return Err((503, format!("发送意图未能持久记录，未发送：{error}")));
-    }
+    let recorded = match crate::recorded_send::Recorded::begin(context, now_ms, now, fields) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            release_send_quota(context, key, now, count);
+            return Err(match error {
+                crate::recorded_send::BeginError::Busy => (409, crate::recorded_send::BATCH_BUSY.to_string()),
+                crate::recorded_send::BeginError::Intent(error) => (503, format!("发送意图未能持久记录，未发送：{error}")),
+            });
+        }
+    };
+    let batch_id = recorded.batch_id().to_string();
     // 4. Send item by item, with durable attempt and outcome records.
     let indices: Vec<usize> = (0..count).collect();
     let plan = plan_for(messages, actual_reply, at_user, &indices);
@@ -869,7 +870,7 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     // JS `sendChain`: every outbound bubble (text and sticker) is serialized in enqueue order, and a
     // burst occupies the chain through its typing wait and gaps. Held until the items are sent;
     // quota settlement and state updates run after it is released.
-    let report = run_send_items(context, cfg, &ob, &batch_id, key, kind, id_s, &epoch, policy, tool_flag, &plan, &delays, &[], &initial, &turn_scope);
+    let report = run_send_items(context, cfg, &ob, &recorded, key, kind, id_s, &epoch, policy, tool_flag, &plan, &delays, &[], &initial, &turn_scope);
     drop(chain);
     // 5. Settle the reservation and the conversation state.
     let states = ordered_states(count, &report);

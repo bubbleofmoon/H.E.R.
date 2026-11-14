@@ -1,0 +1,81 @@
+name: quick
+# One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`.
+# The CI-first gate is checks.yml on the pull request; this job never gates a merge.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'run-tests.py target name(s), comma-separated (unit, an her/tests stem, scripts)'
+        required: true
+      filter:
+        description: 'optional libtest name filter'
+        required: false
+        default: ''
+      os:
+        description: 'linux or windows'
+        required: false
+        default: linux
+        type: choice
+        options: [linux, windows]
+permissions:
+  contents: read
+concurrency:
+  group: quick-${{ github.ref }}-${{ inputs.target }}-${{ inputs.os }}
+  cancel-in-progress: true
+jobs:
+  quick:
+    name: quick (${{ inputs.os }}, ${{ inputs.target }})
+    runs-on: ${{ inputs.os == 'windows' && 'windows-2022' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: ${{ inputs.os == 'windows' && 'C:/her-ci' || '/tmp/her' }}
+      CARGO_TARGET_DIR: ${{ inputs.os == 'windows' && 'C:/her-ci-target' || '/tmp/her-target' }}
+      CI_EVIDENCE: ${{ inputs.os == 'windows' && 'C:/her-ci-evidence' || '/tmp/her-evidence' }}
+      QUICK_TARGET: ${{ inputs.target }}
+      QUICK_FILTER: ${{ inputs.filter }}
+    steps:
+      - name: Use long-form Windows temporary directory
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p "${PUBLIC_TREE}-temp"
+          echo "TEMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+          echo "TMP=${PUBLIC_TREE}-temp" >> "$GITHUB_ENV"
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Toolchains
+        run: |
+          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
+          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # rust-cache joins workspace and target; relative so it resolves to CARGO_TARGET_DIR on both OSes.
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ${{ inputs.os == 'windows' && '../../her-ci-target' || '../../her-target' }}
+          key: quick-${{ inputs.os }}
+          cache-on-failure: true
+      - name: Build and run the named target
+        run: |
+          cd "$PUBLIC_TREE"
+          export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
+          args=(--only "$QUICK_TARGET")
+          if [ -n "$QUICK_FILTER" ]; then args+=(--filter "$QUICK_FILTER"); fi
+          python -I scripts/ci/run-tests.py "${args[@]}"
+      - name: Upload evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-evidence
+          path: ${{ env.CI_EVIDENCE }}
+          retention-days: 3
