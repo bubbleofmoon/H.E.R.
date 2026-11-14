@@ -71,9 +71,9 @@ impl<'a> Digest<'a> {
                 return Ok(Outcome::Quiet);
             }
         }
-        let Some(batch) = evidence::read(self.context, self.cfg, key, space, stored.map(|c| (c.through, c.digested_at)), max_input_chars(self.cfg))
+        let Some(batch) = evidence::read(self.context, self.cfg, key, space, stored.unwrap_or_default(), max_input_chars(self.cfg))
             .map_err(|_| DigestError::Evidence)? else { return Ok(Outcome::Quiet) };
-        if batch.messages < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
+        if batch.pending < limits.min_messages.max(1) { return Ok(Outcome::Quiet); }
         if cancel.load(Ordering::SeqCst) { return Err(DigestError::Cancelled); }
         let answer = self.model.complete(PROMPT, &batch.input).map_err(|error| DigestError::Model(error.0))?;
         let items = parse_items(&answer)?;
@@ -83,7 +83,7 @@ impl<'a> Digest<'a> {
             owner_type: "session", scope: None, kind: "inference", subject: subject.as_deref(), content,
             tags: None, source: &source, importance: 0.5,
         }).collect();
-        match reader.write_digest(space, stored.map_or(0, |c| c.through), batch.through, stored.map_or(0, |c| c.replies_ms), &memories).map_err(|_| DigestError::Storage)? {
+        match reader.write_digest(space, stored.map_or(0, |c| c.through), batch.through, batch.replies_ms, &memories).map_err(|_| DigestError::Storage)? {
             Some(written) => Ok(Outcome::Written { through: batch.through, memories: written.len() }),
             None => Ok(Outcome::Quiet),
         }
