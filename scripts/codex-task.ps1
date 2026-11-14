@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory)][string]$Name,
   [Parameter(Mandatory)][string]$WorkDir,
   [Parameter(Mandatory)][string]$PromptFile,
-  [string]$Model = 'gpt-6.1-sol',
+  [string]$Model = 'gpt-6-astra',
   [string]$Effort = 'high',
   [ValidateSet('workspace-write', 'read-only', 'none')][string]$Sandbox = 'none',
   [string[]]$AddDir = @('C:\her-orch', 'C:\her-targets', (Join-Path $env:USERPROFILE '.cargo')),

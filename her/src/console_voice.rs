@@ -203,7 +203,7 @@ fn open_library(context: &RuntimeContext, vc: &VoiceCfg) -> Result<Library, (u16
         let root = if configured.is_absolute() {
             configured.to_path_buf()
         } else {
-            PathBuf::from(format!("C:\\qqbot\\qq-bridge\\{}", vc.dir_rel.replace('/', "\\")))
+            PathBuf::from(format!("{}{}", crate::legacy_path!(windows "qq-bridge\\"), vc.dir_rel.replace('/', "\\")))
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
         Ok(Library { root: voice::normalize_lexically(&root), dir_rel: vc.dir_rel.clone(), isolated: false, cwd })

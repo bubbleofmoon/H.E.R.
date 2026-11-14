@@ -21,12 +21,16 @@ mod harness;
 mod prompt;
 mod briefing;
 mod initial_prompts;
+mod persona;
+mod persona_command;
 mod activity;
 mod feedback;
 mod wake;
 mod question;
 #[cfg(test)]
 mod wake_rate_tests;
+#[cfg(test)]
+mod production_root_tests;
 mod session;
 mod reserved2;
 mod reserved;
@@ -53,7 +57,6 @@ mod forward_fmt;
 mod preset_prompt;
 mod runtime;
 mod guarded_file;
-mod install_root;
 mod scheduled_task;
 mod release;
 mod release_signature;
@@ -83,6 +86,7 @@ mod schedule;
 mod backup;
 mod restore;
 mod console_tasks;
+mod console_persona;
 mod supervisor;
 mod supervisor_dependencies;
 mod dependency;
@@ -104,11 +108,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-const CONFIG_PATH: &str = "C:/qqbot/qq-bridge/config.json";
-const SOCIAL_PATH: &str = "C:/qqbot/qq-bridge/state/social-v2.json";
-const DECISION_LOG: &str = "C:/qqbot/logs/rbridge-live.jsonl";
+const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
+const SOCIAL_PATH: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
+const DECISION_LOG: &str = crate::legacy_path!("logs/rbridge-live.jsonl");
 /// 状态机真正「醒」的时刻（含合批延迟），A/B 与 P6 验收都用这份对拍。
-const WAKE_LOG: &str = "C:/qqbot/logs/rbridge-live-wakes.jsonl";
+const WAKE_LOG: &str = crate::legacy_path!("logs/rbridge-live-wakes.jsonl");
 
 #[derive(Deserialize, Debug, Default)]
 struct Config {
@@ -617,7 +621,7 @@ fn decide(
 }
 
 fn discover_ws_token() -> Option<String> {
-    let dir = std::path::Path::new("C:/qqbot/SnowLuma/config");
+    let dir = std::path::Path::new(crate::legacy_path!("SnowLuma/config"));
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if !name.starts_with("onebot_") || !name.ends_with(".json") {
@@ -811,7 +815,7 @@ fn acquire_single_instance(
         context.resolve_path(runtime::RuntimeArea::Data, &relative, runtime::PathIntent::WriteFile)
             .map_err(|e| println!("[her] owner path unavailable: {e}")).ok()?
     } else {
-        std::path::PathBuf::from(format!("C:/qqbot/{relative}"))
+        std::path::PathBuf::from(format!("{}/{relative}", crate::legacy_path!()))
     };
     let identity = lifecycle::current_identity().map_err(|e| println!("[her] identity unavailable: {e}")).ok()?;
     let groups = {
@@ -929,7 +933,7 @@ fn dsh_probe_base() -> String {
     if let Ok(v) = std::env::var("DSH_BASE_URL") {
         return v;
     }
-    read_json("C:/qqbot/qq-bridge/config.json")
+    read_json(crate::legacy_path!("qq-bridge/config.json"))
         .and_then(|v| v.get("dsh").and_then(|d| d.get("baseUrl")).and_then(|b| b.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| "http://127.0.0.1:3080".to_string())
 }
@@ -1077,7 +1081,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // P2-A 探针：--dsh-probe 只验鉴权；--dsh-demo 建会话并投 prompt
     // P2-B 探针：发一条私聊测试消息，验证 OneBot 发送链路
     if std::env::args().any(|a| a == "--send-probe") {
-        let cfgv = read_json("C:/qqbot/qq-bridge/config.json").unwrap_or_default();
+        let cfgv = read_json(crate::legacy_path!("qq-bridge/config.json")).unwrap_or_default();
         let http_url = cfgv
             .get("snowluma").and_then(|s| s.get("httpUrl")).and_then(|u| u.as_str())
             .unwrap_or("http://127.0.0.1:3000").to_string();
@@ -1121,7 +1125,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         let target_arg = std::env::args().nth(pos + 1).ok_or("--ask needs target")?;
         let text = std::env::args().nth(pos + 2).ok_or("--ask needs text")?;
         let live = std::env::args().any(|a| a == "--live");
-        let cfgv = read_json("C:/qqbot/qq-bridge/config.json").unwrap_or_default();
+        let cfgv = read_json(crate::legacy_path!("qq-bridge/config.json")).unwrap_or_default();
         let target = parse_target(&target_arg, &cfgv)?;
         match pipeline::Pipeline::new(&cfgv, live) {
             Ok(mut p) => {
@@ -2061,7 +2065,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     );
                 } else {
                     let _ = std::fs::write(
-                        format!("C:/qqbot/qq-bridge/state/{name}"),
+                        format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
                         payload.to_string(),
                     );
                 }
@@ -2366,10 +2370,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         }
 
-        // Administrative release approval is independent of participation mode.
+        // Administrative release approval and persona switching are independent of participation mode.
         if is_message && live_mode && pipeline.is_some() && runtime_context.is_isolated() {
             let (plain, _, _) = plain_text(&ev.message, self_id);
-            if chat::is_update_command(&plain) {
+            let persona_command = persona_command::is_persona_command(&plain);
+            if persona_command || chat::is_update_command(&plain) {
                 let (kind, id) = if ev.message_type == "private" {
                     ("private", sender.unwrap_or(0))
                 } else {
@@ -2396,15 +2401,23 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 }
                 // Keep replacement behind this command's reply, approval and durable
                 // settlement. A replacement must never replay a partly executed /update.
-                let _admission = release::turn_guard(&runtime_context).await?;
+                let _admission = if persona_command { None } else { Some(release::turn_guard(&runtime_context).await?) };
                 let context = runtime_context.clone();
                 let user = sender.unwrap_or(0).to_string();
                 let result = tokio::task::spawn_blocking(move || {
-                    chat::handle_update_command(&context, &key, &user, &plain)
+                    if persona_command {
+                        persona_command::handle(&context, &key, &user, &plain)
+                    } else {
+                        chat::handle_update_command(&context, &key, &user, &plain)
+                    }
                 })
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
-                    crate::safe_eprintln!("[release] update command refused or reply not confirmed");
+                    if persona_command {
+                        crate::safe_eprintln!("[persona] persona command reply not confirmed");
+                    } else {
+                        crate::safe_eprintln!("[release] update command refused or reply not confirmed");
+                    }
                 }
                 journal
                     .mark_handled(vec![inbound_key], now_ms() as i64)

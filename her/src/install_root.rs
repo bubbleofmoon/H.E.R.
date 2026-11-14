@@ -2,7 +2,24 @@
 #![allow(dead_code)]
 use std::path::{Component, Path, PathBuf};
 
-pub const DEFAULT_INSTALL_ROOT: &str = if cfg!(windows) { "C:/HER" } else { "/HER" };
+/// The one production root's spelling. The fixed-path runtime keeps its files in their old shape
+/// under this same root until #78 retires that mode: `legacy_path!("qq-bridge/config.json")`
+/// spells one of them. Production path literals live only in this module.
+#[macro_export]
+macro_rules! legacy_path {
+    () => {
+        "C:/qqbot"
+    };
+    (windows $relative:literal) => {
+        concat!("C:\\qqbot\\", $relative)
+    };
+    ($relative:literal) => {
+        concat!("C:/qqbot/", $relative)
+    };
+}
+
+/// One production root: everything production runs lives inside it (`layout`).
+pub const DEFAULT_INSTALL_ROOT: &str = if cfg!(windows) { legacy_path!() } else { "/qqbot" };
 
 pub struct InstallRoot {
     lexical: PathBuf,
@@ -66,12 +83,13 @@ impl InstallRoot {
     /// Installed runtimes keep backups beside the runtime; legacy roots retain their own base.
     /// Lexical only: loading settings never touches the destination (it may be a slow share).
     pub fn backup_destination(&self, runtime: &Path, configured: &Path) -> Result<PathBuf, String> {
-        let base = if self.protects(runtime)? {
-            self.root()
-        } else {
-            runtime
-        };
+        let installed = self.protects(runtime)?;
+        let base = if installed { self.root() } else { runtime };
         let destination = normalize(&base.join(configured), false)?;
+        // A relative or root-relative destination of the root's own runtime may not climb out of the root.
+        if installed && !configured.is_absolute() && !within(&destination, &self.lexical)? {
+            return Err("relative backup destination must stay inside the install root".into());
+        }
         self.refuse_backup_destination(&destination)?;
         Ok(destination)
     }
@@ -118,8 +136,9 @@ impl InstallRoot {
             ("dsh", "deps/dsh"),
             ("relay", "deps/relay"),
             ("runtime", "runtime"),
-            ("dshHome", "runtime/dsh/home"),
+            ("dshHome", "runtime/user/dsh"),
             ("dshWork", "runtime/dsh/work"),
+            ("logs", "runtime/data/logs"),
             ("backups", "backups"),
         ]
         .into_iter()
@@ -220,6 +239,12 @@ pub fn development_root(path: impl AsRef<Path>) -> PathBuf {
         .and_then(|install| install.check_development(path))
         .unwrap_or_else(|reason| panic!("fixture root refused: {reason}"));
     path.to_path_buf()
+}
+
+/// The fixed-path runtime's DSH home under a user profile; the install-root runtime keeps its DSH
+/// home at `runtime/user/dsh` instead. Retired with the fixed-path mode (#78).
+pub fn legacy_dsh_home(profile: impl AsRef<std::ffi::OsStr>) -> PathBuf {
+    PathBuf::from(profile.as_ref()).join(".dsh")
 }
 
 // Compare components, including a path separator boundary: HER-other is never inside HER.

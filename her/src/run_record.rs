@@ -731,7 +731,7 @@ mod tests {
             Box::new(|t: &str| t.replace("hunter2", "***")),
             RecordLimits::default(),
         );
-        let nasty = "failed: password=hunter2 cookie dsh-auth-AbC=v1.eyJ.sig Authorization: Bearer aaaaaaaaaaaa at /root/her/her/config.json and C:\\qqbot\\config.json\nnext\tline token=zzzzzzzz sid=abcdefabcdefabcdefabcdefabcdefab0123";
+        let nasty = "failed: password=hunter2 cookie dsh-auth-AbC=v1.eyJ.sig Authorization: Bearer aaaaaaaaaaaa at /root/her/her/config.json and C:\\qqbot\\config.json\nnext\tline token=zzzzzzzz sid=abcdefabcdefabcdefabcdefabcdefab0123"; // layout-literal: sanitizer fixture
         w.record(&input(Component::Dsh, "x", Outcome::Failed, nasty))
             .unwrap();
         let text = io.text();
@@ -740,7 +740,7 @@ mod tests {
             "AbC",
             "aaaaaaaaaaaa",
             "/root/her",
-            "C:\\\\qqbot",
+            "C:\\\\qqbot", // layout-literal: sanitizer fixture
             "zzzzzzzz",
             "abcdefabcdefabcdefabcdefabcdefab0123",
         ] {

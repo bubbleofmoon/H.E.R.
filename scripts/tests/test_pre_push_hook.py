@@ -33,6 +33,17 @@ GIT_ENV = {
 }
 
 
+def clean_env(**extra):
+    """This process's environment without any GIT_* variable: a hook's git variables must never point a test
+    at another repository."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(extra)
+    return env
+
+
+IDENTITY = ['-c', 'user.name=Guard Test', '-c', 'user.email=guard.test@example.invalid', '-c', 'commit.gpgsign=false']
+
+
 def gitleaks():
     override = os.environ.get('HER_GITLEAKS')
     if override and Path(override).is_file():
@@ -67,17 +78,13 @@ class PushHook(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / rel, target)
         self.git('init', '-q', '-b', 'main')
-        self.git('config', 'user.name', 'Guard Test')
-        self.git('config', 'user.email', 'guard.test@example.invalid')
-        self.git('config', 'commit.gpgsign', 'false')
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def git(self, *args):
-        env = dict(os.environ)
-        env.update(GIT_ENV)
-        proc = subprocess.run(['git', '-C', str(self.repo), *args], capture_output=True, text=True, env=env)
+        proc = subprocess.run(['git', '-C', str(self.repo), *IDENTITY, *args], capture_output=True, text=True,
+                              env=clean_env(**GIT_ENV))
         self.assertEqual(proc.returncode, 0,
                          f'git {" ".join(args)}: {scrub(proc.stdout)}{scrub(proc.stderr)}')
         return proc.stdout.strip()
@@ -96,22 +103,22 @@ class PushHook(unittest.TestCase):
         return self.git('rev-parse', ref)
 
     def scan_objects(self, *oids):
-        """Runs the message pass directly, so a receipt can name the pass that refused."""
-        env = dict(os.environ)
-        env.update(GIT_ENV)
+        """Runs the message pass directly on this repository: (exit status, output)."""
+        env = clean_env(**GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
-        proc = subprocess.run([BASH, str(ROOT / 'scripts' / 'scan-public.py'), '--objects-from-stdin'],
-                              cwd=self.repo, input='\n'.join(oids) + '\n',
+        proc = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts' / 'scan-public.py'), '--root', str(self.repo),
+                               '--objects-from-stdin'],
+                              input='\n'.join(oids) + '\n',
                               capture_output=True, text=True, encoding='utf-8', env=env)
-        return scrub((proc.stdout or '') + (proc.stderr or ''))
+        return proc.returncode, scrub((proc.stdout or '') + (proc.stderr or ''))
 
-    def push(self, *lines):
-        """Run the hook exactly as git does: repository as cwd, ref lines on stdin."""
-        env = dict(os.environ)
-        env.update(GIT_ENV)
+    def push(self, *lines, extra=None):
+        """Run the hook exactly as git does: repository as cwd, ref lines on stdin; `extra` overrides variables."""
+        env = clean_env(**GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
+        env.update(extra or {})
         proc = subprocess.run([BASH, str(HOOK), 'origin', 'https://example.invalid/guard.git'],
                               cwd=self.repo, input='\n'.join(lines) + '\n',
                               capture_output=True, text=True, encoding='utf-8', env=env)
@@ -156,7 +163,9 @@ class PushHook(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('digit', out)
         self.assertIn('user-path', out)
-        self.assertIn('commit ', self.scan_objects(sha))        # the message pass reports it
+        message_code, message_out = self.scan_objects(sha)     # the message pass reports the finding itself
+        self.assertEqual(message_code, 1, message_out)
+        self.assertIn(f'digit commit {sha[:12]}:', message_out)
         self.assertNotIn('123456' + '789', out)
         self.assertNotIn('fakeuser', out.lower())
 
@@ -290,6 +299,246 @@ class PushHook(unittest.TestCase):
         self.commit('clean')
         code, out = self.push(f'refs/heads/main {"0" * 40} refs/heads/main {self.head("main")}')
         self.assertEqual(code, 0, out)
+
+    # --- a branch that moves forward publishes only what its new commits add -----------
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_one_file_branch_update_scans_that_one_file(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base is on the remote')
+        self.write('docs/b.md', 'clean note too\n')
+        tip = self.commit('one new file')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings', out)
+        self.assertIn('1 commits, 0 whole trees, 1 blobs', out)
+        self.assertIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_dirty_blob_in_a_branch_update_is_refused(self):
+        def build():
+            self.write('docs/b.md', DIRTY)
+            self.commit('dirty new file')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('1 commits, 0 whole trees', out)
+        self.assertNotIn('123456' + '789', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_deletion_only_update_scans_no_blob(self):
+        self.write('docs/a.md', 'clean note\n')
+        self.write('docs/b.md', 'clean note too\n')
+        base = self.commit('base is on the remote')
+        self.git('rm', '-q', 'docs/b.md')
+        tip = self.commit('delete a file')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 0, out)
+        added = [line for line in out.splitlines() if line.startswith('Public scan (added)')]
+        self.assertTrue(added, out)
+        self.assertIn('0 blobs', added[0])
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_force_push_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base')
+        self.git('checkout', '-qb', 'old')
+        self.write('docs/r.md', 'clean note\n')
+        remote = self.commit('remote history, sibling of the local one')
+        self.git('checkout', '-q', 'main')
+        self.write('docs/l.md', 'clean note\n')
+        local = self.commit('local history')
+        code, out = self.push(f'refs/heads/main {local} refs/heads/main {remote}')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_ref_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_an_unknown_remote_sha_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"e" * 40}')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_an_unrelated_root_merged_into_an_update_is_scanned_whole(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base is on the remote')
+        self.git('checkout', '-q', '--orphan', 'side')
+        self.write('docs/c.md', DIRTY)
+        self.commit('side root holds a dirty file')
+        self.git('rm', '-q', 'docs/c.md')
+        self.commit('side removes the dirty file')
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--allow-unrelated-histories', '-m', 'merge side', 'side')
+        tip = self.head()
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 1, out)
+        self.assertIn('digit', out)
+        self.assertIn('1 whole trees', out)
+        self.assertNotIn('123456' + '789', out)
+
+    # --- a branch that moves forward scans only what its new commits add ---------------
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_branch_pushed_to_a_tag_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base')
+        self.write('docs/b.md', 'clean note too\n')
+        tip = self.commit('tip')
+        code, out = self.push(f'refs/heads/main {tip} refs/tags/v1 {base}')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    def branch_update(self, build, seed=None):
+        """Base on main, the update on branch `work`, then main checked out again: the working tree is clean,
+        so only the scans of what the push publishes can refuse it."""
+        self.write('docs/a.md', 'clean note\n')
+        for rel, text in (seed or {}).items():
+            self.write(rel, text)
+        base = self.commit('base is on the remote')
+        self.git('checkout', '-qb', 'work')
+        build()
+        tip = self.head()
+        self.git('checkout', '-q', 'main')
+        return self.push(f'refs/heads/work {tip} refs/heads/work {base}')
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_dirty_file_added_and_deleted_in_an_update_is_refused(self):
+        def build():
+            self.write('docs/d.md', DIRTY)
+            self.commit('add a dirty file')
+            self.git('rm', '-q', 'docs/d.md')
+            self.commit('delete it again')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('2 commits, 0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_dirty_modification_cleaned_later_is_refused(self):
+        def build():
+            self.write('docs/a.md', DIRTY)
+            self.commit('dirty edit')
+            self.write('docs/a.md', 'clean note again\n')
+            self.commit('clean it')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('2 commits, 0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_merge_whose_side_added_and_removed_a_dirty_file_is_refused(self):
+        def build():
+            self.git('checkout', '-qb', 'side')
+            self.write('docs/d.md', DIRTY)
+            self.commit('side adds a dirty file')
+            self.git('rm', '-q', 'docs/d.md')
+            self.commit('side removes it')
+            self.git('checkout', '-q', 'work')
+            self.write('docs/e.md', 'clean note\n')
+            self.commit('work moves on')
+            self.git('merge', '-q', '--no-ff', '-m', 'merge side', 'side')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_rename_that_makes_a_record_line_count_is_refused(self):
+        record = 'const SAMPLE: &str = r#"{"turn' + '":"t1"}"#;\n'          # clean in .rs, a record in .md
+
+        def build():
+            self.git('mv', 'src/x.rs', 'docs/x.md')
+            self.commit('rename to markdown')
+        code, out = self.branch_update(build, seed={'src/x.rs': record})
+        self.assertEqual(code, 1, out)
+        self.assertIn('chat-record', out)
+        self.assertIn('0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_replaced_blob_is_scanned_as_pushed(self):
+        def build():
+            self.write('docs/d.md', DIRTY)
+            self.commit('dirty file')
+            dirty = self.git('rev-parse', 'HEAD:docs/d.md')
+            (self.tmp / 'clean.txt').write_text('clean note\n', encoding='utf-8')
+            clean = self.git('hash-object', '-w', str(self.tmp / 'clean.txt'))
+            self.git('replace', dirty, clean)
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('digit docs/d.md:', out)          # the finding itself; 'digit' alone also matches the summary
+
+    @REQUIRES_BASH                                                       # no scanner needed
+    def test_a_missing_scanner_is_its_own_refusal(self):
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}',
+                              extra={'HER_GITLEAKS': str(self.tmp / 'no-such-gitleaks')})
+        self.assertEqual(code, 3, out)
+        self.assertIn('refusal=scanner-missing', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_failed_list_write_refuses_the_push(self):
+        # The list files are made by mktemp; a path that is a directory makes every write to it fail.
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        blocked = self.tmp / 'not-a-file'
+        blocked.mkdir()
+        fake_bin = self.tmp / 'fake-bin'
+        fake_bin.mkdir()
+        fake_mktemp = fake_bin / 'mktemp'
+        fake_mktemp.write_text(f'#!/bin/sh\necho "{blocked}"\n', encoding='utf-8', newline='\n')
+        fake_mktemp.chmod(0o755)
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}',
+                              extra={'PATH': f'{fake_bin}{os.pathsep}' + os.environ.get('PATH', '')})
+        self.assertEqual(code, 1, out)
+        self.assertIn('cannot write the outgoing list; nothing is published', out)
+        self.assertNotIn('Public scan (added)', out)
+        self.assertNotIn('Public scan (history)', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_failed_ref_read_refuses_the_push_after_partial_output(self):
+        # The ref lines come from one read of stdin. A read that prints a complete, clean line and
+        # then fails must refuse the push: the partial output is not the whole list.
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        partial = self.ref('main')
+        fake_bin = self.tmp / 'fake-cat-bin'
+        fake_bin.mkdir()
+        fake_cat = fake_bin / 'cat'
+        fake_cat.write_text(f'#!/bin/sh\nprintf "%s\\n" "{partial}"\nexit 1\n', encoding='utf-8', newline='\n')
+        fake_cat.chmod(0o755)
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}',
+                              extra={'PATH': f'{fake_bin}{os.pathsep}' + os.environ.get('PATH', '')})
+        self.assertEqual(code, 1, out)
+        self.assertIn('cannot read the refs git sends; nothing is published', out)
+        self.assertNotIn('Public scan (history)', out)
 
 
 if __name__ == '__main__':

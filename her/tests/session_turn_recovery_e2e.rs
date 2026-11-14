@@ -52,6 +52,39 @@ fn wait_for(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// A fixture read or append of a product-owned ledger can collide with the product's exclusive whole-file lock:
+/// on Windows that lock is mandatory, so the fixture's own `ReadFile`/`WriteFile` fails with ERROR_LOCK_VIOLATION
+/// (os error 33) for as long as the product holds it. Retry exactly that error for a short bound; any other
+/// error, or a lock that outlasts the bound, fails the test with the operation named.
+fn retry_lock_violation<T>(what: &str, mut op: impl FnMut() -> std::io::Result<T>) -> T {
+    const BOUND: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + BOUND;
+    loop {
+        match op() {
+            Ok(value) => return value,
+            Err(error) if cfg!(windows) && error.raw_os_error() == Some(33) => {
+                if Instant::now() >= deadline {
+                    panic!("{what}: the file stayed locked by another process for {BOUND:?}: {error}");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{what}: {error}"),
+        }
+    }
+}
+
+fn read_locked(path: &Path) -> String {
+    retry_lock_violation(&format!("read {}", path.display()), || fs::read_to_string(path))
+}
+
+/// `read_locked` for a poll that runs before the product has created the file: a missing file reads as empty.
+fn read_locked_or_default(path: &Path) -> String {
+    retry_lock_violation(&format!("read {}", path.display()), || match fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        other => other,
+    })
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -196,16 +229,11 @@ struct DshInner {
     stream_usage: bool,
     provider: &'static str,
     digest_fault: bool,
-    digest_rpc_reject: bool,
     digest_hold: bool,
     digest_text: &'static str,
-    digest_memory_error: bool,
-    digest_memory_legacy_error: bool,
+    digest_requests: Vec<Value>,
     follow_drop: bool,
     follow_history_cap: bool,
-    digest_cancel_reject: bool,
-    active_digests: HashSet<String>,
-    overlapping_prompts: usize,
     archive_fault: bool,
     turn_start_delay_ms: u64,
     sessions: HashMap<String, Sess>,
@@ -254,16 +282,11 @@ impl Dsh {
                 stream_usage: false,
                 provider: "ticket10-provider",
                 digest_fault: false,
-                digest_rpc_reject: false,
                 digest_hold: false,
-                digest_text: "synthetic turn complete",
-                digest_memory_error: false,
-                digest_memory_legacy_error: false,
+                digest_text: "[]",
+                digest_requests: Vec::new(),
                 follow_drop: false,
                 follow_history_cap: false,
-                digest_cancel_reject: false,
-                active_digests: HashSet::new(),
-                overlapping_prompts: 0,
                 archive_fault: false,
                 turn_start_delay_ms: 0,
                 sessions: HashMap::new(),
@@ -323,6 +346,31 @@ impl Dsh {
     fn sends(&self) -> Vec<(u16, Value)> {
         lock(&self.inner).sends.clone()
     }
+    fn digest_calls(&self) -> usize {
+        lock(&self.inner).digest_requests.len()
+    }
+    /// The relay's chat-completions endpoint answers rotation digests (`dependencies.model` is this server).
+    fn model_digest(self: &Arc<Self>, stream: &mut TcpStream, body: &[u8]) {
+        let (fault, hold, text) = {
+            let mut inner = lock(&self.inner);
+            inner.digest_requests.push(serde_json::from_slice(body).unwrap_or(Value::Null));
+            (inner.digest_fault, inner.digest_hold, inner.digest_text)
+        };
+        if hold {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline {
+                { let inner = lock(&self.inner); if inner.released || inner.shutting_down { break; } }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        if fault {
+            respond(stream, 500, &json!({"error":{"message":"synthetic-private-error-text"}}));
+            return;
+        }
+        respond(stream, 200, &json!({"id":"fixture","object":"chat.completion","created":1,"model":"ticket10-digest",
+            "choices":[{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}));
+    }
 
     /// The old turn finally calls its send tool with the token it was given.
     fn late_send(&self, prompt_text: &str) -> Option<(u16, Value)> {
@@ -362,7 +410,6 @@ impl Dsh {
                 inner.sessions.get_mut(&sid).unwrap().inbox.retain(|item| Some(&item["id"]) != id);
                 Ok(json!({"accepted": true}))
             }
-            "session/cancel" if inner.digest_cancel_reject && sid == "js-origin-session" => Err(("invalid-request".into(), "synthetic cancel refusal".into())),
             "session/cancel" => {
                 if let Some(s) = inner.sessions.get_mut(&sid) {
                     s.cancelled = true;
@@ -379,27 +426,21 @@ impl Dsh {
     fn prompt(self: &Arc<Self>, args: &Value, rpc_id: &str) -> Option<Result<Value, (String, String)>> {
         let sid = args.pointer("/request/sessionId").and_then(Value::as_str).unwrap_or("").to_string();
         let text = args.pointer("/request/content/0/text").and_then(Value::as_str).unwrap_or("").to_string();
-        let digest = text.starts_with("【记忆整理】");
         let (plan, fault) = {
             let mut inner = lock(&self.inner);
             inner.rpc.push(("session/prompt".into(), args.clone()));
-            if !digest && inner.active_digests.contains(&sid) {inner.overlapping_prompts+=1;}
             if inner.sessions.get(&sid).map(|s| s.gone).unwrap_or(true) {
                 inner.prompts.push(PromptRec { session: sid.clone(), rpc_id: rpc_id.into(), text, applied: false });
                 return Some(Err(("session-not-found".into(), "session not found".into())));
             }
-            if digest && inner.digest_rpc_reject {
-                inner.prompts.push(PromptRec { session: sid.clone(), rpc_id: rpc_id.into(), text, applied: false });
-                return Some(Err(("invalid-request".into(), "synthetic digest RPC rejection".into())));
-            }
-            let fault = if digest && inner.digest_fault { Fault::Refuse } else { inner.fault };
+            let fault = inner.fault;
             if fault == Fault::Refuse {
                 inner.prompts.push(PromptRec { session:sid.clone(),rpc_id:rpc_id.into(),text:text.clone(),applied:false });
                 return Some(Ok(json!({"accepted":false})));
             }
             let applied = fault != Fault::HangWithoutApply;
             inner.prompts.push(PromptRec { session: sid.clone(), rpc_id: rpc_id.into(), text: text.clone(), applied });
-            (if digest { Plan {send:None,hold:inner.digest_hold} } else {inner.plan.clone()}, fault)
+            (inner.plan.clone(), fault)
         };
         if fault == Fault::HangWithoutApply {
             return None;
@@ -439,7 +480,6 @@ impl Dsh {
         if delay>0 { thread::sleep(Duration::from_millis(delay)); }
         let turn = {
             let mut inner = lock(&self.inner);
-            if prompt.starts_with("【记忆整理】") {inner.active_digests.insert(sid.into());}
             let sess = inner.sessions.get_mut(sid).expect("session");
             sess.turn_no += 1;
             let turn = sess.turn_no;
@@ -453,7 +493,7 @@ impl Dsh {
             }
             turn
         };
-        if lock(&self.inner).observation_waits && !prompt.starts_with("【记忆整理】") {
+        if lock(&self.inner).observation_waits {
             let token = prompt.lines().find_map(|line| line.strip_prefix("【会话令牌】"))
                 .and_then(|line| line.split_once('（').map(|(token, _)| token.trim())).unwrap();
             let engage = lock(&self.inner).engage_send;
@@ -495,7 +535,6 @@ impl Dsh {
         let cancelled = lock(&self.inner).sessions.get(sid).map(|s| s.cancelled).unwrap_or(true);
         if cancelled {
             let mut inner = lock(&self.inner);
-            inner.active_digests.remove(sid);
             if let Some(sess) = inner.sessions.get_mut(sid) {
                 event(sess, "turn/end", json!({"turn": turn, "reason": {"kind": "aborted"}}));
             }
@@ -504,7 +543,7 @@ impl Dsh {
         // Most lifecycle cases model an agent that closes its turn without acknowledging any
         // unread work. The dedicated missing-close case opts out and checks JS's reminders.
         let close = {let inner=lock(&self.inner); inner.close_turns && !(inner.unclosed_first && turn==1)};
-        if !prompt.starts_with("【记忆整理】") && close {
+        if close {
             let token = prompt.lines().find_map(|line| line.strip_prefix("【会话令牌】"))
                 .and_then(|line| line.split_once('（').map(|(token, _)| token.trim()));
             if let Some(token) = token {
@@ -540,20 +579,12 @@ impl Dsh {
             );
         }
         let mut inner = lock(&self.inner);
-        inner.active_digests.remove(sid);
         let input_tokens = if turn>1 {inner.later_input_tokens.unwrap_or(inner.input_tokens)} else {inner.input_tokens};
         let cached_tokens = inner.cached_tokens;
         let stream_usage = inner.stream_usage;
         let provider = inner.provider;
-        let digest = prompt.starts_with("【记忆整理】");
-        let final_text = if digest { inner.digest_text } else { inner.reply_text };
-        let memory_error = inner.digest_memory_error;
-        let legacy_memory_error = inner.digest_memory_legacy_error;
+        let final_text = inner.reply_text;
         let sess = inner.sessions.get_mut(sid).expect("session");
-        if digest {
-            event(sess, "tool/call", json!({"turn":turn,"step":0,"callId":"digest-memory","name":"memory_write","arguments":"{}"}));
-            event(sess, "tool/result", json!({"turn":turn,"step":0,"message":{"isError":memory_error && !legacy_memory_error,"source":{"callId":"digest-memory"},"content":[{"type":"text","text":if memory_error && legacy_memory_error {"写入失败：synthetic-private-error-text"} else {"ok"}}]}}));
-        }
         event(
             sess,
             "assistant/message",
@@ -620,6 +651,10 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream) {
         return;
     }
     let Some(request) = read_request(&mut stream) else { return };
+    if request.request_line.split_whitespace().nth(1) == Some("/v1/chat/completions") {
+        world.model_digest(&mut stream, &request.body);
+        return;
+    }
     let Ok(envelope) = serde_json::from_slice::<Value>(&request.body) else { return };
     let method = envelope.get("method").and_then(Value::as_str).unwrap_or("").to_string();
     let rpc_id = envelope.get("rpcId").and_then(Value::as_str).unwrap_or("").to_string();
@@ -964,6 +999,7 @@ impl Rig {
                     "recovery": {"waitSecs": 30}
                 },
                 "slang": {"enabled": false},
+                "harness": {"model": "ticket10-digest"},
                 "rollout": {"enabled": false, "rustGroups": []}
             })
             .to_string(),
@@ -982,6 +1018,7 @@ impl Rig {
         .unwrap();
         fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
         fs::write(root.join("user/dsh/.credentials.yaml"), SECRET).unwrap();
+        fs::write(root.join("config/harness-api-key"), "ticket10-digest-key").unwrap();
         fs::write(
             root.join("dependencies.json"),
             json!({"dsh": dsh_url, "model": dsh_url, "onebot": ob_url, "onebot_ws": ws_url}).to_string(),
@@ -1223,8 +1260,7 @@ fn scheduling_first_typing_budget_subtracts_time_already_spent_in_the_turn() {
     assert!(wait_for(LONG,||rig.dsh.applied().len()==1));
     let mut started_at = None;
     assert!(wait_for(LONG, || {
-        started_at = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl"))
-            .unwrap_or_default()
+        started_at = read_locked_or_default(&rig.root.join("data/turn-ledger.jsonl"))
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|record| record["k"] == "started")
@@ -1354,7 +1390,7 @@ fn timing_records_distinguish_normal_and_cancelled_dsh_endings() {
             rig.start_candidate(mention(29901,"normal timing"));
         }
         let read_timing = || -> Vec<Value> {
-            fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap_or_default()
+            read_locked_or_default(&rig.root.join("data/logs/turn-timing.jsonl"))
                 .lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
         };
         assert!(wait_for(LONG, || !read_timing().is_empty()), "turn timing missing");
@@ -1365,7 +1401,7 @@ fn timing_records_distinguish_normal_and_cancelled_dsh_endings() {
         else { assert!(timing["cancelReason"].is_null()); }
         let turn_id = timing["turnId"].as_str().expect("timing needs the bridge turn identity");
         let rpc_id = timing["attemptRpcId"].as_str().expect("timing needs its submitted attempt");
-        let ledger: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap()
+        let ledger: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl"))
             .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert!(ledger.iter().any(|row| row["k"] == "begun" && row["turn"] == turn_id));
         assert!(ledger.iter().any(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id));
@@ -1405,7 +1441,7 @@ fn scheduling_timer_held_by_recovery_is_released_without_new_ingress() {
     fs::write(path,state.to_string()).unwrap();
     rig.dsh.set_plan(Plan{send:None,hold:false});
     rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(6),||fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap().contains("\"k\":\"held\"")));
+    assert!(wait_for(Duration::from_secs(6),||read_locked(&rig.root.join("data/turn-ledger.jsonl")).contains("\"k\":\"held\"")));
     assert!(rig.dsh.applied().is_empty());
     let resolved=rig.console("POST","/api/turns/resolve",Some(&json!({"turnId":"paused-before-wake","action":"abandon"})));
     assert_eq!(resolved.0,200,"{resolved:?}");
@@ -1484,7 +1520,7 @@ fn scheduling_successful_tool_send_arms_reply_check_for_later_nontrigger_message
     assert_ne!(send.1["reviseRequired"],true,"{send:?}");
     assert_eq!(rig.onebot_sends().len(),1,"initial gateway delivery must precede the follow-up");
     assert!(wait_for(Duration::from_secs(8), || rig.dsh.applied().len() == 1), "successful tool send never armed scheduleReplyCheckV2");
-    let wakes = fs::read_to_string(rig.root.join("data/logs/rbridge-live-wakes.jsonl")).unwrap();
+    let wakes = read_locked(&rig.root.join("data/logs/rbridge-live-wakes.jsonl"));
     assert_eq!(serde_json::from_str::<Value>(wakes.lines().next().unwrap()).unwrap()["reason"], "replyCheck");
     assert!(rig.dsh.applied()[0].text.contains("nontrigger follow up"));
 }
@@ -1532,7 +1568,7 @@ fn scheduling_persisted_conversation_gets_proactive_opportunity_without_ingress(
     rig.start_candidate(vec![]);
     assert!(wait_for(Duration::from_secs(66), || rig.dsh.applied().len() == 1), "no proactive turn without ingress");
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-    let wakes: Vec<Value> = fs::read_to_string(rig.root.join("data/logs/rbridge-live-wakes.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let wakes: Vec<Value> = read_locked(&rig.root.join("data/logs/rbridge-live-wakes.jsonl")).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(wakes[0]["reason"], "proactiveCheck");
     assert_eq!(rig.dsh.count("session/create"), 0);
 }
@@ -1612,7 +1648,7 @@ fn scheduling_priority_upgrade_flushes_quiet_on_mention() {
     first["message"] = json!([{"type":"text","data":{"text":"first lower priority"}}]);
     rig.start_candidate(vec![Step::Wait(500), Step::Frame(first), Step::Wait(700), Step::Mention { message_id:16202, text:"upgrade" }]);
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-    let records = |file: &str| -> Vec<Value> { fs::read_to_string(rig.root.join(file)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
+    let records = |file: &str| -> Vec<Value> { read_locked_or_default(&rig.root.join(file)).lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
     let decisions = records("data/logs/rbridge-live.jsonl");
     let urgent = decisions.iter().find(|v| v["key"] == GROUP_KEY && v["reason"] == "atMention").unwrap()["ts"].as_i64().unwrap();
     let wakes = records("data/logs/rbridge-live-wakes.jsonl");
@@ -1835,7 +1871,7 @@ fn hf136_observation_budget_sleeps_once_and_restart_does_not_reopen() {
             .contains("observation budget ended; keeping wake config")), "hub did not collect the sleeping turn");
         assert!(wait_for(Duration::from_secs(5), || rig.inbound()["stages"]["handled"].as_i64() == Some(1)),
             "restart must witness durable ingress settlement");
-        let ends = |root: &Path| fs::read_to_string(root.join("data/turn-ledger.jsonl")).unwrap().lines()
+        let ends = |root: &Path| read_locked(&root.join("data/turn-ledger.jsonl")).lines()
             .filter_map(|l|serde_json::from_str::<Value>(l).ok()).filter(|r|r["k"]=="ended").collect::<Vec<_>>();
         assert!(wait_for(Duration::from_secs(5), || !lock(&rig.dsh.inner).wait_results.is_empty()));
         let results = lock(&rig.dsh.inner).wait_results.clone();
@@ -1914,7 +1950,7 @@ fn engage_window_end_is_a_clean_sleep_with_one_terminal_record() {
         "chatter returns with the window end, marked not for her: {results:?}");
     assert!(results.iter().all(|(_, body)| body["waitLimitReached"] != true), "{results:?}");
     assert_eq!(last["nextAction"], "end_turn");
-    let records: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap().lines()
+    let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl")).lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
     let ends: Vec<&Value> = records.iter().filter(|r| r["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{ends:?}");
@@ -1945,8 +1981,8 @@ fn a_capped_turn_is_cancelled_and_its_late_send_is_refused() {
     // The bridge gives up after the timeout: DSH work is stopped and the turn's token is revoked.
     assert!(wait_for(LONG, || rig.dsh.count("session/cancel") >= 1), "a timed-out turn must be cancelled in DSH");
     assert!(wait_for(LONG, || rig.turn_state(0) == "cancelled"), "{:?}", rig.turns());
-    assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl"))
-        .unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    assert!(wait_for(LONG, || read_locked_or_default(&rig.root.join("data/logs/turn-timing.jsonl"))
+        .lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .any(|v| v["endKind"] == "aborted" && v["cancelled"] == true && v["cancelReason"] == "turnTimeout")),
         "hard-cap timing must identify the bridge cancellation");
     assert_eq!(rig.dsh.count("session/cancel"),1,"one hard cap must cause exactly one cancellation");
@@ -1980,19 +2016,19 @@ fn a_capped_turn_ending_before_the_cancel_rpc_returns_is_cancelled_once() {
     // The collector must consume the aborted end while cancel_with_reason is still
     // waiting for its RPC response, before it can rotate authority and end the turn.
     let collected = wait_for(Duration::from_secs(10), || {
-        fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl"))
-            .unwrap_or_default().lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        read_locked_or_default(&rig.root.join("data/logs/turn-timing.jsonl"))
+            .lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .any(|row| row["endKind"] == "aborted" && row["cancelReason"] == "turnTimeout")
     });
     let ledger = rig.root.join("data/turn-ledger.jsonl");
-    let before_reply = fs::read_to_string(&ledger).unwrap();
+    let before_reply = read_locked(&ledger);
     release.send(()).unwrap();
     assert!(collected, "collector did not reach the forced interleaving");
     assert!(!before_reply.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["k"] == "ended"), "cancellation must revoke authority before finalizing: {before_reply}");
     assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
         .unwrap_or_default().contains("[reserved2] group:420042 turn ended:")));
-    let records: Vec<Value> = fs::read_to_string(&ledger).unwrap().lines()
+    let records: Vec<Value> = read_locked(&ledger).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     let ends: Vec<_> = records.iter().filter(|row| row["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{records:?}");
@@ -2024,26 +2060,26 @@ fn a_completed_end_observed_before_the_cap_keeps_completion_while_bookkeeping_wa
     assert!(wait_for(LONG, || rig.root.join("data/collector-bookkeeping-ready").exists()),
         "collector did not observe the completed end");
     let ledger = rig.root.join("data/turn-ledger.jsonl");
-    let before_cap = fs::read_to_string(&ledger).unwrap();
+    let before_cap = read_locked(&ledger);
     assert!(!before_cap.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["k"] == "ended" || row["verdict"] == "cancel-requested"), "{before_cap}");
     assert_eq!(rig.dsh.count("session/cancel"), 0, "completion was observed before cancellation intent");
     assert!(wait_for(LONG, || rig.dsh.count("session/cancel") == 1), "the cap never fired");
     // Token rotation proves the independent cap handler has passed its intent and RPC.
     assert!(wait_for(LONG, || rig.agent_token() != SEED_TOKEN));
-    let while_held = fs::read_to_string(&ledger).unwrap();
+    let while_held = read_locked(&ledger);
     fs::remove_file(hold).unwrap();
     assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
         .unwrap_or_default().contains("[reserved2] group:420042 turn ended:")));
     assert!(!while_held.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["k"] == "ended"), "completion's terminal write is still pending: {while_held}");
-    let records: Vec<Value> = fs::read_to_string(&ledger).unwrap().lines()
+    let records: Vec<Value> = read_locked(&ledger).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     let ends: Vec<_> = records.iter().filter(|row| row["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{records:?}");
     assert_eq!(ends[0]["outcome"], "completed", "{records:?}");
     assert_eq!(rig.turn_state(0), "completed");
-    let timing = fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing = read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     assert!(timing.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["endKind"] == "completed" && row["cancelled"] == false && row["ok"] == true), "{timing}");
     let output = fs::read_to_string(rig.root.join("candidate-out.log")).unwrap();
@@ -2061,14 +2097,14 @@ fn a_completed_end_keeps_its_outcome_when_the_bookkeeping_barrier_path_is_invali
     rig.restart(mention(11006, "completed with an unavailable bookkeeping barrier"));
     assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
         .unwrap_or_default().contains("[reserved2] group:420042 turn ended:")));
-    let records: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap().lines()
+    let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl")).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     assert!(records.iter().any(|row| row["verdict"] == "completion-observed"), "{records:?}");
     let ends: Vec<_> = records.iter().filter(|row| row["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{records:?}");
     assert_eq!(ends[0]["outcome"], "completed", "{records:?}");
     assert_eq!(rig.turn_state(0), "completed");
-    let timing = fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing = read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     assert!(timing.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["endKind"] == "completed" && row["cancelled"] == false && row["ok"] == true), "{timing}");
     let output = fs::read_to_string(rig.root.join("candidate-out.log")).unwrap();
@@ -2114,7 +2150,7 @@ fn restart_with_pending_cancellation(queued: bool, unreachable: bool) {
     assert_ne!(rig.agent_token(), SEED_TOKEN, "pending cancellation must revoke authority before waiting");
     let late = rig.dsh.late_send(&prompt.text).unwrap();
     assert!(matches!(late.0, 401 | 403), "{late:?}");
-    let records: Vec<Value> = fs::read_to_string(&ledger).unwrap().lines()
+    let records: Vec<Value> = read_locked(&ledger).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     assert!(!records.iter().any(|row| row["k"] == "ended"), "unproven work must stay open: {records:?}");
     assert_eq!(rig.dsh.received(), 1, "the cancelled input must not be replayed");
@@ -2888,15 +2924,22 @@ fn an_unreadable_send_ledger_pauses_the_finished_turn_and_rotates_the_token() {
     assert!(wait_for(LONG, || rig.onebot_sends().len() == 1), "the model's send did not reach QQ");
     let before = rig.agent_token();
     let outbox = rig.root.join("data/send-outbox.jsonl");
-    let mut file = fs::OpenOptions::new().append(true).open(&outbox).expect("the send ledger exists");
-    std::io::Write::write_all(&mut file, b"{\"k\":\"attempt\",\"batch\":\"b\"}}\n").expect("damage the last line");
+    let damage: &[u8] = b"{\"k\":\"attempt\",\"batch\":\"b\"}}\n";
+    let mut file = retry_lock_violation("open the send ledger", || fs::OpenOptions::new().append(true).open(&outbox));
+    let mut written = 0;
+    while written < damage.len() {
+        // Retry each write from the offset already written, so a retry never appends a prefix twice.
+        let count = retry_lock_violation("damage the last send-ledger line", || std::io::Write::write(&mut file, &damage[written..]));
+        assert!(count > 0, "damage the last send-ledger line: the ledger accepted no bytes");
+        written += count;
+    }
     drop(file);
     rig.start_candidate(vec![]);
     // The console's own turn view reads the same ledger and refuses while it is torn, so observe the verdict
     // recovery recorded in the turn ledger.
     let ledger = rig.root.join("data/turn-ledger.jsonl");
     let records = || -> Vec<Value> {
-        fs::read_to_string(&ledger).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+        read_locked(&ledger).lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
     };
     assert!(
         wait_for(LONG, || records().iter().any(|r| r["k"] == json!("unknown") && r["reason"] == json!("send-unresolved"))),
@@ -3016,7 +3059,7 @@ fn recovered_finished_turn_usage_is_written_once_to_the_rust_ledger() {
     rig.restart(vec![]);
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"), "recovery must close the turn: {:?}", rig.turns());
     thread::sleep(Duration::from_secs(3));
-    let ledger = fs::read_to_string(rig.root.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+    let ledger = read_locked_or_default(&rig.root.join("data/token-usage-rust.jsonl"));
     let rows: Vec<Value> = ledger
         .lines()
         .filter(|line| !line.is_empty())
@@ -3046,7 +3089,7 @@ fn reattached_running_turn_usage_is_written_once_to_the_rust_ledger() {
     rig.dsh.release();
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"), "{:?}", rig.turns());
     thread::sleep(Duration::from_secs(3));
-    let ledger = fs::read_to_string(rig.root.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+    let ledger = read_locked_or_default(&rig.root.join("data/token-usage-rust.jsonl"));
     let usage: Vec<Value> = ledger
         .lines()
         .filter(|line| !line.is_empty())
@@ -3097,7 +3140,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     println!("hf85 UTF16: first body={}, first briefing={}, delta median body={}, first packet={}, delta packet={}; tools stay session-owned (none in prompt RPC)",
         units(&inputs[0].text),units(inputs[0].text.split("【会话令牌】").next().unwrap()),deltas[deltas.len()/2],
         units(&packet(&inputs[0].text)),units(&packet(&inputs[24].text)));
-    let timing=fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing=read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     let rows:Vec<Value>=timing.lines().map(|l|serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows.last().unwrap()["promptChars"],inputs[24].text.chars().count(),"timing counts actual delivery");
 
@@ -3247,8 +3290,9 @@ fn hf85_idle_rotation_digest_archive_and_next_wake_fresh_briefing() {
     rig.patch_config(|c|c["dsh"]["rotation"]["caps"]["ticket10-model"]=json!(500_000));
     assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"eligible sleeping session was not rotated");
     let calls=rig.dsh.calls("session/prompt");
-    assert_eq!(calls.len(),2,"one wake and one digest only");
-    assert!(calls[1]["request"]["content"][0]["text"].as_str().unwrap().starts_with("【记忆整理】"));
+    assert_eq!(calls.len(),1,"one wake; the digest goes to the relay");
+    assert_eq!(rig.dsh.digest_calls(),1);
+    assert!(lock(&rig.dsh.inner).digest_requests[0].to_string().contains("preserve this recent message"));
     assert!(rig.onebot_sends().is_empty());
     assert!(wait_for(LONG,||fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap_or_default().contains("session rotation")));
     let activity=fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap();
@@ -3256,8 +3300,8 @@ fn hf85_idle_rotation_digest_archive_and_next_wake_fresh_briefing() {
     assert_eq!(lock(&rig.gateway).sends.len(),sent_before,"successful rotation sent a QQ message");
     assert!(activity.contains("500000") && activity.contains("digest=yes"));
     assert_eq!(rig.console("POST","/api/socialV2/wake",Some(&json!({"key":GROUP_KEY}))).0,200);
-    assert!(wait_for(LONG,||rig.dsh.applied().len()==3));
-    let next=rig.dsh.applied()[2].clone();
+    assert!(wait_for(LONG,||rig.dsh.applied().len()==2));
+    let next=rig.dsh.applied()[1].clone();
     assert_ne!(next.session,"js-origin-session");
     assert!(next.text.contains("【简报 revision=") && next.text.contains("preserve this recent message"));
     assert!(next.text.contains("【简报节 sending】\n【发送规则】") && next.text.contains("文本输出不会发送到 QQ"), "rotated session lost delivery rules");
@@ -3280,7 +3324,8 @@ fn hf85_rotation_digest_failure_alerts_once_and_still_archives() {
     thread::sleep(Duration::from_secs(2));
     assert_eq!(lock(&rig.gateway).requests.iter().filter(|(_,b)|b["user_id"].to_string().trim_matches('"')=="8808" && b["message"].to_string().contains("session rotation")).count(),1,"owner alert was not deduplicated");
     assert_eq!(rig.dsh.count("workspace/archiveSession"),1);
-    assert_eq!(rig.dsh.received(),2,"failed digest was resent");
+    assert_eq!(rig.dsh.received(),1);
+    assert_eq!(rig.dsh.digest_calls(),1,"failed digest was resent");
 }
 
 #[test]
@@ -3288,6 +3333,7 @@ fn hf85_rotation_incoming_during_digest_cancels_retirement_and_replies_once() {
     let mut rig=Rig::new("hf85-rotation-ingress",Opts{seed_session:Some("js-origin-session")});
     lock(&rig.dsh.inner).input_tokens=500_000;
     lock(&rig.dsh.inner).digest_hold=true;
+    lock(&rig.dsh.inner).digest_text=ONE_MEMORY;
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":5}));
     rig.start_candidate(mention(85600,"before rotation"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
@@ -3295,12 +3341,16 @@ fn hf85_rotation_incoming_during_digest_cancels_retirement_and_replies_once() {
     // Ingress and held sends must use the same synthetic wall clock in both processes.
     rig.restart_console_at_epoch();
     rig.restart(vec![]);
-    assert!(wait_for(LONG,||lock(&rig.dsh.inner).active_digests.contains("js-origin-session")),"digest never started");
+    assert!(wait_for(LONG,||rig.dsh.digest_calls()==1),"digest never started");
     lock(&rig.gateway).frames.push(mention_event(85601,"message during digest"));
     assert!(wait_for(LONG,||rig.dsh.applied().iter().any(|p|p.text.contains("message during digest"))),"queued incoming wake did not resume");
     assert!(wait_for(LONG,||rig.onebot_sends().len()==2));
     assert_eq!(rig.dsh.count("workspace/archiveSession"),0,"incoming message did not cancel rotation");
     assert_eq!(rig.onebot_sends().len(),2,"incoming wake replied more than once");
+    // The held digest answers one memory after the cancel; the late result must write nothing.
+    rig.dsh.release();
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(digest_rows(&rig), 0, "a cancelled digest wrote its late result");
 }
 
 
@@ -3339,28 +3389,29 @@ fn hf85_rotation_owner_private_uses_total_input_and_provider_cache_life() {
 
 
 #[test]
-fn hf85_rotation_unknown_digest_admission_survives_restart_without_resubmission() {
+fn hf85_rotation_digest_interrupted_by_restart_writes_nothing_and_runs_once_more() {
     let mut rig=Rig::new("hf85-digest-restart",Opts{seed_session:Some("js-origin-session")});
     lock(&rig.dsh.inner).input_tokens=500_000;
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":5}));
     rig.dsh.set_plan(Plan{send:None,hold:false});
-    rig.start_candidate(mention(85800,"before lost digest admission"));
+    rig.start_candidate(mention(85800,"before interrupted digest"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
     rig.epoch=Some(now_ms()+245_000);
-    rig.dsh.set_fault(Fault::ApplyThenHang);
     lock(&rig.dsh.inner).digest_hold=true;
+    lock(&rig.dsh.inner).digest_text=ONE_MEMORY;
     rig.restart(vec![]);
-    assert!(wait_for(LONG,||rig.dsh.applied().len()==2 && lock(&rig.dsh.inner).active_digests.contains("js-origin-session")),"digest never reached the fake DSH");
+    assert!(wait_for(LONG,||rig.dsh.digest_calls()==1),"digest never reached the fake relay");
     rig.kill_candidate();
-    rig.dsh.set_fault(Fault::None);
-    // A pending external wake must wait for recovery of the durable maintenance RPC.
-    assert_eq!(rig.console("POST","/api/socialV2/wake",Some(&json!({"key":GROUP_KEY}))).0,200);
+    assert_eq!(digest_rows(&rig), 0, "an interrupted digest wrote memories");
+    lock(&rig.dsh.inner).digest_hold=false;
+    rig.dsh.release();
     rig.start_candidate(vec![]);
-    assert!(wait_for(LONG,||rig.dsh.applied().len()==3),"external wake remained stuck after digest recovery");
-    assert_eq!(rig.dsh.applied().iter().filter(|p|p.text.starts_with("【记忆整理】")).count(),1,"unknown digest was blindly resubmitted");
-    assert_eq!(rig.dsh.count("workspace/archiveSession"),0,"queued external wake did not delay rotation");
-    assert_eq!(lock(&rig.dsh.inner).overlapping_prompts,0,"wake was submitted before the old digest stopped");
+    assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"interrupted digest blocked rotation");
+    assert_eq!(rig.dsh.digest_calls(),2,"an interrupted digest wrote nothing and runs once more");
+    let record=rig.sessions_file()["briefings"][GROUP_KEY].clone();
+    assert_eq!(record["digestedThrough"],record["lastTurnSeq"]);
     assert!(rig.onebot_sends().is_empty());
+    assert_eq!(digest_rows(&rig), 1, "the rerun writes its one memory exactly once");
 }
 
 #[test]
@@ -3376,11 +3427,11 @@ fn hf85_rotation_never_runs_during_a_turn_even_after_cache_expiry() {
     rig.restart(mention(85901,"active turn prevents rotation"));
     assert!(wait_for(LONG,||rig.turn_state(1)=="running"));
     let before=rig.dsh.received();
-    assert!(lock(&rig.dsh.inner).active_digests.is_empty(),"normal turn overlaps an unfinished digest");
-    assert_eq!(lock(&rig.dsh.inner).overlapping_prompts,0);
+    let digests=rig.dsh.digest_calls();
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":1.01}));
     thread::sleep(Duration::from_secs(3));
     assert_eq!(rig.dsh.received(),before,"maintenance submitted a prompt during a running turn");
+    assert_eq!(rig.dsh.digest_calls(),digests,"normal turn overlaps a digest");
     assert_eq!(rig.dsh.count("workspace/archiveSession"),0);
     rig.dsh.release();
     assert!(wait_for(LONG,||rig.turn_state(1)=="completed"));
@@ -3416,7 +3467,8 @@ fn hf85_rotation_one_minute_cache_rotates_after_the_turn_closes() {
     rig.start_candidate(mention(86100,"one-minute provider cache"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
     assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"cache life minus one minute should rotate immediately after closing");
-    assert_eq!(rig.dsh.applied().len(),2,"one normal wake and one digest");
+    assert_eq!(rig.dsh.applied().len(),1);
+    assert_eq!(rig.dsh.digest_calls(),1);
     assert!(rig.onebot_sends().is_empty());
 }
 
@@ -3468,28 +3520,9 @@ fn hf85_rotation_uses_the_last_reminder_calls_input_and_closing_evidence() {
     rig.epoch=Some(now_ms()+245_000);
     rig.restart(vec![]);
     assert!(wait_for(LONG,||rig.dsh.count("workspace/archiveSession")==1),"last call was a closed reminder at the cap; it must be eligible for rotation");
-    assert_eq!(rig.dsh.applied().iter().filter(|p|p.text.starts_with("【记忆整理】")).count(),1);
+    assert_eq!(rig.dsh.digest_calls(),1);
 }
 
-#[test]
-fn hf85_fix1_digest_rpc_rejection_with_partial_history_unblocks_incoming_wake() {
-    let mut rig = Rig::new("hf85-rpc-rejection", Opts { seed_session: Some("js-origin-session") });
-    lock(&rig.dsh.inner).input_tokens = 500_000;
-    lock(&rig.dsh.inner).digest_rpc_reject = true;
-    rig.patch_config(|c| c["dsh"]["cacheTtlMinutes"] = json!({"ticket10-provider":5}));
-    rig.start_candidate(mention(86400, "before explicit digest rejection"));
-    assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-    rig.dsh.set_truncate(true);
-    rig.epoch = Some(now_ms() + 245_000);
-    rig.restart_console_at_epoch();
-    rig.restart(vec![]);
-    assert!(wait_for(LONG, || rig.dsh.received() == 2), "digest RPC was never submitted");
-    lock(&rig.gateway).frames.push(mention_event(86401, "incoming after digest rejection"));
-    assert!(wait_for(LONG, || rig.turn_state(1) == "completed"), "definite RPC rejection with partial history blocked the incoming wake");
-    assert_eq!(rig.dsh.received(), 3, "a rejected digest must never be probed or resent as unknown");
-    assert!(wait_for(LONG, || rig.onebot_sends().len() == 2), "incoming wake did not reply exactly once");
-    assert_eq!(lock(&rig.gateway).requests.iter().filter(|(_, b)| b["user_id"].to_string().trim_matches('"') == "8808" && b["message"].to_string().contains("session rotation")).count(), 1, "digest failure must alert the owner once");
-}
 
 fn hf85_digest_terminal_case(name: &str, text: &'static str, recover: bool, success: bool) {
     let mut rig = Rig::new(name, Opts { seed_session: Some("js-origin-session") });
@@ -3506,10 +3539,9 @@ fn hf85_digest_terminal_case(name: &str, text: &'static str, recover: bool, succ
     rig.epoch = Some(now_ms() + 245_000);
     rig.restart(vec![]);
     if recover {
-        assert!(wait_for(LONG, || lock(&rig.dsh.inner).active_digests.contains("js-origin-session")));
+        assert!(wait_for(LONG, || rig.dsh.digest_calls() == 1));
         rig.kill_candidate();
         rig.dsh.release();
-        assert!(wait_for(LONG, || lock(&rig.dsh.inner).sessions["js-origin-session"].events.last().is_some_and(|e| e["type"] == "turn/end" && e["data"]["turn"] == 2)));
         rig.start_candidate(vec![]);
     }
     assert!(wait_for(LONG, || rig.dsh.count("workspace/archiveSession") == 1), "digest completion blocked rotation: {name}, recover={recover}");
@@ -3525,7 +3557,8 @@ fn hf85_digest_terminal_case(name: &str, text: &'static str, recover: bool, succ
     rig.restart(vec![]);
     thread::sleep(Duration::from_secs(1));
     assert_eq!(alerts(&rig), if success { 0 } else { 1 }, "restart duplicated the owner alert");
-    assert_eq!(rig.dsh.received(), 2, "digest was resent");
+    assert_eq!(rig.dsh.received(), 1);
+    assert_eq!(rig.dsh.digest_calls(), if recover { 2 } else { 1 }, "digest was resent");
     assert!(rig.onebot_sends().is_empty());
 }
 
@@ -3544,9 +3577,9 @@ fn hf85_fix1_digest_completed_error_fails_live_and_after_restart() {
 }
 
 #[test]
-fn hf85_fix1_digest_empty_final_after_memory_tools_succeeds_live_and_after_restart() {
+fn hf85_fix1_digest_empty_array_succeeds_live_and_after_restart() {
     for recover in [false, true] {
-        hf85_digest_terminal_case("hf85-empty-digest", "", recover, true);
+        hf85_digest_terminal_case("hf85-empty-digest", "[]", recover, true);
     }
 }
 
@@ -3626,7 +3659,7 @@ fn hf_next_delivery_case(full: bool) {
     let operator = delivered.split(operator_header).nth(1).unwrap().split("\n\n【").next().unwrap();
     let operator_hash = format!("{:x}", Sha256::digest(operator.as_bytes()));
     assert_eq!(rig.sessions_file()["briefings"][GROUP_KEY]["installed"]["sections"]["operator"],operator_hash,"stored section hash differs from delivered filtered content");
-    let rows = || fs::read_to_string(rig.root.join("data/logs/model-refusals.jsonl")).unwrap_or_default().lines().map(|l|serde_json::from_str::<Value>(l).unwrap()).collect::<Vec<_>>();
+    let rows = || read_locked_or_default(&rig.root.join("data/logs/model-refusals.jsonl")).lines().map(|l|serde_json::from_str::<Value>(l).unwrap()).collect::<Vec<_>>();
     assert!(wait_for(LONG, || rows().len() == 1), "refusal metadata not recorded");
     let row = rows().remove(0);
     assert_eq!(row["errorClass"],"refusal");
@@ -3637,7 +3670,7 @@ fn hf_next_delivery_case(full: bool) {
     let stored = fs::read_to_string(rig.root.join("data/social-v2.json")).unwrap();
     assert!(stored.contains("configured-drop") && stored.contains("file-new"),"model filtering changed stored chat");
     assert!(!rows().iter().any(|r|r.to_string().contains("file-old")),"refusal record retained chat text");
-    let timing = fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing = read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     let last: Value = serde_json::from_str(timing.lines().last().unwrap()).unwrap();
     assert_eq!(last["promptChars"],delivered.chars().count());
 }
@@ -3680,8 +3713,8 @@ fn hf_next_completed_failure_records_a_single_terminal_outcome() {
         assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
             .unwrap_or_default().contains(&format!("[reserved2] {GROUP_KEY} turn ended: Err("))));
         assert_eq!(rig.turn_state(0), "failed", "completed failure remained open: {}", rig.view());
-        let records: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl"))
-            .unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl"))
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(records.iter().filter(|row| row["k"] == "ended").count(), 1);
         assert!(rig.onebot_sends().is_empty());
     }
@@ -3728,7 +3761,7 @@ fn hf85_port_fix3_restart_after_settled_digest_rotates_once_without_redigest() {
             let mut inner = lock(&rig.dsh.inner);
             inner.input_tokens = 500_000;
             inner.digest_hold = true;
-            inner.digest_text = if success { "" } else { r#"{"errorMessage":"upstream unavailable"}"# };
+            inner.digest_text = if success { "[]" } else { r#"{"errorMessage":"upstream unavailable"}"# };
             inner.plan = Plan { send: None, hold: false };
         }
         rig.patch_config(|c| c["dsh"]["cacheTtlMinutes"] = json!({"ticket10-provider":5}));
@@ -3736,7 +3769,7 @@ fn hf85_port_fix3_restart_after_settled_digest_rotates_once_without_redigest() {
         assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
         rig.epoch = Some(now_ms() + 245_000);
         rig.restart(vec![]);
-        assert!(wait_for(LONG, || lock(&rig.dsh.inner).active_digests.contains("js-origin-session")));
+        assert!(wait_for(LONG, || rig.dsh.digest_calls() == 1));
         // Hold the existing OS reset gate: digest persistence can finish, but the hub cannot retire.
         let gate = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .open(rig.root.join("data/locks/closed-agent.lock")).unwrap();
@@ -3754,14 +3787,14 @@ fn hf85_port_fix3_restart_after_settled_digest_rotates_once_without_redigest() {
         drop(gate);
         rig.start_candidate(vec![]);
         assert!(wait_for(LONG, || rig.dsh.count("workspace/archiveSession") == 1), "restart lost the rotation after digest success={success}");
-        assert_eq!(rig.dsh.received(), 2, "restart resubmitted a settled digest");
+        assert_eq!(rig.dsh.received(), 1); assert_eq!(rig.dsh.digest_calls(), 1, "restart re-ran a settled digest");
         let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
         assert_eq!(record["digestedThrough"] == record["lastTurnSeq"], success);
         assert!(rig.sessions_file()["sessions"].get(GROUP_KEY).is_none());
         rig.restart(vec![]);
         thread::sleep(Duration::from_secs(1));
         assert_eq!(rig.dsh.count("workspace/archiveSession"), 1, "restart repeated retirement");
-        assert_eq!(rig.dsh.received(), 2);
+        assert_eq!(rig.dsh.received(), 1); assert_eq!(rig.dsh.digest_calls(), 1, "restart re-ran a settled digest");
         assert_eq!(alerts(&rig), if success { 0 } else { 1 });
         assert!(rig.onebot_sends().is_empty());
     }
@@ -3822,7 +3855,7 @@ fn hf129_fix1_recovered_running_turn_admits_arrivals_and_covers_model_reads() {
     rig.dsh.release();
     assert!(wait_for(LONG, || rig.turn_state(0)=="completed"));
     thread::sleep(Duration::from_secs(3));
-    let decisions:Vec<Value>=fs::read_to_string(rig.root.join("data/logs/rbridge-live.jsonl")).unwrap().lines()
+    let decisions:Vec<Value>=read_locked(&rig.root.join("data/logs/rbridge-live.jsonl")).lines()
         .filter_map(|l|serde_json::from_str::<Value>(l).ok()).filter(|v|v["shouldWake"].is_boolean()).collect();
     assert_eq!(decisions[1]["reason"],"in-turn","{decisions:?}");
     assert_eq!(decisions[2]["reason"],"in-turn","{decisions:?}");
@@ -3853,6 +3886,15 @@ fn hf129_fix3_restart_keeps_the_base_urgent_followup_once() {
     rig.start_candidate(vec![]);
     thread::sleep(Duration::from_secs(3));
     assert_eq!(rig.dsh.applied().len(),2,"one completed base followup stays settled across restart");
+}
+
+const ONE_MEMORY: &str = r#"[{"subject":"整理","content":"一条整理出的记忆"}]"#;
+
+/// Digest memory rows in the fixture memory database.
+fn digest_rows(rig: &Rig) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(rig.root.join("data/memory.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect("open memory.db");
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |row| row.get(0)).expect("count digest rows")
 }
 
 /// Total search hits of the fixture memory database (the live bridge holds it open in WAL mode).
@@ -3901,195 +3943,27 @@ fn hf135_pending_fixture(name: &str) -> Rig {
     rig
 }
 
+
+
 #[test]
-fn hf135_unknown_digest_stream_failure_does_not_hold_conversation_forever() {
-    let mut rig = hf135_pending_fixture("hf135-unknown-stream");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        inner.follow_drop = true;
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        event(sess, "user/message", json!({"source":{"rpcId":"hf135-before-restart"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-    }
+fn hf135_pending_dsh_digest_from_an_earlier_release_runs_the_digest_once() {
+    let mut rig = hf135_pending_fixture("hf135-legacy-pending");
     rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1),
-        "unverified pending digest held the maintenance slot forever");
+    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
+    assert_eq!(rig.dsh.received(), 1, "no DSH digest prompt is ever submitted");
+    assert_eq!(rig.dsh.digest_calls(), 1);
     let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-    assert!(record["digestedThrough"].is_null(), "unknown digest advanced the cursor");
-    assert_eq!(rig.dsh.received(), 1, "unknown digest was blindly repeated");
-    let (_, status) = rig.console("GET", "/api/sessions", None);
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["step"], "follow-read");
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["kind"], "transport");
-    lock(&rig.dsh.inner).follow_drop = false;
-    lock(&rig.dsh.inner).truncate = false;
-    assert_eq!(rig.console("POST", "/api/socialV2/wake", Some(&json!({"key":GROUP_KEY}))).0, 200);
-    assert!(wait_for(LONG, || rig.dsh.applied().len() == 2), "session unusable after digest failure");
-    assert_ne!(rig.dsh.applied()[1].session, "js-origin-session");
+    assert_eq!(record["digestedThrough"], record["lastTurnSeq"]);
 }
 
 
-#[test]
-fn hf135_unexecuted_pending_digest_retires_without_replay() {
-    let mut rig = hf135_pending_fixture("hf135-never-executed");
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    assert_eq!(rig.dsh.received(), 1, "pending digests must never submit a replacement RPC");
-    let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-    assert!(record["digestedThrough"].is_null(), "unexecuted digest advanced the cursor");
-    assert!(record["rotation"]["retryCount"].is_null());
-}
-
-#[test]
-fn hf135_failed_memory_write_never_advances_digest_cursor() {
-    for recover in [false, true] {
-        // The final answer is empty/successful; only the actual tool result reports failure.
-        // Use the existing fake-DSH terminal-result scenario, with the failure flag added here.
-        let mut rig = Rig::new("hf135-memory-write", Opts { seed_session: Some("js-origin-session") });
-        {
-            let mut inner = lock(&rig.dsh.inner);
-            inner.input_tokens = 500_000;
-            inner.digest_memory_error = true;
-            inner.digest_memory_legacy_error = recover;
-            inner.digest_text = "";
-            inner.digest_hold = recover;
-            inner.plan = Plan { send: None, hold: false };
-        }
-        rig.patch_config(|c| c["dsh"]["cacheTtlMinutes"] = json!({"ticket10-provider":5}));
-        rig.start_candidate(mention(13510, "memory write failure"));
-        assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-        rig.epoch = Some(now_ms() + 245_000);
-        rig.restart(vec![]);
-        if recover {
-            assert!(wait_for(LONG, || lock(&rig.dsh.inner).active_digests.contains("js-origin-session")));
-            rig.kill_candidate();
-            rig.dsh.release();
-            assert!(wait_for(LONG, || lock(&rig.dsh.inner).sessions["js-origin-session"].events.last().is_some_and(|e| e["type"] == "turn/end" && e["data"]["turn"] == 2)));
-            rig.start_candidate(vec![]);
-        }
-        assert!(wait_for(LONG, || rig.dsh.count("workspace/archiveSession") == 1));
-        let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-        assert!(record["digestedThrough"].is_null(), "failed memory_write was recorded as a successful digest");
-        let (_, status) = rig.console("GET", "/api/sessions", None);
-        assert_eq!(status["rotationFailures"][GROUP_KEY]["step"], "memory-write");
-        assert_eq!(rig.dsh.received(), 2, "partial digest must not be replayed");
-        assert!(rig.onebot_sends().is_empty());
-    }
-}
 
 
-#[test]
-fn hf135_partial_history_preserves_unknown_outcome_without_replaying_memory() {
-    let mut rig = hf135_pending_fixture("hf135-truncated-history");
-    lock(&rig.dsh.inner).truncate = true;
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    let (_, status) = rig.console("GET", "/api/sessions", None);
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["step"], "rpc-lookup");
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["kind"], "history-truncated");
-    assert_eq!(rig.dsh.received(), 1, "partial history cannot prove non-execution");
-    assert!(rig.sessions_file()["briefings"][GROUP_KEY]["digestedThrough"].is_null());
-}
 
 
-#[test]
-fn hf135_follow_open_reports_only_step_and_kind() {
-    let mut rig = hf135_pending_fixture("hf135-open-failure");
-    lock(&rig.dsh.inner).probe = ProbeFault::MethodNotFound;
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(10), || {
-        let (_, status) = rig.console("GET", "/api/sessions", None);
-        status["rotationFailures"][GROUP_KEY]["step"] == "follow-open"
-    }));
-    assert!(wait_for(Duration::from_secs(10), || lock(&rig.gateway).requests.iter().any(|(_, b)| b["message"].to_string().contains("step=follow-open kind=rejected"))));
-    let notices: Vec<_> = lock(&rig.gateway).requests.iter().filter(|(_, b)| b["message"].to_string().contains("session rotation")).cloned().collect();
-    assert_eq!(notices.len(), 1);
-    assert!(!notices[0].1["message"].to_string().contains("method-not-found"));
-    lock(&rig.dsh.inner).probe = ProbeFault::None;
-}
 
 
-#[test]
-fn hf135_restart_keeps_out_of_window_digest_unverified_without_replay() {
-    let mut rig = hf135_pending_fixture("hf135-old-rpc");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        inner.follow_history_cap = true;
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        event(sess, "user/message", json!({"source":{"rpcId":"hf135-before-restart"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-        event(sess, "tool/call", json!({"turn":2,"callId":"saved-memory","name":"memory_write"}));
-        event(sess, "tool/result", json!({"turn":2,"message":{"isError":false,"source":{"callId":"saved-memory"}}}));
-        for step in 0..250 {
-            event(sess, "assistant/message", json!({"turn":2,"step":step,"message":{"content":[{"type":"text","text":"synthetic digest step"}]}}));
-        }
-        event(sess, "turn/end", json!({"turn":2,"reason":{"kind":"completed"}}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1), "restart held an out-of-window digest forever");
-    let record = rig.sessions_file()["briefings"][GROUP_KEY].clone();
-    assert!(record["digestedThrough"].is_null(), "unverified out-of-window digest advanced the cursor");
-    assert_eq!(rig.dsh.received(), 1, "out-of-window digest was replayed");
-    assert_eq!(rig.sessions_file()["rotationFailures"][GROUP_KEY]["kind"], "history-truncated");
-}
 
 
-#[test]
-fn hf135_unknown_digest_and_broken_cancel_do_not_block_queued_wake() {
-    let mut rig = hf135_pending_fixture("hf135-cancel-unverified");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        inner.follow_drop = true;
-        inner.digest_cancel_reject = true;
-        inner.active_digests.insert("js-origin-session".into());
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        event(sess, "user/message", json!({"source":{"rpcId":"hf135-before-restart"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(10), || rig.sessions_file()["rotationFailures"][GROUP_KEY]["step"] == "follow-read"));
-    assert_eq!(rig.console("POST", "/api/socialV2/wake", Some(&json!({"key":GROUP_KEY}))).0, 200);
-    assert!(wait_for(Duration::from_secs(15), || rig.sessions_file()["sessions"][GROUP_KEY] != "js-origin-session"), "failed DSH cancellation held the old mapping forever");
-    lock(&rig.dsh.inner).follow_drop = false;
-    lock(&rig.dsh.inner).digest_cancel_reject = false;
-    assert!(wait_for(LONG, || rig.dsh.applied().len() == 2), "queued wake was lost while retiring unknown digest");
-    assert_ne!(rig.dsh.applied()[1].session, "js-origin-session");
-    assert_eq!(lock(&rig.dsh.inner).overlapping_prompts, 0);
-    assert_eq!(rig.dsh.applied().iter().filter(|p| p.text.starts_with("【记忆整理】")).count(), 0, "unknown digest was resubmitted");
-    assert_eq!(rig.dsh.late_send(&rig.dsh.applied()[0].text).unwrap().0, 403, "old digest authority survived retirement");
-}
-
-#[test]
-fn hf135_legacy_foreign_rpc_never_replays_a_possibly_written_digest() {
-    let mut rig = hf135_pending_fixture("hf135-legacy-rpc");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        let sess = inner.sessions.get_mut("js-origin-session").unwrap();
-        // Legacy envelope/source mismatch: the digest already wrote memory under another ID.
-        event(sess, "user/message", json!({"source":{"rpcId":"legacy-dsh-request-id"}}));
-        event(sess, "turn/start", json!({"turn":2}));
-        event(sess, "tool/call", json!({"turn":2,"callId":"legacy-write","name":"memory_write"}));
-        event(sess, "tool/result", json!({"turn":2,"message":{"isError":false,"source":{"callId":"legacy-write"}}}));
-        event(sess, "turn/end", json!({"turn":2,"reason":{"kind":"completed"}}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    assert_eq!(rig.dsh.received(), 1, "a foreign correlated digest may already have committed memory; replay duplicates it");
-    assert!(rig.sessions_file()["briefings"][GROUP_KEY]["digestedThrough"].is_null());
-    let (_, status) = rig.console("GET", "/api/sessions", None);
-    assert_eq!(status["rotationFailures"][GROUP_KEY]["kind"], "identity-unverified");
-}
 
 
-#[test]
-fn hf135_explicit_queue_removal_never_replays_a_digest() {
-    let mut rig = hf135_pending_fixture("hf135-removed-intent");
-    {
-        let mut inner = lock(&rig.dsh.inner);
-        event(inner.sessions.get_mut("js-origin-session").unwrap(), "agent/inbox/spliced",
-            json!({"outcome":"canceled","inserted":[{"source":{"rpcId":"hf135-before-restart"}}]}));
-    }
-    rig.start_candidate(vec![]);
-    assert!(wait_for(Duration::from_secs(15), || rig.dsh.count("workspace/archiveSession") == 1));
-    assert_eq!(rig.dsh.received(), 1, "removed digest was replayed under a fresh RPC");
-    assert!(rig.sessions_file()["briefings"][GROUP_KEY]["digestedThrough"].is_null());
-}
