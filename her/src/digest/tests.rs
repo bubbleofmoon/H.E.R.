@@ -423,23 +423,25 @@ fn filtered_rows_never_consume_her_replies() {
     harness_replies(&root, &context, "group:77", &timed);
     journal_message_at(&context, "group:77", 2, group_text(5002, "/status"), t0 + 10);
     journal_message_at(&context, "group:77", 3, group_text(5002, &"字".repeat(400)), t0 + 20);
-    journal_message_at(&context, "group:77", 4, group_text(5002, "第四句"), t0 + 30);
-    journal_message_at(&context, "group:77", 5, group_text(5002, "第五句"), t0 + 40);
-    // Replies the cap defers wait for the next message: the seq 5 message takes them in a later digest.
     let mut reached = false;
-    for _ in 0..6 {
-        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 5, .. })) {
+    for _ in 0..4 {
+        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 3, .. })) {
             reached = true;
             break;
         }
     }
     assert!(reached, "the message after the filtered row was never digested");
+    // Replies the cap defers wait for the next message: the seq 4 message takes them in a later digest.
+    journal_message_at(&context, "group:77", 4, group_text(5002, "第四句"), t0 + 30);
+    assert_eq!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 4, memories: 0 }));
     let inputs = model.inputs();
     assert!(!inputs.is_empty(), "no model call");
     for n in 1..=3 {
         let marker = format!("回复{n}");
         assert_eq!(inputs.iter().filter(|input| input.contains(&marker)).count(), 1, "{marker} must reach exactly one digest");
     }
+    let last = inputs.last().expect("a model input");
+    assert!(last.contains("回复2") && last.contains("回复3"), "the deferred replies must be in the last input: {last}");
 }
 
 #[test]
