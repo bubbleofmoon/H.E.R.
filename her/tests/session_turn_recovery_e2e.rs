@@ -3318,6 +3318,7 @@ fn hf85_rotation_incoming_during_digest_cancels_retirement_and_replies_once() {
     let mut rig=Rig::new("hf85-rotation-ingress",Opts{seed_session:Some("js-origin-session")});
     lock(&rig.dsh.inner).input_tokens=500_000;
     lock(&rig.dsh.inner).digest_hold=true;
+    lock(&rig.dsh.inner).digest_text=ONE_MEMORY;
     rig.patch_config(|c|c["dsh"]["cacheTtlMinutes"]=json!({"ticket10-provider":5}));
     rig.start_candidate(mention(85600,"before rotation"));
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
@@ -3331,6 +3332,10 @@ fn hf85_rotation_incoming_during_digest_cancels_retirement_and_replies_once() {
     assert!(wait_for(LONG,||rig.onebot_sends().len()==2));
     assert_eq!(rig.dsh.count("workspace/archiveSession"),0,"incoming message did not cancel rotation");
     assert_eq!(rig.onebot_sends().len(),2,"incoming wake replied more than once");
+    // The held digest answers one memory after the cancel; the late result must write nothing.
+    rig.dsh.release();
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(digest_rows(&rig), 0, "a cancelled digest wrote its late result");
 }
 
 
@@ -3378,9 +3383,11 @@ fn hf85_rotation_digest_interrupted_by_restart_writes_nothing_and_runs_once_more
     assert!(wait_for(LONG,||rig.turn_state(0)=="completed"));
     rig.epoch=Some(now_ms()+245_000);
     lock(&rig.dsh.inner).digest_hold=true;
+    lock(&rig.dsh.inner).digest_text=ONE_MEMORY;
     rig.restart(vec![]);
     assert!(wait_for(LONG,||rig.dsh.digest_calls()==1),"digest never reached the fake relay");
     rig.kill_candidate();
+    assert_eq!(digest_rows(&rig), 0, "an interrupted digest wrote memories");
     lock(&rig.dsh.inner).digest_hold=false;
     rig.dsh.release();
     rig.start_candidate(vec![]);
@@ -3389,6 +3396,7 @@ fn hf85_rotation_digest_interrupted_by_restart_writes_nothing_and_runs_once_more
     let record=rig.sessions_file()["briefings"][GROUP_KEY].clone();
     assert_eq!(record["digestedThrough"],record["lastTurnSeq"]);
     assert!(rig.onebot_sends().is_empty());
+    assert_eq!(digest_rows(&rig), 1, "the rerun writes its one memory exactly once");
 }
 
 #[test]
@@ -3864,6 +3872,15 @@ fn hf129_fix3_restart_keeps_the_base_urgent_followup_once() {
     rig.start_candidate(vec![]);
     thread::sleep(Duration::from_secs(3));
     assert_eq!(rig.dsh.applied().len(),2,"one completed base followup stays settled across restart");
+}
+
+const ONE_MEMORY: &str = r#"[{"subject":"整理","content":"一条整理出的记忆"}]"#;
+
+/// Digest memory rows in the fixture memory database.
+fn digest_rows(rig: &Rig) -> i64 {
+    let conn = rusqlite::Connection::open_with_flags(rig.root.join("data/memory.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).expect("open memory.db");
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.query_row("SELECT count(*) FROM memory WHERE source LIKE 'digest:%'", [], |row| row.get(0)).expect("count digest rows")
 }
 
 /// Total search hits of the fixture memory database (the live bridge holds it open in WAL mode).

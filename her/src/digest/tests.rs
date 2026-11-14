@@ -53,15 +53,43 @@ fn social(root: &Root, key: &str, messages: Value) {
 }
 
 fn journal_message(context: &RuntimeContext, key: &str, n: i64, event: Value) {
+    journal_message_at(context, key, n, event, crate::parity_clock::now_ms());
+}
+
+fn journal_message_at(context: &RuntimeContext, key: &str, n: i64, event: Value, at: i64) {
     let journal = crate::inbound::Journal::open(context).unwrap();
     let event_key = format!("{key}|message:{n}");
-    journal.record_received(&event_key, key, &event.to_string(), crate::parity_clock::now_ms()).unwrap();
-    journal.mark_handled(&[event_key], crate::parity_clock::now_ms()).unwrap();
+    journal.record_received(&event_key, key, &event.to_string(), at).unwrap();
+    journal.mark_handled(&[event_key], at).unwrap();
 }
 
 fn private_text(user: i64, text: &str) -> Value {
     json!({"post_type":"message","message_type":"private","self_id":1000,"user_id":user,
         "message":[{"type":"text","data":{"text":text}}],"sender":{"nickname":"主人"}})
+}
+
+fn group_text(user: i64, text: &str) -> Value {
+    json!({"post_type":"message","message_type":"group","group_id":77,"self_id":1000,"user_id":user,
+        "message":[{"type":"text","data":{"text":text}}],"sender":{"card":"乙"}})
+}
+
+/// HER's completed harness replies in `key` at the given times, in one completed turn.
+fn harness_replies(root: &Root, context: &RuntimeContext, key: &str, replies: &[(i64, &str)]) {
+    drop(crate::harness::store::Store::open(context).unwrap());
+    let conn = rusqlite::Connection::open(root.0.join("data/conversations.db")).unwrap();
+    conn.execute("INSERT INTO sessions(id,conversation,generation) VALUES('s1',?1,'g1')", [key]).unwrap();
+    conn.execute("INSERT INTO turns(id,session_id,conversation,profile,state,begun_ms,ended_ms) VALUES('t1','s1',?1,'chat','completed',?2,?2)",
+        rusqlite::params![key, replies[0].0]).unwrap();
+    for (at, text) in replies {
+        conn.execute("INSERT INTO events(session_id,turn_id,kind,payload,created_ms) VALUES('s1','t1','assistant',?1,?2)",
+            rusqlite::params![json!({"text":text}).to_string(), at]).unwrap();
+    }
+}
+
+/// The stored cursor sequence, read straight from the database.
+fn cursor(root: &Root, key: &str, space: &str) -> Option<i64> {
+    let conn = rusqlite::Connection::open(root.0.join("data/memory.db")).unwrap();
+    conn.query_row("SELECT through_seq FROM digest_cursor WHERE conversation=?1 AND space=?2", [key, space], |r| r.get(0)).ok()
 }
 
 const CFG: fn() -> Value = || json!({"consoleToken":"digest-unit","ownerQQ":9001});
@@ -273,4 +301,140 @@ fn relay_model_answers_and_classifies_failures_without_provider_text() {
     assert!(seen[0].contains("input"));
     let unconfigured = json!({"consoleToken":"digest-unit"});
     assert!(matches!(super::model::RelayModel::from_runtime(&context, &unconfigured), Err(ModelError("unconfigured"))));
+}
+
+#[test]
+fn a_command_sent_as_a_quoted_reply_never_reaches_the_digest_input() {
+    let (_root, context) = fixture(Some("chat"), CFG(), "http://127.0.0.1:1");
+    let quoted = |text: &str| json!({"post_type":"message","message_type":"private","self_id":1000,"user_id":9001,
+        "message":[{"type":"reply","data":{"id":"77"}},{"type":"text","data":{"text":text}}],"sender":{"nickname":"主人"}});
+    journal_message(&context, "private:9001", 1, quoted("/reset"));
+    journal_message(&context, "private:9001", 2, quoted("重试 0a1b2c3d"));
+    journal_message(&context, "private:9001", 3, private_text(9001, "周末去看展"));
+    let model = Fake::new(vec![Ok("[]"), Ok("[]")]);
+    assert_eq!(run(&context, &model, "private:9001", &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
+    let journal_input = model.inputs()[0].clone();
+    for hidden in ["/reset", "重试", "引用消息"] {
+        assert!(!journal_input.contains(hidden), "a quoted command reached the input: {journal_input}");
+    }
+    assert!(journal_input.contains("#3 管理员：周末去看展"), "{journal_input}");
+    let (social_root, social_context) = fixture(None, CFG(), "http://127.0.0.1:1");
+    social(&social_root, "group:42", json!([
+        {"seq":1,"sender":"管理员","userId":"9001","isOwner":true,"text":"[引用消息]/reset","plain":"/reset","isSelf":false},
+        {"seq":2,"sender":"甲","userId":"5001","text":"[引用消息]/status","plain":"/status","isSelf":false},
+        {"seq":3,"sender":"甲","userId":"5001","text":"周末去看展","isSelf":false}
+    ]));
+    assert_eq!(run(&social_context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
+    let social_input = model.inputs()[1].clone();
+    assert!(!social_input.contains("/reset") && !social_input.contains("/status"), "a quoted command reached the input: {social_input}");
+}
+
+#[test]
+fn a_batch_of_only_commands_moves_the_cursor_without_the_model_and_reaches_later_messages() {
+    let (root, context) = fixture(Some("chat"), CFG(), "http://127.0.0.1:1");
+    let journal = crate::inbound::Journal::open(&context).unwrap();
+    let now = crate::parity_clock::now_ms();
+    let keys: Vec<String> = (1..=2001).map(|n| format!("private:9001|message:{n}")).collect();
+    for key in &keys {
+        journal.record_received(key, "private:9001", &private_text(9001, "/status").to_string(), now).unwrap();
+    }
+    journal.mark_handled(&keys, now).unwrap();
+    drop(journal);
+    journal_message(&context, "private:9001", 2002, private_text(9001, "明天提醒我交房租"));
+    let model = Fake::new(vec![Ok(r#"[{"subject":"房租","content":"主人明天要交房租"}]"#)]);
+    assert_eq!(run(&context, &model, "private:9001", &ANY), Ok(Outcome::Written { through: 2002, memories: 1 }));
+    let inputs = model.inputs();
+    assert_eq!(inputs.len(), 1, "command-only batches reached the model");
+    assert!(inputs[0].contains("#2002 管理员：明天提醒我交房租") && !inputs[0].contains("/status"), "{}", inputs[0]);
+    journal_message(&context, "private:9001", 2003, private_text(9001, "/status"));
+    assert_eq!(run(&context, &model, "private:9001", &ANY), Ok(Outcome::Quiet));
+    assert_eq!(model.inputs().len(), 1);
+    assert_eq!(cursor(&root, "private:9001", "inbound"), Some(2003), "a command-only batch must move the cursor");
+}
+
+#[test]
+fn the_input_cap_counts_the_whole_input_and_cuts_one_oversized_message() {
+    let capped = json!({"consoleToken":"digest-unit","ownerQQ":9001,"memory":{"digest":{"maxInputChars":1000}}});
+    let (root, context) = fixture(None, capped.clone(), "http://127.0.0.1:1");
+    social(&root, "group:42", json!([
+        {"seq":1,"sender":"甲","userId":"5001","text":"长".repeat(20000),"isSelf":false},
+        {"seq":2,"sender":"甲","userId":"5001","text":"第二句","isSelf":false}
+    ]));
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 1, memories: 0 }));
+    assert_eq!(run(&context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 2, memories: 0 }));
+    let (journal_root, journal_context) = fixture(Some("chat"), capped, "http://127.0.0.1:1");
+    let t0 = crate::parity_clock::now_ms() - 3_600_000;
+    for (n, at, text) in [(1, t0, "第一句"), (2, t0 + 10, "第二句"), (3, t0 + 20, "第三句")] {
+        journal_message_at(&journal_context, "group:77", n, group_text(5002, text), at);
+    }
+    let (long_a, long_b) = ("回".repeat(900), "复".repeat(900));
+    harness_replies(&journal_root, &journal_context, "group:77", &[(t0 + 5, long_a.as_str()), (t0 + 15, long_b.as_str())]);
+    for _ in 0..4 { let _ = run(&journal_context, &model, "group:77", &ANY); }
+    let inputs = model.inputs();
+    for input in &inputs {
+        assert!(input.chars().count() <= 1000, "input of {} chars exceeds maxInputChars", input.chars().count());
+    }
+    let journal_inputs = inputs[2..].join("\n");
+    for message in ["#1 乙：第一句", "#2 乙：第二句", "#3 乙：第三句"] {
+        assert!(journal_inputs.contains(message), "{message} was never digested");
+    }
+}
+
+#[test]
+fn the_backlog_check_counts_messages_past_the_input_cap() {
+    let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
+    let messages: Vec<Value> = (1..=100).map(|n| json!({"seq":n,"sender":"甲","userId":"5001","text":"话".repeat(200),"isSelf":false})).collect();
+    social(&root, "group:42", Value::Array(messages));
+    let model = Fake::new(vec![]);
+    let outcome = run(&context, &model, "group:42", &Limits { min_messages: 70, min_interval_ms: 0 });
+    assert!(matches!(outcome, Ok(Outcome::Written { through, .. }) if through < 100), "a 100-message backlog was judged quiet: {outcome:?}");
+    assert_eq!(model.inputs().len(), 1);
+}
+
+#[test]
+fn her_replies_deferred_by_the_cap_reach_a_later_digest() {
+    let (root, context) = fixture(Some("chat"), json!({"consoleToken":"digest-unit","ownerQQ":9001,"memory":{"digest":{"maxInputChars":1000}}}), "http://127.0.0.1:1");
+    let t0 = crate::parity_clock::now_ms() - 3_600_000;
+    let long = "字".repeat(400);
+    for (n, at) in [(1, t0), (2, t0 + 10), (3, t0 + 20)] {
+        journal_message_at(&context, "group:77", n, group_text(5002, &long), at);
+    }
+    harness_replies(&root, &context, "group:77", &[(t0 + 5, "回复一"), (t0 + 15, "回复二"), (t0 + 25, "回复三")]);
+    let model = Fake::new(vec![]);
+    assert!(matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 2, .. })));
+    assert!(matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 3, .. })));
+    let inputs = model.inputs();
+    for reply in ["回复一", "回复二", "回复三"] {
+        assert_eq!(inputs.iter().filter(|input| input.contains(reply)).count(), 1, "{reply} must reach exactly one digest");
+    }
+}
+
+#[test]
+fn conversations_are_digested_oldest_cursor_first() {
+    let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
+    let message = json!([{"seq":1,"sender":"甲","userId":"5001","text":"在吗","isSelf":false}]);
+    std::fs::write(root.0.join("data/social-v2.json"), json!({"conversations":{
+        "group:1":{"agentToken":"a","recentMessages":message},"group:2":{"agentToken":"b","recentMessages":message},
+        "private:3":{"agentToken":"c","recentMessages":message}}}).to_string()).unwrap();
+    let cfg = context.load_config().unwrap();
+    drop(MemoryStore::open(&context, &cfg).unwrap());
+    let conn = rusqlite::Connection::open(root.0.join("data/memory.db")).unwrap();
+    conn.execute_batch("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at) VALUES('group:1','msg',1,2000),('private:3','msg',1,1000);").unwrap();
+    drop(conn);
+    let model = Fake::new(vec![]);
+    assert_eq!(Digest::new(&context, &cfg, &*model).conversations(),
+        Ok(vec!["group:2".to_string(), "private:3".to_string(), "group:1".to_string()]));
+}
+
+#[test]
+fn a_failed_batch_waits_the_minimum_interval_before_it_is_retried() {
+    let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
+    social(&root, "group:42", json!([{"seq":1,"sender":"甲","userId":"5001","text":"第一句","isSelf":false}]));
+    let model = Fake::new(vec![Err("quota")]);
+    let spaced = Limits { min_messages: 1, min_interval_ms: 3_600_000 };
+    assert_eq!(run(&context, &model, "group:42", &spaced), Err(DigestError::Model("quota")));
+    assert_eq!(run(&context, &model, "group:42", &spaced), Ok(Outcome::Quiet), "a failed batch was retried at once");
+    assert_eq!(model.inputs().len(), 1);
+    assert!(rows(&root).is_empty());
 }

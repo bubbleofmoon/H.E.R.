@@ -72,6 +72,11 @@ struct Model {
 }
 impl Model {
     fn start(replies: Vec<(u16, String)>) -> Self {
+        Self::start_delayed(replies.into_iter().map(|(s, b)| (s, b, 0)).collect())
+    }
+
+    /// Like `start`; each reply waits its delay (ms) after the request is recorded.
+    fn start_delayed(replies: Vec<(u16, String, u64)>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -83,7 +88,11 @@ impl Model {
                 Ok((mut stream, _)) => {
                     let Some((path, header, body)) = request(&mut stream) else { continue };
                     log.lock().unwrap().push((path, header, body));
-                    let (status, body) = replies.lock().unwrap().pop_front().unwrap_or_else(|| completion("[]"));
+                    let (status, body, delay) = replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+                        let (s, b) = completion("[]");
+                        (s, b, 0)
+                    });
+                    thread::sleep(Duration::from_millis(delay));
                     let _ = write!(stream, "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 }
                 Err(_) => thread::sleep(Duration::from_millis(5)),
@@ -240,6 +249,10 @@ impl Rig {
             thread::sleep(Duration::from_millis(20));
         }
     }
+    fn cursor_rows(&self) -> i64 {
+        let db = rusqlite::Connection::open(self.root.join("data/memory.db")).unwrap();
+        db.query_row("SELECT count(*) FROM digest_cursor", [], |r| r.get(0)).unwrap()
+    }
     /// Digest memory rows, in write order.
     fn digest_rows(&self) -> Vec<(String, String, String, String)> {
         let db = rusqlite::Connection::open(self.root.join("data/memory.db")).unwrap();
@@ -300,6 +313,19 @@ fn leaks(rig: &Rig, run: &Value, needle: &str) -> bool {
         .http("GET", &format!("/api/tasks/runs/{id}/log"), None)
         .unwrap();
     raw.contains(needle) || log.to_string().contains(needle) || run.to_string().contains(needle)
+}
+
+fn wait_for_request(model: &Model, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while model.count() < count {
+        assert!(Instant::now() < deadline, "the model call never started");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn two() -> Value {
+    json!({"conversations":{"group:42":{"agentToken":"t42","recentMessages":three()},
+        "group:43":{"agentToken":"t43","recentMessages":[{"seq":1,"sender":"丙","userId":"5003","text":"下周开会","isSelf":false}]}}})
 }
 
 fn social(messages: Value) -> Value {
@@ -428,8 +454,9 @@ fn check_digest_waits_for_a_backlog() {
     assert_eq!(model.count(), 1);
 }
 
+/// Guard: admission refuses a stopped runtime. The in-run hold is covered by `stop_during_a_model_call_...`.
 #[test]
-fn stop_holds_the_digest_before_the_model() {
+fn a_stopped_runtime_refuses_digest_admission_with_409() {
     let model = Model::start(vec![]);
     let mut rig = Rig::new(&model, json!({}), social(three()));
     rig.start();
@@ -439,4 +466,55 @@ fn stop_holds_the_digest_before_the_model() {
         .unwrap();
     assert_eq!(code, 409, "{body}");
     assert_eq!(model.count(), 0);
+}
+
+#[test]
+fn stop_during_a_model_call_ends_the_run_cancelled_without_a_write_or_a_second_request() {
+    let model = Model::start_delayed(vec![(200, completion(r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#).1, 1500)]);
+    let mut rig = Rig::new(&model, json!({}), two());
+    rig.start();
+    let id = rig.trigger("memory-digest", "digest-stop-mid-run");
+    wait_for_request(&model, 1);
+    rig.stop_jobs();
+    let run = rig.wait_run(&id, Duration::from_secs(15));
+    assert_eq!(run["state"], "cancelled", "{run}");
+    assert!(rig.digest_rows().is_empty(), "a held digest wrote memories: {:?}", rig.digest_rows());
+    assert_eq!(rig.cursor_rows(), 0, "a held digest moved a cursor");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(model.count(), 1, "the second conversation reached the model");
+    assert!(!model.requests.lock().unwrap()[0].2.to_string().contains("下周开会"), "another conversation's message reached the input");
+}
+
+#[test]
+fn a_check_during_a_running_digest_skips_on_the_lock() {
+    let model = Model::start_delayed(vec![(200, completion("[]").1, 3000)]);
+    let mut rig = Rig::new(&model, json!({}), social(three()));
+    rig.start();
+    let daily = rig.trigger("memory-digest", "digest-gate-daily");
+    wait_for_request(&model, 1);
+    let check = rig.run("memory-digest-check", "digest-gate-check");
+    assert_eq!(check["state"], "succeeded", "{check}");
+    assert!(meta_lines(&rig, &check).iter().any(|l| l.contains("digest skipped: already running")), "check did not skip on the lock");
+    assert_eq!(rig.wait_run(&daily, Duration::from_secs(15))["state"], "succeeded");
+    assert_eq!(model.count(), 1);
+}
+
+#[test]
+fn each_job_reloads_the_selected_config_and_model_endpoint() {
+    let old = Model::start(vec![]);
+    let current = Model::start(vec![completion(r#"[{"subject":"爬山","content":"甲周六去爬山"}]"#)]);
+    let mut rig = Rig::new(&old, json!({"enabled":false}), social(three()));
+    rig.start();
+    assert_eq!(rig.run("memory-digest", "digest-reload-disabled")["state"], "succeeded");
+    let path = rig.root.join("config/config.json");
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    cfg["memory"]["autoFlush"]["enabled"] = json!(true);
+    std::fs::write(&path, cfg.to_string()).unwrap();
+    std::fs::write(rig.root.join("dependencies.json"), json!({"dsh":"http://127.0.0.1:1",
+        "model":format!("http://127.0.0.1:{}", current.port),"onebot":"http://127.0.0.1:1"}).to_string()).unwrap();
+    let run = rig.run("memory-digest", "digest-reload-enabled");
+    assert_eq!(run["state"], "succeeded", "{run}");
+    assert_eq!(current.count(), 1, "the job must use the current dependencies.json");
+    assert_eq!(old.count(), 0, "the job contacted the endpoint cached at console start");
+    assert_eq!(rig.digest_rows().len(), 1);
 }
