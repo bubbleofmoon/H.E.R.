@@ -449,7 +449,7 @@ fn gaps_of(view: &Value) -> Vec<Value> {
 /// 启动候选进程与两个假服务，返回 (候选进程, 控制台端口, 网关状态)。
 struct Harness {
     child: Child,
-    console: Child,
+    console: crate::support::ports::OwnedChild,
     console_port: u16,
     gateway: Arc<Mutex<FakeGateway>>,
     root: PathBuf,
@@ -506,6 +506,7 @@ fn start_with_scope(root: &Path, scripts: Vec<Vec<Step>>, owner: Option<i64>, pr
         thread::spawn(move || serve_onebot(onebot_listener, gateway));
     }
     let (console, console_port) = crate::support::ports::start_console(Duration::from_secs(20), |port| spawn_console(root, port));
+    let console = crate::support::ports::OwnedChild(console);
     let child = spawn_candidate(root, console_port);
     Harness { child, console, console_port, gateway, root: root.to_path_buf() }
 }
