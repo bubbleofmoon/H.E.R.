@@ -64,6 +64,7 @@ mod config;
 mod inbound;
 mod send_outbox;
 mod recorded_send;
+mod group_mute;
 mod history_log;
 mod session_map;
 mod session_context;
