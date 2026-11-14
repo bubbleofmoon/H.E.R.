@@ -6,6 +6,7 @@ Binding for coordinator sessions; planners read "Planner" and its "Threats": the
 
 - The coordinator is the Linux main session (Opus) and never implements: it picks ready issues (open, unclaimed, its host label and baton, blockers closed), claims them (`docs/agents/issue-tracker.md`), sizes, investigates by reading, plans and routes them, relays plans, caps fix rounds, owns every owner question, checks reports by their receipts (exit files, test-result lines, diff), runs the merge gates, merges, pushes, keeps the ticket's handoff current and closes the issue after merge. Few status turns while waiting.
 - A worker returns its report as its final message; save it to the ticket's report file (`/root/orch/her/<ticket>/report-<run>.md`, Windows `C:/her-orch/<ticket>/report-<run>.md`) before acting on it.
+- A worker that dispatched `quick.yml` ends its message with a "CI running" handback instead of waiting; wait for its runs and resume it with the result ("GitHub API budget").
 - Hand off with `scripts/handoff.sh` / `scripts/handoff.ps1` (`docs/agents/baton.md` "Handing over"), and keep the baton watcher running between handoffs (`baton.md` "Watcher").
 
 ## Sizing
@@ -68,6 +69,41 @@ A plan that touches the guard, the agents or the Codex form carries these threat
 
 - Flow: ticket branch from `origin/main` → execute → review → fix round if needed → merge `origin/main` in, push, open a pull request against `main` → gate (CI on the head, plus native checks) → coordinator merges the pull request when CI is green or red only by listed known red (`scripts/ci/known-red.txt`). Every push to `main` runs CI; a red `main` is fixed before the next merge. Before fixing a failing test, search open issues, the known-red list and the other host's branches for its name.
 
+## GitHub API budget
+
+- Limits:
+  - The REST limit is 5,000 calls an hour per user account, shared by every token, `gh` login and machine on that account; GraphQL has its own per-account budget. Over it, every `gh` call fails with 403 until the hourly reset.
+  - GitHub's secondary limits on bursts answer 403 or 429, with `Retry-After` or only a message. `ci-wait.py` honours `Retry-After` and otherwise waits at least one window; the baton watcher waits at least 180 s.
+- The guard refuses workers' plain polling and their plain ways of running the CI waiter; coordinators follow these rules by hand.
+- Only coordinators wait for CI. A worker dispatches its `quick.yml` runs once, reads their ids once and ends its message with a "CI running" handback (`implementer-protocol.md` "Test loop").
+  - Start one waiter per handback, and resume the worker with its output when it exits.
+  - The Windows coordinator waits for its own workers' runs while an item is in progress. Runs still open at handback go to Linux as ids, and Linux waits.
+- Wait with `scripts/ci-wait.py` from the integration checkout (`/root/her`, Windows `C:/her`), started with the Bash tool's background option.
+  - A worker's runs: `python -I scripts/ci-wait.py --label <n>-<run> --timeout 7200 --run <id> [--run <id> ...]`.
+  - A pull request's checks: `python -I scripts/ci-wait.py --workflow checks.yml --event pull_request --sha <head sha> --timeout 7200`.
+  - A handback line without an id: read the ids once with `gh run list --workflow quick.yml --branch her/<n>-<slug> --commit <sha> -L 10 --json databaseId,displayTitle`, then wait by id.
+- How it saves calls:
+  - Every waiter on a machine reads one cached run list per workflow file (`actions/workflows/<file>/runs?per_page=40`) in `~/.cache/her-ci-wait` (Windows `%LOCALAPPDATA%\her-ci-wait`). Several `--run` ids share it.
+  - One waiter at a time refreshes the list under a file lock: at most one list call per ~100 s per workflow file, with `If-None-Match`, and a 304 costs nothing.
+  - A machine-wide budget file holds the remaining calls and any block. Under 1,000 calls left, calls go every 5 min; under 200, every 15 min.
+  - After a rate-limit 403 or a 429, no call of any kind is made until the reset, and at least one window passes. After a refused token (401), no call for 15 min. Any other 403 or error is retried at the next window.
+  - A green quick.yml result per commit is cached and reused; checks.yml results never are.
+  - Logs are fetched only for a failed run, only the first failed job's, and filtered.
+- Exit codes:
+  - 0 green; 1 red, followed by the failed job names and the filtered test-result and panic lines; 3 cancelled or another conclusion; 2 usage (including `--timeout` outside 0-86400 s).
+  - 4 (still running when `--timeout` ran out) and 5 (GitHub unavailable or internal error) are not results: start the wait again with the `--run <id>` its last lines name.
+  - With several runs or `--label`, the output ends with `[<label>]` and one `run <id>: <result>` line each. The exit is then 1 if any run failed, else 5, else 4, else 3, else 0.
+- The waiter's two limits:
+  - Several `--run` ids are waited for in turn, so a failure in a later id is reported only after the earlier ids finish or the timeout ends. When an early answer matters, start a separate waiter for that run.
+  - A run that is no longer among the 40 newest runs of its workflow ends the whole wait with exit 2 and no summary. Read it once with `gh run view <id> --json status,conclusion`, and wait again for the other ids.
+- An API error is never a result: no test, CI run or gate is reported failed because GitHub did not answer.
+- Never wait with `gh run watch`, `--watch`, a loop or repeated `gh run view`, and do not check what a background waiter will report.
+- A merge decision reads the pull request's `statusCheckRollup` once (`merge-gate`). `ci-wait.py` only waits, and its cache is local state any process on the host can write.
+- Prefer one list call over many single-item calls. Use GraphQL (`gh api graphql`) where it covers the data, such as issues and labels; Actions runs are REST only.
+- Before a burst of calls, and when something returns 403, check the budget with `gh api rate_limit`; it does not count against the limit.
+- Intervals: CI at least 100 s (`ci-wait.py`); the baton watcher at least 180 s (`issue_watch.py --interval`).
+- If the limit is still too small, a GitHub App installed on the repository gets its own limit; a second token for the same user does not help.
+
 ## Windows coordinator
 
 Windows (32 GB, 4 cores / 8 threads, also runs production):
@@ -76,3 +112,4 @@ Windows (32 GB, 4 cores / 8 threads, also runs production):
 - One worker session at a time; each item gets a fresh coordinator session that starts from and ends with a handoff comment.
 - Native checks a gate names build via `C:/her/scripts/cargo-slot.ps1 -WorkTree <worktree>` (the integration checkout's copy): two build slots, two test slots (`docs/agents/rust-validation.md`). pi (`scripts/pi-task.ps1`) is paused.
 - An M/L ticket's planning goes to the Linux coordinator ("Planner"); Windows executes the plan it gets back.
+- "GitHub API budget" applies unchanged. Each host keeps its own cache (here `%LOCALAPPDATA%\her-ci-wait`), so the two hosts together make at most two list calls per window per workflow file. While an item is in progress, wait for its workers' runs from `C:/her` with the Bash tool's background option; at handback, give Linux the ids of the runs still open.
