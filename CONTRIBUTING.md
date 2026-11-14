@@ -12,7 +12,7 @@ python -I scripts/scan-public.py
 `scripts/scan-public.py` is the one public guard: it checks secrets, digit runs of 7
 or more, account-home paths (Windows, `/c/` and macOS spellings, any casing) and quoted
 chat or session records over the whole tree, over a text on stdin (`--stdin`) and over the
-tracked blobs of the revisions a push publishes (`--revs-from-stdin`) and the commit and tag
+tracked blobs of the revisions a push publishes (`--revs-from-stdin`), over only the blobs new commits add when a branch moves forward from a commit the remote has (`--added-from-stdin`), and over the commit and tag
 messages of the objects it publishes (`--objects-from-stdin`). `.githooks/pre-push` runs the
 tree scan, then the blob scan and the message scan for every ref being pushed, so a clean
 checkout does not excuse a dirty branch, tag or ancestor, and a clean tree does not excuse a

@@ -291,6 +291,101 @@ class PushHook(unittest.TestCase):
         code, out = self.push(f'refs/heads/main {"0" * 40} refs/heads/main {self.head("main")}')
         self.assertEqual(code, 0, out)
 
+    # --- a branch that moves forward publishes only what its new commits add -----------
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_one_file_branch_update_scans_that_one_file(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base is on the remote')
+        self.write('docs/b.md', 'clean note too\n')
+        tip = self.commit('one new file')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings', out)
+        self.assertIn('1 commits, 0 whole trees, 1 blobs', out)
+        self.assertIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_dirty_blob_in_a_branch_update_is_refused(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base is on the remote')
+        self.write('docs/b.md', DIRTY)
+        tip = self.commit('dirty new file')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 1, out)
+        self.assertIn('digit', out)
+        self.assertNotIn('123456' + '789', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_deletion_only_update_scans_no_blob(self):
+        self.write('docs/a.md', 'clean note\n')
+        self.write('docs/b.md', 'clean note too\n')
+        base = self.commit('base is on the remote')
+        self.git('rm', '-q', 'docs/b.md')
+        tip = self.commit('delete a file')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 0, out)
+        added = [line for line in out.splitlines() if line.startswith('Public scan (added)')]
+        self.assertTrue(added, out)
+        self.assertIn('0 blobs', added[0])
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_force_push_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base')
+        self.git('checkout', '-qb', 'old')
+        self.write('docs/r.md', 'clean note\n')
+        remote = self.commit('remote history, sibling of the local one')
+        self.git('checkout', '-q', 'main')
+        self.write('docs/l.md', 'clean note\n')
+        local = self.commit('local history')
+        code, out = self.push(f'refs/heads/main {local} refs/heads/main {remote}')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_new_ref_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_an_unknown_remote_sha_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"e" * 40}')
+        self.assertEqual(code, 0, out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_an_unrelated_root_merged_into_an_update_is_scanned_whole(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base is on the remote')
+        self.git('checkout', '-q', '--orphan', 'side')
+        self.write('docs/c.md', DIRTY)
+        self.commit('side root holds a dirty file')
+        self.git('rm', '-q', 'docs/c.md')
+        self.commit('side removes the dirty file')
+        self.git('checkout', '-q', 'main')
+        self.git('merge', '-q', '--allow-unrelated-histories', '-m', 'merge side', 'side')
+        tip = self.head()
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        self.assertEqual(code, 1, out)
+        self.assertIn('digit', out)
+        self.assertIn('1 whole trees', out)
+        self.assertNotIn('123456' + '789', out)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

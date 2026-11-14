@@ -6,9 +6,15 @@
 #     <local ref> <local sha> <remote ref> <remote sha>
 # Every ref is inspected, not just the checked-out one: a clean checkout says nothing about
 # another branch or tag that leaves with the same push. For each ref, the commits the remote
-# does not have yet are listed and their trees are scanned blob by blob, so a value a later
-# commit deletes is still refused, and a tracked blob under a folder the working copy ignores
-# is still scanned, because a committed blob is published. The published text is not only
+# does not have yet are listed and scanned, so a value a later commit deletes is still refused,
+# and a tracked blob under a folder the working copy ignores is still scanned, because a
+# committed blob is published. A branch that moves forward from a commit the remote already
+# has (the remote sha is a commit present here and an ancestor of the new commit) publishes
+# only what its new commits add: their blobs that differ from their parents are scanned
+# (scan-public.py --added-from-stdin), and a new commit without a parent, or with a parent
+# this repository cannot read, is scanned whole. Every other ref (a new ref, a remote sha
+# this repository lacks, a force push, a tag) has the whole tree of every new commit scanned
+# (--revs-from-stdin). The published text is not only
 # blobs: the message of every outgoing commit, and of an annotated tag object whose ref leaves
 # with this push, is scanned in a second pass, so a clean tree with a sensitive commit or tag
 # message is refused too. Refusal prints only finding kinds and positions, never the matched
@@ -33,7 +39,8 @@ fi
 refs=$(cat)
 revs=$(mktemp) || { echo 'pre-push: no temporary file for the outgoing revisions' >&2; exit 1; }
 objects=$(mktemp) || { echo 'pre-push: no temporary file for the outgoing objects' >&2; exit 1; }
-trap 'rm -f "$revs" "$objects"' EXIT
+added=$(mktemp) || { echo 'pre-push: no temporary file for the added commits' >&2; exit 1; }
+trap 'rm -f "$revs" "$added" "$objects"' EXIT
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_ref// /}" ] || continue          # nothing being pushed on this line
   if [ -z "${local_sha:-}" ]; then
@@ -48,10 +55,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "pre-push: the outgoing commit of $local_ref cannot be inspected" >&2
     exit 1
   fi
+  forward=0
   if [ -n "${remote_sha:-}" ] && git -C "$root" cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
     if ! listed=$(git -C "$root" rev-list "$local_sha" --not "$remote_sha" 2>/dev/null); then
       echo "pre-push: the new commits of $local_ref cannot be listed" >&2
       exit 1
+    fi
+    # A fast-forward of a branch: every parent the new commits do not list is on the remote.
+    # Tag refs never take this path: their whole history is scanned.
+    if [ "${local_ref#refs/heads/}" != "$local_ref" ] \
+       && [ "$(git -C "$root" cat-file -t "$local_sha" 2>/dev/null)" = commit ] \
+       && git -C "$root" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+      forward=1
     fi
   elif ! listed=$(git -C "$root" rev-list "$local_sha" 2>/dev/null); then
     echo "pre-push: the commits of $local_ref cannot be listed" >&2
@@ -63,7 +78,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "pre-push: $local_ref is a tag of a tag; push only tags of commits" >&2
     exit 1
   fi
-  printf '%s\n' "$listed" >>"$revs"
+  if [ $forward -eq 1 ]; then printf '%s\n' "$listed" >>"$added"; else printf '%s\n' "$listed" >>"$revs"; fi
   # The ref's own object joins the message pass: for a tag ref that is the annotated tag
   # object, whose message rev-list never reports.
   printf '%s\n' "$local_sha" >>"$objects"
@@ -74,6 +89,10 @@ EOF
 
 if ! sort -u "$revs" | "$py" -I "$root/scripts/scan-public.py" --revs-from-stdin; then
   echo 'pre-push: the public scan refused the history this push publishes' >&2
+  exit 1
+fi
+if ! sort -u "$added" | "$py" -I "$root/scripts/scan-public.py" --added-from-stdin; then
+  echo 'pre-push: the public scan refused the blobs this push adds' >&2
   exit 1
 fi
 if ! sort -u "$objects" | "$py" -I "$root/scripts/scan-public.py" --objects-from-stdin; then
