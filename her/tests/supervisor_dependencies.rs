@@ -1880,10 +1880,12 @@ fn a_refused_dsh_start_leaves_a_log_line_and_an_owner_alert() {
     fixture.wait(|| fixture.states()["dsh"]["state"] == "refused");
     let reason = "script or working directory is unavailable";
     let log = fixture.root.join("data/logs/dependency-dsh.err.log");
+    // The err log also takes the dependency's own stderr once it has run; count only our lines.
     let lines = || -> Vec<String> {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
+            .filter(|line| line.contains("] refused: "))
             .map(str::to_string)
             .collect()
     };
@@ -1908,7 +1910,9 @@ fn a_refused_dsh_start_leaves_a_log_line_and_an_owner_alert() {
         fixture.root.join("dsh/missing.mjs"),
     )
     .unwrap();
+    // "started" is recorded at spawn; wait until node has loaded the script and listens.
     fixture.wait(|| fixture.states()["dsh"]["state"] == "started");
+    fixture.wait(|| fixture.root.join("dsh/starts").exists());
     std::fs::remove_file(fixture.root.join("dsh/missing.mjs")).unwrap();
     fixture.wait(|| lines().len() == 2);
     std::thread::sleep(Duration::from_millis(1500));
