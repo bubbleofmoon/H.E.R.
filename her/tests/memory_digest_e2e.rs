@@ -429,12 +429,14 @@ fn check_digest_waits_for_a_backlog() {
 }
 
 #[test]
-fn stop_cancels_before_the_model() {
+fn stop_holds_the_digest_before_the_model() {
     let model = Model::start(vec![]);
     let mut rig = Rig::new(&model, json!({}), social(three()));
     rig.start();
     rig.stop_jobs();
-    let run = rig.run("memory-digest", "digest-stopped");
-    assert_eq!(run["state"], "cancelled", "{run}");
+    let (code, body) = rig
+        .http("POST", "/api/tasks/memory-digest/run", Some(json!({"requestId":"digest-stopped"})))
+        .unwrap();
+    assert_eq!(code, 409, "{body}");
     assert_eq!(model.count(), 0);
 }
