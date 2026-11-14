@@ -1679,6 +1679,7 @@ fn checkpoint(
     }
     deliver_outage_notice(context, cfg, states, name)?;
     if let Some((key, reason)) = notice {
+        log_refusal(context, &key, &reason);
         alert(context, cfg, &key, &reason);
     }
     Ok(())
