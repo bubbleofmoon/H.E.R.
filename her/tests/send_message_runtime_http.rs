@@ -464,6 +464,8 @@ enum Step {
     Drop,
     /// Answer a failed OneBot envelope with this retcode (HTTP 200).
     Failed(i64),
+    /// Retcode 100 with QQ result=120: the bot is muted in the group.
+    Muted,
     /// Answer with this HTTP status and an empty JSON failure envelope.
     HttpStatus(u16),
     /// Deliver (id assigned) but answer only after this many milliseconds.
@@ -585,6 +587,7 @@ fn handle_onebot(
             Step::Failed(retcode) => Some(
                 json!({ "status": "failed", "retcode": retcode, "wording": "fixture failure" }).to_string(),
             ),
+            Step::Muted => Some(json!({ "status": "failed", "retcode": 100, "message": "sendMsg failed: result=120", "wording": "fixture muted" }).to_string()),
             Step::HttpStatus(code) => {
                 http_status = code;
                 Some(json!({ "status": "failed", "retcode": 1400 }).to_string())
@@ -2014,6 +2017,7 @@ fn resume_racing_the_original_send_is_refused_and_never_duplicates() {
     assert_eq!(send_texts(&requests), vec!["一", "二"], "no item is sent twice");
 }
 
+// Retcode 100 without result=120 may have delivered (#46 keeps it unknown); result=120 is covered by a_result_120_refusal_is_not_committed.
 #[test]
 fn failure_retcodes_that_may_have_delivered_are_unknown_and_clear_refusals_stay_not_committed() {
     let onebot = FakeOneBot::start_with(
@@ -2038,6 +2042,21 @@ fn failure_retcodes_that_may_have_delivered_are_unknown_and_clear_refusals_stay_
     assert_eq!(resumed.body["unknown"], json!([2, 3]));
     let requests = onebot.finish();
     assert_eq!(send_texts(&requests), vec!["甲", "乙", "丙", "丁", "甲", "乙"], "unknown items are never resent");
+}
+
+#[test]
+fn a_result_120_refusal_is_not_committed() {
+    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
+    let root = fixture_root("mute-120", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    let console = ConsoleProcess::start(&root);
+    let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["甲"] }));
+    assert_eq!(first.body["notCommitted"], json!([0]), "a muted refusal is definite: {}", first.body);
+    assert_eq!(first.body["unknown"], json!([]), "{}", first.body);
+    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refusal gives its reservation back");
+    let refused: Vec<String> = read_outbox(&root).iter().filter(|r| r["k"] == "not_committed")
+        .filter_map(|r| r["error"].as_str().map(str::to_string)).collect();
+    assert_eq!(refused, vec!["OneBot 发送失败：retcode=100 fixture muted（被禁言 result=120）".to_string()], "the marker is recorded verbatim");
+    drop(onebot);
 }
 
 #[test]
