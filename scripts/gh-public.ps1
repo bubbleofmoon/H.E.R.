@@ -26,7 +26,7 @@
 # handle and keeps every byte.
 #
 # A refusal prints a fixed kind and the argument position, never a supplied value, and exits
-# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings. Install
+# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings, 3 when gitleaks cannot be found (refusal=scanner-missing, which says nothing about the text). After a clean scan, a failing gh exits 4 (refusal=gh-failed): the text may or may not be published. Install
 # gitleaks first (scripts/ci/install-gitleaks.py or set HER_GITLEAKS); a scan that cannot run
 # the secret check refuses too.
 $ErrorActionPreference = 'Continue'
@@ -70,7 +70,11 @@ function Invoke-ScanFile([string]$path) {
     }
 }
 
-function Refuse-Scan([string]$field, [int]$position) {
+function Refuse-Scan([int]$code, [string]$field, [int]$position) {
+    if ($code -eq 3) {
+        Write-Host "gh-public: refusal=scanner-missing field=$field argument-position=$position (set HER_GITLEAKS to the pinned gitleaks: docs/agents/rust-validation.md)"
+        exit 3
+    }
     Write-Host "gh-public: refusal=scan-findings field=$field argument-position=$position"
     Write-Host 'gh-public: refused (public scan findings above; matched text is never shown)'
     exit 1
@@ -182,13 +186,15 @@ if ($subcommand -eq 'comment' -and -not $number) { Refuse unsupported-argument 0
 if ($subcommand -eq 'create' -and $number) { Refuse unsupported-argument 0 }
 if ($subcommand -eq 'create' -and -not ($fieldNames -contains 'title')) { Refuse missing-title 0 }  # gh would prompt for an unscanned title
 
-if ((Invoke-ScanFile $body) -ne 0) { Refuse-Scan body-file $bodyPosition }
+$scanCode = Invoke-ScanFile $body
+if ($scanCode -ne 0) { Refuse-Scan $scanCode body-file $bodyPosition }
 for ($index = 0; $index -lt $fieldNames.Count; $index++) {
     $temp = [IO.Path]::GetTempFileName()
     try {
         # The whole value, every line of it, goes to the scan in one file.
         [IO.File]::WriteAllText($temp, [string]$fieldTexts[$index] + "`n", (New-Object Text.UTF8Encoding $false))
-        if ((Invoke-ScanFile $temp) -ne 0) { Refuse-Scan $fieldNames[$index] $fieldPositions[$index] }
+        $scanCode = Invoke-ScanFile $temp
+        if ($scanCode -ne 0) { Refuse-Scan $scanCode $fieldNames[$index] $fieldPositions[$index] }
     }
     finally {
         Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
@@ -206,5 +212,9 @@ for ($index = 0; $index -lt $fieldNames.Count; $index++) {
     if ($fieldNames[$index] -eq 'label') { $argv += @('--label', [string]$fieldTexts[$index]) }
 }
 & gh @argv
-if ($null -eq $LASTEXITCODE) { exit 1 }
-exit $LASTEXITCODE
+$ghCode = $LASTEXITCODE
+if ($null -eq $ghCode -or $ghCode -ne 0) {
+    [Console]::Error.WriteLine("gh-public: refusal=gh-failed exit=$ghCode (the scan passed and gh failed: the text may or may not be on GitHub, check before retrying)")
+    exit 4
+}
+exit 0

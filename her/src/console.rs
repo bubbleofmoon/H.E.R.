@@ -41,6 +41,8 @@ mod voice_http;
 #[path = "console_access.rs"]
 mod access;
 pub(crate) use access::take_admin_wake;
+#[path = "console_schedule.rs"]
+mod schedule_routes;
 pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
     revoke as revoke_agent_token, token as conversation_token,
@@ -482,6 +484,7 @@ fn is_bounded_json_post(method: &str, path: &str) -> bool {
     is_role_management_post(method, path)
         || (method == "POST" && path == "/api/socialV2/send-message")
         || (method == "POST" && path.starts_with("/api/tasks/"))
+        || (method == "POST" && (path == "/api/schedule" || path.starts_with("/api/schedule/")))
         || (method == "POST" && path.starts_with("/api/backups/"))
         || (method == "POST" && path.starts_with("/api/releases/"))
         || (method == "POST" && path.starts_with("/api/dependencies/"))
@@ -3313,12 +3316,13 @@ fn handle_roles_delete(context: &RuntimeContext, body: &str) -> Result<Value, (u
     Ok(json!({ "ok": true, "deleted": name, "clearedCurrent": cleared }))
 }
 
+fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
+    if error.class().starts_with("temp/") { format!("写临时文件失败：{error}") } else { format!("改名失败：{error}") }
+}
+
 /// 原子写文本：与 `write_json_atomic` 同一套「临时文件 + 改名」。
 fn write_text_atomic(path: &str, text: &str) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("改名失败：{e}"))?;
-    Ok(())
+    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
 
 /// `validateRoleContent`：CRLF 归一 → trim → 非空 → 64KB 上限。
@@ -3451,30 +3455,16 @@ fn handle_roles_limit(context: &RuntimeContext, body: &str) -> Result<Value, (u1
 /// 等于机器人起不来。同盘改名在 Windows 上是原子的。
 /// 原子写文本：先写临时文件再改名（同目录，保证 rename 是原子的）。
 fn write_file_atomic(path: &str, text: &str) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换文件失败：{e}"))
+    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
-/// 进程内原子写序号（M7）：与 pid 一起保证并发写的临时文件名不撞车。
-static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static JSON_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
     // Unique temp names protect contents; serialize replacement too, since overlapping
     // Windows replacements can transiently hold the target against another replacement.
     let _gate = JSON_WRITE_GATE.lock().map_err(|_| "JSON write gate is poisoned".to_string())?;
-    // M7：固定 `{path}.tmp` 在「每连接一线程」的控制台里会互相截断/覆盖
-    // （后一个线程 rename 走前一个线程的内容 → 丢更新）。pid 区分进程，
-    // 进程内自增序号区分同进程的并发线程；临时文件仍放同目录，rename 保持原子。
-    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = format!("{path}.{}.{}.tmp", std::process::id(), seq);
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp); // rename 失败别把临时文件留在目录里
-        return Err(format!("改名失败：{e}"));
-    }
-    Ok(())
+    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
 
 /// `POST /api/whitelist`：白名单 / 黑名单 / 管理员 QQ。
@@ -12155,6 +12145,24 @@ fn route_with_context(
             Ok(value) => (if value["queued"] == true {202} else {200}, "application/json; charset=utf-8".to_string(), value.to_string()),
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
+    }
+    if context.is_isolated() && crate::console_persona::is_route(&req.path) {
+        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
+        // Writes commit under the configuration gate after a fresh credential check, like release
+        // approval: a credential revoked while this request waited never writes.
+        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+            let gate = config_gate(context)?;
+            let latest = selected_config_for_handler(context)?;
+            if !authorized_in(context, req, &latest) {
+                return Err((401, "console credential was revoked".into()));
+            }
+            Ok(gate)
+        };
+        let (status, content_type, body) = crate::console_persona::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
+        return (status, content_type.to_string(), body);
+    }
+    if context.is_isolated() && schedule_routes::is_schedule_path(&req.path) {
+        return schedule_routes::route(context, cfg, req);
     }
     if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
         // Hold the configuration gate until the lifecycle mutation commits. A credential
@@ -24063,6 +24071,43 @@ mod tests {
     }
 
     #[test]
+    fn schedule_writes_recheck_the_console_credential_under_the_config_gate() {
+        const OLD: &str = "fixture-schedule-old-console-token";
+        const NEW: &str = "fixture-schedule-new-console-token";
+        let (root, context) = fixture_runtime("ticket33 schedule revoked", OLD);
+        // The front door accepted the old credential; the rotation completed while the request waited.
+        let front = context.load_config().unwrap();
+        let config_path = root.0.join("config/config.json");
+        let mut raw: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        raw["consoleToken"] = json!(NEW);
+        std::fs::write(&config_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let now = crate::parity_clock::now_ms();
+        let writes = [
+            ("/api/schedule", json!({"conversation": "private:7001", "text": "喝水", "at": now + 3_600_000})),
+            ("/api/schedule/item:rem-fixture/cancel", json!({})),
+            ("/api/schedule/system:backup/pause", json!({"confirm": true})),
+            ("/api/schedule/system:backup/run", json!({"confirm": true, "requestId": "fixture-request-33"})),
+            ("/api/schedule/reachOut:private:7001/cancel", json!({"at": now + 60_000})),
+            ("/api/schedule/replyCheck:private:7001/run", json!({})),
+            ("/api/schedule/sleep:private:7001/cancel", json!({})),
+        ];
+        for (path, body) in writes {
+            let mut request = req("POST", path, Some(OLD));
+            request.body = body.to_string();
+            let (status, _, response) = schedule_routes::route(&context, &front, &request);
+            assert_eq!(status, 401, "{path}: {response}");
+        }
+        assert!(!root.0.join("data/schedule.json").exists(), "nothing was written with the revoked credential");
+        assert!(!std::fs::read_to_string(root.0.join("data/social-v2.json")).unwrap().contains("adminWakes"));
+
+        let mut request = req("POST", "/api/schedule/system:backup/pause", Some(NEW));
+        request.body = json!({"confirm": true}).to_string();
+        let (status, _, response) = schedule_routes::route(&context, &context.load_config().unwrap(), &request);
+        assert_eq!(status, 200, "{response}");
+        assert!(crate::schedule::ScheduleStore::new(&context).system_paused("backup"));
+    }
+
+    #[test]
     fn isolated_social_seen_rechecks_revoked_auth_after_gate_wait() {
         use std::sync::mpsc;
         use std::time::Duration;
@@ -26314,6 +26359,7 @@ mod tests {
     }
 
     mod memory_ticket17_tests { include!("memory_ticket17_tests.rs"); }
+    mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
 }

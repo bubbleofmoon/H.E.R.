@@ -711,15 +711,10 @@ fn a_group_message_round_trips_with_ack_plain_reply_session_and_records() {
 }
 
 #[test]
-fn owner_prompts_carry_the_admin_tag_and_the_role_hint_in_the_old_layout() {
-    let mut rig = Rig::new(
-        "owner",
-        Seed {
-            roles: vec![("小鲸鱼", "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n")],
-            current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
-            ..Seed::default()
-        },
-    );
+fn owner_prompts_carry_the_admin_tag_and_the_persona_core_in_the_old_layout() {
+    let mut rig = Rig::new("owner", Seed::default());
+    fs::write(rig.root.join("data/personas.json"), json!({"format": 1, "nextId": 2, "default": "p1", "overrides": {}, "importedRolesAt": null,
+        "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [{"version": 1, "approved": true, "name": "小鲸鱼", "core": "你是一只爱聊天的小鲸鱼。"}]}}}).to_string()).unwrap();
     rig.start();
     says(&rig, OWNER_KEY, OWNER, "owner", "私聊你好");
     says(&rig, GROUP_KEY, OWNER, "owner", "群里你好");
@@ -728,8 +723,8 @@ fn owner_prompts_carry_the_admin_tag_and_the_role_hint_in_the_old_layout() {
     let bodies: Vec<String> = rig.dsh.prompts().iter().map(|p| body_of(&p.text).to_string()).collect();
     let private = bodies.iter().find(|b| b.contains("私聊你好")).expect("private prompt");
     let group = bodies.iter().find(|b| b.contains("群里你好")).expect("group prompt");
-    assert_eq!(private, "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】私聊你好", "role hint, blank line, admin tag, text (private has no sender prefix)");
-    assert_eq!(group, "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】owner：群里你好");
+    assert_eq!(private, "【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】私聊你好", "persona core, blank line, admin tag, text");
+    assert_eq!(group, "【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n【管理员】owner：群里你好");
 }
 
 #[test]
@@ -894,15 +889,15 @@ fn status_role_silent_and_active_commands_have_the_old_texts_and_effects() {
     says(&rig, OWNER_KEY, OWNER, "owner", "/role 不存在的");
     says(&rig, OWNER_KEY, OWNER, "owner", "/status");
     let t = rig.wait_texts(OWNER_KEY, 4);
-    assert_eq!(t[1], "已切换角色：小鲸鱼。");
-    assert_eq!(t[2], "角色「不存在的」不存在。角色文件放 qq-bridge/roles/ 目录。");
-    assert_eq!(t[3], "会话 未创建；白名单 通过；角色 小鲸鱼；模式 active");
-    assert_eq!(rig.data_json("current-role.json"), json!({"role": "小鲸鱼", "mode": "active"}));
+    assert_eq!(t[1], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
+    assert_eq!(t[2], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。", "an unknown name gets the same notice");
+    assert_eq!(t[3], "会话 未创建；白名单 通过；角色 无；模式 active");
+    assert!(rig.data_json("current-role.json")["role"].is_null(), "a retired /role writes nothing");
 
     says(&rig, OWNER_KEY, OWNER, "owner", "/role off");
     let t = rig.wait_texts(OWNER_KEY, 5);
-    assert_eq!(t[4], "已清除角色，恢复正常人格。");
-    assert_eq!(rig.data_json("current-role.json"), json!({"role": null, "mode": "active"}));
+    assert_eq!(t[4], "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
+    assert!(rig.data_json("current-role.json")["role"].is_null());
 
     // /silent: members are ignored (not even a refusal), the owner still gets answers.
     says(&rig, OWNER_KEY, OWNER, "owner", "/silent");
@@ -1329,6 +1324,28 @@ fn reserved_commands_and_disabled_social_use_the_public_chat_fallback() {
         social.0 == 200
     }), "social view never became available: {social:?}");
     assert_eq!(social.1["pendingSummaries"], json!({}), "{social:?}");
+}
+
+#[test]
+fn reserved_role_commands_answer_the_retirement_notice_and_write_nothing() {
+    let mut rig = Rig::new(
+        "reserved-role19",
+        Seed {
+            mode: "reserved",
+            config: json!({"social":{"enabled":false},"ackMessage":""}),
+            roles: vec![("小鲸鱼", "你是小鲸鱼。\n")],
+            ..Seed::default()
+        },
+    );
+    rig.start();
+    for command in ["/role 小鲸鱼", "/role 不存在的", "/role off"] {
+        says(&rig, OWNER_KEY, OWNER, "owner", command);
+    }
+    for text in rig.wait_texts(OWNER_KEY, 3) {
+        assert_eq!(text, "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
+    }
+    assert!(rig.data_json("current-role.json")["role"].is_null(), "a retired /role writes nothing");
+    assert!(rig.dsh.prompts().is_empty(), "no /role form reaches the model");
 }
 
 fn reserved_seed(extra: Value) -> Seed {

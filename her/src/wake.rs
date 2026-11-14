@@ -40,7 +40,7 @@ pub fn wake_priority(reason: &str) -> i32 {
 pub fn is_timer_reason(reason: &str) -> bool {
     matches!(
         reason.split(':').next().unwrap_or(""),
-        "timeout" | "replyCheck" | "proactiveCheck" | "bootstrap" | "admin"
+        "timeout" | "replyCheck" | "proactiveCheck" | "bootstrap" | "admin" | "reminder"
     )
 }
 
@@ -1389,6 +1389,7 @@ mod tests {
     fn timer_reasons_are_recognised() {
         assert!(is_timer_reason("timeout"));
         assert!(is_timer_reason("replyCheck"));
+        assert!(is_timer_reason("reminder:rem-1"));
         assert!(!is_timer_reason("atMention"));
         assert!(!is_timer_reason("keyword:大肥鱼"));
     }

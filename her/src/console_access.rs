@@ -712,6 +712,17 @@ const ADMIN_WAKE_QUEUE: usize = 20;
 /// request is handed to the live scheduler through the conversation record (`adminWakes`) with the
 /// token epoch it was made under; the scheduler drops it if that epoch is gone.
 pub(super) fn social_v2_wake(context: &RuntimeContext, cfg: &Value, body: &str) -> Result<Value, (u16, String)> {
+    social_v2_wake_with(context, cfg, body, &|_| true)
+}
+
+/// `social_v2_wake` plus an authority check run under the social-state gate against the current configuration
+/// (ticket 33: a Schedule page run now cannot commit after the console credential rotated).
+pub(super) fn social_v2_wake_with(
+    context: &RuntimeContext,
+    cfg: &Value,
+    body: &str,
+    still_authorized: &dyn Fn(&Value) -> bool,
+) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     let key = js_trim(&js_string_or(body.get("key"), "")).to_string();
     let requested = js_trim(&js_string_or(body.get("reason"), "admin")).to_string();
@@ -739,6 +750,9 @@ pub(super) fn social_v2_wake(context: &RuntimeContext, cfg: &Value, body: &str) 
             return Err((403, "该接口仅 reserved2 模式可用".to_string()));
         }
         let fresh = context.load_config().map_err(|e| (503, e.to_string()))?;
+        if !still_authorized(&fresh) {
+            return Err((401, "console credential was revoked".to_string()));
+        }
         if !agent::mode_allowed(&fresh, &mode, &key) {
             return Err((403, "目标不在当前模式允许范围内".to_string()));
         }

@@ -738,6 +738,32 @@ fn related_top_k_accepts_only_the_depth_a_wake_executes_and_reads_show_that_dept
 }
 
 #[test]
+fn a_persona_switch_while_a_wake_is_prepared_never_installs_the_old_persona() {
+    let (_root, context, _state, _conn, cfg) = recall_wake_fixture("dsh persona switch race");
+    let key = RECALL_KEY;
+    let open: crate::persona::Authority<'static> = &crate::persona::open_authority;
+    let mut ids = Vec::new();
+    for (name, core) in [("小鲸鱼", "你是一只爱聊天的小鲸鱼。"), ("会计", "你是会计助手，只讲数字。")] {
+        let id = crate::persona::create(&context, &json!({"name": name, "core": core}), open).unwrap()["id"].as_str().unwrap().to_string();
+        crate::persona::approve(&context, &json!({"id": id, "version": 1}), open).unwrap();
+        ids.push(id);
+    }
+    crate::persona::assign(&context, &json!({"default": ids[0]}), open).unwrap();
+    let (context, server) = serve_wake_packets(&context, 2);
+    let (switcher, clerk) = (context.clone(), ids[1].clone());
+    // The switch lands after the identity section was rendered with the old persona.
+    crate::prompt::AFTER_SECTIONS.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+        crate::persona::assign(&switcher, &json!({"default": clerk}), &crate::persona::open_authority).unwrap();
+    })));
+    let error = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-1", "").unwrap_err();
+    assert_eq!(error, crate::prompt::WAKE_BRIEFING_CHANGED, "a wake rendered with the old persona is never installed");
+    let (text, _) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-1", "").unwrap();
+    server.join().unwrap();
+    assert!(text.contains("以下各节是本代会话的当前完整简报"), "the retry is the new generation's full briefing:\n{text}");
+    assert!(text.contains("【人设】会计\n你是会计助手，只讲数字。") && !text.contains("【人设】小鲸鱼"), "{text}");
+}
+
+#[test]
 fn ticket55_forget_visibility_check_failure_answers_search_failed() {
     let (_root, context) = fixture_runtime("ticket55 forget check", "fixture-console-token-17");
     context.write_atomic(RuntimeArea::Data, "social-v2.json",

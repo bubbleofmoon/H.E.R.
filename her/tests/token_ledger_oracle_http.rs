@@ -3,7 +3,6 @@
 //! Recorded token-ledger fixtures are served by an isolated console process.
 //! Every value is synthetic (fixture tokens, loopback ports, temp roots). No live service, config or endpoint is touched.
 
-use support::install_root;
 use support::hide_window as hide;
 mod support;
 
@@ -13,7 +12,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const CONSOLE_TOKEN: &str = "synthetic-ledger-oracle-console-token";
 const OWNER: &str = "7001";
@@ -29,27 +28,6 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn fixture_json(name: &str) -> Value {
     serde_json::from_slice(&fs::read(fixture_path(name)).expect("fixture readable")).expect("fixture is JSON")
-}
-
-struct SyntheticRoot(PathBuf);
-
-impl SyntheticRoot {
-    fn new(label: &str) -> Self {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-ledger-oracle-{label}-{}-{stamp}", std::process::id())));
-        fs::create_dir_all(&root).expect("create synthetic root");
-        Self(root)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for SyntheticRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 /// Config in the isolated-runtime shape (`allow.private`, `dsh`) with the fixture pricing override.
@@ -213,7 +191,7 @@ fn check_ledger_routes(console: &Console) {
 
 #[test]
 fn isolated_console_serves_the_js_ledger_outputs_for_the_fixture() {
-    let root = SyntheticRoot::new("isolated");
+    let root = crate::support::RuntimeRoot::new("ledger-oracle-isolated");
     let path = root.path();
     for dir in ["config", "data", "user/dsh", "resources/roles"] {
         fs::create_dir_all(path.join(dir)).expect("create runtime dir");

@@ -174,7 +174,7 @@ fn library_dir_missing(resources: &Path, dir_rel: &str) -> bool {
         let std::path::Component::Normal(part) = component else { return false };
         candidate.push(part);
         match std::fs::symlink_metadata(&candidate) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.is_dir() && !crate::guarded_file::is_link(&metadata) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
             _ => return false,
         }

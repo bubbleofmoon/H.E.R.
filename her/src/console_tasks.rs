@@ -1,4 +1,4 @@
-//! Ticket 27: the task page and its JSON routes.
+//! Ticket 27 (renamed by ticket 33): the Schedule page's task routes (`/api/tasks/*`) and the page markup.
 //!
 //! Mounted behind the console front (ticket 24): Host check, console credential, `application/json` and Origin checks
 //! on POST, and the audit record of every administrator write happen before [`route`] is called (phase B wiring). This
@@ -289,7 +289,7 @@ fn run_log(api: &TasksApi, run_id: &str, query: &HashMap<String, String>) -> Opt
     )
 }
 
-fn trigger(api: &TasksApi, task: &str, body: &str) -> Option<TaskResponse> {
+pub(crate) fn trigger(api: &TasksApi, task: &str, body: &str) -> Option<TaskResponse> {
     let Some(id) = TaskId::parse(task) else { return error(404, "unknown task") };
     if id == TaskId::ConsoleRestart { return error(409, "restart must be submitted through /api/restart"); }
     if !task_def(id).runs_when_held {
@@ -322,15 +322,15 @@ fn trigger(api: &TasksApi, task: &str, body: &str) -> Option<TaskResponse> {
     }
 }
 
-const PAGE: &str = r##"<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>后台任务</title>
+pub(crate) const PAGE: &str = r##"<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>日程</title>
 <style>
 body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}
 td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}th{background:#f4f4f4}
 .state-failed,.state-unknown{color:#b00}.state-succeeded{color:#070}.state-running,.state-queued{color:#a60}
 pre{background:#f8f8f8;border:1px solid #ddd;padding:8px;max-height:360px;overflow:auto;white-space:pre-wrap}
 </style></head><body>
-<h1>后台任务</h1>
+<h1>日程</h1>
 <p>控制台令牌 <input id="token" type="password" size="32"> <button id="save">使用</button> <span id="desired"></span></p>
 <p>运行状态： <button data-state="running">运行</button> <button data-state="maintenance">维护（暂停 live 和任务）</button> <button data-state="stopped">停止</button></p>
 <h2 id="updates">HER 更新</h2>
@@ -353,9 +353,13 @@ pre{background:#f8f8f8;border:1px solid #ddd;padding:8px;max-height:360px;overfl
 <p><label>恢复范围 <select id="restore-scope"><option value="everything">全部（记忆、状态、角色和配置）</option><option value="memory">仅记忆</option></select></label></p>
 <p id="backup-list-message" role="status"></p>
 <table id="backup-list"><thead><tr><th>时间</th><th>文件 / 运行</th><th>大小</th><th>结果</th><th>恢复</th></tr></thead><tbody></tbody></table>
-<h2>任务</h2><table id="tasks"><thead><tr><th>任务</th><th>调度</th><th>启用</th><th>下次运行</th><th>最近一次</th><th></th></tr></thead><tbody></tbody></table>
+<h2 id="schedule">日程</h2><p><button id="tab-upcoming" type="button">即将运行</button> <button id="tab-history" type="button">历史</button> <span id="schedule-message" role="status"></span></p>
+<section id="upcoming"><table id="schedule-upcoming"><thead><tr><th>类型</th><th>创建者</th><th>会话</th><th>下次运行</th><th>重复</th><th>动作</th><th>状态</th><th>创建时间</th><th>上次结果</th><th></th></tr></thead><tbody></tbody></table>
+<form id="schedule-create"><label>会话 <input id="create-conversation" placeholder="group:123 / private:123" required></label> <label>时间 <input id="create-at" type="datetime-local" required></label> <label>重复 <select id="create-repeat"><option value="once">一次</option><option value="hourly">每小时</option><option value="daily">每天</option></select></label> <label>内容 <input id="create-text" size="40" maxlength="500" required></label> <button type="submit">新建提醒</button></form></section>
+<section id="history" hidden><h3>提醒记录</h3><table id="schedule-history"><thead><tr><th>时间</th><th>项目</th><th>会话</th><th>结果</th></tr></thead><tbody></tbody></table>
 <h2>运行历史</h2><p>筛选 <select id="filter"><option value="">全部</option></select> <button id="more">更早</button></p>
 <table id="runs"><thead><tr><th>运行 ID</th><th>任务</th><th>来源</th><th>状态</th><th>退出码</th><th>原因</th><th>排队</th><th>开始</th><th>结束</th></tr></thead><tbody></tbody></table>
+</section>
 <h2>日志 <span id="logrun"></span></h2><pre id="log">选择一次运行查看日志</pre>
 <h2>旧计划任务处置</h2><table id="legacy"><thead><tr><th>Windows 任务</th><th>处置</th><th>替代</th><th>说明</th></tr></thead><tbody></tbody></table>
 <script>
@@ -406,12 +410,9 @@ function runRow(r){return `<tr><td><a href="#" data-log="${esc(r.runId)}">${esc(
  <td class="state-${esc(r.state)}">${esc(r.state)}</td><td>${esc(r.exitCode)}</td><td>${esc(r.reason)}</td><td>${t(r.queuedAt)}</td><td>${t(r.startedAt)}</td><td>${t(r.endedAt)}</td></tr>`}
 async function load(){const j=await api('/api/tasks');if(!j.ok){$('#desired').textContent=j.error;return}
  $('#desired').textContent='期望状态：'+j.desired.state;
- $('#tasks tbody').innerHTML=j.tasks.map(x=>`<tr><td>${esc(x.title)}<br><small>${esc(x.id)}</small></td><td>${esc(x.schedule)}</td><td>${x.enabled?'是':'否'}</td>
-  <td>${t(x.nextRunAt)}</td><td>${x.lastRun?`<span class="state-${esc(x.lastRun.state)}">${esc(x.lastRun.state)}</span> ${t(x.lastRun.endedAt||x.lastRun.queuedAt)}`:''}</td>
-  <td><button data-run="${esc(x.id)}" data-effect="${esc(x.effect)}" ${x.running?'disabled':''}>立即运行</button></td></tr>`).join('');
- $('#legacy tbody').innerHTML=j.legacy.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.disposition==='retired'?'退役':'迁移'}</td><td>${esc(x.replacement)}</td><td>${esc(x.note)}</td></tr>`).join('');
+  $('#legacy tbody').innerHTML=j.legacy.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.disposition==='retired'?'退役':'迁移'}</td><td>${esc(x.replacement)}</td><td>${esc(x.note)}</td></tr>`).join('');
  if($('#filter').options.length===1)for(const x of j.tasks){const o=document.createElement('option');o.value=x.id;o.textContent=x.title;$('#filter').append(o)}
- before=null;$('#runs tbody').innerHTML='';await runs();await loadBackupList()}
+ before=null;$('#runs tbody').innerHTML='';await runs();await loadBackupList();await loadSchedule()}
 async function runs(){const q=new URLSearchParams({limit:'50'});if($('#filter').value)q.set('task',$('#filter').value);if(before)q.set('before',before);
  const j=await api('/api/tasks/runs?'+q);if(!j.ok)return;$('#runs tbody').insertAdjacentHTML('beforeend',j.runs.map(runRow).join(''));before=j.nextBefore;$('#more').disabled=!before}
 async function showLog(id){$('#logrun').textContent=id;let after=null,text='';
@@ -431,6 +432,30 @@ document.addEventListener('click',async e=>{const control=e.target.closest('[dat
   b.disabled=true;const j=await api(`/api/tasks/${encodeURIComponent(b.dataset.run)}/run`,{method:'POST',body:JSON.stringify({requestId})});
   if(!j.ok){alert(j.error);if(j.runId)follow(j.runId);else load();return}follow(j.runId);return}
  const l=e.target.closest('[data-log]');if(l){e.preventDefault();showLog(l.dataset.log)}});
+const schedKinds={job:'任务',reminder:'提醒',sleep:'潜水结束',replyCheck:'回复检查',reachOut:'主动冒泡'};
+const schedCreators={system:'系统',owner:'管理员',her:'HER'};
+const schedStatus={active:'待运行',paused:'已暂停',overdue:'已逾期',running:'运行中',disabled:'未启用',stale:'已过时（HER 未在运行）'};
+const schedLabels={pause:'暂停',resume:'恢复',edit:'编辑',cancel:'取消',run:'立即运行'};
+function schedRow(x){const buttons=x.actions.map(a=>x.kind==='job'&&a==='run'?`<button data-run="${esc(x.id.slice(7))}" data-effect="${esc(x.action)}" ${x.status==='running'?'disabled':''}>${schedLabels.run}</button>`:`<button type="button" data-sched="${esc(x.id)}" data-act="${a}" data-text="${esc(x.action)}" data-at="${esc(x.nextRunAt??'')}">${schedLabels[a]}</button>`).join(' ');
+ return `<tr><td>${esc(schedKinds[x.kind]||x.kind)}</td><td>${esc(schedCreators[x.creator]||x.creator)}</td><td>${esc(x.conversation??'')}</td><td>${x.nextRunAt==null?'':t(x.nextRunAt)}</td><td>${esc(x.repeat)}</td><td>${esc(x.action)}</td><td>${esc(schedStatus[x.status]||x.status)}</td><td>${t(x.createdAt)}</td><td>${x.lastResult?esc(x.lastResult.summary)+' '+t(x.lastResult.at):''}</td><td>${buttons}</td></tr>`}
+async function loadSchedule(){try{const j=await api('/api/schedule');if(!j.ok)throw Error(j.error);$('#schedule-upcoming tbody').innerHTML=j.entries.map(schedRow).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
+async function loadScheduleHistory(){try{const j=await api('/api/schedule/history?limit=100');if(!j.ok)throw Error(j.error);$('#schedule-history tbody').innerHTML=j.history.map(r=>`<tr><td>${t(r.at)}</td><td>${esc(r.id)}</td><td>${esc(r.conversation)}</td><td>${esc(r.summary)}${r.late?'（迟到）':''}</td></tr>`).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
+$('#tab-upcoming').onclick=()=>{$('#upcoming').hidden=false;$('#history').hidden=true};
+$('#tab-history').onclick=()=>{$('#upcoming').hidden=true;$('#history').hidden=false;loadScheduleHistory()};
+document.addEventListener('click',async e=>{const b=e.target.closest('[data-sched]');if(!b)return;
+ const id=b.dataset.sched,act=b.dataset.act,message=$('#schedule-message'),body={};
+ if(id.startsWith('system:')){if(!confirm((act==='pause'?'暂停':'恢复')+'系统任务「'+id.slice(7)+'」？'))return;body.confirm=true}
+ if(act==='cancel'&&!confirm(id.startsWith('reachOut:')?'跳过这次主动冒泡机会？下一次机会会在它之后重新安排。':'取消这条日程？'))return;if(act==='cancel'&&(id.startsWith('replyCheck:')||id.startsWith('reachOut:')))body.at=Number(b.dataset.at);
+ if(act==='edit'){const at=prompt('新的时间（本地，例如 2026-11-14 09:00）','');if(!at)return;const ms=new Date(at.replace(' ','T')).getTime();if(Number.isNaN(ms)){message.textContent='时间格式无效';return}body.at=ms;
+  if(id.startsWith('item:')){const text=prompt('提醒内容',b.dataset.text||'');if(text===null)return;body.text=text}}
+ b.disabled=true;
+ try{const j=await api('/api/schedule/'+id+'/'+act,{method:'POST',body:JSON.stringify(body)});if(!j.ok){message.textContent=j.error||'操作失败';return}message.textContent='已完成';await loadSchedule()}
+ catch(error){message.textContent=error.message}finally{b.disabled=false}});
+$('#schedule-create').onsubmit=async e=>{e.preventDefault();const message=$('#schedule-message');const local=new Date($('#create-at').value);const at=local.getTime();
+ const kind=$('#create-repeat').value;
+ const repeat=kind==='hourly'?{kind:'every',minutes:60}:kind==='daily'?{kind:'daily',hour:local.getHours(),minute:local.getMinutes()}:{kind:'once'};
+ const j=await api('/api/schedule',{method:'POST',body:JSON.stringify({conversation:$('#create-conversation').value,text:$('#create-text').value,at,repeat})});
+ if(!j.ok){message.textContent=j.error;return}message.textContent='已新建';e.target.reset();await loadSchedule()};
 $('#filter').onchange=()=>{before=null;$('#runs tbody').innerHTML='';runs()};$('#more').onclick=runs;load();loadBackupSettings();
 </script></body></html>
 "##;

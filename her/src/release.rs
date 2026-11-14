@@ -1,6 +1,6 @@
 //! Release discovery and verified side-by-side installation. Handover belongs to herupdate.
 use crate::release_store::{
-    directory, installation_gate, redirected, sums, version, write_new, IMAGES,
+    directory, installation_gate, sums, version, write_new, IMAGES,
 };
 use crate::{install_root::InstallRoot, runtime::RuntimeContext};
 use crate::release_signature::{self, MAX_CHECKSUM_BYTES, MAX_SIGNATURE_BYTES, SIGNATURE_NAME};
@@ -303,7 +303,7 @@ fn recover_staging(root: &InstallRoot, releases: &Path) -> Result<(), String> {
         let path = entry.path();
         let metadata =
             fs::symlink_metadata(&path).map_err(|_| "release staging cannot be inspected")?;
-        if !metadata.is_dir() || redirected(&metadata) {
+        if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) {
             continue;
         }
         let resolved = fs::canonicalize(&path).map_err(|_| "release staging cannot be resolved")?;
@@ -854,10 +854,10 @@ pub fn start(context: RuntimeContext) {
     });
 }
 
-/// Appended to the runtime-supplied main console page; the tasks page owns settings controls.
+/// Appended to the runtime-supplied main console page; the Schedule page owns settings controls.
 pub const BANNER: &str = r#"<aside id="her-update-banner" role="status" hidden></aside>
 <script>(()=>{const box=document.getElementById('her-update-banner');const token=()=>new URLSearchParams(location.search).get('token')||sessionStorage.getItem('consoleToken')||'';
-async function refresh(){try{const r=await fetch('/api/releases',{headers:{'x-console-token':token()}});if(!r.ok){box.hidden=true;return}const j=await r.json();box.hidden=!j.available;if(j.available){box.textContent='HER 更新可用：'+(j.current||'未知版本')+' → '+j.available.tag+' ';const button=document.createElement('button');button.textContent='批准更新';button.disabled=!!j.approval;button.onclick=async()=>{if(!confirm('批准更新 HER：'+(j.current||'未知版本')+' → '+j.available.tag+'？'))return;button.disabled=true;try{const r=await fetch('/api/releases/approve',{method:'POST',headers:{'x-console-token':token(),'content-type':'application/json'},body:JSON.stringify({confirm:true,tag:j.available.tag})});const result=await r.json();if(!r.ok||!result.ok)throw Error(result.error||'更新被拒绝');box.textContent='HER 更新已批准：'+result.current+' → '+result.approved}catch(e){button.disabled=false;alert(e.message)}};box.append(button);const link=document.createElement('a');link.textContent='更新策略';link.href='/tasks?'+new URLSearchParams({token:token()})+'#updates';box.append(link)}}catch{box.hidden=true}}
+async function refresh(){try{const r=await fetch('/api/releases',{headers:{'x-console-token':token()}});if(!r.ok){box.hidden=true;return}const j=await r.json();box.hidden=!j.available;if(j.available){box.textContent='HER 更新可用：'+(j.current||'未知版本')+' → '+j.available.tag+' ';const button=document.createElement('button');button.textContent='批准更新';button.disabled=!!j.approval;button.onclick=async()=>{if(!confirm('批准更新 HER：'+(j.current||'未知版本')+' → '+j.available.tag+'？'))return;button.disabled=true;try{const r=await fetch('/api/releases/approve',{method:'POST',headers:{'x-console-token':token(),'content-type':'application/json'},body:JSON.stringify({confirm:true,tag:j.available.tag})});const result=await r.json();if(!r.ok||!result.ok)throw Error(result.error||'更新被拒绝');box.textContent='HER 更新已批准：'+result.current+' → '+result.approved}catch(e){button.disabled=false;alert(e.message)}};box.append(button);const link=document.createElement('a');link.textContent='更新策略';link.href='/schedule?'+new URLSearchParams({token:token()})+'#updates';box.append(link)}}catch{box.hidden=true}}
 refresh();setInterval(refresh,30000)})();</script>"#;
 
 pub fn run_cli(args: &[String]) -> i32 {

@@ -40,6 +40,10 @@ pub fn role_for_session(key: &str) -> Option<String> {
 }
 
 pub fn role_for_session_with_runtime(context: &RuntimeContext, key: &str) -> Option<String> {
+    // Role cards are retired in companion modes; identity comes from the persona library there.
+    if crate::persona::applies(context) {
+        return None;
+    }
     let map = read_data_json(context, "role-map.json").unwrap_or_else(|| serde_json::json!({}));
 
     if let Some(sessions) = map.get("sessions").and_then(|s| s.as_object()) {
@@ -102,6 +106,19 @@ pub fn role_line_with_runtime(context: &RuntimeContext, key: &str) -> String {
         Some(name) => format!("【当前角色】{name}（完整角色卡请调用 qq_get_prompt 查看）\n\n"),
         None => String::new(),
     }
+}
+
+/// The Identity text of a conversation: the active persona core in companion modes, cut at
+/// `role.maxInjectChars`; empty in closed-agent. The single injection point: the layered DSH briefing reaches it
+/// through `briefing::persona_core`.
+pub(crate) fn identity_core(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
+    crate::persona::core_block(context, key, role_inject_limit(cfg))
+}
+
+/// Chat and first-generation prompts: the persona core, else the role card (closed-agent, legacy).
+pub fn identity_hint_v1(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
+    let core = identity_core(context, cfg, key);
+    if core.is_empty() { role_hint_v1(context, cfg, key) } else { core.trim_end().to_string() }
 }
 
 /// JS `roleRawContent(key)`: the role card file of the session's role, or an empty string.
@@ -172,7 +189,16 @@ fn convert_example_spaces_to_comma(line: &str) -> String {
 /// JS `currentRoleHintV2(key)`: the second-generation card text with first-generation commands
 /// removed and the example section's space separators rewritten to commas.
 pub fn role_hint_v2(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
-    let raw = role_hint_for_mode(context, cfg, key, crate::role::MODE_V2);
+    v2_card_lines(&role_hint_for_mode(context, cfg, key, crate::role::MODE_V2))
+}
+
+/// The reserved2 view of a whole role card, uncut; persona import stores it as the core.
+pub(crate) fn role_card_v2_text(card: &str) -> String {
+    v2_card_lines(&crate::role::select_role_text(card, crate::role::MODE_V2))
+}
+
+/// Drops first-generation command lines and rewrites the example section's spaces to commas.
+fn v2_card_lines(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
@@ -649,7 +675,7 @@ pub fn recall_block_with_runtime(
             .map(|record| held_recall_ids(&record)).unwrap_or_default(),
         _ => Vec::new(),
     };
-    recall_block_with(context, cfg, st, key, &held).0
+    recall_block_with(context, cfg, st, key, &held, &keep_all).0
 }
 
 /// Count one use of each memory a delivered prompt carried (`recall_block_with`'s ids). A failure is
@@ -674,15 +700,26 @@ pub(crate) fn recall_top_k(cfg: &Value) -> usize {
         .map_or(3, |n| n.round().clamp(1.0, 20.0) as usize)
 }
 
+fn keep_all(items: &[String]) -> usize { items.len() }
+
+/// The header line of the recall block (`recall_block_with`), before its items.
+pub(crate) const RECALL_HEADER: &str = "【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：";
+/// The footer line of the recall block, after its items and index hint.
+pub(crate) const RECALL_FOOTER: &str = "（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）";
+/// The most estimated tokens the 【记忆索引】 hint line of the recall block may take (`recall_block_with`).
+pub(crate) const RECALL_HINT_MAX: usize = 60;
+
 /// The recall block and the ids of the memories it carries. `memory::recall` decides what is
 /// recalled (matches only, never the ids in `held`, which the session generation already carries);
 /// this renders it.
+/// `keep` says how many of the leading rendered items to carry (the Material budget); the rest are neither rendered nor returned.
 fn recall_block_with(
     context: &RuntimeContext,
     cfg: &Value,
     st: &Value,
     key: &str,
     held: &[i64],
+    keep: &dyn Fn(&[String]) -> usize,
 ) -> (String, Vec<i64>) {
     if cfg.get("memory").and_then(|m| m.get("enabled")).and_then(|v| v.as_bool()) == Some(false) {
         return (String::new(), Vec::new());
@@ -732,21 +769,24 @@ fn recall_block_with(
             (0, Vec::new())
         }
     };
+    let mut rows = rows;
+    let items: Vec<String> = rows.iter().map(|m| {
+        let tag = match &m.subject {
+            Some(s) if !s.is_empty() => format!("{}·{}", m.kind, s),
+            _ => m.kind.clone(),
+        };
+        let content: String = m.content.chars().take(120).collect();
+        format!("- [{tag}] {content}")
+    }).collect();
+    rows.truncate(keep(&items).min(rows.len()));
     if rows.is_empty() && total == 0 {
         return (String::new(), Vec::new());
     }
 
     let mut lines: Vec<String> = Vec::new();
     if !rows.is_empty() {
-        lines.push("【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：".to_string());
-        for m in &rows {
-            let tag = match &m.subject {
-                Some(s) if !s.is_empty() => format!("{}·{}", m.kind, s),
-                _ => m.kind.clone(),
-            };
-            let content: String = m.content.chars().take(120).collect();
-            lines.push(format!("- [{tag}] {content}"));
-        }
+        lines.push(RECALL_HEADER.to_string());
+        lines.extend(items.into_iter().take(rows.len()));
     }
     if total > rows.len() as i64 {
         let used: Vec<String> = rows.iter().filter_map(|m| m.subject.clone()).collect();
@@ -755,15 +795,22 @@ fn recall_block_with(
             .filter(|t| !t.is_empty() && !used.iter().any(|u| u == *t))
             .take(6)
             .collect();
-        if !extra.is_empty() {
-            lines.push(format!(
-                "【记忆索引】本会话另有 {} 条，话题：{}（要细节用 memory_search）",
-                total - rows.len() as i64,
-                extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
-            ));
+        // The hint takes at most RECALL_HINT_MAX estimated tokens: subjects are dropped from the end until it fits,
+        // and the line is omitted when not even one subject fits.
+        let hint = |shown: usize| format!(
+            "【记忆索引】本会话另有 {} 条，话题：{}（要细节用 memory_search）",
+            total - rows.len() as i64,
+            extra[..shown].iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
+        );
+        let mut shown = extra.len();
+        while shown > 0 && crate::briefing::estimate_tokens(&hint(shown)) > RECALL_HINT_MAX {
+            shown -= 1;
+        }
+        if shown > 0 {
+            lines.push(hint(shown));
         }
     }
-    lines.push("（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）".to_string());
+    lines.push(RECALL_FOOTER.to_string());
     (format!("{}\n\n", lines.join("\n")), rows.iter().map(|m| m.id).collect())
 }
 
@@ -777,33 +824,35 @@ fn short_term_block(st: &Value, cfg: &Value) -> String {
 /// `stable` renders the briefing form: no clock-dependent text and no interaction counts, which change
 /// with every message, so the section hash moves only when the content really changes.
 fn short_term_block_at(st: &Value, cfg: &Value, now: i64, stable: bool) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    let mut groups = memory_groups(st, now, stable);
+    groups.push(impression_group(st, cfg, stable));
+    crate::briefing::render_groups(&groups)
+}
 
+/// Conversation layer: ongoing topics, then pending thoughts, as `(heading, lines)` groups, oldest line first.
+fn memory_groups(st: &Value, now: i64, stable: bool) -> Vec<(String, Vec<String>)> {
     let topics = st.get("activeTopics").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let topics: Vec<&Value> = topics
         .iter()
         .filter(|t| t.get("text").and_then(|x| x.as_str()).map(|s| !s.is_empty()).unwrap_or(false))
         .collect();
-    if !topics.is_empty() {
-        lines.push("【进行中的话题】".to_string());
-        let start = topics.len().saturating_sub(10);
-        for t in &topics[start..] {
-            let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let mentioned = t.get("lastMentionAt").and_then(|v| v.as_i64()).unwrap_or(0);
-            let ago = if mentioned > 0 { ((now - mentioned).max(0) as f64 / 60_000.0).round() as i64 } else { 0 };
-            let stale = if mentioned > 0 && now - mentioned > 2 * 60 * 60 * 1000 { "（已搁置）" } else { "" };
-            let ago_text = if ago > 0 { format!("{ago}分钟前") } else { "刚刚".to_string() };
-            let pq = t
-                .get("pendingQuestion")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("；待追问：{s}"))
-                .unwrap_or_default();
-            if stable {
-                lines.push(format!("- {text}（lastMentionAt={mentioned}）{pq}"));
-            } else {
-                lines.push(format!("- {text}{stale}（{ago_text}）{pq}"));
-            }
+    let mut topic_lines: Vec<String> = Vec::new();
+    for t in &topics[topics.len().saturating_sub(10)..] {
+        let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let mentioned = t.get("lastMentionAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ago = if mentioned > 0 { ((now - mentioned).max(0) as f64 / 60_000.0).round() as i64 } else { 0 };
+        let stale = if mentioned > 0 && now - mentioned > 2 * 60 * 60 * 1000 { "（已搁置）" } else { "" };
+        let ago_text = if ago > 0 { format!("{ago}分钟前") } else { "刚刚".to_string() };
+        let pq = t
+            .get("pendingQuestion")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("；待追问：{s}"))
+            .unwrap_or_default();
+        if stable {
+            topic_lines.push(format!("- {text}（lastMentionAt={mentioned}）{pq}"));
+        } else {
+            topic_lines.push(format!("- {text}{stale}（{ago_text}）{pq}"));
         }
     }
 
@@ -816,46 +865,39 @@ fn short_term_block_at(st: &Value, cfg: &Value, now: i64, stable: bool) -> Strin
             has_text && alive
         })
         .collect();
-    if !thoughts.is_empty() {
-        lines.push("【你想说但还没说的】".to_string());
-        let start = thoughts.len().saturating_sub(10);
-        for t in &thoughts[start..] {
-            let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let mot = t
-                .get("motivation")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("（{s}）"))
-                .unwrap_or_default();
-            lines.push(format!("- {text}{mot}"));
-        }
+    let mut thought_lines: Vec<String> = Vec::new();
+    for t in &thoughts[thoughts.len().saturating_sub(10)..] {
+        let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let mot = t
+            .get("motivation")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("（{s}）"))
+            .unwrap_or_default();
+        thought_lines.push(format!("- {text}{mot}"));
     }
+    vec![("【进行中的话题】".to_string(), topic_lines), ("【你想说但还没说的】".to_string(), thought_lines)]
+}
 
+/// Relationship layer: member impressions (`social_mem::select_impressions` order) as one group.
+fn impression_group(st: &Value, cfg: &Value, stable: bool) -> (String, Vec<String>) {
     let policy = crate::social_mem::ImpressionPolicy::from_cfg(cfg);
-    let impressions = crate::social_mem::select_impressions(st, policy.prompt_members);
-    if !impressions.is_empty() {
-        lines.push("【对群友的印象】".to_string());
-        for (name, e) in impressions {
-            let traits: Vec<String> = e
-                .get("traits")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default();
-            let traits_text = if traits.is_empty() { "暂无记录".to_string() } else { traits.join("、") };
-            if stable {
-                lines.push(format!("- {name}：{traits_text}"));
-            } else {
-                let n = e.get("interactionCount").and_then(|v| v.as_i64()).unwrap_or(0);
-                lines.push(format!("- {name}：{traits_text}（互动 {n} 次）"));
-            }
+    let mut lines = Vec::new();
+    for (name, e) in crate::social_mem::select_impressions(st, policy.prompt_members) {
+        let traits: Vec<String> = e
+            .get("traits")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let traits_text = if traits.is_empty() { "暂无记录".to_string() } else { traits.join("、") };
+        if stable {
+            lines.push(format!("- {name}：{traits_text}"));
+        } else {
+            let n = e.get("interactionCount").and_then(|v| v.as_i64()).unwrap_or(0);
+            lines.push(format!("- {name}：{traits_text}（互动 {n} 次）"));
         }
     }
-
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n\n", lines.join("\n"))
-    }
+    ("【对群友的印象】".to_string(), lines)
 }
 
 /// 参与度参考（对应 JS 的 formatParticipationV2）。
@@ -1032,6 +1074,9 @@ fn tail(reason: &str, key: &str, pre_sleep_ms: u64) -> String {
         // 对拍矩阵一跑就露出来了（proactiveCheck 三种会话全部不一致）。
         "proactiveCheck" => format!(
             "【主动机会】{key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。"
+        ),
+        r if r.starts_with("reminder:") => format!(
+            "【提醒】{key}\n原因：一条提醒到时间了，内容见上方【提醒内容】。\n用发送工具在本会话自然地把提醒告诉对方；不要提到日程、系统或提醒编号。说完后按【沉睡前强制等待】收尾。"
         ),
         other => format!(
             "【唤醒】{key}\n原因：{other}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。"
@@ -1212,6 +1257,7 @@ fn build_inner(
 
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
+    out.push_str(&identity_core(context, &cfg, key));
     out.push_str(&identity_line(self_name, self_qq));
     out.push_str(&token_line(token));
     let initial = initial_prompt_line_with_runtime(context, &cfg, key, reason);
@@ -1228,10 +1274,11 @@ fn build_inner(
     out.push_str(&wake_line(&st));
     out.push_str(&short_term_block(&st, &cfg));
     out.push_str(&recent_block(&st));
-    let (recall, recalled) = recall_block_with(context, &cfg, &st, key, &[]);
+    let (recall, recalled) = recall_block_with(context, &cfg, &st, key, &[], &keep_all);
     out.push_str(&recall);
     out.push_str(&participation_block(&st));
     out.push_str(&pre_sleep_line(&cfg));
+    out.push_str(&crate::schedule::reminder_line(context, reason));
     out.push_str(&tail(reason, key, pre_sleep_ms(&cfg)));
     let recent = st["recentMessages"].as_array().cloned().unwrap_or_default();
     let carried = &recent[recent.len().saturating_sub(10)..];
@@ -1264,6 +1311,23 @@ pub fn build_text_only_with_runtime(
     self_name: &str,
     self_qq: &str,
 ) -> String {
+    build_text_only_inner(context, key, recent, self_name, self_qq, "")
+}
+
+/// Ticket 33: the pinned-CLI prompt for one wake. A `reminder:<id>` wake carries the reminder content and asks for it
+/// to be said, since the CLI has no tools and its one reply is the delivery; other reasons get the plain prompt.
+pub fn build_text_only_for_wake(context: &RuntimeContext, key: &str, reason: &str, self_name: &str, self_qq: &str) -> String {
+    build_text_only_inner(context, key, &[], self_name, self_qq, reason)
+}
+
+fn build_text_only_inner(
+    context: &RuntimeContext,
+    key: &str,
+    recent: &[String],
+    self_name: &str,
+    self_qq: &str,
+    reason: &str,
+) -> String {
     let st = social_state_for_runtime(context)
         .get("conversations")
         .and_then(|c| c.get(key))
@@ -1272,6 +1336,7 @@ pub fn build_text_only_with_runtime(
     let cfg = config_for_runtime(context);
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
+    out.push_str(&identity_core(context, &cfg, key));
     out.push_str(&identity_line(&crate::model_view::strip_from_model_text(self_name, &cfg), self_qq));
 
     out.push_str("【这次怎么做】\n");
@@ -1317,6 +1382,14 @@ pub fn build_text_only_with_runtime(
         let _ = mode;
     }
 
+    let reminder = crate::schedule::reminder_line(context, reason);
+    if !reminder.is_empty() {
+        out.push('\n');
+        out.push_str(&crate::model_view::strip_from_model_text(&reminder, &cfg));
+        if reminder != crate::schedule::REMINDER_GONE {
+            out.push_str("【提醒】这次不是新消息叫醒你：一条提醒到时间了。你要说的那句话就是把上面【提醒内容】自然地告诉对方；不要提到日程、系统或提醒编号。\n");
+        }
+    }
     out.push_str("\n【输出要求】只输出那句话本身。不要加「回复：」前缀，不要加引号，不要解释。");
     let refs = if recent.is_empty() { crate::model_failure::snapshot_refs(&out).unwrap_or_default() } else { Vec::new() };
     crate::model_failure::remember_prompt(context, key, "cli", &out, refs);
@@ -1414,6 +1487,23 @@ mod tests {
     }
 
     #[test]
+    fn text_only_prompt_carries_the_reminder_for_a_reminder_wake() {
+        let (root, context) = runtime_fixture("cli reminder");
+        let now = crate::parity_clock::now_ms();
+        let item = crate::schedule::ScheduleStore::new(&context)
+            .create(crate::schedule::NewItem { creator: crate::schedule::Creator::Owner, conversation: "group:1".into(),
+                text: "记得交周报".into(), at: now + 60_000, repeat: crate::schedule::Repeat::Once }, now)
+            .unwrap();
+        let reminder = build_text_only_for_wake(&context, "group:1", &format!("reminder:{}", item.id), "bot", "9001");
+        let ordinary = build_text_only_for_wake(&context, "group:1", "atMention", "bot", "9001");
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(reminder.contains("【提醒内容】记得交周报"), "{reminder}");
+        assert!(reminder.contains("把上面【提醒内容】自然地告诉对方"), "{reminder}");
+        assert!(reminder.find("【提醒内容】").unwrap() < reminder.find("【输出要求】").unwrap());
+        assert!(!ordinary.contains("【提醒内容】"), "{ordinary}");
+    }
+
+    #[test]
     fn reason_tails_are_distinct() {
         let a = tail("replyCheck", "group:1", 300_000);
         let b = tail("poke", "group:1", 300_000);
@@ -1427,6 +1517,7 @@ mod tests {
         assert!(d.starts_with("【主动机会】"), "proactiveCheck 必须走专属分支，实际：{d}");
         assert!(d.contains("主动冒泡"));
         assert!(!d.contains("【行动前】"));
+        assert!(tail("reminder:rem-1", "group:1", 300_000).starts_with("【提醒】"));
     }
 
     #[test]
@@ -1497,6 +1588,7 @@ mod tests {
         }}).to_string();
         std::fs::write(root.join("data/social-v2.json"), &state).unwrap();
 
+        std::fs::write(root.join("data/personas.json"), r#"{"format":1,"nextId":2,"default":null,"overrides":{"group:1":"p1"},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"测试人设","core":"测试人设核心。"}]}}}"#).unwrap();
         // The selected-runtime wake hub has no legacy process-local string window.
         let prompt = build_text_only_with_runtime(&context, "group:1", &[], "bot", "9001");
         let explicit = build_text_only_with_runtime(
@@ -1518,7 +1610,7 @@ mod tests {
         assert_eq!(packet["includedUnreadCount"], 12);
         assert_eq!(packet["readThroughSeq"], 12);
         assert_eq!(packet["partial"], true);
-        assert!(prompt.contains("【当前角色】测试角色"), "CLI prompt lost selected role: {prompt}");
+        assert!(prompt.contains("【人设】测试人设\n测试人设核心。"), "CLI prompt lost the selected persona: {prompt}");
         assert!(prompt.contains("【未读】13 条"), "CLI prompt lost selected unread count: {prompt}");
         assert!(!prompt.contains("foreign-conversation"), "CLI prompt crossed conversations: {prompt}");
         assert!(explicit.contains("7777: live-window-message"));
@@ -1714,6 +1806,7 @@ mod tests {
     #[test]
     fn role_hint_v2_selects_v2_sections_and_rewrites_example_spaces() {
         let (root, context) = runtime_fixture("role-hint");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
         std::fs::create_dir_all(root.join("resources/roles")).unwrap();
         std::fs::write(root.join("resources/roles/测试角色.md"), CARD).unwrap();
         let cfg = serde_json::json!({});
@@ -1745,6 +1838,7 @@ mod tests {
     #[test]
     fn role_map_default_empty_string_means_no_role_even_with_a_global_role() {
         let (root, context) = runtime_fixture("role-default");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap(); // roles remain for closed-agent only
         std::fs::write(root.join("data/current-role.json"), r#"{"role":"全局","mode":"active"}"#).unwrap();
         std::fs::write(root.join("data/role-map.json"), r#"{"default":""}"#).unwrap();
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), None);
@@ -1752,6 +1846,46 @@ mod tests {
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), Some("组角色".to_string()));
         std::fs::write(root.join("data/role-map.json"), "{}").unwrap();
         assert_eq!(role_for_session_with_runtime(&context, "group:9"), Some("全局".to_string()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_an_approved_complete_active_version_is_rendered_and_the_core_is_capped() {
+        let (root, context) = runtime_fixture("persona validation");
+        let cfg = serde_json::json!({});
+        let library = |active: u64, second: &str| format!(r#"{{"format":1,"nextId":2,"default":"p1","overrides":{{}},"importedRolesAt":null,"personas":{{"p1":{{"id":"p1","activeVersion":{active},"versions":[{{"version":1,"approved":true,"name":"测试人设","core":"已批准的核心。"}},{second}]}}}}}}"#);
+        for (active, second) in [
+            (2, r#"{"version":2,"approved":false,"name":"测试人设","core":"未批准的草稿。"}"#),
+            (2, r#"{"version":2,"approved":true,"name":"测试人设","core":""}"#),
+            (2, r#"{"version":2,"approved":"yes","name":"测试人设","core":"字符串批准。"}"#),
+            (3, r#"{"version":2,"approved":true,"name":"测试人设","core":"不在用。"}"#),
+        ] {
+            std::fs::write(root.join("data/personas.json"), library(active, second)).unwrap();
+            assert_eq!(identity_core(&context, &cfg, "group:1"), "", "{second}");
+        }
+        std::fs::write(root.join("data/personas.json"), library(1, r#"{"version":2,"approved":false,"name":"测试人设","core":"草稿。"}"#)).unwrap();
+        assert_eq!(identity_core(&context, &cfg, "group:1"), "【人设】测试人设\n已批准的核心。\n\n");
+        // Bounded by role.maxInjectChars (minimum 1000) until #18 owns the budget.
+        let long = "长".repeat(1500);
+        std::fs::write(root.join("data/personas.json"), library(2, &format!(r#"{{"version":2,"approved":true,"name":"测试人设","core":"{long}"}}"#))).unwrap();
+        let capped = identity_core(&context, &serde_json::json!({"role": {"maxInjectChars": 1000}}), "group:1");
+        assert_eq!(capped, format!("【人设】测试人设\n{}\n\n", "长".repeat(1000)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn closed_agent_prompts_keep_the_role_card_and_render_no_persona() {
+        let (root, context) = runtime_fixture("closed-agent persona");
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
+        std::fs::create_dir_all(root.join("resources/roles")).unwrap();
+        std::fs::write(root.join("resources/roles/测试角色.md"), CARD).unwrap();
+        std::fs::write(root.join("data/personas.json"), r#"{"format":1,"nextId":2,"default":null,"overrides":{"group:1":"p1"},"importedRolesAt":null,"personas":{"p1":{"id":"p1","activeVersion":1,"versions":[{"version":1,"approved":true,"name":"测试人设","core":"测试人设核心。"}]}}}"#).unwrap();
+        let cfg = serde_json::json!({});
+        assert_eq!(identity_core(&context, &cfg, "group:1"), "");
+        let hint = identity_hint_v1(&context, &cfg, "group:1");
+        assert!(!hint.is_empty() && hint == role_hint_v1(&context, &cfg, "group:1"), "{hint}");
+        let prompt = build_text_only_with_runtime(&context, "group:1", &[], "bot", "9001");
+        assert!(prompt.contains("【当前角色】测试角色") && !prompt.contains("【人设】"), "{prompt}");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1814,14 +1948,55 @@ mod tests {
     }
 }
 
-/// Render at the DSH submission boundary, after resolving the actual session and epoch.
-/// Full/debug and CLI builders intentionally keep their historical self-contained contract.
-/// Returns the prompt and the ids of the memories its recall block carries; the caller counts them
-/// (`record_recall_hits`) only after DSH accepts the submission.
+/// `prepare_dsh_wake_layered`'s error when the session, epoch or briefing generation changed while the wake
+/// was prepared (a persona switch or compaction). Nothing was submitted; the pipeline prepares once
+/// more and never reports it as a backend failure.
+pub(crate) const WAKE_BRIEFING_CHANGED: &str = "wake session, epoch or briefing generation changed before submission";
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once inside `prepare_dsh_wake_layered` after its sections are rendered (race tests).
+    pub(crate) static AFTER_SECTIONS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn after_sections() {
+    if let Some(hook) = AFTER_SECTIONS.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_sections() {}
+
+/// A prepared DSH wake: its text, the ids of the memories its recall carries (counted only after DSH accepts
+/// it), the items each memory layer injected and lost to the budgets, and the empty layers it alerted.
+pub(crate) struct DshWake {
+    pub text: String,
+    pub recalled: Vec<i64>,
+    pub layers: crate::briefing::Counts,
+    pub cut: crate::briefing::Counts,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub alerted: Vec<crate::briefing::Layer>,
+}
+
+/// `prepare_dsh_wake_layered` as the prompt and the ids of the memories it carries.
+#[cfg(test)]
 pub(crate) fn prepare_dsh_wake(
     context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
     reason: &str, rpc_id: &str, prebuilt: &str,
 ) -> Result<(String, Vec<i64>), String> {
+    prepare_dsh_wake_layered(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt).map(|w| (w.text, w.recalled))
+}
+
+/// Render at the DSH submission boundary, after resolving the actual session and epoch.
+/// Full/debug and CLI builders intentionally keep their historical self-contained contract.
+/// Briefing sections and recall are assembled by memory layer (`briefing.rs`). The caller counts the recalled ids
+/// (`record_recall_hits`) only after DSH accepts the submission.
+pub(crate) fn prepare_dsh_wake_layered(
+    context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
+    reason: &str, rpc_id: &str, prebuilt: &str,
+) -> Result<DshWake, String> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -1831,38 +2006,49 @@ pub(crate) fn prepare_dsh_wake(
     let state = context.read_social_state()?;
     let st = &state["conversations"][key];
     if st["agentToken"].as_str() != Some(epoch) { return Err("wake epoch changed before briefing".into()); }
+    // Capture the briefing generation before any section is rendered. A persona switch saves the
+    // library before it bumps the generation, so sections rendered after this capture are at least
+    // as new as it; a bump after it fails the pending guard below and the caller prepares again.
+    let record = crate::session_map::context_record(context,key,sid,epoch)?;
+    let generation = record["generation"].as_u64().unwrap_or(0);
+    let installed = &record["installed"];
+    let needs_briefing = record["needsBriefing"] == true;
+    let full = needs_briefing || installed["generation"].as_u64() != Some(generation);
     let identity = read_data_json(context, "identity.json").unwrap_or(json!({}));
     let saved_identity = identity_line(identity["nickname"].as_str().unwrap_or(""), identity["userId"].as_str().unwrap_or(""));
     let live_identity = if saved_identity.is_empty() {
         prebuilt.lines().find(|line|line.starts_with("【你的身份】"))
             .map(|line|format!("{line}\n\n")).unwrap_or_default()
     } else { saved_identity };
-    let mut sections = BTreeMap::new();
-    sections.insert("identity", format!("{}{}{}", role_line_with_runtime(context,key), live_identity,
-        role_hint_v2(context,cfg,key)));
-    sections.insert("operator", crate::initial_prompts::format_injection(context,cfg,key));
-    sections.insert("behaviour", format!("{ANTI_AI_LINE}{PROACTIVE_LINE}"));
-    sections.insert("stickers", sticker_line_with_runtime(context,cfg));
-    sections.insert("sending", format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg)));
-    sections.insert("reply", reply_line(cfg,&json!({})));
-    sections.insert("sleep", pre_sleep_line(cfg));
-    sections.insert("retrieval", "【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string());
-    sections.insert("memory", short_term_block_at(st,cfg,now_ms(),true));
     let activity_at = st["lastIncomingAt"].as_i64().unwrap_or(0).max(st["lastAiReplyAt"].as_i64().unwrap_or(0));
-    sections.insert("participation", format!("参与参考基准：最后活动时间 {activity_at}\n{}",participation_block_at(st,activity_at)));
     let slang = if cfg.pointer("/slang/enabled") != Some(&json!(false)) {
         crate::slang::build_context(&crate::slang::load_entries_for_runtime(context), cfg.pointer("/slang/injectMax"))
     } else { String::new() };
-    sections.insert("slang", slang);
+    // Memory layers: Identity and Relationship are never cut; Conversation is cut after Material (the
+    // delta's recall below). Rule sections (no layer) are never cut or counted.
+    use crate::briefing::{Layer, Section};
+    let assembly = crate::briefing::assemble(vec![
+        Section::parts("identity", Some(Layer::Identity), vec![role_line_with_runtime(context,key),
+            crate::briefing::persona_core(context,cfg,key), live_identity, role_hint_v2(context,cfg,key)]),
+        Section::parts("operator", Some(Layer::Relationship), vec![crate::initial_prompts::format_injection(context,cfg,key)]),
+        Section::groups("impressions", Some(Layer::Relationship), vec![impression_group(st,cfg,true)]),
+        Section::groups("memory", Some(Layer::Conversation), memory_groups(st,now_ms(),true)),
+        Section::parts("participation", Some(Layer::Conversation),
+            vec![format!("参与参考基准：最后活动时间 {activity_at}\n{}",participation_block_at(st,activity_at))]),
+        Section::parts("slang", Some(Layer::Conversation), vec![slang]),
+        Section::parts("behaviour", None, vec![format!("{ANTI_AI_LINE}{PROACTIVE_LINE}")]),
+        Section::parts("stickers", None, vec![sticker_line_with_runtime(context,cfg)]),
+        Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg))]),
+        Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
+        Section::parts("sleep", None, vec![pre_sleep_line(cfg)]),
+        Section::parts("retrieval", None, vec!["【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string()]),
+    ], &crate::briefing::Budgets::from_cfg(cfg));
+    let mut sections = assembly.sections.clone();
     for text in sections.values_mut() { *text = crate::model_view::strip_from_model_text(text,cfg); }
+    after_sections();
     let hashes: BTreeMap<&str,String> = sections.iter().filter(|(_,v)| !v.is_empty())
         .map(|(k,v)| (*k, format!("{:x}",Sha256::digest(v.as_bytes())))).collect();
     let revision = format!("{:x}",Sha256::digest(serde_json::to_vec(&hashes).map_err(|e|e.to_string())?));
-    let record = crate::session_map::context_record(context,key,sid,epoch)?;
-    let generation = record["generation"].as_u64().unwrap_or(0);
-    let installed = &record["installed"];
-    let needs_briefing = record["needsBriefing"] == true;
-    let full = needs_briefing || installed["generation"].as_u64() != Some(generation);
     let mut body = if full { format!("【简报 revision={revision} generation={generation}】\n以下各节是本代会话的当前完整简报。\n\n") }
         else { format!("【唤醒增量】沿用简报；当前 revision={revision} generation={generation}。仅下列替换/删除改变旧简报。\n\n") };
     for (name,text) in &sections {
@@ -1890,15 +2076,41 @@ pub(crate) fn prepare_dsh_wake(
     // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
     // wakes already carried; a new generation, session or epoch starts afresh.
     let held = held_recall_ids(&record);
-    let (recall, recalled) = recall_block_with(context, cfg, st, key, &held);
+    // Material: the best-ranked recalled memories that fit what Identity and Relationship left of its budget.
+    let offered = std::cell::Cell::new(0usize);
+    // The recall block adds its header and footer around the items, and the index hint line (at most
+    // RECALL_HINT_MAX tokens); Material's budget covers all of it.
+    let overhead = crate::briefing::estimate_tokens(RECALL_HEADER) + crate::briefing::estimate_tokens(RECALL_FOOTER) + RECALL_HINT_MAX;
+    let (recall, recalled) = recall_block_with(context, cfg, st, key, &held, &|items: &[String]| {
+        offered.set(items.len());
+        assembly.material_fit(items, overhead)
+    });
+    // The recall block is stripped on its own before anything is counted or held: a block the strip empties
+    // delivers no memory and holds none. A partial strip keeps the ids, as a partly stripped section stays counted.
+    let recall = crate::model_view::strip_from_model_text(&recall, cfg);
+    let recalled = if recall.trim().is_empty() { Vec::new() } else { recalled };
+    // What DSH receives: a section the model-view strip emptied delivers nothing, so its items are not counted.
+    // A section that is only partly stripped stays counted in full.
+    let mut delivered = assembly.counts;
+    for (name, layer, items) in &assembly.section_items {
+        if let Some(layer) = layer {
+            if sections.get(name).map_or(true, |t| t.trim().is_empty()) { delivered.remove(*layer, *items); }
+        }
+    }
+    delivered.material = recalled.len();
+    let layers = delivered;
+    let mut cut = assembly.cut;
+    cut.material = offered.get() - recalled.len();
     delta.push_str(&recall);
+    delta.push_str(&crate::schedule::reminder_line(context, reason));
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
     body.push_str(&crate::model_view::strip_from_model_text(&delta, cfg));
     body.push_str(&crate::qq_tools::wake_snapshot(context,cfg,key,epoch)?);
     let carried: Vec<i64> = held.iter().chain(&recalled).copied().collect();
     let pending = json!({"rpcId":rpc_id,"generation":generation,"revision":revision,"sections":hashes,"full":full,"recalled":carried});
     if !crate::session_map::update_context(context,key,sid,epoch,|r| {if r["generation"].as_u64().unwrap_or(0) == generation && (r["needsBriefing"]==true)==needs_briefing { r["pending"]=pending; }})? {
-        return Err("wake session or epoch changed before submission".into());
+        return Err(WAKE_BRIEFING_CHANGED.into());
     }
-    Ok((format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled))
+    let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);
+    Ok(DshWake { text: format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled, layers, cut, alerted })
 }

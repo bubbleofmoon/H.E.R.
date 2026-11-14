@@ -19,7 +19,10 @@ mod memory_actions;
 mod pipeline;
 mod harness;
 mod prompt;
+mod briefing;
 mod initial_prompts;
+mod persona;
+mod persona_command;
 mod activity;
 mod feedback;
 mod wake;
@@ -51,6 +54,7 @@ mod voice;
 mod forward_fmt;
 mod preset_prompt;
 mod runtime;
+mod guarded_file;
 mod install_root;
 mod scheduled_task;
 mod release;
@@ -62,6 +66,7 @@ mod config;
 mod inbound;
 mod send_outbox;
 mod recorded_send;
+mod history_log;
 mod session_map;
 mod session_context;
 mod session_rotation;
@@ -76,9 +81,11 @@ mod lifecycle_cli;
 mod watchdog;
 mod task_runs;
 mod tasks;
+mod schedule;
 mod backup;
 mod restore;
 mod console_tasks;
+mod console_persona;
 mod supervisor;
 mod supervisor_dependencies;
 mod dependency;
@@ -2331,6 +2338,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             }
             continue;
         }
+        // Chat history log (#58): every conversation, before self filtering, the allow list and mode dispatch.
+        if !replayed {
+            history_log::record_inbound(&runtime_context, &text);
+        }
         let is_message = ev.post_type == "message";
         let is_notice = ev.post_type == "notice";
         if !is_message && !is_notice {
@@ -2358,10 +2369,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         }
 
-        // Administrative release approval is independent of participation mode.
+        // Administrative release approval and persona switching are independent of participation mode.
         if is_message && live_mode && pipeline.is_some() && runtime_context.is_isolated() {
             let (plain, _, _) = plain_text(&ev.message, self_id);
-            if chat::is_update_command(&plain) {
+            let persona_command = persona_command::is_persona_command(&plain);
+            if persona_command || chat::is_update_command(&plain) {
                 let (kind, id) = if ev.message_type == "private" {
                     ("private", sender.unwrap_or(0))
                 } else {
@@ -2388,15 +2400,23 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 }
                 // Keep replacement behind this command's reply, approval and durable
                 // settlement. A replacement must never replay a partly executed /update.
-                let _admission = release::turn_guard(&runtime_context).await?;
+                let _admission = if persona_command { None } else { Some(release::turn_guard(&runtime_context).await?) };
                 let context = runtime_context.clone();
                 let user = sender.unwrap_or(0).to_string();
                 let result = tokio::task::spawn_blocking(move || {
-                    chat::handle_update_command(&context, &key, &user, &plain)
+                    if persona_command {
+                        persona_command::handle(&context, &key, &user, &plain)
+                    } else {
+                        chat::handle_update_command(&context, &key, &user, &plain)
+                    }
                 })
                 .await;
                 if !matches!(result, Ok(Ok(()))) {
-                    crate::safe_eprintln!("[release] update command refused or reply not confirmed");
+                    if persona_command {
+                        crate::safe_eprintln!("[persona] persona command reply not confirmed");
+                    } else {
+                        crate::safe_eprintln!("[release] update command refused or reply not confirmed");
+                    }
                 }
                 journal
                     .mark_handled(vec![inbound_key], now_ms() as i64)

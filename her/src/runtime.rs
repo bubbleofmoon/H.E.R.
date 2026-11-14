@@ -12,6 +12,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
+use crate::guarded_file::{is_link, no_follow};
 
 const LEGACY_CONFIG: &str = "C:/qqbot/qq-bridge/config.json";
 const LEGACY_DATA: &str = "C:/qqbot/qq-bridge/state";
@@ -19,7 +20,6 @@ const LEGACY_RESOURCES: &str = "C:/qqbot/qq-bridge";
 const LEGACY_SOCIAL_STATE: &str = "C:/qqbot/qq-bridge/state/social-v2.json";
 const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
 const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
-static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     pub(crate) static AUTHORITY_WRITE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
@@ -248,7 +248,7 @@ impl RuntimeContext {
             .map_err(|_| "development runtime root is under the production install root")?;
         let root_metadata =
             fs::symlink_metadata(root).map_err(|_| "runtime root is unavailable")?;
-        if is_reparse_point(&root_metadata) || !root_metadata.is_dir() {
+        if is_link(&root_metadata) || !root_metadata.is_dir() {
             return Err("runtime root is unavailable");
         }
         #[cfg(test)]
@@ -464,7 +464,7 @@ impl RuntimeContext {
         }
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Ok(metadata) if !is_reparse_point(&metadata) && metadata.is_file() => self
+            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => self
                 .read_text(area, relative)
                 .map(Some),
             _ => Err("runtime path is unavailable"),
@@ -483,7 +483,7 @@ impl RuntimeContext {
         }
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Ok(metadata) if !is_reparse_point(&metadata) && metadata.is_file() => Ok(metadata.len()),
+            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => Ok(metadata.len()),
             _ => Err("runtime path is unavailable"),
         }
     }
@@ -520,17 +520,17 @@ impl RuntimeContext {
         }
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Ok(metadata) if !is_reparse_point(&metadata) && metadata.is_file() => {}
+            Ok(metadata) if !is_link(&metadata) && metadata.is_file() => {}
             Err(error) => return Err(error),
             _ => return Err(unavailable()),
         }
         let mut options = OpenOptions::new();
         options.read(true);
-        set_open_no_follow(&mut options);
+        no_follow(&mut options);
         let mut file = options.open(&path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file()
-            || opened_file_is_reparse(&metadata)
+            || is_link(&metadata)
             || self.resolve_path(area, relative, PathIntent::ReadOptionalFile).map_err(|_| unavailable())? != path
         {
             return Err(unavailable());
@@ -600,7 +600,7 @@ impl RuntimeContext {
         }
         let mut options = OpenOptions::new();
         options.read(true).write(true).append(true).create(true);
-        set_open_no_follow(&mut options);
+        no_follow(&mut options);
         let mut file = append_io(deadline, || {
             #[cfg(test)]
             append_io_test_hook("open")?;
@@ -614,7 +614,7 @@ impl RuntimeContext {
             .metadata()
             .map_err(|error| format!("cannot verify runtime file: {}", runtime_io_error("append/metadata", &error)))?;
         if !metadata.is_file()
-            || opened_file_is_reparse(&metadata)
+            || is_link(&metadata)
             || self
                 .resolve_path(area, relative, PathIntent::WriteFile)
                 .map_err(str::to_string)?
@@ -672,7 +672,7 @@ impl RuntimeContext {
         }
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        set_open_no_follow(&mut options);
+        no_follow(&mut options);
         let mut file = options
             .open(&target)
             .map_err(|error| format!("cannot exclusively create runtime file: {error}"))?;
@@ -694,7 +694,7 @@ impl RuntimeContext {
             .map(|checked| checked == target)
             .unwrap_or(false);
         if !metadata.is_file()
-            || opened_file_is_reparse(&metadata)
+            || is_link(&metadata)
             || !path_matches
         {
             drop(file);
@@ -749,12 +749,11 @@ impl RuntimeContext {
         if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
             return Err("runtime path is unavailable".to_string());
         }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        set_open_no_follow(&mut options);
-        let file = options
-            .open(&target)
-            .map_err(|error| runtime_io_error("lock/open", &error))?;
+        let file = crate::guarded_file::open_gate(&target, crate::guarded_file::Gate::Create)
+            .map_err(|error| match error {
+                crate::guarded_file::GateError::Open(error) => runtime_io_error("lock/open", &error),
+                _ => "runtime path is unavailable".to_string(),
+            })?;
         let metadata = file
             .metadata()
             .map_err(|error| runtime_io_error("lock/metadata", &error))?;
@@ -762,7 +761,7 @@ impl RuntimeContext {
             .resolve_path_detailed(area, relative, PathIntent::ReadFile)
             .map(|checked| checked == target)
             .unwrap_or(false);
-        if !metadata.is_file() || opened_file_is_reparse(&metadata) || !path_matches {
+        if !metadata.is_file() || is_link(&metadata) || !path_matches {
             return Err("runtime path is unavailable".to_string());
         }
         match if shared {
@@ -785,7 +784,7 @@ impl RuntimeContext {
         let locked_metadata = file
             .metadata()
             .map_err(|error| runtime_io_error("lock/metadata", &error))?;
-        if !still_selected || opened_file_is_reparse(&locked_metadata) || !locked_metadata.is_file() {
+        if !still_selected || is_link(&locked_metadata) || !locked_metadata.is_file() {
             return Err("runtime path is unavailable".to_string());
         }
         Ok(file)
@@ -824,32 +823,13 @@ impl RuntimeContext {
         relative: &str,
         input: &mut dyn std::io::Read,
     ) -> Result<(), String> {
-        let target = self
-            .resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let parent = target.parent().ok_or_else(|| "runtime path is unavailable".to_string())?;
-        let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let file_name = target
-            .file_name()
-            .ok_or_else(|| "runtime path is unavailable".to_string())?
-            .to_string_lossy();
-        let temp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), seq));
+        let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|e| runtime_io_error("temp/create", &e))?;
-        if let Err(error) = std::io::copy(input, &mut file).and_then(|_| file.sync_all()) {
-            let _ = fs::remove_file(&temp);
-            return Err(runtime_io_error("temp/write", &error));
-        }
-        drop(file);
-        let checked_target = self
-            .resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let checked_temp = fs::symlink_metadata(&temp)
-            .map_err(|e| runtime_io_error("temp/metadata", &e))?;
-        if checked_target != target || is_reparse_point(&checked_temp) || !checked_temp.is_file() {
-            let _ = fs::remove_file(&temp);
+        // Every early return below drops `staged`, which removes the temporary file.
+        let staged = crate::guarded_file::stage(&target, input, None).map_err(|failure| failure.to_string())?;
+        let checked_target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
+        let checked_temp = fs::symlink_metadata(staged.temp()).map_err(|e| runtime_io_error("temp/metadata", &e))?;
+        if checked_target != target || is_link(&checked_temp) || !checked_temp.is_file() {
             return Err("runtime path is unavailable".to_string());
         }
         // Social writers already own social-v2.lock. The authority gate is always acquired
@@ -862,31 +842,18 @@ impl RuntimeContext {
             AUTHORITY_WRITE_TEST_HOOK.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
             });
-            match self.authority_gate() {
-                Ok(gate) => Some(gate),
-                Err(error) => { let _ = fs::remove_file(&temp); return Err(error); }
-            }
+            Some(self.authority_gate()?)
         } else { None };
-        // Windows readers can briefly deny deletion of the old leaf. Retry only replacement,
-        // retaining the already-fsynced temp; never repeat a mutation or external send.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            // Revalidate confinement on every attempt; path-policy failures are never retried.
-            if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
-                let _ = fs::remove_file(&temp);
-                return Err("runtime path changed class=leaf".into());
-            }
-            match atomic_replace(&temp, &target) {
-                Ok(()) => break,
-                Err(error) if transient_replace_error(&error) && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+        // Retry only the replacement of the already-fsynced temp, never a mutation or external send.
+        // Confinement is revalidated before every attempt; path-policy failures are never retried.
+        staged
+            .commit(&mut || -> Result<(), String> {
+                if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
+                    return Err("runtime path changed class=leaf".to_string());
                 }
-                Err(error) => {
-                    let _ = fs::remove_file(&temp);
-                    return Err(runtime_io_error("leaf/replace", &error));
-                }
-            }
-        }
+                Ok(())
+            })
+            .map_err(|failure| failure.to_string())?;
         // Verify the committed leaf still resolves inside the pinned root.
         self.resolve_path_detailed(area, relative, PathIntent::ReadFile)?;
         Ok(())
@@ -1138,8 +1105,13 @@ impl RuntimeContext {
                     | ("GET", "/api/recovery-record")
             )
             || (method == "GET" && matches!(path, "/tasks" | "/api/tasks"))
+            || (method == "GET" && matches!(path, "/schedule" | "/api/schedule"))
+            || (method == "POST" && path == "/api/schedule")
+            || (matches!(method, "GET" | "POST") && path.starts_with("/api/schedule/"))
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
             || (method == "POST" && path == "/api/memory/archive")
+            || (method == "GET" && path == "/personas")
+            || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
             || path.strip_prefix("/api/slang/").is_some_and(|tail| {
                 let parts: Vec<&str> = tail.split('/').collect();
                 match (method, parts.as_slice()) {
@@ -1266,7 +1238,7 @@ pub(crate) fn resolve_contained_path(
         return Err("runtime path policy rejected class=path".into());
     }
     let root_meta = fs::symlink_metadata(pinned_root).map_err(|e| runtime_io_error("root/metadata", &e))?;
-    if is_reparse_point(&root_meta) || !root_meta.is_dir() || fs::canonicalize(pinned_root).ok().as_deref() != Some(pinned_root) {
+    if is_link(&root_meta) || !root_meta.is_dir() || fs::canonicalize(pinned_root).ok().as_deref() != Some(pinned_root) {
         return Err("runtime path policy rejected class=path".into());
     }
     let root_components = validated_components(area_relative)?;
@@ -1282,7 +1254,7 @@ pub(crate) fn resolve_contained_path(
         let is_final = index + 1 == all_components.len();
         match fs::symlink_metadata(&candidate) {
             Ok(metadata) => {
-                if is_reparse_point(&metadata) {
+                if is_link(&metadata) {
                     return Err("runtime path policy rejected class=path".into());
                 }
                 let want_dir = !is_final || leaf_is_area_root || matches!(intent, PathIntent::ReadDirectory | PathIntent::CreateDirectory);
@@ -1295,7 +1267,7 @@ pub(crate) fn resolve_contained_path(
                     if create_error.kind() == std::io::ErrorKind::AlreadyExists { Ok(()) } else { Err(create_error) }
                 }).map_err(|e| runtime_io_error("parent/create", &e))?;
                 let metadata = fs::symlink_metadata(&candidate).map_err(|e| runtime_io_error("parent/metadata", &e))?;
-                if is_reparse_point(&metadata) || !metadata.is_dir() {
+                if is_link(&metadata) || !metadata.is_dir() {
                     return Err("runtime path policy rejected class=path".into());
                 }
             }
@@ -1313,7 +1285,7 @@ pub(crate) fn resolve_contained_path(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_final && intent == PathIntent::CreateDirectory => {
                 fs::create_dir(&candidate).map_err(|e| runtime_io_error("directory/create", &e))?;
                 let metadata = fs::symlink_metadata(&candidate).map_err(|e| runtime_io_error("parent/metadata", &e))?;
-                if is_reparse_point(&metadata) || !metadata.is_dir() {
+                if is_link(&metadata) || !metadata.is_dir() {
                     return Err("runtime path policy rejected class=path".into());
                 }
             }
@@ -1331,40 +1303,14 @@ pub(crate) fn resolve_contained_path(
         return Err("runtime path policy rejected class=path".into());
     }
     let root_meta = fs::symlink_metadata(pinned_root).map_err(|e| runtime_io_error("root/metadata", &e))?;
-    if is_reparse_point(&root_meta) || fs::canonicalize(pinned_root).ok().as_deref() != Some(pinned_root) {
+    if is_link(&root_meta) || fs::canonicalize(pinned_root).ok().as_deref() != Some(pinned_root) {
         return Err("runtime path policy rejected class=path".into());
     }
     Ok(canonical)
 }
 
-#[cfg(windows)]
-fn set_open_no_follow(options: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(windows))]
-fn set_open_no_follow(_options: &mut OpenOptions) {}
-
-#[cfg(windows)]
-fn opened_file_is_reparse(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn opened_file_is_reparse(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
 pub(crate) fn runtime_io_error(class: &str, error: &std::io::Error) -> String {
     format!("class={class} kind={:?} os={:?}", error.kind(), error.raw_os_error())
-}
-
-fn transient_replace_error(error: &std::io::Error) -> bool {
-    cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
 pub(crate) const APPEND_CONFLICT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -1442,21 +1388,6 @@ pub(crate) fn write_append_all(
         }
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let target: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-    if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, target: &Path) -> std::io::Result<()> {
-    fs::rename(source, target)
 }
 
 #[cfg(test)]
@@ -1830,6 +1761,24 @@ mod tests {
         fs::write(root.join("config/config.json"), r#"{"consoleToken":"config-console-token-abcdefghij"}"#).unwrap();
         let cfg = context.load_config().unwrap();
         assert_eq!(context.effective_console_token(&cfg), "config-console-token-abcdefghij", "a configured token wins");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn selected_atomic_writes_sync_the_file_and_the_folder() {
+        let root = fixture_root("guarded-durability");
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::<&'static str>::new()));
+        let seen = steps.clone();
+        crate::guarded_file::STEP_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move |step: &'static str| -> std::io::Result<()> {
+            seen.borrow_mut().push(step);
+            Ok(())
+        })));
+        let result = context.write_atomic(RuntimeArea::Data, "probe.json", b"{}");
+        crate::guarded_file::STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result.unwrap();
+        assert_eq!(*steps.borrow(), ["temp/sync", "leaf/replace", "dir/sync"]);
+        assert_eq!(fs::read(root.join("data/probe.json")).unwrap(), b"{}");
         cleanup(&root);
     }
 
@@ -3221,23 +3170,9 @@ mod tests {
     }
 }
 
-pub(crate) fn is_reparse_point(metadata: &fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
 fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBuf, &'static str> {
     let root_metadata = fs::symlink_metadata(root).map_err(|_| "runtime layout is incomplete")?;
-    if is_reparse_point(&root_metadata) || !root_metadata.is_dir() {
+    if is_link(&root_metadata) || !root_metadata.is_dir() {
         return Err("runtime layout is incomplete");
     }
     let canonical_root = fs::canonicalize(root).map_err(|_| "runtime layout is incomplete")?;
@@ -3257,7 +3192,7 @@ fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBu
         candidate.push(name);
         let metadata =
             fs::symlink_metadata(&candidate).map_err(|_| "runtime layout is incomplete")?;
-        if is_reparse_point(&metadata) {
+        if is_link(&metadata) {
             return Err("runtime layout is incomplete");
         }
         let is_final = index + 1 == components.len();

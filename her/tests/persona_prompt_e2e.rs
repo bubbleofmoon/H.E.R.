@@ -8,17 +8,15 @@
 //! through the public send route), a fake OneBot WebSocket gateway and HTTP API. No real QQ,
 //! model or DSH endpoint is contacted.
 
-#[path = "../src/install_root.rs"]
-mod install_root;
-#[path = "support/console.rs"]
-mod console_fixture;
+use support::hide_window;
+mod support;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -433,18 +431,8 @@ fn serve_onebot(listener: TcpListener, gateway: Arc<Mutex<Gateway>>) {
 
 // ───────────────────────── rig ─────────────────────────
 
-fn hide_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 struct Rig {
-    root: PathBuf,
+    root: crate::support::RuntimeRoot,
     console_port: u16,
     dsh: Arc<Dsh>,
     gateway: Arc<Mutex<Gateway>>,
@@ -467,7 +455,6 @@ impl Drop for Rig {
         }
         let _ = self.console.kill();
         let _ = self.console.wait();
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -482,13 +469,15 @@ struct Seed {
     roles: Vec<(&'static str, &'static str)>,
     /// `initial-prompts.json` content, if any.
     initial_prompts: Option<Value>,
+    /// `personas.json` content, if any.
+    personas: Option<Value>,
     /// Extra keys merged into the `config.json` top level.
     config: Value,
 }
 
 impl Default for Seed {
     fn default() -> Self {
-        Seed { bootstrap_sent: false, role_map: None, current_role: None, roles: Vec::new(), initial_prompts: None, config: json!({}) }
+        Seed { bootstrap_sent: false, role_map: None, current_role: None, roles: Vec::new(), initial_prompts: None, personas: None, config: json!({}) }
     }
 }
 
@@ -498,14 +487,12 @@ impl Rig {
     }
 
     fn new_with_console_hook(name: &str, seed: Seed, mut after_release: impl FnMut(u16)) -> Self {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-ticket11-{name}-{}-{}", std::process::id(), now_ms())));
+        let root = crate::support::RuntimeRoot::new(&format!("ticket11-{name}"));
         for dir in ["config", "data/logs", "resources/roles", "user/dsh", "ambient"] {
             fs::create_dir_all(root.join(dir)).expect("create runtime dir");
         }
-        // Keep the port unavailable to the fake listeners until the console can bind.
-        let reservation = console_fixture::reserve_port();
-        let console_port = reservation.local_addr().expect("console addr").port();
-        let dsh = Dsh::new(console_port);
+        // start_console names the console port before each spawn; the fakes below bind theirs first.
+        let dsh = Dsh::new(0);
         let gateway = Arc::new(Mutex::new(Gateway::default()));
         let dsh_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind dsh");
         let dsh_url = format!("http://127.0.0.1:{}", dsh_listener.local_addr().unwrap().port());
@@ -574,16 +561,15 @@ impl Rig {
         if let Some(prompts) = &seed.initial_prompts {
             fs::write(root.join("data/initial-prompts.json"), prompts.to_string()).unwrap();
         }
-        drop(reservation);
-        after_release(console_port);
-        let console = spawn_console(&root, console_port);
-        let mut rig = Self { root, console_port, dsh, gateway, console, candidate: None };
-        console_fixture::wait_for_console(&mut rig.console, &mut rig.console_port, &rig.root, CONSOLE_TOKEN, Duration::from_secs(20), |port| {
-            rig.dsh.console_port.store(port, Ordering::Relaxed);
+        if let Some(personas) = &seed.personas {
+            fs::write(root.join("data/personas.json"), personas.to_string()).unwrap();
+        }
+        let (console, console_port) = crate::support::ports::start_console(Duration::from_secs(20), |port| {
+            dsh.console_port.store(port, Ordering::Relaxed);
             after_release(port);
-            spawn_console(&rig.root, port)
+            spawn_console(&root, port)
         });
-        rig
+        Self { root, console_port, dsh, gateway, console, candidate: None }
     }
 
     fn start_candidate(&mut self, script: Vec<Step>) {
@@ -592,7 +578,7 @@ impl Rig {
         let ambient = self.root.join("ambient");
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
         command
-            .arg("--runtime-root").arg(&self.root)
+            .arg("--runtime-root").arg(self.root.path())
             .arg("--live").arg("--live-groups").arg(GROUP_KEY)
             .arg("--console-port").arg(self.console_port.to_string())
             .env_remove("HER_RUNTIME_ROOT")
@@ -667,6 +653,22 @@ const CARD_SHARED: &str = "# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n
 const CARD_OVERRIDE: &str = "你是会计助手，只讲数字。\n";
 const INITIAL_TEXT: &str = "这是一个动漫讨论群。\n氛围轻松，别太正式。";
 
+/// A stored library with one approved default persona.
+fn library(name: &str, core: &str) -> Value {
+    json!({"format": 1, "nextId": 2, "default": "p1", "overrides": {}, "importedRolesAt": null,
+        "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [{"version": 1, "approved": true, "name": name, "core": core}]}}})
+}
+
+/// Creates and approves a persona through the console; returns its id.
+fn approved_persona(rig: &Rig, name: &str, core: &str) -> String {
+    let (status, created) = rig.console("POST", "/api/personas/create", Some(&json!({"name": name, "core": core})));
+    assert_eq!(status, 200, "{created}");
+    let id = created["id"].as_str().unwrap().to_string();
+    let (status, approved) = rig.console("POST", "/api/personas/approve", Some(&json!({"id": id, "version": 1})));
+    assert_eq!(status, 200, "{approved}");
+    id
+}
+
 // ───────────────────────── assertions on the delivered prompt ─────────────────────────
 
 /// Positions of the section markers of the delivered prompt, in the order JS buildWakePromptV2
@@ -739,8 +741,7 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
     let mut rig = Rig::new(
         "first",
         Seed {
-            roles: vec![("小鲸鱼", CARD_SHARED)],
-            current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
+            personas: Some(library("小鲸鱼", "你是一只爱聊天的小鲸鱼。")),
             initial_prompts: Some(json!({GROUP_KEY: {"text": INITIAL_TEXT, "createdAt": 1, "updatedAt": 2}})),
             ..Seed::default()
         },
@@ -762,7 +763,7 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
         text,
         &[
             "【当前时间】", "【简报 revision=",
-            "【当前角色】小鲸鱼（完整角色卡请调用 qq_get_prompt 查看）", "【你的身份】",
+            "【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。", "【你的身份】",
             "【群聊环境（操作者预设，仅本次首次唤醒参考）】", "【沉睡前强制等待】",
             "【会话令牌】", "【此刻状态】", "【当前唤醒】",
             "【引导唤醒】你已接入 QQ 会话 group:420042", "【本次消息快照】",
@@ -780,28 +781,35 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
 }
 
 #[test]
-fn qq_get_prompt_hands_the_model_its_role_card_for_the_v2_mode() {
-    let mut rig = Rig::new(
-        "hint",
-        Seed {
-            roles: vec![("小鲸鱼", CARD_SHARED)],
-            current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
-            ..Seed::default()
-        },
-    );
+fn role_cards_are_retired_in_companion_modes() {
+    let mut rig = Rig::new("hint", Seed {
+        roles: vec![("小鲸鱼", CARD_SHARED)],
+        current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
+        ..Seed::default()
+    });
     rig.restart(mention(1101, "看角色"));
     let prompts = rig.wait_prompts(1);
     let view = &prompts[0].get_prompt;
     assert_eq!(view["status"], json!(200), "{view}");
-    let role = &view["body"]["role"];
-    assert_eq!(role["name"], json!("小鲸鱼"));
-    // v2 card: the 〔一代〕 section is dropped, the 〔二代〕 tag is stripped, the example section's
-    // spaces become a comma, and the 一代-only command lines never reach the model.
-    assert_eq!(
-        role["hint"],
-        json!("# 小鲸鱼\n你是一只爱聊天的小鲸鱼。\n\n## 表情包体系\n只在二代出现。\n\n## 回复示例\n你好，世界")
-    );
-    assert!(prompts[0].text.contains(role["hint"].as_str().unwrap()),"briefing must use the same v2 role transformation as qq_get_prompt: {}",prompts[0].text);
+    assert_eq!(view["body"]["role"]["name"], Value::Null);
+    assert_eq!(view["body"]["role"]["hint"], json!(""));
+    assert!(!prompts[0].text.contains("【当前角色】") && !prompts[0].text.contains("你是一只爱聊天的小鲸鱼"), "{}", prompts[0].text);
+}
+
+#[test]
+fn a_damaged_persona_library_renders_no_persona_and_no_role_card() {
+    let mut rig = Rig::new("persona-damaged", Seed {
+        roles: vec![("小鲸鱼", CARD_SHARED)],
+        current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
+        personas: Some(json!({"format": 99, "personas": {"p1": {"id": "p1"}}})),
+        ..Seed::default()
+    });
+    assert_eq!(rig.console("GET", "/api/personas", None).0, 503);
+    rig.restart(mention(1201, "坏的人设库"));
+    let prompts = rig.wait_prompts(1);
+    let text = &prompts[0].text;
+    assert!(!text.contains("【人设】") && !text.contains("【当前角色】") && !text.contains("你是一只爱聊天的小鲸鱼"), "{text}");
+    assert_eq!(rig.data_json("personas.json")["format"], json!(99), "a damaged library is never repaired");
 }
 
 // ───────────────────────── AC4: first wake, repeat, reset, restart ─────────────────────────
@@ -894,62 +902,39 @@ fn an_initial_prompt_longer_than_the_limit_is_cut_with_the_old_marker() {
 // ───────────────────────── AC1: roles in the turn ─────────────────────────
 
 #[test]
-fn a_session_override_in_the_role_map_beats_the_global_role_and_null_means_no_role() {
-    let mut rig = Rig::new(
-        "override",
-        Seed {
-            bootstrap_sent: true,
-            roles: vec![("小鲸鱼", CARD_SHARED), ("会计", CARD_OVERRIDE)],
-            current_role: Some(json!({"role": "小鲸鱼", "mode": "active"})),
-            role_map: Some(json!({"sessions": {GROUP_KEY: "会计"}})),
-            ..Seed::default()
-        },
-    );
+fn a_conversation_override_wins_over_the_default_persona() {
+    let mut rig = Rig::new("override", Seed { bootstrap_sent: true, ..Seed::default() });
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    let clerk = approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale}))).0, 200);
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": clerk}))).0, 200);
     rig.restart(mention(5001, "按会话覆盖"));
     let first = rig.wait_prompts(1);
-    assert!(first[0].text.contains("【当前角色】会计（完整角色卡请调用 qq_get_prompt 查看）"), "{}", first[0].text);
-    assert!(!first[0].text.contains("【当前角色】小鲸鱼"));
-    assert_eq!(first[0].get_prompt["body"]["role"]["name"], json!("会计"));
-    assert_eq!(first[0].get_prompt["body"]["role"]["hint"], json!("你是会计助手，只讲数字。"));
-
-    // The map is read on every wake: an explicit null removes the role card for this session.
-    fs::write(rig.root.join("data/role-map.json"), json!({"sessions": {GROUP_KEY: null}}).to_string()).unwrap();
-    rig.restart(mention(5002, "不要角色"));
-    let second = rig.wait_prompts(2);
-    assert!(!second[1].text.contains("【当前角色】"), "{}", second[1].text);
-    assert_eq!(second[1].get_prompt["body"]["role"]["name"], Value::Null);
-    assert_eq!(second[1].get_prompt["body"]["role"]["hint"], json!(""));
-
-    // An empty-string default means "no role" too, even with a global role set (old behaviour).
-    fs::write(rig.root.join("data/role-map.json"), json!({"default": ""}).to_string()).unwrap();
-    rig.restart(mention(5003, "默认为空"));
-    let third = rig.wait_prompts(3);
-    assert!(!third[2].text.contains("【当前角色】"), "{}", third[2].text);
+    assert!(first[0].text.contains("【人设】会计\n你是会计助手，只讲数字。"), "{}", first[0].text);
+    assert!(!first[0].text.contains("【人设】小鲸鱼"), "{}", first[0].text);
 }
 
 #[test]
-fn roles_and_initial_prompts_saved_in_the_console_apply_to_the_next_turn_without_restart() {
+fn personas_and_initial_prompts_saved_in_the_console_apply_to_the_next_turn_without_restart() {
     let mut rig = Rig::new("console", Seed::default());
-    // Operator work in the admin console, before the conversation ever woke.
-    let created = rig.console("POST", "/api/roles/create", Some(&json!({"name": "控制台人格", "content": "你是在控制台里写的人格。"})));
-    assert_eq!(created.0, 200, "{:?}", created.1);
-    assert_eq!(rig.console("POST", "/api/role", Some(&json!({"role": "控制台人格"}))).0, 200);
+    let id = approved_persona(&rig, "控制台人设", "你是在控制台里写的人设。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": id}))).0, 200);
     let saved = rig.console("POST", "/api/socialV2/initial-prompt", Some(&json!({"key": GROUP_KEY, "text": "控制台写的背景"})));
     assert_eq!(saved.0, 200, "{:?}", saved.1);
-    assert_eq!(saved.1["chars"], json!(7));
-
     rig.restart(mention(6001, "用控制台配置"));
     let prompts = rig.wait_prompts(1);
-    assert!(prompts[0].text.contains("【当前角色】控制台人格（"), "{}", prompts[0].text);
+    assert!(prompts[0].text.contains("【人设】控制台人设\n你是在控制台里写的人设。"), "{}", prompts[0].text);
     assert!(prompts[0].text.contains("控制台写的背景"), "{}", prompts[0].text);
-    assert_eq!(prompts[0].get_prompt["body"]["role"]["hint"], json!("你是在控制台里写的人格。"));
-
-    // Edit the card while the bridge keeps running: the next wake carries the new text.
-    let updated = rig.console("POST", "/api/roles/update", Some(&json!({"name": "控制台人格", "content": "改过的人格。"})));
-    assert_eq!(updated.0, 200);
-    rig.restart(mention(6002, "改后再来"));
+    // A core edit waits for approval: the next wake keeps the approved core.
+    let updated = rig.console("POST", "/api/personas/update", Some(&json!({"id": id, "core": "改过的人设。"})));
+    assert_eq!(updated.0, 200, "{:?}", updated.1);
+    rig.restart(mention(6002, "改后未批准"));
     let second = rig.wait_prompts(2);
-    assert_eq!(second[1].get_prompt["body"]["role"]["hint"], json!("改过的人格。"));
+    assert!(!second[1].text.contains("改过的人设。"), "{}", second[1].text);
+    assert_eq!(rig.console("POST", "/api/personas/approve", Some(&json!({"id": id, "version": 2}))).0, 200);
+    rig.restart(mention(6003, "批准后"));
+    let third = rig.wait_prompts(3);
+    assert!(third[2].text.contains("【人设】控制台人设\n改过的人设。"), "{}", third[2].text);
 }
 
 #[test]
@@ -988,4 +973,163 @@ fn fixture_console_rejects_foreign_health_and_retries_before_persona_tools() {
     let prompts = rig.wait_prompts(1);
     assert_eq!(prompts[0].get_prompt["status"], 200);
     assert!(wait_for(LONG, || rig.onebot_sends() == 1), "persona send did not follow the replacement console port");
+}
+
+// ───────────────────────── Seam 4: persona library over console HTTP ─────────────────────────
+
+#[test]
+fn persona_library_crud_versions_and_approval_over_console_http() {
+    let rig = Rig::new("persona-crud", Seed::default());
+    let (status, empty) = rig.console("GET", "/api/personas", None);
+    assert_eq!(status, 200, "{empty}");
+    assert_eq!(empty["personas"], json!([]));
+    assert_eq!(empty["default"], Value::Null);
+
+    let (status, created) = rig.console("POST", "/api/personas/create", Some(&json!({
+        "name": "小鲸鱼", "core": "你是小鲸鱼，说话软软的。", "notes": "喜欢海。", "compact": "小鲸鱼，软。",
+        "names": ["小鲸鱼", "鲸鱼"], "traits": {"neediness": 2}})));
+    assert_eq!(status, 200, "{created}");
+    assert_eq!((created["id"].clone(), created["version"].clone()), (json!("p1"), json!(1)));
+    let (_, item) = rig.console("GET", "/api/personas/item?id=p1", None);
+    let first = &item["persona"]["versions"][0];
+    assert_eq!(first["approved"], json!(false));
+    assert_eq!(item["persona"]["activeVersion"], Value::Null);
+    assert_eq!(first["editMode"], json!("auto"));
+    assert_eq!(first["traits"], json!({"neediness": 2}));
+    assert_eq!(first["names"], json!(["小鲸鱼", "鲸鱼"]));
+    assert_eq!(first["autoRules"], json!({"parts": ["notes"], "perWeek": 3, "monthlyDriftPause": true, "notify": true}));
+
+    // An unapproved persona cannot be assigned.
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": "p1"}))).0, 409);
+    let (status, approved) = rig.console("POST", "/api/personas/approve", Some(&json!({"id": "p1", "version": 1})));
+    assert_eq!((status, approved["activeVersion"].clone()), (200, json!(1)), "{approved}");
+
+    // Notes-only edit: core and compact unchanged, so the new version is in effect at once.
+    let (status, notes) = rig.console("POST", "/api/personas/update", Some(&json!({"id": "p1", "notes": "喜欢海和星星。"})));
+    assert_eq!(status, 200, "{notes}");
+    assert_eq!((notes["version"].clone(), notes["activeVersion"].clone()), (json!(2), json!(2)));
+    // A core edit waits for approval; the approved version stays in effect.
+    let (_, core) = rig.console("POST", "/api/personas/update", Some(&json!({"id": "p1", "core": "你是小鲸鱼，说话更软。"})));
+    assert_eq!((core["version"].clone(), core["activeVersion"].clone()), (json!(3), json!(2)), "{core}");
+    let (_, listed) = rig.console("GET", "/api/personas", None);
+    assert_eq!(listed["personas"][0]["pendingVersions"], json!([3]));
+    assert_eq!(rig.console("POST", "/api/personas/approve", Some(&json!({"id": "p1", "version": 3}))).1["activeVersion"], json!(3));
+    // Approving an older version rolls back.
+    assert_eq!(rig.console("POST", "/api/personas/approve", Some(&json!({"id": "p1", "version": 2}))).1["activeVersion"], json!(2));
+
+    let (status, copy) = rig.console("POST", "/api/personas/duplicate", Some(&json!({"id": "p1", "name": "小鲸鱼二号"})));
+    assert_eq!((status, copy["id"].clone()), (200, json!("p2")), "{copy}");
+    let (_, copied) = rig.console("GET", "/api/personas/item?id=p2", None);
+    assert_eq!(copied["persona"]["activeVersion"], json!(1));
+    assert_eq!(copied["persona"]["versions"][0]["core"], json!("你是小鲸鱼，说话软软的。"));
+
+    // Refusals: duplicate name, trait range, empty core, unknown edit mode, agent credentials.
+    assert_eq!(rig.console("POST", "/api/personas/create", Some(&json!({"name": "小鲸鱼", "core": "重复"}))).0, 409);
+    assert_eq!(rig.console("POST", "/api/personas/create", Some(&json!({"name": "新人设", "core": "x", "traits": {"neediness": 4}}))).0, 400);
+    assert_eq!(rig.console("POST", "/api/personas/create", Some(&json!({"name": "新人设", "core": "  "}))).0, 400);
+    assert_eq!(rig.console("POST", "/api/personas/update", Some(&json!({"id": "p1", "editMode": "sometimes"}))).0, 400);
+    let agent = http_call(rig.console_port, "GET", "/api/personas", &[("x-console-token", CONSOLE_TOKEN), ("x-agent-token", SEED_TOKEN)], None);
+    assert_eq!(agent.map(|(status, _)| status), Some(403));
+
+    // Assignment: one default plus per-conversation overrides; an assigned persona cannot be deleted.
+    let (status, assigned) = rig.console("POST", "/api/personas/assign", Some(&json!({"default": "p1"})));
+    assert_eq!((status, assigned["default"].clone()), (200, json!("p1")), "{assigned}");
+    let (_, overridden) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": "p2"})));
+    assert_eq!(overridden["overrides"], json!({GROUP_KEY: "p2"}));
+    assert_eq!(rig.console("POST", "/api/personas/delete", Some(&json!({"id": "p2"}))).0, 409);
+    let (_, cleared) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": null})));
+    assert_eq!(cleared["overrides"], json!({}));
+    assert_eq!(rig.console("POST", "/api/personas/delete", Some(&json!({"id": "p2"}))).0, 200);
+    let (_, listed) = rig.console("GET", "/api/personas", None);
+    assert_eq!(listed["personas"].as_array().map(Vec::len), Some(1));
+    let page = http_call(rig.console_port, "GET", "/personas", &[("x-console-token", CONSOLE_TOKEN)], None);
+    assert_eq!(page.map(|(status, _)| status), Some(200));
+    assert_eq!(rig.data_json("personas.json")["format"], json!(1));
+}
+
+#[test]
+fn role_cards_are_imported_once_as_approved_personas() {
+    let rig = Rig::new("persona-import", Seed { roles: vec![("小鲸鱼", CARD_SHARED), ("会计", CARD_OVERRIDE)], ..Seed::default() });
+    let (status, imported) = rig.console("POST", "/api/personas/import-roles", Some(&json!({})));
+    assert_eq!(status, 200, "{imported}");
+    let mut names: Vec<String> = imported["imported"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect();
+    names.sort();
+    let mut expected = vec!["会计".to_string(), "小鲸鱼".to_string()];
+    expected.sort();
+    assert_eq!(names, expected);
+    let (_, listed) = rig.console("GET", "/api/personas", None);
+    for persona in listed["personas"].as_array().unwrap() {
+        let (_, item) = rig.console("GET", &format!("/api/personas/item?id={}", persona["id"].as_str().unwrap()), None);
+        let version = &item["persona"]["versions"][0];
+        assert_eq!(version["approved"], json!(true));
+        assert_eq!(version["source"], json!("import"));
+        assert_eq!(item["persona"]["activeVersion"], json!(1));
+        // Imported like the old reserved2 hint: v2 and untagged sections, no first-generation
+        // command lines, example spaces as commas, uncut.
+        let core = version["core"].as_str().unwrap_or("");
+        if persona["name"] == "会计" {
+            assert_eq!(core, "你是会计助手，只讲数字。");
+        } else {
+            for kept in ["你是一只爱聊天的小鲸鱼。", "只在二代出现。", "你好，世界"] {
+                assert!(core.contains(kept), "{kept} missing: {core}");
+            }
+            for dropped in ["[SILENT]", "用空格分条", "〔二代〕", "〔一代〕", "你好 世界"] {
+                assert!(!core.contains(dropped), "{dropped} kept: {core}");
+            }
+        }
+    }
+    assert!(listed["importedRolesAt"].is_number());
+    assert_eq!(rig.console("POST", "/api/personas/import-roles", Some(&json!({}))).0, 409, "import runs once");
+}
+
+#[test]
+fn a_persona_switch_starts_a_new_briefing_generation_in_the_same_session() {
+    let mut rig = Rig::new("switch", Seed::default());
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    let clerk = approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale}))).0, 200);
+    rig.restart(mention(5101, "默认人设"));
+    let first = rig.wait_prompts(1);
+    assert!(first[0].text.contains("【人设】小鲸鱼\n你是一只爱聊天的小鲸鱼。") && first[0].text.contains("generation=0】"), "{}", first[0].text);
+
+    let (status, switched) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": clerk})));
+    assert_eq!(status, 200, "{switched}");
+    assert_eq!(switched["rebriefed"], json!([GROUP_KEY]));
+    rig.restart(mention(5102, "覆盖人设"));
+    let second = rig.wait_prompts(2);
+    let text = &second[1].text;
+    assert!(text.contains("【简报 revision=") && text.contains("generation=1】"), "a switch must re-brief in full: {text}");
+    assert!(text.contains("【人设】会计\n你是会计助手，只讲数字。") && !text.contains("【人设】小鲸鱼"), "{text}");
+    assert_eq!(second[1].session, second[0].session, "the switch keeps the session and its memory");
+
+    let (_, cleared) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": null})));
+    assert_eq!(cleared["rebriefed"], json!([GROUP_KEY]));
+    rig.restart(mention(5103, "回到默认"));
+    let third = rig.wait_prompts(3);
+    assert!(third[2].text.contains("generation=2】") && third[2].text.contains("【人设】小鲸鱼"), "{}", third[2].text);
+}
+
+#[test]
+fn a_group_member_cannot_switch_personas_and_gets_the_fixed_refusal() {
+    let mut rig = Rig::new("persona-refusal", Seed::default());
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale.clone()}))).0, 200);
+    // A later ordinary mention proves ordering: the command was settled before it and never became input.
+    let mut script = mention(7001, "/persona 会计");
+    script.extend([Step::Wait(1500), Step::Mention { message_id: 7002, text: "后续的普通消息" }]);
+    rig.restart(script);
+    let refused = || lock(&rig.gateway).sends.iter().any(|send| send.to_string().contains("人设只能由管理员在私聊或控制台切换。"));
+    assert!(wait_for(LONG, refused), "no fixed refusal: {:?}", lock(&rig.gateway).sends);
+    let prompts = rig.wait_prompts(1);
+    assert!(prompts[0].text.contains("后续的普通消息"), "{}", prompts[0].text);
+    assert!(!prompts[0].text.contains("/persona 会计"), "the command never reaches the model: {}", prompts[0].text);
+    thread::sleep(Duration::from_secs(3));
+    // The rig fires its own timed wakes (bootstrap, then wakeReminder), so the count is not the check:
+    // no prompt carries the command, and every prompt is one of those timed wakes.
+    let delivered = rig.dsh.prompts();
+    assert!(delivered.iter().all(|p| !p.text.contains("/persona")), "the command reached the model: {delivered:?}");
+    assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】你已接入 QQ 会话") || p.text.contains("【提醒】你还没有完成回合收尾")), "a turn other than a timed wake ran: {delivered:?}");
+    assert_eq!(rig.data_json("personas.json")["default"], json!(whale));
+    assert_eq!(rig.data_json("personas.json")["overrides"], json!({}));
 }

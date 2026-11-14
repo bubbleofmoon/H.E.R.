@@ -1,4 +1,5 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+mod guarded_file;
 mod handover;
 mod install_root;
 mod process_identity;
