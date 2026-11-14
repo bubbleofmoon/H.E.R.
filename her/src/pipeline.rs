@@ -28,7 +28,7 @@ pub(crate) fn pinned_cli_backend<'a>(cfg: &'a serde_json::Value, key: &str) -> O
 }
 
 #[cfg(not(test))]
-const SESSION_FILE: &str = "C:/qqbot/state/rust-sessions.json";
+const SESSION_FILE: &str = crate::legacy_path!("state/rust-sessions.json");
 
 #[cfg(test)]
 // Keep legacy-wrapper tests off the fixed production path; an unscoped test call fails closed.
@@ -643,7 +643,7 @@ impl Pipeline {
         } else {
             cfg.get("sessionCwd")
                 .and_then(|c| c.as_str())
-                .unwrap_or("C:/qqbot/state/agents")
+                .unwrap_or(crate::legacy_path!("state/agents"))
                 .to_string()
         };
 
@@ -1439,7 +1439,7 @@ fn last_ai_reply_at(context: &RuntimeContext, key: &str) -> i64 {
     let state = if context.is_isolated() {
         context.read_social_state().ok()
     } else {
-        std::fs::read_to_string("C:/qqbot/qq-bridge/state/social-v2.json")
+        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json"))
             .ok()
             .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
     };
@@ -1469,7 +1469,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     } else {
         use std::io::Write as _;
         let name = relative.strip_prefix("logs/").unwrap_or(relative);
-        let path = PathBuf::from(format!("C:/qqbot/logs/{name}"));
+        let path = PathBuf::from(format!("{}/logs/{name}", crate::legacy_path!()));
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -4296,7 +4296,7 @@ mod tests {
     #[test]
     fn outbound_sentinel_matches_js_categories() {
         // 四类必须拦：本机路径（Win/UNC/Unix）+ 凭据赋值
-        assert!(outbound_violation(r"C:\qqbot\config.json", &[]).is_some());
+        assert!(outbound_violation(r"C:\qqbot\config.json", &[]).is_some()); // layout-literal: sanitizer fixture
         assert!(outbound_violation(r"\\192.168.1.5\share\x.txt", &[]).is_some());
         assert!(outbound_violation("/home/me/.dsh/config", &[]).is_some());
         assert!(outbound_violation("/etc/passwd", &[]).is_some());
@@ -4324,8 +4324,8 @@ mod tests {
     #[test]
     fn sentinel_blocks_paths() {
         let secrets = vec!["TOPSECRET".to_string()];
-        assert!(outbound_violation("看 C:\\qqbot\\docs 里的文件", &secrets).is_some());
-        assert!(outbound_violation("路径 C:/qqbot/x", &secrets).is_some());
+        assert!(outbound_violation("看 C:\\qqbot\\docs 里的文件", &secrets).is_some()); // layout-literal: sanitizer fixture
+        assert!(outbound_violation("路径 C:/qqbot/x", &secrets).is_some()); // layout-literal: sanitizer fixture
         assert!(outbound_violation("token 是 TOPSECRET", &secrets).is_some());
         assert!(outbound_violation("cookie dsh-auth-abc=def", &secrets).is_some());
     }

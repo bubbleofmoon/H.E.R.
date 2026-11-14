@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use std::path::Path;
 
-pub const STICKER_FILE: &str = "C:/qqbot/qq-bridge/state/stickers.json";
+pub const STICKER_FILE: &str = crate::legacy_path!("qq-bridge/state/stickers.json");
 const MAX_FETCH: usize = 500;
 const DEFAULT_COUNT: usize = 100;
 const TTL_MS: i64 = 60_000;

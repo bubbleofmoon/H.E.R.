@@ -105,11 +105,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
-const CONFIG_PATH: &str = "C:/qqbot/qq-bridge/config.json";
-const SOCIAL_PATH: &str = "C:/qqbot/qq-bridge/state/social-v2.json";
-const DECISION_LOG: &str = "C:/qqbot/logs/rbridge-live.jsonl";
+const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
+const SOCIAL_PATH: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
+const DECISION_LOG: &str = crate::legacy_path!("logs/rbridge-live.jsonl");
 /// 状态机真正「醒」的时刻（含合批延迟），A/B 与 P6 验收都用这份对拍。
-const WAKE_LOG: &str = "C:/qqbot/logs/rbridge-live-wakes.jsonl";
+const WAKE_LOG: &str = crate::legacy_path!("logs/rbridge-live-wakes.jsonl");
 
 #[derive(Deserialize, Debug, Default)]
 struct Config {
@@ -618,7 +618,7 @@ fn decide(
 }
 
 fn discover_ws_token() -> Option<String> {
-    let dir = std::path::Path::new("C:/qqbot/SnowLuma/config");
+    let dir = std::path::Path::new(crate::legacy_path!("SnowLuma/config"));
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if !name.starts_with("onebot_") || !name.ends_with(".json") {
@@ -812,7 +812,7 @@ fn acquire_single_instance(
         context.resolve_path(runtime::RuntimeArea::Data, &relative, runtime::PathIntent::WriteFile)
             .map_err(|e| println!("[her] owner path unavailable: {e}")).ok()?
     } else {
-        std::path::PathBuf::from(format!("C:/qqbot/{relative}"))
+        std::path::PathBuf::from(format!("{}/{relative}", crate::legacy_path!()))
     };
     let identity = lifecycle::current_identity().map_err(|e| println!("[her] identity unavailable: {e}")).ok()?;
     let groups = {
@@ -930,7 +930,7 @@ fn dsh_probe_base() -> String {
     if let Ok(v) = std::env::var("DSH_BASE_URL") {
         return v;
     }
-    read_json("C:/qqbot/qq-bridge/config.json")
+    read_json(crate::legacy_path!("qq-bridge/config.json"))
         .and_then(|v| v.get("dsh").and_then(|d| d.get("baseUrl")).and_then(|b| b.as_str()).map(|s| s.to_string()))
         .unwrap_or_else(|| "http://127.0.0.1:3080".to_string())
 }
@@ -1078,7 +1078,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // P2-A 探针：--dsh-probe 只验鉴权；--dsh-demo 建会话并投 prompt
     // P2-B 探针：发一条私聊测试消息，验证 OneBot 发送链路
     if std::env::args().any(|a| a == "--send-probe") {
-        let cfgv = read_json("C:/qqbot/qq-bridge/config.json").unwrap_or_default();
+        let cfgv = read_json(crate::legacy_path!("qq-bridge/config.json")).unwrap_or_default();
         let http_url = cfgv
             .get("snowluma").and_then(|s| s.get("httpUrl")).and_then(|u| u.as_str())
             .unwrap_or("http://127.0.0.1:3000").to_string();
@@ -1122,7 +1122,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         let target_arg = std::env::args().nth(pos + 1).ok_or("--ask needs target")?;
         let text = std::env::args().nth(pos + 2).ok_or("--ask needs text")?;
         let live = std::env::args().any(|a| a == "--live");
-        let cfgv = read_json("C:/qqbot/qq-bridge/config.json").unwrap_or_default();
+        let cfgv = read_json(crate::legacy_path!("qq-bridge/config.json")).unwrap_or_default();
         let target = parse_target(&target_arg, &cfgv)?;
         match pipeline::Pipeline::new(&cfgv, live) {
             Ok(mut p) => {
@@ -2062,7 +2062,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     );
                 } else {
                     let _ = std::fs::write(
-                        format!("C:/qqbot/qq-bridge/state/{name}"),
+                        format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
                         payload.to_string(),
                     );
                 }

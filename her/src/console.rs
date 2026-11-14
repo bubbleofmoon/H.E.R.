@@ -17,11 +17,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-const CONFIG_PATH: &str = "C:/qqbot/qq-bridge/config.json";
+const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 /// 写类端点改的那份文件（与 CONFIG_PATH 同一个，单独命名是为了让读/写意图在代码里可辨）
-const CFG_PATH: &str = "C:/qqbot/qq-bridge/config.json";
-const SOCIAL_STATE: &str = "C:/qqbot/qq-bridge/state/social-v2.json";
-const CONSOLE_HTML: &str = "C:/qqbot/qq-bridge/public/console.html";
+const CFG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
+const SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
+const CONSOLE_HTML: &str = crate::legacy_path!("qq-bridge/public/console.html");
 /// DSH Web 总账文件名：events 里的 day/model/cost/tokens 是**所有入口**（含 Web GUI / CLI）的用量。
 /// No-root callers find it under the explicit DSH home; isolated callers use `user/dsh`.
 const DSH_USAGE_FILE_NAME: &str = ".dshw-usage.json";
@@ -69,27 +69,31 @@ fn runtime_location(path: &str) -> Result<(RuntimeArea, String), String> {
     if let Some(relative) = normalized.strip_prefix("runtime:dsh-user:/") {
         return Ok((RuntimeArea::DshUser, relative.to_string()));
     }
-    if normalized == "C:/qqbot/data/memory.db" {
+    // Legacy fixed paths keep their old shape under the production root (`install_root::legacy_path!`).
+    let Some(legacy) = normalized.strip_prefix(crate::legacy_path!("")) else {
+        return Err("path is outside the selected runtime areas".to_string());
+    };
+    if legacy == "data/memory.db" {
         return Ok((RuntimeArea::Memory, "memory.db".to_string()));
     }
     // Match exact roots before the broad resource prefix. Keep roles relative paths rooted at
     // `resources/roles/`; dropping that component would make directory and file resolution differ.
-    match normalized.as_str() {
-        "C:/qqbot/qq-bridge/config.json" => return Ok((RuntimeArea::Config, "config.json".to_string())),
-        "C:/qqbot/qq-bridge/state" => return Ok((RuntimeArea::Data, String::new())),
-        "C:/qqbot/qq-bridge/roles" => return Ok((RuntimeArea::Resources, "roles".to_string())),
-        "C:/qqbot/qq-bridge" => return Ok((RuntimeArea::Resources, String::new())),
-        "C:/qqbot/logs" => return Ok((RuntimeArea::Logs, String::new())),
+    match legacy {
+        "qq-bridge/config.json" => return Ok((RuntimeArea::Config, "config.json".to_string())),
+        "qq-bridge/state" => return Ok((RuntimeArea::Data, String::new())),
+        "qq-bridge/roles" => return Ok((RuntimeArea::Resources, "roles".to_string())),
+        "qq-bridge" => return Ok((RuntimeArea::Resources, String::new())),
+        "logs" => return Ok((RuntimeArea::Logs, String::new())),
         _ => {}
     }
     for (prefix, area, keep_prefix) in [
-        ("C:/qqbot/qq-bridge/config/", RuntimeArea::Config, ""),
-        ("C:/qqbot/qq-bridge/state/", RuntimeArea::Data, ""),
-        ("C:/qqbot/qq-bridge/roles/", RuntimeArea::Resources, "roles/"),
-        ("C:/qqbot/logs/", RuntimeArea::Logs, ""),
-        ("C:/qqbot/qq-bridge/", RuntimeArea::Resources, ""),
+        ("qq-bridge/config/", RuntimeArea::Config, ""),
+        ("qq-bridge/state/", RuntimeArea::Data, ""),
+        ("qq-bridge/roles/", RuntimeArea::Resources, "roles/"),
+        ("logs/", RuntimeArea::Logs, ""),
+        ("qq-bridge/", RuntimeArea::Resources, ""),
     ] {
-        if let Some(relative) = normalized.strip_prefix(prefix) {
+        if let Some(relative) = legacy.strip_prefix(prefix) {
             return Ok((area, format!("{keep_prefix}{relative}")));
         }
     }
@@ -1073,10 +1077,10 @@ fn handle_whitelist(cfg: &Value) -> Value {
     })
 }
 
-const SESSIONS_FILE: &str = "C:/qqbot/qq-bridge/state/sessions.json";
+const SESSIONS_FILE: &str = crate::legacy_path!("qq-bridge/state/sessions.json");
 
-const TOOL_LOG_FILE: &str = "C:/qqbot/qq-bridge/state/tool-calls.jsonl";
-const ROLES_DIR: &str = "C:/qqbot/qq-bridge/roles";
+const TOOL_LOG_FILE: &str = crate::legacy_path!("qq-bridge/state/tool-calls.jsonl");
+const ROLES_DIR: &str = crate::legacy_path!("qq-bridge/roles");
 
 /// `/api/socialV2/state?key=`：单个会话的**摘要**（不是整份状态）。
 ///
@@ -1394,7 +1398,7 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
     // override the identity is unknown here (JS reports null until the login info is read).
     let (nick, qq) = if context.is_isolated() {
         // The live bridge persists the login identity in `<data>/identity.json` (JS keeps it in memory).
-        let stored = read_json_for(context, "C:/qqbot/qq-bridge/state/identity.json").unwrap_or_else(|| json!({}));
+        let stored = read_json_for(context, crate::legacy_path!("qq-bridge/state/identity.json")).unwrap_or_else(|| json!({}));
         let text = |name: &str| stored.get(name).and_then(Value::as_str).unwrap_or("").to_string();
         (
             std::env::var("HER_SELF_NICK").unwrap_or_else(|_| text("nickname")),
@@ -2399,7 +2403,7 @@ fn handle_stickers(
             matches!(sync_outcome, StickerSyncOutcome::Cached),
         )
     } else {
-        let path = "C:/qqbot/qq-bridge/state/stickers.json";
+        let path = crate::legacy_path!("qq-bridge/state/stickers.json");
         let list: Vec<Value> = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok())
@@ -3212,8 +3216,8 @@ fn handle_initial_prompt_post(context: &RuntimeContext, cfg: &Value, body: &str)
     }))
 }
 
-const ROLES_DIR_PATH: &str = "C:/qqbot/qq-bridge/roles";
-const ROLE_STATE_FILE: &str = "C:/qqbot/qq-bridge/state/current-role.json";
+const ROLES_DIR_PATH: &str = crate::legacy_path!("qq-bridge/roles");
+const ROLE_STATE_FILE: &str = crate::legacy_path!("qq-bridge/state/current-role.json");
 const ROLE_NAME_MAX: usize = 40;
 /// 内容上限 64KB：create/update 要校验。
 const ROLE_CONTENT_MAX_BYTES: usize = 64 * 1024;
@@ -4476,7 +4480,7 @@ fn passthrough_error(msg: String) -> String {
 /// 缺文件时按 `reserved2` —— 这个桥接实际只在二代仿真模式下跑，
 /// 而 `chat`/`reserved` 会让所有发送类端点直接 403，缺省成那边等于"什么都没法用"。
 fn current_mode() -> String {
-    read_json("C:/qqbot/qq-bridge/state/mode.json")
+    read_json(crate::legacy_path!("qq-bridge/state/mode.json"))
         .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()))
         .map(|s| crate::config::normalize_mode(&s).map(str::to_string).unwrap_or(s))
         .unwrap_or_else(|| "reserved2".to_string())
@@ -5997,7 +6001,7 @@ fn handle_social_v1_config(context: &RuntimeContext, body: &str) -> Result<Value
 /// state/ 目录：ACL 收紧与自检的**唯一实现**（对应 JS 的 `src/state-acl.mjs`）。
 // 用**反斜杠**：这个值会原样进 JSON（控制台显示 + 手工命令里给用户复制），
 // 正斜杠在 Windows 上看着就别扭，而且和 JS 的 path.resolve 输出不一致。
-const STATE_DIR: &str = "C:\\qqbot\\qq-bridge\\state";
+const STATE_DIR: &str = crate::legacy_path!(windows "qq-bridge\\state");
 
 /// 宽松主体：Authenticated Users / BUILTIN\Users / Everyone（按 SID，不受显示语言影响）。
 const PERMISSIVE_SIDS: [&str; 3] = ["*S-1-5-11", "*S-1-5-32-545", "*S-1-1-0"];
@@ -6167,11 +6171,11 @@ fn handle_security_post(body: &str) -> Result<Value, (u16, String)> {
     Ok(json!({ "ok": true, "security": security }))
 }
 /// 预设备份目录（`state/preset-backups`），只留最近 10 份。
-const PRESET_BACKUP_DIR: &str = "C:/qqbot/qq-bridge/state/preset-backups";
+const PRESET_BACKUP_DIR: &str = crate::legacy_path!("qq-bridge/state/preset-backups");
 const PRESET_BACKUP_KEEP: usize = 10;
 
 fn preset_source_yaml(name: &str) -> String {
-    format!("C:/qqbot/qq-bridge/dsh/agent-presets/{name}/agent.cordis.yml")
+    format!("{}/qq-bridge/dsh/agent-presets/{name}/agent.cordis.yml", crate::legacy_path!())
 }
 
 /// Installed preset under the explicit DSH home; `None` when no DSH home is configured.
@@ -6403,7 +6407,7 @@ fn handle_preset_get(context: &RuntimeContext, params: &HashMap<String, String>)
             ))
         }
     };
-    let path = format!("C:/qqbot/qq-bridge/dsh/agent-presets/{name}/agent.cordis.yml");
+    let path = format!("{}/qq-bridge/dsh/agent-presets/{name}/agent.cordis.yml", crate::legacy_path!());
     let text = read_text_for(context, &path)
         .map_err(|e| (500, format!("读取预设失败：{e}")))?;
     let prefix = crate::preset_prompt::extract_prefix(&text)
@@ -7952,7 +7956,7 @@ fn handle_mode_post(body: &str) -> Result<Value, (u16, String)> {
             ))
         }
     };
-    let existing = read_json("C:/qqbot/qq-bridge/state/mode.json").unwrap_or_else(|| json!({}));
+    let existing = read_json(crate::legacy_path!("qq-bridge/state/mode.json")).unwrap_or_else(|| json!({}));
     let preset = match req.get("closedAgentPreset") {
         Some(v) => js_scalar(Some(v)),
         None => existing
@@ -7962,7 +7966,7 @@ fn handle_mode_post(body: &str) -> Result<Value, (u16, String)> {
             .to_string(),
     };
     let next = json!({ "mode": mode, "closedAgentPreset": preset });
-    write_json_atomic("C:/qqbot/qq-bridge/state/mode.json", &next).map_err(|e| (500, e))?;
+    write_json_atomic(crate::legacy_path!("qq-bridge/state/mode.json"), &next).map_err(|e| (500, e))?;
     // 写穿到 DSH 设置：不写的话，DSH 每 5 秒的轮询会把本地值覆盖回去
     // （JS 注释里写过这个坑）。写穿用的是**内部拼写**，因为 DSH 里那份值会被读回来当下游判断用。
     let dsh_synced = write_mode_to_dsh(mode).is_ok();
@@ -8206,10 +8210,10 @@ fn handle_console_token_post(
         // 旧路径：authorized() 只读 config，随机令牌也写 config，否则重启后全员 401。
         obj.insert("consoleToken".into(), json!(new_token.as_str()));
         write_json_atomic_for(context, CONFIG_PATH, &cfg).map_err(|e| (500, e))?;
-        if let Some(dir) = std::path::Path::new("C:/qqbot/qq-bridge/state/console-token").parent() {
+        if let Some(dir) = std::path::Path::new(crate::legacy_path!("qq-bridge/state/console-token")).parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write("C:/qqbot/qq-bridge/state/console-token", &new_token)
+        std::fs::write(crate::legacy_path!("qq-bridge/state/console-token"), &new_token)
             .map_err(|e| (500, format!("写令牌失败：{e}")))?;
     }
     DESKTOP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8358,7 +8362,7 @@ fn handle_self_image(
             return Err((403, "工具未启用：qq_get_self_image".to_string()));
         }
     }
-    let path = "C:/qqbot/qq-bridge/assets/deepseek娘.png";
+    let path = crate::legacy_path!("qq-bridge/assets/deepseek娘.png");
     let _source = crate::media::admit_source()
         .ok_or_else(|| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?;
     let bytes = if context.is_isolated() {
@@ -13615,11 +13619,11 @@ fn test_request(context: &RuntimeContext, method: &str, path: &str, body: Option
 // ── 写操作审计 ────────────────────────────────────────────────────────────────
 
 const AUDIT_FILES: [&str; 2] = [
-    "C:/qqbot/qq-bridge/config.json",
-    "C:/qqbot/qq-bridge/state/role-map.json",
+    crate::legacy_path!("qq-bridge/config.json"),
+    crate::legacy_path!("qq-bridge/state/role-map.json"),
 ];
-const AUDIT_LOG: &str = "C:/qqbot/logs/audit.jsonl";
-const AUDIT_BLOB_DIR: &str = "C:/qqbot/logs/audit-blobs";
+const AUDIT_LOG: &str = crate::legacy_path!("logs/audit.jsonl");
+const AUDIT_BLOB_DIR: &str = crate::legacy_path!("logs/audit-blobs");
 
 /// 当前可审计文件的内容快照。
 fn isolated_audit_file(file: &str) -> Option<(RuntimeArea, &'static str)> {
@@ -14490,19 +14494,19 @@ mod tests {
     #[test]
     fn runtime_path_mapping_keeps_exact_config_and_role_roots_distinct() {
         assert_eq!(
-            runtime_location("C:/qqbot/qq-bridge/config.json").unwrap(),
+            runtime_location(crate::legacy_path!("qq-bridge/config.json")).unwrap(),
             (RuntimeArea::Config, "config.json".to_string())
         );
         assert_eq!(
-            runtime_location("C:/qqbot/qq-bridge/roles").unwrap(),
+            runtime_location(crate::legacy_path!("qq-bridge/roles")).unwrap(),
             (RuntimeArea::Resources, "roles".to_string())
         );
         assert_eq!(
-            runtime_location("C:/qqbot/qq-bridge/roles/Shared.md").unwrap(),
+            runtime_location(crate::legacy_path!("qq-bridge/roles/Shared.md")).unwrap(),
             (RuntimeArea::Resources, "roles/Shared.md".to_string())
         );
         assert_eq!(
-            runtime_location("C:/qqbot/qq-bridge/public/console.html").unwrap(),
+            runtime_location(crate::legacy_path!("qq-bridge/public/console.html")).unwrap(),
             (RuntimeArea::Resources, "public/console.html".to_string())
         );
     }
@@ -22902,12 +22906,12 @@ mod tests {
 
     #[test]
     fn audit_backup_must_stay_inside_blob_dir() {
-        assert!(audit_backup_allowed("C:/qqbot/logs/audit-blobs/123/config.json"));
-        assert!(audit_backup_allowed("C:\\qqbot\\logs\\audit-blobs\\123\\config.json"));
-        assert!(!audit_backup_allowed("C:/qqbot/qq-bridge/config.json"));
-        assert!(!audit_backup_allowed("C:/qqbot/logs/audit-blobs/../config.json"));
-        assert!(!audit_backup_allowed("C:/qqbot/logs/audit-blobs/..\\qq-bridge\\config.json"));
-        assert!(!audit_backup_allowed("C:/qqbot/logs/audit-blobs-evil/config.json"));
+        assert!(audit_backup_allowed(crate::legacy_path!("logs/audit-blobs/123/config.json")));
+        assert!(audit_backup_allowed(crate::legacy_path!(windows "logs\\audit-blobs\\123\\config.json")));
+        assert!(!audit_backup_allowed(crate::legacy_path!("qq-bridge/config.json")));
+        assert!(!audit_backup_allowed(crate::legacy_path!("logs/audit-blobs/../config.json")));
+        assert!(!audit_backup_allowed(crate::legacy_path!("logs/audit-blobs/..\\qq-bridge\\config.json")));
+        assert!(!audit_backup_allowed(crate::legacy_path!("logs/audit-blobs-evil/config.json")));
         assert!(!audit_backup_allowed(""));
     }
 
