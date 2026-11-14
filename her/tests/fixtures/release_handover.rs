@@ -264,12 +264,33 @@ http.createServer((req,res)=>{
     }
     #[track_caller]
     fn wait_for(&self, timeout: Duration, predicate: impl Fn() -> bool) {
+        self.wait_with(timeout, "portable fixture wait", String::new, predicate);
+    }
+    /// Like `wait_for`, but a timeout names `what`, the state from `snapshot` and the supervisor's stderr tail.
+    #[track_caller]
+    fn wait_with(
+        &self,
+        timeout: Duration,
+        what: &str,
+        snapshot: impl Fn() -> String,
+        predicate: impl Fn() -> bool,
+    ) {
         let end = Instant::now() + timeout;
         while !predicate() {
             self.record_owners();
-            assert!(Instant::now() < end, "portable fixture wait timed out");
+            if Instant::now() >= end {
+                panic!("{what} timed out\n{}\n{}", snapshot(), self.supervisor_tail());
+            }
             thread::sleep(Duration::from_millis(20));
         }
+    }
+    fn supervisor_tail(&self) -> String {
+        let text = fs::read_to_string(self.f.root.join("old-supervisor.err")).unwrap_or_default();
+        let mut start = text.len().saturating_sub(4000);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("old-supervisor.err tail:\n{}", &text[start..])
     }
     fn runtime(&self) -> PathBuf {
         self.f.root.join("install/runtime")
@@ -636,10 +657,39 @@ fn portable_rollback_finish_preserves_supervisor_alert_claim_and_completion() {
                     .unwrap_or(Value::Null)
             };
             // Actual supervisor update.rs claim/complete writes these fields.
-            fixture.wait(|| {
-                let alert = read();
-                alert["retryAfter"].as_i64().unwrap_or(0) > 0 && alert["delivered"] == deliver
-            });
+            fixture.wait_with(
+                Duration::from_secs(30),
+                "alert claim not visible",
+                || {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+                    let lock = match fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(fixture.runtime().join("data/locks/update-alert.lock"))
+                    {
+                        Err(error) => format!("missing ({error})"),
+                        Ok(file) => match file.try_lock() {
+                            Ok(()) => {
+                                let _ = file.unlock();
+                                "free".to_string()
+                            }
+                            Err(error) => format!("held ({error:?})"),
+                        },
+                    };
+                    let alert = read();
+                    format!(
+                        "update-alert.json={alert} retryAfter-now={} update-alert.lock={lock}",
+                        alert["retryAfter"].as_i64().unwrap_or(0) - now
+                    )
+                },
+                || {
+                    let alert = read();
+                    alert["retryAfter"].as_i64().unwrap_or(0) > 0 && alert["delivered"] == deliver
+                },
+            );
             let lock = fs::OpenOptions::new()
                 .read(true)
                 .write(true)
