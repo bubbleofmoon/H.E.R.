@@ -35,7 +35,7 @@ and the complete unit/integration suite; use isolated fixtures and no real servi
 The checks workflow defines Windows and Linux validation and runs on hosted runners
 for every pull request and every push to main; it is the merge gate for everything it runs,
 and local gates keep only the native, elevated and production checks the hosted runners cannot run.
-On the shared development host, use the cargo-slot scripts for every Rust command.
+No host needs a local Rust build: compile, lint, format and tests run on CI (`docs/agents/rust-validation.md`). A native check a gate names uses the cargo-slot scripts.
 
 The guard tests itself: `python -I scripts/tests/test_scan_public.py`,
 `python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`, `python -I scripts/tests/test_handoff.py`
