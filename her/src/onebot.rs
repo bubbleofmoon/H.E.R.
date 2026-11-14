@@ -934,7 +934,7 @@ mod tests {
             r#"{"status":"failed","retcode":100,"wording":"result：120"}"#,
         ] {
             match classify_send_reply(200, body) {
-                Err(SendError::NotCommitted(_error)) => {} // A2 adds: assert!(is_mute_refusal(&_error), "{body}: {_error}")
+                Err(SendError::NotCommitted(error)) => assert!(is_mute_refusal(&error), "{body}: {error}"),
                 other => panic!("{body}: {other:?}"),
             }
         }
