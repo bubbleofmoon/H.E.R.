@@ -77,6 +77,14 @@ fn read_locked(path: &Path) -> String {
     retry_lock_violation(&format!("read {}", path.display()), || fs::read_to_string(path))
 }
 
+/// `read_locked` for a poll that runs before the product has created the file: a missing file reads as empty.
+fn read_locked_or_default(path: &Path) -> String {
+    retry_lock_violation(&format!("read {}", path.display()), || match fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        other => other,
+    })
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
@@ -1252,8 +1260,7 @@ fn scheduling_first_typing_budget_subtracts_time_already_spent_in_the_turn() {
     assert!(wait_for(LONG,||rig.dsh.applied().len()==1));
     let mut started_at = None;
     assert!(wait_for(LONG, || {
-        started_at = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl"))
-            .unwrap_or_default()
+        started_at = read_locked_or_default(&rig.root.join("data/turn-ledger.jsonl"))
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|record| record["k"] == "started")
@@ -1383,7 +1390,7 @@ fn timing_records_distinguish_normal_and_cancelled_dsh_endings() {
             rig.start_candidate(mention(29901,"normal timing"));
         }
         let read_timing = || -> Vec<Value> {
-            fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap_or_default()
+            read_locked_or_default(&rig.root.join("data/logs/turn-timing.jsonl"))
                 .lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
         };
         assert!(wait_for(LONG, || !read_timing().is_empty()), "turn timing missing");
@@ -1394,7 +1401,7 @@ fn timing_records_distinguish_normal_and_cancelled_dsh_endings() {
         else { assert!(timing["cancelReason"].is_null()); }
         let turn_id = timing["turnId"].as_str().expect("timing needs the bridge turn identity");
         let rpc_id = timing["attemptRpcId"].as_str().expect("timing needs its submitted attempt");
-        let ledger: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap()
+        let ledger: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl"))
             .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert!(ledger.iter().any(|row| row["k"] == "begun" && row["turn"] == turn_id));
         assert!(ledger.iter().any(|row| row["k"] == "attempt" && row["turn"] == turn_id && row["rpcId"] == rpc_id));
@@ -1513,7 +1520,7 @@ fn scheduling_successful_tool_send_arms_reply_check_for_later_nontrigger_message
     assert_ne!(send.1["reviseRequired"],true,"{send:?}");
     assert_eq!(rig.onebot_sends().len(),1,"initial gateway delivery must precede the follow-up");
     assert!(wait_for(Duration::from_secs(8), || rig.dsh.applied().len() == 1), "successful tool send never armed scheduleReplyCheckV2");
-    let wakes = fs::read_to_string(rig.root.join("data/logs/rbridge-live-wakes.jsonl")).unwrap();
+    let wakes = read_locked(&rig.root.join("data/logs/rbridge-live-wakes.jsonl"));
     assert_eq!(serde_json::from_str::<Value>(wakes.lines().next().unwrap()).unwrap()["reason"], "replyCheck");
     assert!(rig.dsh.applied()[0].text.contains("nontrigger follow up"));
 }
@@ -1561,7 +1568,7 @@ fn scheduling_persisted_conversation_gets_proactive_opportunity_without_ingress(
     rig.start_candidate(vec![]);
     assert!(wait_for(Duration::from_secs(66), || rig.dsh.applied().len() == 1), "no proactive turn without ingress");
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-    let wakes: Vec<Value> = fs::read_to_string(rig.root.join("data/logs/rbridge-live-wakes.jsonl")).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let wakes: Vec<Value> = read_locked(&rig.root.join("data/logs/rbridge-live-wakes.jsonl")).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     assert_eq!(wakes[0]["reason"], "proactiveCheck");
     assert_eq!(rig.dsh.count("session/create"), 0);
 }
@@ -1641,7 +1648,7 @@ fn scheduling_priority_upgrade_flushes_quiet_on_mention() {
     first["message"] = json!([{"type":"text","data":{"text":"first lower priority"}}]);
     rig.start_candidate(vec![Step::Wait(500), Step::Frame(first), Step::Wait(700), Step::Mention { message_id:16202, text:"upgrade" }]);
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"));
-    let records = |file: &str| -> Vec<Value> { fs::read_to_string(rig.root.join(file)).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
+    let records = |file: &str| -> Vec<Value> { read_locked_or_default(&rig.root.join(file)).lines().filter_map(|l| serde_json::from_str(l).ok()).collect() };
     let decisions = records("data/logs/rbridge-live.jsonl");
     let urgent = decisions.iter().find(|v| v["key"] == GROUP_KEY && v["reason"] == "atMention").unwrap()["ts"].as_i64().unwrap();
     let wakes = records("data/logs/rbridge-live-wakes.jsonl");
@@ -1864,7 +1871,7 @@ fn hf136_observation_budget_sleeps_once_and_restart_does_not_reopen() {
             .contains("observation budget ended; keeping wake config")), "hub did not collect the sleeping turn");
         assert!(wait_for(Duration::from_secs(5), || rig.inbound()["stages"]["handled"].as_i64() == Some(1)),
             "restart must witness durable ingress settlement");
-        let ends = |root: &Path| fs::read_to_string(root.join("data/turn-ledger.jsonl")).unwrap().lines()
+        let ends = |root: &Path| read_locked(&root.join("data/turn-ledger.jsonl")).lines()
             .filter_map(|l|serde_json::from_str::<Value>(l).ok()).filter(|r|r["k"]=="ended").collect::<Vec<_>>();
         assert!(wait_for(Duration::from_secs(5), || !lock(&rig.dsh.inner).wait_results.is_empty()));
         let results = lock(&rig.dsh.inner).wait_results.clone();
@@ -1943,7 +1950,7 @@ fn engage_window_end_is_a_clean_sleep_with_one_terminal_record() {
         "chatter returns with the window end, marked not for her: {results:?}");
     assert!(results.iter().all(|(_, body)| body["waitLimitReached"] != true), "{results:?}");
     assert_eq!(last["nextAction"], "end_turn");
-    let records: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap().lines()
+    let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl")).lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
     let ends: Vec<&Value> = records.iter().filter(|r| r["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{ends:?}");
@@ -1974,8 +1981,8 @@ fn a_capped_turn_is_cancelled_and_its_late_send_is_refused() {
     // The bridge gives up after the timeout: DSH work is stopped and the turn's token is revoked.
     assert!(wait_for(LONG, || rig.dsh.count("session/cancel") >= 1), "a timed-out turn must be cancelled in DSH");
     assert!(wait_for(LONG, || rig.turn_state(0) == "cancelled"), "{:?}", rig.turns());
-    assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl"))
-        .unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
+    assert!(wait_for(LONG, || read_locked_or_default(&rig.root.join("data/logs/turn-timing.jsonl"))
+        .lines().filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .any(|v| v["endKind"] == "aborted" && v["cancelled"] == true && v["cancelReason"] == "turnTimeout")),
         "hard-cap timing must identify the bridge cancellation");
     assert_eq!(rig.dsh.count("session/cancel"),1,"one hard cap must cause exactly one cancellation");
@@ -2009,19 +2016,19 @@ fn a_capped_turn_ending_before_the_cancel_rpc_returns_is_cancelled_once() {
     // The collector must consume the aborted end while cancel_with_reason is still
     // waiting for its RPC response, before it can rotate authority and end the turn.
     let collected = wait_for(Duration::from_secs(10), || {
-        fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl"))
-            .unwrap_or_default().lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        read_locked_or_default(&rig.root.join("data/logs/turn-timing.jsonl"))
+            .lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .any(|row| row["endKind"] == "aborted" && row["cancelReason"] == "turnTimeout")
     });
     let ledger = rig.root.join("data/turn-ledger.jsonl");
-    let before_reply = fs::read_to_string(&ledger).unwrap();
+    let before_reply = read_locked(&ledger);
     release.send(()).unwrap();
     assert!(collected, "collector did not reach the forced interleaving");
     assert!(!before_reply.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["k"] == "ended"), "cancellation must revoke authority before finalizing: {before_reply}");
     assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
         .unwrap_or_default().contains("[reserved2] group:420042 turn ended:")));
-    let records: Vec<Value> = fs::read_to_string(&ledger).unwrap().lines()
+    let records: Vec<Value> = read_locked(&ledger).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     let ends: Vec<_> = records.iter().filter(|row| row["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{records:?}");
@@ -2072,7 +2079,7 @@ fn a_completed_end_observed_before_the_cap_keeps_completion_while_bookkeeping_wa
     assert_eq!(ends.len(), 1, "{records:?}");
     assert_eq!(ends[0]["outcome"], "completed", "{records:?}");
     assert_eq!(rig.turn_state(0), "completed");
-    let timing = fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing = read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     assert!(timing.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["endKind"] == "completed" && row["cancelled"] == false && row["ok"] == true), "{timing}");
     let output = fs::read_to_string(rig.root.join("candidate-out.log")).unwrap();
@@ -2090,14 +2097,14 @@ fn a_completed_end_keeps_its_outcome_when_the_bookkeeping_barrier_path_is_invali
     rig.restart(mention(11006, "completed with an unavailable bookkeeping barrier"));
     assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
         .unwrap_or_default().contains("[reserved2] group:420042 turn ended:")));
-    let records: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl")).unwrap().lines()
+    let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl")).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     assert!(records.iter().any(|row| row["verdict"] == "completion-observed"), "{records:?}");
     let ends: Vec<_> = records.iter().filter(|row| row["k"] == "ended").collect();
     assert_eq!(ends.len(), 1, "{records:?}");
     assert_eq!(ends[0]["outcome"], "completed", "{records:?}");
     assert_eq!(rig.turn_state(0), "completed");
-    let timing = fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing = read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     assert!(timing.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["endKind"] == "completed" && row["cancelled"] == false && row["ok"] == true), "{timing}");
     let output = fs::read_to_string(rig.root.join("candidate-out.log")).unwrap();
@@ -2143,7 +2150,7 @@ fn restart_with_pending_cancellation(queued: bool, unreachable: bool) {
     assert_ne!(rig.agent_token(), SEED_TOKEN, "pending cancellation must revoke authority before waiting");
     let late = rig.dsh.late_send(&prompt.text).unwrap();
     assert!(matches!(late.0, 401 | 403), "{late:?}");
-    let records: Vec<Value> = fs::read_to_string(&ledger).unwrap().lines()
+    let records: Vec<Value> = read_locked(&ledger).lines()
         .map(|line| serde_json::from_str(line).unwrap()).collect();
     assert!(!records.iter().any(|row| row["k"] == "ended"), "unproven work must stay open: {records:?}");
     assert_eq!(rig.dsh.received(), 1, "the cancelled input must not be replayed");
@@ -3052,7 +3059,7 @@ fn recovered_finished_turn_usage_is_written_once_to_the_rust_ledger() {
     rig.restart(vec![]);
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"), "recovery must close the turn: {:?}", rig.turns());
     thread::sleep(Duration::from_secs(3));
-    let ledger = fs::read_to_string(rig.root.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+    let ledger = read_locked_or_default(&rig.root.join("data/token-usage-rust.jsonl"));
     let rows: Vec<Value> = ledger
         .lines()
         .filter(|line| !line.is_empty())
@@ -3082,7 +3089,7 @@ fn reattached_running_turn_usage_is_written_once_to_the_rust_ledger() {
     rig.dsh.release();
     assert!(wait_for(LONG, || rig.turn_state(0) == "completed"), "{:?}", rig.turns());
     thread::sleep(Duration::from_secs(3));
-    let ledger = fs::read_to_string(rig.root.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+    let ledger = read_locked_or_default(&rig.root.join("data/token-usage-rust.jsonl"));
     let usage: Vec<Value> = ledger
         .lines()
         .filter(|line| !line.is_empty())
@@ -3133,7 +3140,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     println!("hf85 UTF16: first body={}, first briefing={}, delta median body={}, first packet={}, delta packet={}; tools stay session-owned (none in prompt RPC)",
         units(&inputs[0].text),units(inputs[0].text.split("【会话令牌】").next().unwrap()),deltas[deltas.len()/2],
         units(&packet(&inputs[0].text)),units(&packet(&inputs[24].text)));
-    let timing=fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing=read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     let rows:Vec<Value>=timing.lines().map(|l|serde_json::from_str(l).unwrap()).collect();
     assert_eq!(rows.last().unwrap()["promptChars"],inputs[24].text.chars().count(),"timing counts actual delivery");
 
@@ -3652,7 +3659,7 @@ fn hf_next_delivery_case(full: bool) {
     let operator = delivered.split(operator_header).nth(1).unwrap().split("\n\n【").next().unwrap();
     let operator_hash = format!("{:x}", Sha256::digest(operator.as_bytes()));
     assert_eq!(rig.sessions_file()["briefings"][GROUP_KEY]["installed"]["sections"]["operator"],operator_hash,"stored section hash differs from delivered filtered content");
-    let rows = || fs::read_to_string(rig.root.join("data/logs/model-refusals.jsonl")).unwrap_or_default().lines().map(|l|serde_json::from_str::<Value>(l).unwrap()).collect::<Vec<_>>();
+    let rows = || read_locked_or_default(&rig.root.join("data/logs/model-refusals.jsonl")).lines().map(|l|serde_json::from_str::<Value>(l).unwrap()).collect::<Vec<_>>();
     assert!(wait_for(LONG, || rows().len() == 1), "refusal metadata not recorded");
     let row = rows().remove(0);
     assert_eq!(row["errorClass"],"refusal");
@@ -3663,7 +3670,7 @@ fn hf_next_delivery_case(full: bool) {
     let stored = fs::read_to_string(rig.root.join("data/social-v2.json")).unwrap();
     assert!(stored.contains("configured-drop") && stored.contains("file-new"),"model filtering changed stored chat");
     assert!(!rows().iter().any(|r|r.to_string().contains("file-old")),"refusal record retained chat text");
-    let timing = fs::read_to_string(rig.root.join("data/logs/turn-timing.jsonl")).unwrap();
+    let timing = read_locked(&rig.root.join("data/logs/turn-timing.jsonl"));
     let last: Value = serde_json::from_str(timing.lines().last().unwrap()).unwrap();
     assert_eq!(last["promptChars"],delivered.chars().count());
 }
@@ -3706,8 +3713,8 @@ fn hf_next_completed_failure_records_a_single_terminal_outcome() {
         assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
             .unwrap_or_default().contains(&format!("[reserved2] {GROUP_KEY} turn ended: Err("))));
         assert_eq!(rig.turn_state(0), "failed", "completed failure remained open: {}", rig.view());
-        let records: Vec<Value> = fs::read_to_string(rig.root.join("data/turn-ledger.jsonl"))
-            .unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl"))
+            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(records.iter().filter(|row| row["k"] == "ended").count(), 1);
         assert!(rig.onebot_sends().is_empty());
     }
@@ -3848,7 +3855,7 @@ fn hf129_fix1_recovered_running_turn_admits_arrivals_and_covers_model_reads() {
     rig.dsh.release();
     assert!(wait_for(LONG, || rig.turn_state(0)=="completed"));
     thread::sleep(Duration::from_secs(3));
-    let decisions:Vec<Value>=fs::read_to_string(rig.root.join("data/logs/rbridge-live.jsonl")).unwrap().lines()
+    let decisions:Vec<Value>=read_locked(&rig.root.join("data/logs/rbridge-live.jsonl")).lines()
         .filter_map(|l|serde_json::from_str::<Value>(l).ok()).filter(|v|v["shouldWake"].is_boolean()).collect();
     assert_eq!(decisions[1]["reason"],"in-turn","{decisions:?}");
     assert_eq!(decisions[2]["reason"],"in-turn","{decisions:?}");
