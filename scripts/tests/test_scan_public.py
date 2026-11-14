@@ -208,5 +208,87 @@ class TreeMode(unittest.TestCase):
         self.assertNotIn('product_regex', out)
 
 
+@REQUIRES_SCANNER
+class AddedMode(unittest.TestCase):
+    DIRTY = 'session ' + FAKE_NUMBER + '\n'
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix='public-scan-added-'))
+        for name in ('.gitleaks.toml', '.public-scan.json'):
+            shutil.copy(ROOT / name, self.repo / name)
+        self.git('init', '-q', '-b', 'main')
+        self.git('config', 'user.name', 'Guard Test')
+        self.git('config', 'user.email', 'guard.test@example.invalid')
+        self.git('config', 'commit.gpgsign', 'false')
+
+    def tearDown(self):
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def git(self, *args):
+        proc = subprocess.run(['git', '-C', str(self.repo), *args], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def commit(self, files, message):
+        for rel, text in files.items():
+            path = self.repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        self.git('add', '--', *files)
+        self.git('commit', '-qm', message)
+        return self.git('rev-parse', 'HEAD')
+
+    def added(self, *commits, env=None):
+        return run(['--root', str(self.repo), '--added-from-stdin'], '\n'.join(commits) + '\n', env)
+
+    def test_a_merge_scans_what_differs_from_each_parent(self):
+        self.commit({'docs/a.md': 'clean\n'}, 'base')
+        self.git('checkout', '-qb', 'side')
+        self.commit({'docs/d.md': self.DIRTY}, 'side')
+        self.git('checkout', '-q', 'main')
+        self.commit({'docs/e.md': 'clean\n'}, 'main')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge', 'side')
+        code, out = self.added(self.git('rev-parse', 'HEAD'))
+        self.assertEqual(code, 1, out)
+        self.assertIn('digit docs/d.md', out)
+        self.assertIn('1 commits, 0 whole trees', out)
+
+    def test_a_mode_only_change_scans_the_blob(self):
+        self.commit({'a.sh': 'echo clean\n'}, 'base')
+        self.git('update-index', '--chmod=+x', 'a.sh')
+        self.git('commit', '-qm', 'mode only')
+        code, out = self.added(self.git('rev-parse', 'HEAD'))
+        self.assertEqual(code, 0, out)
+        self.assertIn('1 commits, 0 whole trees, 1 blobs', out)
+
+    def test_an_unreadable_parent_scans_the_whole_tree(self):
+        # Coverage of the cat-file reading of parents: a missing parent object is unreadable, never absent.
+        base = self.commit({'docs/a.md': 'clean\n'}, 'base')
+        tip = self.commit({'docs/b.md': 'clean\n'}, 'tip')
+        (self.repo / '.git' / 'objects' / base[:2] / base[2:]).unlink()     # the parent commit object only
+        code, out = self.added(tip)
+        self.assertEqual(code, 0, out)
+        self.assertIn('1 commits, 1 whole trees', out)
+
+    @unittest.skipIf(os.name == 'nt', 'the fake git is a shell script')
+    def test_unreadable_diff_tree_output_is_a_finding(self):
+        self.commit({'docs/a.md': 'clean\n'}, 'base')
+        tip = self.commit({'docs/b.md': 'clean\n'}, 'tip')
+        bin_dir = self.repo / 'fake-bin'
+        bin_dir.mkdir()
+        fake = bin_dir / 'git'
+        fake.write_text('#!/bin/sh\nif [ "$3" = diff-tree ]; then printf \':100644 x\\000\'; exit 0; fi\n'
+                        f'exec {shutil.which("git")} "$@"\n', encoding='utf-8')
+        fake.chmod(0o755)
+        code, out = self.added(tip, env={'PATH': str(bin_dir) + os.pathsep + os.environ.get('PATH', '')})
+        self.assertEqual(code, 1, out)
+        self.assertIn('diff-tree output could not be read', out)
+
+    def test_no_commits_scans_nothing(self):
+        code, out = run(['--root', str(self.repo), '--added-from-stdin'], '\n')
+        self.assertEqual(code, 0, out)
+        self.assertIn('0 commits', out)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

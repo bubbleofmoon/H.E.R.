@@ -234,10 +234,14 @@ def collect_added_blobs(repo, commits):
     """
     blobs, whole = {}, []
     for commit in commits:
-        line, error = git_stdout(repo, 'rev-list', '--parents', '-n', '1', commit)
+        raw_commit, error = git_stdout(repo, 'cat-file', 'commit', commit)
         if error:
             return {}, [], f'{error} (commit {commit[:12]})'
-        parents = line.decode('ascii', 'replace').split()[1:]
+        header = raw_commit.partition(b'\n\n')[0]
+        # The recorded parents, read from the object itself: a parent missing here (a shallow
+        # boundary or a pruned object) is then seen as unreadable, never as absent.
+        parents = [line[len(b'parent '):].decode('ascii', 'replace').strip()
+                   for line in header.split(b'\n') if line.startswith(b'parent ')]
         if not parents or any(git_stdout(repo, 'cat-file', '-e', f'{parent}^{{commit}}')[1] for parent in parents):
             whole.append(commit)
             continue

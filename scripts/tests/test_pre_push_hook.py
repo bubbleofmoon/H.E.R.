@@ -106,12 +106,13 @@ class PushHook(unittest.TestCase):
                               capture_output=True, text=True, encoding='utf-8', env=env)
         return scrub((proc.stdout or '') + (proc.stderr or ''))
 
-    def push(self, *lines):
-        """Run the hook exactly as git does: repository as cwd, ref lines on stdin."""
+    def push(self, *lines, extra=None):
+        """Run the hook exactly as git does: repository as cwd, ref lines on stdin; `extra` overrides variables."""
         env = dict(os.environ)
         env.update(GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
+        env.update(extra or {})
         proc = subprocess.run([BASH, str(HOOK), 'origin', 'https://example.invalid/guard.git'],
                               cwd=self.repo, input='\n'.join(lines) + '\n',
                               capture_output=True, text=True, encoding='utf-8', env=env)
@@ -308,13 +309,13 @@ class PushHook(unittest.TestCase):
     @REQUIRES_SCANNER
     @REQUIRES_BASH
     def test_a_dirty_blob_in_a_branch_update_is_refused(self):
-        self.write('docs/a.md', 'clean note\n')
-        base = self.commit('base is on the remote')
-        self.write('docs/b.md', DIRTY)
-        tip = self.commit('dirty new file')
-        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {base}')
+        def build():
+            self.write('docs/b.md', DIRTY)
+            self.commit('dirty new file')
+        code, out = self.branch_update(build)
         self.assertEqual(code, 1, out)
-        self.assertIn('digit', out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('1 commits, 0 whole trees', out)
         self.assertNotIn('123456' + '789', out)
 
     @REQUIRES_SCANNER
@@ -385,6 +386,111 @@ class PushHook(unittest.TestCase):
         self.assertIn('digit', out)
         self.assertIn('1 whole trees', out)
         self.assertNotIn('123456' + '789', out)
+
+    # --- a branch that moves forward scans only what its new commits add ---------------
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_branch_pushed_to_a_tag_keeps_the_whole_tree_scan(self):
+        self.write('docs/a.md', 'clean note\n')
+        base = self.commit('base')
+        self.write('docs/b.md', 'clean note too\n')
+        tip = self.commit('tip')
+        code, out = self.push(f'refs/heads/main {tip} refs/tags/v1 {base}')
+        self.assertEqual(code, 0, out)
+        self.assertIn('Public scan (added): 0 findings (none); 0 commits', out)
+        self.assertNotIn('Public scan (history): 0 findings (none); 0 revisions', out)
+
+    def branch_update(self, build, seed=None):
+        """Base on main, the update on branch `work`, then main checked out again: the working tree is clean,
+        so only the scans of what the push publishes can refuse it."""
+        self.write('docs/a.md', 'clean note\n')
+        for rel, text in (seed or {}).items():
+            self.write(rel, text)
+        base = self.commit('base is on the remote')
+        self.git('checkout', '-qb', 'work')
+        build()
+        tip = self.head()
+        self.git('checkout', '-q', 'main')
+        return self.push(f'refs/heads/work {tip} refs/heads/work {base}')
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_dirty_file_added_and_deleted_in_an_update_is_refused(self):
+        def build():
+            self.write('docs/d.md', DIRTY)
+            self.commit('add a dirty file')
+            self.git('rm', '-q', 'docs/d.md')
+            self.commit('delete it again')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('2 commits, 0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_dirty_modification_cleaned_later_is_refused(self):
+        def build():
+            self.write('docs/a.md', DIRTY)
+            self.commit('dirty edit')
+            self.write('docs/a.md', 'clean note again\n')
+            self.commit('clean it')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('2 commits, 0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_merge_whose_side_added_and_removed_a_dirty_file_is_refused(self):
+        def build():
+            self.git('checkout', '-qb', 'side')
+            self.write('docs/d.md', DIRTY)
+            self.commit('side adds a dirty file')
+            self.git('rm', '-q', 'docs/d.md')
+            self.commit('side removes it')
+            self.git('checkout', '-q', 'work')
+            self.write('docs/e.md', 'clean note\n')
+            self.commit('work moves on')
+            self.git('merge', '-q', '--no-ff', '-m', 'merge side', 'side')
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_rename_that_makes_a_record_line_count_is_refused(self):
+        record = 'const SAMPLE: &str = r#"{"turn' + '":"t1"}"#;\n'          # clean in .rs, a record in .md
+
+        def build():
+            self.git('mv', 'src/x.rs', 'docs/x.md')
+            self.commit('rename to markdown')
+        code, out = self.branch_update(build, seed={'src/x.rs': record})
+        self.assertEqual(code, 1, out)
+        self.assertIn('chat-record', out)
+        self.assertIn('0 whole trees', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_replaced_blob_is_scanned_as_pushed(self):
+        def build():
+            self.write('docs/d.md', DIRTY)
+            self.commit('dirty file')
+            dirty = self.git('rev-parse', 'HEAD:docs/d.md')
+            (self.tmp / 'clean.txt').write_text('clean note\n', encoding='utf-8')
+            clean = self.git('hash-object', '-w', str(self.tmp / 'clean.txt'))
+            self.git('replace', dirty, clean)
+        code, out = self.branch_update(build)
+        self.assertEqual(code, 1, out)
+        self.assertIn('digit', out)
+
+    @REQUIRES_BASH                                                       # no scanner needed
+    def test_a_missing_scanner_is_its_own_refusal(self):
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}',
+                              extra={'HER_GITLEAKS': str(self.tmp / 'no-such-gitleaks')})
+        self.assertEqual(code, 3, out)
+        self.assertIn('refusal=scanner-missing', out)
 
 
 if __name__ == '__main__':

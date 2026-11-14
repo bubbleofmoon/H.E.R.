@@ -9,28 +9,41 @@
 # does not have yet are listed and scanned, so a value a later commit deletes is still refused,
 # and a tracked blob under a folder the working copy ignores is still scanned, because a
 # committed blob is published. A branch that moves forward from a commit the remote already
-# has (the remote sha is a commit present here and an ancestor of the new commit) publishes
-# only what its new commits add: their blobs that differ from their parents are scanned
-# (scan-public.py --added-from-stdin), and a new commit without a parent, or with a parent
-# this repository cannot read, is scanned whole. Every other ref (a new ref, a remote sha
-# this repository lacks, a force push, a tag) has the whole tree of every new commit scanned
-# (--revs-from-stdin). The published text is not only
-# blobs: the message of every outgoing commit, and of an annotated tag object whose ref leaves
-# with this push, is scanned in a second pass, so a clean tree with a sensitive commit or tag
-# message is refused too. Refusal prints only finding kinds and positions, never the matched
-# text. Anything this hook cannot inspect is a refusal too: an unreadable outgoing commit, a
-# message object that cannot be read or a scan that could not run fails closed.
+# has (the remote sha is a commit present here and an ancestor of the new commit, and both the
+# local and the remote ref are branches) publishes only what its new commits add: their blobs
+# that differ from their parents are scanned (scan-public.py --added-from-stdin), and a new
+# commit without a parent, or with a parent this repository cannot read, is scanned whole.
+# Every other ref (a new ref, a remote sha this repository lacks, a force push, a tag or a
+# branch pushed to a tag) has the whole tree of every new commit scanned (--revs-from-stdin).
+# Replace refs are ignored, because a push sends the real objects. The published text is not
+# only blobs: the message of every outgoing commit, and of an annotated tag object whose ref
+# leaves with this push, is scanned in a second pass, so a clean tree with a sensitive commit or
+# tag message is refused too. Refusal prints only finding kinds and positions, never the matched
+# text, and exits 1; a missing gitleaks exits 3 with refusal=scanner-missing. Anything this hook
+# cannot inspect is a refusal too: an unreadable outgoing commit, a message object that cannot
+# be read, a list that cannot be sorted or a scan that could not run fails closed.
 set -u
+export GIT_NO_REPLACE_OBJECTS=1          # scan the objects a push sends, never their local replacements
 root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo 'pre-push: not inside a git repository' >&2; exit 1; }
 py=python; command -v python >/dev/null 2>&1 || py=python3
 for guard in scripts/scan-public.py scripts/tests/test_scan_public.py; do
   [ -f "$root/$guard" ] || { echo "pre-push: the public guard file $guard is missing" >&2; exit 1; }
 done
-
-if ! "$py" -I "$root/scripts/scan-public.py"; then
-  echo 'pre-push: the public scan refused this push (kinds and line numbers above)' >&2
+scan() { # <refusal message> <scan-public.py arguments...>: one scan; a refusal ends the hook
+  local message=$1 code
+  shift
+  "$py" -I "$root/scripts/scan-public.py" "$@"
+  code=$?
+  [ "$code" -eq 0 ] && return 0
+  if [ "$code" -eq 3 ]; then
+    echo 'pre-push: refusal=scanner-missing (gitleaks not found: set HER_GITLEAKS, docs/agents/rust-validation.md)' >&2
+    exit 3
+  fi
+  echo "pre-push: $message" >&2
   exit 1
-fi
+}
+
+scan 'the public scan refused this push (kinds and line numbers above)'
 if ! "$py" -I "$root/scripts/tests/test_scan_public.py" >/dev/null; then
   echo 'pre-push: the public guard tests did not pass' >&2
   exit 1
@@ -62,8 +75,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       exit 1
     fi
     # A fast-forward of a branch: every parent the new commits do not list is on the remote.
-    # Tag refs never take this path: their whole history is scanned.
-    if [ "${local_ref#refs/heads/}" != "$local_ref" ] \
+    # Tag refs, on either side, never take this path: their whole history is scanned.
+    if [ "${local_ref#refs/heads/}" != "$local_ref" ] && [ "${remote_ref#refs/heads/}" != "$remote_ref" ] \
        && [ "$(git -C "$root" cat-file -t "$local_sha" 2>/dev/null)" = commit ] \
        && git -C "$root" merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
       forward=1
@@ -87,15 +100,9 @@ done <<EOF
 $refs
 EOF
 
-if ! sort -u "$revs" | "$py" -I "$root/scripts/scan-public.py" --revs-from-stdin; then
-  echo 'pre-push: the public scan refused the history this push publishes' >&2
-  exit 1
-fi
-if ! sort -u "$added" | "$py" -I "$root/scripts/scan-public.py" --added-from-stdin; then
-  echo 'pre-push: the public scan refused the blobs this push adds' >&2
-  exit 1
-fi
-if ! sort -u "$objects" | "$py" -I "$root/scripts/scan-public.py" --objects-from-stdin; then
-  echo 'pre-push: the public scan refused the commit and tag messages this push publishes' >&2
-  exit 1
-fi
+for list in "$revs" "$added" "$objects"; do
+  sort -u -o "$list" "$list" || { echo 'pre-push: the outgoing lists cannot be sorted' >&2; exit 1; }
+done
+scan 'the public scan refused the history this push publishes' --revs-from-stdin <"$revs"
+scan 'the public scan refused the blobs this push adds' --added-from-stdin <"$added"
+scan 'the public scan refused the commit and tag messages this push publishes' --objects-from-stdin <"$objects"
