@@ -423,9 +423,10 @@ fn filtered_rows_never_consume_her_replies() {
     harness_replies(&root, &context, "group:77", &timed);
     journal_message_at(&context, "group:77", 2, group_text(5002, "/status"), t0 + 10);
     journal_message_at(&context, "group:77", 3, group_text(5002, &"字".repeat(400)), t0 + 20);
+    journal_message_at(&context, "group:77", 4, group_text(5002, "第四句"), t0 + 30);
     let mut reached = false;
     for _ in 0..4 {
-        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 3, .. })) {
+        if matches!(run(&context, &model, "group:77", &ANY), Ok(Outcome::Written { through: 4, .. })) {
             reached = true;
             break;
         }
