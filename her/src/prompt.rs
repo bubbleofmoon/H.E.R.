@@ -306,7 +306,7 @@ pub fn sticker_line_with_runtime(context: &RuntimeContext, cfg: &Value) -> Strin
     }
     // The softening rule points at the inventory, so it is only printed with one.
     if sticker_context.is_empty() {
-        format!("{strategy}\n{STICKER_SOFTEN}\n\n")
+        format!("{strategy}\n\n")
     } else {
         format!("{strategy}\n{STICKER_SOFTEN}\n{sticker_context}\n\n")
     }

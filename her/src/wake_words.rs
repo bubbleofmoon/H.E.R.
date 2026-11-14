@@ -15,12 +15,10 @@ pub(crate) const LOG_MAX: usize = 20;
 const NAMES_MAX: usize = 10;
 const NAME_MAX: usize = 40;
 const LISTS: [&str; 2] = ["keywords", "dropNames"];
-/// `keywords` keeps at most this many words (`wake::normalize_wake_config`).
-const KEYWORDS_MAX: usize = 50;
 
 /// The most words a wake-config write keeps in `list`; an undo never restores past it.
 fn list_max(list: &str) -> usize {
-    if list == "dropNames" { NAMES_MAX } else { KEYWORDS_MAX }
+    if list == "dropNames" { NAMES_MAX } else { crate::wake::KEYWORDS_MAX }
 }
 
 /// Trimmed non-empty strings of a JSON list; anything else is an empty list.
@@ -119,16 +117,11 @@ pub(crate) fn record(conversation: &mut Value, before: &Value, after: &Value, by
 
 /// Undoes log entry `id` of `key`: its added words are taken out and its removed words put back, only
 /// while every added word is still there and every removed word still absent (otherwise a newer change
-/// is in the way), and only when she can still be woken afterwards. A refusal changes nothing and never
-/// creates a record. The undo is logged itself (`by: "undo"`, `undoes: id`).
-#[cfg(test)]
+/// is in the way), only without putting more words back than a wake-config write keeps, and only when
+/// the stored triggers still wake her by the write path's rule (`wake::ensure_wakeable`: persona names
+/// are no stored trigger, speaker ids count). A refusal changes nothing and never creates a record.
+/// The undo is logged itself (`by: "undo"`, `undoes: id`).
 pub(crate) fn undo(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
-    undo_in(None, state, key, id, at)
-}
-
-/// `undo` that also counts the persona names `context` gives `key` (not dropped ones) as wake triggers,
-/// as the ingress does; without a context only the stored triggers count.
-pub(crate) fn undo_in(context: Option<&RuntimeContext>, state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
     let conversation = state
         .get_mut("conversations")
         .and_then(|all| all.get_mut(key))
@@ -158,12 +151,7 @@ pub(crate) fn undo_in(context: Option<&RuntimeContext>, state: &mut Value, key: 
         }
         next["triggers"][list] = json!(words);
     }
-    let mut wakes = next.clone();
-    if let Some(context) = context {
-        let keywords = effective(context, key, &strings(&next["triggers"]["keywords"]), &strings(&next["triggers"]["dropNames"]));
-        wakes["triggers"]["keywords"] = json!(keywords);
-    }
-    if !crate::wake::is_wakeable(&crate::session::wake_config_from_json(Some(&wakes)), at) {
+    if crate::wake::ensure_wakeable(&mut next.clone(), &json!({}), at, 0.5) {
         return Err((409, "undoing this entry would leave no way to wake her".to_string()));
     }
     let (added, removed) = change(&before, &next);
@@ -189,10 +177,11 @@ pub(crate) fn view(context: &RuntimeContext, conversation: &str) -> Result<Value
 }
 
 /// The briefing's `【名字唤醒】` rule section: which persona names wake her in `key`, which she turned
-/// off and how to change them; empty when her persona declares no names.
+/// off and how to change them; empty in private chats (the section is for group conversations) and when her
+/// persona declares no names.
 pub(crate) fn briefing_line(context: &RuntimeContext, key: &str, conversation: &Value) -> String {
     let names = crate::persona::wake_names(context, key);
-    if names.is_empty() {
+    if names.is_empty() || key.starts_with("private:") {
         return String::new();
     }
     let dropped = strings(&conversation["wakeConfig"]["triggers"]["dropNames"]);
@@ -201,7 +190,6 @@ pub(crate) fn briefing_line(context: &RuntimeContext, key: &str, conversation: &
     let off = if off.is_empty() { String::new() } else { format!("你已关闭：{}。", off.join("、")) };
     format!("【名字唤醒】群里有人说到这些名字会唤醒你（来自当前人设）：{on}。{off}想关掉某个名字，就用 qq_set_wake_config 把要关掉的名字完整写进 triggers.dropNames（空列表全部恢复）；triggers.keywords 是你自己另加的唤醒词。每次改动都会记下来，管理员可以撤销。\n\n")
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -402,7 +390,7 @@ mod tests {
     fn the_name_section_is_for_groups_only() {
         let (root, context) = fixture("private", &library());
         assert!(super::briefing_line(&context, "group:1", &json!({})).starts_with("【名字唤醒】"));
-        assert_eq!(super::briefing_line(&context, "private:1", &json!({})), "", "a private chat is woken by every message");
+        assert_eq!(super::briefing_line(&context, "private:1", &json!({})), "", "private chats get no name section");
         let _ = std::fs::remove_dir_all(root);
     }
 
