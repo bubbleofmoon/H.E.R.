@@ -1,6 +1,8 @@
 //! Health check through seam 1: real CLI, selected roots and loopback fakes.
 #[path = "../src/install_root.rs"]
 mod install_root;
+#[path = "../src/process_identity.rs"]
+mod process_identity;
 
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -8,6 +10,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use process_identity::{KillOutcome, Liveness, ProcessIdentity};
 
 struct Child(Option<std::process::Child>);
 impl Drop for Child {
@@ -17,6 +21,143 @@ impl Drop for Child {
             let _ = child.wait();
         }
     }
+}
+
+/// How long the rig's cleanup gives each lifecycle CLI call and the owners' exit.
+const CLEANUP_BOUND: Duration = Duration::from_secs(10);
+/// How long a finished child's pipes may stay open: a detached grandchild can inherit them.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
+/// One output pipe read to its end on its own thread; the bytes so far are readable at any time.
+struct Drain {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+impl Drain {
+    fn new<R: Read + Send + 'static>(pipe: Option<R>) -> Self {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink = bytes.clone();
+        let reader = pipe.and_then(|mut pipe| {
+            std::thread::Builder::new()
+                .name("fixture-pipe".into())
+                .spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match pipe.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => sink
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok()
+        });
+        Self { bytes, reader }
+    }
+    fn closed(&self) -> bool {
+        self.reader.as_ref().map_or(true, |reader| reader.is_finished())
+    }
+    fn bytes(&self) -> Vec<u8> {
+        self.bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// Runs `cmd` with both output pipes drained on reader threads, so a child printing more than
+/// one pipe buffer (4 KiB on Windows) cannot block. Waits at most `allow` for the exit, then at
+/// most `PIPE_GRACE` for the pipes to close (a detached grandchild may hold an inherited pipe).
+/// On timeout the child is killed through its own handle and reaped within 5 s; a child that
+/// ignores the kill leaks its handle and the error says so. The error carries what it printed
+/// so far. Never panics, so `Rig::drop` can use it while unwinding.
+fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Output, String> {
+    let mut process = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start: {e}"))?;
+    let stdout = Drain::new(process.stdout.take());
+    let stderr = Drain::new(process.stderr.take());
+    let mut child = Child(Some(process));
+    let limit = Instant::now() + allow;
+    let mut status = loop {
+        let Some(process) = child.0.as_mut() else {
+            break Err("lost its process handle".to_string());
+        };
+        match process.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < limit => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                break Err(format!(
+                    "exceeded the fixture's {}-second limit",
+                    allow.as_secs()
+                ))
+            }
+            Err(e) => break Err(format!("could not be polled: {e}")),
+        }
+    };
+    if let Err(reason) = &mut status {
+        // The timeout path kills through the std `Child` handle: the handle names this exact
+        // process instance, so no pid lookup can race a recycled pid — the recorded-identity
+        // rule that `kill_verified` enforces for handleless processes is satisfied directly.
+        // The reap after the kill is bounded: a child that ignores the kill leaks its handle
+        // and is reported, never followed by a blocking `wait` that could stall the fixture.
+        let mut leaked = false;
+        if let Some(process) = child.0.as_mut() {
+            let _ = process.kill();
+            let reaped = Instant::now() + Duration::from_secs(5);
+            loop {
+                match process.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < reaped => std::thread::sleep(Duration::from_millis(5)),
+                    Ok(None) => {
+                        *reason += "; child did not exit after kill";
+                        leaked = true;
+                        break;
+                    }
+                    Err(e) => {
+                        *reason += &format!("; child did not exit after kill (could not be polled: {e})");
+                        leaked = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if leaked {
+            // Dropping a std `Child` is non-blocking and leaves the process running: that is
+            // the leak. Keeping it in the wrapper would call blocking `wait` in `Child::drop`.
+            child.0 = None;
+        }
+    }
+    // Exited (or reaped after the kill): the wrapper's Drop only reaps here.
+    drop(child);
+    let grace = Instant::now() + PIPE_GRACE;
+    while !(stdout.closed() && stderr.closed()) && Instant::now() < grace {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match status {
+        Ok(status) => Ok(std::process::Output {
+            status,
+            stdout: stdout.bytes(),
+            stderr: stderr.bytes(),
+        }),
+        Err(reason) => Err(format!(
+            "{reason}; partial stdout={}; partial stderr={}",
+            String::from_utf8_lossy(&stdout.bytes()),
+            String::from_utf8_lossy(&stderr.bytes())
+        )),
+    }
+}
+
+/// Cleanup diagnostics; `writeln!` to a possibly closed stderr cannot panic inside `Drop`.
+fn cleanup_note(args: std::fmt::Arguments) {
+    let _ = writeln!(std::io::stderr(), "rig cleanup: {args}");
 }
 
 #[derive(Clone)]
@@ -246,25 +387,11 @@ impl Fixture {
     /// The CLI child must exit within `allow`, so a fixture that lets it wait on a product
     /// deadline says so; every bound stays explicit and every path still ends in a failure.
     fn output_bounded(&self, extra: &[&str], allow: Duration) -> std::process::Output {
-        let child = hidden(env!("CARGO_BIN_EXE_her-cli"))
-            .args(["lifecycle", "assert-running", "--runtime-root"])
+        let mut cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
+        cmd.args(["lifecycle", "assert-running", "--runtime-root"])
             .arg(&self.0)
-            .args(extra)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut child = Child(Some(child));
-        let limit = Instant::now() + allow;
-        while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
-            assert!(
-                Instant::now() < limit,
-                "assert-running exceeded the fixture's {}-second limit",
-                allow.as_secs()
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        child.0.take().unwrap().wait_with_output().unwrap()
+            .args(extra);
+        run_bounded(&mut cmd, allow).unwrap_or_else(|error| panic!("assert-running {error}"))
     }
     fn check(&self, extra: &[&str]) -> (i32, Value) {
         self.check_bounded(extra, Duration::from_secs(12))
@@ -449,6 +576,9 @@ fn unavailable_runtime_does_not_hide_malformed_cli_input() {
 }
 
 struct Rig {
+    /// Every process instance this rig caused, by role (`console`, `live`, `supervisor`):
+    /// recorded at spawn and from the owner markers, stopped by `Drop` with `kill_verified`.
+    owners: Vec<(&'static str, ProcessIdentity)>,
     console: Option<Child>,
     supervisor: Option<Child>,
     fixture: Fixture,
@@ -520,7 +650,18 @@ impl Rig {
             &port.to_string(),
         ]));
         let supervisor = Some(spawn(&["supervise"]));
+        let mut owners = Vec::new();
+        for (role, child) in [("console", &console), ("supervisor", &supervisor)] {
+            let pid = child
+                .as_ref()
+                .and_then(|child| child.0.as_ref())
+                .map(std::process::Child::id);
+            if let Some(Ok(Some(identity))) = pid.map(process_identity::identity_of) {
+                owners.push((role, identity));
+            }
+        }
         let rig = Self {
+            owners,
             console,
             supervisor,
             fixture,
@@ -555,6 +696,120 @@ impl Rig {
             self.config.to_string(),
         )
         .unwrap();
+    }
+    /// Adds every owner the runtime published in `data/logs/<lock>.owner.json`. Reads only the
+    /// marker: a held `.lock` file is byte-range locked on Windows (os error 33).
+    fn record_owners(&mut self) {
+        for (name, role) in [
+            ("rbridge-live.lock", "live"),
+            ("rbridge-console.lock", "console"),
+            ("rbridge-supervisor.lock", "supervisor"),
+        ] {
+            let marker = self
+                .fixture
+                .0
+                .join("data/logs")
+                .join(format!("{name}.owner.json"));
+            let Ok(bytes) = std::fs::read(&marker) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            let Ok(identity) = serde_json::from_value::<ProcessIdentity>(value["identity"].clone())
+            else {
+                continue;
+            };
+            if !self.owners.iter().any(|(_, known)| *known == identity) {
+                self.owners.push((role, identity));
+            }
+        }
+    }
+    fn kill_recorded(&self, select: impl Fn(&str) -> bool) {
+        for (role, identity) in self.owners.iter().filter(|(role, _)| select(role)) {
+            match process_identity::kill_verified(identity) {
+                KillOutcome::Gone => {}
+                KillOutcome::Killed => cleanup_note(format_args!(
+                    "killed {role} pid {} that outlived the lifecycle stop",
+                    identity.pid
+                )),
+                outcome => cleanup_note(format_args!(
+                    "LEAK RISK: {role} pid {} was not stopped: {outcome:?}",
+                    identity.pid
+                )),
+            }
+        }
+    }
+    fn running_owners(&self) -> Vec<String> {
+        self.owners
+            .iter()
+            .filter(|(_, identity)| process_identity::check_identity(identity) == Liveness::Matches)
+            .map(|(role, identity)| format!("{role} pid {}", identity.pid))
+            .collect()
+    }
+}
+impl Drop for Rig {
+    /// Stops everything this rig caused on every exit path (pass, failed assert, panic, timeout).
+    /// Never panics and never asserts: a panic while unwinding aborts the whole test binary.
+    /// Field drops follow: `Child` handles kill and reap, and `Fixture` removes the directory last.
+    fn drop(&mut self) {
+        self.record_owners();
+        // 1. The product's own stop, each call bounded; failures are reported, never fatal.
+        let stops: [(&str, &[&str]); 2] = [
+            (
+                "set stopped",
+                &["lifecycle", "set", "stopped", "--confirm", "--runtime-root"],
+            ),
+            (
+                "stop-supervisor",
+                &["lifecycle", "stop-supervisor", "--confirm", "--runtime-root"],
+            ),
+        ];
+        for (label, args) in stops {
+            let mut cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
+            cmd.args(args).arg(&self.fixture.0);
+            match run_bounded(&mut cmd, CLEANUP_BOUND) {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => cleanup_note(format_args!(
+                    "lifecycle {label} exited {:?}: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )),
+                Err(error) => cleanup_note(format_args!("lifecycle {label} {error}")),
+            }
+            self.record_owners();
+        }
+        // 2. Give the recorded owners time to exit on their own.
+        let deadline = Instant::now() + CLEANUP_BOUND;
+        while Instant::now() < deadline && !self.running_owners().is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 3. Pinned kills by pid plus start stamp; the supervisor goes last.
+        self.kill_recorded(|role| role != "supervisor");
+        self.kill_recorded(|role| role == "supervisor");
+        // 4. A child the supervisor started just before it died publishes its marker late.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let known = self.owners.len();
+            self.record_owners();
+            if self.owners.len() > known {
+                self.kill_recorded(|_| true);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // 5. TerminateProcess is asynchronous: confirm exits before Fixture removes the directory.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let running = self.running_owners();
+            if running.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                cleanup_note(format_args!("still running after cleanup: {running:?}"));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -986,32 +1241,14 @@ fn restore_with_fake_peers(never_ready: bool) {
             self.thread.take().unwrap().join().unwrap();
         }
     }
-    struct RestoreRig(Rig);
-    impl Drop for RestoreRig {
-        fn drop(&mut self) {
-            let _ = hidden(env!("CARGO_BIN_EXE_her-cli"))
-                .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
-                .arg(&self.0.fixture.0)
-                .output();
-            let _ = hidden(env!("CARGO_BIN_EXE_her-cli"))
-                .args([
-                    "lifecycle",
-                    "stop-supervisor",
-                    "--confirm",
-                    "--runtime-root",
-                ])
-                .arg(&self.0.fixture.0)
-                .output();
-        }
-    }
     for &offline in if never_ready {
         &[true][..]
     } else {
         &[false, true][..]
     } {
-        let mut rig = RestoreRig(Rig::new());
+        let mut rig = Rig::new();
         let socket = SocketPeer::new();
-        let deps = rig.0.fixture.0.join("dependencies.json");
+        let deps = rig.fixture.0.join("dependencies.json");
         let mut config: Value = serde_json::from_slice(&std::fs::read(&deps).unwrap()).unwrap();
         config["onebot_ws"] = if never_ready {
             // A refused WebSocket connection prevents live startup; HTTP peers remain healthy.
@@ -1020,12 +1257,12 @@ fn restore_with_fake_peers(never_ready: bool) {
             json!(socket.url)
         };
         std::fs::write(deps, config.to_string()).unwrap();
-        rig.0.config["backends"]["mcpRustBridge"] = json!(true);
-        rig.0.config["rollout"]["rustGroups"] = json!(["group:123456"]);
-        rig.0.config["tasks"]["watchdog"]["enabled"] = json!(true);
-        rig.0.save_config();
+        rig.config["backends"]["mcpRustBridge"] = json!(true);
+        rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+        rig.config["tasks"]["watchdog"]["enabled"] = json!(true);
+        rig.save_config();
         let initialized = Instant::now() + Duration::from_secs(10);
-        while !rig.0.fixture.0.join("data/backup-notices.json").exists() {
+        while !rig.fixture.0.join("data/backup-notices.json").exists() {
             assert!(
                 Instant::now() < initialized,
                 "supervisor initialization did not finish"
@@ -1035,13 +1272,13 @@ fn restore_with_fake_peers(never_ready: bool) {
         if offline {
             let stopped = hidden(env!("CARGO_BIN_EXE_her-cli"))
                 .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
-                .arg(&rig.0.fixture.0)
+                .arg(&rig.fixture.0)
                 .output()
                 .unwrap();
             assert!(stopped.status.success());
-            drop(rig.0.supervisor.take());
+            drop(rig.supervisor.take());
         }
-        let root = &rig.0.fixture.0;
+        let root = &rig.fixture.0;
         for dir in ["resources/roles", "resources/docs", "resources/patches"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -1105,24 +1342,13 @@ fn restore_with_fake_peers(never_ready: bool) {
             );
             let text = String::from_utf8_lossy(&preview.stdout);
             let p: Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-            let mut child = Child(Some(
-                command()
-                    .arg("--confirm")
-                    .arg(p["preview"]["confirmation"].as_str().unwrap())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap(),
-            ));
-            let deadline = Instant::now() + Duration::from_secs(150);
-            while child.0.as_mut().unwrap().try_wait().unwrap().is_none() {
-                assert!(
-                    Instant::now() < deadline,
-                    "restore exceeded health/rollback budget"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let output = child.0.take().unwrap().wait_with_output().unwrap();
+            let mut restore = command();
+            restore
+                .arg("--confirm")
+                .arg(p["preview"]["confirmation"].as_str().unwrap());
+            let output = run_bounded(&mut restore, Duration::from_secs(150)).unwrap_or_else(
+                |error| panic!("restore exceeded health/rollback budget: {error}"),
+            );
             if never_ready {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1165,7 +1391,7 @@ fn restore_with_fake_peers(never_ready: bool) {
                 String::from_utf8_lossy(&output.stderr)
             );
         } else {
-            let port = rig.0.config["consolePort"].as_u64().unwrap() as u16;
+            let port = rig.config["consolePort"].as_u64().unwrap() as u16;
             let name = archive.file_name().unwrap().to_str().unwrap();
             let (status, plan) = console_restore(
                 port,
@@ -1229,7 +1455,7 @@ fn restore_with_fake_peers(never_ready: bool) {
         assert_eq!(value, "archived memory");
         if !offline {
             assert!(
-                rig.0
+                rig
                     .supervisor
                     .as_mut()
                     .unwrap()
@@ -1242,7 +1468,7 @@ fn restore_with_fake_peers(never_ready: bool) {
                 "supervisor stays running"
             );
         }
-        let (health_code, health_report) = rig.0.fixture.check(&[]);
+        let (health_code, health_report) = rig.fixture.check(&[]);
         eprintln!("post-restore health (offline={offline}, code={health_code}): {health_report}");
         if health_code != 0 {
             let status = hidden(env!("CARGO_BIN_EXE_her-cli"))
@@ -1264,37 +1490,142 @@ fn restore_with_fake_peers(never_ready: bool) {
 
 #[test]
 fn a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change() {
-    struct ReconcileRig(Rig);
-    impl Drop for ReconcileRig {
-        fn drop(&mut self) {
-            let _ = hidden(env!("CARGO_BIN_EXE_her-cli"))
-                .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
-                .arg(&self.0.fixture.0)
-                .output();
-        }
-    }
-    let mut rig = ReconcileRig(Rig::new());
+    let mut rig = Rig::new();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !rig.0.fixture.0.join("data/backup-notices.json").exists() {
+    while !rig.fixture.0.join("data/backup-notices.json").exists() {
         assert!(
             Instant::now() < deadline,
             "supervisor did not complete its first poll"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    rig.0.config["backends"]["mcpRustBridge"] = json!(true);
-    rig.0.config["rollout"]["rustGroups"] = json!(["group:123456"]);
-    rig.0.save_config();
-    drop(rig.0.console.take());
+    rig.config["backends"]["mcpRustBridge"] = json!(true);
+    rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+    rig.save_config();
+    drop(rig.console.take());
     let running = hidden(env!("CARGO_BIN_EXE_her-cli"))
         .args(["lifecycle", "set", "running", "--runtime-root"])
-        .arg(&rig.0.fixture.0)
+        .arg(&rig.fixture.0)
         .output()
         .unwrap();
     assert!(running.status.success());
     // The supervisor notices the new revision on its one-second scheduler pass and only starts the
     // console owner after that: measured at ~5 s of supervisor delay and ~7 s to a healthy
     // console on the Windows host, so this check outlives the shared 12-second CLI bound.
-    let (code, verdict) = rig.0.fixture.check_bounded(&["--wait", "30s"], Duration::from_secs(40));
+    let (code, verdict) = rig.fixture.check_bounded(&["--wait", "30s"], Duration::from_secs(40));
     assert_eq!(code, 0, "a new running revision must reconcile: {verdict}");
+}
+
+/// Makes the rig's supervisor start a console the fixture holds no handle for; returns its identity.
+fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
+    let notices = rig.fixture.0.join("data/backup-notices.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !notices.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not complete its first poll"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let original = rig
+        .console
+        .as_ref()
+        .and_then(|console| console.0.as_ref())
+        .map(std::process::Child::id);
+    rig.config["backends"]["mcpRustBridge"] = json!(true);
+    rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+    rig.save_config();
+    drop(rig.console.take());
+    let mut set = hidden(env!("CARGO_BIN_EXE_her-cli"));
+    set.args(["lifecycle", "set", "running", "--runtime-root"])
+        .arg(&rig.fixture.0);
+    let running = run_bounded(&mut set, Duration::from_secs(12))
+        .unwrap_or_else(|error| panic!("lifecycle set running {error}"));
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let marker = rig
+        .fixture
+        .0
+        .join("data/logs/rbridge-console.lock.owner.json");
+    // Same budget as the reconcile test: ~7 s to a healthy console measured on the Windows host.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let identity = loop {
+        let identity = std::fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok());
+        if let Some(identity) = identity {
+            if Some(identity.pid) != original
+                && process_identity::check_identity(&identity) == Liveness::Matches
+            {
+                break identity;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor did not start a console within 40 s; marker={}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The owner marker is published before the console loads its config (entry.rs acquires the
+    // gate first), so a live marker pid does not yet prove the console runs: a console that
+    // exits once the fixture is deleted during that window makes both tests pass falsely.
+    // Require shared health for this runtime — the console part passes only when /api/health
+    // answers with this console's pid — and the same marker identity, before any cleanup.
+    // `--wait` re-snapshots until every part passes, like the reconcile test.
+    let (code, verdict) = rig
+        .fixture
+        .check_bounded(&["--wait", "30s"], Duration::from_secs(40));
+    assert_eq!(code, 0, "the supervisor-started console never answered health: {verdict}");
+    let reread = std::fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok());
+    assert_eq!(
+        reread.as_ref(),
+        Some(&identity),
+        "the console marker no longer names the console that answered health"
+    );
+    identity
+}
+
+fn assert_stopped_after_drop(console: &ProcessIdentity) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match process_identity::check_identity(console) {
+            Liveness::Gone | Liveness::Mismatch(_) => return,
+            state => assert!(
+                Instant::now() < deadline,
+                "the supervisor-started console {} outlived the rig: {state:?}",
+                console.pid
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn rig_drop_stops_a_console_the_supervisor_started() {
+    let mut rig = Rig::new();
+    let console = supervisor_started_console(&mut rig);
+    drop(rig);
+    assert_stopped_after_drop(&console);
+}
+
+#[test]
+fn rig_drop_stops_a_console_the_supervisor_started_when_the_test_panics() {
+    let mut console = None;
+    let unwound: std::thread::Result<()> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut rig = Rig::new();
+            console = Some(supervisor_started_console(&mut rig));
+            panic!("fixture panic after the supervisor started a console");
+        }));
+    assert!(unwound.is_err(), "the closure must panic");
+    let console = console.expect("the console was started before the panic");
+    assert_stopped_after_drop(&console);
 }
