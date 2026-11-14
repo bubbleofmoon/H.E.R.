@@ -657,6 +657,10 @@ fn send_recorded_inline(
             report.error = Some(format!("发送意图未能持久记录，未发送：{error}"));
             return report;
         }
+        Err(BeginError::Muted(text)) => {
+            report.error = Some(text);
+            return report;
+        }
     };
     let history = History { ob, kind, id_s };
     let mut confirmed_ids: Vec<i64> = Vec::new();

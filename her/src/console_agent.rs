@@ -853,6 +853,7 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
             return Err(match error {
                 crate::recorded_send::BeginError::Busy => (409, crate::recorded_send::BATCH_BUSY.to_string()),
                 crate::recorded_send::BeginError::Intent(error) => (503, format!("发送意图未能持久记录，未发送：{error}")),
+                crate::recorded_send::BeginError::Muted(text) => mute_send_denial(context, cfg, key, token).err().unwrap_or((403, text)),
             });
         }
     };

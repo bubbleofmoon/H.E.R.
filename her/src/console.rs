@@ -5534,6 +5534,12 @@ fn note_engagement_ended(out: &mut Value) {
     out["reason"] = json!(END_TURN);
 }
 
+/// #46: a send to a group where QQ has muted her is refused here, before quota, quote or gateway
+/// work. The result says until when; an open turn is marked ended so it closes as a clean sleep.
+pub(crate) fn mute_send_denial(_context: &RuntimeContext, _cfg: &Value, _key: &str, _token: &str) -> Result<(), (u16, String)> {
+    Ok(())
+}
+
 fn wait_console_generation() -> &'static str {
     static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GENERATION.get_or_init(|| crate::turn_ledger::mint_id("console-")).as_str()
@@ -8796,6 +8802,7 @@ where
     let recorded = crate::recorded_send::Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| match error {
         crate::recorded_send::BeginError::Busy => (409, crate::recorded_send::BATCH_BUSY.to_string()),
         crate::recorded_send::BeginError::Intent(error) => (503, format!("发送意图未能持久记录，未发送：{error}")),
+        crate::recorded_send::BeginError::Muted(text) => mute_send_denial(context, cfg, &storage_key, token).err().unwrap_or((403, text)),
     })?;
     // JS enqueues the sticker on the same `sendChain` as text bubbles, so it can never overtake an
     // in-flight burst, and pauses 800-2000 ms inside the chain before `assertSendAllowed()`.
@@ -14692,6 +14699,20 @@ mod tests {
         let mut message = json!({"text":id,"userId":"1001","time":now_ms(),"isSelf":false});
         for (name, value) in extra.as_object().unwrap() { message[name] = value.clone(); }
         record_reserved2_incoming(context, config, HF94_KEY, id, message).unwrap();
+    }
+
+    #[test]
+    fn a_muted_send_marks_the_open_turn_as_a_clean_sleep() {
+        let (root, context, config, headers) = hf94_wait_fixture(json!({}));
+        let token = headers.get("x-agent-token").unwrap().clone();
+        let turn = engage_turn(&context);
+        let mut groups = serde_json::Map::new();
+        groups.insert(HF94_KEY.to_string(), json!({"personalUntil": crate::parity_clock::now_ms() + 600_000, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        std::fs::write(root.0.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+        let (status, text) = mute_send_denial(&context, &config, HF94_KEY, &token).unwrap_err();
+        assert_eq!(status, 403);
+        assert!(text.contains("muted in this group until") && text.contains(END_TURN), "{text}");
+        assert!(turn_budget_ended(&context, HF94_KEY, &turn.id), "turnBudgetEnded equals the open turn id");
     }
 
     #[test]

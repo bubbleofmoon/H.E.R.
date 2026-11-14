@@ -1072,6 +1072,25 @@ fn definite_refusal_is_reported_as_not_committed_with_an_outbox_trail() {
 }
 
 #[test]
+fn a_muted_group_voice_send_is_refused_locally() {
+    let bot = FakeOneBot::start();
+    let fx = fixture("muted", &bot.url, Options::default());
+    fx.audio("a.mp3", &bytes(64));
+    let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 600_000;
+    let mut groups = serde_json::Map::new();
+    groups.insert("group:111".to_string(), json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+    fs::write(fx.root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    let console = Console::start(&fx);
+    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    assert_eq!(s, 403, "{b}");
+    assert_eq!(b["ok"], false);
+    assert!(b["error"].as_str().unwrap_or_default().contains("禁言"), "{b}");
+    assert!(bot.requests("send_group_msg").is_empty(), "no gateway send");
+    assert!(bot.requests("get_msg").is_empty(), "no readback");
+    assert!(fx.outbox().iter().all(|r| r["k"] != "intent"), "no send intent is recorded");
+}
+
+#[test]
 fn lost_reply_is_unknown_and_never_resent_until_verified() {
     let bot = FakeOneBot::start();
     let fx = fixture("lost", &bot.url, Options::default());

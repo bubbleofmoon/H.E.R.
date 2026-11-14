@@ -588,6 +588,7 @@ fn send_processed(
     let recorded = Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| Failure::Plain(match error {
         BeginError::Busy => BATCH_BUSY.to_string(),
         BeginError::Intent(error) => format!("发送意图未能持久记录，未发送：{error}"),
+        BeginError::Muted(text) => text,
     }))?;
     let batch_id = recorded.batch_id().to_string();
     let attempt_ms = match recorded.attempt(0, None) {

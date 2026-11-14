@@ -82,6 +82,8 @@ pub enum BeginError {
     Busy,
     /// The intent could not be recorded; nothing may be sent.
     Intent(String),
+    /// The group is muted (#46); the text is the model-facing refusal.
+    Muted(String),
 }
 
 /// One item's settled outcome.
@@ -444,6 +446,20 @@ mod tests {
 
     fn unreachable() -> OneBot {
         OneBot::new("http://127.0.0.1:1", String::new())
+    }
+
+    #[test]
+    fn begin_refuses_a_muted_group_before_any_record() {
+        let (root, context) = root("her-recorded-muted-");
+        let mut groups = serde_json::Map::new();
+        groups.insert("group:1".to_string(), json!({"personalUntil": crate::parity_clock::now_ms() + 600_000, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        std::fs::write(root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+        let result = Recorded::begin(&context, clock, 1_000, json!({"key":"group:1","epoch":"e","messages":["a"]}));
+        assert!(matches!(result, Err(BeginError::Muted(_))), "a muted group is refused");
+        assert!(read_records(&context).unwrap().is_empty(), "no intent is recorded");
+        // A group that is not muted still begins.
+        assert!(Recorded::begin(&context, clock, 1_000, json!({"key":"group:2","epoch":"e","messages":["a"]})).is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
