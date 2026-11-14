@@ -179,6 +179,31 @@ const REFUSAL_HTTP_STATUS: [u16; 5] = [400, 401, 403, 404, 426];
 /// The same refusals as `retcode` in the OneBot envelope (1400/1401/1403/1404).
 const REFUSAL_RETCODES: [i64; 4] = [1400, 1401, 1403, 1404];
 
+/// Marker in a not-committed error for a group-mute refusal (#46).
+pub(crate) const MUTE_REFUSAL: &str = "（被禁言 result=120）";
+
+/// OneBot retcode 100 carrying QQ `result=120`: she is muted in that group and QQ refused the
+/// message before delivery, so it is a definite refusal (#46). Retcode 100 without it stays unknown.
+pub(crate) fn is_mute_reply(v: &serde_json::Value) -> bool {
+    if v.get("retcode").and_then(|r| r.as_i64()) != Some(100) { return false; }
+    v.pointer("/data/result").and_then(|r| r.as_i64()) == Some(120)
+        || ["message", "wording", "msg"].iter()
+            .any(|f| v.get(*f).and_then(|s| s.as_str()).is_some_and(has_result_120))
+}
+
+fn has_result_120(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.match_indices("result").any(|(at, _)| {
+        let rest = lower[at + 6..].trim_start();
+        let Some(rest) = rest.strip_prefix(['=', ':', '：']) else { return false };
+        let rest = rest.trim_start();
+        rest.starts_with("120") && !rest[3..].starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// Whether a not-committed error came from a group-mute refusal.
+pub(crate) fn is_mute_refusal(error: &str) -> bool { error.contains(MUTE_REFUSAL) }
+
 /// Classify a send reply that arrived in full.
 ///
 /// The frozen JS bridge treats every non-`ok`/non-zero reply as a failed send and never retries,
@@ -187,6 +212,8 @@ const REFUSAL_RETCODES: [i64; 4] = [1400, 1401, 1403, 1404];
 /// went out, and `status:"async"` (retcode 1) only means queued. Only the request-level refusals
 /// above are therefore `NotCommitted`; every other failure is `Unknown`, which is verified
 /// against history and never resent automatically.
+///
+/// Retcode 100 with `result=120` (muted) is also `NotCommitted`; retcode 100 without it stays `Unknown`.
 pub(crate) fn classify_send_reply(http_status: u16, raw: &str) -> Result<serde_json::Value, SendError> {
     if REFUSAL_HTTP_STATUS.contains(&http_status) {
         return Err(SendError::NotCommitted(format!("OneBot 拒绝请求：HTTP {http_status}")));
@@ -203,6 +230,9 @@ pub(crate) fn classify_send_reply(http_status: u16, raw: &str) -> Result<serde_j
     }
     let wording = v.get("wording").and_then(|w| w.as_str()).unwrap_or("");
     let message = format!("OneBot 发送失败：retcode={} {wording}", retcode.unwrap_or(-1));
+    if is_mute_reply(&v) {
+        return Err(SendError::NotCommitted(format!("{message}{MUTE_REFUSAL}")));
+    }
     if retcode.is_some_and(|code| REFUSAL_RETCODES.contains(&code)) {
         Err(SendError::NotCommitted(message))
     } else {
