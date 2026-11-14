@@ -14,6 +14,9 @@ const NAME_MAX: usize = 40;
 const NAMES_MAX: usize = 10;
 /// Versions kept per persona.
 const VERSIONS_MAX: usize = 50;
+/// Estimated tokens (`briefing::estimate_tokens`) a newly approved core and compact form may use.
+pub const CORE_TOKENS_MAX: usize = 1500;
+pub const COMPACT_TOKENS_MAX: usize = 300;
 /// The fields a save compares with the latest version.
 const CONTENT: [&str; 8] = ["name", "core", "notes", "compact", "names", "traits", "editMode", "autoRules"];
 /// Parts auto edits may change; the name and the rule set are never auto-editable.
@@ -102,6 +105,19 @@ fn complete(v: &Value) -> bool {
     v["version"].is_u64()
         && v["name"].as_str().is_some_and(|n| !n.trim().is_empty())
         && v["core"].as_str().is_some_and(|c| !c.trim().is_empty())
+}
+
+/// Why a version's core or compact form is over its approval budget, or `None` when both fit.
+fn over_budget(v: &Value) -> Option<String> {
+    let core = crate::briefing::estimate_tokens(v["core"].as_str().unwrap_or(""));
+    if core > CORE_TOKENS_MAX {
+        return Some(format!("core uses {core} estimated tokens; at most {CORE_TOKENS_MAX}"));
+    }
+    let compact = crate::briefing::estimate_tokens(v["compact"].as_str().unwrap_or(""));
+    if compact > COMPACT_TOKENS_MAX {
+        return Some(format!("compact uses {compact} estimated tokens; at most {COMPACT_TOKENS_MAX}"));
+    }
+    None
 }
 
 /// The version in effect: `activeVersion`, only when that record is approved and complete. Every
@@ -284,10 +300,20 @@ pub fn list(context: &RuntimeContext) -> Result<Value, Failure> {
         "personas": personas}))
 }
 
+/// One persona with every version; each version also reports its estimated `coreTokens` and
+/// `compactTokens` (computed here, never stored) against the approval `budgets`.
 pub fn item(context: &RuntimeContext, id: &str) -> Result<Value, Failure> {
     let doc = load(context)?;
-    let found = persona(&doc, id)?.clone();
-    Ok(json!({"ok": true, "persona": found}))
+    let mut found = persona(&doc, id)?.clone();
+    if let Some(versions) = found["versions"].as_array_mut() {
+        for v in versions.iter_mut().filter(|v| v.is_object()) {
+            let core = crate::briefing::estimate_tokens(v["core"].as_str().unwrap_or(""));
+            let compact = crate::briefing::estimate_tokens(v["compact"].as_str().unwrap_or(""));
+            v["coreTokens"] = json!(core);
+            v["compactTokens"] = json!(compact);
+        }
+    }
+    Ok(json!({"ok": true, "persona": found, "budgets": {"coreTokens": CORE_TOKENS_MAX, "compactTokens": COMPACT_TOKENS_MAX}}))
 }
 
 pub fn create(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
@@ -329,6 +355,13 @@ pub fn approve(context: &RuntimeContext, body: &Value, authority: Authority<'_>)
         let target = version(persona(doc, &id)?, number).ok_or_else(|| fail(404, "version not found"))?;
         if !complete(target) {
             return Err(fail(409, "version is damaged"));
+        }
+        // A first approval must fit the persona budgets; putting an approved version back (rollback,
+        // an imported card) is not checked again.
+        if target["approved"] != true {
+            if let Some(error) = over_budget(target) {
+                return Err(fail(409, &error));
+            }
         }
         // Approval and rollback put this version's name in effect, so it must stay unique.
         if name_taken(doc, target["name"].as_str().unwrap_or(""), Some(&id)) {
@@ -580,6 +613,24 @@ pub(crate) fn core_block(context: &RuntimeContext, key: &str, limit: usize) -> S
     format!("【人设】{}\n{core}\n\n", found["name"].as_str().unwrap_or(""))
 }
 
+/// The wake words the conversation's persona declares (`wake_words.rs`): the active version's `names`,
+/// or its name when a version has no list; empty outside companion modes, without an assigned persona
+/// or with a damaged library.
+pub(crate) fn wake_names(context: &RuntimeContext, key: &str) -> Vec<String> {
+    if !applies(context) {
+        return Vec::new();
+    }
+    let Ok(doc) = load(context) else { return Vec::new() };
+    let Some(found) = effective_id(&doc, key).and_then(|id| doc["personas"].get(&id).and_then(active).cloned()) else {
+        return Vec::new();
+    };
+    let listed: Vec<&str> = match found["names"].as_array() {
+        Some(names) => names.iter().filter_map(Value::as_str).collect(),
+        None => found["name"].as_str().into_iter().collect(),
+    };
+    listed.into_iter().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
@@ -698,6 +749,57 @@ mod tests {
         assert_eq!(again["rebriefed"], json!(["group:1"]), "{again}");
         assert_eq!(generation(), json!(1));
         assert_eq!(super::list(&context).unwrap()["rebriefDue"], json!([]));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_refuses_a_core_or_compact_over_its_budget_but_allows_a_rollback() {
+        let (root, context) = fixture("budget");
+        let at = |core: usize, compact: usize| json!({"name": "甲", "core": "长".repeat(core), "compact": "短".repeat(compact)});
+        let id = new_id(super::create(&context, &at(super::CORE_TOKENS_MAX + 1, 10), open()).unwrap());
+        let refused = super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap_err();
+        assert_eq!(refused.0, 409);
+        assert!(refused.1.contains("1501") && refused.1.contains("1500"), "{}", refused.1);
+        super::update(&context, &json!({"id": id, "core": "长".repeat(super::CORE_TOKENS_MAX)}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 2}), open()).unwrap()["activeVersion"], 2, "exactly the budget is allowed");
+        super::update(&context, &json!({"id": id, "compact": "短".repeat(super::COMPACT_TOKENS_MAX + 1)}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 3}), open()).unwrap_err().0, 409);
+        super::update(&context, &json!({"id": id, "compact": "短".repeat(super::COMPACT_TOKENS_MAX)}), open()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 4}), open()).unwrap()["activeVersion"], 4);
+        // ASCII counts one token per four characters: 6000 letters are 1500 tokens, 6001 are 1501.
+        assert_eq!(crate::briefing::estimate_tokens(&"a".repeat(6000)), 1500);
+        assert_eq!(crate::briefing::estimate_tokens(&"a".repeat(6001)), 1501);
+        // An already approved version over the budget (an imported card) can be put back in effect.
+        std::fs::write(root.join("data/personas.json"), json!({"format": 1, "nextId": 2, "default": null, "overrides": {}, "importedRolesAt": 1,
+            "personas": {"p1": {"id": "p1", "activeVersion": 2, "versions": [
+                {"version": 1, "approved": true, "name": "乙", "core": "长".repeat(2000)},
+                {"version": 2, "approved": true, "name": "乙", "core": "短。"}]}}}).to_string()).unwrap();
+        assert_eq!(super::approve(&context, &json!({"id": "p1", "version": 1}), open()).unwrap()["activeVersion"], 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_api_defaults_names_to_the_name_and_keeps_an_explicit_empty_list() {
+        let (root, context) = fixture("names-default");
+        let names = |id: &str| super::load(&context).unwrap()["personas"][id]["versions"][0]["names"].clone();
+        let blank = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());
+        assert_eq!(names(&blank), json!(["甲"]), "no names given: the persona's name");
+        let none = new_id(super::create(&context, &json!({"name": "乙", "core": "核心。", "names": []}), open()).unwrap());
+        assert_eq!(names(&none), json!([]), "an explicit empty list stays empty");
+        super::update(&context, &json!({"id": none, "core": "新核心。"}), open()).unwrap();
+        assert_eq!(super::load(&context).unwrap()["personas"][none.as_str()]["versions"][1]["names"], json!([]), "an update without names keeps the list");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_item_reports_estimated_tokens_per_version() {
+        let (root, context) = fixture("tokens");
+        let id = new_id(super::create(&context, &json!({"name": "甲", "core": "小鲸鱼abcd", "compact": "鲸"}), open()).unwrap());
+        let item = super::item(&context, &id).unwrap();
+        let first = &item["persona"]["versions"][0];
+        assert_eq!((first["coreTokens"].clone(), first["compactTokens"].clone()), (json!(4), json!(1)));
+        assert_eq!(item["budgets"], json!({"coreTokens": 1500, "compactTokens": 300}));
+        assert!(super::load(&context).unwrap()["personas"][id.as_str()]["versions"][0].get("coreTokens").is_none(), "counts are not stored");
         let _ = std::fs::remove_dir_all(root);
     }
 }

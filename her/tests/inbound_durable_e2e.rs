@@ -102,6 +102,12 @@ enum Step {
     Wait(u64),
     /// A raw gateway frame, sent exactly as given.
     Frame(Value),
+    /// Make the fake `get_group_info` answer this `group_all_shut` from now on.
+    AllShut(i64),
+    /// Wait (in the script) until the fixture group's mute entry satisfies this check.
+    AwaitMute(fn(&Value) -> bool),
+    /// Wait until the fake OneBot has received at least `count` requests on `path`.
+    AwaitRequests { path: &'static str, count: usize },
     Drop,
 }
 
@@ -135,6 +141,12 @@ struct FakeGateway {
     slow_history: Arc<SlowHistory>,
     send_retcode: Option<i64>,
     held_send: Option<Arc<SlowHistory>>,
+    /// `get_group_member_info` answers this `shut_up_timestamp` (seconds) for her own id when set.
+    shut_up_timestamp: Option<i64>,
+    /// `get_group_info` answers this `group_all_shut` when set.
+    group_all_shut: Option<i64>,
+    /// Her role in the fixture group (default `member`).
+    self_role: Option<&'static str>,
 }
 
 fn mention_event(message_id: i64, text: &str, time_s: i64) -> Value {
@@ -236,6 +248,21 @@ fn serve_ws(listener: TcpListener, scripts: Vec<Vec<Step>>, gateway: Arc<Mutex<F
                     if socket.send(Message::Text(event.to_string())).is_err() {
                         break;
                     }
+                }
+                Step::AllShut(value) => gateway.lock().expect("gateway state").group_all_shut = Some(value),
+                Step::AwaitMute(check) => {
+                    let reached = wait_for(Duration::from_secs(20), || {
+                        fs::read_to_string(root.join("data/group-mutes.json")).ok()
+                            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                            .is_some_and(|v| check(&v["groups"][format!("group:{GROUP_ID}")]))
+                    });
+                    assert!(reached, "scripted mute state was not reached");
+                }
+                Step::AwaitRequests { path, count } => {
+                    let reached = wait_for(Duration::from_secs(20), || {
+                        gateway.lock().expect("gateway state").paths.iter().filter(|p| *p == path).count() >= count
+                    });
+                    assert!(reached, "the fake gateway did not see {count} {path} requests");
                 }
                 Step::Wait(ms) => thread::sleep(Duration::from_millis(ms)),
                 Step::Drop => break,
@@ -349,6 +376,17 @@ fn serve_onebot(listener: TcpListener, gateway: Arc<Mutex<FakeGateway>>) {
                     );
                 }
             }
+        } else if path == "/get_group_member_info" && gateway.lock().unwrap().shut_up_timestamp.is_some() {
+            let (ts, role) = {
+                let state = gateway.lock().unwrap();
+                (state.shut_up_timestamp.unwrap(), state.self_role.unwrap_or("member"))
+            };
+            write_http_json(&mut stream, "200 OK", &json!({"status":"ok","retcode":0,"data":{
+                "user_id": SELF_ID, "card": "", "nickname": "tester", "shut_up_timestamp": ts, "role": role}}));
+        } else if path == "/get_group_info" && gateway.lock().unwrap().group_all_shut.is_some() {
+            let value = gateway.lock().unwrap().group_all_shut.unwrap();
+            write_http_json(&mut stream, "200 OK", &json!({"status":"ok","retcode":0,"data":{
+                "group_id": GROUP_ID, "group_all_shut": value}}));
         } else if path.contains("send") && gateway.lock().unwrap().send_retcode.is_some() {
             let code = gateway.lock().unwrap().send_retcode.unwrap();
             write_http_json(&mut stream, "200 OK", &json!({"status":"failed", "retcode":code, "data":null}));
@@ -930,6 +968,9 @@ fn admin_can_reset_gap_retries_through_the_console_route() {
 
 #[path = "inbound_durable_e2e/notices.rs"]
 mod notices;
+
+#[path = "inbound_durable_e2e/mute.rs"]
+mod mute;
 
 #[test]
 fn hotfix127_two_restarts_notice_only_new_windows_and_never_retry_private_gaps() {

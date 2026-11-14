@@ -663,6 +663,33 @@ fn closed_agent_unresolved_preset_new_session_omits_preset_and_stores_the_empty_
 }
 
 #[test]
+fn a_muted_group_gets_no_turn_and_no_record_until_the_mute_ends() {
+    let mut rig = Rig::new("muted-chat", Seed::default());
+    let mute_path = rig.root.join("data/group-mutes.json");
+    let seed_mute = |until: i64| {
+        let mut groups = serde_json::Map::new();
+        groups.insert(GROUP_KEY.to_string(), json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        fs::write(&mute_path, json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    };
+    seed_mute(now_ms() + 600_000);
+    rig.start();
+    rig.push(group_event(1101, 1001, "tester", "", vec![text_seg("while muted")]));
+    let handled = wait_for(LONG, || {
+        let Ok(db) = rusqlite::Connection::open_with_flags(rig.root.join("data/inbound.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { return false };
+        db.query_row("SELECT stage FROM inbound_events WHERE event_key = ?1", [format!("group:{GROUP_ID}|message:1101")], |row| row.get::<_, String>(0)).ok().as_deref() == Some("handled")
+    });
+    assert!(handled, "the muted message was never marked handled");
+    assert!(rig.dsh.prompts().is_empty(), "no turn ran for a muted group: {:?}", rig.dsh.prompts());
+    assert!(rig.texts_to(GROUP_KEY).is_empty(), "nothing was sent: {:?}", rig.sends());
+    assert!(rig.data_json("social-v2.json")["conversations"].get(GROUP_KEY).is_none(), "no conversation record was created");
+
+    seed_mute(0);
+    rig.push(group_event(1102, 1001, "tester", "", vec![text_seg("after the mute")]));
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2), vec![ACK.to_string(), "synthetic reply".to_string()]);
+    assert_eq!(rig.dsh.prompts().len(), 1, "only the message after the mute ran a turn");
+}
+
+#[test]
 fn a_new_group_chat_acknowledges_before_rename_and_final_reply() {
     let mut rig = Rig::new("relay-order", Seed::default());
     rig.start();
@@ -1400,6 +1427,85 @@ fn reserved_probe_returns_to_watching_and_inbound_revives_probing() {
     assert!(rig.wait_prompts(2)[1].text.contains("【新消息】"));
     wait_phase(&rig, "probing");
     wait_phase(&rig, "idle");
+}
+
+fn seed_group_mute(rig: &Rig, personal_until: i64) {
+    let mut groups = serde_json::Map::new();
+    groups.insert(GROUP_KEY.to_string(), json!({"personalUntil": personal_until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+    fs::write(rig.root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+}
+
+#[test]
+fn reserved_muted_group_gets_no_probe_until_the_mute_ends() {
+    let mut rig = Rig::new(
+        "reserved-muted-probe",
+        reserved_seed(json!({"idleWindowMs":0,"idleRetryProbability":1,"idleRetryWaitMs":7000})),
+    );
+    seed_group_mute(&rig, now_ms() + 600_000);
+    rig.start();
+    assert_eq!(
+        rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
+        200
+    );
+    // The scheduler scans every five seconds: two scans pass without a probe prompt.
+    assert!(
+        !wait_for(Duration::from_secs(12), || !rig.dsh.prompts().is_empty()),
+        "a muted group got a model turn: {:?}",
+        rig.dsh.prompts()
+    );
+    assert_eq!(reserved_phase(&rig), "active", "the probe did not start");
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
+    seed_group_mute(&rig, 0);
+    wait_phase(&rig, "probing");
+    assert!(rig.wait_prompts(1)[0].text.contains("群里安静了一会儿"));
+}
+
+#[test]
+fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
+    let mut rig = Rig::new(
+        "reserved-muted-queue",
+        reserved_seed(json!({"activeReplyDelayMinMs":6000,"activeReplyDelayMaxMs":6000})),
+    );
+    rig.start();
+    // An idle group and a direct message: ingress itself enters the conversation and queues the job (due six
+    // seconds later), so the job exists before any scheduler scan. Once the phase reads `active` the job is
+    // pending, and the mute below can only be held by the dispatch guard: the scan guard and ingress do not apply.
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued before the ban");
+    wait_phase(&rig, "active");
+    assert!(rig.dsh.prompts().is_empty(), "the delayed job ran before the mute: {:?}", rig.dsh.prompts());
+    seed_group_mute(&rig, now_ms() + 600_000);
+    assert!(
+        !wait_for(Duration::from_secs(14), || !rig.dsh.prompts().is_empty()),
+        "queued work for a muted group ran a model turn: {:?}",
+        rig.dsh.prompts()
+    );
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
+    seed_group_mute(&rig, 0);
+    assert!(rig.wait_prompts(1)[0].text.contains("queued before the ban"), "the held job ran after the lift");
+}
+
+#[test]
+fn reserved_muted_group_answers_a_message_the_scan_held_after_the_mute_ends() {
+    let mut rig = Rig::new("reserved-muted-scan", reserved_seed(json!({})));
+    rig.start();
+    assert_eq!(
+        rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
+        200
+    );
+    // In an active group ingress only stores the message; the scan turns it into a job. The mute lands
+    // right after ingress, so the scan guard is what holds it. (`lastActiveMessageAt` cannot prove ingress
+    // ran: entering the phase through the console sets it too, and a message arriving under a mute is dropped.)
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 held by the scan");
+    assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["recent"].to_string().contains("held by the scan")),
+        "ingress never stored the message");
+    seed_group_mute(&rig, now_ms() + 600_000);
+    assert!(
+        !wait_for(Duration::from_secs(8), || !rig.dsh.prompts().is_empty()),
+        "a muted group got a model turn: {:?}",
+        rig.dsh.prompts()
+    );
+    seed_group_mute(&rig, 0);
+    assert!(rig.wait_prompts(1)[0].text.contains("held by the scan"), "the held message was answered after the lift");
 }
 
 #[test]

@@ -1063,6 +1063,9 @@ pub fn pre_sleep_remaining(st: &Value, cfg: &Value, now: i64) -> Option<i64> {
     Some(window_end.map_or(remaining, |end| remaining.min(end - now)))
 }
 
+/// A wake configuration keeps at most this many `keywords`.
+pub const KEYWORDS_MAX: usize = 50;
+
 fn is_infinite(wc: &Value) -> bool {
     wc.get("infinite").and_then(|v| v.as_bool()).unwrap_or(true)
 }
@@ -1124,7 +1127,7 @@ pub fn normalize_wake_config(
                 other => other.to_string().trim().to_string(),
             })
             .filter(|s| !s.is_empty())
-            .take(50)
+            .take(KEYWORDS_MAX)
             .map(|s| Value::String(s.chars().take(100).collect()))
             .collect(),
         Some(_) => Vec::new(),
@@ -1133,7 +1136,7 @@ pub fn normalize_wake_config(
             .and_then(|v| v.as_array())
             .map(|a| {
                 a.iter()
-                    .take(50)
+                    .take(KEYWORDS_MAX)
                     .map(|k| match k {
                         Value::String(s) => Value::String(s.chars().take(100).collect()),
                         other => other.clone(),
@@ -1148,6 +1151,10 @@ pub fn normalize_wake_config(
     triggers.insert("anyMessage".into(), Value::Bool(trig_bool("anyMessage", flag_of(&cur_tr, "anyMessage"))));
     triggers.insert("poke".into(), Value::Bool(trig_bool("poke", flag_of(&cur_tr, "poke"))));
     triggers.insert("keywords".into(), Value::Array(keywords));
+    // Persona names she turned off (`wake_words.rs`): kept like keywords when the input omits them.
+    if let Some(names) = crate::wake_words::drop_names_input(in_tr.get("dropNames"), cur_tr.get("dropNames")) {
+        triggers.insert("dropNames".into(), Value::Array(names));
+    }
 
     let cur_mode = cur.get("mode").and_then(|v| v.as_str()).unwrap_or("diving");
     let mode = match input_obj.get("mode").and_then(|v| v.as_str()) {
@@ -1343,7 +1350,12 @@ pub fn ensure_wakeable(wc: &mut Value, cfg: &Value, now: i64, rand01: f64) -> bo
     if wakeable {
         return false;
     }
+    // Persona names she turned off stay off through the reset (`wake_words.rs`), like keywords in the other resets.
+    let dropped = wc["triggers"].get("dropNames").filter(|names| names.as_array().is_some_and(|a| !a.is_empty())).cloned();
     *wc = default_wake_config(cfg, now, rand01);
+    if let Some(names) = dropped {
+        wc["triggers"]["dropNames"] = names;
+    }
     true
 }
 

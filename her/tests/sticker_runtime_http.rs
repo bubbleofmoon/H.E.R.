@@ -412,6 +412,42 @@ fn model_sends_a_historic_favorite_and_the_use_survives_restart() {
     assert_eq!(legacy_snapshot(&root), legacy_before, "default production paths were touched");
 }
 
+#[test]
+fn a_result_120_sticker_refusal_is_a_definite_403_and_teaches_the_mute() {
+    let ob = OneBot::start(vec![row("stk1", "a.png", "cat")]);
+    let root = fixture("send-120", &ob.url, json!({"enabled": true}), json!([local("stk1", "a.png")]));
+    fs::write(root.p("images/a.png"), png(10, 200, 30)).unwrap();
+    ob.reply("send_group_msg", json!({"status": "failed", "retcode": 100, "message": "sendMsg failed: result=120", "wording": "muted", "data": null}));
+    let console = Console::start(&root);
+    let body = json!({"key": KEY, "stickerId": "stk1"});
+    let (status, result) = console.call("POST", "/api/socialV2/send-sticker", true, body.clone());
+    assert_eq!(status, 403, "{result}");
+    assert!(result["error"].as_str().unwrap_or_default().contains("禁言"), "{result}");
+    let store = root.json("data/group-mutes.json");
+    assert_eq!(store["groups"][KEY]["personalUntil"], json!(-1));
+    assert_eq!(root.json("data/stickers.json")[0]["useCount"], 7, "a refused sticker is not a use");
+    let (status, result) = console.call("POST", "/api/socialV2/send-sticker", true, body);
+    assert_eq!(status, 403, "{result}");
+    assert_eq!(ob.count("send_group_msg"), 1, "the second send stayed local");
+}
+
+#[test]
+fn a_muted_group_sticker_send_is_refused_locally() {
+    let ob = OneBot::start(vec![row("stk1", "a.png", "cat")]);
+    let root = fixture("send-muted", &ob.url, json!({"enabled": true}), json!([local("stk1", "a.png")]));
+    fs::write(root.p("images/a.png"), png(10, 200, 30)).unwrap();
+    let until = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 + 600_000;
+    let mut groups = serde_json::Map::new();
+    groups.insert(KEY.to_string(), json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+    fs::write(root.p("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    let console = Console::start(&root);
+    let (status, result) = console.call("POST", "/api/socialV2/send-sticker", true, json!({"key": KEY, "stickerId": "stk1"}));
+    assert_eq!(status, 403, "{result}");
+    assert!(result["error"].as_str().unwrap_or_default().contains("禁言"), "{result}");
+    assert_eq!(ob.count("send_group_msg"), 0, "a muted group gets no gateway send");
+    assert!(outbox(&root).iter().all(|r| r["k"] != "intent"), "no send intent is recorded");
+}
+
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !f() {

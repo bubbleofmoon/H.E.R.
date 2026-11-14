@@ -23,6 +23,7 @@ mod briefing;
 mod initial_prompts;
 mod persona;
 mod persona_command;
+mod wake_words;
 mod activity;
 mod feedback;
 mod wake;
@@ -67,6 +68,7 @@ mod config;
 mod inbound;
 mod send_outbox;
 mod recorded_send;
+mod group_mute;
 mod history_log;
 mod session_map;
 mod session_context;
@@ -172,6 +174,9 @@ struct Triggers {
     name_mention: bool,
     #[serde(default)]
     keywords: Vec<String>,
+    /// Persona names she turned off (`wake_words.rs`).
+    #[serde(rename = "dropNames", default)]
+    drop_names: Vec<String>,
     #[serde(default)]
     question: bool,
     #[serde(default)]
@@ -210,6 +215,15 @@ struct Event {
     message_type: String,
     #[serde(default)]
     sub_type: String,
+    /// Lenient like the other mute fields: a null or non-string value must not drop the whole frame.
+    #[serde(default)]
+    notice_type: Option<Value>,
+    /// `group_ban` operator. Lenient: a malformed value only loses the name in the owner notice.
+    #[serde(default)]
+    operator_id: Option<Value>,
+    /// `group_ban` duration in seconds. Lenient: an unreadable value means the end is unknown.
+    #[serde(default)]
+    duration: Option<Value>,
     #[serde(default, deserialize_with = "deserialize_account_id")]
     group_id: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_account_id")]
@@ -1958,6 +1972,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
     let mut seen = inbound::SeenTracker::default();
+    let mut mute_refresh_armed = false;
+    let mut last_mute_recheck = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
     let mut replay_queue: std::collections::VecDeque<inbound::Replayable> = std::collections::VecDeque::new();
     for item in journal.replayable().await? {
@@ -2210,6 +2226,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 None => break,
             },
             _ = ticker.tick() => {
+                if self_id > 0 && last_mute_recheck.elapsed() >= group_mute::RECHECK_EVERY {
+                    last_mute_recheck = std::time::Instant::now();
+                    let groups: Vec<(i64, Option<i64>)> = group_mute::unknown_end_groups(&runtime_context, parity_clock::now_ms()).into_iter().map(|g| (g, None)).collect();
+                    group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), self_id, groups);
+                }
                 if let Some(hub)=reserved_hub.as_mut(){ if let Err(error)=hub.tick(&self_nick).await {println!("[reserved] scheduler error: {error}");} }
                 if let Some(hub) = reserved2_hub.as_mut() {
                     if let Err(error) = hub.tick(&self_nick, self_id).await { println!("[reserved2] scheduler error: {error}"); }
@@ -2264,7 +2285,22 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 println!("[her] 入站帧含孤立代理项转义，已替换为 U+FFFD 后照常处理");
                 (ev, repaired)
             }
-            Err(_) => continue,
+            Err(_) => {
+                // #46: QQ's whole-group mute notice has user_id 0, which `Event` refuses.
+                if !replayed && self_id > 0 {
+                    if let Some((gid, operator)) = group_mute::whole_group_notice(&text) {
+                        if allow_groups.iter().any(|g| g == &gid.to_string()) {
+                            // Older refreshes predate this notice: drop them before the new one starts.
+                            let (context, key) = (runtime_context.clone(), format!("group:{gid}"));
+                            if let Err(error) = tokio::task::spawn_blocking(move || group_mute::note_whole_group_notice(&context, &key)).await {
+                                println!("[mute] group:{gid} 全员禁言通知的处理线程失败：{error}");
+                            }
+                            group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), self_id, vec![(gid, operator)]);
+                        }
+                    }
+                }
+                continue;
+            }
         };
         // 心跳等元事件只记内存，断线时补写一次；其余帧才落盘（不在异步线程里 fsync）。
         if !replayed {
@@ -2272,6 +2308,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             dependency_watch::note_frame(&ev.post_type, &ev.meta_event_type, ev.status.as_ref());
             if let Some(at) = seen.observe(now_ms() as i64, &ev.post_type) {
                 journal.touch_seen(at).await?;
+            }
+        }
+        // #46: once per connection (startup and every reconnect), relearn mute state missed while away.
+        if !mute_refresh_armed {
+            let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
+            if me > 0 {
+                mute_refresh_armed = true;
+                let groups: Vec<(i64, Option<i64>)> = allow_groups.iter().filter_map(|g| g.parse().ok()).map(|g| (g, None)).collect();
+                group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), me, groups);
             }
         }
 
@@ -2362,6 +2407,26 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     println!("[her] identity.json 未能写入：{error}");
                 }
             }
+        }
+        // #46: QQ's mute notice. Before the self filter (it names her own id) and before mode dispatch;
+        // it is not journaled and never wakes anyone. A notice for another user is ignored.
+        if is_notice && ev.notice_type.as_ref().and_then(Value::as_str) == Some("group_ban") {
+            let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
+            if let (false, Some(gid)) = (replayed, ev.group_id) {
+                if me > 0 && ev.user_id == Some(me) && allow_groups.iter().any(|g| g == &gid.to_string()) {
+                    let operator = ev.operator_id.as_ref().and_then(protocol_integer).filter(|id| *id > 0);
+                    let (context, sub_type, duration, key) = (runtime_context.clone(), ev.sub_type.clone(), ev.duration.clone(), format!("group:{gid}"));
+                    // Settled before the next frame: a message right after the ban never wakes her.
+                    let log_key = format!("group:{gid}");
+                    if let Err(error) = tokio::task::spawn_blocking(move || {
+                        let cfg = context.load_config().unwrap_or_else(|_| json!({}));
+                        group_mute::on_self_notice(&context, &cfg, &key, &sub_type, duration.as_ref(), operator);
+                    }).await {
+                        println!("[mute] {log_key} 禁言通知的处理线程失败：{error}");
+                    }
+                }
+            }
+            continue;
         }
         let sender = if is_notice { ev.sender_id.or(ev.user_id) } else { ev.user_id }
             .or_else(|| ev.sender.as_ref().and_then(|s| s.user_id));
@@ -2467,6 +2532,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 {
                     continue;
                 }
+                if kind == "group" && group_mute::active(&runtime_context, &key).is_some() {
+                    // #46: muted here, so nothing could be sent; no turn runs for it.
+                    journal.mark_handled(vec![inbound_key], now_ms() as i64).await?;
+                    continue;
+                }
                 events += 1;
                 let inb = chat::Inbound {
                     kind,
@@ -2535,13 +2605,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // 与 JS 一致：**状态里没有这个会话就直接跳过**。
         // 之前这里 unwrap_or_default() 会给未知会话套上默认触发器（@/概率 0.05），
         // 于是重放出来的唤醒数比 JS 多一截 —— 数据对不上的第一来源就是这个。
-        let Some(tr) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
+        let Some(mut tr) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
             .and_then(|v| serde_json::from_value::<SocialState>(v).ok())
             .and_then(|s| s.conversations.get(&key).and_then(|c| c.wake_config.clone()))
             .map(|w| w.triggers)
         else {
             continue;
         };
+        // The persona's names wake her like keywords, except the ones she dropped.
+        tr.keywords = wake_words::effective(&runtime_context, &key, &tr.keywords, &tr.drop_names);
 
         // 入站持久化（ticket 07）：保存成功后才进入唤醒；同一事件身份的重复到达不产生第二次工作。
         let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
