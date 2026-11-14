@@ -1706,4 +1706,41 @@ mod tests {
         assert_eq!(records[3]["messageId"], 4242);
         assert_eq!(records[3]["verified"], true);
     }
+
+    /// Issue #82: a chat send waiting behind a held chain must not occupy the runtime worker.
+    #[test]
+    fn issue82_chat_send_waiting_on_held_chain_leaves_ingress_running() {
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let (root, context) = issue70_root("chain-wait");
+        let records = context.clone();
+        let held = crate::recorded_send::send_chain();
+        // Never contacted: the guard refuses before any request.
+        let ob = OneBot::new("http://127.0.0.1:1", String::new());
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let send = runtime.spawn(async move {
+            entered_tx.send(()).unwrap();
+            let guard = || -> Result<(), String> { Err("fixture stop".into()) };
+            send_recorded(&context, &ob, "group:42", "chat", "reply", "排队中", 0, &guard)
+        });
+        entered.recv_timeout(Duration::from_secs(5)).expect("send task never started");
+        std::thread::sleep(Duration::from_millis(200)); // let it reach the chain
+        let (ingress_tx, ingress) = std::sync::mpsc::channel();
+        runtime.spawn(async move { let _ = ingress_tx.send(()); });
+        let progressed = ingress.recv_timeout(Duration::from_secs(3)).is_ok();
+        let waiting = !send.is_finished();
+        let before = crate::send_outbox::read_records(&records).unwrap().len();
+        drop(held);
+        let report = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(10), send).await })
+            .expect("send did not finish after the chain was released")
+            .unwrap();
+        let kinds: Vec<String> = crate::send_outbox::read_records(&records).unwrap().iter()
+            .filter_map(|r| r["k"].as_str().map(str::to_string)).collect();
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(progressed, "an ingress task starved while a chat send waited behind the held chain");
+        assert!(waiting && before == 0, "the chat send must wait for the chain before recording its intent");
+        assert!(report.error.as_deref().is_some_and(|e| e.contains("fixture stop")), "{report:?}");
+        assert_eq!(kinds, ["intent", "cancelled"]);
+    }
 }
