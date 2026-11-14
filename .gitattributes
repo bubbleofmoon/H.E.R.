@@ -7,3 +7,5 @@
 *.yml text eol=lf
 # Windows lifecycle launchers are ASCII with CRLF in a checkout.
 /停止机器人.bat text eol=crlf
+# The published default persona is read byte for byte by a unit test on every OS.
+her/tests/fixtures/persona/*.json text eol=lf

@@ -802,4 +802,21 @@ mod tests {
         assert!(super::load(&context).unwrap()["personas"][id.as_str()]["versions"][0].get("coreTokens").is_none(), "counts are not stored");
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn the_published_default_persona_is_within_budgets_and_approvable() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/persona/xiaojingyu-v1.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("the owner-approved default persona is published at her/tests/fixtures/persona/xiaojingyu-v1.json: {error}"));
+        assert!(!text.starts_with('\u{FEFF}') && !text.contains('\r'), "UTF-8 without BOM, LF line endings");
+        let body: Value = serde_json::from_str(&text).expect("the published persona is JSON");
+        let keys: Vec<&String> = body.as_object().expect("the create body is an object").keys().collect();
+        assert!(keys.iter().all(|k| super::CONTENT.contains(&k.as_str())), "only create-body fields: {keys:?}");
+        let names = body["names"].as_array().map(Vec::len).unwrap_or(0);
+        assert!((1..=10).contains(&names), "it declares 1 to 10 wake names, not {names}");
+        let (root, context) = fixture("published");
+        let id = new_id(super::create(&context, &body, open()).unwrap());
+        assert_eq!(super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap()["activeVersion"], 1, "within the core and compact budgets");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
