@@ -575,9 +575,6 @@ fn unavailable_runtime_does_not_hide_malformed_cli_input() {
 }
 
 struct Rig {
-    /// Every process instance this rig caused, by role (`console`, `live`, `supervisor`):
-    /// recorded at spawn and from the owner markers, stopped by `Drop` with `kill_verified`.
-    owners: Vec<(&'static str, ProcessIdentity)>,
     console: Option<Child>,
     supervisor: Option<Child>,
     fixture: Fixture,
@@ -649,18 +646,7 @@ impl Rig {
             &port.to_string(),
         ]));
         let supervisor = Some(spawn(&["supervise"]));
-        let mut owners = Vec::new();
-        for (role, child) in [("console", &console), ("supervisor", &supervisor)] {
-            let pid = child
-                .as_ref()
-                .and_then(|child| child.0.as_ref())
-                .map(std::process::Child::id);
-            if let Some(Ok(Some(identity))) = pid.map(process_identity::identity_of) {
-                owners.push((role, identity));
-            }
-        }
         let rig = Self {
-            owners,
             console,
             supervisor,
             fixture,
@@ -695,120 +681,6 @@ impl Rig {
             self.config.to_string(),
         )
         .unwrap();
-    }
-    /// Adds every owner the runtime published in `data/logs/<lock>.owner.json`. Reads only the
-    /// marker: a held `.lock` file is byte-range locked on Windows (os error 33).
-    fn record_owners(&mut self) {
-        for (name, role) in [
-            ("rbridge-live.lock", "live"),
-            ("rbridge-console.lock", "console"),
-            ("rbridge-supervisor.lock", "supervisor"),
-        ] {
-            let marker = self
-                .fixture
-                .0
-                .join("data/logs")
-                .join(format!("{name}.owner.json"));
-            let Ok(bytes) = std::fs::read(&marker) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-                continue;
-            };
-            let Ok(identity) = serde_json::from_value::<ProcessIdentity>(value["identity"].clone())
-            else {
-                continue;
-            };
-            if !self.owners.iter().any(|(_, known)| *known == identity) {
-                self.owners.push((role, identity));
-            }
-        }
-    }
-    fn kill_recorded(&self, select: impl Fn(&str) -> bool) {
-        for (role, identity) in self.owners.iter().filter(|(role, _)| select(role)) {
-            match process_identity::kill_verified(identity) {
-                KillOutcome::Gone => {}
-                KillOutcome::Killed => cleanup_note(format_args!(
-                    "killed {role} pid {} that outlived the lifecycle stop",
-                    identity.pid
-                )),
-                outcome => cleanup_note(format_args!(
-                    "LEAK RISK: {role} pid {} was not stopped: {outcome:?}",
-                    identity.pid
-                )),
-            }
-        }
-    }
-    fn running_owners(&self) -> Vec<String> {
-        self.owners
-            .iter()
-            .filter(|(_, identity)| process_identity::check_identity(identity) == Liveness::Matches)
-            .map(|(role, identity)| format!("{role} pid {}", identity.pid))
-            .collect()
-    }
-}
-impl Drop for Rig {
-    /// Stops everything this rig caused on every exit path (pass, failed assert, panic, timeout).
-    /// Never panics and never asserts: a panic while unwinding aborts the whole test binary.
-    /// Field drops follow: `Child` handles kill and reap, and `Fixture` removes the directory last.
-    fn drop(&mut self) {
-        self.record_owners();
-        // 1. The product's own stop, each call bounded; failures are reported, never fatal.
-        let stops: [(&str, &[&str]); 2] = [
-            (
-                "set stopped",
-                &["lifecycle", "set", "stopped", "--confirm", "--runtime-root"],
-            ),
-            (
-                "stop-supervisor",
-                &["lifecycle", "stop-supervisor", "--confirm", "--runtime-root"],
-            ),
-        ];
-        for (label, args) in stops {
-            let mut cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
-            cmd.args(args).arg(&self.fixture.0);
-            match run_bounded(&mut cmd, CLEANUP_BOUND) {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => cleanup_note(format_args!(
-                    "lifecycle {label} exited {:?}: {}",
-                    out.status.code(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                )),
-                Err(error) => cleanup_note(format_args!("lifecycle {label} {error}")),
-            }
-            self.record_owners();
-        }
-        // 2. Give the recorded owners time to exit on their own.
-        let deadline = Instant::now() + CLEANUP_BOUND;
-        while Instant::now() < deadline && !self.running_owners().is_empty() {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        // 3. Pinned kills by pid plus start stamp; the supervisor goes last.
-        self.kill_recorded(|role| role != "supervisor");
-        self.kill_recorded(|role| role == "supervisor");
-        // 4. A child the supervisor started just before it died publishes its marker late.
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            let known = self.owners.len();
-            self.record_owners();
-            if self.owners.len() > known {
-                self.kill_recorded(|_| true);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        // 5. TerminateProcess is asynchronous: confirm exits before Fixture removes the directory.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let running = self.running_owners();
-            if running.is_empty() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                cleanup_note(format_args!("still running after cleanup: {running:?}"));
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 }
 
@@ -1240,14 +1112,32 @@ fn restore_with_fake_peers(never_ready: bool) {
             self.thread.take().unwrap().join().unwrap();
         }
     }
+    struct RestoreRig(Rig);
+    impl Drop for RestoreRig {
+        fn drop(&mut self) {
+            let _ = hidden(env!("CARGO_BIN_EXE_her-cli"))
+                .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
+                .arg(&self.0.fixture.0)
+                .output();
+            let _ = hidden(env!("CARGO_BIN_EXE_her-cli"))
+                .args([
+                    "lifecycle",
+                    "stop-supervisor",
+                    "--confirm",
+                    "--runtime-root",
+                ])
+                .arg(&self.0.fixture.0)
+                .output();
+        }
+    }
     for &offline in if never_ready {
         &[true][..]
     } else {
         &[false, true][..]
     } {
-        let mut rig = Rig::new();
+        let mut rig = RestoreRig(Rig::new());
         let socket = SocketPeer::new();
-        let deps = rig.fixture.0.join("dependencies.json");
+        let deps = rig.0.fixture.0.join("dependencies.json");
         let mut config: Value = serde_json::from_slice(&std::fs::read(&deps).unwrap()).unwrap();
         config["onebot_ws"] = if never_ready {
             // A refused WebSocket connection prevents live startup; HTTP peers remain healthy.
@@ -1256,12 +1146,12 @@ fn restore_with_fake_peers(never_ready: bool) {
             json!(socket.url)
         };
         std::fs::write(deps, config.to_string()).unwrap();
-        rig.config["backends"]["mcpRustBridge"] = json!(true);
-        rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
-        rig.config["tasks"]["watchdog"]["enabled"] = json!(true);
-        rig.save_config();
+        rig.0.config["backends"]["mcpRustBridge"] = json!(true);
+        rig.0.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+        rig.0.config["tasks"]["watchdog"]["enabled"] = json!(true);
+        rig.0.save_config();
         let initialized = Instant::now() + Duration::from_secs(10);
-        while !rig.fixture.0.join("data/backup-notices.json").exists() {
+        while !rig.0.fixture.0.join("data/backup-notices.json").exists() {
             assert!(
                 Instant::now() < initialized,
                 "supervisor initialization did not finish"
@@ -1271,13 +1161,13 @@ fn restore_with_fake_peers(never_ready: bool) {
         if offline {
             let stopped = hidden(env!("CARGO_BIN_EXE_her-cli"))
                 .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
-                .arg(&rig.fixture.0)
+                .arg(&rig.0.fixture.0)
                 .output()
                 .unwrap();
             assert!(stopped.status.success());
-            drop(rig.supervisor.take());
+            drop(rig.0.supervisor.take());
         }
-        let root = &rig.fixture.0;
+        let root = &rig.0.fixture.0;
         for dir in ["resources/roles", "resources/docs", "resources/patches"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
@@ -1390,7 +1280,7 @@ fn restore_with_fake_peers(never_ready: bool) {
                 String::from_utf8_lossy(&output.stderr)
             );
         } else {
-            let port = rig.config["consolePort"].as_u64().unwrap() as u16;
+            let port = rig.0.config["consolePort"].as_u64().unwrap() as u16;
             let name = archive.file_name().unwrap().to_str().unwrap();
             let (status, plan) = console_restore(
                 port,
@@ -1454,7 +1344,7 @@ fn restore_with_fake_peers(never_ready: bool) {
         assert_eq!(value, "archived memory");
         if !offline {
             assert!(
-                rig
+                rig.0
                     .supervisor
                     .as_mut()
                     .unwrap()
@@ -1467,7 +1357,7 @@ fn restore_with_fake_peers(never_ready: bool) {
                 "supervisor stays running"
             );
         }
-        let (health_code, health_report) = rig.fixture.check(&[]);
+        let (health_code, health_report) = rig.0.fixture.check(&[]);
         eprintln!("post-restore health (offline={offline}, code={health_code}): {health_report}");
         if health_code != 0 {
             let status = hidden(env!("CARGO_BIN_EXE_her-cli"))
@@ -1489,29 +1379,38 @@ fn restore_with_fake_peers(never_ready: bool) {
 
 #[test]
 fn a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change() {
-    let mut rig = Rig::new();
+    struct ReconcileRig(Rig);
+    impl Drop for ReconcileRig {
+        fn drop(&mut self) {
+            let _ = hidden(env!("CARGO_BIN_EXE_her-cli"))
+                .args(["lifecycle", "set", "stopped", "--confirm", "--runtime-root"])
+                .arg(&self.0.fixture.0)
+                .output();
+        }
+    }
+    let mut rig = ReconcileRig(Rig::new());
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !rig.fixture.0.join("data/backup-notices.json").exists() {
+    while !rig.0.fixture.0.join("data/backup-notices.json").exists() {
         assert!(
             Instant::now() < deadline,
             "supervisor did not complete its first poll"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    rig.config["backends"]["mcpRustBridge"] = json!(true);
-    rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
-    rig.save_config();
-    drop(rig.console.take());
+    rig.0.config["backends"]["mcpRustBridge"] = json!(true);
+    rig.0.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+    rig.0.save_config();
+    drop(rig.0.console.take());
     let running = hidden(env!("CARGO_BIN_EXE_her-cli"))
         .args(["lifecycle", "set", "running", "--runtime-root"])
-        .arg(&rig.fixture.0)
+        .arg(&rig.0.fixture.0)
         .output()
         .unwrap();
     assert!(running.status.success());
     // The supervisor notices the new revision on its one-second scheduler pass and only starts the
     // console owner after that: measured at ~5 s of supervisor delay and ~7 s to a healthy
     // console on the Windows host, so this check outlives the shared 12-second CLI bound.
-    let (code, verdict) = rig.fixture.check_bounded(&["--wait", "30s"], Duration::from_secs(40));
+    let (code, verdict) = rig.0.fixture.check_bounded(&["--wait", "30s"], Duration::from_secs(40));
     assert_eq!(code, 0, "a new running revision must reconcile: {verdict}");
 }
 
