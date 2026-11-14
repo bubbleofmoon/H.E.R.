@@ -51,6 +51,7 @@ mod voice;
 mod forward_fmt;
 mod preset_prompt;
 mod runtime;
+mod guarded_file;
 mod install_root;
 mod scheduled_task;
 mod release;
@@ -62,6 +63,7 @@ mod config;
 mod inbound;
 mod send_outbox;
 mod recorded_send;
+mod history_log;
 mod session_map;
 mod session_context;
 mod session_rotation;
@@ -2330,6 +2332,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
             continue;
+        }
+        // Chat history log (#58): every conversation, before self filtering, the allow list and mode dispatch.
+        if !replayed {
+            history_log::record_inbound(&runtime_context, &text);
         }
         let is_message = ev.post_type == "message";
         let is_notice = ev.post_type == "notice";

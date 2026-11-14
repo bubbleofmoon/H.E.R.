@@ -118,7 +118,7 @@ fn regular_tree_path(path: &Path) -> Result<(), String> {
     crate::install_root::check_runtime(path, false).map_err(|_| "relay path is protected")?;
     for ancestor in path.ancestors() {
         let meta = std::fs::symlink_metadata(ancestor).map_err(|_| "relay path is unavailable")?;
-        if super::redirected(&meta) {
+        if crate::guarded_file::is_link(&meta) {
             return Err("relay paths must not be redirected".into());
         }
     }

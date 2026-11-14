@@ -193,13 +193,13 @@ fn legacy_fence_paths(root: &std::path::Path) -> Result<[std::path::PathBuf; 2],
         Err(_) => return Err("legacy Rust gate directory is unavailable".into()),
     }
     let metadata = std::fs::symlink_metadata(&logs).map_err(|_| "legacy Rust gate directory is unavailable")?;
-    if !metadata.is_dir() || legacy_reparse(&metadata) { return Err("legacy Rust gate directory is redirected".into()); }
+    if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) { return Err("legacy Rust gate directory is redirected".into()); }
     Ok([root.join("state/bridge.lock"), logs.join("rbridge-live.lock")])
 }
 
 fn verify_legacy_fence(path: &std::path::Path, record: &[u8]) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| "legacy launch fence is unavailable")?;
-    if !metadata.is_dir() || legacy_reparse(&metadata) || read_legacy(&path.join("retired.json"))? != record {
+    if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) || read_legacy(&path.join("retired.json"))? != record {
         return Err("legacy launch fence is occupied or belongs to another runtime".into());
     }
     Ok(())
@@ -234,7 +234,7 @@ pub fn verify_cutover(context: &RuntimeContext) -> Result<(), String> {
 fn read_legacy(path: &std::path::Path) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
     let metadata = std::fs::symlink_metadata(path).map_err(|_| "legacy file is unavailable")?;
-    if !metadata.is_file() || legacy_reparse(&metadata) || metadata.len() > 8 * 1024 * 1024 {
+    if !metadata.is_file() || crate::guarded_file::is_link(&metadata) || metadata.len() > 8 * 1024 * 1024 {
         return Err("legacy file is not a bounded regular file".into());
     }
     let mut bytes = Vec::new();
@@ -242,16 +242,6 @@ fn read_legacy(path: &std::path::Path) -> Result<Vec<u8>, String> {
         .read_to_end(&mut bytes).map_err(|_| "legacy file cannot be read")?;
     if bytes.len() > 8 * 1024 * 1024 { return Err("legacy file is too large".into()); }
     Ok(bytes)
-}
-
-fn legacy_reparse(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() { return true; }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 { return true; }
-    }
-    false
 }
 
 #[cfg(test)]
