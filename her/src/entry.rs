@@ -27,6 +27,8 @@ mod wake;
 mod question;
 #[cfg(test)]
 mod wake_rate_tests;
+#[cfg(test)]
+mod production_root_tests;
 mod session;
 mod reserved2;
 mod reserved;
@@ -53,7 +55,6 @@ mod forward_fmt;
 mod preset_prompt;
 mod runtime;
 mod guarded_file;
-mod install_root;
 mod scheduled_task;
 mod release;
 mod release_signature;

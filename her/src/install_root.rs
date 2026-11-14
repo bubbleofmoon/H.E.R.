@@ -2,6 +2,22 @@
 #![allow(dead_code)]
 use std::path::{Component, Path, PathBuf};
 
+/// The one production root's spelling. The fixed-path runtime keeps its files in their old shape
+/// under this same root until #78 retires that mode: `legacy_path!("qq-bridge/config.json")`
+/// spells one of them. Production path literals live only in this module.
+#[macro_export]
+macro_rules! legacy_path {
+    () => {
+        "C:/qqbot"
+    };
+    (windows $relative:literal) => {
+        concat!("C:\\qqbot\\", $relative)
+    };
+    ($relative:literal) => {
+        concat!("C:/qqbot/", $relative)
+    };
+}
+
 pub const DEFAULT_INSTALL_ROOT: &str = if cfg!(windows) { "C:/HER" } else { "/HER" };
 
 pub struct InstallRoot {
@@ -220,6 +236,12 @@ pub fn development_root(path: impl AsRef<Path>) -> PathBuf {
         .and_then(|install| install.check_development(path))
         .unwrap_or_else(|reason| panic!("fixture root refused: {reason}"));
     path.to_path_buf()
+}
+
+/// The fixed-path runtime's DSH home under a user profile; the install-root runtime keeps its DSH
+/// home at `runtime/user/dsh` instead. Retired with the fixed-path mode (#78).
+pub fn legacy_dsh_home(profile: impl AsRef<std::ffi::OsStr>) -> PathBuf {
+    PathBuf::from(profile.as_ref()).join(".dsh")
 }
 
 // Compare components, including a path separator boundary: HER-other is never inside HER.

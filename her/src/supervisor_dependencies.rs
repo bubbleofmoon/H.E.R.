@@ -578,22 +578,22 @@ fn npx_cache(path: &Path) -> bool {
 fn dependency_directory(context: &RuntimeContext, cfg: &Value) -> Result<PathBuf, String> {
     Ok(match cfg["dependencies"].get("directory") {
         None | Some(Value::Null) => {
-            // Production keeps dependencies beside the runtime: <install root>/deps.
-            let install = crate::install_root::InstallRoot::configured()?;
-            let runtime = context.runtime_root().ok_or("runtime root unavailable")?;
-            if std::fs::canonicalize(install.root().join("runtime"))
-                .ok()
-                .as_deref()
-                != Some(runtime)
-            {
-                return Err(
-                    "dependencies.directory is not configured for the dependency install".into(),
-                );
-            }
-            install.root().join("deps")
+            default_dependency_directory(&crate::install_root::InstallRoot::configured()?, context)?
         }
         Some(value) => absolute(value.as_str())?,
     })
+}
+
+/// Production keeps dependencies beside the runtime: <install root>/deps, for that root's own runtime only.
+pub(crate) fn default_dependency_directory(
+    install: &crate::install_root::InstallRoot,
+    context: &RuntimeContext,
+) -> Result<PathBuf, String> {
+    let runtime = context.runtime_root().ok_or("runtime root unavailable")?;
+    if std::fs::canonicalize(install.root().join("runtime")).ok().as_deref() != Some(runtime) {
+        return Err("dependencies.directory is not configured for the dependency install".into());
+    }
+    Ok(install.root().join("deps"))
 }
 
 fn managed(
