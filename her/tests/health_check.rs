@@ -1380,3 +1380,97 @@ fn a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change(
     let (code, verdict) = rig.0.fixture.check_bounded(&["--wait", "30s"], Duration::from_secs(40));
     assert_eq!(code, 0, "a new running revision must reconcile: {verdict}");
 }
+
+/// Makes the rig's supervisor start a console the fixture holds no handle for; returns its identity.
+fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
+    let notices = rig.fixture.0.join("data/backup-notices.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !notices.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not complete its first poll"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let original = rig
+        .console
+        .as_ref()
+        .and_then(|console| console.0.as_ref())
+        .map(std::process::Child::id);
+    rig.config["backends"]["mcpRustBridge"] = json!(true);
+    rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+    rig.save_config();
+    drop(rig.console.take());
+    let mut set = hidden(env!("CARGO_BIN_EXE_her-cli"));
+    set.args(["lifecycle", "set", "running", "--runtime-root"])
+        .arg(&rig.fixture.0);
+    let running = run_bounded(&mut set, Duration::from_secs(12))
+        .unwrap_or_else(|error| panic!("lifecycle set running {error}"));
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let marker = rig
+        .fixture
+        .0
+        .join("data/logs/rbridge-console.lock.owner.json");
+    // Same budget as the reconcile test: ~7 s to a healthy console measured on the Windows host.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        let identity = std::fs::read(&marker)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok());
+        if let Some(identity) = identity {
+            if Some(identity.pid) != original
+                && process_identity::check_identity(&identity) == Liveness::Matches
+            {
+                return identity;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor did not start a console within 40 s; marker={}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn assert_stopped_after_drop(console: &ProcessIdentity) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match process_identity::check_identity(console) {
+            Liveness::Gone | Liveness::Mismatch(_) => return,
+            state => assert!(
+                Instant::now() < deadline,
+                "the supervisor-started console {} outlived the rig: {state:?}",
+                console.pid
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn rig_drop_stops_a_console_the_supervisor_started() {
+    let mut rig = Rig::new();
+    let console = supervisor_started_console(&mut rig);
+    drop(rig);
+    assert_stopped_after_drop(&console);
+}
+
+#[test]
+fn rig_drop_stops_a_console_the_supervisor_started_when_the_test_panics() {
+    let mut console = None;
+    let unwound: std::thread::Result<()> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut rig = Rig::new();
+            console = Some(supervisor_started_console(&mut rig));
+            panic!("fixture panic after the supervisor started a console");
+        }));
+    assert!(unwound.is_err(), "the closure must panic");
+    let console = console.expect("the console was started before the panic");
+    assert_stopped_after_drop(&console);
+}
