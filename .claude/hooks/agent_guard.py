@@ -31,8 +31,8 @@ Polling GitHub gets its own refusal message for implementers and gates: gh with 
 by `watch` (a wrapper) or inside a while/until/for loop, unless the command is one plain gh call. The guard also
 refuses the plain ways of running a ci-wait program (by path, through python, through any program that is not a
 reader and is given a file named ci-wait*, after a wrapper, or named anywhere in a command with a wrapper, $ or
-python); a quoted argument of one plain gh read, git log or git grep without an option that runs a program, or of
-grep or rg without --pre, is search text. Only coordinators wait for CI (docs/agents/coordinator.md
+python, or after a VAR=value assignment); a quoted argument is search text only in an allow-list of read forms (one
+plain gh read, git log or git grep, grep or rg with a fixed set of flags). Only coordinators wait for CI (docs/agents/coordinator.md
 "GitHub API budget"). Not seen: a launcher given only a module or another name, a glob, a copy under another name, a
 name built inside python (the T1 class).
 A worker's shell is not a sandbox. For implementers and gates this stops mistakes and plain attempts only; the
@@ -610,21 +610,55 @@ def runs_ci_wait(words):
             or (bool(PYTHON_NAME.fullmatch(first)) and any('ci-wait' in word.lower() for word in words[1:])))
 
 
-GIT_RUNS_PROGRAMS = ('-c', '-C', '-x', '-O', '--config-env', '--exec-path', '--ext-diff', '--textconv', '--exec', '--upload-pack',
-                     '--receive-pack', '--open-files-in-pager', '--output')
+GIT_TEXT_FLAGS = {'-i', '-E', '-F', '-n', '--oneline', '--'}
+GIT_TEXT_VALUE = re.compile(r'-[0-9]+|--max-count=[0-9]+')
+GREP_TEXT_FLAGS = re.compile(r'-[rnilEFwchHR]+')
+
+
+def plain_word(word):
+    return bool(word) and not word.startswith('-') and '=' not in word
 
 
 def reads_only_text(words):
-    """One of the narrow read forms whose quoted arguments are search text, never a command: `gh` reads, `git log` and
-    `git grep` straight after `git` with no option that runs a program, and grep or rg without --pre."""
+    """One of the narrow read forms whose quoted arguments are search text, never a command. This is an allow-list: a
+    leading assignment, an option not listed, an `=` form not listed or an abbreviated option loses the exemption.
+    - gh: gh_read.
+    - git: `log` or `git grep` straight after `git`, then only -i -E -F -n --oneline --, -<digits>,
+      --max-count=<digits>, --grep <text>, --grep=<text>, -e <text> and plain words.
+    - grep, egrep, fgrep, rg: only combined short flags from -rnilEFwchHR, -e <text>, -- and plain words."""
     first = base(words[0])
+    if ASSIGNMENT.fullmatch(words[0]):
+        return False
     if first == 'gh':
         return gh_read(words, 'implementer')
     if first == 'git':
-        return (len(words) > 1 and words[1] in ('log', 'grep')
-                and not any(word.startswith(GIT_RUNS_PROGRAMS) for word in words[1:]))
+        if len(words) < 2 or words[1] not in ('log', 'grep'):
+            return False
+        args, i = words[2:], 0
+        while i < len(args):
+            word = args[i]
+            if word in ('--grep', '-e'):
+                if i + 1 >= len(args):
+                    return False
+                i += 2
+                continue
+            if not (word.startswith('--grep=') or word in GIT_TEXT_FLAGS or GIT_TEXT_VALUE.fullmatch(word) or plain_word(word)):
+                return False
+            i += 1
+        return True
     if first in ('grep', 'egrep', 'fgrep', 'rg'):
-        return not any(word.startswith(('--pre', '--hostname-bin')) for word in words[1:])
+        args, i = words[1:], 0
+        while i < len(args):
+            word = args[i]
+            if word == '-e':
+                if i + 1 >= len(args):
+                    return False
+                i += 2
+                continue
+            if not (word == '--' or GREP_TEXT_FLAGS.fullmatch(word) or plain_word(word)):
+                return False
+            i += 1
+        return True
     return False
 
 
@@ -719,8 +753,9 @@ def check_bash(role, command, hook_cwd):
                    '-Effort high -Sandbox read-only); <n> is your branch\'s ticket and the prompt is no link. '
                    'To read the script, use the Read tool.')
     plain_reader = bool(words) and not indirect and reads_only_text(words)      # its quoted arguments are search text
+    assigns = any(ASSIGNMENT.fullmatch(word) for word in flat)                   # VAR=value before a command can run a program
     if not plain_reader and (any(runs_ci_wait(seg) for seg, _ in segs) or ('ci-wait' in text.lower() and (
-            indirect or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs)))):
+            indirect or assigns or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs)))):
         raise Deny(CI_WAIT_DENIED)
     if ('gh' in names or GH_WORD.search(text)) and gh_polls(segs, flat, bool(words) and base(words[0]) == 'gh'):
         raise Deny(POLL_DENIED)       # before the push and commit words: `gh run list --event push` is polling when repeated

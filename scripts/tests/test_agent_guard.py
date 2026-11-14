@@ -591,6 +591,17 @@ CI_WAIT_REFUSED = [   # #90: only coordinators (no guard) wait for CI
     ('wt', "git grep -O'python3 scripts/ci-wait.py --run 42' x"),
     ('wt', "git log --ext-diff -p --grep 'python3 scripts/ci-wait.py --run 42'"),
     ('wt', "rg --pre 'python3 scripts/ci-wait.py --run 42' x ."),
+    # the exemption is an allow-list: bundled and abbreviated options, assignments, anything not listed
+    ('wt', "git grep -nO'python3 scripts/ci-wait.py --run 42 #' x"),
+    ('wt', "git grep --open-files-in-page='python3 scripts/ci-wait.py --run 42' x"),
+    ('wt', "git grep --open-files='python3 scripts/ci-wait.py --run 42' x"),
+    ('wt', "GIT_PAGER='/root/orch/her/tools/ci-wait.sh 90 42' git log"),
+    ('wt', "GIT_EXTERNAL_DIFF='python3 scripts/ci-wait.py --run 42' git log -p"),
+    ('wt', "git log -p --ext-diff --grep='python3 scripts/ci-wait.py --run 42'"),
+]
+CI_WAIT_REFUSED_TO_WORKERS = [   # reads that read-only roles may run, but whose options are not search text
+    ('wt', "git log -c 'python3 scripts/ci-wait.py --run 42'"),
+    ('wt', "git log --grep 'x' -c 'python3 scripts/ci-wait.py --run 42'"),
 ]
 CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the script stay allowed for implementers and gates
     ('wt', 'python3 -I scripts/tests/test_ci_wait.py'),
@@ -605,6 +616,11 @@ CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the scr
     ('wt', 'grep -rn "python -I scripts/ci-wait.py" docs'),
     ('wt', 'sed -n 1,5p scripts/ci-wait.py'),
     ('wt', 'wc -l scripts/ci-wait.py | head -1'),
+    ('wt', "git log --oneline -5 --grep 'ci-wait timeout'"),
+    ('wt', "git log --grep='ci-wait timeout' -n 3 -- scripts"),
+    ('wt', "git grep -n -i -e 'python scripts/ci-wait.py' -- docs"),
+    ('wt', "grep -rniE 'ci-wait timeout' docs"),
+    ('wt', "rg -n -i 'python scripts/ci-wait.py' docs"),
 ]
 WATCH_WRAPS = [
     ('wt', 'watch -n 600 codex exec x'),
@@ -818,6 +834,12 @@ class AgentGuard(unittest.TestCase):
         self.expect(CI_WAIT_REFUSED, ROLES, False)
         for role in ('implementer', 'gate'):
             for where, command in CI_WAIT_REFUSED:
+                with self.subTest(role=role, command=command):
+                    code, err = self.guard(role, where, command)
+                    self.assertIn('only the coordinator waits for CI', err)
+        self.expect(CI_WAIT_REFUSED_TO_WORKERS, ('implementer', 'gate'), False)
+        for role in ('implementer', 'gate'):
+            for where, command in CI_WAIT_REFUSED_TO_WORKERS:
                 with self.subTest(role=role, command=command):
                     code, err = self.guard(role, where, command)
                     self.assertIn('only the coordinator waits for CI', err)
