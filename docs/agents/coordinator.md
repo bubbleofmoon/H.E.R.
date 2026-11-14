@@ -4,7 +4,7 @@ Binding for coordinator sessions; planners read "Planner" and its "Threats": the
 
 ## Role
 
-- The coordinator is the Linux main session (Opus) and never implements: it picks ready issues (open, unclaimed, its host label and baton, blockers closed), claims them (`docs/agents/issue-tracker.md`), sizes, investigates by reading, plans and routes them, relays plans, caps fix rounds, owns every owner question, checks reports by their receipts (exit files, test-result lines, diff), runs the merge gates, merges, pushes, keeps the ticket's handoff current and closes the issue after merge. Few status turns while waiting.
+- The coordinator is the Linux main session (Opus) and never implements: it picks ready issues (open, unclaimed, its host label and baton, blockers closed), claims them (`docs/agents/issue-tracker.md`), sizes, investigates by reading, plans and routes them, relays plans, caps fix rounds, owns every owner question, checks reports by their receipts (exit files, test-result lines, diff), runs the merge gates, merges, pushes, keeps the ticket's handoff current and closes the issue after merge. Every implementation item (XS, S and the executor runs of an M/L plan) goes to Windows with `baton:windows`; Linux runs no implementation workers and no local Rust builds. Few status turns while waiting.
 - A worker returns its report as its final message; save it to the ticket's report file (`/root/orch/her/<ticket>/report-<run>.md`, Windows `C:/her-orch/<ticket>/report-<run>.md`) before acting on it.
 - Hand off with `scripts/handoff.sh` / `scripts/handoff.ps1` (`docs/agents/baton.md` "Handing over"), and keep the baton watcher running between handoffs (`baton.md` "Watcher").
 
@@ -14,10 +14,12 @@ Size every ticket before routing and record the size on the ticket. Decided: can
 
 | Size | Signals | Route |
 |---|---|---|
-| XS | decided, 1–2 files, one Linux test target | `ticket-implementer` on Haiku with an exact coordinator brief |
-| S | ≤ ~4 files in one crate, short loop, small design call | `ticket-implementer` on Sonnet |
-| M/L | several crates, long loop or real design | `planner` agent (Opus; writes `/root/orch/her/<n>/plan.md`) → Haiku executes; a part the plan cannot make exact goes back to the planner, never to Sonnet |
+| XS | decided, 1–2 files, one Linux test target | Haiku on Windows with an exact coordinator brief |
+| S | ≤ ~4 files in one crate, short loop, small design call | Sonnet on Windows |
+| M/L | several crates, long loop or real design | `planner` agent (Opus; writes `/root/orch/her/<n>/plan.md`) → Haiku on Windows executes; a part the plan cannot make exact goes back to the planner, never to Sonnet |
 | ? | cause or approach unknown | investigate (Sonnet, Opus if hard), then size the resulting plan |
+
+- Long plans and briefs go to the vault at `.scratch/her-orch/<n>/` (push the vault); the handoff comment names those paths and carries only the summary, Do and Done-when. Several items may be queued on Windows at once; the Windows coordinator schedules them.
 
 Record every run with `scripts/agent_usage.py record --agent <id> --ticket <n> --size <size> --host <linux|windows>` (ledger `.scratch/her-supervisor/agent-usage.jsonl`, private run data that stays untracked and is never published); after merge compare the predicted size with the measured cost and adjust the borders. The baseline and the weekly verdict live in the vault (`C:/her-vault/.scratch/her-supervisor/agent-usage.md`).
 
@@ -65,7 +67,7 @@ A plan that touches the guard, the agents or the Codex form carries these threat
 
 Windows (32 GB, 4 cores / 8 threads, also runs production):
 
-- Executes only items Linux hands with `baton:windows` in the plan format (an XS/S brief, an M/L plan, an investigation run, a native or production check, or a question), same rules otherwise: it runs the item as written (executor, investigation runs), commits the run's changes to the ticket branch, pushes the branch, and runs only the native Windows checks a gate asks for (Windows-only tests, junctions, ACLs, production hotfix gates); it hands back with `baton:linux` when done or when the plan does not hold (a `?` is resolved on Linux).
-- One worker session at a time; each item gets a fresh coordinator session that starts from and ends with a handoff comment.
+- Implements every item Linux hands with `baton:windows` in the plan format (an XS/S brief, an M/L plan, an investigation run, a native or production check, or a question): it runs the item as written with its own workers (rust-analyzer available), commits to the ticket branch, pushes it, dispatches the CI targets the item names and hands back with `baton:linux` and the run ids when done or when the plan does not hold (a `?` is resolved on Linux). Linux runs the review, the merge gate and the merge.
+- Schedules its own queue: several handed items may run at once, within the host's memory and the production load.
 - Builds via `C:/her/scripts/cargo-slot.ps1 -WorkTree <worktree>` (the integration checkout's copy): two build slots, two test slots (`docs/agents/rust-validation.md`). pi (`scripts/pi-task.ps1`) is paused.
 - An M/L ticket's planning goes to the Linux coordinator ("Planner"); Windows executes the plan it gets back.
