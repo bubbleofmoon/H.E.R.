@@ -481,7 +481,8 @@ class PushHook(unittest.TestCase):
             self.git('replace', dirty, clean)
         code, out = self.branch_update(build)
         self.assertEqual(code, 1, out)
-        self.assertIn('digit', out)
+        self.assertIn('the public scan refused the blobs this push adds', out)
+        self.assertIn('digit docs/d.md:', out)          # the finding itself; 'digit' alone also matches the summary
 
     @REQUIRES_BASH                                                       # no scanner needed
     def test_a_missing_scanner_is_its_own_refusal(self):
