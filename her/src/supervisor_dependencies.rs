@@ -284,6 +284,18 @@ struct Scan {
     pending: bool,
 }
 
+/// Names a skipped process once per pid, not on every one-second reconcile pass.
+fn skipped_unreadable(name: &str, pid: u32, reason: &str) {
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.contains(&pid) {
+        seen.push(pid);
+        crate::safe_eprintln!(
+            "[dependencies] {name}: skipped pid {pid}, its image cannot be read ({reason}); treated as a foreign process"
+        );
+    }
+}
+
 fn matching(dependency: &Dependency) -> Result<Scan, String> {
     let mut found = Vec::new();
     let mut pending = false;
@@ -300,7 +312,22 @@ fn matching(dependency: &Dependency) -> Result<Scan, String> {
         if !entry.name.eq_ignore_ascii_case(&name) && !dsh_node {
             continue;
         }
-        let instance = identity::identity_of(entry.pid).map_err(|_| format!("{}: cannot inspect elevated or access-restricted dependency (pid {}); no process changed",dependency.name,entry.pid))?;
+        // A dependency this supervisor started runs under its own account, so its image is always
+        // readable. A process whose image is not (another token, protected) is foreign: skip it.
+        let instance = match identity::identity_of(entry.pid) {
+            Ok(instance) => instance,
+            Err(first) => {
+                // A process being reaped may briefly deny a new handle; look once more.
+                std::thread::sleep(Duration::from_millis(50));
+                match identity::identity_of(entry.pid) {
+                    Ok(instance) => instance,
+                    Err(_) => {
+                        skipped_unreadable(dependency.name, entry.pid, &first);
+                        continue;
+                    }
+                }
+            }
+        };
         let Some(instance) = instance else { continue };
         let image = identity::Process {
             identity: instance,
