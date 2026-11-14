@@ -27,6 +27,11 @@ stay inside their word. Publishing and moving refs pass only as exact whole comm
   <orch>/<n>/review/codex-self-<k>.md (its branch's ticket, not a link) as the prompt.
 scripts/gh-public and scripts/handoff are the coordinator's alone; they, and codex, are also refused by name anywhere in
 a command that has a wrapper, a $ or a backtick.
+Polling GitHub gets its own refusal message for implementers and gates: gh with --watch or `gh run watch`, and gh run
+by `watch` (a wrapper) or inside a while/until/for loop, unless the command is one plain gh call. The guard also
+refuses the plain ways of running a ci-wait program (by path, through python in any spelling, after a wrapper, or
+named anywhere in a command with a wrapper, $ or python); only coordinators wait for CI (docs/agents/coordinator.md
+"GitHub API budget"). Not seen: a glob, a copy under another name, a name built inside python (the T1 class).
 A worker's shell is not a sandbox. For implementers and gates this stops mistakes and plain attempts only; the
 containment boundary is #85. python runs unrestricted for them.
 Tests: scripts/tests/test_agent_guard.py.
@@ -95,11 +100,19 @@ CODEX_PS_PARAMS = {'-name', '-workdir', '-promptfile', '-model', '-effort', '-sa
 WRAPPERS = {'bash', 'sh', 'env', 'timeout', 'nice', 'nohup', 'exec', 'command', 'xargs', 'sudo', 'time', 'stdbuf',
             'npx', 'npm', 'pnpm', 'yarn', 'bunx', 'node', 'pwsh', 'powershell', 'cmd', 'busybox',
             'setsid', 'ionice', 'taskset', 'flock', 'strace', 'script', 'doas', 'su', 'runuser', 'winpty', 'start', 'call',
-            'eval', 'builtin', 'coproc', 'source', '.'}
+            'eval', 'builtin', 'coproc', 'source', '.', 'watch'}
 FIND_EXEC = {'-exec', '-execdir', '-ok', '-okdir'}
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=.*', re.S)
 SEGMENT_BREAKS = OPERATOR_CHARS + '\n'
 KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'function'}
+LOOP_WORDS = {'while', 'until', 'for'}
+PYTHON_NAME = re.compile(r'pyw?|pypy[0-9.]*|pythonw?[0-9.]*')
+POLL_DENIED = ('polling GitHub is refused (one API limit is shared by every agent): no --watch, no gh run watch, and '
+               'no gh repeated by a while/until/for loop or by watch. Dispatch quick.yml once, read its run id once and '
+               'hand it back; the coordinator waits (docs/agents/implementer-protocol.md "Test loop").')
+CI_WAIT_DENIED = ('only the coordinator waits for CI (scripts/ci-wait.py): an implementer hands back its run ids, a gate '
+                  'reports a check still running as waiting (docs/agents/implementer-protocol.md "Test loop"). '
+                  'To read the script, use the Read tool.')
 HIDDEN = {c: chr(0xE000 + k) for k, c in enumerate(SEGMENT_BREAKS)}
 SHOWN = {v: k for k, v in HIDDEN.items()}
 REDIRECT = re.compile(r'&>>?|>>|>&|>\||>|<<<|<<|<&|<>|<')
@@ -583,6 +596,26 @@ def gh_read(found, role):
     return len(rest) >= 3 and rest[0] == 'gh' and rest[1] in GH_GROUPS and rest[2] in verbs
 
 
+def runs_ci_wait(words):
+    """A command that runs a CI waiter: a program named ci-wait*, or python (any spelling) with ci-wait in an argument."""
+    return ('ci-wait' in base(words[0])
+            or (bool(PYTHON_NAME.fullmatch(base(words[0]))) and any('ci-wait' in word.lower() for word in words[1:])))
+
+
+def gh_polls(segs, flat, plain_gh):
+    """A command that repeats gh calls: gh with a --watch flag or `gh run watch`, or (unless it is one plain gh call,
+    whose quoted arguments may hold any words) gh together with `watch` or a while/until/for loop."""
+    has_gh = watching = False
+    for words, _ in segs:
+        rest = without_repo(words)
+        if rest and base(rest[0]) == 'gh':
+            has_gh = True
+            if rest[1:3] == ['run', 'watch'] or any(word == '--watch' or word.startswith('--watch=') for word in rest[1:]):
+                return True
+        watching = watching or base(words[0]) == 'watch'
+    return has_gh and not plain_gh and (watching or bool(LOOP_WORDS & set(flat)))
+
+
 def is_link(path):
     """A symlink, a junction or any other reparse point; a stat error other than not-found counts as one."""
     if os.path.islink(path):
@@ -659,6 +692,9 @@ def check_bash(role, command, hook_cwd):
                    '-Name <name> -WorkDir <worktree> -PromptFile C:/her-orch/<n>/review/codex-self-<k>.md -Model gpt-6-astra '
                    '-Effort high -Sandbox read-only); <n> is your branch\'s ticket and the prompt is no link. '
                    'To read the script, use the Read tool.')
+    if any(runs_ci_wait(seg) for seg, _ in segs) or ('ci-wait' in text.lower() and (
+            indirect or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs))):
+        raise Deny(CI_WAIT_DENIED)
     if re.search(r'(>|rm |mv |cp .* |sed -i|tee ).*/root/js-baseline-01|/root/her/backups/js-rust-baseline-01', command) \
             and not re.match(r'\s*(cat|ls|sha256sum|grep|head|tail|node|diff|find)\s', command):
         raise Deny('the frozen JS baseline is read-only.')
@@ -680,6 +716,8 @@ def check_bash(role, command, hook_cwd):
     if has_git and COMMIT_WORD.search(text):
         raise Deny('workers commit only on their her/<n>-<slug> branch, as one plain command: [cd <worktree> &&] '
                    'git commit [-a] -m <msg> | -F <file> (no chaining, no $); reviews and gates never commit.')
+    if ('gh' in names or GH_WORD.search(text)) and gh_polls(segs, flat, bool(words) and base(words[0]) == 'gh'):
+        raise Deny(POLL_DENIED)
     if ('gh' in names or GH_WORD.search(text)) and not (words and gh_read(words, role)):
         raise Deny('gh is read-only for workers: one plain `gh [-R repo] pr|run|issue|workflow '
                    'view|list|diff|checks|status|download ...` (never watch or --watch) or `gh api rate_limit [--jq <x>]`; '

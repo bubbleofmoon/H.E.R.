@@ -533,6 +533,58 @@ READ_ONLY_DENIED = [   # expected denied for planner and reviewer; '# regression
     ('wt', 'git -C /root/./orch/her/80/scratch/x status'),
     ('wt', 'git -C /root -C orch/her/80/scratch/x log'),
 ]
+POLLING_DENIED = [   # #90: implementers and gates get the polling message; read-only roles are refused by the allow-list
+    ('wt', 'gh pr checks 5 --watch'),
+    ('wt', 'gh pr checks 5 --watch=true'),
+    ('wt', 'gh run watch 1'),
+    ('wt', 'gh -R bubbleofmoon/H.E.R. run watch 1'),
+    ('wt', 'bash -c "gh pr checks 5 --watch"'),
+    ('wt', 'while true; do gh run view 1; sleep 60; done'),
+    ('wt', 'until gh run view 1 --exit-status; do sleep 30; done'),
+    ('wt', 'for i in 1 2 3; do gh api repos/x/actions/runs; done'),
+    ('wt', 'while true\ndo gh run list -L 1\nsleep 60\ndone'),
+    ('wt', 'bash -c "while :; do gh run view 1; done"'),
+    ('wt', 'watch -n 60 gh run view 1'),
+    ('wt', 'watch -n 60 bash -c "gh run view 1"'),
+    ('wt', 'watch gh api rate_limit'),
+    ('wt', 'timeout 600 watch gh run list'),
+]
+POLL_WORDS_IN_QUOTES_ALLOWED = [
+    ('wt', 'gh issue list --search "watch the flag"'),
+    ('wt', 'gh issue list --search "watch gh"'),
+    ('wt', 'gh issue list --search "the --watch flag"'),
+    ('wt', 'gh issue list --search "while true"'),
+]
+CI_WAIT_REFUSED = [   # #90: only coordinators (no guard) wait for CI
+    ('wt', 'python3 -I scripts/ci-wait.py --run 42'),
+    ('wt', 'python -I scripts/ci-wait.py --branch her/1-x --target unit'),
+    ('repo', 'cd {wt} && python -I scripts/ci-wait.py --label 1-a --run 42 --run 43'),
+    ('wt', 'py -3 scripts/ci-wait.py --run 42'),
+    ('wt', 'python3.12 C:/her/scripts/ci-wait.py --run 42'),
+    ('wt', 'scripts/ci-wait.py --run 42'),
+    ('wt', 'timeout 600 python3 -I scripts/ci-wait.py --run 42'),
+    ('wt', 'HER_GITHUB_API=http://127.0.0.1:1 python3 -I scripts/ci-wait.py --run 42'),
+    ('wt', 'bash /root/orch/her/tools/ci-wait.sh 90 42'),
+    ('wt', '/root/orch/her/tools/ci-wait.sh 90 42'),
+    ('wt', "python3 -c \"import runpy; runpy.run_path('scripts/ci-wait.py')\""),
+    ('wt', 'python3 -I scripts/CI-WAIT.py --run 42'),
+    ('wt', 's=scripts/ci-wait.py; python3 -I $s --run 42'),
+    ('wt', 'cat scripts/ci-wait.py | python3 - --run 42'),
+    ('wt', 'pyw scripts/ci-wait.py --run 42'),
+    ('wt', 'pypy3 scripts/ci-wait.py --run 42'),
+]
+CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the script stay allowed for implementers and gates
+    ('wt', 'python3 -I scripts/tests/test_ci_wait.py'),
+    ('wt', 'python -I scripts/tests/test_ci_wait.py CiWait.test_several_runs_are_waited_for_together'),
+    ('wt', 'cat scripts/ci-wait.py'),
+    ('wt', 'grep -n LOCAL_API scripts/ci-wait.py'),
+    ('wt', 'git diff -- scripts/ci-wait.py'),
+    ('wt', 'sha256sum scripts/ci-wait.py'),
+]
+WATCH_WRAPS = [
+    ('wt', 'watch -n 600 codex exec x'),
+    ('wt', 'watch scripts/handoff.sh 80 linux b.md'),
+]
 
 
 @unittest.skipUnless(BASH, 'bash is not available')
@@ -724,6 +776,30 @@ class AgentGuard(unittest.TestCase):
 
     def test_reviewer_reads_git_log(self):
         self.expect([('wt', 'git log --oneline')], ('reviewer',), True)
+
+    # --- #90: polling GitHub and the CI waiter -----------------------------------------------
+    def test_nobody_polls_github(self):                                       # first red of run B (message)
+        self.expect(POLLING_DENIED, ROLES, False)
+        for role in ('implementer', 'gate'):
+            for where, command in POLLING_DENIED:
+                with self.subTest(role=role, command=command):
+                    code, err = self.guard(role, where, command)
+                    self.assertIn('polling GitHub is refused', err)
+
+    def test_poll_words_inside_quoted_arguments_are_not_polling(self):
+        self.expect(POLL_WORDS_IN_QUOTES_ALLOWED, ROLES, True)
+
+    def test_only_the_coordinator_waits_for_ci(self):
+        self.expect(CI_WAIT_REFUSED, ROLES, False)
+        for role in ('implementer', 'gate'):
+            for where, command in CI_WAIT_REFUSED:
+                with self.subTest(role=role, command=command):
+                    code, err = self.guard(role, where, command)
+                    self.assertIn('only the coordinator waits for CI', err)
+        self.expect(CI_WAIT_NEIGHBOURS_ALLOWED, ('implementer', 'gate'), True)
+
+    def test_watch_is_a_wrapper(self):
+        self.expect(WATCH_WRAPS, ('implementer', 'gate'), False)
 
 
 if __name__ == '__main__':
