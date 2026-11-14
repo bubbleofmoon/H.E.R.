@@ -136,6 +136,7 @@ impl InstallRoot {
             ("runtime", "runtime"),
             ("dshHome", "runtime/dsh/home"),
             ("dshWork", "runtime/dsh/work"),
+            ("logs", "runtime/data/logs"),
             ("backups", "backups"),
         ]
         .into_iter()
