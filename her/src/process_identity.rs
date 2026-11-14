@@ -42,6 +42,12 @@ pub fn identity_of(pid: u32) -> Result<Option<ProcessIdentity>, String> {
     os::identity_of(pid)
 }
 
+/// Whether an `identity_of` or `identify` error says the OS refused access (another token or
+/// user), not that the process vanished or the table was unreadable.
+pub fn is_access_denied(reason: &str) -> bool {
+    reason.ends_with(": access denied") || reason.ends_with("permission denied")
+}
+
 /// Foreground an existing QQ window while retaining a handle to the verified instance.
 #[cfg(windows)]
 pub fn focus_qq_window(expected: &ProcessIdentity) -> Result<(), String> {
@@ -117,11 +123,19 @@ pub fn matches(
         };
         let entry = match script_operand(&process.args) {
             Ok(entry) => entry,
-            // A switch this module cannot classify leaves the entry unknown. A process of the
-            // same image that never names the configured script cannot be that dependency.
+            // A switch this module cannot classify leaves the entry unknown. A package launcher
+            // stays a launcher, and a process of the same image that never names the configured
+            // script cannot be that dependency.
             Err(reason) => {
+                let candidates = operand_candidates(&process.args);
+                if candidates
+                    .iter()
+                    .any(|operand| is_package_launcher(operand))
+                {
+                    return Ok(Match::Wrapper);
+                }
                 let expected = resolve_script(process, script)?;
-                return if names_script(process, &expected) {
+                return if names_script(process, &candidates, script, &expected) {
                     Err(reason)
                 } else {
                     Ok(Match::Mismatch(
@@ -133,8 +147,7 @@ pub fn matches(
         let Some(entry) = entry else {
             return Ok(Match::Mismatch("process has no script entry".into()));
         };
-        let name = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
-        if name.eq_ignore_ascii_case("npm-cli.js") || name.eq_ignore_ascii_case("npx-cli.js") {
+        if is_package_launcher(entry) {
             return Ok(Match::Wrapper);
         }
         let actual = resolve_script(process, std::path::Path::new(entry))?;
@@ -148,35 +161,53 @@ pub fn matches(
     compare(process, program, script).unwrap_or_else(Match::Unknown)
 }
 
-/// Whether any argument (or the value of an `--option=value`, or any operand after `--`) names
-/// `expected`. An operand that cannot be resolved (its working folder may have changed) still
-/// counts when its file name is the script's, so an unresolved entry stays unknown, never foreign.
-fn names_script(process: &Process, expected: &std::path::Path) -> bool {
+/// npm and npx run their own CLI script as the node entry.
+fn is_package_launcher(entry: &str) -> bool {
+    let name = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
+    name.eq_ignore_ascii_case("npm-cli.js") || name.eq_ignore_ascii_case("npx-cli.js")
+}
+
+/// Every argument that could name a script: plain arguments, the value of an `--option=value`,
+/// and every operand after `--`. Bare switches are skipped.
+fn operand_candidates(args: &[String]) -> Vec<&str> {
     let mut operands = false;
-    process.args.iter().skip(1).any(|arg| {
-        let candidate = if operands {
-            arg.as_str()
+    let mut found = Vec::new();
+    for arg in args.iter().skip(1) {
+        if operands {
+            found.push(arg.as_str());
         } else if arg == "--" {
             operands = true;
-            return false;
-        } else {
-            match arg.strip_prefix('-') {
-                Some(option) => match option.split_once('=') {
-                    Some((_, value)) => value,
-                    None => return false,
-                },
-                None => arg.as_str(),
+        } else if let Some(option) = arg.strip_prefix('-') {
+            if let Some((_, value)) = option.split_once('=') {
+                found.push(value);
             }
-        };
+        } else {
+            found.push(arg.as_str());
+        }
+    }
+    found
+}
+
+/// Whether any candidate names the configured script. A candidate that cannot be resolved (its
+/// working folder may have changed) still counts when its file name is the configured spelling's
+/// or the resolved target's (the entry may be a link), so an unresolved entry stays unknown.
+fn names_script(
+    process: &Process,
+    candidates: &[&str],
+    configured: &std::path::Path,
+    expected: &std::path::Path,
+) -> bool {
+    candidates.iter().any(|candidate| {
         let candidate = std::path::Path::new(candidate);
         match resolve_script(process, candidate) {
             Ok(actual) => same_exe(&actual.to_string_lossy(), &expected.to_string_lossy()),
-            Err(_) => match (candidate.file_name(), expected.file_name()) {
-                (Some(left), Some(right)) => {
-                    same_exe(&left.to_string_lossy(), &right.to_string_lossy())
-                }
-                _ => false,
-            },
+            Err(_) => candidate.file_name().is_some_and(|name| {
+                [configured, expected].iter().any(|script| {
+                    script.file_name().is_some_and(|known| {
+                        same_exe(&name.to_string_lossy(), &known.to_string_lossy())
+                    })
+                })
+            }),
         }
     })
 }

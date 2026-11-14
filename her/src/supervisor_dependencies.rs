@@ -296,7 +296,17 @@ fn skipped_unreadable(name: &str, pid: u32, reason: &str) {
     }
 }
 
-fn matching(dependency: &Dependency) -> Result<Scan, String> {
+/// What `matching` does with a process whose image the OS refuses to show. Only the start path
+/// skips it: a dependency this supervisor started runs under its own account and is always
+/// readable, so an unreadable image is foreign. Stop and upgrade judgment must still refuse,
+/// because an inaccessible process could be the dependency they are about to act on.
+#[derive(Clone, Copy, PartialEq)]
+enum Unreadable {
+    Skip,
+    Refuse,
+}
+
+fn matching(dependency: &Dependency, unreadable: Unreadable) -> Result<Scan, String> {
     let mut found = Vec::new();
     let mut pending = false;
     let entries = os::processes()?;
@@ -312,18 +322,23 @@ fn matching(dependency: &Dependency) -> Result<Scan, String> {
         if !entry.name.eq_ignore_ascii_case(&name) && !dsh_node {
             continue;
         }
-        // A dependency this supervisor started runs under its own account, so its image is always
-        // readable. A process whose image is not (another token, protected) is foreign: skip it.
         let instance = match identity::identity_of(entry.pid) {
             Ok(instance) => instance,
-            Err(first) => {
-                // A process being reaped may briefly deny a new handle; look once more.
-                std::thread::sleep(Duration::from_millis(50));
-                match identity::identity_of(entry.pid) {
-                    Ok(instance) => instance,
-                    Err(_) => {
-                        skipped_unreadable(dependency.name, entry.pid, &first);
+            Err(error) => {
+                let mut retry = None;
+                if unreadable == Unreadable::Skip && identity::is_access_denied(&error) {
+                    // A process being reaped may briefly deny a new handle; look once more.
+                    std::thread::sleep(Duration::from_millis(50));
+                    retry = Some(identity::identity_of(entry.pid));
+                }
+                match retry {
+                    Some(Ok(instance)) => instance,
+                    Some(Err(second)) if identity::is_access_denied(&second) => {
+                        skipped_unreadable(dependency.name, entry.pid, &second);
                         continue;
+                    }
+                    _ => {
+                        return Err(format!("{}: cannot inspect elevated or access-restricted dependency (pid {}); no process changed",dependency.name,entry.pid));
                     }
                 }
             }
@@ -1231,7 +1246,7 @@ fn ensure(
         );
         return Ok(());
     }
-    let scan = matching(dependency)?;
+    let scan = matching(dependency, Unreadable::Skip)?;
     if let Some(found) = scan.found.into_iter().next() {
         remember(
             states,
@@ -1472,7 +1487,7 @@ pub(crate) fn stop(context: &RuntimeContext) -> Result<(), String> {
     // Inspect both dependencies before terminating either, including non-listeners.
     for dependency in &dependencies {
         let listener = holder(dependency)?;
-        let scan = matching(dependency)?;
+        let scan = matching(dependency, Unreadable::Refuse)?;
         if scan.pending {
             return Err("unresolved npm/npx DSH wrapper; dependency stop refused".into());
         }
@@ -1694,6 +1709,10 @@ fn checkpoint(
     } else {
         None
     };
+    if states[name]["state"] != "refused" {
+        // The refusal episode is over: a later refusal, even for the same reason, logs again.
+        forget_refusals(name);
+    }
     if states != previous {
         publish(context, states)?;
     }
@@ -1911,27 +1930,47 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
     }
 }
 
+/// Reasons already written to a dependency's err log during its current refusal episode.
+static LOGGED_REFUSALS: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Distinct reasons remembered per dependency; the oldest is forgotten first.
+const LOGGED_REFUSALS_PER_DEPENDENCY: usize = 16;
+
 /// A refused start never spawns the dependency, so its own log would otherwise not exist. Each
-/// distinct refusal is written once per supervisor process, not on every reconcile pass.
+/// refusal episode appends one line per distinct reason, not one per reconcile pass. A reason is
+/// remembered only after its line was written, so a failed write is retried on the next pass.
 fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
     use std::io::Write;
-    static SEEN: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-    {
-        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if seen.iter().any(|(n, r)| n == name && r == reason) {
-            return;
-        }
-        if seen.len() >= 256 {
-            seen.clear();
-        }
-        seen.push((name.to_string(), reason.to_string()));
+    let logged = |map: &std::collections::BTreeMap<String, Vec<String>>| {
+        map.get(name)
+            .is_some_and(|reasons| reasons.iter().any(|seen| seen == reason))
+    };
+    if logged(&LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner())) {
+        return;
     }
     let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
-    if let Err(error) = dependency_log(context, name, "err")
+    match dependency_log(context, name, "err")
         .and_then(|mut file| file.write_all(line.as_bytes()).map_err(|e| e.to_string()))
     {
-        crate::safe_eprintln!("[dependencies] refusal of {name} could not be logged: {error}");
+        Ok(()) => {
+            let mut map = LOGGED_REFUSALS.lock().unwrap_or_else(|p| p.into_inner());
+            let reasons = map.entry(name.to_string()).or_default();
+            if reasons.len() >= LOGGED_REFUSALS_PER_DEPENDENCY {
+                reasons.remove(0);
+            }
+            reasons.push(reason.to_string());
+        }
+        Err(error) => {
+            crate::safe_eprintln!("[dependencies] refusal of {name} could not be logged: {error}");
+        }
     }
+}
+
+fn forget_refusals(name: &str) {
+    LOGGED_REFUSALS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(name);
 }
 
 fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {

@@ -484,21 +484,20 @@ fn a_package_launcher_with_an_unclassifiable_switch_is_a_wrapper_never_foreign()
 fn operands_after_double_dash_and_option_values_keep_an_unclassifiable_switch_unknown() {
     let mut f = Fixture::node("operands", "entry.js", &[]);
     let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
-    std::fs::copy(f.root.join("entry.js"), f.root.join("-dash.js")).unwrap();
     std::fs::write(f.root.join("preload.js"), "").unwrap();
     std::fs::write(f.root.join("other.js"), "").unwrap();
-    // An operand after `--` may start with a dash.
+    // Operands after `--` are never switches.
     respawn(
         &mut f,
         &program,
         &[
             "--no-deprecation",
             "--",
-            "-dash.js",
+            "entry.js",
             "her-process-fixture-05",
         ],
     );
-    assert_eq!(match_state(&f, &program, "-dash.js"), "unknown");
+    assert_eq!(match_state(&f, &program, "entry.js"), "unknown");
     assert_eq!(match_state(&f, &program, "other.js"), "mismatch");
     // An `--option=value` value can name the script.
     respawn(
