@@ -1653,6 +1653,93 @@ fn an_uninspectable_foreign_node_image_does_not_block_configured_dependency_star
     );
 }
 
+/// The legacy `tasks.nodePath` form, as the lifecycle fixture script and production configure it.
+fn legacy_node_config(fixture: &mut Fixture, node: &std::path::Path) {
+    let root = fixture.root.clone();
+    fixture
+        .config
+        .as_object_mut()
+        .unwrap()
+        .remove("dependencies");
+    fixture.config["ownerQQ"] = json!(42);
+    fixture.config["tasks"]["nodePath"] = json!(node);
+    fixture.config["tasks"]["start-all"] = json!({
+        "snowLumaDirectory": root.join("snow"),
+        "dshScript": root.join("dsh/index.mjs"),
+        "dshWorkingDirectory": root.join("dsh"),
+    });
+    std::fs::write(root.join("config/config.json"), fixture.config.to_string()).unwrap();
+}
+
+/// A node image whose folder name contains a space: the hosted Windows runner's own install under
+/// Program Files, else a copy inside a spaced folder.
+fn spaced_node(fixture: &Fixture) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let installed = PathBuf::from(r"C:\Program Files\nodejs\node.exe");
+        if installed.is_file() {
+            return installed;
+        }
+    }
+    let folder = fixture.root.join("node folder with spaces");
+    std::fs::create_dir(&folder).unwrap();
+    let copy = folder.join(if cfg!(windows) { "node.exe" } else { "node" });
+    std::fs::copy(
+        fixture.config["dependencies"]["dsh"]["program"]
+            .as_str()
+            .unwrap(),
+        &copy,
+    )
+    .unwrap();
+    copy
+}
+
+#[test]
+fn spaced_node_path_starts_dsh_from_the_legacy_configuration() {
+    let mut fixture = Fixture::new();
+    let node = spaced_node(&fixture);
+    assert!(node.to_string_lossy().contains(' '), "{node:?}");
+    legacy_node_config(&mut fixture, &node);
+    fixture.start();
+    fixture.healthy();
+    let states = fixture.states();
+    assert_eq!(states["dsh"]["state"], "started", "{states}");
+    let identity: process_identity::ProcessIdentity =
+        serde_json::from_value(states["dsh"]["identity"].clone()).unwrap();
+    assert!(
+        identity.exe.eq_ignore_ascii_case(&node.to_string_lossy()) || cfg!(unix),
+        "DSH ran {} instead of {node:?}",
+        identity.exe
+    );
+    assert!(fixture.root.join("dsh/starts").exists());
+}
+
+#[test]
+fn an_unrelated_process_of_the_same_node_image_does_not_block_dsh_startup() {
+    let mut fixture = Fixture::new();
+    let node = spaced_node(&fixture);
+    legacy_node_config(&mut fixture, &node);
+    // Another tool on the host runs the same node image with a switch the supervisor cannot classify.
+    let script = fixture.root.join("unrelated.js");
+    std::fs::write(&script, "setInterval(()=>{},1000);").unwrap();
+    let bystander = Owned::new(
+        hidden(&node)
+            .arg("--no-deprecation")
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    fixture.start();
+    fixture.healthy();
+    assert_eq!(fixture.states()["dsh"]["state"], "started");
+    assert_eq!(
+        process_identity::check_identity(&bystander.identity),
+        process_identity::Liveness::Matches
+    );
+}
+
 #[test]
 fn dependencies_started_by_the_supervisor_survive_cli_stop_and_are_readopted() {
     let mut fixture = Fixture::new();
