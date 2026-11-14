@@ -371,21 +371,38 @@ mod tests {
     }
 
     #[test]
-    fn undo_counts_the_persona_names_as_wake_triggers() {
-        let (root, context) = fixture("undo-names", &library());
-        let state = |dropped: &[&str]| {
-            let mut state = json!({"conversations": {"group:1": {"wakeConfig": {"mode": "diving", "infinite": true,
-                "triggers": {"atMention": false, "keywords": ["海"], "dropNames": dropped}}}}});
-            super::record(&mut state["conversations"]["group:1"], &json!({"triggers": {"dropNames": dropped}}), &json!({"triggers": {"keywords": ["海"], "dropNames": dropped}}), "her", 1);
+    fn undo_wakeability_matches_the_write_path() {
+        let entry_state = |triggers: Value| {
+            let mut state = json!({"conversations": {"group:1": {"wakeConfig": {"mode": "diving", "infinite": true, "triggers": triggers}}}});
+            super::record(&mut state["conversations"]["group:1"], &json!({"triggers": {}}), &json!({"triggers": {"keywords": ["海"]}}), "her", 1);
             state
         };
-        let mut plain = state(&[]);
-        assert_eq!(super::undo(&mut plain, "group:1", 1, 2).unwrap_err().0, 409, "without the persona's names her only trigger is the keyword");
-        let mut named = state(&[]);
-        super::undo_in(Some(&context), &mut named, "group:1", 1, 2).unwrap();
-        assert_eq!(super::words_of(&named["conversations"]["group:1"]["wakeConfig"]), json!({"keywords": [], "dropNames": []}));
-        let mut dropped = state(&["小鲸鱼", "鲸鱼"]);
-        assert_eq!(super::undo_in(Some(&context), &mut dropped, "group:1", 1, 2).unwrap_err().0, 409, "every persona name is turned off: nothing would wake her");
+        // Persona names are not stored triggers: the next write-path reset would drop them, so the undo refuses.
+        let mut names_only = entry_state(json!({"atMention": false, "keywords": ["海"], "dropNames": []}));
+        assert_eq!(super::undo(&mut names_only, "group:1", 1, 2).unwrap_err().0, 409);
+        // Speaker ids are stored as strings and wake her: the undo of the keyword is fine and the write path agrees.
+        let mut speaker = entry_state(json!({"atMention": false, "keywords": ["海"], "speakerIds": ["42"]}));
+        super::undo(&mut speaker, "group:1", 1, 2).unwrap();
+        let mut stored = speaker["conversations"]["group:1"]["wakeConfig"].clone();
+        assert!(!crate::wake::ensure_wakeable(&mut stored, &json!({}), 3, 0.5), "the undone configuration is wakeable for the write path");
+        assert_eq!(stored["triggers"]["speakerIds"], json!(["42"]));
+    }
+
+    #[test]
+    fn the_safety_reset_keeps_dropped_names() {
+        let mut wake = json!({"mode": "diving", "infinite": false, "sleepUntil": "2000-01-01T00:00:00.000Z",
+            "triggers": {"atMention": false, "nameMention": false, "poke": false, "question": false, "anyMessage": false,
+                "keywords": [], "probability": 0, "speakerIds": [], "dropNames": ["小鲸鱼"]}});
+        assert!(crate::wake::ensure_wakeable(&mut wake, &json!({}), 1_000_000_000_000, 0.5), "a timer that ran out with no trigger resets");
+        assert_eq!(wake["triggers"]["dropNames"], json!(["小鲸鱼"]), "the reset keeps the names she turned off");
+        assert_eq!(wake["triggers"]["atMention"], json!(true), "the rest is the default");
+    }
+
+    #[test]
+    fn the_name_section_is_for_groups_only() {
+        let (root, context) = fixture("private", &library());
+        assert!(super::briefing_line(&context, "group:1", &json!({})).starts_with("【名字唤醒】"));
+        assert_eq!(super::briefing_line(&context, "private:1", &json!({})), "", "a private chat is woken by every message");
         let _ = std::fs::remove_dir_all(root);
     }
 

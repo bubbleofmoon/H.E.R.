@@ -779,6 +779,19 @@ mod tests {
     }
 
     #[test]
+    fn names_default_to_the_name_and_an_explicit_empty_list_means_none() {
+        let (root, context) = fixture("names-default");
+        let names = |id: &str| super::load(&context).unwrap()["personas"][id]["versions"][0]["names"].clone();
+        let blank = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());
+        assert_eq!(names(&blank), json!(["甲"]), "no names given: the persona's name");
+        let none = new_id(super::create(&context, &json!({"name": "乙", "core": "核心。", "names": []}), open()).unwrap());
+        assert_eq!(names(&none), json!([]), "an explicit empty list stays empty");
+        super::update(&context, &json!({"id": none, "core": "新核心。"}), open()).unwrap();
+        assert_eq!(super::load(&context).unwrap()["personas"][none.as_str()]["versions"][1]["names"], json!([]), "an update without names keeps the list");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn the_item_reports_estimated_tokens_per_version() {
         let (root, context) = fixture("tokens");
         let id = new_id(super::create(&context, &json!({"name": "甲", "core": "小鲸鱼abcd", "compact": "鲸"}), open()).unwrap());
