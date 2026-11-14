@@ -3313,12 +3313,13 @@ fn handle_roles_delete(context: &RuntimeContext, body: &str) -> Result<Value, (u
     Ok(json!({ "ok": true, "deleted": name, "clearedCurrent": cleared }))
 }
 
+fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
+    if error.class().starts_with("temp/") { format!("写临时文件失败：{error}") } else { format!("改名失败：{error}") }
+}
+
 /// 原子写文本：与 `write_json_atomic` 同一套「临时文件 + 改名」。
 fn write_text_atomic(path: &str, text: &str) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("改名失败：{e}"))?;
-    Ok(())
+    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
 
 /// `validateRoleContent`：CRLF 归一 → trim → 非空 → 64KB 上限。
@@ -3451,30 +3452,16 @@ fn handle_roles_limit(context: &RuntimeContext, body: &str) -> Result<Value, (u1
 /// 等于机器人起不来。同盘改名在 Windows 上是原子的。
 /// 原子写文本：先写临时文件再改名（同目录，保证 rename 是原子的）。
 fn write_file_atomic(path: &str, text: &str) -> Result<(), String> {
-    let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("替换文件失败：{e}"))
+    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
-/// 进程内原子写序号（M7）：与 pid 一起保证并发写的临时文件名不撞车。
-static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static JSON_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
     // Unique temp names protect contents; serialize replacement too, since overlapping
     // Windows replacements can transiently hold the target against another replacement.
     let _gate = JSON_WRITE_GATE.lock().map_err(|_| "JSON write gate is poisoned".to_string())?;
-    // M7：固定 `{path}.tmp` 在「每连接一线程」的控制台里会互相截断/覆盖
-    // （后一个线程 rename 走前一个线程的内容 → 丢更新）。pid 区分进程，
-    // 进程内自增序号区分同进程的并发线程；临时文件仍放同目录，rename 保持原子。
-    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = format!("{path}.{}.{}.tmp", std::process::id(), seq);
     let text = serde_json::to_string_pretty(value).map_err(|e| format!("序列化失败：{e}"))?;
-    std::fs::write(&tmp, text).map_err(|e| format!("写临时文件失败：{e}"))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp); // rename 失败别把临时文件留在目录里
-        return Err(format!("改名失败：{e}"));
-    }
-    Ok(())
+    crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
 }
 
 /// `POST /api/whitelist`：白名单 / 黑名单 / 管理员 QQ。
@@ -26314,6 +26301,7 @@ mod tests {
     }
 
     mod memory_ticket17_tests { include!("memory_ticket17_tests.rs"); }
+    mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
 }

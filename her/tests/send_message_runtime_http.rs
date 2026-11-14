@@ -72,7 +72,7 @@ fn fixture_root(
         "allow": { "groups": group_ids, "private": private_ids },
         "snowluma": {
             // This closed poison URL detects accidental fallback from dependencies.json.
-            "httpUrl": "http://127.0.0.1:1",
+            "httpUrl": crate::support::CLOSED,
             "accessToken": onebot_token
         },
         "socialV2": {
@@ -113,7 +113,7 @@ fn fixture_root(
     )
     .expect("write selected state");
     fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).expect("write selected mode");
-    crate::support::write_dependencies(&root, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
+    crate::support::write_dependencies(&root, crate::support::CLOSED, "http://127.0.0.1:2", onebot_url, None);
     FixtureRoot(root)
 }
 
@@ -1905,7 +1905,7 @@ fn crash_between_attempt_and_outcome_restarts_as_unknown_and_resume_verifies_bef
 #[test]
 fn unreachable_gateway_is_recorded_as_not_committed_and_resumable() {
     let onebot = FakeOneBot::start(70001, false);
-    let dead_url = "http://127.0.0.1:1".to_string();
+    let dead_url = crate::support::CLOSED.to_string();
     let root = fixture_root("durable-dead", CONSOLE_A, AGENT_A, ONEBOT_A, &dead_url, "group:70001", &[70001], &[], 20, json!([]));
     let console = ConsoleProcess::start(&root);
     let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["连不上"] }));

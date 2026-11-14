@@ -2,7 +2,8 @@
 //!
 //! Every chat, tool, voice and sticker send goes through here:
 //!   · `send_chain` — the process-wide send order (JS `sendChain`); callers hold it from their
-//!     last validity check through the gateway answer and the unknown-outcome check;
+//!     last validity check through the gateway answer and the unknown-outcome check; async
+//!     callers wait for it through `off_worker` (issue #82);
 //!   · `Recorded::begin` / `resume` — claim the batch (one runner per batch) and, for a new
 //!     batch, durably record its intent before any request;
 //!   · `attempt`, `cancelled`, `superseded` — the records around one item's request;
@@ -33,6 +34,21 @@ pub fn send_chain() -> MutexGuard<'static, ()> {
     SEND_CHAIN
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run a send that may wait for the chain (and then on the gateway) without holding a tokio
+/// worker (issue #82). On a multi-thread runtime the worker first hands its other tasks to
+/// another thread (`block_in_place`), so ingress keeps running while the send waits. On a plain
+/// thread, a blocking-pool thread or a current-thread runtime (where `block_in_place` panics)
+/// it runs inline. The chain itself, and so the send order, is unchanged.
+pub fn off_worker<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// A OneBot message id, sent as a number or a numeric string.

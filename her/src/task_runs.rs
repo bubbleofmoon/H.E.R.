@@ -16,7 +16,7 @@
 //! `max_history_bytes`; logs of dropped runs are deleted with them.
 #![allow(dead_code)]
 
-use crate::lifecycle::{lock_with_wait, write_replace};
+use crate::lifecycle::lock_with_wait;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -233,23 +233,13 @@ pub struct LogPage {
 
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
-fn redirected(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() { return true; }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 { return true; }
-    }
-    false
-}
-
 fn store_dir(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() && !redirected(&meta) => Ok(()),
+        Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             std::fs::create_dir_all(path)?;
             let meta = std::fs::symlink_metadata(path)?;
-            if meta.is_dir() && !redirected(&meta) { Ok(()) }
+            if meta.is_dir() && !crate::guarded_file::is_link(&meta) { Ok(()) }
             else { Err(io::Error::new(io::ErrorKind::PermissionDenied, "task directory is redirected")) }
         }
         _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "task directory is redirected or unavailable")),
@@ -259,7 +249,7 @@ fn store_dir(path: &Path) -> io::Result<()> {
 fn store_file(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Ok(meta) if meta.is_file() && !redirected(&meta) => Ok(()),
+        Ok(meta) if meta.is_file() && !crate::guarded_file::is_link(&meta) => Ok(()),
         _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, "task file is redirected or unavailable")),
     }
 }
@@ -338,7 +328,7 @@ impl StoreRef {
     fn validate(&self) -> io::Result<()> {
         for dir in [&self.dir, &self.dir.join("locks"), &self.dir.join("logs")] {
             let meta = std::fs::symlink_metadata(dir)?;
-            if !meta.is_dir() || redirected(&meta) {
+            if !meta.is_dir() || crate::guarded_file::is_link(&meta) {
                 return Err(io::Error::new(io::ErrorKind::PermissionDenied, "task directory is redirected"));
             }
         }
@@ -487,7 +477,7 @@ impl StoreRef {
             kept.extend(serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?);
             kept.push(b'\n');
         }
-        write_replace(&self.history(), &kept)?;
+        crate::guarded_file::write_atomic(&self.history(), &kept)?;
         for run_id in dropped {
             let _ = std::fs::remove_file(self.log_path(run_id));
         }
@@ -569,7 +559,7 @@ impl TaskStore {
         if let Err(error) = store_file(&store.task_lock_path(task)) {
             return Claim::Unavailable(format!("task lock cannot be opened: {}", error.kind()));
         }
-        let lock = match task_file_options().read(true).write(true).create(true).truncate(false).open(store.task_lock_path(task)) {
+        let lock = match crate::guarded_file::open_gate(&store.task_lock_path(task), crate::guarded_file::Gate::Create).map_err(io::Error::from) {
             Ok(file) => file,
             Err(error) => return Claim::Unavailable(format!("task lock cannot be opened: {}", error.kind())),
         };
@@ -637,7 +627,7 @@ impl TaskStore {
         let mut settled = Vec::new();
         for run in runs.iter().filter(|r| !r.state.is_terminal()) {
             if store_file(&store.task_lock_path(&run.task_id)).is_err() { continue; }
-            let Ok(lock) = task_file_options().read(true).write(true).create(true).truncate(false).open(store.task_lock_path(&run.task_id)) else {
+            let Ok(lock) = crate::guarded_file::open_gate(&store.task_lock_path(&run.task_id), crate::guarded_file::Gate::Create) else {
                 continue; // cannot tell: leave it
             };
             if lock.try_lock().is_ok() {
