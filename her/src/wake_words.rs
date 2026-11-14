@@ -115,6 +115,15 @@ pub(crate) fn record(conversation: &mut Value, before: &Value, after: &Value, by
 /// is in the way), and only when she can still be woken afterwards. A refusal changes nothing and never
 /// creates a record. The undo is logged itself (`by: "undo"`, `undoes: id`).
 pub(crate) fn undo(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
+    undo_in(None, state, key, id, at)
+}
+
+/// `undo` that also counts the persona names of `context` as wake triggers. Stub until the fix.
+pub(crate) fn undo_in(_context: Option<&RuntimeContext>, state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
+    undo_entry(state, key, id, at)
+}
+
+fn undo_entry(state: &mut Value, key: &str, id: u64, at: i64) -> Result<Value, (u16, String)> {
     let conversation = state
         .get_mut("conversations")
         .and_then(|all| all.get_mut(key))
@@ -346,5 +355,46 @@ mod tests {
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["mode"], json!("diving"), "the missed-closure reset ran");
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["triggers"]["dropNames"], json!(["小鲸鱼"]));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn undo_counts_the_persona_names_as_wake_triggers() {
+        let (root, context) = fixture("undo-names", &library());
+        let state = |dropped: &[&str]| {
+            let mut state = json!({"conversations": {"group:1": {"wakeConfig": {"mode": "diving", "infinite": true,
+                "triggers": {"atMention": false, "keywords": ["海"], "dropNames": dropped}}}}});
+            super::record(&mut state["conversations"]["group:1"], &json!({"triggers": {"dropNames": dropped}}), &json!({"triggers": {"keywords": ["海"], "dropNames": dropped}}), "her", 1);
+            state
+        };
+        let mut plain = state(&[]);
+        assert_eq!(super::undo(&mut plain, "group:1", 1, 2).unwrap_err().0, 409, "without the persona's names her only trigger is the keyword");
+        let mut named = state(&[]);
+        super::undo_in(Some(&context), &mut named, "group:1", 1, 2).unwrap();
+        assert_eq!(super::words_of(&named["conversations"]["group:1"]["wakeConfig"]), json!({"keywords": [], "dropNames": []}));
+        let mut dropped = state(&["小鲸鱼", "鲸鱼"]);
+        assert_eq!(super::undo_in(Some(&context), &mut dropped, "group:1", 1, 2).unwrap_err().0, 409, "every persona name is turned off: nothing would wake her");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn undo_refuses_to_restore_words_past_the_list_limits() {
+        let at_limit = |list: &str, count: usize| {
+            let words: Vec<String> = (0..count).map(|i| format!("词{i}")).collect();
+            let mut triggers = json!({"atMention": true, "keywords": [], "dropNames": []});
+            triggers[list] = json!(words);
+            let mut removed = json!({"keywords": [], "dropNames": []});
+            removed[list] = json!(["旧"]);
+            json!({"conversations": {"group:1": {"wakeConfig": {"mode": "diving", "infinite": true, "triggers": triggers},
+                "wakeWordLog": [{"id": 1, "at": 1, "by": "her", "added": {"keywords": [], "dropNames": []}, "removed": removed}]}}})
+        };
+        for (list, max) in [("dropNames", 10), ("keywords", 50)] {
+            let mut full = at_limit(list, max);
+            let kept = full.clone();
+            assert_eq!(super::undo(&mut full, "group:1", 1, 2).unwrap_err().0, 409, "{list}: {max} words plus the restored one is over the limit");
+            assert_eq!(full, kept, "a refusal changes nothing");
+            let mut room = at_limit(list, max - 1);
+            super::undo(&mut room, "group:1", 1, 2).unwrap();
+            assert_eq!(room["conversations"]["group:1"]["wakeConfig"]["triggers"][list].as_array().map(Vec::len), Some(max), "{list}: exactly the limit fits");
+        }
     }
 }
