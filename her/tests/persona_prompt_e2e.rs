@@ -8,17 +8,15 @@
 //! through the public send route), a fake OneBot WebSocket gateway and HTTP API. No real QQ,
 //! model or DSH endpoint is contacted.
 
-#[path = "../src/install_root.rs"]
-mod install_root;
-#[path = "support/console.rs"]
-mod console_fixture;
+use support::hide_window;
+mod support;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
@@ -433,18 +431,8 @@ fn serve_onebot(listener: TcpListener, gateway: Arc<Mutex<Gateway>>) {
 
 // ───────────────────────── rig ─────────────────────────
 
-fn hide_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
-
 struct Rig {
-    root: PathBuf,
+    root: crate::support::RuntimeRoot,
     console_port: u16,
     dsh: Arc<Dsh>,
     gateway: Arc<Mutex<Gateway>>,
@@ -467,7 +455,6 @@ impl Drop for Rig {
         }
         let _ = self.console.kill();
         let _ = self.console.wait();
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -498,14 +485,12 @@ impl Rig {
     }
 
     fn new_with_console_hook(name: &str, seed: Seed, mut after_release: impl FnMut(u16)) -> Self {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-ticket11-{name}-{}-{}", std::process::id(), now_ms())));
+        let root = crate::support::RuntimeRoot::new(&format!("ticket11-{name}"));
         for dir in ["config", "data/logs", "resources/roles", "user/dsh", "ambient"] {
             fs::create_dir_all(root.join(dir)).expect("create runtime dir");
         }
-        // Keep the port unavailable to the fake listeners until the console can bind.
-        let reservation = console_fixture::reserve_port();
-        let console_port = reservation.local_addr().expect("console addr").port();
-        let dsh = Dsh::new(console_port);
+        // start_console names the console port before each spawn; the fakes below bind theirs first.
+        let dsh = Dsh::new(0);
         let gateway = Arc::new(Mutex::new(Gateway::default()));
         let dsh_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind dsh");
         let dsh_url = format!("http://127.0.0.1:{}", dsh_listener.local_addr().unwrap().port());
@@ -574,16 +559,12 @@ impl Rig {
         if let Some(prompts) = &seed.initial_prompts {
             fs::write(root.join("data/initial-prompts.json"), prompts.to_string()).unwrap();
         }
-        drop(reservation);
-        after_release(console_port);
-        let console = spawn_console(&root, console_port);
-        let mut rig = Self { root, console_port, dsh, gateway, console, candidate: None };
-        console_fixture::wait_for_console(&mut rig.console, &mut rig.console_port, &rig.root, CONSOLE_TOKEN, Duration::from_secs(20), |port| {
-            rig.dsh.console_port.store(port, Ordering::Relaxed);
+        let (console, console_port) = crate::support::ports::start_console(Duration::from_secs(20), |port| {
+            dsh.console_port.store(port, Ordering::Relaxed);
             after_release(port);
-            spawn_console(&rig.root, port)
+            spawn_console(&root, port)
         });
-        rig
+        Self { root, console_port, dsh, gateway, console, candidate: None }
     }
 
     fn start_candidate(&mut self, script: Vec<Step>) {
@@ -592,7 +573,7 @@ impl Rig {
         let ambient = self.root.join("ambient");
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
         command
-            .arg("--runtime-root").arg(&self.root)
+            .arg("--runtime-root").arg(self.root.path())
             .arg("--live").arg("--live-groups").arg(GROUP_KEY)
             .arg("--console-port").arg(self.console_port.to_string())
             .env_remove("HER_RUNTIME_ROOT")

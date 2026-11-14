@@ -649,7 +649,7 @@ pub fn recall_block_with_runtime(
             .map(|record| held_recall_ids(&record)).unwrap_or_default(),
         _ => Vec::new(),
     };
-    recall_block_with(context, cfg, st, key, &held).0
+    recall_block_with(context, cfg, st, key, &held, &keep_all).0
 }
 
 /// Count one use of each memory a delivered prompt carried (`recall_block_with`'s ids). A failure is
@@ -674,15 +674,26 @@ pub(crate) fn recall_top_k(cfg: &Value) -> usize {
         .map_or(3, |n| n.round().clamp(1.0, 20.0) as usize)
 }
 
+fn keep_all(items: &[String]) -> usize { items.len() }
+
+/// The header line of the recall block (`recall_block_with`), before its items.
+pub(crate) const RECALL_HEADER: &str = "【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：";
+/// The footer line of the recall block, after its items and index hint.
+pub(crate) const RECALL_FOOTER: &str = "（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）";
+/// The most estimated tokens the 【记忆索引】 hint line of the recall block may take (`recall_block_with`).
+pub(crate) const RECALL_HINT_MAX: usize = 60;
+
 /// The recall block and the ids of the memories it carries. `memory::recall` decides what is
 /// recalled (matches only, never the ids in `held`, which the session generation already carries);
 /// this renders it.
+/// `keep` says how many of the leading rendered items to carry (the Material budget); the rest are neither rendered nor returned.
 fn recall_block_with(
     context: &RuntimeContext,
     cfg: &Value,
     st: &Value,
     key: &str,
     held: &[i64],
+    keep: &dyn Fn(&[String]) -> usize,
 ) -> (String, Vec<i64>) {
     if cfg.get("memory").and_then(|m| m.get("enabled")).and_then(|v| v.as_bool()) == Some(false) {
         return (String::new(), Vec::new());
@@ -732,21 +743,24 @@ fn recall_block_with(
             (0, Vec::new())
         }
     };
+    let mut rows = rows;
+    let items: Vec<String> = rows.iter().map(|m| {
+        let tag = match &m.subject {
+            Some(s) if !s.is_empty() => format!("{}·{}", m.kind, s),
+            _ => m.kind.clone(),
+        };
+        let content: String = m.content.chars().take(120).collect();
+        format!("- [{tag}] {content}")
+    }).collect();
+    rows.truncate(keep(&items).min(rows.len()));
     if rows.is_empty() && total == 0 {
         return (String::new(), Vec::new());
     }
 
     let mut lines: Vec<String> = Vec::new();
     if !rows.is_empty() {
-        lines.push("【记忆】你可能需要回顾（来自你自己的记忆库，不是对方刚说的话）：".to_string());
-        for m in &rows {
-            let tag = match &m.subject {
-                Some(s) if !s.is_empty() => format!("{}·{}", m.kind, s),
-                _ => m.kind.clone(),
-            };
-            let content: String = m.content.chars().take(120).collect();
-            lines.push(format!("- [{tag}] {content}"));
-        }
+        lines.push(RECALL_HEADER.to_string());
+        lines.extend(items.into_iter().take(rows.len()));
     }
     if total > rows.len() as i64 {
         let used: Vec<String> = rows.iter().filter_map(|m| m.subject.clone()).collect();
@@ -755,15 +769,22 @@ fn recall_block_with(
             .filter(|t| !t.is_empty() && !used.iter().any(|u| u == *t))
             .take(6)
             .collect();
-        if !extra.is_empty() {
-            lines.push(format!(
-                "【记忆索引】本会话另有 {} 条，话题：{}（要细节用 memory_search）",
-                total - rows.len() as i64,
-                extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
-            ));
+        // The hint takes at most RECALL_HINT_MAX estimated tokens: subjects are dropped from the end until it fits,
+        // and the line is omitted when not even one subject fits.
+        let hint = |shown: usize| format!(
+            "【记忆索引】本会话另有 {} 条，话题：{}（要细节用 memory_search）",
+            total - rows.len() as i64,
+            extra[..shown].iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
+        );
+        let mut shown = extra.len();
+        while shown > 0 && crate::briefing::estimate_tokens(&hint(shown)) > RECALL_HINT_MAX {
+            shown -= 1;
+        }
+        if shown > 0 {
+            lines.push(hint(shown));
         }
     }
-    lines.push("（遇到\"那个/上次/之前说的\"指代不明时，先用 memory_search 拿话题名试探，不要直接说不记得）".to_string());
+    lines.push(RECALL_FOOTER.to_string());
     (format!("{}\n\n", lines.join("\n")), rows.iter().map(|m| m.id).collect())
 }
 
@@ -777,33 +798,35 @@ fn short_term_block(st: &Value, cfg: &Value) -> String {
 /// `stable` renders the briefing form: no clock-dependent text and no interaction counts, which change
 /// with every message, so the section hash moves only when the content really changes.
 fn short_term_block_at(st: &Value, cfg: &Value, now: i64, stable: bool) -> String {
-    let mut lines: Vec<String> = Vec::new();
+    let mut groups = memory_groups(st, now, stable);
+    groups.push(impression_group(st, cfg, stable));
+    crate::briefing::render_groups(&groups)
+}
 
+/// Conversation layer: ongoing topics, then pending thoughts, as `(heading, lines)` groups, oldest line first.
+fn memory_groups(st: &Value, now: i64, stable: bool) -> Vec<(String, Vec<String>)> {
     let topics = st.get("activeTopics").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let topics: Vec<&Value> = topics
         .iter()
         .filter(|t| t.get("text").and_then(|x| x.as_str()).map(|s| !s.is_empty()).unwrap_or(false))
         .collect();
-    if !topics.is_empty() {
-        lines.push("【进行中的话题】".to_string());
-        let start = topics.len().saturating_sub(10);
-        for t in &topics[start..] {
-            let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let mentioned = t.get("lastMentionAt").and_then(|v| v.as_i64()).unwrap_or(0);
-            let ago = if mentioned > 0 { ((now - mentioned).max(0) as f64 / 60_000.0).round() as i64 } else { 0 };
-            let stale = if mentioned > 0 && now - mentioned > 2 * 60 * 60 * 1000 { "（已搁置）" } else { "" };
-            let ago_text = if ago > 0 { format!("{ago}分钟前") } else { "刚刚".to_string() };
-            let pq = t
-                .get("pendingQuestion")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("；待追问：{s}"))
-                .unwrap_or_default();
-            if stable {
-                lines.push(format!("- {text}（lastMentionAt={mentioned}）{pq}"));
-            } else {
-                lines.push(format!("- {text}{stale}（{ago_text}）{pq}"));
-            }
+    let mut topic_lines: Vec<String> = Vec::new();
+    for t in &topics[topics.len().saturating_sub(10)..] {
+        let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let mentioned = t.get("lastMentionAt").and_then(|v| v.as_i64()).unwrap_or(0);
+        let ago = if mentioned > 0 { ((now - mentioned).max(0) as f64 / 60_000.0).round() as i64 } else { 0 };
+        let stale = if mentioned > 0 && now - mentioned > 2 * 60 * 60 * 1000 { "（已搁置）" } else { "" };
+        let ago_text = if ago > 0 { format!("{ago}分钟前") } else { "刚刚".to_string() };
+        let pq = t
+            .get("pendingQuestion")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("；待追问：{s}"))
+            .unwrap_or_default();
+        if stable {
+            topic_lines.push(format!("- {text}（lastMentionAt={mentioned}）{pq}"));
+        } else {
+            topic_lines.push(format!("- {text}{stale}（{ago_text}）{pq}"));
         }
     }
 
@@ -816,46 +839,39 @@ fn short_term_block_at(st: &Value, cfg: &Value, now: i64, stable: bool) -> Strin
             has_text && alive
         })
         .collect();
-    if !thoughts.is_empty() {
-        lines.push("【你想说但还没说的】".to_string());
-        let start = thoughts.len().saturating_sub(10);
-        for t in &thoughts[start..] {
-            let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let mot = t
-                .get("motivation")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("（{s}）"))
-                .unwrap_or_default();
-            lines.push(format!("- {text}{mot}"));
-        }
+    let mut thought_lines: Vec<String> = Vec::new();
+    for t in &thoughts[thoughts.len().saturating_sub(10)..] {
+        let text = t.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let mot = t
+            .get("motivation")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("（{s}）"))
+            .unwrap_or_default();
+        thought_lines.push(format!("- {text}{mot}"));
     }
+    vec![("【进行中的话题】".to_string(), topic_lines), ("【你想说但还没说的】".to_string(), thought_lines)]
+}
 
+/// Relationship layer: member impressions (`social_mem::select_impressions` order) as one group.
+fn impression_group(st: &Value, cfg: &Value, stable: bool) -> (String, Vec<String>) {
     let policy = crate::social_mem::ImpressionPolicy::from_cfg(cfg);
-    let impressions = crate::social_mem::select_impressions(st, policy.prompt_members);
-    if !impressions.is_empty() {
-        lines.push("【对群友的印象】".to_string());
-        for (name, e) in impressions {
-            let traits: Vec<String> = e
-                .get("traits")
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
-                .unwrap_or_default();
-            let traits_text = if traits.is_empty() { "暂无记录".to_string() } else { traits.join("、") };
-            if stable {
-                lines.push(format!("- {name}：{traits_text}"));
-            } else {
-                let n = e.get("interactionCount").and_then(|v| v.as_i64()).unwrap_or(0);
-                lines.push(format!("- {name}：{traits_text}（互动 {n} 次）"));
-            }
+    let mut lines = Vec::new();
+    for (name, e) in crate::social_mem::select_impressions(st, policy.prompt_members) {
+        let traits: Vec<String> = e
+            .get("traits")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let traits_text = if traits.is_empty() { "暂无记录".to_string() } else { traits.join("、") };
+        if stable {
+            lines.push(format!("- {name}：{traits_text}"));
+        } else {
+            let n = e.get("interactionCount").and_then(|v| v.as_i64()).unwrap_or(0);
+            lines.push(format!("- {name}：{traits_text}（互动 {n} 次）"));
         }
     }
-
-    if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n\n", lines.join("\n"))
-    }
+    ("【对群友的印象】".to_string(), lines)
 }
 
 /// 参与度参考（对应 JS 的 formatParticipationV2）。
@@ -1231,7 +1247,7 @@ fn build_inner(
     out.push_str(&wake_line(&st));
     out.push_str(&short_term_block(&st, &cfg));
     out.push_str(&recent_block(&st));
-    let (recall, recalled) = recall_block_with(context, &cfg, &st, key, &[]);
+    let (recall, recalled) = recall_block_with(context, &cfg, &st, key, &[], &keep_all);
     out.push_str(&recall);
     out.push_str(&participation_block(&st));
     out.push_str(&pre_sleep_line(&cfg));
@@ -1861,14 +1877,34 @@ mod tests {
     }
 }
 
-/// Render at the DSH submission boundary, after resolving the actual session and epoch.
-/// Full/debug and CLI builders intentionally keep their historical self-contained contract.
-/// Returns the prompt and the ids of the memories its recall block carries; the caller counts them
-/// (`record_recall_hits`) only after DSH accepts the submission.
+/// A prepared DSH wake: its text, the ids of the memories its recall carries (counted only after DSH accepts
+/// it), the items each memory layer injected and lost to the budgets, and the empty layers it alerted.
+pub(crate) struct DshWake {
+    pub text: String,
+    pub recalled: Vec<i64>,
+    pub layers: crate::briefing::Counts,
+    pub cut: crate::briefing::Counts,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub alerted: Vec<crate::briefing::Layer>,
+}
+
+/// `prepare_dsh_wake_layered` as the prompt and the ids of the memories it carries.
+#[cfg(test)]
 pub(crate) fn prepare_dsh_wake(
     context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
     reason: &str, rpc_id: &str, prebuilt: &str,
 ) -> Result<(String, Vec<i64>), String> {
+    prepare_dsh_wake_layered(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt).map(|w| (w.text, w.recalled))
+}
+
+/// Render at the DSH submission boundary, after resolving the actual session and epoch.
+/// Full/debug and CLI builders intentionally keep their historical self-contained contract.
+/// Briefing sections and recall are assembled by memory layer (`briefing.rs`). The caller counts the recalled ids
+/// (`record_recall_hits`) only after DSH accepts the submission.
+pub(crate) fn prepare_dsh_wake_layered(
+    context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
+    reason: &str, rpc_id: &str, prebuilt: &str,
+) -> Result<DshWake, String> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -1884,23 +1920,30 @@ pub(crate) fn prepare_dsh_wake(
         prebuilt.lines().find(|line|line.starts_with("【你的身份】"))
             .map(|line|format!("{line}\n\n")).unwrap_or_default()
     } else { saved_identity };
-    let mut sections = BTreeMap::new();
-    sections.insert("identity", format!("{}{}{}", role_line_with_runtime(context,key), live_identity,
-        role_hint_v2(context,cfg,key)));
-    sections.insert("operator", crate::initial_prompts::format_injection(context,cfg,key));
-    sections.insert("behaviour", format!("{ANTI_AI_LINE}{PROACTIVE_LINE}"));
-    sections.insert("stickers", sticker_line_with_runtime(context,cfg));
-    sections.insert("sending", format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg)));
-    sections.insert("reply", reply_line(cfg,&json!({})));
-    sections.insert("sleep", pre_sleep_line(cfg));
-    sections.insert("retrieval", "【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string());
-    sections.insert("memory", short_term_block_at(st,cfg,now_ms(),true));
     let activity_at = st["lastIncomingAt"].as_i64().unwrap_or(0).max(st["lastAiReplyAt"].as_i64().unwrap_or(0));
-    sections.insert("participation", format!("参与参考基准：最后活动时间 {activity_at}\n{}",participation_block_at(st,activity_at)));
     let slang = if cfg.pointer("/slang/enabled") != Some(&json!(false)) {
         crate::slang::build_context(&crate::slang::load_entries_for_runtime(context), cfg.pointer("/slang/injectMax"))
     } else { String::new() };
-    sections.insert("slang", slang);
+    // Memory layers: Identity and Relationship are never cut; Conversation is cut after Material (the
+    // delta's recall below). Rule sections (no layer) are never cut or counted.
+    use crate::briefing::{Layer, Section};
+    let assembly = crate::briefing::assemble(vec![
+        Section::parts("identity", Some(Layer::Identity), vec![role_line_with_runtime(context,key), live_identity,
+            role_hint_v2(context,cfg,key), crate::briefing::persona_core(context,key)]),
+        Section::parts("operator", Some(Layer::Relationship), vec![crate::initial_prompts::format_injection(context,cfg,key)]),
+        Section::groups("impressions", Some(Layer::Relationship), vec![impression_group(st,cfg,true)]),
+        Section::groups("memory", Some(Layer::Conversation), memory_groups(st,now_ms(),true)),
+        Section::parts("participation", Some(Layer::Conversation),
+            vec![format!("参与参考基准：最后活动时间 {activity_at}\n{}",participation_block_at(st,activity_at))]),
+        Section::parts("slang", Some(Layer::Conversation), vec![slang]),
+        Section::parts("behaviour", None, vec![format!("{ANTI_AI_LINE}{PROACTIVE_LINE}")]),
+        Section::parts("stickers", None, vec![sticker_line_with_runtime(context,cfg)]),
+        Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg))]),
+        Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
+        Section::parts("sleep", None, vec![pre_sleep_line(cfg)]),
+        Section::parts("retrieval", None, vec!["【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string()]),
+    ], &crate::briefing::Budgets::from_cfg(cfg));
+    let mut sections = assembly.sections.clone();
     for text in sections.values_mut() { *text = crate::model_view::strip_from_model_text(text,cfg); }
     let hashes: BTreeMap<&str,String> = sections.iter().filter(|(_,v)| !v.is_empty())
         .map(|(k,v)| (*k, format!("{:x}",Sha256::digest(v.as_bytes())))).collect();
@@ -1937,7 +1980,31 @@ pub(crate) fn prepare_dsh_wake(
     // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
     // wakes already carried; a new generation, session or epoch starts afresh.
     let held = held_recall_ids(&record);
-    let (recall, recalled) = recall_block_with(context, cfg, st, key, &held);
+    // Material: the best-ranked recalled memories that fit what Identity and Relationship left of its budget.
+    let offered = std::cell::Cell::new(0usize);
+    // The recall block adds its header and footer around the items, and the index hint line (at most
+    // RECALL_HINT_MAX tokens); Material's budget covers all of it.
+    let overhead = crate::briefing::estimate_tokens(RECALL_HEADER) + crate::briefing::estimate_tokens(RECALL_FOOTER) + RECALL_HINT_MAX;
+    let (recall, recalled) = recall_block_with(context, cfg, st, key, &held, &|items: &[String]| {
+        offered.set(items.len());
+        assembly.material_fit(items, overhead)
+    });
+    // The recall block is stripped on its own before anything is counted or held: a block the strip empties
+    // delivers no memory and holds none. A partial strip keeps the ids, as a partly stripped section stays counted.
+    let recall = crate::model_view::strip_from_model_text(&recall, cfg);
+    let recalled = if recall.trim().is_empty() { Vec::new() } else { recalled };
+    // What DSH receives: a section the model-view strip emptied delivers nothing, so its items are not counted.
+    // A section that is only partly stripped stays counted in full.
+    let mut delivered = assembly.counts;
+    for (name, layer, items) in &assembly.section_items {
+        if let Some(layer) = layer {
+            if sections.get(name).map_or(true, |t| t.trim().is_empty()) { delivered.remove(*layer, *items); }
+        }
+    }
+    delivered.material = recalled.len();
+    let layers = delivered;
+    let mut cut = assembly.cut;
+    cut.material = offered.get() - recalled.len();
     delta.push_str(&recall);
     delta.push_str(&crate::schedule::reminder_line(context, reason));
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
@@ -1948,5 +2015,6 @@ pub(crate) fn prepare_dsh_wake(
     if !crate::session_map::update_context(context,key,sid,epoch,|r| {if r["generation"].as_u64().unwrap_or(0) == generation && (r["needsBriefing"]==true)==needs_briefing { r["pending"]=pending; }})? {
         return Err("wake session or epoch changed before submission".into());
     }
-    Ok((format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled))
+    let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);
+    Ok(DshWake { text: format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled, layers, cut, alerted })
 }

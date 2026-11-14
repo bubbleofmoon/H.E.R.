@@ -7,7 +7,7 @@
 //! instead of guessed at. Re-running is idempotent (an unchanged file is not rewritten); a changed file is saved
 //! as `<file>.bak-<UTC timestamp>` first (newest five kept).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const BEGIN: &str = "# === qq-bridge MCP BEGIN ===";
 const END: &str = "# === qq-bridge MCP END ===";
@@ -129,15 +129,6 @@ fn backup(file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn write_atomic(file: &Path, text: &str) -> Result<(), String> {
-    let temporary = PathBuf::from(format!("{}.{}.tmp", file.display(), std::process::id()));
-    let result = std::fs::write(&temporary, text).and_then(|_| std::fs::rename(&temporary, file));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result.map_err(|e| format!("write failed: {e}"))
-}
-
 /// `her dsh-mcp-config --patch-file <file> [--bridge-exe <path>] [--runtime-root <absolute root> --console-port <port>] [--check]`. Exit 0: installed / unchanged
 /// (`--check`: already current); 1: `--check` and the file differs; 2: refused or failed.
 pub fn run_cli(args: &[String]) -> i32 {
@@ -253,7 +244,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 2;
         }
     }
-    match write_atomic(file, &updated) {
+    match crate::guarded_file::write_atomic(file, updated.as_bytes()).map_err(|e| format!("write failed: {e}")) {
         Ok(()) => {
             println!("written");
             0

@@ -262,9 +262,7 @@ impl RecordIo for FileIo {
     }
 
     fn replace(&self, content: &[u8]) -> io::Result<()> {
-        let tmp = self.path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, content)?;
-        std::fs::rename(&tmp, &self.path)
+        Ok(crate::guarded_file::write_atomic(&self.path, content)?)
     }
 }
 

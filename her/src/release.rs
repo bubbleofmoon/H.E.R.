@@ -1,6 +1,6 @@
 //! Release discovery and verified side-by-side installation. Handover belongs to herupdate.
 use crate::release_store::{
-    directory, installation_gate, redirected, sums, version, write_new, IMAGES,
+    directory, installation_gate, sums, version, write_new, IMAGES,
 };
 use crate::{install_root::InstallRoot, runtime::RuntimeContext};
 use crate::release_signature::{self, MAX_CHECKSUM_BYTES, MAX_SIGNATURE_BYTES, SIGNATURE_NAME};
@@ -303,7 +303,7 @@ fn recover_staging(root: &InstallRoot, releases: &Path) -> Result<(), String> {
         let path = entry.path();
         let metadata =
             fs::symlink_metadata(&path).map_err(|_| "release staging cannot be inspected")?;
-        if !metadata.is_dir() || redirected(&metadata) {
+        if !metadata.is_dir() || crate::guarded_file::is_link(&metadata) {
             continue;
         }
         let resolved = fs::canonicalize(&path).map_err(|_| "release staging cannot be resolved")?;

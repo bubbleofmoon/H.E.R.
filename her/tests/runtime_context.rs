@@ -450,6 +450,8 @@ fn isolated_runtime_starts_health_and_status_without_escaping_to_legacy_paths() 
         "https://production.example.invalid",
         &model_url,
     );
+    // Refusal children exit before binding. Their port is released, not held: a regressed child that
+    // skipped the check must be able to bind and stay up, which require_exit_within reports.
     let bad_port = crate::support::ports::reserve().release();
     let mut child = start_console(&root, bad_port, false);
     require_exit_within(&mut child, "invalid dependency");
@@ -465,6 +467,7 @@ fn isolated_runtime_starts_health_and_status_without_escaping_to_legacy_paths() 
     assert!(!diagnostic.contains("production.example.invalid"));
     assert!(!diagnostic.contains(CONSOLE_TOKEN));
     assert!(!diagnostic.contains(&root.to_string_lossy().to_string()));
+    // Released for the same reason as bad_port.
     let blank_port = crate::support::ports::reserve().release();
     let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
     command

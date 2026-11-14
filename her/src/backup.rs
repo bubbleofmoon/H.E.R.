@@ -318,17 +318,6 @@ pub fn monitor_notices(
     Ok(())
 }
 
-pub(crate) fn redirected(metadata: &fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return true;
-        }
-    }
-    metadata.file_type().is_symlink()
-}
-
 fn ensure_destination(path: &Path) -> Result<(), String> {
     inspect_destination(path, true).map(|_| ())
 }
@@ -342,7 +331,7 @@ fn inspect_destination(path: &Path, create: bool) -> Result<bool, String> {
             continue;
         }
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if !redirected(&metadata) && metadata.is_dir() => {}
+            Ok(metadata) if !crate::guarded_file::is_link(&metadata) && metadata.is_dir() => {}
             Ok(_) => return Err("backup destination is redirected or is not a directory".into()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !create {
@@ -356,7 +345,7 @@ fn inspect_destination(path: &Path, create: bool) -> Result<bool, String> {
                     }
                 }
                 let metadata = fs::symlink_metadata(&current).map_err(|e| e.to_string())?;
-                if redirected(&metadata) || !metadata.is_dir() {
+                if crate::guarded_file::is_link(&metadata) || !metadata.is_dir() {
                     return Err("backup destination is redirected".into());
                 }
             }
@@ -384,29 +373,10 @@ impl DestinationLock {
                 return Err("backup destination lock timed out".into());
             }
             ensure_destination(destination)?;
-            let mut options = OpenOptions::new();
-            options.read(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW);
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
-            }
-            let mut file = match options.clone().create_new(true).open(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => options
-                    .open(&path)
-                    .map_err(|e| format!("backup lock unavailable: {}", e.kind()))?,
-                Err(error) => return Err(format!("backup lock unavailable: {}", error.kind())),
-            };
-            let metadata = file.metadata().map_err(|e| e.to_string())?;
-            if !metadata.is_file() || redirected(&metadata) {
-                return Err("backup destination lock is redirected or invalid".into());
-            }
+            let mut file = crate::guarded_file::open_gate(&path, crate::guarded_file::Gate::Create).map_err(|error| match error {
+                crate::guarded_file::GateError::Open(error) => format!("backup lock unavailable: {}", error.kind()),
+                _ => "backup destination lock is redirected or invalid".to_string(),
+            })?;
             match file.try_lock() {
                 Err(std::fs::TryLockError::WouldBlock) => {
                     std::thread::sleep(Duration::from_millis(20));
@@ -529,7 +499,7 @@ fn archive_files(
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-        if !metadata.is_file() || redirected(&metadata) {
+        if !metadata.is_file() || crate::guarded_file::is_link(&metadata) {
             continue;
         }
         archives.push((
@@ -657,7 +627,7 @@ fn verify_listed(
             Ok(lock) => lock,
             Err(error) if error == LIST_DEADLINE => {
                 let metadata = match fs::symlink_metadata(path) {
-                    Ok(metadata) if metadata.is_file() && !redirected(&metadata) => metadata,
+                    Ok(metadata) if metadata.is_file() && !crate::guarded_file::is_link(&metadata) => metadata,
                     Ok(_) => return Ok(None),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                     Err(error) => return Err(error.to_string()),
@@ -673,7 +643,7 @@ fn verify_listed(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.to_string()),
         };
-        if !metadata.is_file() || redirected(&metadata) {
+        if !metadata.is_file() || crate::guarded_file::is_link(&metadata) {
             return Ok(None);
         }
         (File::open(path).map_err(|e| e.to_string())?, metadata)
@@ -708,14 +678,14 @@ fn prune(
         check()?;
         ensure_destination(destination)?;
         let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-        if !metadata.is_file() || redirected(&metadata) {
+        if !metadata.is_file() || crate::guarded_file::is_link(&metadata) {
             return Err("backup archive changed before pruning".into());
         }
         let pin_path = path.with_extension("zip.restore-until");
         let pinned = match fs::symlink_metadata(&pin_path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(format!("restore retention pin unavailable: {e}")),
-            Ok(meta) if meta.is_file() && !redirected(&meta) => {
+            Ok(meta) if meta.is_file() && !crate::guarded_file::is_link(&meta) => {
                 let until: i64 = fs::read_to_string(&pin_path).map_err(|e| e.to_string())?.trim().parse().map_err(|_| "restore retention pin invalid")?;
                 until > crate::parity_clock::now_ms()
             }
@@ -811,7 +781,7 @@ pub fn protect_pre_restore(path: &Path, check: Check<'_>) -> Result<(), String> 
     }
     let pin_path = path.with_extension("zip.restore-until");
     let metadata = fs::symlink_metadata(&pin_path).map_err(|e| e.to_string())?;
-    if !metadata.is_file() || redirected(&metadata) { return Err("restore retention pin redirected or invalid".into()); }
+    if !metadata.is_file() || crate::guarded_file::is_link(&metadata) { return Err("restore retention pin redirected or invalid".into()); }
     let mut options = OpenOptions::new();
     options.write(true).truncate(true);
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.custom_flags(libc::O_NOFOLLOW); }

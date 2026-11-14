@@ -113,6 +113,9 @@ pub enum Budget {
     /// Rust-only owner notices (accepted deviation 22): the same rule on a limiter of their own, so a flood of notices
     /// can never use up the budget of the alerts JS sends.
     Notice,
+    /// Memory-layer alerts (an empty Identity or Relationship, `briefing.rs`): the same rule on a limiter of their
+    /// own, so they never spend the notices' budget.
+    Memory,
 }
 
 /// The limiter shared by every JS-texted alert of this process.
@@ -127,11 +130,18 @@ pub fn notice_limiter() -> &'static Mutex<AlertLimiter> {
     L.get_or_init(|| Mutex::new(AlertLimiter::new()))
 }
 
-/// Charge `key` to `budget` (pure over the two limiters, so the policy is testable).
-fn admit(js: &mut AlertLimiter, notice: &mut AlertLimiter, budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVerdict {
+/// The limiter of the memory-layer alerts.
+pub fn memory_limiter() -> &'static Mutex<AlertLimiter> {
+    static L: OnceLock<Mutex<AlertLimiter>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(AlertLimiter::new()))
+}
+
+/// Charge `key` to `budget` (pure over the three limiters, so the policy is testable).
+fn admit(js: &mut AlertLimiter, notice: &mut AlertLimiter, memory: &mut AlertLimiter, budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVerdict {
     match budget {
         Budget::Js => js.check(scope, key, now_ms),
         Budget::Notice => notice.check(scope, key, now_ms),
+        Budget::Memory => memory.check(scope, key, now_ms),
     }
 }
 
@@ -139,6 +149,7 @@ fn admit_global(budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVer
     let mut limiter = match budget {
         Budget::Js => shared_limiter(),
         Budget::Notice => notice_limiter(),
+        Budget::Memory => memory_limiter(),
     }
     .lock()
     .unwrap_or_else(|p| p.into_inner());
@@ -329,6 +340,11 @@ pub fn notify_notice(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_k
     notify_with(context, cfg, Budget::Notice, text, dedupe_key, false, Vec::new())
 }
 
+/// A memory-layer alert (`briefing::alert_empty`): one per key per minute, ten per hour, on its own budget.
+pub fn notify_memory(context: &RuntimeContext, cfg: &Value, text: &str, dedupe_key: &str) -> bool {
+    notify_with(context, cfg, Budget::Memory, text, dedupe_key, false, Vec::new())
+}
+
 /// Queue an already claimed gap notice. The worker checkpoints uncertainty before
 /// I/O and records only confirmed delivery; known refusals become pending again.
 /// Admission failures are released by the caller. Unknown sends are never retried.
@@ -444,18 +460,18 @@ mod tests {
 
     #[test]
     fn rust_only_notices_never_spend_the_budget_of_the_js_texted_alerts() {
-        let (mut js, mut notice) = (AlertLimiter::new(), AlertLimiter::new());
+        let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
         let t0 = 50_000_000i64;
         for i in 0..HOURLY_CAP as i64 {
-            assert!(admit(&mut js, &mut notice, Budget::Notice, "s", &format!("n{i}"), t0 + i).is_send());
+            assert!(admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", &format!("n{i}"), t0 + i).is_send());
         }
         assert_eq!(
-            admit(&mut js, &mut notice, Budget::Notice, "s", "n-extra", t0 + 100),
+            admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", "n-extra", t0 + 100),
             AlertVerdict::SkipHourlyCap,
             "the notices have their own hourly cap"
         );
         assert!(
-            admit(&mut js, &mut notice, Budget::Js, "s", "turn-error", t0 + 101).is_send(),
+            admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", "turn-error", t0 + 101).is_send(),
             "a JS-texted alert is still sent after ten notices"
         );
         assert_eq!(js.sent_in_last_hour(t0 + 102), 1, "only the JS-texted alert was charged to its budget");
@@ -463,29 +479,48 @@ mod tests {
 
     #[test]
     fn a_js_texted_alert_never_spends_the_notice_budget_either() {
-        let (mut js, mut notice) = (AlertLimiter::new(), AlertLimiter::new());
+        let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
         for i in 0..HOURLY_CAP as i64 {
-            assert!(admit(&mut js, &mut notice, Budget::Js, "s", &format!("j{i}"), 1_000 + i).is_send());
+            assert!(admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", &format!("j{i}"), 1_000 + i).is_send());
         }
-        assert!(admit(&mut js, &mut notice, Budget::Notice, "s", "dsh-recovered", 2_000).is_send());
+        assert!(admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", "dsh-recovered", 2_000).is_send());
+    }
+
+    #[test]
+    fn memory_alerts_are_refused_once_their_own_limiter_is_spent() {
+        let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
+        let t0 = 80_000_000i64;
+        for i in 0..HOURLY_CAP as i64 {
+            assert!(admit(&mut js, &mut notice, &mut memory, Budget::Memory, "s", &format!("m{i}"), t0 + i).is_send());
+        }
+        assert_eq!(
+            admit(&mut js, &mut notice, &mut memory, Budget::Memory, "s", "m-extra", t0 + 100),
+            AlertVerdict::SkipHourlyCap,
+            "the memory-layer alerts have their own hourly cap"
+        );
+        assert!(
+            admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", "dsh-recovered", t0 + 101).is_send(),
+            "a spent memory budget does not block a notice"
+        );
+        assert_eq!(memory.sent_in_last_hour(t0 + 102), HOURLY_CAP, "only memory alerts were charged to the memory budget");
     }
 
     #[test]
     fn administrator_messages_are_deduplicated_per_kind_and_capped_per_hour() {
-        let (mut js, mut notice) = (AlertLimiter::new(), AlertLimiter::new());
+        let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
         let t0 = 70_000_000i64;
-        assert!(admit(&mut js, &mut notice, Budget::Js, "s", &admin_key("turn-error"), t0).is_send());
+        assert!(admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", &admin_key("turn-error"), t0).is_send());
         assert_eq!(
-            admit(&mut js, &mut notice, Budget::Js, "s", &admin_key("turn-error"), t0 + 59_999),
+            admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", &admin_key("turn-error"), t0 + 59_999),
             AlertVerdict::SkipKeyWindow,
             "the second message of a kind inside a minute is not sent"
         );
         assert!(
-            admit(&mut js, &mut notice, Budget::Js, "s", &admin_key("not-accepted"), t0 + 1).is_send(),
+            admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", &admin_key("not-accepted"), t0 + 1).is_send(),
             "another kind has its own window"
         );
         assert!(
-            admit(&mut js, &mut notice, Budget::Js, "s", &admin_key("turn-error"), t0 + 60_000).is_send(),
+            admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", &admin_key("turn-error"), t0 + 60_000).is_send(),
             "a minute later the kind may be sent again"
         );
         assert_ne!(admin_key("turn-error"), "turn-error", "an administrator kind never shares a slot with the failover step alert");
