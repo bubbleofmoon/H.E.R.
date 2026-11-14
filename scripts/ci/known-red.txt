@@ -1,0 +1,15 @@
+# Known red: failing tests that CI reports under KNOWN RED instead of failing the run.
+# Format: <os> <target> <test> #<ticket>   os: linux | windows | any; test: libtest name (no wildcards).
+# Read only by scripts/ci/run-tests.py --known-red (CI); local runs stay strict. Rules: docs/agents/rust-validation.md.
+
+# Hosted Windows runner: administrator rights, timing, file locks
+windows supervisor_dependencies an_uninspectable_foreign_node_image_does_not_block_configured_dependency_startup #40
+windows supervisor_dependencies denied_inspection_reports_an_elevated_or_access_restricted_dependency_and_leaves_it_alone #40
+windows supervisor_dependencies explicit_stop_and_hang_recovery_never_kill_uninspectable_dependencies #40
+windows harness_e2e provider_error_bodies_cannot_leak_the_model_key_or_trigger_a_dsh_fallback #40
+windows harness_e2e runtime_model_key_is_used_for_auth_but_never_persisted_logged_or_relayed_even_when_echoed #40
+windows harness_e2e nonzero_cli_private_output_stays_out_of_trial_logs_errors_and_owner_alerts #40
+windows health_check a_fresh_running_revision_reconciles_a_missing_console_without_a_state_change #40
+windows health_check each_required_part_can_fail_independently_without_changing_desired_state #40
+windows console_runtime_routes backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_console #40
+windows session_turn_recovery_e2e a_completed_end_observed_before_the_cap_keeps_completion_while_bookkeeping_waits #40

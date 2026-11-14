@@ -38,7 +38,7 @@ There is no watcher process on the public tracker: read the queue when a session
 
 ## Shared ground rules
 
-- Only coordinators merge, and only after `git fetch` and merging the latest integration tip; push right after so the hosted checks run on the merged result.
+- Only coordinators merge, and only through a pull request whose CI is green on a head that contains the current `origin/main` (`issue-tracker.md` "Pull requests and merging").
 - Production, its config, tokens, tasks and data are touched only from the Windows machine and only with the owner's go-ahead at the time. Production incident detail stays in the vault.
 - Never write `C:/qqbot`, `C:/qqbot-rust`, `memory.db` or `~/.dsh` from either machine. Production is read-only for development and every production edit is the owner’s own action under the vault operating procedures (`docs/agents/production-ops.md`). Tests never contact real QQ, DSH, model or TTS services.
 - Never `@`-mention in comments: that notifies real GitHub accounts.
