@@ -134,7 +134,7 @@ impl InstallRoot {
             ("dsh", "deps/dsh"),
             ("relay", "deps/relay"),
             ("runtime", "runtime"),
-            ("dshHome", "runtime/dsh/home"),
+            ("dshHome", "runtime/user/dsh"),
             ("dshWork", "runtime/dsh/work"),
             ("logs", "runtime/data/logs"),
             ("backups", "backups"),

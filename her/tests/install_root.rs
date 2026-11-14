@@ -390,8 +390,9 @@ fn configurable_install_layout_is_reported_without_creating_it() {
         ("dsh", "deps/dsh"),
         ("relay", "deps/relay"),
         ("runtime", "runtime"),
-        ("dshHome", "runtime/dsh/home"),
+        ("dshHome", "runtime/user/dsh"),
         ("dshWork", "runtime/dsh/work"),
+        ("logs", "runtime/data/logs"),
         ("backups", "backups"),
     ] {
         assert_eq!(
@@ -770,4 +771,65 @@ fn affected_native_script_checks_use_disposable_roots() {
         );
         assert!(output.status.success(), "{name}: {output:?}");
     }
+}
+
+#[test]
+fn default_production_root_is_the_one_production_folder() {
+    assert_eq!(install_root::DEFAULT_INSTALL_ROOT, if cfg!(windows) { "C:/qqbot" } else { "/qqbot" });
+    assert_eq!(crate::legacy_path!(), "C:/qqbot");
+    assert_eq!(crate::legacy_path!("qq-bridge/config.json"), "C:/qqbot/qq-bridge/config.json");
+    assert_eq!(crate::legacy_path!(windows "qq-bridge\\state"), "C:\\qqbot\\qq-bridge\\state");
+}
+
+#[test]
+fn production_root_spellings_are_inside_and_siblings_are_outside() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("qqbot");
+    std::fs::create_dir_all(root.join("runtime")).unwrap();
+    let install = install_root::InstallRoot::new(&root).unwrap();
+    let text = root.to_str().unwrap().to_string();
+    let mut inside = vec![root.join("runtime/data"), PathBuf::from(format!("{text}/runtime/../backups"))];
+    #[cfg(windows)]
+    {
+        let back = text.replace('/', "\\");
+        inside.push(PathBuf::from(&back).join("runtime"));
+        inside.push(PathBuf::from(back.to_uppercase()).join("RUNTIME"));
+        inside.push(PathBuf::from(format!(r"\\?\{back}")).join("runtime"));
+        inside.push(PathBuf::from(format!("{back}\\")).join("runtime"));
+    }
+    for path in &inside { assert!(install.protects(path).unwrap(), "{path:?} must be inside"); }
+    for path in [fixture.0.join("qqbot-rust/runtime"), fixture.0.join("qqbot2"),
+                 PathBuf::from(format!("{text}/../qqbot-rust"))] {
+        assert!(!install.protects(&path).unwrap(), "{path:?} must be outside");
+    }
+    #[cfg(windows)]
+    {
+        let back = text.replace('/', "\\");
+        assert!(install_root::InstallRoot::new(Path::new(&format!(r"\\.\{back}"))).is_err(), "device namespace");
+    }
+}
+
+#[test]
+fn installed_runtime_backups_stay_inside_the_root() {
+    let fixture = Fixture::new();
+    let root = fixture.0.join("qqbot");
+    let runtime = root.join("runtime");
+    let install = install_root::InstallRoot::new(&root).unwrap();
+    assert_eq!(install.backup_destination(&runtime, Path::new("backups")).unwrap(), root.join("backups"));
+    assert_eq!(install.backup_destination(&runtime, Path::new("archive/daily")).unwrap(), root.join("archive/daily"));
+    for escaping in ["../elsewhere", "backups/../../elsewhere"] {
+        assert!(install.backup_destination(&runtime, Path::new(escaping)).is_err(), "{escaping}");
+    }
+    #[cfg(windows)]
+    assert!(install.backup_destination(&runtime, Path::new(r"\elsewhere")).is_err(), "root-relative");
+    for area in ["releases/v1", "deps", "runtime/backups"] {
+        assert!(install.backup_destination(&runtime, Path::new(area)).is_err(), "{area}");
+    }
+    // An absolute destination is the administrator's explicit choice and stays supported.
+    let external = fixture.0.join("share");
+    assert_eq!(install.backup_destination(&runtime, &external).unwrap(), external);
+    // A runtime outside the root (today's fixed layout) keeps runtime-relative backups, `..` included.
+    let outside = fixture.0.join("qqbot-rust/runtime");
+    assert_eq!(install.backup_destination(&outside, Path::new("backups")).unwrap(), outside.join("backups"));
+    assert_eq!(install.backup_destination(&outside, Path::new("../b")).unwrap(), fixture.0.join("qqbot-rust/b"));
 }
