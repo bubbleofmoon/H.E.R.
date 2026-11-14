@@ -111,6 +111,9 @@ DENIED_EVERY_ROLE = [
     ('wt', 'gh release create v1'),
     ('wt', 'gh repo edit'),
     ('wt', 'gh secret set X'),
+    # the one-step handoff is the coordinator's alone
+    ('wt', 'scripts/handoff.sh 80 windows /root/orch/her/80/handoff.md'),
+    ('wt', 'pwsh -NoProfile -File scripts/handoff.ps1 80 windows b.md'),
     ('wt', 'gh variable set X'),
     ('wt', 'gh pr view 5; gh pr merge 5'),
     ('wt', 'gh pr view 5 | sh'),

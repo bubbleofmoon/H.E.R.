@@ -10,6 +10,7 @@ Anything that can publish or move refs passes only as an exact whole command, op
 - `git commit` passes for an implementer only as one plain command on a her/<n>-<slug> branch;
 - `gh` passes only as one plain read (`gh [-R x] pr|run|issue|workflow view|list|diff|checks|status|watch|download ...`),
   or for an implementer exactly `gh workflow run quick.yml --ref <cwd branch> -f target=<x> [-f filter=<y>] [-f os=linux|windows]`.
+scripts/handoff.sh|ps1 is the coordinator's alone.
 A worker's shell is not a sandbox: this stops mistakes and plain attempts; server-side rules on main are the boundary.
 Tests: scripts/tests/test_agent_guard.py.
 """
@@ -197,6 +198,8 @@ def check_bash(role, command, hook_cwd):
         raise Deny('hooks stay on: no --no-verify and no core.hooksPath.')
     if 'gh-public' in text:
         raise Deny('only the coordinator posts (scripts/gh-public); put it in your report.')
+    if re.search(r'handoff\.(?:sh|ps1)', text):
+        raise Deny('only the coordinator hands off (scripts/handoff); put it in your report. To read the script, use the Read tool.')
     if 'build-slot.lock' in text:
         raise Deny('use the build slot (scripts/cargo-slot.ps1 on Windows, scripts/cargo-slot.sh on Linux); never create or remove its lock by hand.')
     if re.search(r'(>|rm |mv |cp .* |sed -i|tee ).*/root/js-baseline-01|/root/her/backups/js-rust-baseline-01', command) \
