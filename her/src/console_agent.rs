@@ -1427,6 +1427,8 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
             obj.insert("confirmedBy".into(), json!("set_wake_config"));
         }
         if short_rewake { force_short_rewake(&mut wc, now); }
+        // Her (agent) and console changes of keywords or dropNames are logged and undoable (`wake_words.rs`).
+        let _ = crate::wake_words::record(conv, &current, &wc, if is_agent { "her" } else { "console" }, now);
         conv["wakeConfig"] = wc.clone();
         conv["lastActionAt"] = json!(now);
         conv["preSleepWaitSatisfiedAt"] = json!(0);

@@ -137,7 +137,7 @@ The four parts of what HER is given about the past, each with its own budget: **
 _Avoid_: memory tiers, context blocks
 
 **Persona (人设)**:
-An owner-editable, versioned description of who HER is and how she talks: a **persona core** (人设核心) present in every request (the Identity layer), **persona notes** (人设资料) recalled only when relevant, and an owner-approved **compact persona** (精简人设) used when the core cannot fit. Edits arrive automatically within the owner's rules (auto) or only on approval (manual).
+An owner-editable, versioned description of who HER is and how she talks: a **persona core** (人设核心) present in every request (the Identity layer), **persona notes** (人设资料) recalled only when relevant, and an owner-approved **compact persona** (精简人设) used when the core cannot fit. Its **names** (名字) are her default wake words while it is assigned. Edits arrive automatically within the owner's rules (auto) or only on approval (manual).
 _Avoid_: character bible, role card, preset, system prompt
 
 **Trait (性格参数)**:

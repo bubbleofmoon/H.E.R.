@@ -443,7 +443,15 @@
           }
          },
          "keywords": {
-          "description": "出现任意关键词时唤醒",
+          "description": "出现任意关键词时唤醒（你自己另加的词；当前人设的名字默认也会唤醒你，见 dropNames）",
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "dropNames": {
+          "description": "要关掉的人设名字（完整名单，空数组全部恢复）：列出的名字不再唤醒你，其余人设名字照常唤醒；每次改动都会记录，管理员可以撤销",
+          "maxItems": 10,
           "type": "array",
           "items": {
            "type": "string"

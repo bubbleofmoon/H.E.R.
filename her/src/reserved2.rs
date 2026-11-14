@@ -2603,7 +2603,9 @@ impl Hub {
         self.synced
             .entry(key.clone())
             .or_insert_with(|| session::WakeSync::of(&conv["wakeConfig"]));
-        let tr = serde_json::from_value(conv["wakeConfig"]["triggers"].clone()).unwrap_or_default();
+        let mut tr: crate::Triggers = serde_json::from_value(conv["wakeConfig"]["triggers"].clone()).unwrap_or_default();
+        // The persona's names wake her like keywords, except the ones she dropped (`wake_words.rs`).
+        tr.keywords = crate::wake_words::effective(&self.context, &key, &tr.keywords, &tr.drop_names);
         // Do not even evaluate probability or question triggers for an active conversation.
         // Urgent candidates survive only if no later read covers them before completion.
         let (mut wake, mut reason) = in_turn_decision(in_turn, at_self, is_owner && ev.post_type == "message", &owner_qq)
