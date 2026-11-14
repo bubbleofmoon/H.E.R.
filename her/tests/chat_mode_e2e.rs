@@ -1467,16 +1467,11 @@ fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
         reserved_seed(json!({"activeReplyDelayMinMs":6000,"activeReplyDelayMaxMs":6000})),
     );
     rig.start();
-    assert_eq!(
-        rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
-        200
-    );
+    // An idle group and a direct message: ingress itself enters the conversation and queues the job (due six
+    // seconds later), so the job exists before any scheduler scan. Once the phase reads `active` the job is
+    // pending, and the mute below can only be held by the dispatch guard: the scan guard and ingress do not apply.
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued before the ban");
-    // The scheduler scan turns the stored message into a delayed job and records `lastActiveMessageAt` in the
-    // same pass. Once that is visible the job is pending (due six seconds later), so the mute below can only
-    // be held by the dispatch guard, not by the scan guard or by ingress.
-    assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]["lastActiveMessageAt"].as_i64().unwrap_or(0) > 0),
-        "the scan never queued the message");
+    wait_phase(&rig, "active");
     assert!(rig.dsh.prompts().is_empty(), "the delayed job ran before the mute: {:?}", rig.dsh.prompts());
     seed_group_mute(&rig, now_ms() + 600_000);
     assert!(
@@ -1484,6 +1479,7 @@ fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
         "queued work for a muted group ran a model turn: {:?}",
         rig.dsh.prompts()
     );
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
     seed_group_mute(&rig, 0);
     assert!(rig.wait_prompts(1)[0].text.contains("queued before the ban"), "the held job ran after the lift");
 }
