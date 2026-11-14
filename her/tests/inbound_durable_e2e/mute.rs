@@ -111,6 +111,7 @@ fn a_ban_for_her_mutes_notifies_once_and_a_mention_does_not_wake_until_the_lift(
     let entry = mute_entry(root.path());
     assert_eq!(entry["rev"], json!(1), "the notice for another user did not start an episode: {entry}");
     assert_eq!(entry["personalUntil"], json!(0), "the lift cleared the mute: {entry}");
+    assert_eq!(entry["seq"], json!(2), "only the own ban and the lift wrote; the notice for another user wrote nothing: {entry}");
     let notices = owner_texts(&harness, "禁言");
     assert_eq!(notices.len(), 1, "one notice for the episode and none for the lift: {notices:?}");
     assert!(notices[0].contains("420042") && notices[0].contains("1001") && notices[0].contains("10 分钟"), "{notices:?}");

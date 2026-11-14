@@ -134,7 +134,9 @@ pub(crate) fn apply_at(context: &RuntimeContext, key: &str, change: Change, oper
     match change {
         Change::Banned(until) => entry["personalUntil"] = json!(until),
         Change::Lifted => entry["personalUntil"] = json!(0),
-        Change::Learned => { if before.is_some() { return Ok(None); } entry["personalUntil"] = json!(-1); }
+        // A refusal never shortens a known mute, but it is newer evidence than any refresh in flight:
+        // it still bumps `seq` below.
+        Change::Learned => { if before.is_none() { entry["personalUntil"] = json!(-1); } }
         Change::Refreshed { personal_until, whole_group, seen_seq } => {
             if entry["seq"].as_i64().unwrap_or(0) != seen_seq { return Ok(None); }
             if let Some(p) = personal_until {

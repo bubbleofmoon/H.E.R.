@@ -552,6 +552,8 @@ fn handle_onebot(
             }
             .to_string(),
         )
+    } else if path == "/get_group_member_list" {
+        Some(json!({ "status": "ok", "retcode": 0, "data": [{ "user_id": 822 }] }).to_string())
     } else if path == "/get_group_member_info" {
         Some(json!({ "status": "ok", "retcode": 0, "data": { "user_id": 822, "card": "被艾特的名片", "nickname": "nick" } }).to_string())
     } else if path == "/get_login_info" {
@@ -2118,6 +2120,25 @@ fn a_result_120_refusal_teaches_the_mute_and_the_next_send_stays_local() {
     assert_eq!(notices.len(), 1, "{notices:?}");
     assert!(notices[0].contains("70001") && notices[0].contains("禁言"), "{notices:?}");
     assert!(!notices[0].contains('甲') && !notices[0].contains('乙'), "the notice carries no message content");
+}
+
+#[test]
+fn a_result_120_poke_refusal_is_a_definite_403_and_teaches_the_mute() {
+    let onebot = FakeOneBot::start_with(70001, Behavior { steps: [Step::Muted].into_iter().collect(), ..Behavior::default() });
+    let root = fixture_root("muted-poke", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url, "group:70001", &[70001], &[], 20, json!([]));
+    hf123_config(&root, |cfg| cfg["socialV2"]["tools"]["sendPoke"] = json!(true));
+    let console = ConsoleProcess::start(&root);
+    let body = json!({"key": "group:70001", "targetUserId": "822"});
+    let first = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A), &body).unwrap();
+    assert_eq!(first.status, 403, "{}", first.body);
+    assert!(first.body["error"].as_str().unwrap_or_default().contains("禁言"), "{}", first.body);
+    let store: Value = serde_json::from_slice(&fs::read(root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    assert_eq!(store["groups"]["group:70001"]["personalUntil"], json!(-1));
+    assert_eq!(read_selected_state(&root)["conversations"]["group:70001"]["sendTimes"].as_array().unwrap().len(), 0, "the refused poke gave its reservation back");
+    let second = http_request(console.port, "POST", "/api/socialV2/send-poke", Some(CONSOLE_A), Some(AGENT_A), &body).unwrap();
+    assert_eq!(second.status, 403, "{}", second.body);
+    let requests = onebot.finish();
+    assert_eq!(requests.iter().filter(|r| r.path == "/group_poke").count(), 1, "the second poke stayed local");
 }
 
 #[test]
