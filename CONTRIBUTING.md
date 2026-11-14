@@ -12,7 +12,7 @@ python -I scripts/scan-public.py
 `scripts/scan-public.py` is the one public guard: it checks secrets, digit runs of 7
 or more, account-home paths (Windows, `/c/` and macOS spellings, any casing) and quoted
 chat or session records over the whole tree, over a text on stdin (`--stdin`) and over the
-tracked blobs of the revisions a push publishes (`--revs-from-stdin`) and the commit and tag
+tracked blobs of the revisions a push publishes (`--revs-from-stdin`), over only the blobs new commits add when a branch moves forward from a commit the remote has (`--added-from-stdin`), and over the commit and tag
 messages of the objects it publishes (`--objects-from-stdin`). `.githooks/pre-push` runs the
 tree scan, then the blob scan and the message scan for every ref being pushed, so a clean
 checkout does not excuse a dirty branch, tag or ancestor, and a clean tree does not excuse a
@@ -38,8 +38,8 @@ and local gates keep only the native, elevated and production checks the hosted 
 On the shared development host, use the cargo-slot scripts for every Rust command.
 
 The guard tests itself: `python -I scripts/tests/test_scan_public.py`,
-`python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`
-run against synthetic samples and a stub `gh`, and need gitleaks on `PATH` or `HER_GITLEAKS`.
+`python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`, `python -I scripts/tests/test_handoff.py`
+run against synthetic samples and a stub `gh`, and need gitleaks on `PATH` or `HER_GITLEAKS`. `.githooks/pre-push` and `scripts/gh-public` need it too; without it they refuse with `scanner-missing` (exit 3), not with a finding. After a clean scan, `scripts/gh-public` exits 4 when `gh` itself fails (`gh-failed`). Install the pinned version with `python -I scripts/ci/install-gitleaks.py <dir>` and point `HER_GITLEAKS` at it (host paths: `docs/agents/rust-validation.md`).
 
 Fixtures use short synthetic account identifiers. Numeric scan exceptions must
 name a specific file/value and explain the non-account meaning. Secret scan

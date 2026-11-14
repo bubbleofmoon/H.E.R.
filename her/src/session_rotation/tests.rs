@@ -1,28 +1,47 @@
 use super::*;
+use crate::digest::{DigestModel, ModelError};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
     thread,
+    time::{Duration, Instant},
 };
-use tokio_tungstenite::tungstenite::{accept, Message};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Fault {
-    Open,
-    Read,
-    ReadError,
-    IntentChanged,
-    IntentWrite,
-    Prompt,
-    Observe,
-    Cancel,
-    Facts,
-    Complete,
+    None,
+    ModelError,
+    Refusal,
+    Unparseable,
     Checkpoint,
-    Memory,
-    MemoryText,
-    Result,
+}
+
+/// The in-process digest model for these fixtures: each call is recorded, and the answer follows the fault.
+struct FixtureModel {
+    root: PathBuf,
+    fault: Fault,
+}
+
+impl DigestModel for FixtureModel {
+    fn complete(&self, _system: &str, _input: &str) -> Result<String, ModelError> {
+        use std::fs::OpenOptions;
+        let mut calls = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join("model-called"))
+            .unwrap();
+        writeln!(calls, "call").unwrap();
+        if self.fault == Fault::Checkpoint {
+            std::fs::write(self.root.join("data/sessions.json"), "invalid-json").unwrap();
+        }
+        match self.fault {
+            Fault::ModelError => Err(ModelError("backend")),
+            Fault::Refusal => Ok("content_filter".into()),
+            Fault::Unparseable => Ok("好的".into()),
+            _ => Ok(r#"[{"subject":"爬山","content":"甲周六要去爬山"}]"#.into()),
+        }
+    }
 }
 
 struct Fixture {
@@ -63,25 +82,19 @@ impl Fixture {
         .unwrap();
         std::fs::write(
             root.join("data/social-v2.json"),
-            json!({"conversations":{"group:1":{"agentToken":"epoch"}}}).to_string(),
+            json!({"conversations":{"group:1":{"agentToken":"epoch","recentMessages":[
+                {"seq":1,"sender":"甲","userId":"5001","text":"周六去爬山","isSelf":false},
+                {"seq":2,"sender":"乙","userId":"5002","text":"我也去","isSelf":false}]}}}).to_string(),
         )
         .unwrap();
-        let pending = matches!(
-            fault,
-            Fault::Read
-                | Fault::ReadError
-                | Fault::Cancel
-                | Fault::Complete
-                | Fault::Checkpoint
-                | Fault::Memory
-                | Fault::MemoryText
-                | Fault::Result
-        );
         std::fs::write(root.join("data/sessions.json"), json!({"sessions":{"group:1":"sid"},"briefings":{"group:1":{
-            "sid":"sid","epoch":"epoch","format":1,"lastTurnSeq":5,
-            "rotation":if pending {json!({"phase":"pending","rpcId":"pending-rpc","turnSeq":5})} else {json!({})}
+            "sid":"sid","epoch":"epoch","format":1,"lastTurnSeq":5,"rotation":json!({})
         }}}).to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
+        crate::digest::install_test_model(
+            context.runtime_root().unwrap(),
+            Arc::new(FixtureModel { root: root.clone(), fault }),
+        );
         let plan = Plan {
             key: "group:1".into(),
             sid: "sid".into(),
@@ -89,7 +102,7 @@ impl Fixture {
             guard: json!({}),
             turn_seq: 5,
             input: 0,
-            recovering: pending,
+            recovering: false,
             policy: json!({}),
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -101,7 +114,7 @@ impl Fixture {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let root = server_root.clone();
-                        thread::spawn(move || connection(stream, fault, &root));
+                        thread::spawn(move || connection(stream, &root));
                     }
                     Err(_) => thread::sleep(Duration::from_millis(5)),
                 }
@@ -125,110 +138,11 @@ impl Drop for Fixture {
     }
 }
 
-fn connection(mut stream: TcpStream, fault: Fault, root: &std::path::Path) {
+fn connection(mut stream: TcpStream, root: &std::path::Path) {
     stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut peek = [0; 64];
-    let Ok(n) = stream.peek(&mut peek) else {
-        return;
-    };
-    if String::from_utf8_lossy(&peek[..n]).starts_with("GET /api/remote.mux") {
-        let Ok(mut ws) = accept(stream) else { return };
-        let Ok(Message::Text(open)) = ws.read() else {
-            return;
-        };
-        let open: Value = serde_json::from_str(&open).unwrap();
-        assert_eq!(
-            open.pointer("/payload/args/request/address/sessionId")
-                .and_then(Value::as_str),
-            Some("sid")
-        );
-        let id = &open["streamId"];
-        if fault == Fault::Open {
-            let _ = ws.send(Message::Text(
-                json!({"type":"error","streamId":id,"error":{"code":"private-error-text"}})
-                    .to_string(),
-            ));
-            close_fake_ws(&mut ws, true);
-            return;
-        }
-        let mut events = vec![];
-        if matches!(
-            fault,
-            Fault::Read
-                | Fault::ReadError
-                | Fault::Cancel
-                | Fault::Complete
-                | Fault::Checkpoint
-                | Fault::Memory
-                | Fault::MemoryText
-                | Fault::Result
-        ) {
-            events = vec![
-                json!({"seq":1,"type":"user/message","data":{"source":{"rpcId":"pending-rpc"}}}),
-                json!({"seq":2,"type":"turn/start","data":{"turn":1}}),
-            ];
-            if matches!(
-                fault,
-                Fault::Complete
-                    | Fault::Checkpoint
-                    | Fault::Memory
-                    | Fault::MemoryText
-                    | Fault::Result
-            ) {
-                let call_id = if fault == Fault::MemoryText {
-                    json!(17)
-                } else {
-                    json!("m")
-                };
-                events.push(json!({"seq":3,"type":"tool/call","data":{"turn":1,"callId":call_id,"name":"memory_write"}}));
-                events.push(json!({"seq":4,"type":"tool/result","data":{"turn":1,"message":{"isError":fault==Fault::Memory,"source":{"callId":call_id},"content":[{"type":"text","text":if fault==Fault::MemoryText {"写入失败：private-memory-error-text"} else {"ok"}}]}}}));
-                events.push(json!({"seq":5,"type":"turn/end","data":{"turn":1,"reason":{"kind":if fault==Fault::Result {"failed"} else {"completed"}}}}));
-            }
-        }
-        let records: Vec<_> = events
-            .into_iter()
-            .map(|event| json!({"type":"event","event":event}))
-            .collect();
-        if fault == Fault::IntentChanged {
-            std::fs::write(
-                root.join("data/social-v2.json"),
-                r#"{"conversations":{"group:1":{"agentToken":"replacement"}}}"#,
-            )
-            .unwrap();
-        }
-        if matches!(fault, Fault::IntentWrite | Fault::Checkpoint) {
-            std::fs::write(root.join("data/sessions.json"), "invalid-json").unwrap();
-        }
-        let _ = ws.send(Message::Text(json!({"type":"item","streamId":id,"value":{"type":"snapshot","records":records,"hasMore":false}}).to_string()));
-        if fault == Fault::Read {
-            close_fake_ws(&mut ws, true);
-            return;
-        }
-        if fault == Fault::ReadError {
-            ws.send(Message::Text(
-                json!({"type":"error","streamId":id,
-                "error":{"code":"timeout-private-error-text"}})
-                .to_string(),
-            ))
-            .unwrap();
-            close_fake_ws(&mut ws, true);
-            return;
-        }
-        if fault == Fault::Observe {
-            // Wait until the intent has been submitted before making the next persistence fail.
-            let until = Instant::now() + Duration::from_secs(2);
-            while !root.join("prompt-submitted").exists() && Instant::now() < until {
-                thread::sleep(Duration::from_millis(5));
-            }
-            std::fs::write(root.join("data/sessions.json"), "invalid-json").unwrap();
-            let _ = ws.send(Message::Text(json!({"type":"item","streamId":id,"value":{"type":"event","event":{"seq":10,"type":"compaction/start","data":{"compactionId":"synthetic"}}}}).to_string()));
-        }
-        close_fake_ws(&mut ws, false);
-        return;
-    }
     let mut bytes = Vec::new();
     let mut buf = [0; 4096];
     let body = loop {
@@ -269,78 +183,54 @@ fn connection(mut stream: TcpStream, fault: Fault, root: &std::path::Path) {
         );
         return;
     }
-    let method = request["method"].as_str().unwrap();
-    if method == "session/prompt" {
-        std::fs::write(root.join("prompt-submitted"), "").unwrap();
-    }
-    let error = (method == "session/prompt" && fault == Fault::Prompt)
-        || (method == "session/cancel" && fault == Fault::Cancel);
-    let value = if method == "session/projections" {
-        json!({"values":{"inbox":{"next-turn":[],"next-step":[]}}})
-    } else {
-        json!({"accepted":true})
-    };
-    let result = if error {
-        json!({"ok":false,"error":{"code":"invalid-request","message":"private-model-error-text"}})
-    } else {
-        json!({"ok":true,"value":value})
-    };
-    let body =
-        json!({"type":"server-response","rpcId":request["rpcId"],"result":result}).to_string();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
+    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
-// Drain queued client frames before dropping the TCP socket: unread bytes can
-// turn an ordinary fixture teardown into a reset on Windows.
-fn close_fake_ws(ws: &mut tokio_tungstenite::tungstenite::WebSocket<TcpStream>, initiate: bool) {
-    if initiate {
-        let _ = ws.close(None);
-    }
-    while let Ok(message) = ws.read() {
-        if matches!(message, Message::Close(_)) {
-            let _ = ws.flush();
-            break;
-        }
-    }
+fn model_calls(f: &Fixture) -> usize {
+    std::fs::read_to_string(f.root.join("model-called"))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+fn digest_rows(f: &Fixture) -> i64 {
+    rusqlite::Connection::open(f.root.join("data/memory.db"))
+        .ok()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT count(*) FROM memory WHERE source LIKE 'digest:%'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        })
+        .unwrap_or(0)
+}
+
+fn no_cancel() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn digest_failures_identify_every_boundary_without_retaining_content() {
+async fn rotation_digest_failures_carry_a_fixed_step_and_kind_and_write_nothing() {
     for (fault, step, kind) in [
-        (Fault::Open, "follow-open", "rejected"),
-        (Fault::Read, "follow-read", "transport"),
-        (Fault::ReadError, "follow-read", "rejected"),
-        (Fault::IntentChanged, "intent-write", "session-changed"),
-        (Fault::IntentWrite, "intent-write", "storage"),
-        (Fault::Prompt, "prompt", "rejected"),
-        (Fault::Observe, "observe", "storage"),
-        (Fault::Cancel, "cancel", "rejected"),
-        (Fault::Facts, "turn-facts", "timeout"),
-        (Fault::Memory, "memory-write", "tool-failed"),
-        (Fault::MemoryText, "memory-write", "tool-failed"),
-        (Fault::Result, "digest-result", "turn-failed"),
+        (Fault::ModelError, "model", "backend"),
+        (Fault::Refusal, "digest-result", "refusal-or-error"),
+        (Fault::Unparseable, "digest-result", "unparseable"),
     ] {
         let f = Fixture::new(fault);
-        let result = digest_inner(
-            &f.context,
-            &f.plan,
-            &AtomicBool::new(fault == Fault::Cancel),
-        )
-        .await;
-        let error = result.unwrap_err();
-        assert_eq!((error.step, error.kind), (step, kind), "{error:?}");
+        let error = digest_inner(&f.context, &json!({}), &f.plan, &no_cancel())
+            .await
+            .unwrap_err();
+        assert_eq!((error.step, error.kind, error.settled), (step, kind, true), "{error:?}");
         assert!(!format!("{error:?}").contains("private"));
+        assert_eq!(digest_rows(&f), 0);
     }
 }
 
 #[tokio::test]
 async fn hf135_received_error_frame_wins_over_later_socket_reset() {
     use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (received, read) = tokio::sync::oneshot::channel();
@@ -366,65 +256,52 @@ async fn hf135_received_error_frame_wins_over_later_socket_reset() {
         #[allow(deprecated)]
         ws.get_ref().set_linger(Some(Duration::ZERO)).unwrap();
     });
-    let error = FollowStream::open(&base, "", "sid").await.err().unwrap();
+    let error = crate::dsh::FollowStream::open(&base, "", "sid").await.err().unwrap();
     assert!(
         error.starts_with("订阅被拒："),
         "the error frame must be read first"
     );
     received.send(()).unwrap();
     server.await.unwrap();
-    let failure = DigestFailure::external("follow-open", &error);
-    assert_eq!((failure.step, failure.kind), ("follow-open", "rejected"));
-    assert!(!format!("{failure:?}").contains("private"));
-    assert_eq!(
-        DigestFailure::external("follow-open", "WS 读失败：connection reset").kind,
-        "transport"
-    );
 }
 
-#[tokio::test]
-async fn digest_setup_errors_and_restarted_completion_are_distinct() {
-    let f = Fixture::new(Fault::Complete);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotation_digest_writes_new_messages_with_bridge_provenance_once() {
+    let f = Fixture::new(Fault::None);
     assert_eq!(
-        digest_inner(&f.context, &f.plan, &AtomicBool::new(false))
-            .await
-            .unwrap(),
+        digest_inner(&f.context, &json!({}), &f.plan, &no_cancel()).await.unwrap(),
         Some(true)
     );
+    let (owner, kind, source): (String, String, String) = rusqlite::Connection::open(f.root.join("data/memory.db"))
+        .unwrap()
+        .query_row(
+            "SELECT owner_id,kind,source FROM memory WHERE source LIKE 'digest:%'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (owner.as_str(), kind.as_str(), source.as_str()),
+        ("group:1", "inference", "digest:group:1:msg:1-2")
+    );
+    assert_eq!(
+        digest_inner(&f.context, &json!({}), &f.plan, &no_cancel()).await.unwrap(),
+        Some(true)
+    );
+    assert_eq!(model_calls(&f), 1, "a digested range is never asked again");
     std::fs::write(f.root.join("data/sessions.json"), "bad").unwrap();
     assert_eq!(
-        digest_inner(&f.context, &f.plan, &AtomicBool::new(false))
+        digest_inner(&f.context, &json!({}), &f.plan, &no_cancel())
             .await
             .unwrap_err()
             .step,
         "context-read"
     );
-    std::fs::write(
-        f.root.join("data/sessions.json"),
-        json!({"sessions":{"group:1":"sid"}}).to_string(),
-    )
-    .unwrap();
-    let mut missing = json!({"sessions":{"group:1":"sid"},"briefings":{"group:1":{"sid":"sid","epoch":"epoch","format":1,"rotation":{"phase":"pending"}}}});
-    std::fs::write(f.root.join("data/sessions.json"), missing.to_string()).unwrap();
-    let error = digest_inner(&f.context, &f.plan, &AtomicBool::new(false))
-        .await
-        .unwrap_err();
-    assert_eq!((error.step, error.kind), ("rpc-lookup", "identity-missing"));
-    missing["briefings"]["group:1"]["rotation"] = json!({});
-    std::fs::write(f.root.join("data/sessions.json"), missing.to_string()).unwrap();
-    std::fs::remove_file(f.root.join("user/dsh/.credentials.yaml")).unwrap();
-    assert_eq!(
-        digest_inner(&f.context, &f.plan, &AtomicBool::new(false))
-            .await
-            .unwrap_err()
-            .kind,
-        "credentials"
-    );
 }
 
 #[test]
 fn rotation_notice_is_once_per_conversation_per_day_across_session_replacement() {
-    let f = Fixture::new(Fault::Complete);
+    let f = Fixture::new(Fault::None);
     assert!(crate::session_map::mark_rotation_alert(&f.context, "group:1", "sid-one").unwrap());
     assert!(!crate::session_map::mark_rotation_alert(&f.context, "group:1", "sid-two").unwrap());
     let doc = crate::session_map::read(&f.context).unwrap();
@@ -436,6 +313,7 @@ fn rotation_notice_is_once_per_conversation_per_day_across_session_replacement()
 #[tokio::test]
 async fn checkpoint_failure_does_not_claim_success_or_repeat_a_prompt() {
     let f = Fixture::new(Fault::Checkpoint);
+    let original = std::fs::read(f.root.join("data/sessions.json")).unwrap();
     let result = digest(
         f.context.clone(),
         json!({}),
@@ -444,12 +322,23 @@ async fn checkpoint_failure_does_not_claim_success_or_repeat_a_prompt() {
     )
     .await;
     assert!(matches!(result, DigestResult::Pending));
-    assert!(!f.root.join("prompt-submitted").exists());
+    assert_eq!(model_calls(&f), 1);
+    assert_eq!(digest_rows(&f), 1);
+    std::fs::write(f.root.join("data/sessions.json"), original).unwrap();
+    let result = digest(
+        f.context.clone(),
+        json!({}),
+        f.plan.clone(),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    assert!(matches!(result, DigestResult::Done { ran: true, .. }));
+    assert_eq!(model_calls(&f), 1, "a settled digest range is not asked again");
 }
 
 #[tokio::test]
 async fn hf135_concurrent_digest_and_recovery_failures_send_exactly_one_notice() {
-    let f = Fixture::new(Fault::Complete);
+    let f = Fixture::new(Fault::None);
     let cfg = json!({"ownerQQ":9001});
     let context = f.context.clone();
     let recovery_cfg = cfg.clone();
@@ -547,7 +436,7 @@ async fn hf135_notice_survives_unreadable_store_repair_and_process_restart() {
         wait_for_notice(&context, &barrier).await;
         return;
     }
-    let f = Fixture::new(Fault::Complete);
+    let f = Fixture::new(Fault::None);
     let sessions = f.root.join("data/sessions.json");
     let original = std::fs::read(&sessions).unwrap();
     std::fs::write(&sessions, "private-invalid-state").unwrap();
@@ -623,7 +512,7 @@ async fn wait_for_notice(context: &RuntimeContext, text: &str) {
 
 #[tokio::test]
 async fn hf135_memory_fallback_is_adopted_durably_after_repair() {
-    let f = Fixture::new(Fault::Complete);
+    let f = Fixture::new(Fault::None);
     let sessions = f.root.join("data/sessions.json");
     let original = std::fs::read(&sessions).unwrap();
     let independent = f.root.join("data/rotation-alerts.json");
@@ -671,7 +560,7 @@ async fn hf135_memory_fallback_is_adopted_durably_after_repair() {
 
 #[tokio::test]
 async fn replaced_authority_releases_old_maintenance_without_submitting() {
-    let f = Fixture::new(Fault::Complete);
+    let f = Fixture::new(Fault::None);
     std::fs::write(
         f.root.join("data/social-v2.json"),
         r#"{"conversations":{"group:1":{"agentToken":"replacement"}}}"#,
@@ -687,7 +576,7 @@ async fn replaced_authority_releases_old_maintenance_without_submitting() {
         .await,
         DigestResult::Done { ran: false, .. }
     ));
-    assert!(!f.root.join("prompt-submitted").exists());
+    assert_eq!(model_calls(&f), 0);
 }
 
 #[tokio::test]
@@ -701,7 +590,7 @@ async fn hf135_interleaved_read_failures_alert_once_without_resetting_on_success
 }
 
 async fn persistent_sessions_read_failure(interleaved: bool) {
-    let f = Fixture::new(Fault::Complete);
+    let f = Fixture::new(Fault::None);
     let path = f.root.join("data/sessions.json");
     let original = std::fs::read(&path).unwrap();
     std::fs::write(&path, "private-invalid-state").unwrap();
@@ -750,7 +639,7 @@ async fn persistent_sessions_read_failure(interleaved: bool) {
     assert_eq!(notices.lines().count(), 1);
     assert!(notices.contains("step=context-read kind=storage"));
     assert!(!notices.contains("private-invalid-state"));
-    assert!(!f.root.join("prompt-submitted").exists());
+    assert_eq!(model_calls(&f), 0);
     std::fs::write(path, original).unwrap();
     std::fs::write(social, original_social).unwrap();
     assert!(matches!(
@@ -768,5 +657,5 @@ async fn persistent_sessions_read_failure(interleaved: bool) {
         60_000,
         "a completed digest does not yet confirm revocation or release maintenance"
     );
-    assert!(!f.root.join("prompt-submitted").exists());
+    assert_eq!(model_calls(&f), 1);
 }

@@ -14,9 +14,14 @@ public issue, comment or commit names those vault paths and nothing else.
   development: never write any of them or `memory.db`; never change a scheduled task, a
   service, a token, a release directory or a configuration file there. Development work never stops, starts or replaces
   a production process.
+- A production database is read from file metadata only, or from a copy taken with the
+  owner's go; it is never opened in place, in any mode. `mode=ro` on a WAL database creates
+  `-wal` and `-shm` beside it and leaves them after close, and `immutable=1` reuses existing
+  ones, so no open mode is safe against a live database.
 - Every production action is the owner's, taken with the owner's go at the time it happens
   (`docs/agents/baton.md`). An agent prepares the command and the check, and reports what it
-  would do; it never runs it.
+  would do; it never runs it. A go relayed through a handoff does not change this: a
+  production-action handoff carries the exact command and check for the owner to run.
 - Tests never touch production. They run against throwaway runtimes and fake QQ gateways,
   agent hosts and model servers, and never contact real QQ, DSH, model or TTS services.
   `HER_INSTALL_ROOT` points a test at a throwaway installation, never at a live one.

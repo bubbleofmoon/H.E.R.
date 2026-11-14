@@ -966,8 +966,10 @@ impl Hub {
         let role_mode = role_state.get("mode").and_then(Value::as_str).unwrap_or("active").to_string();
         let session = crate::session_map::lookup(&self.context, &key)?;
         let context = self.context.clone();
+        // In companion modes every `/role` form gets the retirement notice, an unknown name included.
+        let retired = crate::persona::applies(&self.context);
         let exists = move |name: &str| {
-            context
+            retired || context
                 .resolve_path(RuntimeArea::Resources, &format!("roles/{name}.md"), PathIntent::ReadFile)
                 .map(|p| p.is_file())
                 .unwrap_or(false)
@@ -992,8 +994,12 @@ impl Hub {
                 Ok(Outcome::Done)
             }
             Decision::SetRole { name, say } => {
-                crate::console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
-                self.say(cfg, &key, &say);
+                if crate::persona::applies(&self.context) {
+                    self.say(cfg, &key, crate::persona_command::ROLE_RETIRED);
+                } else {
+                    crate::console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    self.say(cfg, &key, &say);
+                }
                 self.settle(inbound_key).await?;
                 Ok(Outcome::Done)
             }
@@ -1033,7 +1039,7 @@ impl Hub {
                 } else {
                     inb.user_id.to_string()
                 };
-                let hint = crate::prompt::role_hint_v1(&self.context, cfg, &key);
+                let hint = crate::prompt::identity_hint_v1(&self.context, cfg, &key);
                 let prompt = build_prompt(
                     &hint,
                     is_owner,

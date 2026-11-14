@@ -231,7 +231,7 @@ fn context_block(c: &Conversation, cfg: &Value) -> String {
     }
 }
 fn role_prefix(context: &RuntimeContext, cfg: &Value, key: &str) -> String {
-    let hint = crate::prompt::role_hint_v1(context, cfg, key);
+    let hint = crate::prompt::identity_hint_v1(context, cfg, key);
     if hint.is_empty() {
         hint
     } else {
@@ -716,8 +716,10 @@ impl Hub {
             session: crate::session_map::lookup(&self.context, &key)?,
             allowed: true,
         };
+        // In companion modes every `/role` form gets the retirement notice, an unknown name included.
+        let retired = crate::persona::applies(&self.context);
         let decision = chat::decide(&facts, &|name| {
-            self.context
+            retired || self.context
                 .resolve_path(
                     RuntimeArea::Resources,
                     &format!("roles/{name}.md"),
@@ -729,8 +731,12 @@ impl Hub {
         let say = match decision {
             chat::Decision::Say(text) => Some(text),
             chat::Decision::SetRole { name, say } => {
-                console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
-                Some(say)
+                if crate::persona::applies(&self.context) {
+                    Some(crate::persona_command::ROLE_RETIRED.to_string())
+                } else {
+                    console::chat_write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    Some(say)
+                }
             }
             chat::Decision::SetRoleMode { mode, say } => {
                 console::chat_write_role_state(&self.context, current_role.as_deref(), mode)?;
@@ -810,7 +816,7 @@ impl Hub {
         );
         if sc["enabled"] == false {
             let prompt = chat::build_prompt(
-                &crate::prompt::role_hint_v1(&self.context, &cfg, &key),
+                &crate::prompt::identity_hint_v1(&self.context, &cfg, &key),
                 owner,
                 (inb.kind == "group").then_some(if !inb.card.is_empty() {
                     inb.card.as_str()
