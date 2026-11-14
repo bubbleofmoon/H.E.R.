@@ -6,6 +6,8 @@
     python -I scripts/scan-public.py --stdin             scan text read from stdin
     python -I scripts/scan-public.py --revs-from-stdin   scan the trees of the revisions
                                                          named on stdin (one sha per line)
+    python -I scripts/scan-public.py --added-from-stdin  scan only the blobs the commits named
+                                                         on stdin add over their parents
     python -I scripts/scan-public.py --objects-from-stdin  scan the message payload of every
                                                          commit or tag object named on stdin
 
@@ -32,7 +34,9 @@ revision it is given, including a blob whose path sits under a directory the tre
 skips locally, because a committed blob is published even when the working copy ignores
 it. Exceptions are read from the checkout being pushed: a reviewed synthetic value stays
 synthetic in an older revision of the same path. A git or scan error is itself a finding,
-so history mode fails closed. Exit code 0 means zero findings.
+so history mode fails closed. Exit code 0 means zero findings, 3 means gitleaks could not be found (the other findings are still printed), 1 any other finding.
+
+Added mode is history mode for a branch that moves forward from a commit the remote already has: for each commit it scans the blobs that differ from each parent (`git diff-tree -r --no-renames`), because a blob a commit shares with a parent is published by that parent. The caller passes only commits whose every parent is passed too or is already on the remote. A commit without a parent, or with a parent this repository cannot read, is scanned as a whole tree. Deletions and submodule links publish no blob content.
 
 Message mode covers the other half of what a push publishes: the message of every commit and
 annotated tag object it is given. A clean tree with a sensitive commit or tag message is
@@ -86,6 +90,9 @@ CHAT_PATTERNS = (
 )
 
 
+MISSING_SCANNER = 'secret-scan <scan>:0: gitleaks not found (set HER_GITLEAKS or install it with scripts/ci/install-gitleaks.py)'
+
+
 def gitleaks_path():
     override = os.environ.get('HER_GITLEAKS')
     if override:
@@ -102,7 +109,7 @@ def secret_findings(source, config, scan_skipped=False):
     """
     exe = gitleaks_path()
     if exe is None:
-        return [], 'secret-scan <scan>:0: gitleaks not found (set HER_GITLEAKS or install it with scripts/ci/install-gitleaks.py)'
+        return [], MISSING_SCANNER
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / 'gitleaks.json'
         command = [str(exe), 'detect', '--no-git']
@@ -218,6 +225,47 @@ def collect_blobs(repo, revs):
     return blobs, None
 
 
+def collect_added_blobs(repo, commits):
+    """(blobs, whole, error): the blobs each commit adds over its parents.
+
+    `blobs` maps (path, oid) to the short commits that add it, as in collect_blobs. A commit
+    without a parent, or with a parent this repository cannot read, goes to `whole` so its full
+    tree is scanned instead.
+    """
+    blobs, whole = {}, []
+    for commit in commits:
+        raw_commit, error = git_stdout(repo, 'cat-file', 'commit', commit)
+        if error:
+            return {}, [], f'{error} (commit {commit[:12]})'
+        header = raw_commit.partition(b'\n\n')[0]
+        # The recorded parents, read from the object itself: a parent missing here (a shallow
+        # boundary or a pruned object) is then seen as unreadable, never as absent.
+        parents = [line[len(b'parent '):].decode('ascii', 'replace').strip()
+                   for line in header.split(b'\n') if line.startswith(b'parent ')]
+        if not parents or any(git_stdout(repo, 'cat-file', '-e', f'{parent}^{{commit}}')[1] for parent in parents):
+            whole.append(commit)
+            continue
+        short = commit[:12]
+        for parent in parents:
+            raw, error = git_stdout(repo, 'diff-tree', '-r', '-z', '--no-renames', '--raw', parent, commit)
+            if error:
+                return {}, [], f'{error} (commit {short})'
+            fields = raw.split(b'\0')
+            if fields and fields[-1] == b'':
+                fields.pop()
+            if len(fields) % 2:
+                return {}, [], f'git diff-tree output could not be read (commit {short})'
+            for meta, path_bytes in zip(fields[0::2], fields[1::2]):
+                try:
+                    _, new_mode, _, new_oid, status = meta.decode('ascii').lstrip(':').split(' ')
+                except (UnicodeDecodeError, ValueError):
+                    return {}, [], f'git diff-tree output could not be read (commit {short})'
+                if status == 'D' or new_mode in ('000000', '160000'):
+                    continue  # a deletion or a submodule link publishes no blob content
+                blobs.setdefault((path_bytes.decode('utf-8', 'surrogateescape'), new_oid), []).append(short)
+    return blobs, whole, None
+
+
 def tree_snapshots(blobs):
     """Group (path, oid) blobs so one snapshot holds at most one content per path.
 
@@ -284,6 +332,33 @@ def history_context(blobs, flagged):
     return lines
 
 
+def scan_blobs(root, blobs, allowed, path_allowed, counters, findings):
+    """Materialize (path, oid) blobs snapshot by snapshot and scan them: (files, snapshots, flagged)."""
+    files, flagged = 0, set()
+    snapshots = tree_snapshots(blobs)
+    for snapshot in snapshots:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / 'tree'
+            stage.mkdir()
+            shutil.copyfile(root / '.gitleaks.toml', stage / '.gitleaks.toml')
+            for (path, oid), _ in snapshot.items():
+                content, blob_error = git_stdout(root, 'cat-file', 'blob', oid)
+                if blob_error:
+                    findings.append(f'history {path}:1: {blob_error}')
+                    continue
+                target = stage / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            scanned, secrets = scan_tree(stage, root / '.gitleaks.toml', allowed, path_allowed,
+                                         counters, findings, scan_skipped=True)
+            files += scanned
+            for rel, line in secrets:
+                findings.append(f'secret {rel}:{line}')
+            for rel, _ in secrets:
+                flagged.add(rel)
+    return files, len(snapshots), flagged
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parent.parent)
@@ -292,6 +367,8 @@ def main():
                         help='scan every tracked blob of every revision named on stdin, one sha per line')
     parser.add_argument('--objects-from-stdin', action='store_true',
                         help='scan the message payload of every commit or tag object named on stdin')
+    parser.add_argument('--added-from-stdin', action='store_true',
+                        help='scan only the blobs the commits named on stdin add over their parents')
     args = parser.parse_args()
     root = args.root.resolve()
     config_path = root / '.public-scan.json'
@@ -353,6 +430,27 @@ def main():
                 for rel, line in secrets:
                     findings.append(f'secret {messages.get(rel, "message")}:{line}')
         summary_extra = f'{checked} message objects'
+    elif args.added_from_stdin:
+        mode = 'added'
+        commits = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
+        if not commits:
+            print('Public scan (added): 0 findings (none); 0 commits, 0 whole trees, 0 blobs, 0 tree snapshots')
+            return 0
+        blobs, whole, error = collect_added_blobs(root, commits)
+        if not error and whole:
+            full, error = collect_blobs(root, whole)
+            for key, publishing in full.items():
+                blobs.setdefault(key, []).extend(publishing)
+        if error:
+            findings.append(f'history <scan>:0: {error}')
+            blobs = {}
+        files, snapshot_count, flagged = scan_blobs(root, blobs, allowed, path_allowed, counters, findings)
+        for finding in findings:
+            kind, _, position = finding.partition(' ')
+            if kind in ('digit', 'user-path', 'chat-record', 'non-text', 'secret'):
+                flagged.add(position.rsplit(':', 1)[0])
+        context = history_context(blobs, flagged) if blobs else []
+        summary_extra = f'{len(commits)} commits, {len(whole)} whole trees, {len(blobs)} blobs, {snapshot_count} tree snapshots'
     elif args.revs_from_stdin:
         mode = 'history'
         revs = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]
@@ -360,38 +458,17 @@ def main():
         if not revs:
             print('Public scan (history): 0 findings (none); 0 revisions, 0 blobs, 0 tree snapshots; 0 files')
             return 0
-        flagged = set()
         blobs, error = collect_blobs(root, revs)
         if error:
             findings.append(f'history <scan>:0: {error}')
-        snapshots = tree_snapshots(blobs) if not error else []
+        files, snapshot_count, flagged = scan_blobs(root, blobs, allowed, path_allowed, counters, findings)
         blob_count = len(blobs)
-        for snapshot in snapshots:
-            with tempfile.TemporaryDirectory() as tmp:
-                stage = Path(tmp) / 'tree'
-                stage.mkdir()
-                shutil.copyfile(root / '.gitleaks.toml', stage / '.gitleaks.toml')
-                for (path, oid), _ in snapshot.items():
-                    content, blob_error = git_stdout(root, 'cat-file', 'blob', oid)
-                    if blob_error:
-                        findings.append(f'history {path}:1: {blob_error}')
-                        continue
-                    target = stage / path
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(content)
-                scanned, secrets = scan_tree(stage, root / '.gitleaks.toml', allowed, path_allowed,
-                                             counters, findings, scan_skipped=True)
-                files += scanned
-                for rel, line in secrets:
-                    findings.append(f'secret {rel}:{line}')
-                for rel, _ in secrets:
-                    flagged.add(rel)
         for finding in findings:
             kind, _, position = finding.partition(' ')
             if kind in ('digit', 'user-path', 'chat-record', 'non-text', 'secret'):
                 flagged.add(position.rsplit(':', 1)[0])
         context = history_context(blobs, flagged) if blobs else []
-        summary_extra = f'{len(revs)} revisions, {blob_count} blobs, {len(snapshots)} tree snapshots'
+        summary_extra = f'{len(revs)} revisions, {blob_count} blobs, {snapshot_count} tree snapshots'
     else:
         files, secrets = scan_tree(root, root / '.gitleaks.toml', allowed, path_allowed, counters, findings)
         for rel, line in secrets:
@@ -410,6 +487,8 @@ def main():
     print(f'Public scan ({mode}): {len(findings)} findings ({summary}); '
           f'{counters["reviewed"]} reviewed digit runs and {counters["paths reviewed"]} reviewed '
           f'account-home lines; {summary_extra}')
+    if MISSING_SCANNER in findings:
+        return 3      # no secret scanner: a setup problem, not a statement about the text
     return bool(findings)
 
 

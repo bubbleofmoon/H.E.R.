@@ -19,3 +19,4 @@ Read for tool schemas, protocol, generated DSH MCP config, memory access or sett
 - Preview uses selected recall and returns the block the next wake would deliver (memories the conversation's current session generation already carries are left out), without counting search hits (`docs/agents/prompts-modes.md` owns the delivery contract). Explicit archive/unarchive retains memory and FTS with audit and is visible to search/index without a new MCP tool. Captured ACL/token-ledger expected outputs stay in tests/fixtures and are exercised through HTTP.
 
 - Harness in-process memory dispatch records a structured source alongside its outcome for later model-copy rendering; `docs/agents/harness.md` owns that internal snapshot contract. Standard stdio MCP results keep their existing shape.
+- `her-memory` probe diagnostics report metadata only; stored model text never enters its output.
