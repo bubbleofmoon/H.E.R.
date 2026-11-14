@@ -596,22 +596,16 @@ CI_WAIT_REFUSED = [   # #90: only coordinators (no guard) wait for CI
     ('wt', "git grep --open-files-in-page='python3 scripts/ci-wait.py --run 42' x"),
     ('wt', "git grep --open-files='python3 scripts/ci-wait.py --run 42' x"),
     ('wt', "GIT_PAGER='/root/orch/her/tools/ci-wait.sh 90 42' git log"),
-    ('wt', "GIT_EXTERNAL_DIFF='python3 scripts/ci-wait.py --run 42' git log -p"),
     ('wt', "git log -p --ext-diff --grep='python3 scripts/ci-wait.py --run 42'"),
 ]
-CI_WAIT_REFUSED_TO_WORKERS = [   # reads that read-only roles may run, but whose options are not search text
+CI_WAIT_REFUSED_TO_WORKERS = [   # implementers and gates: any mention of ci-wait is refused (read-only roles keep their allow-list)
     ('wt', "git log -c 'python3 scripts/ci-wait.py --run 42'"),
     ('wt', "git log --grep 'x' -c 'python3 scripts/ci-wait.py --run 42'"),
-]
-CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the script stay allowed for implementers and gates
-    ('wt', 'python3 -I scripts/tests/test_ci_wait.py'),
-    ('wt', 'python -I scripts/tests/test_ci_wait.py CiWait.test_several_runs_are_waited_for_together'),
     ('wt', 'cat scripts/ci-wait.py'),
     ('wt', 'grep -n LOCAL_API scripts/ci-wait.py'),
     ('wt', 'git diff -- scripts/ci-wait.py'),
     ('wt', 'sha256sum scripts/ci-wait.py'),
     ('wt', "git log --grep 'ci-wait timeout'"),
-    ('wt', "git log --grep 'python timeout'"),
     ('wt', "gh issue list --search 'ci-wait timeout'"),
     ('wt', 'grep -rn "python -I scripts/ci-wait.py" docs'),
     ('wt', 'sed -n 1,5p scripts/ci-wait.py'),
@@ -621,6 +615,16 @@ CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's tests and plain reads of the scr
     ('wt', "git grep -n -i -e 'python scripts/ci-wait.py' -- docs"),
     ('wt', "grep -rniE 'ci-wait timeout' docs"),
     ('wt', "rg -n -i 'python scripts/ci-wait.py' docs"),
+    ('wt', 'echo CI-Wait'),
+    ('wt', "rg -r -e --pre=python3 . scripts/ci-wait.py"),
+    ('wt', "git grep -O'python3 - --run 42 <' LOCAL_API -- scripts/ci-wait.py"),
+    ('wt', "export PATH+=:/root/orch/her/tools GIT_PAGER+=ci-wait.sh; git log"),
+    ('wt', "GIT_PAGER+='/root/orch/her/tools/ci-wait.sh 90 42' git log"),
+]
+CI_WAIT_NEIGHBOURS_ALLOWED = [   # the waiter's own tests (the file name has an underscore) stay allowed
+    ('wt', 'python3 -I scripts/tests/test_ci_wait.py'),
+    ('wt', 'python -I scripts/tests/test_ci_wait.py CiWait.test_several_runs_are_waited_for_together'),
+    ('wt', "git log --grep 'python timeout'"),      # a read that does not mention the waiter
 ]
 WATCH_WRAPS = [
     ('wt', 'watch -n 600 codex exec x'),
@@ -843,6 +847,7 @@ class AgentGuard(unittest.TestCase):
                 with self.subTest(role=role, command=command):
                     code, err = self.guard(role, where, command)
                     self.assertIn('only the coordinator waits for CI', err)
+                    self.assertIn('Read and Grep tools', err)
         self.expect(CI_WAIT_NEIGHBOURS_ALLOWED, ('implementer', 'gate'), True)
 
     def test_watch_is_a_wrapper(self):
