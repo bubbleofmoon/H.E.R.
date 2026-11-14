@@ -107,6 +107,19 @@ fn complete(v: &Value) -> bool {
         && v["core"].as_str().is_some_and(|c| !c.trim().is_empty())
 }
 
+/// Why a version's core or compact form is over its approval budget, or `None` when both fit.
+fn over_budget(v: &Value) -> Option<String> {
+    let core = crate::briefing::estimate_tokens(v["core"].as_str().unwrap_or(""));
+    if core > CORE_TOKENS_MAX {
+        return Some(format!("core uses {core} estimated tokens; at most {CORE_TOKENS_MAX}"));
+    }
+    let compact = crate::briefing::estimate_tokens(v["compact"].as_str().unwrap_or(""));
+    if compact > COMPACT_TOKENS_MAX {
+        return Some(format!("compact uses {compact} estimated tokens; at most {COMPACT_TOKENS_MAX}"));
+    }
+    None
+}
+
 /// The version in effect: `activeVersion`, only when that record is approved and complete. Every
 /// reader (prompt, assignment, auto-approval, names) resolves through here, so a bad stored record
 /// is skipped and never rendered; the file itself is never rewritten to repair it.
@@ -287,10 +300,20 @@ pub fn list(context: &RuntimeContext) -> Result<Value, Failure> {
         "personas": personas}))
 }
 
+/// One persona with every version; each version also reports its estimated `coreTokens` and
+/// `compactTokens` (computed here, never stored) against the approval `budgets`.
 pub fn item(context: &RuntimeContext, id: &str) -> Result<Value, Failure> {
     let doc = load(context)?;
-    let found = persona(&doc, id)?.clone();
-    Ok(json!({"ok": true, "persona": found}))
+    let mut found = persona(&doc, id)?.clone();
+    if let Some(versions) = found["versions"].as_array_mut() {
+        for v in versions.iter_mut().filter(|v| v.is_object()) {
+            let core = crate::briefing::estimate_tokens(v["core"].as_str().unwrap_or(""));
+            let compact = crate::briefing::estimate_tokens(v["compact"].as_str().unwrap_or(""));
+            v["coreTokens"] = json!(core);
+            v["compactTokens"] = json!(compact);
+        }
+    }
+    Ok(json!({"ok": true, "persona": found, "budgets": {"coreTokens": CORE_TOKENS_MAX, "compactTokens": COMPACT_TOKENS_MAX}}))
 }
 
 pub fn create(context: &RuntimeContext, body: &Value, authority: Authority<'_>) -> Result<Value, Failure> {
@@ -332,6 +355,13 @@ pub fn approve(context: &RuntimeContext, body: &Value, authority: Authority<'_>)
         let target = version(persona(doc, &id)?, number).ok_or_else(|| fail(404, "version not found"))?;
         if !complete(target) {
             return Err(fail(409, "version is damaged"));
+        }
+        // A first approval must fit the persona budgets; putting an approved version back (rollback,
+        // an imported card) is not checked again.
+        if target["approved"] != true {
+            if let Some(error) = over_budget(target) {
+                return Err(fail(409, &error));
+            }
         }
         // Approval and rollback put this version's name in effect, so it must stay unique.
         if name_taken(doc, target["name"].as_str().unwrap_or(""), Some(&id)) {
