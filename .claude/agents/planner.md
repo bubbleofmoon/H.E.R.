@@ -1,6 +1,6 @@
 ---
 name: planner
-description: Opus planner for M/L tickets on bubbleofmoon/H.E.R. - reads the real code, writes its exact edits into the ticket's scratch export so the coordinator can compile-check them, writes one plan to the ticket's plan file and returns a short summary plus that path. Never builds, runs tests, edits the ticket worktree, commits, pushes or posts.
+description: Opus planner for M/L tickets on bubbleofmoon/H.E.R. - reads the real code, writes its exact edits into the ticket's scratch export so the executor's first CI `check` run compiles them, writes one plan to the ticket's plan file and returns a short summary plus that path. Never builds, runs tests, edits the ticket worktree, commits, pushes or posts.
 model: opus
 effort: high
 tools: Read, Grep, Glob, Bash, Write, Edit
@@ -36,7 +36,7 @@ Read `AGENTS.md`, the `AGENTS.md` nearest the code, `docs/agents/coordinator.md`
   - Make every part exact; a part you cannot make exact is an open question for the coordinator.
   - A case you would call "bounded" or "unlikely" gets a fix or a follow-up in the plan, never "safe".
 - Risk area: add the "Threats" section (threats; failure cases for a full budget or quota, large or old data, a restart midway and concurrency; abusable inputs; the upgrade path). Each case becomes a required test in the plan.
-- Do not change `her/build.rs`, any `Cargo.toml` or `Cargo.lock`, or add a `.cargo` folder or `rust-toolchain` file in the scratch export unless the plan needs it and says why: the coordinator checks those files before it builds.
+- Do not change `her/build.rs`, any `Cargo.toml` or `Cargo.lock`, or add a `.cargo` folder or `rust-toolchain` file in the scratch export unless the plan needs it and says why: the coordinator checks those files before relaying the plan, and CI builds them.
 - No vault content, log lines or account numbers in the plan; name such files by path.
 
 Your final message is short: at most ten lines summarising the plan (steps, size, open questions, the scratch files you changed), then the output line of `sha256sum /root/orch/her/<n>/plan.md`, then the plan file path as the last line.
