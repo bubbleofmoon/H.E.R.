@@ -74,6 +74,14 @@ impl ModelRoute {
             .and_then(Value::as_str)
             .filter(|v| !v.trim().is_empty())
             .ok_or("harness model is not configured")?;
+        Self::for_model(context, model)
+    }
+
+    /// The selected runtime's relay route for `model`, authenticated with the harness credential.
+    pub fn for_model(context: &RuntimeContext, model: &str) -> Result<Self, String> {
+        if !context.is_isolated() {
+            return Err("harness requires a selected runtime".into());
+        }
         let origin = context
             .dependency_url("model")
             .ok_or("harness model endpoint is unavailable")?;
@@ -95,6 +103,10 @@ impl ModelRoute {
                 auth: AuthData::Key(key.to_string()),
             },
         })
+    }
+
+    pub(crate) fn target(&self) -> ServiceTarget {
+        self.target.clone()
     }
 }
 
@@ -690,15 +702,20 @@ fn model_error(error: genai::Error) -> ModelFailure {
 }
 
 fn classify_model_error(error: &genai::Error) -> String {
+    model_failure(error).summary()
+}
+
+/// Fixed-vocabulary failure of a provider error; never carries the provider's text.
+pub(crate) fn model_failure(error: &genai::Error) -> crate::model_failure::Failure {
     use crate::model_failure::Failure;
     // The streaming adapter wraps HTTP failures without exposing their status on the outer error.
     if let genai::Error::WebStream { error: inner, .. } = error {
         if let Some(error) = inner.downcast_ref::<genai::Error>() {
-            return classify_model_error(error);
+            return model_failure(error);
         }
     }
     if error.status().is_some_and(|s| s.as_u16() == 429) {
-        return Failure::new("quota", "429").summary();
+        return Failure::new("quota", "429");
     }
     let body = match &error {
         genai::Error::ChatResponse { body, .. } => Some(serde_json::json!({"error":body})),
@@ -709,7 +726,7 @@ fn classify_model_error(error: &genai::Error) -> String {
                 serde_json::from_str(body).ok()
             }
             genai::webc::Error::Reqwest(error) if error.is_timeout() => {
-                return Failure::new("timeout", "TIMEOUT").summary()
+                return Failure::new("timeout", "TIMEOUT")
             }
             _ => None,
         },
@@ -717,13 +734,13 @@ fn classify_model_error(error: &genai::Error) -> String {
     };
     if let Some(body) = &body {
         if let Some(failure) = crate::backend::json_output_failure(body) {
-            return failure.summary();
+            return failure;
         }
     }
     if let Some(status) = error.status() {
-        return Failure::new("backend", &status.as_u16().to_string()).summary();
+        return Failure::new("backend", &status.as_u16().to_string());
     }
-    Failure::new("network", "MODEL_CONNECTION_ERROR").summary()
+    Failure::new("network", "MODEL_CONNECTION_ERROR")
 }
 
 /// Structured source references carried by the model request's tool-result packets.

@@ -253,6 +253,11 @@ fn command_action(words: &[&str]) -> Option<&'static str> {
     }
 }
 
+/// Whether `text` is exactly an owner recovery command (`放弃 <code>`, `重试 <code> [确认]`, ASCII forms).
+pub(crate) fn is_recovery_command(text: &str) -> bool {
+    command_action(&text.split_whitespace().collect::<Vec<_>>()).is_some()
+}
+
 /// Consume owner recovery commands before any mode-specific ingress or model dispatch.
 pub async fn owner_command(
     context: &RuntimeContext,
