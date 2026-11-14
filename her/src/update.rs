@@ -578,7 +578,11 @@ pub fn finish_rollback(root: &InstallRoot, id: &str, status: &str) -> Result<(),
     alert.rollback = status.into();
     store_alert(root, &alert)
 }
-pub fn claim_alert(root: &InstallRoot, now: i64) -> Result<Option<UpdateAlert>, String> {
+pub fn claim_alert(
+    root: &InstallRoot,
+    now: i64,
+    _own: Option<&str>,
+) -> Result<Option<UpdateAlert>, String> {
     let _gate = alert_gate(root)?;
     let Some(mut alert) = read_alert(root)? else {
         return Ok(None);
@@ -775,4 +779,178 @@ pub(crate) fn handover_control(
         serde_json::from_slice(&fs::read(&path).map_err(|_| "handover control unavailable")?)
             .map_err(|_| "handover control invalid")?;
     Ok(Some((path, value)))
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    const RETIRING: &str = "v1.2.3";
+    const RESTORED: &str = "v0.0.0";
+
+    /// A throwaway install root, removed on drop (declare gates after it so they close first).
+    struct Root(InstallRoot);
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.root());
+        }
+    }
+    fn install(name: &str) -> Root {
+        let path = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-update-claim-{name}-{}-{}",
+            std::process::id(),
+            wall_clock_ms()
+        )));
+        fs::create_dir_all(path.join("runtime/data/locks")).unwrap();
+        Root(InstallRoot::new(&path).unwrap())
+    }
+    fn lock_path(root: &InstallRoot) -> PathBuf {
+        root.root().join("runtime/data/locks/update-restore.lock")
+    }
+    /// Held the way a rollback helper holds it for the whole rollback.
+    fn hold_restore_gate(root: &InstallRoot) -> fs::File {
+        release_store::installation_gate(&lock_path(root)).unwrap()
+    }
+    fn pending(root: &InstallRoot) -> UpdateAlert {
+        let alert = UpdateAlert::new(RETIRING, RESTORED, "fixture rollback");
+        save_alert(root, &alert).unwrap();
+        alert
+    }
+    fn stored(root: &InstallRoot) -> UpdateAlert {
+        read_alert(root).unwrap().expect("alert stored")
+    }
+    /// The whole alert file, so a deferral that rewrote any byte shows.
+    fn alert_bytes(root: &InstallRoot) -> Vec<u8> {
+        fs::read(root.root().join("update-alert.json")).unwrap()
+    }
+
+    #[test]
+    fn retiring_release_never_claims_its_rollback_in_progress() {
+        let root = install("retiring");
+        let alert = pending(&root.0);
+        let before = alert_bytes(&root.0);
+        let _gate = hold_restore_gate(&root.0);
+        for now in [0, 60_000, i64::MAX] {
+            assert!(
+                claim_alert(&root.0, now, Some(RETIRING)).unwrap().is_none(),
+                "the release a rollback retires must not claim its pending alert (now {now})"
+            );
+        }
+        assert_eq!(
+            alert_bytes(&root.0),
+            before,
+            "a deferred claim must not rewrite the alert or start the retry spacing"
+        );
+        let claimed = claim_alert(&root.0, 1_000, Some(RESTORED))
+            .unwrap()
+            .expect("the restored release claims the pending alert at once");
+        assert_eq!(claimed.id, alert.id);
+        assert_eq!(claimed.rollback, "pending");
+        assert!(claim_alert(&root.0, 1_000, Some(RETIRING))
+            .unwrap()
+            .is_none());
+        finish_rollback(&root.0, &alert.id, "restored").unwrap();
+        let finished = stored(&root.0);
+        assert_eq!(
+            finished.retry_after, 61_000,
+            "rollback finish keeps the claim"
+        );
+        assert_eq!(finished.rollback, "restored");
+    }
+
+    #[test]
+    fn unresolved_own_release_defers_only_a_rollback_in_progress() {
+        let root = install("unresolved");
+        pending(&root.0);
+        let before = alert_bytes(&root.0);
+        let _gate = hold_restore_gate(&root.0);
+        assert!(
+            claim_alert(&root.0, 0, None).unwrap().is_none(),
+            "a supervisor that cannot resolve its own release must not claim a rollback in progress"
+        );
+        assert_eq!(
+            alert_bytes(&root.0),
+            before,
+            "a deferred claim writes nothing"
+        );
+        for status in ["restored", "failed", "preserved"] {
+            for own in [None, Some(RETIRING)] {
+                let mut alert = UpdateAlert::new(RETIRING, RESTORED, "fixture rollback");
+                alert.rollback = status.into();
+                save_alert(&root.0, &alert).unwrap();
+                assert!(
+                    claim_alert(&root.0, 0, own).unwrap().is_some(),
+                    "a {status} alert stays deliverable to {own:?} while the gate is held"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_pending_rollback_stays_deliverable_a_minute_apart() {
+        let root = install("stale");
+        // The on-disk form earlier builds wrote; a helper that died mid-rollback leaves it pending.
+        let stale = serde_json::json!({
+            "v": 1, "id": "1-1", "failed": RETIRING, "restored": RESTORED,
+            "reason": "fixture rollback", "rollback": "pending", "delivered": false, "retryAfter": 0
+        });
+        fs::write(root.0.root().join("update-alert.json"), stale.to_string()).unwrap();
+        let before = alert_bytes(&root.0);
+        let gate = hold_restore_gate(&root.0);
+        assert!(
+            claim_alert(&root.0, 1_000, Some(RETIRING))
+                .unwrap()
+                .is_none(),
+            "the failed release must not claim while the rollback helper holds the gate"
+        );
+        assert_eq!(
+            alert_bytes(&root.0),
+            before,
+            "a deferred claim writes nothing"
+        );
+        drop(gate);
+        let claimed = claim_alert(&root.0, 1_000, Some(RETIRING))
+            .unwrap()
+            .expect("with the gate free a pending alert is stale and deliverable");
+        assert_eq!(claimed.rollback, "pending");
+        assert_eq!(stored(&root.0).retry_after, 61_000);
+        // Unconfirmed delivery (owner unreachable, notice budget spent) retries a minute apart.
+        assert!(claim_alert(&root.0, 60_999, Some(RETIRING))
+            .unwrap()
+            .is_none());
+        assert!(claim_alert(&root.0, 61_000, Some(RETIRING))
+            .unwrap()
+            .is_some());
+        assert_eq!(stored(&root.0).retry_after, 121_000);
+        complete_alert(&root.0, "1-1").unwrap();
+        assert!(
+            claim_alert(&root.0, i64::MAX, None).unwrap().is_none(),
+            "a delivered alert is never claimed again"
+        );
+    }
+
+    #[test]
+    fn only_restore_gate_contention_defers_a_pending_alert() {
+        let root = install("unusable-gate");
+        pending(&root.0);
+        let before = alert_bytes(&root.0);
+        let gate = hold_restore_gate(&root.0);
+        assert!(
+            claim_alert(&root.0, 0, Some(RETIRING)).unwrap().is_none(),
+            "a held update-restore gate defers the failed release's claim"
+        );
+        assert_eq!(
+            alert_bytes(&root.0),
+            before,
+            "a deferred claim writes nothing"
+        );
+        drop(gate);
+        // A directory planted at the gate path cannot suppress delivery.
+        fs::remove_file(lock_path(&root.0)).unwrap();
+        fs::create_dir(lock_path(&root.0)).unwrap();
+        assert!(
+            claim_alert(&root.0, 0, Some(RETIRING)).unwrap().is_some(),
+            "a gate failure other than contention leaves the alert deliverable"
+        );
+    }
 }

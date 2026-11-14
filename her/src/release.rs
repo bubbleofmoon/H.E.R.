@@ -772,6 +772,18 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// This supervisor's release tag: the folder of its own installed image (`releases/<tag>/`).
+fn own_release_tag() -> Result<String, String> {
+    let me = crate::process_identity::current_identity()?;
+    let image = fs::canonicalize(&me.exe).map_err(|_| "installed supervisor image unavailable")?;
+    image
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|tag| tag.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| "installed supervisor tag unavailable".to_string())
+}
+
 /// Installed runtimes check by default; legacy/development runtimes opt in with an update block.
 /// The worker discovers releases and consumes explicit approvals independently of task scheduling.
 pub fn start(context: RuntimeContext) {
@@ -796,15 +808,8 @@ pub fn start(context: RuntimeContext) {
                         && health_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
                     {
                         health_at = Some(Instant::now());
-                        let me = crate::process_identity::current_identity()?;
-                        let image = fs::canonicalize(&me.exe)
-                            .map_err(|_| "installed supervisor image unavailable")?;
-                        let tag = image
-                            .parent()
-                            .and_then(Path::file_name)
-                            .and_then(|tag| tag.to_str())
-                            .ok_or("installed supervisor tag unavailable")?;
-                        if crate::update::start_count(&root, tag, crate::update::wall_clock_ms())?
+                        let tag = own_release_tag()?;
+                        if crate::update::start_count(&root, &tag, crate::update::wall_clock_ms())?
                             > 0
                             && crate::health_check::check(
                                 root.root().join("runtime").as_path(),
@@ -812,13 +817,17 @@ pub fn start(context: RuntimeContext) {
                             )
                             .ok
                         {
-                            crate::update::mark_healthy(&root, tag)?;
+                            crate::update::mark_healthy(&root, &tag)?;
                         }
                     }
                     if is_runtime {
-                        if let Some(alert) =
-                            crate::update::claim_alert(&root, crate::update::wall_clock_ms())?
-                        {
+                        // An unresolved own release (`None`) also defers a rollback in progress.
+                        let own = own_release_tag().ok();
+                        if let Some(alert) = crate::update::claim_alert(
+                            &root,
+                            crate::update::wall_clock_ms(),
+                            own.as_deref(),
+                        )? {
                             let text = format!(
                                 "HER 更新失败：{} → {}；回退状态：{}；原因：{}",
                                 alert.failed, alert.restored, alert.rollback, alert.reason

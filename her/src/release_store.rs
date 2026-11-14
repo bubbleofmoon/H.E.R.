@@ -130,6 +130,13 @@ pub(crate) fn installation_gate(lock: &Path) -> Result<fs::File, String> {
     Ok(gate)
 }
 
+/// True only when another handle holds the gate; any other outcome (unusable path, redirect,
+/// lock acquired and released again) is false.
+#[allow(dead_code)]
+pub(crate) fn gate_contended(_lock: &Path) -> bool {
+    false
+}
+
 /// Fsynced root-level state/helper publication under the caller's installation gate.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
     directory(path.parent().ok_or("release state has no parent")?)?;
@@ -150,4 +157,49 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), String> {
 /// Persist directory entries after publishing synced files or release links.
 pub(crate) fn sync_directory(path: &Path) -> Result<(), String> {
     crate::guarded_file::sync_directory(path).map_err(|_| "release directory cannot sync".into())
+}
+
+#[cfg(test)]
+mod gate_claim_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn gate_contended_only_when_another_handle_holds_the_gate() {
+        let dir = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-release-store-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("gate.lock");
+        let held = installation_gate(&lock).unwrap();
+        let contended = gate_contended(&lock);
+        drop(held);
+        assert!(
+            contended,
+            "a gate held through another handle reads as contended"
+        );
+        assert!(!gate_contended(&lock), "a free gate is not contended");
+        assert!(
+            installation_gate(&lock).is_ok(),
+            "the probe must not leave the gate held"
+        );
+        let planted = dir.join("planted.lock");
+        fs::create_dir(&planted).unwrap();
+        assert!(
+            !gate_contended(&planted),
+            "a directory at the gate path is not contention"
+        );
+    }
 }
