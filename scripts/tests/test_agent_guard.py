@@ -548,6 +548,8 @@ POLLING_DENIED = [   # #90: implementers and gates get the polling message; read
     ('wt', 'watch -n 60 bash -c "gh run view 1"'),
     ('wt', 'watch gh api rate_limit'),
     ('wt', 'timeout 600 watch gh run list'),
+    ('wt', 'watch -n 100 gh run list --event push'),
+    ('wt', 'while true; do gh run list --event push; sleep 100; done'),
 ]
 POLL_WORDS_IN_QUOTES_ALLOWED = [
     ('wt', 'gh issue list --search "watch the flag"'),

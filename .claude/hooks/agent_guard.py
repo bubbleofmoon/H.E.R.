@@ -695,6 +695,8 @@ def check_bash(role, command, hook_cwd):
     if any(runs_ci_wait(seg) for seg, _ in segs) or ('ci-wait' in text.lower() and (
             indirect or any(PYTHON_NAME.fullmatch(base(seg[0])) for seg, _ in segs))):
         raise Deny(CI_WAIT_DENIED)
+    if ('gh' in names or GH_WORD.search(text)) and gh_polls(segs, flat, bool(words) and base(words[0]) == 'gh'):
+        raise Deny(POLL_DENIED)       # before the push and commit words: `gh run list --event push` is polling when repeated
     if re.search(r'(>|rm |mv |cp .* |sed -i|tee ).*/root/js-baseline-01|/root/her/backups/js-rust-baseline-01', command) \
             and not re.match(r'\s*(cat|ls|sha256sum|grep|head|tail|node|diff|find)\s', command):
         raise Deny('the frozen JS baseline is read-only.')
@@ -716,8 +718,6 @@ def check_bash(role, command, hook_cwd):
     if has_git and COMMIT_WORD.search(text):
         raise Deny('workers commit only on their her/<n>-<slug> branch, as one plain command: [cd <worktree> &&] '
                    'git commit [-a] -m <msg> | -F <file> (no chaining, no $); reviews and gates never commit.')
-    if ('gh' in names or GH_WORD.search(text)) and gh_polls(segs, flat, bool(words) and base(words[0]) == 'gh'):
-        raise Deny(POLL_DENIED)
     if ('gh' in names or GH_WORD.search(text)) and not (words and gh_read(words, role)):
         raise Deny('gh is read-only for workers: one plain `gh [-R repo] pr|run|issue|workflow '
                    'view|list|diff|checks|status|download ...` (never watch or --watch) or `gh api rate_limit [--jq <x>]`; '

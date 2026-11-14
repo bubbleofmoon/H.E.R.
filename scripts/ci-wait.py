@@ -336,6 +336,7 @@ def note_answer(ctx, budget, status, headers, url, now):
     if until is None and status == 401:
         until, reason = now + ctx.refresh * 9, "token refused (401)"
     if until is not None:
+        until = max(until, now + ctx.refresh)        # a reset already behind the clock still costs one window, for every waiter
         budget.update(blocked_until=until, block_reason=reason)
     if status in (401, 404):
         budget["refused"] = {"status": status, "url": url, "at": now}
@@ -374,7 +375,7 @@ def refresh_if_due(ctx, state_path, url):
             now = time.time()
             until = note_answer(ctx, budget, status, headers, url, now)
             if until is not None:
-                state.update(next_at=max(until, now + ctx.refresh), error=budget["block_reason"])
+                state.update(next_at=until, error=budget["block_reason"])
             elif status in (200, 304):
                 runs = None
                 if status == 200:
@@ -400,7 +401,7 @@ def check_answer(ctx, budget, status, headers, url):
     now = time.time()
     until = note_answer(ctx, budget, status, headers, url, now)
     if until is not None:
-        raise Later(max(until, now + ctx.refresh), budget["block_reason"])
+        raise Later(until, budget["block_reason"])
     if status != 200:
         raise Later(now + interval(budget.get("remaining"), ctx.refresh), f"GitHub API {status}")
 
@@ -695,7 +696,11 @@ def wait(argv):
         one = argparse.Namespace(**dict(vars(a), run=run_id))
         if results:
             one.timeout = max(0.0, began + a.timeout - time.time())
-        code = wait_one(one)
+        try:
+            code = wait_one(one)
+        except Exception as e:           # an earlier failure keeps its code; this run is "not a result"
+            print(f"ci-wait: internal error ({type(e).__name__}); not a result", flush=True)
+            code = 5
         if code == 2:
             return 2
         results.append((run_id, code))

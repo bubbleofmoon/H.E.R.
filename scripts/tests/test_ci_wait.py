@@ -516,9 +516,29 @@ class CiWait(unittest.TestCase):
         shutil.rmtree(self.cache)
         before = len(self.list_calls())
         self.server.limit_until = time.time() + 60
-        code, out, err = self.wait(*WAIT, '--timeout', '0.8')
+        code, out, err = self.wait(*WAIT, '--timeout', '0.3')
         self.assertEqual(code, 5, out + err)
         self.assertEqual(len(self.list_calls()) - before, 1, self.list_calls())
+        code, out, err = self.wait('--workflow', 'checks.yml', '--sha', SHA_A, '--timeout', '0.3')   # another workflow, same window
+        self.assertEqual(code, 5, out + err)
+        self.assertEqual(len(self.list_calls()) - before, 1, self.list_calls())
+
+    def test_a_later_runs_internal_error_keeps_an_earlier_failure(self):
+        module = load_module()
+        env = {'HER_CI_WAIT_DIR': str(self.cache), 'GH_TOKEN': 't', 'HER_GITHUB_API': self.server.api}
+        codes = iter([1, RuntimeError('x')])
+
+        def one(namespace):
+            code = next(codes)
+            if isinstance(code, Exception):
+                raise code
+            return code
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(module, 'wait_one', side_effect=one), mock.patch('sys.stdout', out):
+            self.assertEqual(module.main(['--run', '12', '--run', '11']), 1)
+        self.assertEqual(out.getvalue().strip().splitlines()[-3:], [
+            '[ci-wait]', 'run 12: failure', 'run 11: GitHub unavailable (not a result); resume with --run 11'], out.getvalue())
 
     def test_the_timeout_is_finite_and_a_label_names_a_branch_wait(self):
         for value in ('inf', 'nan', '86401', '-1'):
@@ -594,6 +614,15 @@ class CiWait(unittest.TestCase):
         with mock.patch.dict(os.environ, env), mock.patch.object(module, 'refresh_if_due', side_effect=RuntimeError('x')), \
                 mock.patch('sys.stdout', out):
             self.assertEqual(module.main(list(WAIT)), 5)
+        self.assertIn('internal error', out.getvalue())
+
+    def test_an_error_outside_the_waits_is_never_a_failure(self):
+        module = load_module()
+        env = {'HER_CI_WAIT_DIR': str(self.cache), 'GH_TOKEN': 't', 'HER_GITHUB_API': self.server.api}
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(module, 'combined', side_effect=RuntimeError('x')), \
+                mock.patch.object(module, 'wait_one', return_value=0), mock.patch('sys.stdout', out):
+            self.assertEqual(module.main(['--run', '11']), 5)
         self.assertIn('internal error', out.getvalue())
 
     def test_bad_options_and_overrides_without_a_local_api_are_refused(self):
