@@ -103,14 +103,15 @@ class PushHook(unittest.TestCase):
         return self.git('rev-parse', ref)
 
     def scan_objects(self, *oids):
-        """Runs the message pass directly, so a receipt can name the pass that refused."""
+        """Runs the message pass directly on this repository: (exit status, output)."""
         env = clean_env(**GIT_ENV)
         if gitleaks():
             env['HER_GITLEAKS'] = gitleaks()
-        proc = subprocess.run([BASH, str(ROOT / 'scripts' / 'scan-public.py'), '--objects-from-stdin'],
-                              cwd=self.repo, input='\n'.join(oids) + '\n',
+        proc = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts' / 'scan-public.py'), '--root', str(self.repo),
+                               '--objects-from-stdin'],
+                              input='\n'.join(oids) + '\n',
                               capture_output=True, text=True, encoding='utf-8', env=env)
-        return scrub((proc.stdout or '') + (proc.stderr or ''))
+        return proc.returncode, scrub((proc.stdout or '') + (proc.stderr or ''))
 
     def push(self, *lines, extra=None):
         """Run the hook exactly as git does: repository as cwd, ref lines on stdin; `extra` overrides variables."""
@@ -162,7 +163,9 @@ class PushHook(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('digit', out)
         self.assertIn('user-path', out)
-        self.assertIn('commit ', self.scan_objects(sha))        # the message pass reports it
+        message_code, message_out = self.scan_objects(sha)     # the message pass reports the finding itself
+        self.assertEqual(message_code, 1, message_out)
+        self.assertIn(f'digit commit {sha[:12]}:', message_out)
         self.assertNotIn('123456' + '789', out)
         self.assertNotIn('fakeuser', out.lower())
 
@@ -497,6 +500,26 @@ class PushHook(unittest.TestCase):
                               extra={'HER_GITLEAKS': str(self.tmp / 'no-such-gitleaks')})
         self.assertEqual(code, 3, out)
         self.assertIn('refusal=scanner-missing', out)
+
+    @REQUIRES_SCANNER
+    @REQUIRES_BASH
+    def test_a_failed_list_write_refuses_the_push(self):
+        # The list files are made by mktemp; a path that is a directory makes every write to it fail.
+        self.write('docs/a.md', 'clean note\n')
+        tip = self.commit('clean')
+        blocked = self.tmp / 'not-a-file'
+        blocked.mkdir()
+        fake_bin = self.tmp / 'fake-bin'
+        fake_bin.mkdir()
+        fake_mktemp = fake_bin / 'mktemp'
+        fake_mktemp.write_text(f'#!/bin/sh\necho "{blocked}"\n', encoding='utf-8', newline='\n')
+        fake_mktemp.chmod(0o755)
+        code, out = self.push(f'refs/heads/main {tip} refs/heads/main {"0" * 40}',
+                              extra={'PATH': f'{fake_bin}{os.pathsep}' + os.environ.get('PATH', '')})
+        self.assertEqual(code, 1, out)
+        self.assertIn('cannot write the outgoing list; nothing is published', out)
+        self.assertNotIn('Public scan (added)', out)
+        self.assertNotIn('Public scan (history)', out)
 
 
 if __name__ == '__main__':

@@ -49,11 +49,14 @@ if ! "$py" -I "$root/scripts/tests/test_scan_public.py" >/dev/null; then
   exit 1
 fi
 
-refs=$(cat)
+refs=$(cat) || { echo 'pre-push: cannot read the refs git sends; nothing is published' >&2; exit 1; }
 revs=$(mktemp) || { echo 'pre-push: no temporary file for the outgoing revisions' >&2; exit 1; }
 objects=$(mktemp) || { echo 'pre-push: no temporary file for the outgoing objects' >&2; exit 1; }
 added=$(mktemp) || { echo 'pre-push: no temporary file for the added commits' >&2; exit 1; }
 trap 'rm -f "$revs" "$added" "$objects"' EXIT
+record() { # <list file> <line>: one line of an outgoing list; a failed write refuses the push
+  printf '%s\n' "$2" >>"$1" || { echo 'pre-push: cannot write the outgoing list; nothing is published' >&2; exit 1; }
+}
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${local_ref// /}" ] || continue          # nothing being pushed on this line
   if [ -z "${local_sha:-}" ]; then
@@ -91,11 +94,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     echo "pre-push: $local_ref is a tag of a tag; push only tags of commits" >&2
     exit 1
   fi
-  if [ $forward -eq 1 ]; then printf '%s\n' "$listed" >>"$added"; else printf '%s\n' "$listed" >>"$revs"; fi
+  if [ $forward -eq 1 ]; then record "$added" "$listed"; else record "$revs" "$listed"; fi
   # The ref's own object joins the message pass: for a tag ref that is the annotated tag
   # object, whose message rev-list never reports.
-  printf '%s\n' "$local_sha" >>"$objects"
-  printf '%s\n' "$listed" >>"$objects"
+  record "$objects" "$local_sha"
+  record "$objects" "$listed"
 done <<EOF
 $refs
 EOF
@@ -103,6 +106,9 @@ EOF
 for list in "$revs" "$added" "$objects"; do
   sort -u -o "$list" "$list" || { echo 'pre-push: the outgoing lists cannot be sorted' >&2; exit 1; }
 done
-scan 'the public scan refused the history this push publishes' --revs-from-stdin <"$revs"
-scan 'the public scan refused the blobs this push adds' --added-from-stdin <"$added"
-scan 'the public scan refused the commit and tag messages this push publishes' --objects-from-stdin <"$objects"
+scan 'the public scan refused the history this push publishes' --revs-from-stdin <"$revs" \
+  || { echo 'pre-push: cannot read the outgoing list; nothing is published' >&2; exit 1; }
+scan 'the public scan refused the blobs this push adds' --added-from-stdin <"$added" \
+  || { echo 'pre-push: cannot read the outgoing list; nothing is published' >&2; exit 1; }
+scan 'the public scan refused the commit and tag messages this push publishes' --objects-from-stdin <"$objects" \
+  || { echo 'pre-push: cannot read the outgoing list; nothing is published' >&2; exit 1; }
