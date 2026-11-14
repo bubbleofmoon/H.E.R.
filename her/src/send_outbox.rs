@@ -17,6 +17,8 @@
 //!
 //! Records hold message text and ids but never tokens: the batch carries only a SHA-256 prefix of
 //! the agent token ("epoch"), so a resume can refuse results that belong to an earlier turn.
+//!
+//! Writers go through `recorded_send.rs`; this module owns the record format and folding.
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};

@@ -75,7 +75,7 @@ async fn config_read_error_during_an_admitted_turn_preserves_the_failure_reason(
     .unwrap();
     let context = RuntimeContext::from_root(&root).unwrap();
     let token =
-        crate::console::ensure_or_rotate_agent_token(&context, "private:8808", false).unwrap();
+        crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
     let generation = crate::send_outbox::token_epoch(&token);
     let chunk = json!({"id":"fake-93-config","object":"chat.completion.chunk","model":"fake-chat",
         "choices":[{"index":0,"delta":{"role":"assistant","content":"must not be delivered"},"finish_reason":null}]});
@@ -155,7 +155,7 @@ async fn revoked_authority_settles_a_submitted_send_without_starting_the_next_ca
         .unwrap()
         .with_console_port(console.local_addr().unwrap().port());
     let token =
-        crate::console::ensure_or_rotate_agent_token(&context, "private:8808", false).unwrap();
+        crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
     let generation = crate::send_outbox::token_epoch(&token);
     let calls = ["submitted-send", "after-revocation"].map(|id| json!({
         "index":if id == "submitted-send" { 0 } else { 1 },
@@ -175,7 +175,7 @@ async fn revoked_authority_settles_a_submitted_send_without_starting_the_next_ca
     let console_task = tokio::spawn(respond_once(
         console.clone(),
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".into(),
-        move || crate::console::revoke_agent_token(&revoke_context, "private:8808", &token).unwrap(),
+        move || crate::conversation_authority::revoke(&revoke_context, "private:8808", &token).unwrap(),
     ));
     let harness = Harness::open(&context).unwrap();
     let mut turn = harness

@@ -1,5 +1,6 @@
-#[path = "../src/install_root.rs"]
-mod install_root;
+use support::install_root;
+use support::hide_window as hide_process_window;
+mod support;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,17 +19,6 @@ const AGENT_A: &str = "fixture-agent-token-A";
 const AGENT_B: &str = "fixture-agent-token-B";
 const ONEBOT_A: &str = "fixture-onebot-token-A";
 const ONEBOT_B: &str = "fixture-onebot-token-B";
-
-fn hide_process_window(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    let _ = command;
-}
 
 struct FixtureRoot(PathBuf);
 
@@ -123,22 +113,8 @@ fn fixture_root(
     )
     .expect("write selected state");
     fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).expect("write selected mode");
-    fs::write(
-        root.join("dependencies.json"),
-        json!({
-            "dsh": "http://127.0.0.1:1",
-            "model": "http://127.0.0.1:2",
-            "onebot": onebot_url
-        })
-        .to_string(),
-    )
-    .expect("write selected dependencies");
+    crate::support::write_dependencies(&root, "http://127.0.0.1:1", "http://127.0.0.1:2", onebot_url, None);
     FixtureRoot(root)
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind temporary port reservation");
-    listener.local_addr().expect("read temporary port").port()
 }
 
 struct ConsoleProcess {
@@ -148,26 +124,25 @@ struct ConsoleProcess {
 
 impl ConsoleProcess {
     fn start(root: &Path) -> Self {
-        let port = free_port();
-        let stdout = fs::File::create(root.join("console.stdout.log"))
-            .expect("create synthetic candidate stdout log");
-        let stderr = fs::File::create(root.join("console.stderr.log"))
-            .expect("create synthetic candidate stderr log");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
-        command
-            .arg("--console-serve")
-            .arg("--runtime-root")
-            .arg(root)
-            .arg("--console-port")
-            .arg(port.to_string())
-            .env_remove("HER_RUNTIME_ROOT")
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
-        hide_process_window(&mut command);
-        let mut process = Self {
-            child: command.spawn().expect("start isolated console candidate"),
-            port,
-        };
+        let (child, port) = crate::support::ports::start_console(Duration::from_secs(8), |port| {
+            let stdout = fs::File::create(root.join("console.stdout.log"))
+                .expect("create synthetic candidate stdout log");
+            let stderr = fs::File::create(root.join("console.stderr.log"))
+                .expect("create synthetic candidate stderr log");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
+            command
+                .arg("--console-serve")
+                .arg("--runtime-root")
+                .arg(root)
+                .arg("--console-port")
+                .arg(port.to_string())
+                .env_remove("HER_RUNTIME_ROOT")
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr));
+            hide_process_window(&mut command);
+            command.spawn().expect("start isolated console candidate")
+        });
+        let mut process = Self { child, port };
         process.wait_for_health();
         process
     }
@@ -1930,8 +1905,7 @@ fn crash_between_attempt_and_outcome_restarts_as_unknown_and_resume_verifies_bef
 #[test]
 fn unreachable_gateway_is_recorded_as_not_committed_and_resumable() {
     let onebot = FakeOneBot::start(70001, false);
-    let dead_port = free_port();
-    let dead_url = format!("http://127.0.0.1:{dead_port}");
+    let dead_url = "http://127.0.0.1:1".to_string();
     let root = fixture_root("durable-dead", CONSOLE_A, AGENT_A, ONEBOT_A, &dead_url, "group:70001", &[70001], &[], 20, json!([]));
     let console = ConsoleProcess::start(&root);
     let first = post_send(&console, AGENT_A, json!({ "key": "group:70001", "messages": ["连不上"] }));

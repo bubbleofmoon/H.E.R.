@@ -762,3 +762,29 @@ fn a_persona_switch_while_a_wake_is_prepared_never_installs_the_old_persona() {
     assert!(text.contains("以下各节是本代会话的当前完整简报"), "the retry is the new generation's full briefing:\n{text}");
     assert!(text.contains("【人设】会计\n你是会计助手，只讲数字。") && !text.contains("【人设】小鲸鱼"), "{text}");
 }
+
+#[test]
+fn ticket55_forget_visibility_check_failure_answers_search_failed() {
+    let (_root, context) = fixture_runtime("ticket55 forget check", "fixture-console-token-17");
+    context.write_atomic(RuntimeArea::Data, "social-v2.json",
+        br#"{"conversations":{"group:101":{"agentToken":"group-token"}}}"#).unwrap();
+    let conn = initialize_fixture_memory_database(&context);
+    crate::memory::write_memory(&conn, &crate::memory::MemoryInput {
+        owner_type: "session", owner_id: "group:101", scope: "group", kind: "fact",
+        subject: None, content: "forget probe", tags: None, source: "fixture", importance: 0.5,
+    }).unwrap();
+    conn.execute_batch("PRAGMA user_version=1; ALTER TABLE memory_acl RENAME COLUMN reader_type TO reader_kind;").unwrap();
+    drop(conn);
+    let args = json!({"key":"group:101","token":"group-token","id":1});
+    let error = memory_tool_action(&context, "forget", &args).unwrap_err();
+    assert!(error.starts_with("检索失败："), "visibility-check failure must answer 检索失败: {error}");
+}
+
+#[test]
+fn conversation_authority_owner_config_is_store_owner() {
+    let (_root, context) = fixture_runtime("ticket55 owner config", "fixture-console-token-17");
+    let cfg = json!({"ownerQQ": 2});
+    let store = crate::memory::MemoryStore::open(&context, &cfg).unwrap();
+    assert!(!store.for_reader("private:1").is_owner(), "ownerQQ 2 must not make private:1 the owner");
+    assert!(store.for_reader("private:2").is_owner(), "the configured integer owner is the owner");
+}
