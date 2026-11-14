@@ -1981,8 +1981,8 @@ pub(crate) fn prepare_dsh_wake_layered(
     // delta's recall below). Rule sections (no layer) are never cut or counted.
     use crate::briefing::{Layer, Section};
     let assembly = crate::briefing::assemble(vec![
-        Section::parts("identity", Some(Layer::Identity), vec![role_line_with_runtime(context,key), live_identity,
-            role_hint_v2(context,cfg,key), crate::briefing::persona_core(context,cfg,key)]),
+        Section::parts("identity", Some(Layer::Identity), vec![role_line_with_runtime(context,key),
+            crate::briefing::persona_core(context,cfg,key), live_identity, role_hint_v2(context,cfg,key)]),
         Section::parts("operator", Some(Layer::Relationship), vec![crate::initial_prompts::format_injection(context,cfg,key)]),
         Section::groups("impressions", Some(Layer::Relationship), vec![impression_group(st,cfg,true)]),
         Section::groups("memory", Some(Layer::Conversation), memory_groups(st,now_ms(),true)),
