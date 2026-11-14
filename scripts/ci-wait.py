@@ -5,22 +5,28 @@ Rules: docs/agents/coordinator.md "GitHub API budget". Every waiter on the machi
 workflow's recent runs (actions/workflows/<file>/runs?per_page=40): at most one list call per ~100 s per workflow
 file, made by whichever waiter takes the file lock first, with If-None-Match on the stored ETag (a 304 costs
 nothing). One machine-wide budget file holds the account's remaining calls and any block, and is read before
-every call of any kind: every 300 s under 1000 calls left, every 900 s under 200, and after a 403 or 429 (or a
-refused token) no call before the reset. A green quick.yml result is cached per commit and reused; checks.yml
+every call of any kind: every 300 s under 1000 calls left, every 900 s under 200; after a rate-limit 403 or a 429
+no call before the reset (and at least one window), after a refused token (401) none for 9 windows; any other
+error is retried at the next window. A green quick.yml result is cached per commit and reused; checks.yml
 results are never cached (a merge reads the pull request's statusCheckRollup). Logs are fetched only for a failed
 run: the names of every failed job and the filtered log of the first.
 
 usage: python -I scripts/ci-wait.py --branch her/<n>-<slug> --target <name> [--filter <test>] [--os linux|windows]
                                     [--sha <commit>] [--timeout 3600] [--once]
        python -I scripts/ci-wait.py --workflow checks.yml --sha <commit> [--event pull_request|push] [--timeout 3600] [--once]
-       python -I scripts/ci-wait.py [--workflow <file>] --run <id> [--timeout 3600]
-Start a quick.yml wait before dispatching: a failed quick.yml run counts only when it was created after the wait
-began (30 s for clock skew); read an older one with --run <id>. Without --sha the commit is the local branch's
+       python -I scripts/ci-wait.py [--workflow <file>] --run <id> [--run <id> ...] [--label <name>] [--timeout 3600] [--once]
+A failed quick.yml run found by --branch counts only when this wait saw it running or it was created after the
+wait began (30 s for clock skew); read an older one with --run <id>. Without --sha the commit is the local branch's
 (git rev-parse in the current directory). quick.yml runs are matched by their run name,
 "quick <os> target=<target> filter=<filter>". --once reads the list once, never waits, and prints its age.
 Exit 0 success; 1 failure or timed out (failed job names and filtered log lines follow); 3 cancelled or another
 conclusion; 2 usage; 4 still running (the wait ended first, or --once found no finished run); 5 GitHub unavailable
-or internal error. Exits 4 and 5 are never a CI result.
+or internal error. Exits 4 and 5 are never a CI result. --timeout is 0 to 86400 seconds. Several --run ids (one
+workflow) share one cached list and one --timeout; with more than one, or with --label, the output ends with
+"[<label>]" and one "run <id>: <result>" line each, and the exit is 1 if any run failed, else 5, else 4, else 3,
+else 0. Two limits: the runs are waited for in turn, so a later run's failure is reported only after the earlier
+runs finish or the timeout ends; and a run that is no longer among the 40 newest of its workflow ends the whole
+wait with exit 2 and no summary (wait for the other runs again without it).
 Cache and lock: ~/.cache/her-ci-wait (mode 0700), on Windows %LOCALAPPDATA%\her-ci-wait; against a local test
 server the folder is her-ci-wait-test instead, unless HER_CI_WAIT_DIR names one.
 Auth: GH_TOKEN, else `gh auth token`, read only by a waiter that is about to call. A local test server
@@ -59,6 +65,10 @@ SHA = re.compile(r"[0-9a-f]{40}")
 TARGET = re.compile(r"[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*")
 FILTER = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_:.-]*)?")
 EVENTS = ("push", "pull_request")
+LABEL = re.compile(r"[A-Za-z0-9._:/-]{1,64}")
+MAX_TIMEOUT = 24 * 3600.0
+OUTCOMES = {0: "success", 1: "failure", 3: "cancelled or another conclusion", 4: "still running (not a result)",
+            5: "GitHub unavailable (not a result)"}
 RUN_FIELDS = ("id", "display_title", "head_branch", "head_sha", "event", "status", "conclusion", "html_url", "created_at")
 FAILED = ("failure", "timed_out", "startup_failure")
 KEEP = re.compile(r"test result:|^test \S+ \.\.\. FAILED|^EXIT |^UNLISTED FAILURES|^---- .+ stdout ----|^error(\[E[0-9]+\])?:|^\(log truncated")
@@ -364,7 +374,7 @@ def refresh_if_due(ctx, state_path, url):
             now = time.time()
             until = note_answer(ctx, budget, status, headers, url, now)
             if until is not None:
-                state.update(next_at=until, error=budget["block_reason"])
+                state.update(next_at=max(until, now + ctx.refresh), error=budget["block_reason"])
             elif status in (200, 304):
                 runs = None
                 if status == 200:
@@ -390,7 +400,7 @@ def check_answer(ctx, budget, status, headers, url):
     now = time.time()
     until = note_answer(ctx, budget, status, headers, url, now)
     if until is not None:
-        raise Later(until, budget["block_reason"])
+        raise Later(max(until, now + ctx.refresh), budget["block_reason"])
     if status != 200:
         raise Later(now + interval(budget.get("remaining"), ctx.refresh), f"GitHub API {status}")
 
@@ -530,13 +540,14 @@ def parse(argv):
     p.add_argument("--workflow", default="quick.yml")
     p.add_argument("--branch")
     p.add_argument("--sha")
-    p.add_argument("--run", type=int)
+    p.add_argument("--run", type=int, action="append")
     p.add_argument("--event", choices=EVENTS)
     p.add_argument("--target")
     p.add_argument("--filter", default="")
     p.add_argument("--os", choices=["linux", "windows"], default="linux")
     p.add_argument("--timeout", type=float, default=3600.0)
     p.add_argument("--once", action="store_true")
+    p.add_argument("--label")
     return p.parse_args(argv)
 
 
@@ -547,8 +558,8 @@ def checked(a):
         raise ValueError("--repo must be <owner>/<name>")
     if not WORKFLOW.fullmatch(a.workflow):
         raise ValueError("--workflow must be a workflow file name such as quick.yml")
-    if not a.timeout >= 0:
-        raise ValueError("--timeout must be zero or more seconds")
+    if not 0 <= a.timeout <= MAX_TIMEOUT:
+        raise ValueError("--timeout must be 0 to 86400 seconds")
     if a.run is not None:
         if a.run < 1 or a.branch or a.sha or a.target or a.filter or a.event:
             raise ValueError("--run names one run by its id; give no --branch, --sha, --event, --target or --filter")
@@ -570,8 +581,8 @@ def checked(a):
     return quick_title(a.os, a.target, a.filter)
 
 
-def wait(argv):
-    a = parse(argv)
+def wait_one(a):
+    """Wait for the run one namespace names (a.run is one id or None) and return its exit code."""
     try:
         api, directory, refresh = settings()
         title = checked(a)
@@ -591,7 +602,7 @@ def wait(argv):
             return report(ctx, a.repo, hit, cached=True)
     start = time.time()
     deadline = start + (0 if a.once else a.timeout)
-    said, seen = None, None
+    said, seen, watched = None, None, set()
     while True:
         state = refresh_if_due(ctx, state_path, url)
         budget = read_json(ctx.budget_path) or {}
@@ -607,8 +618,11 @@ def wait(argv):
         runs = (state or {}).get("runs") or []
         run = find_run(runs, a, title)
         stale = None
+        if run and run.get("status") != "completed":
+            watched.add(run.get("id"))
         if run and run.get("status") == "completed":
-            if run.get("conclusion") == "success" or a.run is not None or title is None or fresh_enough(run, start):
+            if (run.get("conclusion") == "success" or a.run is not None or title is None or fresh_enough(run, start)
+                    or run.get("id") in watched):
                 if key:
                     try:
                         remember(ctx, key, run)
@@ -658,6 +672,40 @@ def wait(argv):
                 print("CI still running: no matching run yet (not a result)", flush=True)
             return 4
         time.sleep(min(ctx.refresh / 10, deadline - now))
+
+
+def combined(codes):
+    """One exit code for several runs: a failure first, then the codes that are not results (5, 4), then 3, else 0."""
+    for code in (1, 5, 4, 3):
+        if code in codes:
+            return code
+    return 0
+
+
+def wait(argv):
+    """Wait for every named run in turn against the shared cached list, within one --timeout."""
+    a = parse(argv)
+    ids = a.run or [None]
+    if (a.label is not None and not LABEL.fullmatch(a.label)) or len(set(ids)) != len(ids):
+        print("ci-wait: --label takes 1-64 of A-Z a-z 0-9 . _ : / -, and each --run id is given once", file=sys.stderr)
+        return 2
+    began = time.time()
+    results = []
+    for run_id in ids:
+        one = argparse.Namespace(**dict(vars(a), run=run_id))
+        if results:
+            one.timeout = max(0.0, began + a.timeout - time.time())
+        code = wait_one(one)
+        if code == 2:
+            return 2
+        results.append((run_id, code))
+    if len(ids) > 1 or a.label is not None:
+        print(f"[{a.label or 'ci-wait'}]", flush=True)
+        for run_id, code in results:
+            name = f"run {run_id}" if run_id is not None else "result"
+            resume = f"; resume with --run {run_id}" if run_id is not None and code in (4, 5) else ""
+            print(f"{name}: {OUTCOMES[code]}{resume}", flush=True)
+    return combined([code for _, code in results])
 
 
 def main(argv=None):

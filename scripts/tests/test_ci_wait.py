@@ -83,6 +83,7 @@ class FakeGitHub(ThreadingHTTPServer):
         self.remaining = '4000'
         self.limit_until = 0           # list calls answer 403 until then
         self.jobs_limit_until = 0      # job-list calls answer 403 until then
+        self.reset_header = None       # an X-RateLimit-Reset value for those 403s instead of the limit's own end
         self.list_status = 200         # 401, 404 or 500 for every list call; 'junk' a non-JSON 200
         self.hold = None               # an Event the first list call waits for before answering
         self.api = f'http://127.0.0.1:{self.server_address[1]}'
@@ -98,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
         if '/actions/workflows/' in path:
             if time.time() < server.limit_until:
                 return 'list', 403, b'{"message": "API rate limit exceeded"}', {
-                    'x-ratelimit-remaining': '0', 'x-ratelimit-reset': str(server.limit_until)}
+                    'x-ratelimit-remaining': '0', 'x-ratelimit-reset': server.reset_header or str(server.limit_until)}
             if server.list_status == 'junk':
                 return 'list', 200, b'not json', limits
             if server.list_status != 200:
@@ -111,7 +112,7 @@ class Handler(BaseHTTPRequestHandler):
         if '/jobs?' in path:
             if time.time() < server.jobs_limit_until:
                 return 'jobs', 403, b'{"message": "API rate limit exceeded"}', {
-                    'x-ratelimit-remaining': '0', 'x-ratelimit-reset': str(server.jobs_limit_until)}
+                    'x-ratelimit-remaining': '0', 'x-ratelimit-reset': server.reset_header or str(server.jobs_limit_until)}
             return 'jobs', 200, json.dumps({'jobs': server.jobs}).encode('utf-8'), limits
         if path.endswith('/logs'):
             return 'logs', 302, b'', dict(limits, Location=f"{server.api}/blob/{path.split('/')[-2]}")
@@ -451,6 +452,86 @@ class CiWait(unittest.TestCase):
         code, out, err = self.wait(*WAIT)
         self.assertEqual(code, 0, out + err)
         self.assertIn('/runs/12', out)
+
+    def test_several_runs_are_waited_for_together(self):                      # first red of run C3
+        self.server.runs = lambda: ([self.make_run(12, status='in_progress'), self.make_run(11)]
+                                    if len(self.list_calls()) < 2
+                                    else [self.make_run(12, conclusion='failure'), self.make_run(11)])
+        code, out, err = self.wait('--run', '11', '--run', '12', '--label', '90-a', '--timeout', '20')
+        self.assertEqual(code, 1, out + err)
+        self.assertEqual(out.strip().splitlines()[-3:], ['[90-a]', 'run 11: success', 'run 12: failure'], out)
+        calls = self.list_calls()
+        times = [call[1] for call in calls]
+        for earlier, later in zip(times, times[1:]):
+            self.assertGreaterEqual(later - earlier, REFRESH * 0.9, times)          # both runs read one shared list
+        self.assertLessEqual(len(calls), int((times[-1] - times[0]) / (REFRESH * 0.9)) + 1, calls)
+        code, out, err = self.wait('--run', '11', '--label', 'x' * 64, '--once')
+        self.assertEqual(code, 0, out + err)
+        self.assertIn('[' + 'x' * 64 + ']', out)
+        self.server.runs = lambda: [self.make_run(15, status='in_progress'), self.make_run(14, status='in_progress'),
+                                    self.make_run(13)]
+        time.sleep(REFRESH * 1.2)
+        start = time.time()
+        code, out, err = self.wait('--run', '13', '--run', '14', '--run', '15', '--timeout', '2')
+        self.assertEqual(code, 4, out + err)
+        self.assertLess(time.time() - start, 3.5, out)                           # one --timeout for every run
+        self.assertEqual(out.strip().splitlines()[-4:], [
+            '[ci-wait]', 'run 13: success', 'run 14: still running (not a result); resume with --run 14',
+            'run 15: still running (not a result); resume with --run 15'], out)
+        time.sleep(REFRESH * 1.2)
+        code, out, err = self.wait('--run', '3', '--run', '13', '--timeout', '1')
+        self.assertEqual(code, 2, out + err)
+        self.assertIn('not among the 40 newest', err)
+        for argv in (['--run', '13', '--run', '13'], ['--run', '13', '--label', 'a b'], ['--run', '13', '--label', ''],
+                     ['--run', '13', '--label', 'x' * 65]):
+            with self.subTest(argv=argv):
+                code, out, err = self.wait(*argv, '--timeout', '1')
+                self.assertEqual(code, 2, out + err)
+
+    def test_several_results_combine_failure_first(self):
+        module = load_module()
+        for codes, expected in (([0, 0], 0), ([0, 3], 3), ([3, 4], 4), ([4, 5], 5), ([5, 1, 0], 1), ([0], 0), ([4], 4)):
+            self.assertEqual(module.combined(codes), expected, codes)
+
+    def test_a_run_seen_running_counts_however_old(self):
+        old = self.began - 600
+        self.server.runs = lambda: ([self.make_run(11, status='in_progress', created=old)]
+                                    if len(self.list_calls()) < 1
+                                    else [self.make_run(11, conclusion='failure', created=old)])
+        code, out, err = self.wait(*WAIT, '--timeout', '6')
+        self.assertEqual(code, 1, out + err)
+        self.assertIn('CI failure', out)
+        self.assertNotIn('no run of this commit since the wait began', out)
+
+    def test_a_rate_limit_whose_reset_has_passed_still_waits_one_window(self):
+        self.server.reset_header = str(int(time.time()) - 100)          # GitHub's reset is already behind the host clock
+        self.server.runs = lambda: [self.make_run(12, sha=SHA_B, conclusion='failure')]
+        self.server.jobs = [{'id': 22, 'name': 'quick (linux, unit)', 'conclusion': 'failure'}]
+        self.server.jobs_limit_until = time.time() + 60
+        results = [self.finish(proc) for proc in [self.start(*FAILING) for _ in range(2)]]
+        for code, out, err in results:
+            self.assertEqual(code, 1, out + err)
+            self.assertIn('log unavailable', out)
+        self.assertEqual(len([call for call in self.server.calls if call[0] == 'jobs']), 1)
+        shutil.rmtree(self.cache)
+        before = len(self.list_calls())
+        self.server.limit_until = time.time() + 60
+        code, out, err = self.wait(*WAIT, '--timeout', '0.8')
+        self.assertEqual(code, 5, out + err)
+        self.assertEqual(len(self.list_calls()) - before, 1, self.list_calls())
+
+    def test_the_timeout_is_finite_and_a_label_names_a_branch_wait(self):
+        for value in ('inf', 'nan', '86401', '-1'):
+            with self.subTest(value=value):
+                code, out, err = self.wait(*WAIT, '--timeout', value, '--once')
+                self.assertEqual(code, 2, out + err)
+        code, out, err = self.wait(*WAIT, '--timeout', '86400', '--once')
+        self.assertEqual(code, 4, out + err)
+        self.server.runs = lambda: [self.make_run(11)]
+        time.sleep(REFRESH * 1.2)
+        code, out, err = self.wait(*WAIT, '--label', '90-b')
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(out.strip().splitlines()[-2:], ['[90-b]', 'result: success'], out)
 
     def test_a_cancelled_run_is_reported_as_cancelled_without_a_log(self):
         self.server.runs = lambda: [self.make_run(11, conclusion='cancelled')]

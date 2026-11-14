@@ -1,6 +1,6 @@
 name: quick
 run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.filter }}
-# One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`. Wait with `python -I scripts/ci-wait.py --branch her/<n>-<slug> --target <name>`, started before this dispatch; it matches the run name.
+# One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`. The worker reads its run id once (run-name above names the run) and hands it back; a coordinator waits with `python -I scripts/ci-wait.py --run <id>`.
 # The CI-first gate is checks.yml on the pull request; this job never gates a merge.
 on:
   workflow_dispatch:
