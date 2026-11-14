@@ -769,12 +769,19 @@ fn recall_block_with(
             .filter(|t| !t.is_empty() && !used.iter().any(|u| u == *t))
             .take(6)
             .collect();
-        if !extra.is_empty() {
-            lines.push(format!(
-                "【记忆索引】本会话另有 {} 条，话题：{}（要细节用 memory_search）",
-                total - rows.len() as i64,
-                extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
-            ));
+        // The hint takes at most RECALL_HINT_MAX estimated tokens: subjects are dropped from the end until it fits,
+        // and the line is omitted when not even one subject fits.
+        let hint = |shown: usize| format!(
+            "【记忆索引】本会话另有 {} 条，话题：{}（要细节用 memory_search）",
+            total - rows.len() as i64,
+            extra[..shown].iter().map(|s| s.as_str()).collect::<Vec<_>>().join("、")
+        );
+        let mut shown = extra.len();
+        while shown > 0 && crate::briefing::estimate_tokens(&hint(shown)) > RECALL_HINT_MAX {
+            shown -= 1;
+        }
+        if shown > 0 {
+            lines.push(hint(shown));
         }
     }
     lines.push(RECALL_FOOTER.to_string());
@@ -1928,18 +1935,20 @@ pub(crate) fn prepare_dsh_wake_layered(
     let held = held_recall_ids(&record);
     // Material: the best-ranked recalled memories that fit what Identity and Relationship left of its budget.
     let offered = std::cell::Cell::new(0usize);
-    // The recall block adds its header and footer around the items, and the index hint line (allowance 60
-    // tokens for the 【记忆索引】 hint line); Material's budget covers all of it.
-    let overhead = crate::briefing::estimate_tokens(RECALL_HEADER) + crate::briefing::estimate_tokens(RECALL_FOOTER) + 60;
+    // The recall block adds its header and footer around the items, and the index hint line (at most
+    // RECALL_HINT_MAX tokens); Material's budget covers all of it.
+    let overhead = crate::briefing::estimate_tokens(RECALL_HEADER) + crate::briefing::estimate_tokens(RECALL_FOOTER) + RECALL_HINT_MAX;
     let (recall, recalled) = recall_block_with(context, cfg, st, key, &held, &|items: &[String]| {
         offered.set(items.len());
         assembly.material_fit(items, overhead)
     });
-    // What DSH receives: a section emptied by the model-view strip delivers nothing, so it is not counted.
+    // What DSH receives: a section the model-view strip emptied delivers nothing, so its items are not counted.
+    // A section that is only partly stripped stays counted in full.
     let mut delivered = assembly.counts;
-    if sections.get("identity").map_or(true, |t| t.trim().is_empty()) { delivered.identity = 0; }
-    if ["operator", "impressions"].iter().all(|n| sections.get(n).map_or(true, |t| t.trim().is_empty())) {
-        delivered.relationship = 0;
+    for (name, layer, items) in &assembly.section_items {
+        if let Some(layer) = layer {
+            if sections.get(name).map_or(true, |t| t.trim().is_empty()) { delivered.remove(*layer, *items); }
+        }
     }
     delivered.material = recalled.len();
     let layers = delivered;
