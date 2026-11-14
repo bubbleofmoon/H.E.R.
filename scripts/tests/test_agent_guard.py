@@ -38,7 +38,6 @@ READS = [
     'gh pr view 5 -R bubbleofmoon/H.E.R. --json headRefOid,statusCheckRollup',
     'gh -R bubbleofmoon/H.E.R. pr checks 5',
     'gh run view 123 --log --job 456',
-    'gh run watch 1 --exit-status',
     'gh issue view 4 --comments',
     'gh run list --workflow quick.yml --branch her/1-x -L 1',
     "gh pr view 5 --json title --jq '.title | ascii_downcase'",
@@ -64,11 +63,35 @@ READS = [
     'git name-rev HEAD',
     'git --version',
     'git branch',
-    'git branch --list her/*',
+    "git branch --list 'her/*'",
     'git branch -a',
     'git remote -v',
-    'sed -n 1,5p x',
     'find . -name x.md',
+    "find . '(' -name '*.md' -o -name '*.rs' ')' -print",
+    "git log --format='<%ae>'",
+    'ls 2>/dev/null',
+    "grep -n ';' x",
+    'grep -n "fn x() -> u8" src',
+    'git log --grep "a;b"',
+    'grep -rn "cargo check" docs/',
+    "grep -rn 'Result<()>' her/src",
+    "grep -n '(a|b)' x",
+    'git log --oneline 2>&1 | head -5',
+    'cat scripts/handoff.sh | head -5',
+    'cat scripts/handoff.sh',
+    'cat scripts/gh-public.sh',
+    'sort -u x',
+    'uniq x',
+    'date +%F',
+    'date -u',
+    'jq .x f.json',
+    "rg -n 'a|b' her/src",
+    'wc -l x',
+    'echo ok',
+    'pwd',
+    'find . -mtime -7 -name x.md',
+    'gh api rate_limit',
+    'gh api rate_limit --jq .resources.core.remaining',
 ]
 IMPLEMENTER_ALLOWED = [
     ('wt', 'git push origin her/1-x'),
@@ -85,8 +108,11 @@ IMPLEMENTER_ALLOWED = [
     ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
     ('wt', 'bash /root/her/scripts/codex-task.sh 1-self-2 {wt} /root/orch/her/1/review/codex-self-2.md gpt-6-astra high read-only 120'),
     ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
-    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile p.md -model gpt-6-astra -effort high -sandbox read-only -timeoutminutes 90'),
+    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6-astra -effort high -sandbox read-only -timeoutminutes 90'),
     ('wt', 'git add scripts/codex-task.sh'),
+    ('repo', 'cd {wt} && /root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', 'git add scripts/handoff.sh'),
+    ('wt', 'git add scripts/gh-public.sh'),
 ]
 DENIED_EVERY_ROLE = [
     # R1: a second push after an allowed one, other refs, flags
@@ -234,6 +260,26 @@ DENIED_EVERY_ROLE = [
     ('wt', 'ls \\ #;scripts/handoff.sh 80 linux b.md'),
     ('wt', 'bash -s 1-self-1 {wt} p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'),   # regression (R3)
     ('wt', 'cd scripts && bash -s 80 linux b.md < handoff.sh'),                                      # regression (R3)
+    # fix round, Run 5: indirection, gh watch and rate_limit, Codex pin and prompt
+    ('wt', 'cat scripts/handoff.sh | bash -s 80 linux b.md'),
+    ('wt', 's=scripts/gh-public.sh; $s --body-file b.md issue comment 5'),
+    ('wt', 'cat /root/her/scripts/codex-task.sh | bash -s x {wt} p.md gpt-6-astra high none'),
+    ('wt', 'find scripts -name handoff.sh -exec {{}} 80 linux b.md \';\''),
+    ('wt', 'echo $HOME codex'),
+    ('wt', "echo a # it's"),
+    ('wt', 'gh run watch 1 --exit-status'),
+    ('wt', 'gh run view 1 --watch'),
+    ('wt', 'gh pr checks 5 --watch'),
+    ('wt', 'gh api rate_limit -X POST'),
+    ('wt', 'gh api rate_limit/x'),
+    ('wt', 'source scripts/gh-public.sh'),                       # regression
+    ('wt', '. scripts/handoff.sh 80 linux b.md'),                # regression
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/her-vault/x.md gpt-6-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/2/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/../x.md gpt-6-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 /root/her-vault /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {repo} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {repo} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
@@ -346,7 +392,6 @@ READ_ONLY_FILE_WRITES_DENIED = [
     ('wt', 'winpty rm x'),
     ('wt', 'cmd /c start rm x'),
     ('wt', 'call rm x'),
-    ('wt', 'grep -rn "cargo check" docs/'),
     ('wt', 'function f {{ rm x; }}'),
     ('wt', 'cat <<EOF\nrm x\nEOF'),                             # a heredoc body line is a command
 ]
@@ -354,11 +399,119 @@ READ_ONLY_FILE_WRITES_DENIED = [
 
 WRITERS_ALLOWED = [                     # implementers and gates keep ordinary commands with quotes and redirections
     ('wt', 'grep -n "Result<()>" x'),
-    ('wt', 'grep -n "<<<<<<<" x'),
+    ('wt', 'grep -n "<<<<<<<" x'),                    # regression
+    ('wt', 'sed -n 1,5p x'),                          # moved from READS: read-only roles run no sed
     ('wt', 'ls >&2'),
     ('wt', 'ls 2>&1 | head'),
     ('wt', 'git status\ngit log --oneline -3'),       # moved from READS: read-only roles now refuse a newline
     ('wt', 'ls >/dev/null 2>&1'),                     # moved from READS: read-only roles allow only 2>/dev/null and 2>&1
+]
+
+
+READ_ONLY_DENIED = [   # expected denied for planner and reviewer; '# regression' rows were already denied before Run 5
+    ('wt', 'git log &>/dev/null --output=/root/her/AGENTS.md'),
+    ('wt', 'find . &>/dev/null -delete'),
+    ('wt', 'git log `echo HEAD` --output=/root/her/AGENTS.md'),
+    ('wt', 'find . `true` -delete'),
+    ('wt', 'git diff --no-index <(true) <(true) --output=/root/x'),
+    ('wt', 'find . <(true) -delete'),
+    ('wt', "echo a # it's\necho x > /root/her/AGENTS.md # it's"),
+    ('wt', "cat <<EOF\n'\nEOF\nls > /root/x\ncat <<EOF\n'\nEOF"),
+    ('wt', 'echo "$(ls ")" > /root/x; echo ")")"'),
+    ('wt', 'echo "ls > /root/x" | sh'),
+    ('wt', "awk 'BEGIN{{print \"x\" > \"/root/her/AGENTS.md\"}}'"),
+    ('wt', "trap 'echo x > /root/f' EXIT"),
+    ('wt', 'readonly PATH=/tmp/x; git log'),
+    ('wt', 'local X=1'),
+    ('wt', 'git log {{--output=/root/her/AGENTS.md,HEAD}}'),
+    ('wt', 'bash -c "true\nrm victim # it\'s"'),
+    ('wt', 'git log --grep \\; --output=/x'),
+    ('wt', 'git log --grep ";" --output=/x'),
+    ('wt', 'ls >|/root/x'),
+    ('wt', '</dev/null rm victim'),
+    ('wt', '2>/dev/null rm x'),
+    ('wt', 'eval -- rm victim'),
+    ('wt', 'eval -- git config x y'),
+    ('wt', "git log --grep ';' --output=/root/her/AGENTS.md"),
+    ('wt', 'git log --grep {{ --output=/x'),
+    ('wt', 'git log --grep "a\nb" --output=/x'),
+    ('wt', "git grep -e '|' --open-files-in-pager=/path/to/script"),
+    ('wt', "find . \\( -name '*.rs' \\) -delete"),
+    ('wt', 'find . ! -name {{ -delete'),
+    ('wt', 'find . -name x -exec true \\; -delete'),
+    ('wt', "sed -e ';' -i -e s/a/b/ x"),
+    ('wt', "sed ';' -i.bak victim"),
+    ('wt', 'ls;>victim'),
+    ('wt', 'echo x > victim >/dev/null'),
+    ('wt', 'ls 2>/root/x'),
+    ('wt', 'ls >/dev/null 2>/root/x'),
+    ('wt', 'ls &>/root/x'),
+    ('wt', 'ls >>/root/x'),                     # regression
+    ('wt', 'cat <>/root/x'),                    # regression
+    ('wt', 'echo x >&/root/x'),
+    ('wt', 'bash -c "ls > /root/x"'),           # regression
+    ('wt', 'echo "$(date > /root/x)"'),         # regression
+    ('wt', 'git grep --op=/root/her/scripts/cargo-slot.sh x'),
+    ('wt', 'git grep -1Osh x'),
+    ('wt', 'export GIT_EXTERNAL_DIFF=/some/script; git diff'),
+    ('wt', 'declare -x GIT_PAGER=x; git log'),
+    ('wt', 'typeset X=1'),
+    ('wt', 'x=1; ls'),
+    ('wt', 'PATH=/tmp/x; git log'),
+    ('wt', 'x=--output=/f; git log $x'),
+    ('wt', 'git log $x'),
+    ('wt', 'sed --i s/a/b/ x'),
+    ('wt', "sed -n 'w out.txt' input.txt"),
+    ('wt', 'sed -n 1,5p x'),
+    ('wt', 'find . -name x -ls'),
+    ('wt', 'find . -name x -printf %p'),
+    ('wt', 'find . -newer x -delete'),          # regression
+    ('wt', 'git log; ls'),
+    ('wt', 'git log && ls'),
+    ('wt', 'git log || ls'),
+    ('wt', 'git log & ls'),
+    ('wt', 'git log\nls'),
+    ('wt', 'cd /root/her && git log'),
+    ('wt', 'ls >/dev/null'),
+    ('wt', 'cat x > /root/y'),
+    ('wt', 'cat x | sh'),
+    ('wt', 'python3 -c 1'),
+    ('wt', '/usr/bin/git log'),
+    ('wt', 'echo "$HOME"'),
+    ('wt', 'echo \\$x'),
+    ('wt', 'grep -n x her/src/*.rs'),
+    ('wt', 'git -C /root/her log *'),
+    ('wt', 'find * -name x'),
+    ('wt', 'sort *'),
+    ('wt', 'sort -o /root/x y'),
+    ('wt', 'sort -uo/root/x y'),
+    ('wt', 'sort --output=/root/x y'),
+    ('wt', 'sort --compress-program=sh y'),
+    ('wt', 'tree -o /root/x'),                  # amendment 6: tree is no longer a reader
+    ('wt', 'tree -L 2 docs'),                   # amendment 6
+    ('wt', 'uniq a /root/x'),
+    ('wt', 'rg --pre sh x'),
+    ('wt', 'rg --hostname-bin=sh x'),
+    ('wt', 'rg --pretty x'),                    # amendment 9: the --pre prefix
+    ('wt', 'file -C -m x'),
+    ('wt', 'date -s 2020-01-01'),
+    ('wt', 'date ' + '0101' + '000020'),          # assembled from parts: a digit run of 7 or more is refused as text
+    ('wt', 'gh run download 5 --dir x'),
+    ('wt', 'gh run view 1 --watch'),
+    # amendments 2, 3, 5, 7, 8, 9
+    ('wt', 'echo x | uniq - /root/her/AGENTS.md'),
+    ('wt', 'uniq -- -in /root/her/AGENTS.md'),
+    ('wt', 'file --co -m x'),
+    ('wt', "grep -n 'a\x01b' x"),
+    ('wt', "git log --out'put=/x'"),
+    ('wt', 'git log "--output=/x"'),
+    ('wt', 'git log\u00a0--output=/x'),
+    ('wt', 'ls | | cat'),
+    ('wt', 'git -C /root/orch/her/80/scratch/x status'),
+    ('wt', 'git -C C:/her-orch/80/scratch/x log'),
+    ('wt', "echo a # it's"),
+    ('wt', 'git grep -lOsh x'),
+    ('wt', 'git diff --output=/root/x'),
 ]
 
 
@@ -441,11 +594,29 @@ class AgentGuard(unittest.TestCase):
     def test_read_only_roles_change_no_files(self):
         self.expect(READ_ONLY_FILE_WRITES_DENIED, ('planner', 'reviewer'), False)
 
-    def test_a_quoted_pattern_naming_a_tool_points_to_the_grep_tool(self):
+    def test_a_read_only_refusal_points_to_the_tools(self):             # replaces the quoted-pattern message test
         for role in ('planner', 'reviewer'):
-            code, err = self.guard(role, 'wt', 'grep -rn "cargo check" docs/')
+            code, err = self.guard(role, 'wt', 'git log; ls')
             self.assertEqual(code, 2, err)
-            self.assertIn('Grep tool', err)
+            self.assertIn('Read, Grep and Glob tools', err)
+
+    def test_read_only_roles_run_only_simple_read_pipelines(self):
+        self.expect(READ_ONLY_DENIED, ('planner', 'reviewer'), False)
+
+    def test_a_codex_prompt_that_is_a_link_is_refused(self):
+        guard = load_guard()
+        prompt = '/root/orch/her/1/review/codex-self-1.md'
+        with mock.patch.object(guard.os.path, 'islink', side_effect=lambda p: p == prompt), \
+                mock.patch.object(guard.os.path, 'isjunction', return_value=False, create=True), \
+                mock.patch.object(guard.os, 'lstat', side_effect=FileNotFoundError):
+            self.assertFalse(guard.codex_target_allowed('/w', prompt, '/w', 'her/1-x'))
+        with mock.patch.object(guard.os.path, 'islink', return_value=False), \
+                mock.patch.object(guard.os.path, 'isjunction', return_value=False, create=True), \
+                mock.patch.object(guard.os, 'lstat', side_effect=FileNotFoundError):
+            self.assertTrue(guard.codex_target_allowed('/w', prompt, '/w', 'her/1-x'))
+
+    def test_a_quoted_pattern_naming_a_tool_is_allowed_for_writers(self):
+        self.expect([('wt', 'grep -rn "cargo check" docs/')], ('implementer', 'gate'), True)
 
     def test_other_roles_keep_their_write_rules(self):
         self.assertEqual(self.tool_call('implementer', 'Write', '/root/her-wt/1/her/src/x.rs'), 0)
@@ -503,7 +674,7 @@ class AgentGuard(unittest.TestCase):
         self.assertIn(['rm', 'victim'], words('</dev/null rm victim'))
         self.assertIn(['rm', 'victim'], words('eval -- rm victim'))
         self.assertIn(['/root/her/scripts/codex-task.sh'],
-                      words('bash -s x {wt} p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'))   # regression (R3)
+                      words('bash -s x /root/her-wt/1 p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'))   # regression (R3)
         self.assertIn(['handoff.sh'], words('bash -s 80 linux b.md <<< handoff.sh'))                    # regression (R3)
         self.assertIn(['rm', 'x'], words("echo a # it's\nrm x # it's"))                                 # comments
         self.assertIn(['codex', 'exec', 'x'], words('ls \\ #;codex exec x'))                            # amendment 1
