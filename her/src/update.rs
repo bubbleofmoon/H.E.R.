@@ -864,9 +864,18 @@ mod claim_tests {
             .expect("the restored release claims the pending alert at once");
         assert_eq!(claimed.id, alert.id);
         assert_eq!(claimed.rollback, "pending");
-        assert!(claim_alert(&root.0, 1_000, Some(RETIRING))
-            .unwrap()
-            .is_none());
+        let claimed_bytes = alert_bytes(&root.0);
+        assert!(
+            claim_alert(&root.0, i64::MAX, Some(RETIRING))
+                .unwrap()
+                .is_none(),
+            "past the lease the retiring release still cannot claim while the gate is held"
+        );
+        assert_eq!(
+            alert_bytes(&root.0),
+            claimed_bytes,
+            "a deferral past the lease writes nothing"
+        );
         finish_rollback(&root.0, &alert.id, "restored").unwrap();
         let finished = stored(&root.0);
         assert_eq!(
@@ -881,7 +890,7 @@ mod claim_tests {
         let root = install("unresolved");
         pending(&root.0);
         let before = alert_bytes(&root.0);
-        let _gate = hold_restore_gate(&root.0);
+        let gate = hold_restore_gate(&root.0);
         assert!(
             claim_alert(&root.0, 0, None).unwrap().is_none(),
             "a supervisor that cannot resolve its own release must not claim a rollback in progress"
@@ -902,6 +911,12 @@ mod claim_tests {
                 );
             }
         }
+        pending(&root.0);
+        drop(gate);
+        assert!(
+            claim_alert(&root.0, 0, None).unwrap().is_some(),
+            "with the gate free a pending alert is stale and deliverable to an unresolved release"
+        );
     }
 
     #[test]
