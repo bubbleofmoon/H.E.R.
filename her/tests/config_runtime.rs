@@ -81,10 +81,12 @@ fn path_arg(path: &Path) -> &str {
 struct Console {
     child: Child,
     port: u16,
+    home: PathBuf,
 }
 
 impl Console {
     fn start(root: &Path) -> Self {
+        let mut homes = Vec::new();
         let (child, port) = crate::support::ports::start_console(Duration::from_secs(10), |port| {
             let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
             command
@@ -95,10 +97,12 @@ impl Console {
                 .arg(root)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            isolate_env(&mut command, &unique_dir("console-home"));
+            let home = unique_dir("console-home"); isolate_env(&mut command, &home); homes.push(home);
             command.spawn().expect("start isolated console candidate")
         });
-        let mut console = Self { child, port };
+        let home = homes.pop().expect("started console home");
+        for stale in homes { let _ = fs::remove_dir_all(stale); }
+        let mut console = Self { child, port, home };
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Ok((200, _)) = http(port, "GET", "/api/health", None, None) {
@@ -122,6 +126,7 @@ impl Drop for Console {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = fs::remove_dir_all(&self.home);
     }
 }
 
