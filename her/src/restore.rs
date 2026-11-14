@@ -10,8 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Ordinary filesystem spelling for operator-facing text; the verbatim form survives only when
+/// `subprocess::external_path` has no safe ordinary spelling.
 fn ordinary_path(path: &Path) -> String {
-    path.display().to_string()
+    crate::subprocess::external_path(path).unwrap_or_else(|_| path.display().to_string())
 }
 
 struct Staging(PathBuf);
@@ -262,7 +264,7 @@ impl Prepared {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis() as i64;
-        let view = json!({"runtimeRoot":context.runtime_root(),"archive":absolute,"time":time,"scope":scope,"contents":contents,"replaces":replaces,"removes":removes,"includesState":state_included,"confirmation":confirmation});
+        let view = json!({"runtimeRoot":context.runtime_root(),"archive":ordinary_path(&absolute),"time":time,"scope":scope,"contents":contents,"replaces":replaces,"removes":removes,"includesState":state_included,"confirmation":confirmation});
         Ok(Self {
             _staging: staging,
             zip,
@@ -710,8 +712,7 @@ fn audit(
     };
     // The audit is an operator record, so the archive keeps its ordinary filesystem spelling; the
     // verbatim form survives only when no safe ordinary spelling exists for it.
-    let archive = crate::subprocess::external_path(archive)
-        .unwrap_or_else(|_| archive.display().to_string());
+    let archive = ordinary_path(archive);
     let entry = json!({"at":crate::parity_clock::now_ms(),"action":"backup.restore","by":by,"archive":archive,
         "scope":if memory_only {"memory"} else {"everything"},"result":result,"rollbackStatus":recovery.rollback_status,"preRestoreArchive":recovery.pre_restore_archive,
         "detail":crate::run_record::sanitize_reason(detail, &|s| crate::pipeline::redact_sensitive_text(s, &[]))});
@@ -776,7 +777,7 @@ fn execute_with(
             crate::backup::protect_pre_restore(&previous, &|| Ok(()))
         })();
         match attempt {
-            Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":previous})),
+            Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
             Err(reason) => {
                 // Always re-quiesce; a failed health check may leave live writers running.
                 let undo = (|| {
@@ -796,7 +797,7 @@ fn execute_with(
                         recovery.rollback_status = "failed";
                         format!(
                             "{reason}; rollback failed: {e}; pre-restore backup: {}",
-                            previous.display()
+                            ordinary_path(&previous)
                         )
                     }
                 };

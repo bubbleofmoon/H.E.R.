@@ -4601,6 +4601,15 @@ fn sticker_list_public_http_uses_selected_roots_and_js_console_auth() {
     assert!(String::from_utf8_lossy(&persisted_b).contains("beta-sticker"));
     assert!(!String::from_utf8_lossy(&persisted_b).contains("alpha-sticker"));
 }
+/// Ordinary spelling for comparing a path with its verbatim form: strips only the `\\?\` prefix.
+fn ordinary(path: impl AsRef<Path>) -> String {
+    let text = path.as_ref().to_str().unwrap().to_string();
+    match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(text),
+    }
+}
+
 #[test]
 fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_console() {
     let workspace = FixtureWorkspace::new("restore-preview");
@@ -4647,7 +4656,7 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     let restore_audits: Vec<Value> = audit.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|event| event["action"] == "backup.restore").collect();
     assert!(restore_audits.iter().any(|event| event["by"] == "console:administrator"
-        && event["archive"] == json!(root.join("backups").join(name))
+        && event["archive"].as_str().map(ordinary) == Some(ordinary(fs::canonicalize(root.join("backups").join(name)).unwrap()))
         && event["scope"] == "memory" && event["result"] == "failed"), "busy console restore audit: {audit}");
     drop(gate);
     fs::write(root.join("backups").join(name), b"broken").unwrap();
