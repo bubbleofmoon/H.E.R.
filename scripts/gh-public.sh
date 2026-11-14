@@ -21,7 +21,7 @@
 # gh publishes exactly the text that was scanned and is never left prompting for a body.
 #
 # A refusal prints a fixed kind and the argument position, never a supplied value, and exits
-# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings, 3 when gitleaks cannot be found (refusal=scanner-missing, which says nothing about the text). Install
+# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings, 3 when gitleaks cannot be found (refusal=scanner-missing, which says nothing about the text). After a clean scan, a failing gh exits 4 (refusal=gh-failed): the text may or may not be published. Install
 # gitleaks first (scripts/ci/install-gitleaks.py or set HER_GITLEAKS); a scan that cannot run
 # the secret check refuses too.
 set -u
@@ -168,4 +168,9 @@ while [ $i -lt $count ]; do
   esac
   i=$((i + 1))
 done
-exec gh "${argv[@]}"
+gh "${argv[@]}"
+code=$?
+if [ $code -ne 0 ]; then
+  echo "gh-public: refusal=gh-failed exit=$code (the scan passed and gh failed: the text may or may not be on GitHub, check before retrying)" >&2
+  exit 4
+fi

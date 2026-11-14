@@ -11,7 +11,7 @@ Binding for both coordinators (Windows and Linux). Tickets are GitHub Issues on 
 ## Handing over
 
 1. Write the comment to a body file whose first line is `**Handoff → windows**`, `**Handoff → linux**` or `**Handoff → owner**`.
-2. Run `scripts/handoff.sh <issue> <linux|windows|owner> <body-file>` (`scripts/handoff.ps1` on Windows). It changes nothing and exits non-zero when the heading does not match the side, the issue is not open, the repository has no `baton:<side>` label or the public scan refuses the body. Otherwise it posts the comment through `scripts/gh-public` first, so the receiver never wakes to a stale comment, then one `gh issue edit` removes every other `baton:*` label and adds `baton:<side>`. Exit 4 means the comment is posted but the label did not move: run the `gh issue edit` line it prints.
+2. Run `scripts/handoff.sh <issue> <linux|windows|owner> <body-file>` (`scripts/handoff.ps1` on Windows). It changes nothing and exits non-zero when the heading does not match the side, the issue is not open, the repository has no `baton:<side>` label or the public scan refuses the body. Otherwise it posts the comment through `scripts/gh-public` first, so the receiver never wakes to a stale comment, then one `gh issue edit` removes every other `baton:*` label and adds `baton:<side>`. Exit 4 means `gh` failed after the scan passed. If it failed posting the comment, the comment may or may not be on the issue and the baton did not move: check the issue first. If it failed moving the label, the comment is posted: run the `gh issue edit` line it prints.
 
 The comment must stand on its own; the receiver reads nothing else first:
 

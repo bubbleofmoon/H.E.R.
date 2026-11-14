@@ -26,7 +26,7 @@
 # handle and keeps every byte.
 #
 # A refusal prints a fixed kind and the argument position, never a supplied value, and exits
-# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings, 3 when gitleaks cannot be found (refusal=scanner-missing, which says nothing about the text). Install
+# non-zero without calling gh: 2 for a refused invocation, 1 for public scan findings, 3 when gitleaks cannot be found (refusal=scanner-missing, which says nothing about the text). After a clean scan, a failing gh exits 4 (refusal=gh-failed): the text may or may not be published. Install
 # gitleaks first (scripts/ci/install-gitleaks.py or set HER_GITLEAKS); a scan that cannot run
 # the secret check refuses too.
 $ErrorActionPreference = 'Continue'
@@ -212,5 +212,9 @@ for ($index = 0; $index -lt $fieldNames.Count; $index++) {
     if ($fieldNames[$index] -eq 'label') { $argv += @('--label', [string]$fieldTexts[$index]) }
 }
 & gh @argv
-if ($null -eq $LASTEXITCODE) { exit 1 }
-exit $LASTEXITCODE
+$ghCode = $LASTEXITCODE
+if ($null -eq $ghCode -or $ghCode -ne 0) {
+    [Console]::Error.WriteLine("gh-public: refusal=gh-failed exit=$ghCode (the scan passed and gh failed: the text may or may not be on GitHub, check before retrying)")
+    exit 4
+}
+exit 0

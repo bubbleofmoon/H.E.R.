@@ -248,9 +248,22 @@ class HandoffCase(unittest.TestCase):
             self.reset_log()
             code, out = self.run_handoff(kind, 80, 'windows', self.body)
             self.assertEqual(code, 4, f'{kind}: {out}')
-            self.assertIn('FAILED', out, kind)
+            self.assertIn('gh failed while moving the label', out, kind)
             writes = self.writes()
             self.assertEqual(writes[0][:2], ['issue', 'comment'], kind)
+
+    @REQUIRES_HOST
+    @REQUIRES_SCANNER
+    def test_a_failed_comment_post_moves_no_label(self):
+        self.write_body('windows')
+        self.env['GH_STUB_ISSUE_LABELS'] = 'baton:linux'
+        self.env['GH_STUB_FAIL'] = 'issue comment'
+        for kind in KINDS:
+            self.reset_log()
+            code, out = self.run_handoff(kind, 80, 'windows', self.body)
+            self.assertEqual(code, 4, f'{kind}: {out}')
+            self.assertIn('gh failed while posting the comment', out, kind)
+            self.assertEqual([c[:2] for c in self.writes()], [['issue', 'comment']], f'{kind}: a label moved')
 
     # --- both launchers agree (no host needed) ----------------------------------------
     def test_both_scripts_refuse_the_same_kinds_and_stay_ascii(self):

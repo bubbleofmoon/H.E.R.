@@ -10,8 +10,10 @@
 # goes first, so the receiver never wakes to a stale comment; a body gh-public refuses exits
 # with gh-public's code (1 findings, 2 refused invocation, 3 no secret scanner) and changes
 # nothing. Then one `gh issue edit` adds baton:<side> and removes every other baton:* label.
-# If that edit fails, the comment is already posted: the script exits 4, says so and prints
-# the label command to run by hand. A refusal prints a fixed kind, never a supplied value.
+# Exit 4 means gh itself failed after the scan passed: while posting the comment (it may or may
+# not be on the issue; the baton did not move) or while moving the label (the comment is
+# posted). The message says which and prints the label command to run by hand.
+# A refusal prints a fixed kind, never a supplied value.
 set -u
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo='bubbleofmoon/H.E.R.'
@@ -41,17 +43,22 @@ known=$(gh label list --repo "$repo" --search 'baton:' --limit 100 --json name -
 printf '%s\n' "$known" | grep -Fxq -- "$label" || refuse unknown-label
 remove=$(printf '%s\n' "$view" | tail -n +2 | grep '^baton:' | grep -Fxv -- "$label" | paste -sd, -)
 
+edit=(issue edit "$issue" --repo "$repo" --add-label "$label")
+[ -z "$remove" ] || edit+=(--remove-label "$remove")
+
 bash "$here/gh-public.sh" --body-file "$body" issue comment "$issue" --repo "$repo"
 code=$?
+if [ $code -eq 4 ]; then
+  echo "handoff: FAILED: gh failed while posting the comment; it may or may not be on the issue, and the baton did not move. Check the issue, then post again or run: gh ${edit[*]}" >&2
+  exit 4
+fi
 if [ $code -ne 0 ]; then
   echo "handoff: the comment was not posted (gh-public exit $code); labels unchanged" >&2
   exit $code
 fi
 
-edit=(issue edit "$issue" --repo "$repo" --add-label "$label")
-[ -z "$remove" ] || edit+=(--remove-label "$remove")
 if ! gh "${edit[@]}"; then
-  echo "handoff: FAILED: the comment is posted but the baton did not move; run: gh ${edit[*]}" >&2
+  echo "handoff: FAILED: gh failed while moving the label; the comment is posted but the baton did not move; run: gh ${edit[*]}" >&2
   exit 4
 fi
 echo "handoff: #$issue -> $label"
