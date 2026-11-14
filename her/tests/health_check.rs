@@ -72,8 +72,9 @@ impl Drain {
 /// Runs `cmd` with both output pipes drained on reader threads, so a child printing more than
 /// one pipe buffer (4 KiB on Windows) cannot block. Waits at most `allow` for the exit, then at
 /// most `PIPE_GRACE` for the pipes to close (a detached grandchild may hold an inherited pipe).
-/// On timeout the child is killed and the error carries what it printed so far. Never panics,
-/// so `Rig::drop` can use it while unwinding.
+/// On timeout the child is killed through its own handle and reaped within 5 s; a child that
+/// ignores the kill leaks its handle and the error says so. The error carries what it printed
+/// so far. Never panics, so `Rig::drop` can use it while unwinding.
 fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Output, String> {
     let mut process = cmd
         .stdin(std::process::Stdio::null())
@@ -85,7 +86,7 @@ fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Outpu
     let stderr = Drain::new(process.stderr.take());
     let mut child = Child(Some(process));
     let limit = Instant::now() + allow;
-    let status = loop {
+    let mut status = loop {
         let Some(process) = child.0.as_mut() else {
             break Err("lost its process handle".to_string());
         };
@@ -101,7 +102,39 @@ fn run_bounded(cmd: &mut Command, allow: Duration) -> Result<std::process::Outpu
             Err(e) => break Err(format!("could not be polled: {e}")),
         }
     };
-    // Exited: this only reaps. Still running: killed and reaped before the output is read.
+    if let Err(reason) = &mut status {
+        // The timeout path kills through the std `Child` handle: the handle names this exact
+        // process instance, so no pid lookup can race a recycled pid — the recorded-identity
+        // rule that `kill_verified` enforces for handleless processes is satisfied directly.
+        // The reap after the kill is bounded: a child that ignores the kill leaks its handle
+        // and is reported, never followed by a blocking `wait` that could stall the fixture.
+        let mut leaked = false;
+        if let Some(process) = child.0.as_mut() {
+            let _ = process.kill();
+            let reaped = Instant::now() + Duration::from_secs(5);
+            loop {
+                match process.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < reaped => std::thread::sleep(Duration::from_millis(5)),
+                    Ok(None) => {
+                        *reason += "; child did not exit after kill";
+                        leaked = true;
+                        break;
+                    }
+                    Err(_) => {
+                        leaked = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if leaked {
+            // Dropping a std `Child` is non-blocking and leaves the process running: that is
+            // the leak. Keeping it in the wrapper would call blocking `wait` in `Child::drop`.
+            child.0 = None;
+        }
+    }
+    // Exited (or reaped after the kill): the wrapper's Drop only reaps here.
     drop(child);
     let grace = Instant::now() + PIPE_GRACE;
     while !(stdout.closed() && stderr.closed()) && Instant::now() < grace {
@@ -1518,7 +1551,7 @@ fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
         .join("data/logs/rbridge-console.lock.owner.json");
     // Same budget as the reconcile test: ~7 s to a healthy console measured on the Windows host.
     let deadline = Instant::now() + Duration::from_secs(40);
-    loop {
+    let identity = loop {
         let identity = std::fs::read(&marker)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -1527,7 +1560,7 @@ fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
             if Some(identity.pid) != original
                 && process_identity::check_identity(&identity) == Liveness::Matches
             {
-                return identity;
+                break identity;
             }
         }
         assert!(
@@ -1536,7 +1569,27 @@ fn supervisor_started_console(rig: &mut Rig) -> ProcessIdentity {
             std::fs::read_to_string(&marker).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    // The owner marker is published before the console loads its config (entry.rs acquires the
+    // gate first), so a live marker pid does not yet prove the console runs: a console that
+    // exits once the fixture is deleted during that window makes both tests pass falsely.
+    // Require shared health for this runtime — the console part passes only when /api/health
+    // answers with this console's pid — and the same marker identity, before any cleanup.
+    // `--wait` re-snapshots until every part passes, like the reconcile test.
+    let (code, verdict) = rig
+        .fixture
+        .check_bounded(&["--wait", "30s"], Duration::from_secs(40));
+    assert_eq!(code, 0, "the supervisor-started console never answered health: {verdict}");
+    let reread = std::fs::read(&marker)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| serde_json::from_value::<ProcessIdentity>(value["identity"].clone()).ok());
+    assert_eq!(
+        reread.as_ref(),
+        Some(&identity),
+        "the console marker no longer names the console that answered health"
+    );
+    identity
 }
 
 fn assert_stopped_after_drop(console: &ProcessIdentity) {
