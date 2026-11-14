@@ -57,7 +57,6 @@ READS = [
     'git -C /root/her log --oneline -3',
     'git show HEAD:AGENTS.md',
     # v4 read-only git and text reads
-    'git status\ngit log --oneline -3',
     'git rev-list --count HEAD',
     'git show-ref --heads',
     'git shortlog -sn HEAD',
@@ -225,6 +224,16 @@ DENIED_EVERY_ROLE = [
     ('wt', 'ionice -c3 codex exec x'),
     ('wt', 'while true; do codex exec x; done'),
     ('wt', 'cat <<EOF\ncodex exec x\nEOF'),
+    # fix round, Run 4: quoted and escaped break characters, redirections, comments (v2 and amendment 1)
+    ('wt', '</dev/null codex exec x'),
+    ('wt', '2>/dev/null codex exec x'),
+    ('wt', 'eval -- codex exec x'),
+    ('wt', "echo a # it's\ncodex exec x # it's"),
+    ('wt', 'ls \\ #;codex exec x'),
+    ('wt', 'ls \\;#;codex exec x'),
+    ('wt', 'ls \\ #;scripts/handoff.sh 80 linux b.md'),
+    ('wt', 'bash -s 1-self-1 {wt} p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'),   # regression (R3)
+    ('wt', 'cd scripts && bash -s 80 linux b.md < handoff.sh'),                                      # regression (R3)
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
@@ -340,6 +349,16 @@ READ_ONLY_FILE_WRITES_DENIED = [
     ('wt', 'grep -rn "cargo check" docs/'),
     ('wt', 'function f {{ rm x; }}'),
     ('wt', 'cat <<EOF\nrm x\nEOF'),                             # a heredoc body line is a command
+]
+
+
+WRITERS_ALLOWED = [                     # implementers and gates keep ordinary commands with quotes and redirections
+    ('wt', 'grep -n "Result<()>" x'),
+    ('wt', 'grep -n "<<<<<<<" x'),
+    ('wt', 'ls >&2'),
+    ('wt', 'ls 2>&1 | head'),
+    ('wt', 'git status\ngit log --oneline -3'),       # moved from READS: read-only roles now refuse a newline
+    ('wt', 'ls >/dev/null 2>&1'),                     # moved from READS: read-only roles allow only 2>/dev/null and 2>&1
 ]
 
 
@@ -471,6 +490,39 @@ class AgentGuard(unittest.TestCase):
                 mock.patch.object(guard.os, 'lstat', side_effect=PermissionError):
             with self.assertRaises(guard.Deny):
                 guard.check('planner', {'tool_name': 'Write', 'tool_input': {'file_path': '/root/orch/her/80/plan.md'}})
+
+    # --- fix round, Run 4: the lexer for implementers and gates -----------------------------
+    def test_segments_keep_arguments_after_quoted_operators_and_redirections(self):   # first red (fix round)
+        guard = load_guard()
+        words = lambda command: [w for w, _ in guard.segments(command)]
+        self.assertIn(['git', 'log', '--output=/x'], words('git log &>/dev/null --output=/x'))
+        self.assertIn(['git', 'log', '--output=/x'], words('git log &>>/dev/null --output=/x'))
+        self.assertIn(['git', 'log', '--grep', ';', '--output=/x'], words("git log --grep ';' --output=/x"))
+        self.assertIn(['git', 'log', '--grep', ';', '--output=/x'], words('git log --grep \\; --output=/x'))
+        self.assertIn(['git', 'log', '--grep', ';', '--output=/x'], words('git log --grep ";" --output=/x'))
+        self.assertIn(['rm', 'victim'], words('</dev/null rm victim'))
+        self.assertIn(['rm', 'victim'], words('eval -- rm victim'))
+        self.assertIn(['/root/her/scripts/codex-task.sh'],
+                      words('bash -s x {wt} p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'))   # regression (R3)
+        self.assertIn(['handoff.sh'], words('bash -s 80 linux b.md <<< handoff.sh'))                    # regression (R3)
+        self.assertIn(['rm', 'x'], words("echo a # it's\nrm x # it's"))                                 # comments
+        self.assertIn(['codex', 'exec', 'x'], words('ls \\ #;codex exec x'))                            # amendment 1
+
+    def test_segments_never_raise_inside_quoted_patterns(self):                                         # regression
+        guard = load_guard()
+        for command in ('grep -rn "Result<()>" her/src', 'grep -n "Result<(), Error>" x', 'grep -n "Vec<u8>)" x',
+                        'grep -n "Vec<u8>;" x', 'grep -n "<<<<<<<" x', 'grep -n ">>>>>>>" x',
+                        'grep -n "Arc<Mutex<Vec<u8>>>" x'):
+            guard.segments(command)
+        with self.assertRaises(ValueError):
+            guard.segments('ls >; x')                                                                   # depth 0 still refuses
+
+    def test_an_unreadable_nested_string_counts_every_word(self):                                       # S6
+        guard = load_guard()
+        self.assertIn(['codex'], [w for w, _ in guard.segments('bash -c "x \'y codex"')])
+
+    def test_writers_keep_ordinary_commands(self):
+        self.expect(WRITERS_ALLOWED, ('implementer', 'gate'), True)
 
     def test_reviewer_cannot_download_and_gate_can(self):
         self.expect([DENIED_REVIEWER[3]], ('reviewer',), False)

@@ -67,11 +67,17 @@ PS_HOST_OPTIONS = {'-noprofile', '-noninteractive', '-nologo', '-executionpolicy
 CODEX_PS_PARAMS = {'-name', '-workdir', '-promptfile', '-model', '-effort', '-sandbox', '-timeoutminutes'}
 WRAPPERS = {'bash', 'sh', 'env', 'timeout', 'nice', 'nohup', 'exec', 'command', 'xargs', 'sudo', 'time', 'stdbuf',
             'npx', 'npm', 'pnpm', 'yarn', 'bunx', 'node', 'pwsh', 'powershell', 'cmd', 'busybox',
-            'setsid', 'ionice', 'taskset', 'flock', 'strace', 'script', 'doas', 'su', 'runuser', 'winpty', 'start', 'call'}
+            'setsid', 'ionice', 'taskset', 'flock', 'strace', 'script', 'doas', 'su', 'runuser', 'winpty', 'start', 'call',
+            'eval', 'builtin', 'coproc', 'source', '.'}
 FIND_EXEC = {'-exec', '-execdir', '-ok', '-okdir'}
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=.*', re.S)
 SEGMENT_BREAKS = OPERATOR_CHARS + '\n'
-KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'eval', 'builtin', 'coproc', 'function'}
+KEYWORDS = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'function'}
+HIDDEN = {c: chr(0xE000 + k) for k, c in enumerate(SEGMENT_BREAKS)}
+SHOWN = {v: k for k, v in HIDDEN.items()}
+REDIRECT = re.compile(r'&>>?|>>|>&|>\||>|<<<|<<|<&|<>|<')
+REDIRECT_AFTER_BREAK = re.compile(r'([;|&()`\n]+?)(&>>?|>>|>&|>\||>|<<<|<<|<&|<>|<)')
+STDIN_REDIRECTS = ('<', '<<<', '<>')
 
 
 class Deny(Exception):
@@ -103,6 +109,48 @@ def is_break(word):
     return bool(word) and not word.strip(SEGMENT_BREAKS)
 
 
+def protect(text):
+    """Prepare a command for segments(): hide quoted or escaped break characters, and drop comments.
+
+    shlex drops quotes and backslashes, after which a quoted ';' or an escaped '\\;' would look like an operator and
+    cut the arguments after it out of their command's segment. shlex also knows no comments, so an apostrophe in
+    `# it's` would open a quote that swallows the next line. restore() turns the hidden characters back.
+    A '#' starts a comment only at the start of a word, tracked from what was emitted, not from the raw text.
+    """
+    out, i, quote, at_word_start = [], 0, None, True
+    while i < len(text):
+        c = text[i]
+        if quote is None and c == '#' and at_word_start:
+            end = text.find('\n', i)
+            i = len(text) if end < 0 else end          # the newline stays: it still ends the command
+            continue
+        if quote is None and c == '\\' and i + 1 < len(text):
+            following = text[i + 1]
+            out.append(HIDDEN[following] if following in HIDDEN else c + following)
+            at_word_start = False
+            i += 2
+            continue
+        if quote == '"' and c == '\\' and i + 1 < len(text) and text[i + 1] in '"\\':
+            out.append(c + text[i + 1])
+            at_word_start = False
+            i += 2
+            continue
+        if quote is None and c in '\'"':
+            quote = c
+        elif quote is not None and c == quote:
+            quote = None
+        elif quote is not None and c in HIDDEN:
+            c = HIDDEN[c]
+        at_word_start = quote is None and (c in ' \t\n' or c in OPERATOR_CHARS)
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def restore(word):
+    return ''.join(SHOWN.get(c, c) for c in word)
+
+
 def flatten(text, depth=0):
     """Every word of the command, dequoted, with nested command strings (bash -c "...") split too."""
     try:
@@ -120,56 +168,80 @@ def flatten(text, depth=0):
 
 
 def segments(text, depth=0):
-    """Every command segment as (words from a command position on, plain).
+    """Every command segment as (words from a command position on, plain), for the implementer and gate denies.
 
     A command position is:
-    - the start of the text;
-    - the word after each operator or unquoted newline;
-    - the word after leading VAR=value assignments and after the shell keywords in KEYWORDS
-      (if then else elif do while until ! { eval builtin coproc function);
-    - a standalone `{` after other words (`function f { ...; }`);
-    - the word after find -exec/-execdir/-ok/-okdir;
-    - every word after a wrapper (bash, env, timeout, xargs, setsid, ...) that is itself at a command position.
-    Nested command strings (bash -c "...", eval "...", a quoted pattern) are split too.
-    `plain` is False for a segment reached through an assignment, a wrapper, find -exec or a nested string.
-    Over-counting a word as a command fails closed.
+    - the start of the text, and the word after each operator or unquoted newline;
+    - the word after leading VAR=value assignments and after the keywords in KEYWORDS;
+    - the word after a redirection's operand (`</dev/null rm x`);
+    - the word after `{`, and after find -exec/-execdir/-ok/-okdir;
+    - every word after a wrapper (bash, env, eval, source, ., timeout, xargs, ...) that is itself at a command position.
+    The operand of `<`, `<<<` or `<>` is a one-word segment too, because a shell can run it from stdin (`bash -s < x.sh`).
+    Quoted or escaped operator characters stay inside their word, and comments are dropped. Nested strings
+    (bash -c "...", a quoted pattern) are split too; one that cannot be lexed counts every word as a command.
+    `plain` is False for a segment reached through an assignment, a wrapper, find -exec, `{` or a nested string.
+    Over-counting a word as a command fails closed. An operator this lexer cannot read raises ValueError, at depth 0 only.
     """
     try:
-        found = split_commands(text)
+        tokens = [(token, True) if is_break(token) else (restore(token), False)
+                  for token in split_commands(protect(text))]
     except ValueError:
         if depth == 0:
             raise
-        found = text.split()
+        return [([word], False) for word in text.split()]
     out, raw, current, assigned = [], [], [], False
-    for word in found:
-        if is_break(word):
-            if current:
-                raw.append((current, assigned))
-            current, assigned = [], False
-            continue
-        if word == '{' and current:
+
+    def close():
+        nonlocal current, assigned
+        if current:
             raw.append((current, assigned))
-            current, assigned = [], False
-            continue
+        current, assigned = [], False
+
+    def nested(word):
         if depth < 3 and word != text and re.search(r'[\s();<>|&`]', word):
             out.extend((words, False) for words, _ in segments(word, depth + 1))
+
+    i = 0
+    while i < len(tokens):
+        word, operator = tokens[i]
+        i += 1
+        if operator:
+            if not REDIRECT.fullmatch(word):
+                joined = REDIRECT_AFTER_BREAK.fullmatch(word)
+                if joined:                               # `ls;>x`: a break, then a redirection
+                    close()
+                    word = joined.group(2)
+            if REDIRECT.fullmatch(word):
+                if current and current[-1].isdigit():
+                    current.pop()                        # the descriptor of `2>file`
+                target, target_is_operator = tokens[i] if i < len(tokens) else ('', True)
+                if not target_is_operator:
+                    i += 1
+                    nested(target)
+                    if word in STDIN_REDIRECTS:
+                        out.append(([target], False))
+                continue
+            if depth == 0 and re.search('[<>]', word) and not word.endswith('('):
+                raise ValueError('unreadable operator')
+            close()
+            continue
+        nested(word)
         if not current and ASSIGNMENT.fullmatch(word):
             assigned = True
             continue
         if not current and word in KEYWORDS:
             continue
         current.append(word)
-    if current:
-        raw.append((current, assigned))
-    for seg, assigned in raw:
-        out.append((seg, not assigned))
+    close()
+    for seg, seg_assigned in raw:
+        out.append((seg, not seg_assigned))
         starts = {0}
-        for i, word in enumerate(seg):
-            if word in FIND_EXEC:
-                starts.add(i + 1)
-            if i in starts and base(word) in WRAPPERS:
-                starts.update(range(i + 1, len(seg)))
-        out.extend((seg[i:], False) for i in sorted(starts) if 0 < i < len(seg))
+        for j, word in enumerate(seg):
+            if word in FIND_EXEC or word == '{':
+                starts.add(j + 1)
+            if j in starts and base(word) in WRAPPERS:
+                starts.update(range(j + 1, len(seg)))
+        out.extend((seg[j:], False) for j in sorted(starts) if 0 < j < len(seg))
     return out
 
 
@@ -388,7 +460,10 @@ def check_bash(role, command, hook_cwd):
     except ValueError:
         raise Deny('cannot parse this command; write it as one plain command.')
     text = command + '\n' + ' '.join(flat)
-    segs = segments(command)
+    try:
+        segs = segments(command)
+    except ValueError:
+        raise Deny('cannot parse this command; write it as one plain command.')
     commands = {base(words[0]) for words, _ in segs}
     names = {base(word) for word in flat}
     wordset = set(flat)
