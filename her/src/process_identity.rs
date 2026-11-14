@@ -115,7 +115,22 @@ pub fn matches(
         let Some(script) = script else {
             return Ok(Match::Matches);
         };
-        let Some(entry) = script_operand(&process.args)? else {
+        let entry = match script_operand(&process.args) {
+            Ok(entry) => entry,
+            // A switch this module cannot classify leaves the entry unknown. A process of the
+            // same image that never names the configured script cannot be that dependency.
+            Err(reason) => {
+                let expected = resolve_script(process, script)?;
+                return if names_script(process, &expected) {
+                    Err(reason)
+                } else {
+                    Ok(Match::Mismatch(
+                        "process does not name the configured script".into(),
+                    ))
+                };
+            }
+        };
+        let Some(entry) = entry else {
             return Ok(Match::Mismatch("process has no script entry".into()));
         };
         let name = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
@@ -131,6 +146,21 @@ pub fn matches(
         }
     }
     compare(process, program, script).unwrap_or_else(Match::Unknown)
+}
+
+/// Whether any argument (or the value of an `--option=value`) resolves to `expected`.
+fn names_script(process: &Process, expected: &std::path::Path) -> bool {
+    process.args.iter().skip(1).any(|arg| {
+        let candidate = match arg.strip_prefix('-') {
+            Some(option) => match option.split_once('=') {
+                Some((_, value)) => value,
+                None => return false,
+            },
+            None => arg.as_str(),
+        };
+        resolve_script(process, std::path::Path::new(candidate))
+            .is_ok_and(|actual| same_exe(&actual.to_string_lossy(), &expected.to_string_lossy()))
+    })
 }
 
 fn canonical(path: &std::path::Path) -> Result<std::path::PathBuf, String> {

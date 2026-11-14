@@ -1679,6 +1679,7 @@ fn checkpoint(
     }
     deliver_outage_notice(context, cfg, states, name)?;
     if let Some((key, reason)) = notice {
+        log_refusal(context, &key, &reason);
         alert(context, cfg, &key, &reason);
     }
     Ok(())
@@ -1879,6 +1880,17 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
         ) {
             crate::safe_eprintln!("[dependencies] {error}");
         }
+    }
+}
+
+/// A refused start never spawns the dependency, so its own log would otherwise not exist.
+fn log_refusal(context: &RuntimeContext, name: &str, reason: &str) {
+    use std::io::Write;
+    let line = format!("[{}] refused: {reason}\n", crate::parity_clock::now_ms());
+    if let Err(error) = dependency_log(context, name, "err")
+        .and_then(|mut file| file.write_all(line.as_bytes()).map_err(|e| e.to_string()))
+    {
+        crate::safe_eprintln!("[dependencies] refusal of {name} could not be logged: {error}");
     }
 }
 

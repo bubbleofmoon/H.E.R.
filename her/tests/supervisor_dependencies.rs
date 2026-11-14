@@ -1741,6 +1741,34 @@ fn an_unrelated_process_of_the_same_node_image_does_not_block_dsh_startup() {
 }
 
 #[test]
+fn a_refused_dsh_start_leaves_a_log_line_and_an_owner_alert() {
+    let mut fixture = Fixture::new();
+    let node = spaced_node(&fixture);
+    legacy_node_config(&mut fixture, &node);
+    fixture.config["tasks"]["start-all"]["dshScript"] = json!(fixture.root.join("dsh/missing.mjs"));
+    std::fs::write(
+        fixture.root.join("config/config.json"),
+        fixture.config.to_string(),
+    )
+    .unwrap();
+    fixture.start();
+    fixture.wait(|| fixture.states()["dsh"]["state"] == "refused");
+    let reason = "script or working directory is unavailable";
+    let log = fixture.root.join("data/logs/dependency-dsh.err.log");
+    fixture.wait(|| {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(reason)
+    });
+    fixture.wait(|| {
+        std::fs::read_to_string(fixture.root.join("snow/alerts"))
+            .unwrap_or_default()
+            .contains(reason)
+    });
+    assert!(!fixture.root.join("dsh/starts").exists());
+}
+
+#[test]
 fn dependencies_started_by_the_supervisor_survive_cli_stop_and_are_readopted() {
     let mut fixture = Fixture::new();
     fixture.start();
