@@ -61,6 +61,8 @@ $script:RehearsalOldRoot = ''
 $script:RelayKey = ''
 $script:SelfChecks = 0
 $script:Blockers = [Collections.Generic.List[string]]::new()
+$script:SecretTexts = [Collections.Generic.List[string]]::new()
+$script:ProfileRoots = $null
 
 if (-not ('HerMove67Native' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -136,11 +138,29 @@ function Write-Log([string]$Text) {
   if ($script:Log) { [IO.File]::AppendAllText($script:Log, ([DateTime]::UtcNow.ToString('o') + ' ' + $Text + "`r`n"), [Text.UTF8Encoding]::new($false)) }
 }
 # Account-home paths never reach the console or inventory.json: the profile root (the -ProfileFolder in use and
-# USERPROFILE) becomes <profile>, in backslash, forward-slash and JSON-escaped spellings. state.json keeps real paths
-# (the rollback reads them); like every evidence file it stays private and goes to the vault.
+# USERPROFILE, long and short spellings) becomes <profile>, in backslash, forward-slash and JSON-escaped spellings.
+# inventory.json is hidden string by string before serialization (Edit-ProjectionStrings), so JSON escapes of
+# characters such as an apostrophe cannot hide a path. state.json keeps real paths (the rollback reads them); like
+# every evidence file it stays private and goes to the vault.
+function Get-ProfileRoots {
+  # The profile roots in their long and short (8.3) spellings, longest first; computed once per run.
+  if ($null -ne $script:ProfileRoots) { return ,$script:ProfileRoots }
+  $found = [Collections.Generic.List[string]]::new()
+  foreach ($path in @($script:ProfilePath, $env:USERPROFILE)) {
+    if (-not $path) { continue }
+    $long = ([string]$path).TrimEnd('\')
+    if ($long.Length -gt 3 -and -not $found.Contains($long)) { $found.Add($long) }
+    try {
+      $short = ([string](New-Object -ComObject Scripting.FileSystemObject).GetFolder($long).ShortPath).TrimEnd('\')
+      if ($short.Length -gt 3 -and -not $found.Contains($short)) { $found.Add($short) }
+    } catch { Write-Log 'no short spelling of a profile root' }
+  }
+  $script:ProfileRoots = @($found | Sort-Object -Property Length -Descending)
+  return ,$script:ProfileRoots
+}
 function Hide-ProfilePath([string]$Text) {
   $result = $Text
-  $roots = @(@($script:ProfilePath, $env:USERPROFILE) | Where-Object { $_ } | ForEach-Object { ([string]$_).TrimEnd('\') } | Where-Object { $_.Length -gt 3 } | Select-Object -Unique | Sort-Object -Property Length -Descending)
+  $roots = Get-ProfileRoots
   foreach ($root in $roots) {
     foreach ($spelling in @($root.Replace('\', '\\'), $root, $root.Replace('\', '/'))) {
       $result = [regex]::Replace($result, [regex]::Escape($spelling), '<profile>', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -149,6 +169,29 @@ function Hide-ProfilePath([string]$Text) {
   return $result
 }
 function Write-Step([string]$Text) { $shown = Hide-ProfilePath $Text; Write-Host ('[67] ' + $shown); Write-Log $shown }
+# Every string in an evidence projection: each configured relay key becomes [redacted] and the profile root
+# becomes <profile>, before any JSON escaping.
+function Edit-ProjectionStrings($Value) {
+  if ($Value -is [string]) {
+    $text = $Value
+    foreach ($secret in $script:SecretTexts) { if ($secret) { $text = $text.Replace($secret, '[redacted]') } }
+    return (Hide-ProfilePath $text)
+  }
+  if ($Value -is [Management.Automation.PSCustomObject]) {
+    foreach ($property in @($Value.PSObject.Properties)) { $property.Value = Edit-ProjectionStrings $property.Value }
+    return $Value
+  }
+  if ($Value -is [Array]) {
+    for ($index = 0; $index -lt $Value.Count; $index++) { $Value[$index] = Edit-ProjectionStrings $Value[$index] }
+    return ,$Value
+  }
+  return $Value
+}
+function Get-TextSha([string]$Text) {
+  $algorithm = [Security.Cryptography.SHA256]::Create()
+  try { return ([BitConverter]::ToString($algorithm.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($Text)))).Replace('-', '').ToLowerInvariant() }
+  finally { $algorithm.Dispose() }
+}
 function Stop-Refused([string]$Reason) { throw ('REFUSED: ' + $Reason) }
 function Stop-Failed([string]$Reason) { throw ('FAILED: ' + $Reason) }
 function Get-SafeMessage([string]$Text) {
@@ -167,6 +210,7 @@ function Add-Failure($ErrorRecord, [string]$Section) {
   Write-Step ('BLOCKED: ' + $Section + ': ' + $safe)
 }
 function Get-PhaseIndex([string]$Phase) { return [Array]::IndexOf($Phases, $Phase) }
+function Get-RunKind { if ($Rehearsal) { return '-Rehearsal' }; return '-Production' }
 function Get-Normal([string]$Path) {
   if ($Path -notmatch '^[A-Za-z]:[\\/]') { Stop-Refused 'a path is not an absolute local drive path' }
   $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -417,6 +461,8 @@ function Read-RelayConfig([string[]]$Lines) {
     }
     if ($line -match '(^|[\s"''=])[A-Za-z]:[\\/]') { $absolute++ }
   }
+  # Every configured key is a secret for the evidence, also when this configuration is refused below.
+  foreach ($key in $keys) { if ($key -and -not $script:SecretTexts.Contains($key)) { $script:SecretTexts.Add($key) } }
   if ($ports.Count -ne 1) { Stop-Refused 'the relay configuration needs exactly one top-level port line' }
   if ($auth.Count -gt 1) { Stop-Refused 'the relay configuration has more than one auth-dir line' }
   if ($keys.Count -lt 1) { Stop-Refused 'the relay configuration lists no api-keys entry' }
@@ -761,6 +807,16 @@ function Remove-TreeSafely([string]$Path) {
   }
   if ($item -is [IO.DirectoryInfo]) { Remove-LinksUnder $Path; Remove-Item -LiteralPath $Path -Recurse -Force } else { Remove-Item -LiteralPath $Path -Force }
 }
+# Before any ACL change on a folder: it must not be a junction or link itself, and every link below it must lead to a
+# place inside it, so neither icacls nor inherited-ACE propagation can reach a folder outside.
+function Assert-LinksInside([string]$Path, [string]$What) {
+  $base = Get-Normal $Path
+  foreach ($link in (Get-ReparsePoints $base)) {
+    $target = ''
+    if ($link -ine $base) { $target = Get-LinkTarget $link }
+    if (-not $target -or -not (Test-Within $target $base)) { Stop-Failed ($What + ' is or holds a junction or link that leads outside it, so its access was not changed') }
+  }
+}
 function Get-RobocopyExclusions([string]$From, [string[]]$Exclude) {
   $directories = @(); $files = @()
   foreach ($relative in @($Exclude)) {
@@ -827,6 +883,7 @@ function Copy-Verified([string]$From, [string]$To, [string[]]$Exclude, [string]$
 # staging, and in a rollback the attempt folder and any new-layout folder left in the root, which hold credential
 # copies (DSH home, relay login and key, harness key) and must stay closed once the root's own access is restored.
 function Protect-Folder([string]$Path, [string]$What = 'the install root') {
+  Assert-LinksInside $Path $What
   $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   $result = Invoke-Native (Join-Path $env:WINDIR 'System32\icacls.exe') @($Path, '/inheritance:r', '/grant:r', ('*' + $sid + ':(OI)(CI)F'), '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F') 'protect'
   if ($result.Code -ne 0) { Stop-Failed ($What + ' could not be restricted') }
@@ -1093,6 +1150,10 @@ function Initialize-Run {
   $base = Get-Normal $EvidenceRoot
   Assert-RehearsalPath $base
   Assert-NoLinkAbove $base 'the evidence folder'
+  if ($Production) {
+    # The console shows the profile root as <profile>; a state file under it would print an unusable rollback command.
+    foreach ($profileRoot in (Get-ProfileRoots)) { if (Test-Within $base $profileRoot) { Stop-Refused 'the evidence folder must not be under the account profile' } }
+  }
   if (Test-Within $base $script:Root) { Stop-Refused 'the evidence folder must be outside the install root' }
   [void][IO.Directory]::CreateDirectory($base)
   try { $script:LockStream = [IO.File]::Open((Join-Path $base 'move.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
@@ -1164,6 +1225,7 @@ function Get-MovePlan {
     $startAll = Get-Prop $tasks 'start-all'
     if ((Get-Prop (Get-Prop $tasks 'upstream-check') 'enabled') -eq $true) { Add-Blocker 'tasks.upstream-check is enabled; it needs the old release folder' }
     $plan.NodePath = Get-ConfigPath (Get-Prop $tasks 'nodePath') 'tasks.nodePath'
+    Assert-NoLinkAbove $plan.NodePath 'the configured Node'
     $plan.OldRelease = Get-ConfigPath (Get-Prop $tasks 'installRoot') 'tasks.installRoot'
     $plan.SnowLuma = Get-ConfigPath (Get-Prop $startAll 'snowLumaDirectory') 'tasks.start-all.snowLumaDirectory'
     $plan.DshScript = Get-ConfigPath (Get-Prop $startAll 'dshScript') 'tasks.start-all.dshScript'
@@ -1299,9 +1361,9 @@ function Get-MovePlan {
     $plan.RelayPin = Join-Path $script:Root ('deps\relay\' + $plan.RelayVersion)
     $relayExe = Get-Normal $relay.Exe
     $plan.RelayProgram = $plan.RelayPin + $relayExe.Substring($plan.OldRelayFolder.Length)
-    # Assigned directly: Convert-RelayArguments returns ,$result, and @() around it would nest the array.
+    # Kept local until the configuration is read and the key check is done: a refusal on the way must not leave raw
+    # arguments (possibly carrying a key) in the plan. Assigned directly: Convert-RelayArguments returns ,$result.
     $relayArguments = Convert-RelayArguments $tokens $plan.OldRelayFolder $plan.RelayPin
-    $plan.RelayArguments = @($relayArguments)
     $relayConfigPath = Find-RelayConfig $tokens $plan.OldRelayFolder
     if (-not (Test-Within $relayConfigPath $plan.OldRelayFolder) -or -not (Test-Path -LiteralPath $relayConfigPath -PathType Leaf)) { Stop-Refused 'the relay configuration file is not inside the old relay folder' }
     $plan.RelayConfigRelative = $relayConfigPath.Substring($plan.OldRelayFolder.Length + 1)
@@ -1311,12 +1373,15 @@ function Get-MovePlan {
     $script:RelayKey = $relayConfig.Key
     if ((Get-ListenerPid $plan.RelayPort) -ne $relay.Pid) { Add-Blocker 'the relay port is not served by the relay process' }
     if (@($plan.OneBotPort, $plan.OneBotWsPort, $plan.DshPort, $plan.ConsolePort) -contains $plan.RelayPort) { Add-Blocker 'the relay port is not distinct from the OneBot, DSH and console ports' }
-    # A command line that carries the client key blocks; the key never stays in the plan, so inventory.json cannot hold it.
-    $carriesKey = @($plan.RelayArguments | Where-Object { ([string]$_).Contains($script:RelayKey) }).Count -gt 0
-    if ($carriesKey) {
-      $plan.RelayArguments = @($plan.RelayArguments | ForEach-Object { if (([string]$_).Contains($script:RelayKey)) { '[redacted: carries the client key]' } else { [string]$_ } })
-      Add-Blocker 'the relay command line carries the client key'
-    }
+    # A command line that carries any configured key blocks; only redacted arguments reach the plan.
+    $redacted = @(@($relayArguments) | ForEach-Object {
+      $argument = [string]$_
+      $hit = @($script:SecretTexts | Where-Object { $argument.Contains($_) }).Count -gt 0
+      if ($hit) { '[redacted: carries a relay key]' } else { $argument }
+    })
+    $carriesKey = @($redacted | Where-Object { $_ -ceq '[redacted: carries a relay key]' }).Count -gt 0
+    $plan.RelayArguments = $redacted
+    if ($carriesKey) { Add-Blocker 'the relay command line carries the client key' }
     if ($DigestModel) {
       # The digest key is the relay client key (Q5); an existing different key needs a decision first.
       $harnessKey = Join-Path $plan.OldRuntime 'config\harness-api-key'
@@ -1425,6 +1490,8 @@ function Get-MovePlan {
     $callerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $explicit = @($rootAcl.Access | Where-Object { -not $_.IsInherited -and @($callerSid, 'S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value })
     if ($explicit.Count -gt 0) { Add-Blocker 'the install root has an explicit access entry for another account; the restriction would keep it' }
+    # The restriction and a rollback's restore propagate into the root: a link in it leading outside blocks now.
+    Assert-LinksInside $script:Root 'the install root'
   } catch { Add-Failure $_ 'install root access' }
 
   try {
@@ -1658,7 +1725,7 @@ function Start-NewProduction($plan) {
 function Write-Done {
   Write-Step 'MOVE DONE. Production runs from the install root; the originals are untouched and stay until the owner approves their deletion.'
   Write-Step 'Owner checks now: (1) QQ login: the console shows QQ logged in (the snowluma health part above passed); (2) memory: the console Memory page lists the memories you expect; (3) the next real conversation turn completes (her-cli report).'
-  Write-Step ('To roll back later: -Mode Rollback -Production -StateFile ' + $script:StatePath + ' -AfterDone (what the new runtime writes until then stays in the moved-aside folder).')
+  Write-Step ('To roll back later: -Mode Rollback ' + (Get-RunKind) + ' -StateFile ' + $script:StatePath + ' -AfterDone (what the new runtime writes until then stays in the moved-aside folder).')
 }
 
 # ---------- rollback ----------
@@ -1711,8 +1778,17 @@ function Test-OldProductionUp($plan) {
   foreach ($port in (Get-ProductionPortList $plan)) { if ((Get-ListenerPid $port) -eq 0) { return $false } }
   return $true
 }
+# Returns $true when it had to start something, $false when the old production was already up. A transient view (an
+# owner between states, one failed status call) gets 30 seconds to settle before anything is started.
 function Start-OldProduction($plan) {
-  if (Test-OldProductionUp $plan) { return }
+  $settle = [DateTime]::UtcNow.AddSeconds(30)
+  while ($true) {
+    $up = $false
+    try { $up = [bool](Test-OldProductionUp $plan) } catch { $up = $false }
+    if ($up) { return $false }
+    if ([DateTime]::UtcNow -ge $settle) { break }
+    Start-Sleep -Seconds 3
+  }
   [void](Invoke-Old @('lifecycle', 'set', 'running', '--runtime-root', $plan.OldRuntime, '--by', 'owner-67', '--reason', 'rollback of the move') 'rollback-old-running')
   # The relay and the supervisor are judged apart: a rerun may find the supervisor back but the relay still down.
   $tasks = @()
@@ -1724,10 +1800,13 @@ function Start-OldProduction($plan) {
     Start-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction Stop
   }
   Wait-Until { Test-OldProductionUp $plan } 300 'the old production did not come back within 5 minutes'
+  return $true
 }
 function Restore-RootAcl($plan) {
   $saved = [string]$plan.RootAccessSddl
   if (-not $saved) { return }
+  # The restored, inheriting DACL propagates into the root: no link in it may lead outside.
+  Assert-LinksInside $script:Root 'the install root'
   $sections = [Security.AccessControl.AccessControlSections]::Access
   $acl = Get-Acl -LiteralPath $script:Root
   if ($acl.GetSecurityDescriptorSddlForm($sections) -eq $saved) { return }
@@ -1738,7 +1817,7 @@ function Restore-RootAcl($plan) {
   if ($restored.GetSecurityDescriptorSddlForm($sections) -ne $saved) { Stop-Failed 'the install root access could not be restored' }
   Write-Step 'the install root access is restored to what it was before the move'
 }
-function Invoke-Rollback([string]$Why) {
+function Invoke-Rollback([string]$Why, [switch]$NothingStopped) {
   $plan = $script:State.Plan
   $phase = Get-PhaseIndex ([string]$script:State.Phase)
   Write-Step ('ROLLBACK started: ' + (Get-SafeMessage $Why))
@@ -1800,10 +1879,14 @@ function Invoke-Rollback([string]$Why) {
   }
   # From OldTasksDisabled on, the old production may be down even before the stop phase (a reboot while its tasks were
   # disabled): Start-OldProduction checks the real state and starts only what is not running.
-  if ($phase -ge (Get-PhaseIndex 'OldTasksDisabled')) {
+  # An in-process refusal before the stop phase (-NothingStopped) has stopped nothing, so it starts nothing either.
+  if ($phase -ge (Get-PhaseIndex 'OldTasksDisabled') -and -not ($NothingStopped -and $phase -lt (Get-PhaseIndex 'Stopping'))) {
     if ($newRunning) { $oldUp = $false }
     else {
-      try { Start-OldProduction $plan; Write-Step 'the old production runs again' }
+      try {
+        $started = [bool](@(Start-OldProduction $plan)[-1])
+        if ($started) { Write-Step 'the old production runs again' } else { Write-Step 'the old production is running' }
+      }
       catch { $oldUp = $false; $problems.Add((Get-SafeMessage $_.Exception.Message)) }
     }
   }
@@ -1817,10 +1900,13 @@ function Invoke-Rollback([string]$Why) {
       # so restoring the root's original access does not open them.
       foreach ($name in @('runtime', 'deps', 'releases')) {
         $left = Join-Path $script:Root $name
-        if (Test-Path -LiteralPath $left -PathType Container) { Protect-Folder $left ('the leftover ' + $name + ' folder') }
+        if (Test-Present $left) { Protect-Folder $left ('the leftover ' + $name + ' folder') }
       }
       Restore-RootAcl $plan
-    } catch { $problems.Add((Get-SafeMessage $_.Exception.Message)) }
+    } catch {
+      # No ACL was changed outside the root; the root keeps its restriction rather than reopening around a link.
+      $problems.Add((Get-SafeMessage $_.Exception.Message) + '; the install root stays restricted to the owner, SYSTEM and Administrators')
+    }
   }
   # An installed app launch after the move registers HERDesktop for the current/her.exe of this root; once current
   # is gone, that logon entry fails. Read only: the owner decides (a later move makes it valid again).
@@ -1835,10 +1921,10 @@ function Invoke-Rollback([string]$Why) {
   }
   foreach ($problem in $problems) { Write-Step ('ROLLBACK PROBLEM: ' + $problem) }
   if ($oldUp) {
-    Write-Step ('THE OLD PRODUCTION RUNS AGAIN, but the rollback is incomplete. Fix the problem above and run -Mode Rollback -StateFile ' + $script:StatePath + ' again.')
+    Write-Step ('THE OLD PRODUCTION RUNS AGAIN, but the rollback is incomplete. Fix the problem above and run -Mode Rollback ' + (Get-RunKind) + ' -StateFile ' + $script:StatePath + ' again.')
     return 'partial'
   }
-  Write-Step ('PRODUCTION MAY BE DOWN. Fix the problem above, then run -Mode Rollback -StateFile ' + $script:StatePath + ' again. By hand the old production starts after its desired state is running: Start-ScheduledTask -TaskName ' + $plan.OldRelayTask + ' and Start-ScheduledTask -TaskName ' + $plan.OldSupervisorTask + '.')
+  Write-Step ('PRODUCTION MAY BE DOWN. Fix the problem above, then run -Mode Rollback ' + (Get-RunKind) + ' -StateFile ' + $script:StatePath + ' again. By hand the old production starts after its desired state is running: Start-ScheduledTask -TaskName ' + $plan.OldRelayTask + ' and Start-ScheduledTask -TaskName ' + $plan.OldSupervisorTask + '.')
   return 'down'
 }
 
@@ -1847,9 +1933,15 @@ function Invoke-Inventory {
   $plan = Get-MovePlan
   $copy = [ordered]@{}
   foreach ($key in @($plan.Keys)) { if ($key -ne 'OldTasks') { $copy[$key] = $plan[$key] } }
-  $copy['OldTasks'] = @($plan.OldTasks | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Shape = $_.Shape; Enabled = $_.Enabled; State = $_.State } })
+  # Task actions are command lines and stay out of the evidence: a hash of each saved shape identifies it.
+  $copy['OldTasks'] = @($plan.OldTasks | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ Name = $_.Name; ShapeSha256 = (Get-TextSha ([string]$_.Shape)); Enabled = $_.Enabled; State = $_.State } })
   $copy['Blockers'] = @($script:Blockers)
-  Write-Utf8 (Join-Path $script:Evidence 'inventory.json') (Hide-ProfilePath ($copy | ConvertTo-Json -Depth 100))
+  # Round-tripped to plain JSON values, then every string is cleaned (keys, profile root) before it is serialized.
+  $projection = Edit-ProjectionStrings (($copy | ConvertTo-Json -Depth 100) | ConvertFrom-Json)
+  # Windows PowerShell 5.1 escapes < and > as unicode escapes; the placeholder is restored to its readable form.
+  $escaped = '\' + 'u003cprofile' + '\' + 'u003e'
+  $json = ($projection | ConvertTo-Json -Depth 100).Replace($escaped, '<profile>')
+  Write-Utf8 (Join-Path $script:Evidence 'inventory.json') $json
   Write-Step ('INVENTORY: ' + $script:Blockers.Count + ' blockers; details in ' + (Join-Path $script:Evidence 'inventory.json'))
   if ($script:Blockers.Count -gt 0) { return 1 }
   return 0
@@ -1910,7 +2002,7 @@ function Invoke-Move {
     $why = [string]$_.Exception.Message
     if ($why -eq 'REHEARSAL-ABORT') { return 4 }
     $unchanged = (Get-PhaseIndex ([string]$script:State.Phase)) -le (Get-PhaseIndex 'OldTasksDisabled')
-    $result = [string](@(Invoke-Rollback $why)[-1])
+    $result = [string](@(Invoke-Rollback $why -NothingStopped:$unchanged)[-1])
     if ($result -ne 'done') { return 3 }
     if ($unchanged) { return 1 }
     return 2
@@ -1929,6 +2021,10 @@ function Invoke-RollbackMode {
   $script:OldCli = [string]$loaded.Plan.OldCli
   $script:OldRuntimePath = [string]$loaded.Plan.OldRuntime
   foreach ($path in @($script:OldExe, $script:OldCli, $script:OldRuntimePath, [string]$loaded.Plan.SourceCli)) { Assert-RehearsalPath $path }
+  # The rollback runs or writes these paths from the state file: the same no-link-above rule as before the move.
+  foreach ($path in @($script:OldExe, $script:OldCli, $script:OldRuntimePath, [string]$loaded.Plan.SourceCli, [string]$loaded.Plan.NodePath, [string]$loaded.Plan.BackupDestination)) {
+    if ($path) { Assert-NoLinkAbove $path 'a path from the state file' }
+  }
   if ($Rehearsal) {
     foreach ($name in @([string]$loaded.Plan.OldSupervisorTask, [string]$loaded.Plan.OldRelayTask)) {
       if ($name -cnotmatch '^HER-Test-67-[0-9a-f]{32}-(supervisor|relay)$') { Stop-Refused 'a rehearsal uses only HER-Test-67 fixture tasks' }

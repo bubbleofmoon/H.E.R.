@@ -94,7 +94,8 @@ $unused = Join-Path $F 'unused-root'
 $oldRelease = Join-Path $F 'qqbot-rust\releases\fixture-old'
 $oldCli = Join-Path $oldRelease 'her-cli.exe'
 $oldRuntime = Join-Path $F 'qqbot-rust\runtimes\production'
-$profileFolder = Join-Path $F 'profile'
+# An apostrophe in the profile name: ConvertTo-Json escapes it, and inventory.json must still hide the path.
+$profileFolder = Join-Path $F 'profile''x'
 $dshHome = Join-Path $profileFolder '.dsh'
 $npx = Join-Path $F 'npm-cache\_npx\fixtureabc'
 $dshPackage = Join-Path $npx 'node_modules\@deepseek-ai\dsh'
@@ -282,6 +283,11 @@ function Assert-Protected([string]$Path, [string]$What) {
   $foreign = @($acl.Access | Where-Object { @($sid, 'S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value })
   Assert-True ($foreign.Count -eq 0) ($What + ' grants access to another account')
 }
+function Assert-NoForeignAccess([string]$Path, [string]$What) {
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $foreign = @((Get-Acl -LiteralPath $Path).Access | Where-Object { @($sid, 'S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value })
+  Assert-True ($foreign.Count -eq 0) ($What + ' grants access to another account')
+}
 # Stops one fixture process by its verified identity (a reboot simulation); never a process outside the fixture.
 function Stop-FixtureProcess([int]$ProcessId) {
   $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
@@ -317,6 +323,11 @@ function Assert-OldRunning([string]$Scenario, [switch]$Restricted) {
     Assert-True ($attemptLinks.Count -eq 0) ($Scenario + ': a moved-aside attempt folder still holds a junction or link')
     # It keeps copied credentials, and the root's original (here wider) access is back: it must be closed on its own.
     Assert-Protected $attempt.FullName ($Scenario + ': a moved-aside attempt folder')
+    # And so must the credential copies inside it (their ACEs may be their own or inherited from the attempt folder).
+    foreach ($relative in @('runtime\user\dsh\.credentials.yaml', 'runtime\config\harness-api-key', 'deps\relay\0.0.1\her-relay-client.key', 'deps\relay\0.0.1\auth\antigravity-fixture.json')) {
+      $file = Join-Path $attempt.FullName $relative
+      if (Test-Path -LiteralPath $file -PathType Leaf) { Assert-NoForeignAccess $file ($Scenario + ': a credential copy in a moved-aside attempt folder') }
+    }
   }
   Assert-RootAcl $Scenario -Restricted:$Restricted
   Assert-Originals $Scenario
@@ -640,8 +651,14 @@ try {
   Assert-True ($run.Text.IndexOf($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: the console shows an account-home path'
   $inventoryText = [IO.File]::ReadAllText((Join-Path $inventoryFolder.FullName 'inventory.json'))
   foreach ($private in @($profileFolder, $env:USERPROFILE)) {
-    Assert-True ($inventoryText.IndexOf($private.Replace('\', '\\'), [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds an account-home path'
+    # Both the plain JSON spelling and the one ConvertTo-Json writes (the apostrophe as a unicode escape).
+    $jsonSpelling = ($private | ConvertTo-Json).Trim('"')
+    foreach ($spelling in @($private.Replace('\', '\\'), $jsonSpelling)) {
+      Assert-True ($inventoryText.IndexOf($spelling, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds an account-home path'
+    }
   }
+  # Task actions are command lines: the relay task's launcher must not appear.
+  Assert-True ($inventoryText.IndexOf('old-relay.vbs', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds a task action'
   Assert-True ($inventoryText.IndexOf('<profile>', [StringComparison]::Ordinal) -ge 0) 'S1b: inventory.json has no profile placeholder'
   Assert-OldUntouched 'S1b'
 
@@ -755,6 +772,7 @@ try {
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalFault', 'DisturbAfterDisable')) 'S1o'
   Add-LedgerRecord ([ordered]@{ k = 'ended'; turn = 'turn-fault-67'; t = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); outcome = 'cancelled'; reason = 'fixture' })
   Assert-Run $run 1 'conversation turns started during the checks' 'S1o'
+  Assert-True ($run.Text.IndexOf('the old production runs again', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1o: a refusal that stopped nothing claims it restarted the old production'
   Assert-OldUntouched 'S1o'
 
   Step 'S1p the owner types a wrong word'
@@ -764,7 +782,9 @@ try {
 
   Step 'S1q link inside a linked bundle'
   $nested = Join-Path $bridgeBundles 'qq-mode-console\nested'
-  [void](New-Item -ItemType Junction -Path $nested -Target (Join-Path $F 'npm-cache'))
+  # Its target stays inside the install root, so only the bundle rule refuses (a link leading outside the root is
+  # refused earlier by the install root access check).
+  [void](New-Item -ItemType Junction -Path $nested -Target (Join-Path $bridgeBundles 'qq-agent-presets'))
   try { $run = Invoke-MoveScript $moveArgs 'S1q' } finally { [IO.Directory]::Delete($nested) }
   Assert-Run $run 1 'a junction or link was found in dsh-bundle-qq-mode-console' 'S1q'
   Assert-OldUntouched 'S1q'
@@ -822,10 +842,22 @@ try {
   Stop-FixtureListener $relayPort
   Wait-For { $null -eq (Get-Listener $relayPort) } 'S1t: the relay stops' 30
   Wait-For { (Get-ScheduledTask -TaskName $relayTask -TaskPath '\').State -ne 'Running' } 'S1t: the relay task instance ends' 60
-  [void](Start-Process -FilePath (Join-Path $relayFolder 'cli-proxy-api.exe') -ArgumentList @(('"' + (Join-Path $relayFolder 'fake-relay.mjs') + '"'), '-config', ('"' + (Join-Path $relayFolder 'config.yaml') + '"'), '--note=fixture-relay-key-67') -WindowStyle Hidden -PassThru)
+  $second = 'fixture-second-key-67'
+  [void](Start-Process -FilePath (Join-Path $relayFolder 'cli-proxy-api.exe') -ArgumentList @(('"' + (Join-Path $relayFolder 'fake-relay.mjs') + '"'), '-config', ('"' + (Join-Path $relayFolder 'config.yaml') + '"'), '--note=fixture-relay-key-67', ('--other=' + $second)) -WindowStyle Hidden -PassThru)
   Wait-For { $null -ne (Get-Listener $relayPort) } 'S1t: the keyed relay listens' 30
-  try { $run = Invoke-MoveScript $inventoryArgs 'S1t' }
+  $relayConfigFile = Join-Path $relayFolder 'config.yaml'
+  $relayConfigBytes = [IO.File]::ReadAllBytes($relayConfigFile)
+  $relayConfigTime = (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc
+  try {
+    $run = Invoke-MoveScript $inventoryArgs 'S1t'
+    # The same command line while the configuration is refused (a second key, then another absolute path): the
+    # relay section stops before its key check, and neither key may reach inventory.json.
+    [IO.File]::AppendAllText($relayConfigFile, "  - `"fixture-second-key-67`"`nlogs-dir: C:\fixture-elsewhere`n", [Text.UTF8Encoding]::new($false))
+    $refused = Invoke-MoveScript $inventoryArgs 'S1t-refused'
+  }
   finally {
+    [IO.File]::WriteAllBytes($relayConfigFile, $relayConfigBytes)
+    (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc = $relayConfigTime
     Stop-FixtureListener $relayPort
     Wait-For { $null -eq (Get-Listener $relayPort) } 'S1t: the keyed relay stops' 30
     Start-ScheduledTask -TaskName $relayTask -TaskPath '\'
@@ -834,6 +866,10 @@ try {
   Assert-Run $run 1 'the relay command line carries the client key' 'S1t'
   $keyedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
   Assert-True ([IO.File]::ReadAllText((Join-Path $keyedFolder.FullName 'inventory.json')).IndexOf('fixture-relay-key-67', [StringComparison]::Ordinal) -lt 0) 'S1t: inventory.json holds the relay client key'
+  Assert-Run $refused 1 'names other absolute paths' 'S1t refused configuration'
+  $refusedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
+  $refusedText = [IO.File]::ReadAllText((Join-Path $refusedFolder.FullName 'inventory.json'))
+  foreach ($key in @('fixture-relay-key-67', $second)) { Assert-True ($refusedText.IndexOf($key, [StringComparison]::Ordinal) -lt 0) ('S1t: inventory.json holds a relay key after a refused configuration') }
   Assert-OldUntouched 'S1t'
 
   Step 'S2 health failure rolls back'
@@ -921,6 +957,30 @@ try {
   Assert-Run $run 0 'ROLLED BACK' 'S3d rollback'
   Assert-Run $run 0 'the old production runs again' 'S3d old production started'
   Assert-OldRunning 'S3d'
+
+  Step 'S3e a junction left in the root when the move-aside fails'
+  # After staging, current is an ordinary folder (the move-aside stops on it) and deps is a junction to a folder
+  # outside: the rollback changes no access outside the root, keeps the root restricted and exits 3.
+  $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Staged')) 'S3e'
+  Assert-Run $run 4 'REHEARSAL ABORT after Staged' 'S3e'
+  $state = Get-LatestState
+  $outsideAcl = Join-Path $F 'outside-acl'
+  [void][IO.Directory]::CreateDirectory($outsideAcl)
+  $accessSection = [Security.AccessControl.AccessControlSections]::Access
+  $outsideSddl = (Get-Acl -LiteralPath $outsideAcl).GetSecurityDescriptorSddlForm($accessSection)
+  [IO.Directory]::Delete((Join-Path $root 'current'))
+  [void][IO.Directory]::CreateDirectory((Join-Path $root 'current'))
+  [void](New-Item -ItemType Junction -Path (Join-Path $root 'deps') -Target $outsideAcl)
+  $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3e-rollback'
+  Assert-Run $run 3 'the install root stays restricted' 'S3e rollback'
+  Assert-True ((Get-Acl -LiteralPath $outsideAcl).GetSecurityDescriptorSddlForm($accessSection) -eq $outsideSddl) 'S3e: the rollback changed the access of a folder outside the install root'
+  Assert-True ((Get-Acl -LiteralPath $root).AreAccessRulesProtected) 'S3e: the install root was reopened around a junction'
+  [IO.Directory]::Delete((Join-Path $root 'deps'))
+  [IO.Directory]::Delete((Join-Path $root 'current'))
+  Remove-Item -LiteralPath $outsideAcl -Recurse -Force
+  $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3e-rollback-again'
+  Assert-Run $run 0 'ROLLED BACK' 'S3e second rollback'
+  Assert-OldUntouched 'S3e'
 
   Step 'S4 interrupted after registration, then a logon starts HER'
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Registered')) 'S4'
