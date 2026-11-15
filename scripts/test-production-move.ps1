@@ -653,7 +653,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 64 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 68 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -702,8 +702,11 @@ try {
   Step 'S1d old archives'
   $archive = Join-Path $root 'backups\qqbot-2026-01-01T04-00-00.zip'
   Write-Fixture $archive 'not a real archive'
-  try { $run = Invoke-MoveScript $moveArgs 'S1d' } finally { Remove-Item -LiteralPath $archive -Force }
+  # The run carries a valid owner go file: refused in preflight, the go file is gone all the same (claimed at the start).
+  $goFile = Write-GoFile 'MOVE fixture-new'
+  try { $run = Invoke-MoveScript ($moveArgs + @('-OwnerGoFile', $goFile)) 'S1d' } finally { Remove-Item -LiteralPath $archive -Force }
   Assert-Run $run 1 'archives the new retention would prune' 'S1d'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S1d: a preflight refusal left the go file for another run'
   Assert-OldUntouched 'S1d'
 
   Step 'S1e earlier attempt'
@@ -756,6 +759,19 @@ try {
   Write-Fixture $sumsPath ($first + $sumsText.Substring(1))
   try { $run = Invoke-MoveScript $moveArgs 'S1j' } finally { [IO.File]::WriteAllBytes($sumsPath, $sumsBytes) }
   Assert-Run $run 1 'differs from SHA256SUMS' 'S1j'
+  # A release folder not built yet, and one with a valid SHA256SUMS but without her.exe: one fixed release finding,
+  # and every section that needs the release check reports it was skipped, never an unexpected error.
+  $releaseRuns = @(@('S1j-missing-folder', (Join-Path $F 'release-missing'), 'the release folder or its SHA256SUMS is not there yet'), @('S1j-missing-image', (Join-Path $F 'release-partial'), 'the release folder has no her.exe'))
+  [void][IO.Directory]::CreateDirectory((Join-Path $F 'release-partial'))
+  foreach ($name in @('her-cli.exe', 'herupdate.exe', 'SHA256SUMS')) { Copy-Item -LiteralPath (Join-Path $releaseSource $name) -Destination (Join-Path $F ('release-partial\' + $name)) }
+  try {
+    foreach ($releaseRun in $releaseRuns) {
+      $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory', '-OldRuntime', $oldRuntime, '-OldRelayFolder', $relayFolder, '-ReleaseSource', $releaseRun[1], '-ReleaseName', 'fixture-new')) $releaseRun[0]
+      Assert-Run $run 1 $releaseRun[2] ($releaseRun[0] + ' release finding')
+      Assert-Run $run 1 'skipped: needs the release check' ($releaseRun[0] + ' skipped sections')
+      Assert-True ($run.Text.IndexOf('an unexpected error', [StringComparison]::OrdinalIgnoreCase) -lt 0) ($releaseRun[0] + ': a section failed with an unexpected error after the release check failed')
+    }
+  } finally { Remove-Item -LiteralPath (Join-Path $F 'release-partial') -Recurse -Force }
   Assert-OldUntouched 'S1j'
 
   Step 'S1k configuration path with a parent step'
@@ -950,8 +966,11 @@ try {
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3-rollback'
   Assert-Run $run 0 'ROLLED BACK' 'S3 rollback'
   Assert-OldRunning 'S3'
-  $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3-rollback-again'
+  # A second rollback with a valid go file returns early; the go file is gone all the same.
+  $goFile = Write-GoFile 'ROLLBACK fixture-new'
+  $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state, '-OwnerGoFile', $goFile)) 'S3-rollback-again'
   Assert-Run $run 0 'nothing to roll back' 'S3 second rollback'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S3: an early-returning rollback left the go file for another run'
 
   Step 'S3b interrupted after staging'
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Staged')) 'S3b'
@@ -1078,7 +1097,7 @@ try {
   $goFile = Write-GoFile 'MOVE fixture-new'
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalFault', 'LateDshChild', '-OwnerGoFile', $goFile)) 'S7'
   Assert-Run $run 0 'MOVE DONE' 'S7'
-  Assert-Run $run 0 'the owner go file names MOVE; it is deleted' 'S7 go file accepted'
+  Assert-Run $run 0 'the owner go file names MOVE; it was deleted when this run started' 'S7 go file accepted'
   Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S7: the go file was not consumed'
   Assert-True (@(Get-LateChildren).Count -eq 0) 'S7: a DSH child started after the checks survived the stop'
   Assert-Moved 'S7'
@@ -1105,6 +1124,20 @@ try {
   try { $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', (Join-Path $goFolder 'go.txt'))) 'S8-go-link' }
   finally { [IO.Directory]::Delete($goFolder); Remove-Item -LiteralPath $goReal -Recurse -Force }
   Assert-Run $run 1 'a junction or link lies on the path of the owner go file' 'S8 go folder behind a link'
+  # A hard-link alias is refused, and the original name is then refused as already used: one file, one run.
+  $goFile = Write-GoFile 'COPY'
+  $alias = Join-Path $goFolder 'alias.txt'
+  [void](New-Item -ItemType HardLink -Path $alias -Target $goFile)
+  $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $alias)) 'S8-go-alias'
+  Assert-Run $run 1 'has another name (a hard link)' 'S8 hard-link alias'
+  $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-replay'
+  Assert-Run $run 1 'the owner go file was already used' 'S8 the other name of a used go file'
+  Assert-True (-not (Test-Path -LiteralPath $goFile) -and -not (Test-Path -LiteralPath $alias)) 'S8: an aliased go file was left behind'
+  # Held open by another run: refused without being read (that run's claim consumes it).
+  $goFile = Write-GoFile 'COPY'
+  $holder = [IO.File]::Open($goFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+  try { $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-busy' } finally { $holder.Dispose(); Remove-Item -LiteralPath $goFile -Force }
+  Assert-Run $run 1 'the owner go file is held by another run' 'S8 go file held by another run'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'ops'))) 'S8: a refused go file let the copy run'
   # A copy that fails its hash check leaves neither ops nor its staging folder, so the retry below can run.
   $run = Invoke-MoveScript ($operatorArgs + @('-RehearsalFault', 'CorruptCopy')) 'S8-corrupt'

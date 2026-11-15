@@ -66,6 +66,8 @@ $script:Blockers = [Collections.Generic.List[string]]::new()
 $script:SecretTexts = [Collections.Generic.List[string]]::new()
 $script:ProfileRoots = $null
 $script:RootAclChanging = $false
+$script:GoClaim = $null
+$script:RunLockStream = $null
 
 if (-not ('HerMove67Native' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -74,8 +76,14 @@ using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 public static class HerMove67Native {
   [StructLayout(LayoutKind.Sequential)] struct FileTime { public uint Low; public uint High; }
+  [StructLayout(LayoutKind.Sequential)] struct ByHandleInfo { public uint Attributes; public FileTime Created; public FileTime Accessed; public FileTime Written; public uint VolumeSerial; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow; }
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle file, out ByHandleInfo info);
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint size, uint flags);
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint size);
   [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
@@ -131,6 +139,50 @@ public static class HerMove67Native {
       for (int i = 0; i < count; i++) result[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size));
       return result;
     } finally { LocalFree(argv); }
+  }
+  // The long spelling of an existing path (8.3 parts expanded), so it compares with a final path by handle.
+  public static string LongPath(string path) {
+    StringBuilder buffer = new StringBuilder(32768);
+    uint length = GetLongPathName(path, buffer, (uint)buffer.Capacity);
+    if (length == 0 || length >= buffer.Capacity) return path;
+    return buffer.ToString();
+  }
+  // Claims the owner go file: opens it once, exclusively (no other open, not even a read) and deleted when the handle
+  // closes, and judges it only through that handle. Returns { status, file identity, last write FILETIME, text }.
+  // Status: ok, missing, busy (another open holds it), unreadable, link (a reparse point or a folder), aliased (more
+  // than one name: a hard link), moved (the final path by handle is not the expected file) or toolarge.
+  public static string[] ClaimFile(string path, string expected) {
+    // Shifts instead of long hex literals: the public scan refuses digit runs of 7 or more.
+    const uint GenericRead = 1u << 31; const uint DeleteAccess = 1u << 16; const uint OpenExisting = 3;
+    const uint OpenReparsePoint = 1u << 21; const uint DeleteOnClose = 1u << 26;
+    SafeFileHandle handle = CreateFile(path, GenericRead | DeleteAccess, 0, IntPtr.Zero, OpenExisting, OpenReparsePoint | DeleteOnClose, IntPtr.Zero);
+    if (handle.IsInvalid) {
+      int error = Marshal.GetLastWin32Error();
+      if (error == 2 || error == 3) return new string[] { "missing", "", "", "" };
+      if (error == 32) return new string[] { "busy", "", "", "" };
+      return new string[] { "unreadable", "", "", "" };
+    }
+    using (handle) {
+      ByHandleInfo info;
+      if (!GetFileInformationByHandle(handle, out info)) return new string[] { "unreadable", "", "", "" };
+      string identity = info.VolumeSerial.ToString("x8") + "-" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8");
+      string written = (((ulong)info.Written.High << 32) | info.Written.Low).ToString();
+      if ((info.Attributes & 0x400) != 0 || (info.Attributes & 0x10) != 0) return new string[] { "link", identity, written, "" };
+      if (info.Links != 1) return new string[] { "aliased", identity, written, "" };
+      StringBuilder final = new StringBuilder(32768);
+      uint length = GetFinalPathNameByHandle(handle, final, (uint)final.Capacity, 0);
+      if (length == 0 || length >= final.Capacity) return new string[] { "unreadable", identity, written, "" };
+      string finalPath = final.ToString();
+      if (finalPath.StartsWith(@"\\?\")) finalPath = finalPath.Substring(4);
+      if (!String.Equals(finalPath, expected, StringComparison.OrdinalIgnoreCase)) return new string[] { "moved", identity, written, "" };
+      if (info.SizeHigh != 0 || info.SizeLow > 4096) return new string[] { "toolarge", identity, written, "" };
+      byte[] bytes = new byte[info.SizeLow];
+      FileStream stream = new FileStream(handle, FileAccess.Read);
+      int read = 0;
+      while (read < bytes.Length) { int got = stream.Read(bytes, read, bytes.Length - read); if (got <= 0) break; read += got; }
+      string text = new UTF8Encoding(false).GetString(bytes, 0, read).TrimStart((char)0xFEFF);
+      return new string[] { "ok", identity, written, text };
+    }
   }
 }
 '@
@@ -218,7 +270,8 @@ function Add-Failure($ErrorRecord, [string]$Section) {
 # section reports a fixed "skipped" finding instead of running on empty values and hiding its own result.
 function Assert-PlanHas($plan, [string[]]$Keys, [string]$Prerequisite) {
   foreach ($key in $Keys) {
-    if (-not $plan.Contains($key) -or $null -eq $plan[$key] -or ([string]$plan[$key]) -eq '') { Stop-Refused ('skipped: needs ' + $Prerequisite) }
+    # A port is an int; 0 means its section refused it (the configuration sets ConsolePort to 0 before refusing).
+    if (-not $plan.Contains($key) -or $null -eq $plan[$key] -or ([string]$plan[$key]) -eq '' -or ($plan[$key] -is [int] -and $plan[$key] -eq 0)) { Stop-Refused ('skipped: needs ' + $Prerequisite) }
   }
 }
 function Get-PhaseIndex([string]$Phase) { return [Array]::IndexOf($Phases, $Phase) }
@@ -263,13 +316,17 @@ function Assert-RehearsalPort([int]$Port) {
 }
 # The owner's go for a run the Windows coordinator starts (#67, docs/agents/production-ops.md): one file directly in
 # the go folder, at most 2 hours old, holding exactly one line: "MOVE <release>", "ROLLBACK <the state file's
-# release>" or "COPY". It is read once and deleted before its content is judged and before any change, so no go file
-# can ever be used twice.
+# release>" or "COPY". Initialize-Run claims it before any lock, blocker or state (Claim-OwnerGo: one exclusive
+# handle, deleted on close, judged through that handle), so a refusal anywhere later leaves no reusable go;
+# Confirm-Owner judges the kept text. A ledger of claimed file identities refuses a second name of the same file.
 function Get-GoFolder {
   if ($Rehearsal) { return (Join-Path (Split-Path -Parent $script:Root) 'go') }
   return 'C:\her-orch\67\go'
 }
+function Get-GoLedger { return (Join-Path (Split-Path -Parent (Get-GoFolder)) 'go-claimed.txt') }
 function Test-OwnerGoLine([string[]]$Lines, [string]$Word, [string]$Release) {
+  # MOVE and ROLLBACK always name a release; only COPY stands alone.
+  if (@('MOVE', 'ROLLBACK') -ccontains $Word -and -not $Release) { return $false }
   $expected = $Word
   if ($Release) { $expected = $Word + ' ' + $Release }
   $all = @($Lines)
@@ -279,30 +336,51 @@ function Test-GoAge([DateTime]$WrittenUtc, [DateTime]$NowUtc) {
   $age = $NowUtc - $WrittenUtc
   return ($age.TotalMinutes -ge -5 -and $age.TotalHours -le 2)
 }
-function Read-OwnerGo([string]$Word, [string]$Release) {
+function Claim-OwnerGo {
   $path = Get-Normal $OwnerGoFile
   $folder = Get-Normal (Get-GoFolder)
   if ((Split-Path -Parent $path) -ine $folder) { Stop-Refused 'the owner go file must lie directly in the go folder' }
   if (Test-Within $path $script:Root) { Stop-Refused 'the owner go file must lie outside the install root' }
-  Assert-NoLinkAbove $path 'the owner go file'
-  Assert-RehearsalPath $path
-  $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-  if ($null -eq $item -or $item -isnot [IO.FileInfo]) { Stop-Refused 'the owner go file is missing' }
-  $written = $item.LastWriteTimeUtc
-  $text = Read-Text $path
-  [IO.File]::Delete($path)
-  if (Test-Present $path) { Stop-Failed 'the owner go file could not be deleted' }
-  Write-Log ('owner go file read and deleted; written ' + $written.ToString('o'))
+  Assert-NoLinkAbove $folder 'the owner go file'
+  Assert-RehearsalPath $folder
+  # The file itself is judged through its handle: no link, one name, and its final path is the expected file (a
+  # folder swapped after the check above shows up there).
+  $expected = [HerMove67Native]::LongPath($folder) + '\' + (Split-Path -Leaf $path)
+  $claim = [HerMove67Native]::ClaimFile($path, $expected)
+  $script:GoClaim = [pscustomobject]@{ Status = [string]$claim[0]; Identity = [string]$claim[1]; Written = [string]$claim[2]; Text = [string]$claim[3] }
+  if ($script:GoClaim.Identity) {
+    $ledger = Get-GoLedger
+    $used = @()
+    if (Test-Path -LiteralPath $ledger -PathType Leaf) { $used = Read-Lines $ledger }
+    if (@($used) -contains $script:GoClaim.Identity -and $script:GoClaim.Status -eq 'ok') { $script:GoClaim.Status = 'replayed' }
+    [IO.File]::AppendAllText($ledger, ($script:GoClaim.Identity + "`r`n"), [Text.ASCIIEncoding]::new())
+  }
+  switch ($script:GoClaim.Status) {
+    'ok' { return }
+    'missing' { Stop-Refused 'the owner go file is missing' }
+    'busy' { Stop-Refused 'the owner go file is held by another run' }
+    'link' { Stop-Refused 'the owner go file is a link or a folder' }
+    'aliased' { Stop-Refused 'the owner go file has another name (a hard link); it serves no run' }
+    'moved' { Stop-Refused 'the owner go file is not where its path says' }
+    'replayed' { Stop-Refused 'the owner go file was already used' }
+    'toolarge' { Stop-Refused 'the owner go file is larger than one line' }
+    default { Stop-Refused 'the owner go file cannot be read' }
+  }
+}
+function Test-OwnerGoClaim([string]$Word, [string]$Release) {
+  $claim = $script:GoClaim
+  if ($null -eq $claim -or $claim.Status -ne 'ok') { Stop-Refused 'the owner go file was not claimed' }
+  $written = [DateTime]::FromFileTimeUtc([long]$claim.Written)
   if (-not (Test-GoAge $written ([DateTime]::UtcNow))) { Stop-Refused 'the owner go file is older than 2 hours (or dated in the future)' }
-  if (-not (Test-OwnerGoLine (Split-Lines $text) $Word $Release)) { Stop-Refused 'the owner go file does not name this action and release' }
+  if (-not (Test-OwnerGoLine (Split-Lines ([string]$claim.Text)) $Word $Release)) { Stop-Refused 'the owner go file does not name this action and release' }
   Write-Log ('owner go file accepted for ' + $Word)
 }
 function Confirm-Owner([string]$Word, [string]$Summary, [string]$Release = '') {
   if ($OwnerGoFile) {
     # A run the Windows coordinator starts on the owner's relayed go: the go file replaces the typed word.
     Write-Step $Summary
-    Read-OwnerGo $Word $Release
-    Write-Step ('the owner go file names ' + $Word + '; it is deleted')
+    Test-OwnerGoClaim $Word $Release
+    Write-Step ('the owner go file names ' + $Word + '; it was deleted when this run started')
     Write-Log ('owner confirmed with ' + $Word + ' through the owner go file')
     return
   }
@@ -505,11 +583,13 @@ function Get-BackupDestination($Config) {
 
 # ---------- relay configuration ----------
 function Read-RelayConfig([string[]]$Lines) {
-  $ports = @(); $auth = @(); $keys = @(); $absolute = 0
+  $ports = @(); $auth = @(); $keys = @(); $absolute = 0; $unreadablePorts = 0
   for ($index = 0; $index -lt $Lines.Count; $index++) {
     $line = $Lines[$index]
     if ($line.Trim().StartsWith('#')) { continue }
     if ($line -match '^port:\s*["'']?(?<port>[0-9]{1,5})["'']?\s*(#.*)?$') { $ports += [int]$Matches['port']; continue }
+    # A top-level port line in another form is not "no port line": it must not fall back to the default.
+    if ($line -match '^port\s*:') { $unreadablePorts++; continue }
     if ($line -match '^auth-dir:\s*(?<value>.*?)\s*$') { $auth += [pscustomobject]@{ Index = $index; Value = $Matches['value'].Trim('"', "'") }; continue }
     if ($line -match '^api-keys:\s*$') {
       while ($index + 1 -lt $Lines.Count -and $Lines[$index + 1] -match '^\s+-\s*(?<key>.+?)\s*$') { $keys += $Matches['key'].Trim('"', "'"); $index++ }
@@ -521,6 +601,7 @@ function Read-RelayConfig([string[]]$Lines) {
   foreach ($key in $keys) { if ($key -and -not $script:SecretTexts.Contains($key)) { $script:SecretTexts.Add($key) } }
   # Only top-level keys count (an indented port belongs to another block); none means the relay's default port (0
   # here; the caller uses -RelayDefaultPort and checks the live listener).
+  if ($unreadablePorts -gt 0 -or @($ports | Where-Object { $_ -lt 1 -or $_ -gt 65535 }).Count -gt 0) { Stop-Refused 'the relay configuration has a top-level port line that cannot be read' }
   if ($ports.Count -gt 1) { Stop-Refused 'the relay configuration has more than one top-level port line' }
   if ($auth.Count -gt 1) { Stop-Refused 'the relay configuration has more than one auth-dir line' }
   if ($keys.Count -lt 1) { Stop-Refused 'the relay configuration lists no api-keys entry' }
@@ -1220,7 +1301,9 @@ function Initialize-Run {
     if ($env:HER_TASK_SCHEDULER_FILE) { Stop-Refused 'HER_TASK_SCHEDULER_FILE is set; open a new PowerShell without it' }
     if ($RehearsalAbortAfter -or $RehearsalFault -or $RehearsalConfirm) { Stop-Refused 'rehearsal switches need -Rehearsal' }
     # Inventory is read-only and may run non-interactively. A changing mode needs the owner at the keyboard, or the
-    # owner's go file for this run (the Windows coordinator runs it on a relayed go; Confirm-Owner reads the file).
+    # owner's go file for this run (the Windows coordinator runs it on a relayed go; claimed below, judged by
+    # Confirm-Owner).
+    if ($RelayDefaultPort -ne 8317) { Stop-Refused '-RelayDefaultPort is for rehearsals; production uses the relay default 8317' }
     if ($Mode -ne 'Inventory' -and -not $OwnerGoFile) {
       $nonInteractive = @([Environment]::GetCommandLineArgs() | Where-Object { $_ -like '-noni*' })
       if (-not [Environment]::UserInteractive -or $nonInteractive.Count -gt 0) { Stop-Refused 'production runs need an interactive PowerShell without -NonInteractive' }
@@ -1230,6 +1313,8 @@ function Initialize-Run {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Stop-Refused 'run this script from an administrator PowerShell' }
   }
   Assert-NoLinkAbove $script:Root 'the install root'
+  # The owner go file is claimed before any lock, blocker or state: whatever refuses later, it serves no other run.
+  if ($OwnerGoFile) { Claim-OwnerGo }
   $script:ProfilePath = $ProfileFolder
   if (-not $script:ProfilePath) { $script:ProfilePath = $env:USERPROFILE }
   $base = Get-Normal $EvidenceRoot
@@ -1241,6 +1326,11 @@ function Initialize-Run {
   }
   if (Test-Within $base $script:Root) { Stop-Refused 'the evidence folder must be outside the install root' }
   [void][IO.Directory]::CreateDirectory($base)
+  # One run at a time whatever -EvidenceRoot says: a fixed lock beside the go folder, then the evidence lock.
+  $runLock = Join-Path (Split-Path -Parent (Get-GoFolder)) 'move-run.lock'
+  [void][IO.Directory]::CreateDirectory((Split-Path -Parent $runLock))
+  try { $script:RunLockStream = [IO.File]::Open($runLock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+  catch { Stop-Refused 'another run of this script is active' }
   try { $script:LockStream = [IO.File]::Open((Join-Path $base 'move.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
   catch { Stop-Refused 'another run of this script is active' }
   $script:Evidence = Join-Path $base ($Mode.ToLowerInvariant() + '-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff'))
@@ -1248,6 +1338,7 @@ function Initialize-Run {
   [void][IO.Directory]::CreateDirectory($script:Evidence)
   $script:Log = Join-Path $script:Evidence 'log.txt'
   Write-Step ('mode ' + $Mode + '; evidence ' + $script:Evidence)
+  if ($null -ne $script:GoClaim) { Write-Log ('owner go file claimed and deleted at the start of this run; identity ' + $script:GoClaim.Identity + ', written ' + [DateTime]::FromFileTimeUtc([long]$script:GoClaim.Written).ToString('o')) }
 }
 
 # ---------- the checks shared by Inventory and Move (read-only) ----------
@@ -1298,6 +1389,8 @@ function Get-MovePlan {
     }
     $plan.SourceCli = Join-Path $plan.ReleaseSource 'her-cli.exe'
     $plan.Cli = Join-Path $script:Root 'current\her-cli.exe'
+    # Set only when the whole release check passed: later sections need the check, not just some of its values.
+    $plan.ReleaseChecked = 'yes'
   } catch { Add-Failure $_ 'release' }
 
   try {
@@ -1546,7 +1639,7 @@ function Get-MovePlan {
 
   try {
     # Old scheduled tasks, other enabled tasks that would still start old production, and the HER task.
-    Assert-PlanHas $plan @('SourceCli') 'the release check'
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     Assert-PlanHas $plan @('Roots') 'the copy plan'
     $plan.OldTasks = @((Get-TaskRecord $OldSupervisorTask), (Get-TaskRecord $OldRelayTask))
     foreach ($task in $plan.OldTasks) { if (-not $task.Enabled) { Add-Blocker ('the scheduled task ' + $task.Name + ' is not enabled') } }
@@ -1561,7 +1654,7 @@ function Get-MovePlan {
 
   try {
     # DSH home: the runtime's own DSH files must equal the profile copies the move installs.
-    Assert-PlanHas $plan @('SourceCli') 'the release check'
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     Assert-PlanHas $plan @('ConsolePort') 'the configuration check'
     Assert-PlanHas $plan @('Roots') 'the copy plan'
     if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
@@ -1619,7 +1712,7 @@ function Get-MovePlan {
   try {
     # Sizes, path lengths and junctions of every copy; free disk space.
     Assert-PlanHas $plan @('Copies') 'the copy plan'
-    Assert-PlanHas $plan @('Sums') 'the release check'
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     $bytes = 0.0
     foreach ($copy in $plan.Copies) {
       $listing = Get-Manifest $copy.From $copy.To $copy.Exclude $copy.Label -NoHash
@@ -1634,7 +1727,7 @@ function Get-MovePlan {
   } catch { Add-Failure $_ 'sizes' }
 
   try {
-    Assert-PlanHas $plan @('SourceCli') 'the release check'
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     $idle = Get-IdleState $plan.SourceCli $plan.OldRuntime 'idle-before'
     if ($idle.Paused -gt 0) { Add-Blocker ('' + $idle.Paused + ' paused turns wait for the owner; resolve them first') }
     if ($idle.Busy -gt 0) { Add-Blocker ('' + $idle.Busy + ' conversation turns are in progress; wait until the bot is idle') }
@@ -2243,8 +2336,12 @@ function Invoke-SelfTest {
   Check (-not (Test-GoAge ($goNow.AddMinutes(-121)) $goNow)) 'owner go file older than two hours'
   $nestedPort = Read-RelayConfig @('remote-management:', '  port: 83', 'api-keys:', '  - "key-three"')
   Check ($nestedPort.Port -eq 0) 'no top-level port line means the relay default port; a nested port is not the relay port'
-  Check (Test-Refused { Assert-PlanHas ([ordered]@{}) @('SourceCli') 'the release check' }) 'a missing earlier result skips the section'
-  Check (-not (Test-Refused { Assert-PlanHas ([ordered]@{ SourceCli = 'C:\R\her-cli.exe' }) @('SourceCli') 'the release check' })) 'a present earlier result lets the section run'
+  Check (Test-Refused { Assert-PlanHas ([ordered]@{}) @('ReleaseChecked') 'the release check' }) 'a missing earlier result skips the section'
+  Check (-not (Test-Refused { Assert-PlanHas ([ordered]@{ ReleaseChecked = 'yes' }) @('ReleaseChecked') 'the release check' })) 'a present earlier result lets the section run'
+  Check (Test-Refused { Assert-PlanHas ([ordered]@{ ConsolePort = 0 }) @('ConsolePort') 'the configuration check' }) 'a port of 0 counts as missing'
+  Check (-not (Test-OwnerGoLine @('MOVE') 'MOVE' '')) 'a MOVE go line always names a release'
+  Check (-not (Test-GoAge ($goNow.AddMinutes(6)) $goNow)) 'owner go file dated more than five minutes ahead'
+  Check (Test-Refused { Read-RelayConfig @('port: eighty', 'api-keys:', '  - "key-four"') }) 'a top-level port line that cannot be read'
   $bundleMap = New-PathMap @([pscustomobject]@{ From = 'C:\Q\qq-bridge\b'; To = 'C:\Q\runtime\user\dsh\bundles\b' })
   Check ((Convert-DshText '"b": "link:C:\Q\qq-bridge\b"' $bundleMap) -ceq '"b": "link:C:\Q\runtime\user\dsh\bundles\b"') 'bundle path with backslashes'
   Check ((Convert-DshText 'b: link:c:/q/qq-bridge/b/x' $bundleMap) -ceq 'b: link:C:/Q/runtime/user/dsh/bundles/b/x') 'bundle path with forward slashes in another case'
@@ -2284,6 +2381,7 @@ try {
   $exitCode = 1
 } finally {
   if ($null -ne $script:LockStream) { $script:LockStream.Dispose() }
+  if ($null -ne $script:RunLockStream) { $script:RunLockStream.Dispose() }
 }
 Write-Step ('exit ' + $exitCode)
 exit $exitCode
