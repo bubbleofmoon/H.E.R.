@@ -82,6 +82,8 @@ pub enum BeginError {
     Busy,
     /// The intent could not be recorded; nothing may be sent.
     Intent(String),
+    /// The group is muted (#46); the text is the model-facing refusal.
+    Muted(String),
 }
 
 /// One item's settled outcome.
@@ -102,6 +104,8 @@ pub struct Recorded<'a> {
     context: &'a RuntimeContext,
     clock: fn() -> i64,
     batch_id: String,
+    /// The conversation key, so a mute refusal at settle time is learned (#46).
+    key: Option<String>,
     _claim: BatchClaim,
 }
 
@@ -115,6 +119,10 @@ impl<'a> Recorded<'a> {
         created_at: i64,
         fields: Value,
     ) -> Result<Self, BeginError> {
+        let key = fields.get("key").and_then(Value::as_str).map(str::to_owned);
+        if let Some(mute) = key.as_deref().and_then(|k| crate::group_mute::active(context, k)) {
+            return Err(BeginError::Muted(mute.refusal_text(crate::parity_clock::now_ms())));
+        }
         let batch_id = new_batch_id(created_at);
         let claim = claim_batch(&batch_id).ok_or(BeginError::Busy)?;
         let mut intent = Map::new();
@@ -129,6 +137,7 @@ impl<'a> Recorded<'a> {
             context,
             clock,
             batch_id,
+            key,
             _claim: claim,
         })
     }
@@ -140,8 +149,15 @@ impl<'a> Recorded<'a> {
             context,
             clock,
             batch_id: batch_id.to_string(),
+            key: None,
             _claim: claim,
         })
+    }
+
+    /// The conversation of a resumed batch, so a mute refusal during the resume is learned too.
+    pub fn with_key(mut self, key: &str) -> Self {
+        self.key = Some(key.to_string());
+        self
     }
 
     pub fn batch_id(&self) -> &str {
@@ -245,6 +261,11 @@ impl<'a> Recorded<'a> {
                 }
             }
             Err(SendError::NotCommitted(error)) => {
+                if crate::onebot::is_mute_refusal(&error) {
+                    if let Some(key) = &self.key {
+                        crate::group_mute::learn_from_refusal(self.context, key);
+                    }
+                }
                 let record_error = self
                     .append("not_committed", idx, &[("error", json!(error))])
                     .err();
@@ -444,6 +465,20 @@ mod tests {
 
     fn unreachable() -> OneBot {
         OneBot::new("http://127.0.0.1:1", String::new())
+    }
+
+    #[test]
+    fn begin_refuses_a_muted_group_before_any_record() {
+        let (root, context) = root("her-recorded-muted-");
+        let mut groups = serde_json::Map::new();
+        groups.insert("group:1".to_string(), json!({"personalUntil": crate::parity_clock::now_ms() + 600_000, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        std::fs::write(root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+        let result = Recorded::begin(&context, clock, 1_000, json!({"key":"group:1","epoch":"e","messages":["a"]}));
+        assert!(matches!(result, Err(BeginError::Muted(_))), "a muted group is refused");
+        assert!(read_records(&context).unwrap().is_empty(), "no intent is recorded");
+        // A group that is not muted still begins.
+        assert!(Recorded::begin(&context, clock, 1_000, json!({"key":"group:2","epoch":"e","messages":["a"]})).is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

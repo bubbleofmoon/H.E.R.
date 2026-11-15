@@ -359,6 +359,8 @@ struct Gateway {
 #[derive(Clone)]
 enum Step {
     Mention { message_id: i64, text: &'static str },
+    /// A group message without any @ of her.
+    Plain { message_id: i64, text: &'static str },
     Wait(u64),
 }
 
@@ -369,6 +371,16 @@ fn mention_event(message_id: i64, text: &str) -> Value {
         "sender": {"nickname": "tester", "card": ""},
         "message": [{"type": "at", "data": {"qq": SELF_ID.to_string()}}, {"type": "text", "data": {"text": format!(" {text}")}}],
         "raw_message": format!("[CQ:at,qq={SELF_ID}] {text}"), "font": 0
+    })
+}
+
+fn plain_event(message_id: i64, text: &str) -> Value {
+    json!({
+        "time": now_ms() / 1000, "self_id": SELF_ID, "post_type": "message", "message_type": "group",
+        "sub_type": "normal", "message_id": message_id, "group_id": GROUP_ID, "user_id": 1001,
+        "sender": {"nickname": "tester", "card": ""},
+        "message": [{"type": "text", "data": {"text": text}}],
+        "raw_message": text, "font": 0
     })
 }
 
@@ -384,6 +396,11 @@ fn serve_gateway_ws(listener: TcpListener, gateway: Arc<Mutex<Gateway>>) {
             match step {
                 Step::Mention { message_id, text } => {
                     if socket.send(Message::Text(mention_event(message_id, text).to_string())).is_err() {
+                        break;
+                    }
+                }
+                Step::Plain { message_id, text } => {
+                    if socket.send(Message::Text(plain_event(message_id, text).to_string())).is_err() {
                         break;
                     }
                 }
@@ -771,7 +788,7 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
     );
     assert!(!text.contains("qq_wait_for_messages(purpose=\"reply\""), "{text}");
     let briefing=text.split("【会话令牌】").next().unwrap();
-    for rule in ["【反AI味】","【积极性】","【回复节奏】"] {
+    for rule in ["【反AI味】","【积极性】","【在群里怎么说话】","【别反复用同一个梗】","【回复节奏】"] {
         assert!(briefing.contains(rule),"briefing omitted {rule}: {text}");
     }
     assert!(text.contains("readThroughSeq") && text.contains("throughSeq"));
@@ -1132,4 +1149,95 @@ fn a_group_member_cannot_switch_personas_and_gets_the_fixed_refusal() {
     assert!(delivered.iter().all(|p| p.text.contains("【引导唤醒】你已接入 QQ 会话") || p.text.contains("【提醒】你还没有完成回合收尾")), "a turn other than a timed wake ran: {delivered:?}");
     assert_eq!(rig.data_json("personas.json")["default"], json!(whale));
     assert_eq!(rig.data_json("personas.json")["overrides"], json!({}));
+}
+
+// ───────────────────────── #21: persona wake words ─────────────────────────
+
+/// The live bridge's ingress wake decisions for the group (`data/logs/rbridge-live.jsonl`), oldest first.
+fn wake_decisions(rig: &Rig) -> Vec<(bool, String)> {
+    fs::read_to_string(rig.root.join("data/logs/rbridge-live.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|v| v["key"] == json!(GROUP_KEY) && v.get("shouldWake").is_some())
+        .map(|v| (v["shouldWake"] == json!(true), v["reason"].as_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+fn activity_has(rig: &Rig, text: &str) -> bool {
+    fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap_or_default().contains(text)
+}
+
+#[test]
+fn wake_words_persona_names_wake_her_and_switch_with_the_persona() {
+    let mut rig = Rig::new("wake-names", Seed { bootstrap_sent: true, ..Seed::default() });
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    let clerk = approved_persona(&rig, "会计", "你是会计助手，只讲数字。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale}))).0, 200);
+    // No message carries an @ and the seeded triggers are @ only: just the persona's names can wake her.
+    rig.restart(vec![Step::Wait(500), Step::Plain { message_id: 9101, text: "会计在吗" }]);
+    assert!(wait_for(LONG, || activity_has(&rig, "会计在吗")), "the first message was never settled");
+    assert_eq!(wake_decisions(&rig), vec![(false, "no-trigger".to_string())], "another persona's name woke her");
+
+    let (status, switched) = rig.console("POST", "/api/personas/assign", Some(&json!({"conversation": GROUP_KEY, "persona": clerk})));
+    assert_eq!(status, 200, "{switched}");
+    rig.restart(vec![
+        Step::Wait(500), Step::Plain { message_id: 9102, text: "小鲸鱼在吗" },
+        Step::Wait(1500), Step::Plain { message_id: 9103, text: "会计你好" },
+    ]);
+    assert!(wait_for(LONG, || wake_decisions(&rig).len() >= 3), "decisions: {:?}", wake_decisions(&rig));
+    assert_eq!(
+        wake_decisions(&rig)[..3],
+        [(false, "no-trigger".to_string()), (false, "no-trigger".to_string()), (true, "keyword:会计".to_string())],
+        "after the switch the old persona's name no longer wakes her and the new one's does"
+    );
+    assert!(
+        wait_for(LONG, || rig.dsh.prompts().iter().any(|p| p.text.contains(&format!("【唤醒】{GROUP_KEY}\n原因：keyword:会计")))),
+        "the wake never reached the model: {:?}", rig.dsh.prompts()
+    );
+    let line = rig.dsh.prompts().iter()
+        .find_map(|p| p.text.lines().find(|l| l.starts_with("【名字唤醒】")).map(str::to_string))
+        .unwrap_or_default();
+    assert!(line.contains("（来自当前人设）：会计。") && !line.contains("：小鲸鱼"), "the briefing names the switched persona's wake words: {line}");
+}
+
+#[test]
+fn wake_words_her_changes_are_logged_and_undone_from_the_console() {
+    let rig = Rig::new("wake-word-log", Seed::default());
+    let whale = approved_persona(&rig, "小鲸鱼", "你是一只爱聊天的小鲸鱼。");
+    assert_eq!(rig.console("POST", "/api/personas/assign", Some(&json!({"default": whale}))).0, 200);
+    let agent = [("x-console-token", CONSOLE_TOKEN), ("x-agent-token", SEED_TOKEN)];
+    let change = json!({"key": GROUP_KEY, "config": {"triggers": {"dropNames": ["小鲸鱼"], "keywords": ["海"]}}});
+    let (status, set) = http_call(rig.console_port, "POST", "/api/socialV2/wake-config", &agent, Some(&change)).unwrap_or((0, Value::Null));
+    assert_eq!(status, 200, "{set}");
+    let path = format!("/api/personas/wake-words?conversation={GROUP_KEY}");
+    let (status, view) = rig.console("GET", &path, None);
+    assert_eq!(status, 200, "{view}");
+    assert_eq!(
+        (view["personaNames"].clone(), view["dropNames"].clone(), view["keywords"].clone(), view["effective"].clone()),
+        (json!(["小鲸鱼"]), json!(["小鲸鱼"]), json!(["海"]), json!(["海"])),
+        "{view}"
+    );
+    let log = view["log"].as_array().cloned().unwrap_or_default();
+    assert_eq!(log.len(), 1, "{view}");
+    assert_eq!((log[0]["id"].clone(), log[0]["by"].clone()), (json!(1), json!("her")));
+    assert_eq!(log[0]["added"], json!({"keywords": ["海"], "dropNames": ["小鲸鱼"]}));
+    assert_eq!(log[0]["removed"], json!({"keywords": [], "dropNames": []}));
+    // The same words again add no entry.
+    assert_eq!(http_call(rig.console_port, "POST", "/api/socialV2/wake-config", &agent, Some(&change)).map(|(s, _)| s), Some(200));
+    assert_eq!(rig.console("GET", &path, None).1["log"].as_array().map(Vec::len), Some(1));
+
+    let (status, undone) = rig.console("POST", "/api/personas/wake-words/undo", Some(&json!({"conversation": GROUP_KEY, "id": 1})));
+    assert_eq!(status, 200, "{undone}");
+    let (_, view) = rig.console("GET", &path, None);
+    assert_eq!((view["dropNames"].clone(), view["keywords"].clone(), view["effective"].clone()), (json!([]), json!([]), json!(["小鲸鱼"])), "{view}");
+    assert_eq!((view["log"][1]["by"].clone(), view["log"][1]["undoes"].clone()), (json!("undo"), json!(1)));
+    assert_eq!(rig.console("POST", "/api/personas/wake-words/undo", Some(&json!({"conversation": GROUP_KEY, "id": 1}))).0, 409, "its added words are gone");
+    // Administrators only; a malformed conversation is refused.
+    assert_eq!(http_call(rig.console_port, "GET", &path, &agent, None).map(|(s, _)| s), Some(403));
+    assert_eq!(rig.console("GET", "/api/personas/wake-words?conversation=group:x", None).0, 400);
+    // Approval over HTTP refuses a core over the persona budget (Run A).
+    let (_, long) = rig.console("POST", "/api/personas/create", Some(&json!({"name": "长人设", "core": "长".repeat(1501)})));
+    let (status, refused) = rig.console("POST", "/api/personas/approve", Some(&json!({"id": long["id"], "version": 1})));
+    assert_eq!(status, 409, "{refused}");
 }

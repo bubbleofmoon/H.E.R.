@@ -300,6 +300,8 @@ enum Send {
     Ok,
     /// OneBot refusal that proves nothing was delivered (retcode 1404).
     Refuse,
+    /// Retcode 100 with QQ result=120: the bot is muted in the group.
+    Muted,
     /// Read the request, close without answering.
     Lost,
     /// Deliver (visible in history) but close without answering.
@@ -405,6 +407,7 @@ fn handle(stream: TcpStream, script: Arc<Mutex<Script>>) {
                     reply(&mut stream, 200, json!({"status":"ok","retcode":0,"data":{"message_id":id}}));
                 }
                 Send::Refuse => reply(&mut stream, 200, json!({"status":"failed","retcode":1404,"wording":"not allowed","data":null})),
+                Send::Muted => reply(&mut stream, 200, json!({"status":"failed","retcode":100,"message":"sendMsg failed: result=120","wording":"muted","data":null})),
                 Send::Lost => {}
                 Send::Slow(_) => unreachable!(),
                 Send::LostButDelivered => {
@@ -1069,6 +1072,46 @@ fn definite_refusal_is_reported_as_not_committed_with_an_outbox_trail() {
     assert_eq!(fx.outbox()[0]["messages"], json!(["[语音:a.mp3]"]));
     let recent = fx.state()["conversations"]["group:111"]["recentMessages"].clone();
     assert_eq!(recent, json!([]), "nothing was said, so nothing is recorded");
+}
+
+#[test]
+fn a_result_120_voice_refusal_is_a_definite_403_and_teaches_the_mute() {
+    let bot = FakeOneBot::start();
+    let fx = fixture("refuse-120", &bot.url, Options::default());
+    fx.audio("a.mp3", &bytes(64));
+    let console = Console::start(&fx);
+    bot.script(vec![Send::Muted]);
+    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    assert_eq!(s, 403, "{b}");
+    assert_eq!(b["ok"], false);
+    assert!(b["error"].as_str().unwrap_or_default().contains("禁言"), "{b}");
+    assert!(b.get("outcome").is_none(), "a mute refusal is not an unknown outcome: {b}");
+    let kinds: Vec<String> = fx.outbox().iter().map(|r| r["k"].as_str().unwrap().to_string()).collect();
+    assert_eq!(kinds, ["intent", "attempt", "not_committed"]);
+    let store: Value = serde_json::from_slice(&fs::read(fx.root.join("data/group-mutes.json")).expect("the refusal wrote the mute state")).unwrap();
+    assert_eq!(store["groups"]["group:111"]["personalUntil"], json!(-1));
+    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    assert_eq!(s, 403, "{b}");
+    assert_eq!(bot.requests("send_group_msg").len(), 1, "the second send stayed local");
+}
+
+#[test]
+fn a_muted_group_voice_send_is_refused_locally() {
+    let bot = FakeOneBot::start();
+    let fx = fixture("muted", &bot.url, Options::default());
+    fx.audio("a.mp3", &bytes(64));
+    let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 + 600_000;
+    let mut groups = serde_json::Map::new();
+    groups.insert("group:111".to_string(), json!({"personalUntil": until, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+    fs::write(fx.root.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+    let console = Console::start(&fx);
+    let (s, b) = console.agent("POST", "/api/socialV2/send-voice", json!({"key": "group:111", "voice": "a.mp3"}));
+    assert_eq!(s, 403, "{b}");
+    assert_eq!(b["ok"], false);
+    assert!(b["error"].as_str().unwrap_or_default().contains("禁言"), "{b}");
+    assert!(bot.requests("send_group_msg").is_empty(), "no gateway send");
+    assert!(bot.requests("get_msg").is_empty(), "no readback");
+    assert!(fx.outbox().iter().all(|r| r["k"] != "intent"), "no send intent is recorded");
 }
 
 #[test]

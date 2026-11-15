@@ -6,6 +6,7 @@ Binding for coordinator sessions; planners read "Planner" and its "Threats": the
 
 - The coordinator is the Linux main session (Opus) and never implements: it picks ready issues (open, unclaimed, its host label and baton, blockers closed), claims them (`docs/agents/issue-tracker.md`), sizes, investigates by reading, plans and routes them, relays plans, caps fix rounds, owns every owner question, checks reports by their receipts (exit files, test-result lines, diff), runs the merge gates, merges, pushes, keeps the ticket's handoff current and closes the issue after merge. Few status turns while waiting.
 - A worker returns its report as its final message; save it to the ticket's report file (`/root/orch/her/<ticket>/report-<run>.md`, Windows `C:/her-orch/<ticket>/report-<run>.md`) before acting on it.
+- A worker that dispatched `quick.yml` ends its message with a "CI running" handback instead of waiting; wait for its runs and resume it with the result ("GitHub API budget").
 - Hand off with `scripts/handoff.sh` / `scripts/handoff.ps1` (`docs/agents/baton.md` "Handing over"), and keep the baton watcher running between handoffs (`baton.md` "Watcher").
 
 ## Sizing
@@ -48,9 +49,16 @@ A plan that touches the guard, the agents or the Codex form carries these threat
 - **T6. Concurrency.** Planners for different tickets have separate exports. Nothing builds locally, which keeps memory bounded on the 7 GB Linux host. Two planners never work on the same ticket at once. Planning runs on the Linux coordinator only.
 - **T7. A restart midway.** It can leave a scratch export and `scratch-evidence` behind. Before every export the coordinator deletes both. An export into a non-empty folder is not allowed, because stale files would be checked too.
 - **T8. Rule changes reach running agents.** The hook script is read on every call from `$CLAUDE_PROJECT_DIR`, so a change to its rules applies as soon as the main checkout pulls the merge; `git pull` replaces files by rename, so it does not break a running call. An unknown role is refused for every call. Through python, which the guard does not restrict for implementers and gates, an agent can still do everything T1 lists.
-- **T9. The implementer and gate denies are an approximation.** Command words are found at command positions: after unquoted newlines, the keywords `if then else elif do while until ! { function`, redirection operands, `{` and find -exec. `eval`, `builtin`, `coproc`, `source` and `.` are wrappers, and the operand of `<`, `<<<` or `<>` counts too. Comments are dropped, and quoted operators stay inside their word. Not seen: a program not on the wrapper list that runs another program (`watch`, `parallel`, `unshare`, `chroot`, `systemd-run`); a command held in a variable; brace expansion; nesting deeper than three levels; PowerShell cmdlets after `powershell -Command`. `gh-public`, `handoff` and `codex` are also refused by name anywhere in a command that has a wrapper, `$` or a backtick. This is the T1 class; #85 is the boundary.
-- **T10. False denies, accepted because they fail closed.** For reviewers and planners, anything outside the allow-list is refused: `cd … &&`, a newline between commands, `>/dev/null` (only `2>/dev/null` and `2>&1` pass), unquoted globs (quote the pattern, or use the Glob tool), a path-qualified reader (`/usr/bin/git`), `rg --pretty` (the `--pre` prefix), and an apostrophe in a comment (`echo a # it's` is unparseable). For implementers and gates: a nested string that names `codex`, `gh-public` or `handoff` after a wrapper; `timeout 5 grep codex x`; an apostrophe in a comment (`echo a # it's` is refused as unparseable); heredoc body lines starting with a tool name (write such files with the Write tool); and, with a `$` in the command, any mention of `codex`.
+- **T9. The implementer and gate denies are an approximation.** Command words are found at command positions: after unquoted newlines, the keywords `if then else elif do while until ! { function`, redirection operands, `{` and find -exec. `eval`, `builtin`, `coproc`, `source`, `.` and `watch` are wrappers, and the operand of `<`, `<<<` or `<>` counts too. Comments are dropped, and quoted operators stay inside their word. Not seen: a program not on the wrapper list that runs another program (`parallel`, `unshare`, `chroot`, `systemd-run`); a command held in a variable; brace expansion; nesting deeper than three levels; PowerShell cmdlets after `powershell -Command`. `gh-public`, `handoff` and `codex` are also refused by name anywhere in a command that has a wrapper, `$` or a backtick. This is the T1 class; #85 is the boundary.
+- **T10. False denies, accepted because they fail closed.** For reviewers and planners, anything outside the allow-list is refused: `cd … &&`, a newline between commands, `>/dev/null` (only `2>/dev/null` and `2>&1` pass), unquoted globs (quote the pattern, or use the Glob tool), a path-qualified reader (`/usr/bin/git`), `rg --pretty` (the `--pre` prefix), and an apostrophe in a comment (`echo a # it's` is unparseable). For implementers and gates: a nested string that names `codex`, `gh-public` or `handoff` after a wrapper; `timeout 5 grep codex x`; an apostrophe in a comment (`echo a # it's` is refused as unparseable); heredoc body lines starting with a tool name (write such files with the Write tool); and, with a `$` in the command, any mention of `codex`. From the CI-waiter rule: for implementers and gates every Bash command whose text mentions `ci-wait` is refused, wherever the name stands (a path, a quoted argument, an assignment value, `+=`, a worktree path such as `her-wt/90-ci-wait`, `git log --grep 'ci-wait'`, `cat scripts/ci-wait.py`, `echo ci-wait`), so searching or reading the waiter goes through the Grep and Read tools. A quoted argument starting with `watch` (`--search "watch it"`) makes the command count as having a wrapper, so the name rules above apply to it. A quoted argument that is itself a gh polling command (`--search "gh run watch"`) is refused as polling.
 - **T11. The read-only allow-list.** A reviewer's or planner's Bash call is one pipeline joined only by `|`. Each command is an allowed reader by bare name, with no option that writes or runs (`sort -o`, `--compress-program`, a second `uniq` file, `rg --pre`/`--hostname-bin`, `file -C`, `date -s` or a date argument, find actions other than `-print`/`-print0`). Arguments are plain words or quoted text: inside double quotes no `$`, backtick or backslash; outside quotes no glob, brace, backslash, `$`, backtick, `;`, `&`, `(`, `)`, `<`, `>` or `#`. The only redirections are `2>/dev/null` and `2>&1`. The allow-list limits writes and execution, not reads: secrets readable by the host user stay readable (the Read tool reaches them too).
+- **T12. Polling and the CI waiter.**
+  - For implementers and gates the guard refuses the plain polling forms with their own message: gh with `--watch`, `gh run watch`, and gh run by `watch` or in a while/until/for loop.
+  - For implementers and gates it refuses every Bash command whose text, dequoted, mentions `ci-wait` in any case: a path, a launcher (`uv run`, `python3.13t`, `parallel`), a quoted argument, an assignment value, a `+=` form. No reader or option grammar is modelled; the need to read or search the waiter is met by the Read and Grep tools. So only coordinators, which have no guard, wait for CI. The waiter's own tests (`python3 -I scripts/tests/test_ci_wait.py`, underscore) stay allowed.
+  - Not seen: a glob, a copy under another name, a name built inside python. That is the T1 class.
+  - It does not see repeated single `gh run view` calls across tool calls, `curl` or python loops against the API, or an unfiltered `gh run view --log` (T1/T9 class); the rule is in "GitHub API budget".
+  - The waiter's cache (`~/.cache/her-ci-wait`, Windows `%LOCALAPPDATA%\her-ci-wait`) is writable by any process of the host user, so a merge reads `statusCheckRollup`, never the cache.
+  - `HER_GITHUB_API` accepts only `127.0.0.1`. Against it the script sends only a fixed dummy or `HER_CI_WAIT_TEST_TOKEN`, never `GH_TOKEN` or the gh login, and uses its own cache folder (`her-ci-wait-test`).
 
 ## Review and gates
 
@@ -60,6 +68,41 @@ A plan that touches the guard, the agents or the Codex form carries these threat
 
 - Flow: ticket branch from `origin/main` → execute → review → fix round if needed → merge `origin/main` in, push, open a pull request against `main` → gate (CI on the head, plus native checks) → coordinator merges the pull request when CI is green or red only by listed known red (`scripts/ci/known-red.txt`). Every push to `main` runs CI; a red `main` is fixed before the next merge. Before fixing a failing test, search open issues, the known-red list and the other host's branches for its name.
 
+## GitHub API budget
+
+- Limits:
+  - The REST limit is 5,000 calls an hour per user account, shared by every token, `gh` login and machine on that account; GraphQL has its own per-account budget. Over it, every `gh` call fails with 403 until the hourly reset.
+  - GitHub's secondary limits on bursts answer 403 or 429, with `Retry-After` or only a message. `ci-wait.py` honours `Retry-After` and otherwise waits at least one window; the baton watcher waits at least 180 s.
+- The guard refuses workers' plain polling and their plain ways of running the CI waiter; coordinators follow these rules by hand.
+- Only coordinators wait for CI. A worker dispatches its `quick.yml` runs once, reads their ids once and ends its message with a "CI running" handback (`implementer-protocol.md` "Test loop").
+  - Start one waiter per handback, and resume the worker with its output when it exits.
+  - The Windows coordinator waits for its own workers' runs while an item is in progress. Runs still open at handback go to Linux as ids, and Linux waits.
+- Wait with `scripts/ci-wait.py` from the integration checkout (`/root/her`, Windows `C:/her`), started with the Bash tool's background option.
+  - A worker's runs: `python -I scripts/ci-wait.py --label <n>-<run> --timeout 7200 --run <id> [--run <id> ...]`.
+  - A pull request's checks: `python -I scripts/ci-wait.py --workflow checks.yml --event pull_request --sha <head sha> --timeout 7200`.
+  - A handback line without an id: read the ids once with `gh run list --workflow quick.yml --branch her/<n>-<slug> --commit <sha> -L 10 --json databaseId,displayTitle`, then wait by id.
+- How it saves calls:
+  - Every waiter on a machine reads one cached run list per workflow file (`actions/workflows/<file>/runs?per_page=40`) in `~/.cache/her-ci-wait` (Windows `%LOCALAPPDATA%\her-ci-wait`). Several `--run` ids share it.
+  - One waiter at a time refreshes the list under a file lock: at most one list call per ~100 s per workflow file, with `If-None-Match`, and a 304 costs nothing.
+  - A machine-wide budget file holds the remaining calls and any block. Under 1,000 calls left, calls go every 5 min; under 200, every 15 min.
+  - After a rate-limit 403 or a 429, no call of any kind is made until the reset, and at least one window passes. After a refused token (401), no call for 15 min. Any other 403 or error is retried at the next window.
+  - A green quick.yml result per commit is cached and reused; checks.yml results never are.
+  - Logs are fetched only for a failed run, only the first failed job's, and filtered.
+- Exit codes:
+  - 0 green; 1 red, followed by the failed job names and the filtered test-result and panic lines; 3 cancelled or another conclusion; 2 usage (including `--timeout` outside 0-86400 s).
+  - 4 (still running when `--timeout` ran out) and 5 (GitHub unavailable or internal error) are not results: start the wait again with the `--run <id>` its last lines name.
+  - With several runs or `--label`, the output ends with `[<label>]` and one `run <id>: <result>` line each. The exit is then 1 if any run failed, else 5, else 4, else 3, else 0.
+- The waiter's two limits:
+  - Several `--run` ids are waited for in turn, so a failure in a later id is reported only after the earlier ids finish or the timeout ends. When an early answer matters, start a separate waiter for that run.
+  - A run that is no longer among the 40 newest runs of its workflow ends the whole wait: exit 2 and no summary, or exit 1 with a summary naming it "not available" when an earlier id already failed. Read it once with `gh run view <id> --json status,conclusion`, and wait again for the other ids.
+- An API error is never a result: no test, CI run or gate is reported failed because GitHub did not answer.
+- Never wait with `gh run watch`, `--watch`, a loop or repeated `gh run view`, and do not check what a background waiter will report.
+- A merge decision reads the pull request's `statusCheckRollup` once (`merge-gate`). `ci-wait.py` only waits, and its cache is local state any process on the host can write.
+- Prefer one list call over many single-item calls. Use GraphQL (`gh api graphql`) where it covers the data, such as issues and labels; Actions runs are REST only.
+- Before a burst of calls, and when something returns 403, check the budget with `gh api rate_limit`; it does not count against the limit.
+- Intervals: CI at least 100 s (`ci-wait.py`); the baton watcher at least 180 s (`issue_watch.py --interval`).
+- If the limit is still too small, a GitHub App installed on the repository gets its own limit; a second token for the same user does not help.
+
 ## Windows coordinator
 
 Windows (32 GB, 4 cores / 8 threads, also runs production):
@@ -68,3 +111,4 @@ Windows (32 GB, 4 cores / 8 threads, also runs production):
 - One worker session at a time; each item gets a fresh coordinator session that starts from and ends with a handoff comment.
 - Native checks a gate names build via `C:/her/scripts/cargo-slot.ps1 -WorkTree <worktree>` (the integration checkout's copy): two build slots, two test slots (`docs/agents/rust-validation.md`). pi (`scripts/pi-task.ps1`) is paused.
 - An M/L ticket's planning goes to the Linux coordinator ("Planner"); Windows executes the plan it gets back.
+- "GitHub API budget" applies unchanged. Each host keeps its own cache (here `%LOCALAPPDATA%\her-ci-wait`), so the two hosts together make at most two list calls per window per workflow file. While an item is in progress, wait for its workers' runs from `C:/her` with the Bash tool's background option; at handback, give Linux the ids of the runs still open.

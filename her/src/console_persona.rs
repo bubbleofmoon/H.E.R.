@@ -1,4 +1,4 @@
-//! Persona library console routes (`/personas`, `/api/personas*`). Mounted behind the console
+//! Persona library and persona wake-word console routes (`/personas`, `/api/personas*`). Mounted behind the console
 //! front (Host, credential, JSON and Origin checks, audit); storage and validation live in `persona.rs`.
 
 use crate::runtime::RuntimeContext;
@@ -36,6 +36,8 @@ pub fn route(
         ("POST", "/api/personas/approve") => object().and_then(|b| crate::persona::approve(context, &b, authority)),
         ("POST", "/api/personas/assign") => object().and_then(|b| crate::persona::assign(context, &b, authority)),
         ("POST", "/api/personas/import-roles") => crate::persona::import_roles(context, authority),
+        ("GET", "/api/personas/wake-words") => crate::wake_words::view(context, query.get("conversation").map(String::as_str).unwrap_or("")),
+        ("POST", "/api/personas/wake-words/undo") => object().and_then(|b| crate::console::undo_wake_words(context, &b, authority)),
         _ => Err((404, "unknown persona route".to_string())),
     };
     match result {
@@ -69,7 +71,11 @@ const PAGE: &str = r##"<!doctype html>
 <label>Edit mode <select id="editMode"><option value="auto">auto</option><option value="manual">manual</option></select></label>
 <label>Auto rules (JSON) <input id="autoRules" size="80"></label>
 <p><button id="save">Save as new version</button> <button id="duplicate">Duplicate with this name</button> <button id="delete">Delete</button></p>
-<h2>Versions</h2><table id="versions"><thead><tr><th>Version</th><th>Source</th><th>Approved</th><th>Core</th><th></th></tr></thead><tbody></tbody></table>
+<h2>Versions</h2><table id="versions"><thead><tr><th>Version</th><th>Source</th><th>Approved</th><th>Core</th><th>Tokens (core / compact)</th><th></th></tr></thead><tbody></tbody></table>
+<h2>Wake words</h2>
+<p><label>Conversation <input id="wwConv" placeholder="group:123"></label> <button id="wwLoad">Load</button></p>
+<pre id="ww"></pre>
+<table id="wwLog"><thead><tr><th>ID</th><th>At</th><th>By</th><th>Added</th><th>Removed</th><th></th></tr></thead><tbody></tbody></table>
 <script>
 const $=s=>document.querySelector(s);
 const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
@@ -77,8 +83,8 @@ $('#token').value=token();
 const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:Object.assign({'x-console-token':token()},body?{'content-type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});const j=await r.json();const failed=(j.rebriefFailed||[]).map(f=>f.conversation);if(body||!j.ok)$('#msg').textContent=j.ok?(failed.length?'Saved; re-brief failed for '+failed.join(', ')+'; assign again to retry':'OK'):(j.error||r.status);return j};
 const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':String(t);return td};
 async function list(){const j=await api('/api/personas');if(!j.ok)return;const tb=$('#list tbody');tb.replaceChildren();for(const p of j.personas){const tr=document.createElement('tr');tr.append(cell(p.id),cell(p.name),cell(p.activeVersion),cell(p.pendingVersions.join(', ')),cell(j.default===p.id?'yes':''));tr.onclick=()=>{$('#id').value=p.id;load()};tb.append(tr)}$('#assign').textContent=JSON.stringify({default:j.default,overrides:j.overrides,rebriefDue:j.rebriefDue},null,1)}
-async function load(){const j=await api('/api/personas/item?id='+encodeURIComponent($('#id').value));if(!j.ok)return;const vs=j.persona.versions;const v=vs[vs.length-1];for(const k of ['name','core','notes','compact','editMode'])$('#'+k).value=v[k];$('#names').value=v.names.join(', ');$('#neediness').value=v.traits.neediness;$('#autoRules').value=JSON.stringify(v.autoRules);const tb=$('#versions tbody');tb.replaceChildren();for(const x of vs.slice().reverse()){const tr=document.createElement('tr');const b=document.createElement('button');b.textContent=j.persona.activeVersion===x.version?'Active':'Approve';b.onclick=async()=>{await api('/api/personas/approve',{id:j.persona.id,version:x.version});load();list()};const td=document.createElement('td');td.append(b);tr.append(cell(x.version),cell(x.source),cell(x.approved?'yes':'no'),cell(x.core),td);tb.append(tr)}}
-function fields(){let rules;try{rules=JSON.parse($('#autoRules').value||'null')}catch(e){rules=undefined}return{name:$('#name').value,core:$('#core').value,notes:$('#notes').value,compact:$('#compact').value,names:$('#names').value.split(',').map(s=>s.trim()).filter(Boolean),traits:{neediness:Number($('#neediness').value||1)},editMode:$('#editMode').value,autoRules:rules}}
+async function load(){const j=await api('/api/personas/item?id='+encodeURIComponent($('#id').value));if(!j.ok)return;const vs=j.persona.versions;const v=vs[vs.length-1];for(const k of ['name','core','notes','compact','editMode'])$('#'+k).value=v[k];$('#names').value=v.names.join(', ');$('#neediness').value=v.traits.neediness;$('#autoRules').value=JSON.stringify(v.autoRules);const tb=$('#versions tbody');tb.replaceChildren();for(const x of vs.slice().reverse()){const tr=document.createElement('tr');const b=document.createElement('button');b.textContent=j.persona.activeVersion===x.version?'Active':'Approve';b.onclick=async()=>{await api('/api/personas/approve',{id:j.persona.id,version:x.version});load();list()};const td=document.createElement('td');td.append(b);tr.append(cell(x.version),cell(x.source),cell(x.approved?'yes':'no'),cell(x.core),cell(x.coreTokens+' / '+x.compactTokens+' (max '+j.budgets.coreTokens+' / '+j.budgets.compactTokens+')'),td);tb.append(tr)}}
+function fields(){let rules;try{rules=JSON.parse($('#autoRules').value||'null')}catch(e){rules=undefined}const names=$('#names').value.split(',').map(s=>s.trim()).filter(Boolean);const f={name:$('#name').value,core:$('#core').value,notes:$('#notes').value,compact:$('#compact').value,traits:{neediness:Number($('#neediness').value||1)},editMode:$('#editMode').value,autoRules:rules};if(names.length)f.names=names;return f}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);list()};
 $('#load').onclick=load;
 $('#save').onclick=async()=>{const id=$('#id').value.trim();const j=id?await api('/api/personas/update',Object.assign({id},fields())):await api('/api/personas/create',fields());if(j.ok){$('#id').value=j.id;load();list()}};
@@ -87,6 +93,22 @@ $('#delete').onclick=async()=>{if(confirm('Delete persona '+$('#id').value+'?'))
 $('#import').onclick=async()=>{await api('/api/personas/import-roles',{});list()};
 $('#setDefault').onclick=async()=>{const v=$('#default').value.trim();await api('/api/personas/assign',{default:v||null});list()};
 $('#setOverride').onclick=async()=>{const v=$('#convPersona').value.trim();await api('/api/personas/assign',{conversation:$('#conv').value.trim(),persona:v||null});list()};
+async function wakeWords(){const conv=$('#wwConv').value.trim();const j=await api('/api/personas/wake-words?conversation='+encodeURIComponent(conv));if(!j.ok)return;$('#ww').textContent=JSON.stringify({personaNames:j.personaNames,keywords:j.keywords,dropNames:j.dropNames,effective:j.effective},null,1);const tb=$('#wwLog tbody');tb.replaceChildren();for(const e of j.log.slice().reverse()){const tr=document.createElement('tr');const b=document.createElement('button');b.textContent='Undo';b.onclick=async()=>{await api('/api/personas/wake-words/undo',{conversation:conv,id:e.id});wakeWords()};const td=document.createElement('td');td.append(b);tr.append(cell(e.id),cell(new Date(e.at).toISOString()),cell(e.by),cell(JSON.stringify(e.added)),cell(JSON.stringify(e.removed)),td);tb.append(tr)}}
+$('#wwLoad').onclick=wakeWords;
 list();
 </script></body></html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    /// The save request the page builds (`fields()` in `PAGE`) must leave `names` out when the Names field is
+    /// blank, so a new persona falls back to its name and an update keeps its list; the API contract for an
+    /// explicit `names: []` is `persona::tests`.
+    #[test]
+    fn the_page_sends_names_only_when_the_field_is_not_blank() {
+        let start = super::PAGE.find("function fields(){").expect("the page builds its save request in fields()");
+        let fields = super::PAGE[start..].lines().next().unwrap();
+        assert!(fields.contains("if(names.length)f.names=names"), "names are added to the request only when listed: {fields}");
+        assert!(!fields.contains("names:"), "the request literal must not carry a names list unconditionally: {fields}");
+    }
+}

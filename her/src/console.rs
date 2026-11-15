@@ -5538,6 +5538,27 @@ fn note_engagement_ended(out: &mut Value) {
     out["reason"] = json!(END_TURN);
 }
 
+/// #46: a send to a group where QQ has muted her is refused here, before quota, quote or gateway
+/// work. The result says until when; an open turn is marked ended so it closes as a clean sleep.
+pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
+    let Some(mute) = crate::group_mute::active(context, key) else { return Ok(()) };
+    if !token.is_empty() {
+        let epoch = crate::send_outbox::token_epoch(token);
+        let marked = load_social_state_for(context).and_then(|state| {
+            let Some(conv) = state["conversations"].get(key).cloned() else { return Ok(()) };
+            match turn_wait_budget(context, cfg, key, &epoch, &conv)? {
+                Some((turn, _)) => mark_turn_budget_ended(context, key, token, &turn),
+                None => Ok(()),
+            }
+        });
+        if let Err((status, error)) = marked {
+            crate::safe_eprintln!("[send] {key} 禁言拒发时标记回合结束失败（{status}）：{error}");
+        }
+    }
+    crate::activity::append(context, &format!("{key} [send] 禁言中，本地拒发，未调用网关"));
+    Err((403, mute.refusal_text(crate::parity_clock::now_ms())))
+}
+
 fn wait_console_generation() -> &'static str {
     static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     GENERATION.get_or_init(|| crate::turn_ledger::mint_id("console-")).as_str()
@@ -6842,7 +6863,7 @@ fn handle_social_config_post(
 /// config file while the state gate is held, not taken from the request that triggered the
 /// refresh: config writers are not serialized, so the last refresh to run may belong to an
 /// earlier write, and it must still leave the conversations on what the file says now.
-fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
+pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
     let now = now_ms();
     let refresh = |state: &mut Value| -> Result<(), (u16, String)> {
         let cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
@@ -6854,6 +6875,10 @@ fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, St
             let kept = old.pointer("/triggers/keywords").and_then(Value::as_array).filter(|k| !k.is_empty()).cloned();
             if let Some(keywords) = kept {
                 fresh["triggers"]["keywords"] = Value::Array(keywords);
+            }
+            // Persona names she turned off survive every reset to the defaults (`wake_words.rs`).
+            if let Some(names) = old.pointer("/triggers/dropNames").and_then(Value::as_array).filter(|k| !k.is_empty()).cloned() {
+                fresh["triggers"]["dropNames"] = Value::Array(names);
             }
             for field in ["lastWakeAt", "wakeCount", "noActionCount", "confirmedAt"] {
                 fresh[field] = old.get(field).filter(|v| v.as_f64().is_some_and(|n| n != 0.0)).cloned().unwrap_or(json!(0));
@@ -6870,6 +6895,22 @@ fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, St
         refresh(&mut state)?;
         write_social_state_for(context, &state).map_err(|e| (500, e))
     }
+}
+
+/// `POST /api/personas/wake-words/undo` (`console_persona.rs`, administrators only): under the persona
+/// route's authority (the social gate after a fresh credential check) reverts one logged wake-word
+/// change (`wake_words::undo`); a refusal writes nothing.
+pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+    let key = body["conversation"]
+        .as_str()
+        .and_then(crate::initial_prompts::canonical_key)
+        .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
+    let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
+    let _authority = authority()?;
+    let mut state = load_social_state_for(context)?;
+    let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
+    write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
+    Ok(result)
 }
 /// 本进程内"已见过的转发 id"（按会话）。JS 用内存 Set，Rust 用它兜住嵌套转发：
 /// 外层消息里的嵌套 id 只在上层读取时才被登记，之后 AI 要单独读它就靠这份记录。
@@ -8636,6 +8677,7 @@ where
         return Err((403, "reserved2 模式发送必须携带 agent token".to_string()));
     }
     let storage_key = projection_storage_key(&key)?;
+    mute_send_denial(context, cfg, &storage_key, token)?;
     let Some((kind, id_s)) = storage_key.split_once(':') else {
         return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
     };
@@ -8800,6 +8842,7 @@ where
     let recorded = crate::recorded_send::Recorded::begin(context, now_ms, now_ms(), fields).map_err(|error| match error {
         crate::recorded_send::BeginError::Busy => (409, crate::recorded_send::BATCH_BUSY.to_string()),
         crate::recorded_send::BeginError::Intent(error) => (503, format!("发送意图未能持久记录，未发送：{error}")),
+        crate::recorded_send::BeginError::Muted(text) => mute_send_denial(context, cfg, &storage_key, token).err().unwrap_or((403, text)),
     })?;
     // JS enqueues the sticker on the same `sendChain` as text bubbles, so it can never overtake an
     // in-flight burst, and pauses 800-2000 ms inside the chain before `assertSendAllowed()`.
@@ -8841,6 +8884,18 @@ where
     let delivered = matches!(settled.state, crate::send_outbox::ItemState::Confirmed { .. });
     if matches!(settled.state, crate::send_outbox::ItemState::NotCommitted) {
         retain_reservation = false;
+    }
+    if matches!(settled.state, crate::send_outbox::ItemState::NotCommitted)
+        && settled.error.as_deref().is_some_and(crate::onebot::is_mute_refusal)
+    {
+        // #46: settle has already learned the mute; answer as a definite local refusal, never 500 or 503
+        // (unknown delivery). A failed record write is reported beside it, not instead of it.
+        if let Some(error) = &settled.record_error {
+            crate::safe_eprintln!("[sticker] {storage_key} 禁言拒绝的发送记录未能写入：{error}");
+            crate::activity::append(context, &format!("{storage_key} [sticker] 禁言拒绝的发送记录未能写入"));
+        }
+        mute_send_denial(context, cfg, &storage_key, token)?;
+        return Err((403, format!("发送表情失败：{}", settled.error.unwrap_or_default())));
     }
     if let Some(error) = settled.record_error {
         return Err((503, if delivered { format!("已发送，但发送结果未能持久记录：{error}") } else { format!("发送结果未能持久记录：{error}") }));
@@ -9361,8 +9416,10 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
             let limit = cfg.pointer("/socialV2/wake/noActionLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(3);
             if no_action >= limit {
                 let keywords = conv["wakeConfig"]["triggers"]["keywords"].clone();
+                let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
                 conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
                 if keywords.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["keywords"] = keywords; }
+                if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
                 conv["bootstrapSent"] = json!(true);
             }
         }
@@ -9370,7 +9427,9 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
         if closed {
             crate::wake::ensure_wakeable(&mut conv["wakeConfig"], cfg, now, rand01());
         } else if u64::from(miss) >= max {
+            let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
             conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
+            if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
         }
         Ok((!closed && u64::from(miss) < max, stamp))
     }).map_err(|(_, e)| e)
@@ -10035,6 +10094,9 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
     if silent_blocks_send(context, cfg, key).map_err(|_| cancelled())? {
         return Err(cancelled());
     }
+    if let Some(mute) = crate::group_mute::active(context, key) {
+        return Err((403, mute.refusal_text(crate::parity_clock::now_ms())));
+    }
     Ok(())
 }
 
@@ -10250,6 +10312,7 @@ fn resume_send_batch(
     // One runner per batch: a concurrent resume (or the original send still running) would
     // otherwise read the same pending item and send it twice.
     let recorded = crate::recorded_send::Recorded::resume(context, now_ms, batch_id)
+        .map(|recorded| recorded.with_key(key))
         .ok_or((409, crate::recorded_send::BATCH_BUSY.to_string()))?;
     let _chain = agent::send_chain();
     let records = read_records(context).map_err(|error| (503, error))?;
@@ -10465,6 +10528,9 @@ fn send_message_inner(
     }
     if !session_allowed(cfg, &key) {
         return Err((403, "目标不在当前模式允许范围内".to_string()));
+    }
+    if let Some(storage) = canonical_v2_key(&key) {
+        mute_send_denial(context, cfg, &storage, &token)?;
     }
     if let Some(batch_id) = resume_batch {
         let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
@@ -14714,6 +14780,20 @@ mod tests {
     }
 
     #[test]
+    fn a_muted_send_marks_the_open_turn_as_a_clean_sleep() {
+        let (root, context, config, headers) = hf94_wait_fixture(json!({}));
+        let token = headers.get("x-agent-token").unwrap().clone();
+        let turn = engage_turn(&context);
+        let mut groups = serde_json::Map::new();
+        groups.insert(HF94_KEY.to_string(), json!({"personalUntil": crate::parity_clock::now_ms() + 600_000, "wholeGroup": false, "rev": 1, "noticedRev": 1, "seq": 1}));
+        std::fs::write(root.0.join("data/group-mutes.json"), json!({"v": 1, "groups": groups}).to_string()).unwrap();
+        let (status, text) = mute_send_denial(&context, &config, HF94_KEY, &token).unwrap_err();
+        assert_eq!(status, 403);
+        assert!(text.contains("muted in this group until") && text.contains(END_TURN), "{text}");
+        assert!(turn_budget_ended(&context, HF94_KEY, &turn.id), "turnBudgetEnded equals the open turn id");
+    }
+
+    #[test]
     fn engage_chatter_does_not_extend_the_window_and_its_end_is_a_clean_sleep() {
         let (_root, context, config, headers) = hf94_wait_fixture(json!({"minMs":100,"minQuietAfterNewMs":0}));
         let turn = engage_turn(&context);
@@ -16597,6 +16677,9 @@ mod tests {
         start_fake_onebot_with_sticker_rows(request_count, fail_mutations, Vec::new())
     }
 
+    /// `failure_retcode` sentinel: answer retcode 100 with QQ's result=120 (the bot is muted).
+    const MUTED_FIXTURE_RETCODE: i64 = -120;
+
     fn start_fake_onebot_with_sticker_rows(
         request_count: usize,
         fail_mutations: bool,
@@ -16706,6 +16789,8 @@ mod tests {
                 let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                 let response = if path == "/fetch_custom_face_detail" {
                     json!({ "status": "ok", "retcode": 0, "data": sticker_rows.clone() })
+                } else if failure_retcode == Some(MUTED_FIXTURE_RETCODE) {
+                    json!({ "status": "failed", "retcode": 100, "message": "sendMsg failed: result=120", "wording": "fixture muted" })
                 } else if let Some(retcode) = failure_retcode {
                     json!({ "status": "failed", "retcode": retcode, "wording": "fixture denied" })
                 } else {
@@ -20015,6 +20100,47 @@ mod tests {
         assert_eq!(conv["stickerCollectTimes"], json!([now]));
         assert_eq!(conv["stickerCollectPending"][0]["id"], "other");
         assert_eq!(conv["stickerSendProtected"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_sticker_mute_refusal_survives_an_outbox_write_failure() {
+        let (url, server) = start_fake_onebot_with_retcode(2, Some(MUTED_FIXTURE_RETCODE), vec![json!({
+            "emoji_id":"fixture-sticker", "resId":"fixture-sticker", "url":"https://fixture.invalid/sticker.gif", "source":"qq"
+        })]);
+        let decoy = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let decoy_url = format!("http://127.0.0.1:{}", decoy.local_addr().unwrap().port());
+        let key = "group:7001";
+        let token = "sticker-mute-persistence";
+        let (root, _) = fixture_runtime("sticker mute persistence", "fixture-console");
+        let config_path = root.0.join("config/config.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        cfg["allow"]["groups"] = json!(["7001"]);
+        std::fs::write(&config_path, cfg.to_string()).unwrap();
+        let context = prepare_sticker_runtime(&root, &url, &decoy_url, "fixture", &json!({
+            "paused":false, "conversations": { (key): {"agentToken":token,"recentMessages":[],"sendTimes":[]} }
+        }));
+        std::fs::write(root.0.join("data/stickers.json"), serde_json::to_vec(&json!([{
+            "id":"fixture-sticker", "url":"https://fixture.invalid/sticker.gif", "source":"fixture"
+        }])).unwrap()).unwrap();
+        // After the attempt record is written, the outbox becomes unwritable: the refusal's own record fails.
+        let outbox = root.0.join("data/send-outbox.jsonl");
+        STICKER_SUBMISSION_TEST_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(move |stage, _| {
+            if stage == "after_guard" {
+                let _ = std::fs::remove_file(&outbox);
+                std::fs::create_dir(&outbox).unwrap();
+            }
+        })));
+        let headers = HashMap::from([("x-agent-token".to_string(), token.to_string())]);
+        let result = handle_send_sticker_selected_with_fetch(&context, &headers,
+            &json!({"key":key,"stickerId":"fixture-sticker"}).to_string(), &context.load_config().unwrap(),
+            |_, _| Ok(b"synthetic image".to_vec()));
+        STICKER_SUBMISSION_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+        let (status, text) = result.unwrap_err();
+        assert_eq!(status, 403, "a definite mute refusal stays a 403 even when its record cannot be written: {text}");
+        assert!(text.contains("禁言"), "{text}");
+        let store: Value = serde_json::from_slice(&std::fs::read(root.0.join("data/group-mutes.json")).unwrap()).unwrap();
+        assert_eq!(store["groups"][key]["personalUntil"], json!(-1), "the refusal still taught the mute");
+        let _ = server.join();
     }
 
     #[test]

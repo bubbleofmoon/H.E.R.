@@ -473,7 +473,7 @@ fn stop_selected(
     }
     // A listener never grants authority. Refuse all ambiguous observations before the first stop.
     let listener = holder(dependency)?;
-    let scan = matching(dependency)?;
+    let scan = matching(dependency, Unreadable::Refuse)?;
     if scan.pending {
         return Err("unresolved dependency wrapper; upgrade stop refused".into());
     }
@@ -936,7 +936,7 @@ fn recover(
             }
             let next = existing(context, &cfg, name)?;
             let mut states = read_states(context)?;
-            let scan = matching(&next)?;
+            let scan = matching(&next, Unreadable::Refuse)?;
             if holder(&next)?.is_none() && scan.found.is_empty() && !scan.pending {
                 return Err("candidate exited before recovery health judgment".into());
             }

@@ -657,6 +657,10 @@ fn send_recorded_inline(
             report.error = Some(format!("发送意图未能持久记录，未发送：{error}"));
             return report;
         }
+        Err(BeginError::Muted(text)) => {
+            report.error = Some(text);
+            return report;
+        }
     };
     let history = History { ob, kind, id_s };
     let mut confirmed_ids: Vec<i64> = Vec::new();
@@ -668,6 +672,11 @@ fn send_recorded_inline(
         if stop.is_none() {
             if let Err(why) = guard() {
                 stop = Some(format!("发送已取消：{why}"));
+            }
+        }
+        if stop.is_none() {
+            if let Some(mute) = crate::group_mute::active(context, key) {
+                stop = Some(mute.refusal_text(crate::parity_clock::now_ms()));
             }
         }
         let mut attempt_ms = 0;

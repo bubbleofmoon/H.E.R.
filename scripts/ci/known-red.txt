@@ -1,8 +1,3 @@
 # Known red: failing tests that CI reports under KNOWN RED instead of failing the run.
 # Format: <os> <target> <test> #<ticket>   os: linux | windows | any; test: libtest name (no wildcards).
 # Read only by scripts/ci/run-tests.py --known-red (CI); local runs stay strict. Rules: docs/agents/rust-validation.md.
-
-# Hosted Windows runner: administrator rights, timing, file locks
-windows supervisor_dependencies an_uninspectable_foreign_node_image_does_not_block_configured_dependency_startup #40
-windows supervisor_dependencies denied_inspection_reports_an_elevated_or_access_restricted_dependency_and_leaves_it_alone #40
-windows supervisor_dependencies explicit_stop_and_hang_recovery_never_kill_uninspectable_dependencies #40
