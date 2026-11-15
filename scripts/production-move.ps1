@@ -84,6 +84,9 @@ public static class HerMove67Native {
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(SafeFileHandle file, out ByHandleInfo info);
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint size, uint flags);
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint size);
+  [StructLayout(LayoutKind.Sequential)] struct DispositionInfo { [MarshalAs(UnmanagedType.U1)] public bool DeleteFile; }
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(SafeFileHandle file, int infoClass, ref DispositionInfo info, uint size);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(SafeFileHandle file, byte[] buffer, uint toRead, out uint read, IntPtr overlapped);
   [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
   [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
@@ -147,42 +150,69 @@ public static class HerMove67Native {
     if (length == 0 || length >= buffer.Capacity) return path;
     return buffer.ToString();
   }
-  // Claims the owner go file: opens it once, exclusively (no other open, not even a read) and deleted when the handle
-  // closes, and judges it only through that handle. Returns { status, file identity, last write FILETIME, text }.
-  // Status: ok, missing, busy (another open holds it), unreadable, link (a reparse point or a folder), aliased (more
-  // than one name: a hard link), moved (the final path by handle is not the expected file) or toolarge.
-  public static string[] ClaimFile(string path, string expected) {
+  // The owner go file, held open while the script judges it. Nothing is deleted until Delete() is called, which the
+  // script does only after the checks and the ledger entry; Close() without Delete() leaves the file in place.
+  public sealed class GoFile {
+    public string Status = ""; public string Identity = ""; public string Written = ""; public string Text = "";
+    internal SafeFileHandle Handle;
+    public bool Delete() {
+      if (Handle == null) return false;
+      DispositionInfo info; info.DeleteFile = true;
+      return SetFileInformationByHandle(Handle, 4, ref info, (uint)Marshal.SizeOf(typeof(DispositionInfo)));
+    }
+    public void Close() { if (Handle != null) { Handle.Dispose(); Handle = null; } }
+  }
+  // Opens the owner go file once, exclusively (no other open, not even a read; the link itself, never its target) and
+  // judges it only through that handle, in this order: a reparse point or folder (link), the final path by handle
+  // against the expected file (moved: a folder swapped after the link check), more than one name (aliased: a hard
+  // link), more than 4 KiB (toolarge), then the text (ok). Other statuses: missing, busy (another open holds it),
+  // unreadable.
+  public static GoFile OpenGoFile(string path, string expected) {
     // Shifts instead of long hex literals: the public scan refuses digit runs of 7 or more.
-    const uint GenericRead = 1u << 31; const uint DeleteAccess = 1u << 16; const uint OpenExisting = 3;
-    const uint OpenReparsePoint = 1u << 21; const uint DeleteOnClose = 1u << 26;
-    SafeFileHandle handle = CreateFile(path, GenericRead | DeleteAccess, 0, IntPtr.Zero, OpenExisting, OpenReparsePoint | DeleteOnClose, IntPtr.Zero);
+    const uint GenericRead = 1u << 31; const uint DeleteAccess = 1u << 16; const uint OpenExisting = 3; const uint OpenReparsePoint = 1u << 21;
+    GoFile go = new GoFile();
+    SafeFileHandle handle = CreateFile(path, GenericRead | DeleteAccess, 0, IntPtr.Zero, OpenExisting, OpenReparsePoint, IntPtr.Zero);
     if (handle.IsInvalid) {
       int error = Marshal.GetLastWin32Error();
-      if (error == 2 || error == 3) return new string[] { "missing", "", "", "" };
-      if (error == 32) return new string[] { "busy", "", "", "" };
-      return new string[] { "unreadable", "", "", "" };
+      go.Status = (error == 2 || error == 3) ? "missing" : (error == 32 ? "busy" : "unreadable");
+      return go;
     }
-    using (handle) {
-      ByHandleInfo info;
-      if (!GetFileInformationByHandle(handle, out info)) return new string[] { "unreadable", "", "", "" };
-      string identity = info.VolumeSerial.ToString("x8") + "-" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8");
-      string written = (((ulong)info.Written.High << 32) | info.Written.Low).ToString();
-      if ((info.Attributes & 0x400) != 0 || (info.Attributes & 0x10) != 0) return new string[] { "link", identity, written, "" };
-      if (info.Links != 1) return new string[] { "aliased", identity, written, "" };
-      StringBuilder final = new StringBuilder(32768);
-      uint length = GetFinalPathNameByHandle(handle, final, (uint)final.Capacity, 0);
-      if (length == 0 || length >= final.Capacity) return new string[] { "unreadable", identity, written, "" };
-      string finalPath = final.ToString();
-      if (finalPath.StartsWith(@"\\?\")) finalPath = finalPath.Substring(4);
-      if (!String.Equals(finalPath, expected, StringComparison.OrdinalIgnoreCase)) return new string[] { "moved", identity, written, "" };
-      if (info.SizeHigh != 0 || info.SizeLow > 4096) return new string[] { "toolarge", identity, written, "" };
-      byte[] bytes = new byte[info.SizeLow];
-      FileStream stream = new FileStream(handle, FileAccess.Read);
-      int read = 0;
-      while (read < bytes.Length) { int got = stream.Read(bytes, read, bytes.Length - read); if (got <= 0) break; read += got; }
-      string text = new UTF8Encoding(false).GetString(bytes, 0, read).TrimStart((char)0xFEFF);
-      return new string[] { "ok", identity, written, text };
+    go.Handle = handle;
+    ByHandleInfo info;
+    if (!GetFileInformationByHandle(handle, out info)) { go.Status = "unreadable"; return go; }
+    go.Identity = info.VolumeSerial.ToString("x8") + "-" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8");
+    go.Written = (((ulong)info.Written.High << 32) | info.Written.Low).ToString();
+    if ((info.Attributes & 0x400) != 0 || (info.Attributes & 0x10) != 0) { go.Status = "link"; return go; }
+    StringBuilder final = new StringBuilder(32768);
+    uint length = GetFinalPathNameByHandle(handle, final, (uint)final.Capacity, 0);
+    if (length == 0 || length >= final.Capacity) { go.Status = "unreadable"; return go; }
+    string finalPath = final.ToString();
+    if (finalPath.StartsWith(@"\\?\")) finalPath = finalPath.Substring(4);
+    if (!String.Equals(finalPath, expected, StringComparison.OrdinalIgnoreCase)) { go.Status = "moved"; return go; }
+    if (info.Links != 1) { go.Status = "aliased"; return go; }
+    if (info.SizeHigh != 0 || info.SizeLow > 4096) { go.Status = "toolarge"; return go; }
+    byte[] bytes = new byte[info.SizeLow];
+    uint read = 0;
+    while (read < bytes.Length) {
+      byte[] chunk = new byte[bytes.Length - read];
+      uint got;
+      if (!ReadFile(handle, chunk, (uint)chunk.Length, out got, IntPtr.Zero) || got == 0) break;
+      Array.Copy(chunk, 0, bytes, read, got);
+      read += got;
     }
+    go.Text = new UTF8Encoding(false).GetString(bytes, 0, (int)read).TrimStart((char)0xFEFF);
+    go.Status = "ok";
+    return go;
+  }
+  // Opens or creates a plain file (the run lock, the go ledger) exclusively, refusing a reparse point, which it checks
+  // through the handle. Returns null for a link or a folder; throws IOException when another holder has it open.
+  public static FileStream OpenPlain(string path) {
+    const uint GenericRead = 1u << 31; const uint GenericWrite = 1u << 30; const uint OpenAlways = 4; const uint OpenReparsePoint = 1u << 21;
+    SafeFileHandle handle = CreateFile(path, GenericRead | GenericWrite, 0, IntPtr.Zero, OpenAlways, OpenReparsePoint, IntPtr.Zero);
+    if (handle.IsInvalid) throw new IOException("the file is held by another holder or cannot be opened", Marshal.GetHRForLastWin32Error());
+    ByHandleInfo info;
+    if (!GetFileInformationByHandle(handle, out info) || (info.Attributes & 0x400) != 0 || (info.Attributes & 0x10) != 0) { handle.Dispose(); return null; }
+    return new FileStream(handle, FileAccess.ReadWrite);
   }
 }
 '@
@@ -316,14 +346,36 @@ function Assert-RehearsalPort([int]$Port) {
 }
 # The owner's go for a run the Windows coordinator starts (#67, docs/agents/production-ops.md): one file directly in
 # the go folder, at most 2 hours old, holding exactly one line: "MOVE <release>", "ROLLBACK <the state file's
-# release>" or "COPY". Initialize-Run claims it before any lock, blocker or state (Claim-OwnerGo: one exclusive
-# handle, deleted on close, judged through that handle), so a refusal anywhere later leaves no reusable go;
-# Confirm-Owner judges the kept text. A ledger of claimed file identities refuses a second name of the same file.
+# release>" or "COPY". Initialize-Run claims it before every refusal that does not judge the go file's own path
+# (Claim-OwnerGo: one exclusive handle, checked through it, recorded in a ledger of file identities, then deleted
+# through it), so a refusal anywhere later leaves no reusable go; Confirm-Owner judges the kept text. The ledger
+# refuses a second name of the same file. Threat model: the go file guards against an agent acting without a
+# relayed owner go; whoever can write the go folder can already write a go file, so the script cannot authenticate
+# the writer, and races that need the same account to swap links during a run are out of scope beyond failing closed.
 function Get-GoFolder {
   if ($Rehearsal) { return (Join-Path (Split-Path -Parent $script:Root) 'go') }
   return 'C:\her-orch\67\go'
 }
 function Get-GoLedger { return (Join-Path (Split-Path -Parent (Get-GoFolder)) 'go-claimed.txt') }
+# Reads the claimed identities and appends this one, through one exclusive handle that refuses a link (checked through
+# the handle) in a folder with no link above it. Returns whether the identity was already there.
+function Use-GoLedger([string]$Identity) {
+  $ledger = Get-GoLedger
+  Assert-NoLinkAbove (Split-Path -Parent $ledger) 'the go ledger'
+  $stream = $null
+  try { $stream = [HerMove67Native]::OpenPlain($ledger) } catch { Stop-Refused 'the go ledger is held by another run' }
+  if ($null -eq $stream) { Stop-Refused 'the go ledger is a link or a folder' }
+  try {
+    $reader = [IO.StreamReader]::new($stream, [Text.ASCIIEncoding]::new(), $false, 4096, $true)
+    $lines = Split-Lines ($reader.ReadToEnd())
+    $seen = @($lines) -contains $Identity
+    $bytes = [Text.ASCIIEncoding]::new().GetBytes($Identity + "`r`n")
+    [void]$stream.Seek(0, [IO.SeekOrigin]::End)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+    return $seen
+  } finally { $stream.Dispose() }
+}
 function Test-OwnerGoLine([string[]]$Lines, [string]$Word, [string]$Release) {
   # MOVE and ROLLBACK always name a release; only COPY stands alone.
   if (@('MOVE', 'ROLLBACK') -ccontains $Word -and -not $Release) { return $false }
@@ -343,18 +395,21 @@ function Claim-OwnerGo {
   if (Test-Within $path $script:Root) { Stop-Refused 'the owner go file must lie outside the install root' }
   Assert-NoLinkAbove $folder 'the owner go file'
   Assert-RehearsalPath $folder
-  # The file itself is judged through its handle: no link, one name, and its final path is the expected file (a
-  # folder swapped after the check above shows up there).
+  # The file itself is judged through its one exclusive handle: no link, its final path is the expected file (a folder
+  # swapped after the check above shows up there), one name, one line's size. Nothing is deleted before those checks:
+  # a link or a moved file is closed and left alone. A file that passed them (or has a second name, or is too large)
+  # is recorded in the ledger while the handle is still held, and only then deleted through that handle.
   $expected = [HerMove67Native]::LongPath($folder) + '\' + (Split-Path -Leaf $path)
-  $claim = [HerMove67Native]::ClaimFile($path, $expected)
-  $script:GoClaim = [pscustomobject]@{ Status = [string]$claim[0]; Identity = [string]$claim[1]; Written = [string]$claim[2]; Text = [string]$claim[3] }
-  if ($script:GoClaim.Identity) {
-    $ledger = Get-GoLedger
-    $used = @()
-    if (Test-Path -LiteralPath $ledger -PathType Leaf) { $used = Read-Lines $ledger }
-    if (@($used) -contains $script:GoClaim.Identity -and $script:GoClaim.Status -eq 'ok') { $script:GoClaim.Status = 'replayed' }
-    [IO.File]::AppendAllText($ledger, ($script:GoClaim.Identity + "`r`n"), [Text.ASCIIEncoding]::new())
-  }
+  $claim = [HerMove67Native]::OpenGoFile($path, $expected)
+  try {
+    $status = [string]$claim.Status
+    if (@('ok', 'aliased', 'toolarge') -contains $status) {
+      $seen = Use-GoLedger ([string]$claim.Identity)
+      if ($status -eq 'ok' -and $seen) { $status = 'replayed' }
+      if (-not $claim.Delete()) { Stop-Failed 'the owner go file could not be deleted' }
+    }
+    $script:GoClaim = [pscustomobject]@{ Status = $status; Identity = [string]$claim.Identity; Written = [string]$claim.Written; Text = [string]$claim.Text }
+  } finally { $claim.Close() }
   switch ($script:GoClaim.Status) {
     'ok' { return }
     'missing' { Stop-Refused 'the owner go file is missing' }
@@ -1283,13 +1338,17 @@ function Initialize-Run {
   if ($env:OS -ne 'Windows_NT') { Stop-Refused 'this script runs on Windows only' }
   if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { Stop-Refused 'run this script in Windows PowerShell 5.1' }
   if ($Production -eq $Rehearsal) { Stop-Refused 'pass -Production for the live move or -Rehearsal for a rehearsal, exactly one' }
-  if ($env:HER_INSTALL_ROOT) { Stop-Refused 'HER_INSTALL_ROOT is set; open a new PowerShell without it' }
   if ($OwnerGoFile -and $Mode -eq 'Inventory') { Stop-Refused 'Inventory changes nothing and takes no owner go file' }
-  if ($OwnerGoFile -and $RehearsalConfirm) { Stop-Refused 'pass either -RehearsalConfirm or -OwnerGoFile, not both' }
+  # Before the claim come only the checks that place the go file itself: the run kind, the install root it sits
+  # beside, and (in a rehearsal) the temporary folder. Every other refusal follows the claim, so a run that carries a
+  # go file and is refused for anything else still consumes it.
   $script:Root = Get-Normal $InstallRoot
   $script:Temp = Get-Normal ([IO.Path]::GetTempPath())
+  if ($Rehearsal -and (-not (Test-Within $script:Root $script:Temp) -or $script:Root -ieq $script:Temp)) { Stop-Refused 'a rehearsal install root must be a folder inside the temporary folder' }
+  if ($OwnerGoFile) { Claim-OwnerGo }
+  if ($env:HER_INSTALL_ROOT) { Stop-Refused 'HER_INSTALL_ROOT is set; open a new PowerShell without it' }
+  if ($OwnerGoFile -and $RehearsalConfirm) { Stop-Refused 'pass either -RehearsalConfirm or -OwnerGoFile, not both' }
   if ($Rehearsal) {
-    if (-not (Test-Within $script:Root $script:Temp) -or $script:Root -ieq $script:Temp) { Stop-Refused 'a rehearsal install root must be a folder inside the temporary folder' }
     if (-not $env:HER_TASK_SCHEDULER_FILE -or -not (Test-Within $env:HER_TASK_SCHEDULER_FILE $script:Temp) -or (Test-Within $env:HER_TASK_SCHEDULER_FILE $script:Root)) { Stop-Refused 'a rehearsal needs HER_TASK_SCHEDULER_FILE in the temporary folder, outside the install root' }
     Assert-RehearsalPath $script:Root
     Assert-RehearsalPath $env:HER_TASK_SCHEDULER_FILE
@@ -1301,7 +1360,7 @@ function Initialize-Run {
     if ($env:HER_TASK_SCHEDULER_FILE) { Stop-Refused 'HER_TASK_SCHEDULER_FILE is set; open a new PowerShell without it' }
     if ($RehearsalAbortAfter -or $RehearsalFault -or $RehearsalConfirm) { Stop-Refused 'rehearsal switches need -Rehearsal' }
     # Inventory is read-only and may run non-interactively. A changing mode needs the owner at the keyboard, or the
-    # owner's go file for this run (the Windows coordinator runs it on a relayed go; claimed below, judged by
+    # owner's go file for this run (the Windows coordinator runs it on a relayed go; claimed above, judged by
     # Confirm-Owner).
     if ($RelayDefaultPort -ne 8317) { Stop-Refused '-RelayDefaultPort is for rehearsals; production uses the relay default 8317' }
     if ($Mode -ne 'Inventory' -and -not $OwnerGoFile) {
@@ -1313,8 +1372,6 @@ function Initialize-Run {
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Stop-Refused 'run this script from an administrator PowerShell' }
   }
   Assert-NoLinkAbove $script:Root 'the install root'
-  # The owner go file is claimed before any lock, blocker or state: whatever refuses later, it serves no other run.
-  if ($OwnerGoFile) { Claim-OwnerGo }
   $script:ProfilePath = $ProfileFolder
   if (-not $script:ProfilePath) { $script:ProfilePath = $env:USERPROFILE }
   $base = Get-Normal $EvidenceRoot
@@ -1327,10 +1384,14 @@ function Initialize-Run {
   if (Test-Within $base $script:Root) { Stop-Refused 'the evidence folder must be outside the install root' }
   [void][IO.Directory]::CreateDirectory($base)
   # One run at a time whatever -EvidenceRoot says: a fixed lock beside the go folder, then the evidence lock.
+  # The lock file must be a plain file (checked through its handle) in a folder with no link above it, or a link
+  # retargeted between runs could hand each run its own lock.
   $runLock = Join-Path (Split-Path -Parent (Get-GoFolder)) 'move-run.lock'
   [void][IO.Directory]::CreateDirectory((Split-Path -Parent $runLock))
-  try { $script:RunLockStream = [IO.File]::Open($runLock, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+  Assert-NoLinkAbove (Split-Path -Parent $runLock) 'the run lock'
+  try { $script:RunLockStream = [HerMove67Native]::OpenPlain($runLock) }
   catch { Stop-Refused 'another run of this script is active' }
+  if ($null -eq $script:RunLockStream) { Stop-Refused 'the run lock is a link or a folder' }
   try { $script:LockStream = [IO.File]::Open((Join-Path $base 'move.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
   catch { Stop-Refused 'another run of this script is active' }
   $script:Evidence = Join-Path $base ($Mode.ToLowerInvariant() + '-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff'))

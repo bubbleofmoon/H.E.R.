@@ -47,8 +47,12 @@ public issue, comment or commit names those vault paths and nothing else.
   owner's words and names the release. The Windows coordinator then writes a one-time go
   file directly in `C:\her-orch\67\go\`, holding the single line `MOVE <release>`,
   `ROLLBACK <release>` or `COPY`, at most 2 hours before the run, and passes it as
-  `-OwnerGoFile`; the script reads and deletes it before the first change, so it serves one
-  run only. The same go covers the move's post-move checks and the persona import and
+  `-OwnerGoFile`. The first run that gets past the invocation guards consumes it: the run
+  checks it and deletes it before its first change, whatever that run does afterwards. The go
+  file guards against an agent acting without a relayed owner go. Anyone who can write the go
+  folder could write a go file, so the script cannot authenticate the writer, and races that
+  need the same account to swap links during a run are out of scope beyond failing closed.
+  The same go covers the move's post-move checks and the persona import and
   assignment through the console. The script's own automatic rollback needs no go. Without
   `-OwnerGoFile`, Move, Rollback and OperatorFolders need an interactive session and the
   typed word (`MOVE`, `ROLLBACK`, `COPY`). Every other production action stays the owner's.

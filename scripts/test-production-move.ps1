@@ -1124,6 +1124,12 @@ try {
   try { $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', (Join-Path $goFolder 'go.txt'))) 'S8-go-link' }
   finally { [IO.Directory]::Delete($goFolder); Remove-Item -LiteralPath $goReal -Recurse -Force }
   Assert-Run $run 1 'a junction or link lies on the path of the owner go file' 'S8 go folder behind a link'
+  # Refused for HER_INSTALL_ROOT, a check that now follows the claim: the go file is consumed all the same.
+  $goFile = Write-GoFile 'COPY'
+  $env:HER_INSTALL_ROOT = $unused
+  try { $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-env' } finally { Remove-Item -Path Env:HER_INSTALL_ROOT -ErrorAction SilentlyContinue }
+  Assert-Run $run 1 'HER_INSTALL_ROOT is set' 'S8 go file with HER_INSTALL_ROOT set'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S8: a refusal for HER_INSTALL_ROOT left the go file for another run'
   # A hard-link alias is refused, and the original name is then refused as already used: one file, one run.
   $goFile = Write-GoFile 'COPY'
   $alias = Join-Path $goFolder 'alias.txt'
@@ -1133,9 +1139,10 @@ try {
   $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-replay'
   Assert-Run $run 1 'the owner go file was already used' 'S8 the other name of a used go file'
   Assert-True (-not (Test-Path -LiteralPath $goFile) -and -not (Test-Path -LiteralPath $alias)) 'S8: an aliased go file was left behind'
-  # Held open by another run: refused without being read (that run's claim consumes it).
+  # Held open elsewhere with every sharing allowed: the claim's own open, which allows none, must fail (a claim that
+  # shared would read it and pass here).
   $goFile = Write-GoFile 'COPY'
-  $holder = [IO.File]::Open($goFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+  $holder = [IO.File]::Open($goFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
   try { $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-busy' } finally { $holder.Dispose(); Remove-Item -LiteralPath $goFile -Force }
   Assert-Run $run 1 'the owner go file is held by another run' 'S8 go file held by another run'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'ops'))) 'S8: a refused go file let the copy run'
