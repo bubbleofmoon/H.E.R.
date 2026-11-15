@@ -197,6 +197,8 @@ function Stop-Refused([string]$Reason) { throw ('REFUSED: ' + $Reason) }
 function Stop-Failed([string]$Reason) { throw ('FAILED: ' + $Reason) }
 function Get-SafeMessage([string]$Text) {
   if ($Text.StartsWith('REFUSED: ') -or $Text.StartsWith('FAILED: ')) { return $Text }
+  # The hidden text goes to the private evidence log, so the console line's pointer to it holds.
+  Write-Log ('unexpected error: ' + $Text)
   return 'an unexpected error (details in the evidence log)'
 }
 function Add-Blocker([string]$Reason) {
@@ -1792,12 +1794,13 @@ function Test-OldProductionUp($plan) {
 function Start-OldProduction($plan, [switch]$Settle) {
   $settleSeconds = 0
   if ($Settle) { $settleSeconds = 30 }
-  $settle = [DateTime]::UtcNow.AddSeconds($settleSeconds)
+  # Not $settle: PowerShell names are case-insensitive, so that would assign to the [switch]$Settle parameter.
+  $settleUntil = [DateTime]::UtcNow.AddSeconds($settleSeconds)
   while ($true) {
     $up = $false
     try { $up = [bool](Test-OldProductionUp $plan) } catch { $up = $false }
     if ($up) { return $false }
-    if ([DateTime]::UtcNow -ge $settle) { break }
+    if ([DateTime]::UtcNow -ge $settleUntil) { break }
     Start-Sleep -Seconds 3
   }
   [void](Invoke-Old @('lifecycle', 'set', 'running', '--runtime-root', $plan.OldRuntime, '--by', 'owner-67', '--reason', 'rollback of the move') 'rollback-old-running')
