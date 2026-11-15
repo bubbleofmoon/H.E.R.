@@ -1070,7 +1070,7 @@ try {
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalConfirm', '-DigestModel', 'fixture-digest-model')) 'S5' 'MOVE'
   Assert-Run $run 0 'MOVE DONE' 'S5'
   Assert-Run $run 0 'Type MOVE to go on' 'S5 confirmation prompt'
-  Assert-Run $run 0 'linked 2 DSH bundles in the new DSH home' 'S5 bundle links'
+  Assert-Run $run 0 'linked 4 DSH bundles in the new DSH home' 'S5 bundle links'
   Assert-Run $run 0 'live: every new owner is held and the new live bridge publishes its heartbeat' 'S5 live owner'
   Assert-Moved 'S5' -Digest
   $doneState = Get-LatestState
