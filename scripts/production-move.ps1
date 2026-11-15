@@ -655,6 +655,9 @@ function Get-IdleState([string]$Cli, [string]$Runtime, [string]$Label) {
 function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [string]$Label, [switch]$NoHash) {
   $base = Get-Normal $Root
   $target = Get-Normal $TargetRoot
+  # The start folder too: a source that is itself a junction or link would be copied from somewhere else.
+  $start = Get-Item -LiteralPath $base -Force -ErrorAction SilentlyContinue
+  if ($null -ne $start -and ($start.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused ('a junction or link was found in ' + $Label) }
   $skip = @{}
   foreach ($relative in @($Exclude)) { if ($relative) { $skip[$relative.ToLowerInvariant()] = $true } }
   $entries = [Collections.Generic.List[object]]::new()
@@ -697,10 +700,14 @@ function Assert-SameManifest($Source, $Copy, [string]$Label) {
     if ($null -eq $copied -or $copied.Length -ne $entry.Length -or $copied.Sha256 -ne $entry.Sha256) { Stop-Failed ('the copy of ' + $Label + ' differs from its source (manifests in the evidence folder)') }
   }
 }
-# Every junction or link below a folder, found without following any.
+# Every junction or link below a folder, found without following any. A start folder that is itself a junction or
+# link is the one result: it is never entered, so a caller deletes only that link and nothing behind it.
 function Get-ReparsePoints([string]$Folder) {
   $found = [Collections.Generic.List[string]]::new()
-  if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return ,$found }
+  $start = Get-Item -LiteralPath $Folder -Force -ErrorAction SilentlyContinue
+  if ($null -eq $start) { return ,$found }
+  if ($start.Attributes -band [IO.FileAttributes]::ReparsePoint) { $found.Add($start.FullName); return ,$found }
+  if ($start -isnot [IO.DirectoryInfo]) { return ,$found }
   $pending = [Collections.Generic.Stack[string]]::new()
   $pending.Push($Folder)
   while ($pending.Count -gt 0) {
@@ -781,7 +788,7 @@ function Copy-Verified([string]$From, [string]$To, [string[]]$Exclude, [string]$
     $stray = Join-Path $To $relative
     if (Test-Present $stray) { Remove-TreeSafely $stray }
   }
-  if ($Rehearsal -and $RehearsalFault -eq 'CorruptCopy' -and $Label -eq 'snowluma') { [IO.File]::AppendAllText((Join-Path $To 'package.json'), ' ') }
+  if ($Rehearsal -and $RehearsalFault -eq 'CorruptCopy' -and @('snowluma', 'ops') -contains $Label) { [IO.File]::AppendAllText((Join-Path $To 'package.json'), ' ') }
   $copied = Get-Manifest $To $To @() $Label
   Save-Manifest $copied ($Label + '-copy')
   Assert-SameManifest $source $copied $Label
@@ -1512,6 +1519,37 @@ function Register-HerTask($plan) {
   Save-State 'Registered'
   Write-Step 'the HER logon task is registered and matches its definition'
 }
+# Fixed facts for a failed health check, kept in the private evidence folder before the rollback moves the runtime
+# aside: what each probe targets (dependencies.json), who listens on each production port and since when, when the
+# new owners started (their markers), and the new runtime's own dependency files. No command lines.
+function Save-HealthDiagnostics($plan) {
+  $lines = [Collections.Generic.List[string]]::new()
+  try {
+    $runtime = Join-Path $script:Root 'runtime'
+    $lines.Add('now ' + [DateTime]::UtcNow.ToString('o'))
+    $dependencies = Read-Json (Join-Path $runtime 'dependencies.json')
+    foreach ($name in @('onebot', 'onebot_ws', 'dsh', 'model', 'relay')) { $lines.Add('target ' + $name + ' ' + [string](Get-Prop $dependencies $name)) }
+    foreach ($port in (Get-ProductionPortList $plan)) {
+      $owners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
+      if ($owners.Count -eq 0) { $lines.Add('listener ' + $port + ' none'); continue }
+      foreach ($owner in $owners) {
+        $identity = Get-Identity $owner 'listener'
+        if ($null -eq $identity) { $lines.Add('listener ' + $port + ' pid ' + $owner + ' unidentified'); continue }
+        $lines.Add('listener ' + $port + ' pid ' + $owner + ' image ' + $identity.Exe + ' started ' + [DateTime]::FromFileTimeUtc([long]$identity.Start).ToString('o'))
+      }
+    }
+    foreach ($role in @('supervisor', 'live', 'console')) {
+      $marker = Join-Path $runtime ('data\logs\rbridge-' + $role + '.lock.owner.json')
+      if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { $lines.Add('owner ' + $role + ' no marker'); continue }
+      $start = [string](Get-Prop (Get-Prop (Read-Json $marker) 'identity') 'start')
+      $lines.Add('owner ' + $role + ' started ' + [DateTime]::FromFileTimeUtc([long]$start).ToString('o'))
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $runtime 'data') -File -Force -Filter 'dependenc*.json')) {
+      Write-Utf8 (Join-Path $script:Evidence ('health-' + $file.Name)) (Read-Text $file.FullName)
+    }
+  } catch { $lines.Add('diagnostics incomplete: ' + [string]$_.Exception.Message) }
+  Write-Utf8 (Join-Path $script:Evidence 'health-diagnostics.txt') ((@($lines) -join "`r`n") + "`r`n")
+}
 function Start-NewProduction($plan) {
   $runtime = Join-Path $script:Root 'runtime'
   [void](Invoke-Cli $plan.Cli @('lifecycle', 'set', 'running', '--runtime-root', $runtime, '--by', 'owner-67', '--reason', 'move into the install root') 'new-set-running')
@@ -1526,6 +1564,7 @@ function Start-NewProduction($plan) {
   $health = Invoke-Cli $plan.Cli @('lifecycle', 'assert-running', '--runtime-root', $runtime, '--wait', ([string]$HealthWaitSeconds + 's')) 'health' @(0, 1)
   $verdict = $health.Output | ConvertFrom-Json
   if ($health.Code -ne 0 -or $verdict.ok -ne $true) {
+    Save-HealthDiagnostics $plan
     $failing = @($verdict.parts.PSObject.Properties | Where-Object { [string]$_.Value.verdict -ne 'pass' } | ForEach-Object { $_.Name })
     Stop-Failed ('the health check failed: ' + ($failing -join ', '))
   }
@@ -1644,11 +1683,20 @@ function Invoke-Rollback([string]$Why) {
       $oldAlreadyUp = $false
       if ($phase -ge (Get-PhaseIndex 'Stopping')) { try { $oldAlreadyUp = [bool](Test-OldProductionUp $plan) } catch { $oldAlreadyUp = $false } }
       try {
+        # Listed before the stop: once DSH is gone, a tool process whose command line names no new-layout path can no
+        # longer be told apart as its descendant.
+        $snapshot = @()
+        foreach ($process in (Get-NewLayoutProcesses $plan)) {
+          $identity = Get-Identity ([int]$process.ProcessId) 'new-layout process'
+          if ($null -ne $identity) { $snapshot += $identity }
+        }
         [void](Invoke-Cli $runtimeCli @('stop', '--runtime-root', $runtime, '--confirm', '--with-dependencies') 'rollback-new-stop' @(0, 3))
         if ((Get-NewOwnerStates $runtimeCli).supervisor -eq 'held') { [void](Invoke-Cli $runtimeCli @('lifecycle', 'stop-supervisor', '--runtime-root', $runtime, '--confirm') 'rollback-new-stop-supervisor') }
         # Only "free" counts: an owner the CLI cannot identify ("unknown") may still run.
         Wait-Until { $states = Get-NewOwnerStates $runtimeCli; $states.supervisor -eq 'free' -and $states.live -eq 'free' -and $states.console -eq 'free' } 30 'the new owners did not stop'
-        # Whatever the stop left of the new layout (a DSH child, a refused dependency) is stopped by verified identity.
+        # Whatever the stop left of the new layout (a DSH child, a refused dependency) is stopped by verified identity:
+        # first what the snapshot saw, then anything still found now.
+        foreach ($identity in $snapshot) { if (Test-SameIdentity $identity) { Stop-Identity $identity } }
         foreach ($process in (Get-NewLayoutProcesses $plan)) {
           $identity = Get-Identity ([int]$process.ProcessId) 'new-layout process'
           if ($null -ne $identity) { Stop-Identity $identity }
@@ -1801,7 +1849,17 @@ function Invoke-OperatorFolders {
   if (-not (Test-Path -LiteralPath $from -PathType Container)) { Stop-Refused 'the ops folder is missing' }
   if (Test-Present $to) { Stop-Refused 'the install root already has ops' }
   Confirm-Owner 'COPY' 'Ready to copy the operator scripts into the install root ops folder.'
-  Copy-Verified $from $to @() 'ops'
+  # Copied beside it first and renamed only after the hash check, so a failed copy leaves no ops folder and a retry
+  # can run (a leftover staging folder is this mode's own and is removed reparse-safely).
+  $staging = Join-Path $script:Root '.ops-copy'
+  if (Test-Present $staging) { Remove-TreeSafely $staging }
+  try { Copy-Verified $from $staging @() 'ops' }
+  catch {
+    $failure = $_
+    try { if (Test-Present $staging) { Remove-TreeSafely $staging } } catch { Write-Log ('the ops staging folder could not be removed: ' + $_.Exception.Message) }
+    throw $failure
+  }
+  [IO.Directory]::Move($staging, $to)
   Write-Step 'OPERATOR FOLDER COPIED: the original stays until the owner approves its deletion'
   return 0
 }

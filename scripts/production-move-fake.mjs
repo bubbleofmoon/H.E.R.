@@ -39,14 +39,22 @@ if (config.role === 'dsh' && Array.isArray(config.bundles) && process.env.DSH_HO
     loaded.push({ name: manifest.name, real });
   }
 }
+// Diagnostics: the start and every request, appended to the log fixture-resident.json names (never a source folder).
+function note(event) {
+  if (!config.requestLog) return;
+  try { fs.appendFileSync(config.requestLog, `${JSON.stringify({ t: new Date().toISOString(), pid: process.pid, role: config.role, from: here, ...event })}\n`); } catch { /* diagnostics only */ }
+}
+note({ event: 'start' });
 
 const server = http.createServer((request, response) => {
   const chunks = [];
   request.on('data', (chunk) => chunks.push(chunk));
   request.on('end', () => {
-    // The late-child scenarios: DSH starts a child process; its command line names DSH's own folder, like a tool server.
+    note({ event: 'request', method: request.method, url: request.url });
+    // The late-child scenarios: DSH starts a child process whose command line names no folder of the layout, like a
+    // tool server; only its parentage ties it to DSH.
     if (config.role === 'dsh' && request.url === '/fixture/spawn-child') {
-      spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'her-67-late-child', here], { stdio: 'ignore' }).unref();
+      spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'her-67-late-child'], { stdio: 'ignore' }).unref();
     }
     let status = 200;
     let body;
@@ -63,8 +71,13 @@ const server = http.createServer((request, response) => {
     } else {
       body = { status: 'ok', retcode: 0, data: { online: true, good: true } };
     }
-    response.writeHead(status, { 'content-type': 'application/json' });
-    response.end(JSON.stringify(body));
+    // An explicit Content-Length and Connection: close, like the real gateway. HER's OneBot client reads the raw body
+    // to the end of the connection and does not decode chunked transfer encoding (her/src/onebot.rs read_response_until);
+    // writeHead without a length makes Node send the body chunked, which that client cannot parse (the likely cause
+    // of the R4 early run's S5 health failure; the harness framing check guards it).
+    const text = JSON.stringify(body);
+    response.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(text), connection: 'close' });
+    response.end(text);
   });
 });
 if (config.role === 'onebot') {

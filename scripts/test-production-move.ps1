@@ -27,6 +27,18 @@ $NodePath = [IO.Path]::GetFullPath($NodePath)
 $F = [IO.Path]::GetFullPath($FixtureRoot).TrimEnd('\')
 $temp = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
 if (-not $F.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase) -or (Test-Path -LiteralPath $F)) { throw 'FixtureRoot must be a new folder under the temporary folder.' }
+# Lexical containment is not enough: a junction or link between the temporary folder and the fixture would lead every
+# fixture write and launch elsewhere, production included.
+function Test-FixturePlace([string]$Path) {
+  $step = Split-Path -Parent ([IO.Path]::GetFullPath($Path).TrimEnd('\'))
+  while ($step.Length -gt $temp.TrimEnd('\').Length) {
+    $item = Get-Item -LiteralPath $step -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    $step = Split-Path -Parent $step
+  }
+  return $true
+}
+if (-not (Test-FixturePlace $F)) { throw 'FixtureRoot must not lie behind a junction or link under the temporary folder.' }
 foreach ($name in @('her.exe', 'her-cli.exe', 'herupdate.exe')) { if (-not (Test-Path -LiteralPath (Join-Path $Candidate $name) -PathType Leaf)) { throw ('Candidate has no ' + $name + '.') } }
 if (-not (Test-Path -LiteralPath $NodePath -PathType Leaf)) { throw 'NodePath must name node.exe.' }
 $cli = Join-Path $Candidate 'her-cli.exe'
@@ -120,13 +132,23 @@ function Invoke-Her([string[]]$Arguments, [int[]]$Allowed = @(0), [string]$Exe =
   return $output
 }
 function Get-FileHashText([string]$Path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
+# A tree's names, file hashes and times, without following a junction or link: a link is recorded with its target
+# (the linked bundles are hashed once, through the qq-bridge entry of Get-Originals).
 function Get-TreeHash([string]$Folder) {
   $base = [IO.Path]::GetFullPath($Folder).TrimEnd('\')
-  $lines = @(Get-ChildItem -LiteralPath $base -Recurse -Force | Sort-Object -Property FullName | ForEach-Object {
-    $relative = $_.FullName.Substring($base.Length)
-    if ($_.PSIsContainer) { 'D ' + $relative } else { 'F ' + $relative + ' ' + (Get-FileHashText $_.FullName) + ' ' + $_.LastWriteTimeUtc.Ticks }
-  })
-  return ($lines -join "`n")
+  $lines = [Collections.Generic.List[string]]::new()
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push($base)
+  while ($pending.Count -gt 0) {
+    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+      $relative = $item.FullName.Substring($base.Length)
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $lines.Add('L ' + $relative + ' ' + [string]@((Get-Item -LiteralPath $item.FullName -Force).Target)[0]); continue }
+      if ($item -is [IO.DirectoryInfo]) { $lines.Add('D ' + $relative); $pending.Push($item.FullName); continue }
+      $lines.Add('F ' + $relative + ' ' + (Get-FileHashText $item.FullName) + ' ' + $item.LastWriteTimeUtc.Ticks)
+    }
+  }
+  $sorted = @($lines | Sort-Object)
+  return ($sorted -join "`n")
 }
 function Get-TaskShape([string]$Name) {
   $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $Name })
@@ -151,6 +173,23 @@ function Get-Listener([int]$Port) {
   $process = @(Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId=' + $ids[0]))
   if ($process.Count -ne 1) { return $null }
   return [pscustomobject]@{ Pid = $ids[0]; Exe = [string]$process[0].ExecutablePath; CommandLine = [string]$process[0].CommandLine }
+}
+# get_status as HER's OneBot client sends and reads it (her/src/onebot.rs): Connection: close, the raw body read to
+# the end of the connection, no chunked decoding. True when that body is JSON with status ok.
+function Test-RawOneBot([int]$Port) {
+  $client = [Net.Sockets.TcpClient]::new('127.0.0.1', $Port)
+  try {
+    $stream = $client.GetStream()
+    $stream.ReadTimeout = 10000
+    $request = 'POST /get_status HTTP/1.1' + "`r`n" + 'Host: 127.0.0.1:' + $Port + "`r`n" + 'Content-Type: application/json' + "`r`n" + 'Content-Length: 2' + "`r`n" + 'Connection: close' + "`r`n`r`n" + '{}'
+    $bytes = [Text.Encoding]::ASCII.GetBytes($request)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $raw = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false)).ReadToEnd()
+  } finally { $client.Close() }
+  $split = $raw.IndexOf("`r`n`r`n")
+  if ($split -lt 0) { return $false }
+  try { $parsed = $raw.Substring($split + 4) | ConvertFrom-Json } catch { return $false }
+  return ([string]$parsed.status -eq 'ok')
 }
 function Stop-FixtureListener([int]$Port) {
   if ($Port -le 0) { return }
@@ -274,6 +313,17 @@ function Get-FixtureLinks([string]$Folder) {
   }
   return ,$found
 }
+# Deletes a fixture tree: its links first, as links, then the folder, but only when no link is left; a failed link
+# deletion keeps the tree (a recursive delete would follow the link). $DeleteLink lets the self-check make it fail.
+function Remove-FixtureTree([string]$Path, [scriptblock]$DeleteLink = { param($Link) if ((Get-Item -LiteralPath $Link -Force) -is [IO.DirectoryInfo]) { [IO.Directory]::Delete($Link) } else { [IO.File]::Delete($Link) } }) {
+  try {
+    foreach ($link in (Get-FixtureLinks $Path)) { & $DeleteLink $link }
+    $remaining = Get-FixtureLinks $Path
+    if ($remaining.Count -gt 0) { return $false }
+  } catch { Write-Warning ('Cleanup of the fixture links: ' + $_.Exception.Message); return $false }
+  Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+  return $true
+}
 function Get-LateChildren {
   return @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf('her-67-late-child', [StringComparison]::OrdinalIgnoreCase) -ge 0 })
 }
@@ -385,6 +435,25 @@ try {
     if ((Get-ComparableConfig $variant) -ceq $sampleBase) { throw 'FAIL comparator self-check: a changed configuration compares equal.' }
   }
 
+  # Link self-check inside the fixture: a place behind a junction is refused, and a tree hash does not follow a
+  # junction (a change behind it leaves the hash alone).
+  $probeTarget = Join-Path $F 'link-check\target'
+  $probeLink = Join-Path $F 'link-check\tree\linked'
+  Write-Fixture (Join-Path $probeTarget 'file.txt') 'one'
+  [void][IO.Directory]::CreateDirectory((Split-Path -Parent $probeLink))
+  [void](New-Item -ItemType Junction -Path $probeLink -Target $probeTarget)
+  try {
+    if (Test-FixturePlace (Join-Path $probeLink 'fixture')) { throw 'FAIL link self-check: a place behind a junction is accepted.' }
+    $before = Get-TreeHash (Join-Path $F 'link-check\tree')
+    Write-Fixture (Join-Path $probeTarget 'file.txt') 'two'
+    if ((Get-TreeHash (Join-Path $F 'link-check\tree')) -cne $before) { throw 'FAIL link self-check: the tree hash follows a junction.' }
+    $removed = Remove-FixtureTree (Join-Path $F 'link-check\tree') { param($Link) throw 'link deletion refused (self-check)' } 3> $null
+    if ($removed -or -not (Test-Path -LiteralPath (Join-Path $probeTarget 'file.txt'))) { throw 'FAIL link self-check: the cleanup deleted a tree whose link could not be removed.' }
+  } finally {
+    if (Test-Path -LiteralPath $probeLink) { [IO.Directory]::Delete($probeLink) }
+    Remove-Item -LiteralPath (Join-Path $F 'link-check') -Recurse -Force
+  }
+
   # Four free loopback ports, none a production port.
   $listeners = @(1..4 | ForEach-Object { $item = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0); $item.Start(); $item })
   $ports = @($listeners | ForEach-Object { $_.LocalEndpoint.Port })
@@ -404,7 +473,9 @@ try {
   [void][IO.Directory]::CreateDirectory((Join-Path $snowFolder 'logs'))
   Copy-Item -LiteralPath $NodePath -Destination (Join-Path $snowFolder 'node.exe')
   Copy-Item -LiteralPath $fake -Destination (Join-Path $snowFolder 'index.mjs')
-  Write-FixtureJson (Join-Path $snowFolder 'fixture-resident.json') ([ordered]@{ role = 'onebot'; port = $onebotPort })
+  # The fakes append their start and every request to logs outside every source folder (diagnostics after a failure).
+  [void][IO.Directory]::CreateDirectory((Join-Path $F 'fake-logs'))
+  Write-FixtureJson (Join-Path $snowFolder 'fixture-resident.json') ([ordered]@{ role = 'onebot'; port = $onebotPort; requestLog = (Join-Path $F 'fake-logs\onebot.jsonl') })
   Write-FixtureJson (Join-Path $snowFolder 'package.json') ([ordered]@{ name = 'snowluma-fixture'; version = '1.2.3' })
   Write-Fixture (Join-Path $snowFolder 'config\snowluma.json') '{"note":"fixture"}'
   $snowConfig = Get-Item -LiteralPath (Join-Path $snowFolder 'config\snowluma.json')
@@ -419,7 +490,7 @@ try {
   Write-FixtureJson (Join-Path $dshPackage 'package.json') ([ordered]@{ name = '@deepseek-ai/dsh'; version = '9.9.9'; bin = [ordered]@{ dsh = 'bin/dsh.mjs' } })
   [void][IO.Directory]::CreateDirectory((Join-Path $dshPackage 'bin'))
   Copy-Item -LiteralPath $fake -Destination (Join-Path $dshPackage 'bin\dsh.mjs')
-  Write-FixtureJson (Join-Path $dshPackage 'bin\fixture-resident.json') ([ordered]@{ role = 'dsh'; port = $dshPort; failMarker = $failMarker; bundles = $bundleNames })
+  Write-FixtureJson (Join-Path $dshPackage 'bin\fixture-resident.json') ([ordered]@{ role = 'dsh'; port = $dshPort; failMarker = $failMarker; bundles = $bundleNames; requestLog = (Join-Path $F 'fake-logs\dsh.jsonl') })
   [void][IO.Directory]::CreateDirectory((Join-Path $F 'dsh-work'))
 
   # Profile DSH home, and the runtime's own copy of its credentials.
@@ -503,6 +574,8 @@ try {
   Start-ScheduledTask -TaskName $relayTask -TaskPath '\'
   Start-ScheduledTask -TaskName $supervisorTask -TaskPath '\'
   Wait-For { Test-OldUp } 'the synthetic old production starts' 120
+  # The fake gateway must answer in the framing HER's client reads, or every health check fails at snowluma.
+  if (-not (Test-RawOneBot $onebotPort)) { throw 'FAIL fixture: the fake OneBot get_status answer is not plain JSON that HER''s client can read.' }
   $baselineSupervisor = (Get-Owners $oldRuntime $unused $cli).supervisorPid
   $taskShapes = @{}
   foreach ($name in @($supervisorTask, $relayTask)) { $taskShapes[$name] = Get-TaskShape $name }
@@ -514,7 +587,7 @@ try {
   [void][IO.Directory]::CreateDirectory($evidence)
   $rehearsalArgs = @('-Rehearsal', '-InstallRoot', $root, '-EvidenceRoot', $evidence, '-OldSupervisorTask', $supervisorTask, '-OldRelayTask', $relayTask, '-ProfileFolder', $profileFolder)
   $sourceArgs = @('-OldRuntime', $oldRuntime, '-OldRelayFolder', $relayFolder, '-ReleaseSource', $releaseSource)
-  $moveArgs = $rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '120')
+  $moveArgs = $rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '180')
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
@@ -731,13 +804,32 @@ try {
   Step 'S3b interrupted after staging'
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Staged')) 'S3b'
   Assert-Run $run 4 'REHEARSAL ABORT after Staged' 'S3b'
+  # Someone put a junction where the new deps folder would be: the rollback deletes that junction as a link and never
+  # enters it, so a link inside its target survives.
+  $outside = Join-Path $F 'outside-deps'
+  $outsideLink = Join-Path $outside 'inner'
+  Write-Fixture (Join-Path $F 'outside-inner\keep.txt') 'keep'
+  [void][IO.Directory]::CreateDirectory($outside)
+  [void](New-Item -ItemType Junction -Path $outsideLink -Target (Join-Path $F 'outside-inner'))
+  [void](New-Item -ItemType Junction -Path (Join-Path $root 'deps') -Target $outside)
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', (Get-LatestState))) 'S3b-rollback'
   Assert-Run $run 0 'ROLLED BACK' 'S3b rollback'
+  Assert-True ((Test-Path -LiteralPath $outsideLink) -and ((Get-Item -LiteralPath $outsideLink -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) 'S3b: the rollback entered a junction at deps and deleted a link behind it'
+  [IO.Directory]::Delete($outsideLink)
+  Remove-Item -LiteralPath $outside, (Join-Path $F 'outside-inner') -Recurse -Force
   Assert-OldUntouched 'S3b'
 
   Step 'S3c interrupted after the copy; a held folder blocks the move-aside'
-  $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Copied')) 'S3c'
+  # The retired cutover files are left out of the copy. They exist only while this Move runs and are gone before any
+  # rollback restarts the old production (with them, its live bridge would demand legacy fences and refuse to start).
+  $handover = @('import-manifest.json', 'data\lifecycle\session-handover.json', 'data\lifecycle\session-handover-required.json')
+  Write-FixtureJson (Join-Path $oldRuntime $handover[0]) ([ordered]@{ sourceLayout = 'legacy-deployment' })
+  Write-FixtureJson (Join-Path $oldRuntime $handover[1]) ([ordered]@{ rustOwns = $true; legacyRoot = (Join-Path $F 'legacy') })
+  Write-FixtureJson (Join-Path $oldRuntime $handover[2]) ([ordered]@{ v = 1 })
+  try { $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Copied')) 'S3c' }
+  finally { foreach ($name in $handover) { Remove-Item -LiteralPath (Join-Path $oldRuntime $name) -Force -ErrorAction SilentlyContinue } }
   Assert-Run $run 4 'REHEARSAL ABORT after Copied' 'S3c'
+  foreach ($name in $handover) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $root ('runtime\' + $name)))) ('S3c: the copied runtime kept ' + $name) }
   $state = Get-LatestState
   $hold = [HerMove67RehearsalNative]::HoldDirectory((Join-Path $root 'runtime'))
   try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3c-held' } finally { $hold.Dispose() }
@@ -763,12 +855,7 @@ try {
   Assert-OldRunning 'S4'
 
   Step 'S5 move, confirmed with the right word'
-  $handover = @('import-manifest.json', 'data\lifecycle\session-handover.json', 'data\lifecycle\session-handover-required.json')
-  Write-FixtureJson (Join-Path $oldRuntime $handover[0]) ([ordered]@{ sourceLayout = 'legacy-deployment' })
-  Write-FixtureJson (Join-Path $oldRuntime $handover[1]) ([ordered]@{ rustOwns = $true; legacyRoot = (Join-Path $F 'legacy') })
-  Write-FixtureJson (Join-Path $oldRuntime $handover[2]) ([ordered]@{ v = 1 })
-  try { $run = Invoke-MoveScript ($moveArgs + @('-RehearsalConfirm', '-DigestModel', 'fixture-digest-model')) 'S5' 'MOVE' }
-  finally { foreach ($name in $handover) { Remove-Item -LiteralPath (Join-Path $oldRuntime $name) -Force -ErrorAction SilentlyContinue } }
+  $run = Invoke-MoveScript ($moveArgs + @('-RehearsalConfirm', '-DigestModel', 'fixture-digest-model')) 'S5' 'MOVE'
   Assert-Run $run 0 'MOVE DONE' 'S5'
   Assert-Run $run 0 'Type MOVE to go on' 'S5 confirmation prompt'
   Assert-Run $run 0 'linked 2 DSH bundles in the new DSH home' 'S5 bundle links'
@@ -794,6 +881,10 @@ try {
 
   Step 'S8 operator folder'
   $operatorArgs = $rehearsalArgs + @('-Mode', 'OperatorFolders', '-OperatorSource', $opsSource)
+  # A copy that fails its hash check leaves neither ops nor its staging folder, so the retry below can run.
+  $run = Invoke-MoveScript ($operatorArgs + @('-RehearsalFault', 'CorruptCopy')) 'S8-corrupt'
+  Assert-Run $run 1 'differs from its source' 'S8 failed copy'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'ops')) -and -not (Test-Path -LiteralPath (Join-Path $root '.ops-copy'))) 'S8: a failed copy left an ops folder behind'
   $run = Invoke-MoveScript $operatorArgs 'S8'
   Assert-Run $run 0 'OPERATOR FOLDER COPIED' 'S8'
   Assert-True ((Get-FileHashText (Join-Path $root 'ops\fixture-op.ps1')) -eq (Get-FileHashText (Join-Path $opsSource 'fixture-op.ps1'))) 'S8: the ops copy differs'
@@ -841,13 +932,7 @@ try {
   if ($savedScheduler) { $env:HER_TASK_SCHEDULER_FILE = $savedScheduler }
   if ($savedInstallRoot) { $env:HER_INSTALL_ROOT = $savedInstallRoot }
   if ($passed -and -not $KeepFixture) {
-    # Links first, as links, so the recursive delete never follows one.
-    try {
-      foreach ($link in (Get-FixtureLinks $F)) {
-        if ((Get-Item -LiteralPath $link -Force) -is [IO.DirectoryInfo]) { [IO.Directory]::Delete($link) } else { [IO.File]::Delete($link) }
-      }
-    } catch { Write-Warning ('Cleanup of the fixture links: ' + $_.Exception.Message) }
-    Remove-Item -LiteralPath $F -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not (Remove-FixtureTree $F)) { Write-Warning 'The fixture still holds a junction or link; it was kept. Delete its links as links, then the folder.' }
   }
 }
 if (-not $passed) { exit 1 }
