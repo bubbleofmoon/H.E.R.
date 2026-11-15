@@ -1,7 +1,7 @@
 ---
 name: ticket-implementer
-description: Implements or fixes one GitHub issue on bubbleofmoon/H.E.R. in its own worktree, test-first, and reports with checkable evidence. Sonnet by default; the coordinator may launch it on Haiku for small mechanical tickets. The coordinator gives it the issue, worktree, branch and any review report to fix.
-model: sonnet
+description: Implements or fixes one GitHub issue on bubbleofmoon/H.E.R. in its own worktree, test-first, and reports with checkable evidence. Haiku by default (XS briefs and M/L plan execution); the coordinator launches it on Sonnet only for S tickets and investigations. The coordinator gives it the issue, worktree, branch and any review report to fix.
+model: haiku
 effort: high
 disallowedTools: Agent
 color: blue
