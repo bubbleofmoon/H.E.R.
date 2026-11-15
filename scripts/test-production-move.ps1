@@ -4,9 +4,12 @@
 # fakes (scripts\production-move-fake.mjs), two HER-Test-67-<guid> fixture tasks started through hidden VBS launchers
 # that wait (so their instances stay Running, as in production) and a file scheduler for the HER task. It names no
 # production path as a target and contacts no QQ, DSH, model or TTS service. Windows PowerShell 5.1; no elevation.
+# The install root's qq-bridge folder holds two DSH bundles the profile DSH home links to, as in production.
+# -NodePath names a node.exe to copy: the synthetic production runs only on a private copy inside the fixture (with an
+# npm stub beside it), so no production process ever matches its configured program; the copy goes with the fixture.
 # Ends with "PASS production move rehearsal" or exits 1.
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-production-move.ps1 -Candidate <folder with
-#     her.exe, her-cli.exe and herupdate.exe> -NodePath <node.exe> -FixtureRoot <new folder under the temporary folder>
+#     her.exe, her-cli.exe and herupdate.exe> -NodePath <node.exe to copy> -FixtureRoot <new folder under the temporary folder>
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$Candidate,
@@ -92,6 +95,8 @@ $herScheduler = Join-Path $F 'scheduler\her-task.xml'
 $oldScheduler = Join-Path $F 'scheduler\old-task.xml'
 $failMarker = Join-Path $F 'fail-new-dsh'
 $decoy = Join-Path $F 'decoy-root'
+$bridgeBundles = Join-Path $root 'qq-bridge\dsh'
+$bundleNames = @('qq-mode-console', 'qq-agent-presets')
 $boundary = Join-Path $temp ('her-67-boundary-' + [guid]::NewGuid().ToString('N'))
 $registered = @()
 $passed = $false
@@ -197,6 +202,9 @@ function Get-ComparableConfig([string]$Text) {
     $parent = $value.PSObject.Properties[$pair[0]]
     if ($null -ne $parent -and $null -ne $parent.Value.PSObject.Properties[$pair[1]]) { $parent.Value.PSObject.Properties.Remove($pair[1]) }
   }
+  # -DigestModel sets memory.digest.model on purpose; everything else under memory must survive.
+  $memory = $value.PSObject.Properties['memory']
+  if ($null -ne $memory -and $null -ne $memory.Value.PSObject.Properties['digest'] -and $null -ne $memory.Value.digest.PSObject.Properties['model']) { $memory.Value.digest.PSObject.Properties.Remove('model') }
   return ($value | ConvertTo-Json -Depth 100 -Compress)
 }
 function Test-OldUp {
@@ -206,7 +214,7 @@ function Test-OldUp {
   return $true
 }
 function Get-Originals {
-  return [ordered]@{ dsh = (Get-TreeHash $dshHome); npx = (Get-TreeHash $npx); relay = (Get-TreeHash $relayFolder); auth = (Get-TreeHash $authFolder); snow = (Get-TreeHash $snowFolder); release = (Get-TreeHash $oldRelease) }
+  return [ordered]@{ dsh = (Get-TreeHash $dshHome); npx = (Get-TreeHash $npx); relay = (Get-TreeHash $relayFolder); auth = (Get-TreeHash $authFolder); snow = (Get-TreeHash $snowFolder); release = (Get-TreeHash $oldRelease); bridge = (Get-TreeHash (Join-Path $root 'qq-bridge')) }
 }
 function Assert-Originals([string]$Scenario) {
   $now = Get-Originals
@@ -250,7 +258,7 @@ function Assert-OldRunning([string]$Scenario, [switch]$Restricted) {
 function Get-LateChildren {
   return @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf('her-67-late-child', [StringComparison]::OrdinalIgnoreCase) -ge 0 })
 }
-function Assert-Moved([string]$Scenario) {
+function Assert-Moved([string]$Scenario, [switch]$Digest) {
   $newCli = Join-Path $root 'current\her-cli.exe'
   $pin = Join-Path $root 'deps\relay\0.0.1'
   $current = Get-Item -LiteralPath (Join-Path $root 'current') -Force
@@ -279,6 +287,39 @@ function Assert-Moved([string]$Scenario) {
   Assert-True ($config.snowluma.homeDir -ieq (Join-Path $root 'deps\snowluma\1.2.3') -and $config.snowluma.launcherPath -ieq (Join-Path $root 'deps\snowluma\1.2.3\index.mjs')) ($Scenario + ': SnowLuma paths were not remapped')
   $dependencies = Get-Content -LiteralPath (Join-Path $root 'runtime\dependencies.json') -Raw | ConvertFrom-Json
   Assert-True ($dependencies.relay -eq ('http://127.0.0.1:' + $relayPort)) ($Scenario + ': the relay origin')
+  $harnessKey = Join-Path $root 'runtime\config\harness-api-key'
+  if ($Digest) {
+    Assert-True ($config.memory.digest.model -ceq 'fixture-digest-model' -and $config.memory.digest.timeoutSecs -eq 90) ($Scenario + ': memory.digest.model or its sibling setting')
+    Assert-True ($dependencies.model -eq ('http://127.0.0.1:' + $relayPort)) ($Scenario + ': the model origin is not the relay')
+    Assert-True ((Test-Path -LiteralPath $harnessKey -PathType Leaf) -and [IO.File]::ReadAllText($harnessKey) -ceq 'fixture-relay-key-67') ($Scenario + ': config\harness-api-key is not the relay client key')
+  } else {
+    Assert-True ($null -eq $config.memory.digest.model -and $config.memory.digest.timeoutSecs -eq 90) ($Scenario + ': memory.digest changed without -DigestModel')
+    Assert-True ($dependencies.model -eq ('http://127.0.0.1:' + $dshPort)) ($Scenario + ': the model origin changed without -DigestModel')
+    Assert-True (-not (Test-Path -LiteralPath $harnessKey)) ($Scenario + ': config\harness-api-key was written without -DigestModel')
+  }
+  # Linked DSH bundles: links recreated in the new DSH home, bundles copied, texts rewritten, and DSH loads them there.
+  $newHome = Join-Path $root 'runtime\user\dsh'
+  foreach ($name in $bundleNames) {
+    $linkPath = Join-Path $newHome ('plugins\node_modules\' + $name)
+    $link = Get-Item -LiteralPath $linkPath -Force
+    Assert-True ([bool]($link.Attributes -band [IO.FileAttributes]::ReparsePoint)) ($Scenario + ': the bundle ' + $name + ' is not linked in the new DSH home')
+    $target = ([string]@($link.Target)[0]) -replace '^\\\\\?\\', ''
+    Assert-True ($target.TrimEnd('\') -ieq (Join-Path $newHome ('bundles\' + $name))) ($Scenario + ': the bundle link ' + $name + ' does not point at the new bundles folder')
+    Assert-True ((Get-FileHashText (Join-Path $newHome ('bundles\' + $name + '\package.json'))) -eq (Get-FileHashText (Join-Path $bridgeBundles ($name + '\package.json')))) ($Scenario + ': the bundle ' + $name + ' was not copied')
+  }
+  Assert-True ((Get-FileHashText (Join-Path $newHome 'bundles\qq-agent-presets\presets\qq-chat-v2.patch.yml')) -eq (Get-FileHashText (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2.patch.yml'))) ($Scenario + ': the bundle preset was not copied')
+  $pluginsText = [IO.File]::ReadAllText((Join-Path $newHome 'plugins\package.json'))
+  Assert-True ($pluginsText.IndexOf('qq-bridge', [StringComparison]::OrdinalIgnoreCase) -lt 0) ($Scenario + ': the new plugins package.json still names qq-bridge')
+  $plugins = $pluginsText | ConvertFrom-Json
+  Assert-True ($plugins.dependencies.'qq-mode-console' -ceq ('link:' + (Join-Path $newHome 'bundles\qq-mode-console').Replace('\', '/'))) ($Scenario + ': the forward-slash link: path was not rewritten')
+  Assert-True ($plugins.dependencies.'qq-agent-presets' -ceq ('link:' + (Join-Path $newHome 'bundles\qq-agent-presets'))) ($Scenario + ': the backslash link: path was not rewritten')
+  $loaded = Invoke-RestMethod -UseBasicParsing -Uri ('http://127.0.0.1:' + $dshPort + '/fixture/bundles') -TimeoutSec 10
+  $loadedNames = @(@($loaded.loaded) | ForEach-Object { [string]$_.name } | Sort-Object)
+  Assert-True (($loadedNames -join ',') -ceq 'qq-agent-presets,qq-mode-console') ($Scenario + ': DSH did not load both bundles')
+  foreach ($entry in @($loaded.loaded)) {
+    $real = [string]$entry.real
+    Assert-True ($real.EndsWith(('\runtime\user\dsh\bundles\' + [string]$entry.name), [StringComparison]::OrdinalIgnoreCase) -and $real.IndexOf('qq-bridge', [StringComparison]::OrdinalIgnoreCase) -lt 0) ($Scenario + ': DSH loaded ' + [string]$entry.name + ' from outside the new bundles folder')
+  }
   foreach ($name in @('import-manifest.json', 'data\lifecycle\session-handover.json', 'data\lifecycle\session-handover-required.json')) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $root ('runtime\' + $name)))) ($Scenario + ': the new runtime kept ' + $name) }
   Assert-True ((Get-FileHashText (Join-Path $root 'runtime\user\dsh\.credentials.yaml')) -eq (Get-FileHashText (Join-Path $dshHome '.credentials.yaml'))) ($Scenario + ': the DSH credentials')
   $newCordis = Join-Path $root 'runtime\user\dsh\profiles\web\cordis.patch.yml'
@@ -308,6 +349,15 @@ try {
   [void][IO.Directory]::CreateDirectory($F)
   # Fixture guard against an unused boundary (rust-validation.md); this never stats the production root.
   [void](Invoke-Her @('install-root', 'check-development', '--runtime-root', $F, '--install-root', $boundary))
+
+  # A private copy of Node inside the fixture runs the whole synthetic production, so a production node.exe (possibly
+  # under another account) never matches the fixture's configured program. The managed DSH pin is used in place; the
+  # supervisor only requires npm beside Node as a file, so a stub stands in and npm never runs.
+  $nodeFolder = Join-Path $F 'node'
+  [void][IO.Directory]::CreateDirectory($nodeFolder)
+  Copy-Item -LiteralPath $NodePath -Destination (Join-Path $nodeFolder 'node.exe')
+  $NodePath = Join-Path $nodeFolder 'node.exe'
+  Write-Fixture (Join-Path $nodeFolder 'node_modules\npm\bin\npm-cli.js') "// fixture npm stub; the rehearsal never runs npm`n"
 
   # The comparator must notice a wrapped array, a changed number and a dropped key, or S5 cannot judge the rewrite.
   $sample = '{"a":[1,2],"b":[],"c":["x"],"d":0.12,"e":null,"f":{},"g":"t"}'
@@ -350,7 +400,7 @@ try {
   Write-FixtureJson (Join-Path $dshPackage 'package.json') ([ordered]@{ name = '@deepseek-ai/dsh'; version = '9.9.9'; bin = [ordered]@{ dsh = 'bin/dsh.mjs' } })
   [void][IO.Directory]::CreateDirectory((Join-Path $dshPackage 'bin'))
   Copy-Item -LiteralPath $fake -Destination (Join-Path $dshPackage 'bin\dsh.mjs')
-  Write-FixtureJson (Join-Path $dshPackage 'bin\fixture-resident.json') ([ordered]@{ role = 'dsh'; port = $dshPort; failMarker = $failMarker })
+  Write-FixtureJson (Join-Path $dshPackage 'bin\fixture-resident.json') ([ordered]@{ role = 'dsh'; port = $dshPort; failMarker = $failMarker; bundles = $bundleNames })
   [void][IO.Directory]::CreateDirectory((Join-Path $F 'dsh-work'))
 
   # Profile DSH home, and the runtime's own copy of its credentials.
@@ -358,10 +408,19 @@ try {
   $credentialText = 'secret: ' + $secret + "`nrecords:`n  client-connection/browser-session:`n    kind: grant`n    payload:`n      version: 1`n      secret: " + $secret + "`n"
   Write-Fixture (Join-Path $dshHome '.credentials.yaml') $credentialText
   Write-Fixture (Join-Path $oldRuntime 'user\dsh\.credentials.yaml') $credentialText
-  Write-Fixture (Join-Path $dshHome 'plugins\qq-agent-presets\presets\qq-chat-v2.patch.yml') "# fixture preset`n"
+  # Two bundles in the install root's qq-bridge folder, linked from the profile's plugins folder (production uses
+  # directory symbolic links, which need a privilege; junctions are the same kind of directory link to the script) and
+  # named by link: dependencies in two spellings.
+  [void][IO.Directory]::CreateDirectory((Join-Path $dshHome 'plugins\node_modules'))
+  foreach ($name in $bundleNames) {
+    Write-FixtureJson (Join-Path $bridgeBundles ($name + '\package.json')) ([ordered]@{ name = $name; version = '0.0.1'; private = $true })
+    [void](New-Item -ItemType Junction -Path (Join-Path $dshHome ('plugins\node_modules\' + $name)) -Target (Join-Path $bridgeBundles $name))
+  }
+  Write-Fixture (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2.patch.yml') "# fixture preset`n"
+  Write-FixtureJson (Join-Path $dshHome 'plugins\package.json') ([ordered]@{ name = 'dsh-plugins-fixture'; private = $true; dependencies = [ordered]@{ 'qq-mode-console' = ('link:' + (Join-Path $bridgeBundles 'qq-mode-console').Replace('\', '/')); 'qq-agent-presets' = ('link:' + (Join-Path $bridgeBundles 'qq-agent-presets')) } })
   Write-Fixture (Join-Path $dshHome 'sessions\fixture-workdir\fixture.bin') ('fixture bytes ' * 50)
   $cordis = Join-Path $dshHome 'profiles\web\cordis.patch.yml'
-  Write-Fixture $cordis "# fixture profile head`n"
+  Write-Fixture $cordis "# fixture profile head`nbundles:`n  - qq-mode-console`n  - qq-agent-presets`n"
   [void](Invoke-Her @('dsh-mcp-config', '--patch-file', $cordis, '--bridge-exe', (Join-Path $oldRelease 'her.exe'), '--runtime-root', $oldRuntime, '--console-port', [string]$consolePort, '--install-root', $decoy))
   [IO.File]::AppendAllText($cordis, "# fixture profile tail`n", [Text.UTF8Encoding]::new($false))
   $originalCordis = [IO.File]::ReadAllText($cordis)
@@ -382,6 +441,7 @@ try {
     snowluma = [ordered]@{ accessToken = 'fixture-snow'; homeDir = $snowFolder; launcherPath = (Join-Path $snowFolder 'index.mjs') }
     tasks = [ordered]@{ installRoot = $oldRelease; nodePath = $NodePath; 'start-all' = [ordered]@{ snowLumaDirectory = $snowFolder; dshScript = (Join-Path $dshPackage 'bin\dsh.mjs'); dshWorkingDirectory = (Join-Path $F 'dsh-work') } }
     backup = [ordered]@{ keepDays = 7 }
+    memory = [ordered]@{ digest = [ordered]@{ timeoutSecs = 90 } }
     fixtureExtras = [ordered]@{
       many = @(1, 2, 3); one = @('only'); none = @(); objects = @([ordered]@{ a = 1 }, [ordered]@{ b = @() }); nested = @(@(1, 2), @('x'))
       big = [long]4 * [long][int]::MaxValue; ratio = 0.12; nothing = $null; empty = [ordered]@{}
@@ -430,7 +490,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 43 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 55 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -461,8 +521,13 @@ try {
 
   Step 'S1e earlier attempt'
   [void][IO.Directory]::CreateDirectory((Join-Path $root 'runtime'))
-  try { $run = Invoke-MoveScript $moveArgs 'S1e' } finally { Remove-Item -LiteralPath (Join-Path $root 'runtime') -Recurse -Force }
+  try {
+    $run = Invoke-MoveScript $moveArgs 'S1e'
+    $inventory = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new')) 'S1e-inventory'
+  } finally { Remove-Item -LiteralPath (Join-Path $root 'runtime') -Recurse -Force }
   Assert-Run $run 1 'the install root already has runtime' 'S1e'
+  # Inventory records the finding and runs every other check (one blocker, then the summary line).
+  Assert-Run $inventory 1 'INVENTORY: 1 blockers' 'S1e inventory'
   Assert-OldUntouched 'S1e'
 
   Step 'S1f disk space'
@@ -524,6 +589,14 @@ try {
   $outside = @('-Rehearsal', '-InstallRoot', $root, '-EvidenceRoot', $evidence, '-OldSupervisorTask', $supervisorTask, '-OldRelayTask', $relayTask, '-ProfileFolder', $env:SystemRoot, '-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new')
   $run = Invoke-MoveScript $outside 'S1m'
   Assert-Run $run 1 'rehearsal paths must lie inside the temporary folder' 'S1m'
+  # Inside the temporary folder by name, but behind a junction: refused before anything is written there.
+  $redirect = Join-Path $F 'redirect'
+  [void][IO.Directory]::CreateDirectory((Join-Path $F 'redirect-target'))
+  [void](New-Item -ItemType Junction -Path $redirect -Target (Join-Path $F 'redirect-target'))
+  $behind = @('-Rehearsal', '-InstallRoot', $root, '-EvidenceRoot', (Join-Path $redirect 'evidence'), '-OldSupervisorTask', $supervisorTask, '-OldRelayTask', $relayTask, '-ProfileFolder', $profileFolder, '-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new')
+  try { $run = Invoke-MoveScript $behind 'S1m-junction' } finally { [IO.Directory]::Delete($redirect) }
+  Assert-Run $run 1 'a rehearsal path passes through a junction or link' 'S1m junction'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $F 'redirect-target\evidence'))) 'S1m: the rehearsal wrote behind the junction'
   Assert-OldUntouched 'S1m'
 
   Step 'S1n process changed after the checks'
@@ -541,6 +614,43 @@ try {
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalConfirm')) 'S1p' 'move'
   Assert-Run $run 1 'the owner did not confirm' 'S1p'
   Assert-OldUntouched 'S1p'
+
+  Step 'S1q link inside a linked bundle'
+  $nested = Join-Path $bridgeBundles 'qq-mode-console\nested'
+  [void](New-Item -ItemType Junction -Path $nested -Target (Join-Path $F 'npm-cache'))
+  try { $run = Invoke-MoveScript $moveArgs 'S1q' } finally { [IO.Directory]::Delete($nested) }
+  Assert-Run $run 1 'a junction or link was found in dsh-bundle-qq-mode-console' 'S1q'
+  Assert-OldUntouched 'S1q'
+
+  Step 'S1r bundle placement and dependencies'
+  $placeholder = Join-Path $dshHome 'bundles'
+  [void][IO.Directory]::CreateDirectory($placeholder)
+  try { $run = Invoke-MoveScript $moveArgs 'S1r-bundles' } finally { [IO.Directory]::Delete($placeholder) }
+  Assert-Run $run 1 'the profile DSH home already has a bundles entry' 'S1r bundles entry'
+  $twinTarget = Join-Path $root 'qq-bridge\other\qq-mode-console'
+  $twinLink = Join-Path $dshHome 'plugins\extra\qq-mode-console'
+  [void][IO.Directory]::CreateDirectory($twinTarget)
+  [void][IO.Directory]::CreateDirectory((Split-Path -Parent $twinLink))
+  [void](New-Item -ItemType Junction -Path $twinLink -Target $twinTarget)
+  try { $run = Invoke-MoveScript $moveArgs 'S1r-twin' }
+  finally { [IO.Directory]::Delete($twinLink); Remove-Item -LiteralPath (Join-Path $dshHome 'plugins\extra') -Recurse -Force; Remove-Item -LiteralPath (Join-Path $root 'qq-bridge\other') -Recurse -Force }
+  Assert-Run $run 1 'two linked DSH bundles share a folder name' 'S1r same folder name'
+  $bundleManifest = Join-Path $bridgeBundles 'qq-mode-console\package.json'
+  $manifestBytes = [IO.File]::ReadAllBytes($bundleManifest)
+  $manifestTime = (Get-Item -LiteralPath $bundleManifest).LastWriteTimeUtc
+  Write-FixtureJson $bundleManifest ([ordered]@{ name = 'qq-mode-console'; version = '0.0.1'; dependencies = [ordered]@{ 'fixture-outside' = '1.0.0' } })
+  try { $run = Invoke-MoveScript $moveArgs 'S1r-dependency' }
+  finally { [IO.File]::WriteAllBytes($bundleManifest, $manifestBytes); (Get-Item -LiteralPath $bundleManifest).LastWriteTimeUtc = $manifestTime }
+  Assert-Run $run 1 'depends on a package outside its own folder' 'S1r outside dependency'
+  Assert-OldUntouched 'S1r'
+
+  Step 'S1s digest key conflict'
+  $oldHarnessKey = Join-Path $oldRuntime 'config\harness-api-key'
+  Write-Fixture $oldHarnessKey 'another-fixture-key'
+  try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-DigestModel', 'fixture-digest-model')) 'S1s' }
+  finally { Remove-Item -LiteralPath $oldHarnessKey -Force }
+  Assert-Run $run 1 'holds another key than the relay client key' 'S1s'
+  Assert-OldUntouched 'S1s'
 
   Step 'S2 health failure rolls back'
   Write-Fixture $failMarker 'fail'
@@ -560,6 +670,9 @@ try {
   $owners = Get-Owners $oldRuntime $unused $cli
   Assert-True ($owners.supervisor -ne 'held' -and $null -eq (Get-Listener $onebotPort)) 'S3: the old production still runs at the abort point'
   $state = Get-LatestState
+  # Someone deleted a disabled old task meanwhile: the rollback recreates it from its saved definition.
+  Wait-For { (Get-ScheduledTask -TaskName $relayTask -TaskPath '\').State -ne 'Running' } 'S3: the relay task instance ends' 60
+  Unregister-ScheduledTask -TaskName $relayTask -TaskPath '\' -Confirm:$false
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3-rollback'
   Assert-Run $run 0 'ROLLED BACK' 'S3 rollback'
   Assert-OldRunning 'S3'
@@ -582,6 +695,9 @@ try {
   Assert-Run $run 3 'THE OLD PRODUCTION RUNS AGAIN' 'S3c held folder'
   Assert-True ($run.Text.IndexOf('could not be moved aside', [StringComparison]::OrdinalIgnoreCase) -ge 0) 'S3c: the move-aside problem is not named'
   Wait-For { Test-OldUp } 'S3c: the old production runs while the rollback is incomplete' 60
+  # The relay fails before the rerun while the old supervisor stays up: the rerun must start the relay task alone.
+  Stop-FixtureListener $relayPort
+  Wait-For { $null -eq (Get-Listener $relayPort) } 'S3c: the relay stops' 30
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3c-rollback'
   Assert-Run $run 0 'ROLLED BACK' 'S3c rollback'
   Assert-OldRunning 'S3c'
@@ -602,18 +718,23 @@ try {
   Write-FixtureJson (Join-Path $oldRuntime $handover[0]) ([ordered]@{ sourceLayout = 'legacy-deployment' })
   Write-FixtureJson (Join-Path $oldRuntime $handover[1]) ([ordered]@{ rustOwns = $true; legacyRoot = (Join-Path $F 'legacy') })
   Write-FixtureJson (Join-Path $oldRuntime $handover[2]) ([ordered]@{ v = 1 })
-  try { $run = Invoke-MoveScript ($moveArgs + @('-RehearsalConfirm')) 'S5' 'MOVE' }
+  try { $run = Invoke-MoveScript ($moveArgs + @('-RehearsalConfirm', '-DigestModel', 'fixture-digest-model')) 'S5' 'MOVE' }
   finally { foreach ($name in $handover) { Remove-Item -LiteralPath (Join-Path $oldRuntime $name) -Force -ErrorAction SilentlyContinue } }
   Assert-Run $run 0 'MOVE DONE' 'S5'
   Assert-Run $run 0 'Type MOVE to go on' 'S5 confirmation prompt'
-  Assert-Moved 'S5'
+  Assert-Run $run 0 'linked 2 DSH bundles in the new DSH home' 'S5 bundle links'
+  Assert-Moved 'S5' -Digest
   $doneState = Get-LatestState
 
   Step 'S6 rollback after a finished move'
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $doneState)) 'S6-refused'
   Assert-Run $run 1 'pass -AfterDone' 'S6 refusal'
+  # The new DSH starts a child the new runtime's own stop does not end; the rollback must find and stop it.
+  [void](Invoke-WebRequest -UseBasicParsing -Uri ('http://127.0.0.1:' + $dshPort + '/fixture/spawn-child') -TimeoutSec 10)
+  Wait-For { @(Get-LateChildren).Count -ge 1 } 'S6: the new DSH child starts' 30
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $doneState, '-AfterDone')) 'S6'
   Assert-Run $run 0 'ROLLED BACK' 'S6'
+  Assert-True (@(Get-LateChildren).Count -eq 0) 'S6: a child of the new DSH survived the rollback'
   Assert-OldRunning 'S6' -Restricted
 
   Step 'S7 move again after rollbacks; DSH starts a child after the checks'

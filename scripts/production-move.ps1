@@ -8,6 +8,8 @@
 #                          checks, rewrite the configuration, register the HER task, start, health and report checks
 #   -Mode Rollback         restore the old task definitions and start the old production from the untouched originals
 #   -Mode OperatorFolders  copy <OperatorSource> (the ops scripts) to <install root>\ops
+# -DigestModel <id> (Inventory and Move) also points the memory digest at the relay: memory.digest.model, the model
+# origin in dependencies.json and config\harness-api-key.
 # Exit codes: 0 done; 1 refused, production left as it was; 2 failed and rolled back; 3 rollback incomplete, read the
 # printed steps; 4 rehearsal abort point reached. The console shows only fixed texts; details go to the evidence
 # folder, which stays private (vault).
@@ -33,6 +35,7 @@ param(
   [long]$FreeSpaceReserveBytes = 1GB,
   [switch]$AcceptDshProfileFiles,
   [switch]$AfterDone,
+  [string]$DigestModel = '',
   [ValidateSet('', 'Staged', 'Stopped', 'Copied', 'Registered')][string]$RehearsalAbortAfter = '',
   [ValidateSet('', 'StaleIdentity', 'DisturbAfterDisable', 'CorruptCopy', 'LateDshChild')][string]$RehearsalFault = '',
   [switch]$RehearsalConfirm
@@ -163,7 +166,16 @@ function Test-Within([string]$Path, [string]$Root) {
 }
 function Test-Present([string]$Path) { return $null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue) }
 function Assert-RehearsalPath([string]$Path) {
-  if ($Rehearsal -and -not (Test-Within $Path $script:Temp)) { Stop-Refused 'rehearsal paths must lie inside the temporary folder' }
+  if (-not $Rehearsal) { return }
+  if (-not (Test-Within $Path $script:Temp)) { Stop-Refused 'rehearsal paths must lie inside the temporary folder' }
+  # Lexical containment is not enough: a junction or link between the temporary folder and the path could lead the
+  # rehearsal's reads and writes anywhere, production included. Every existing step must be a real folder or file.
+  $current = Get-Normal $Path
+  while ($current.Length -gt $script:Temp.Length) {
+    $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused 'a rehearsal path passes through a junction or link' }
+    $current = Split-Path -Parent $current
+  }
 }
 function Assert-RehearsalPort([int]$Port) {
   if ($Rehearsal -and $ProductionPorts -contains $Port) { Stop-Refused 'a rehearsal never uses a production port' }
@@ -224,6 +236,7 @@ function Test-ExactVersion([string]$Version) {
   return $true
 }
 function Test-ReleaseName([string]$Name) { return ($Name -cmatch '^[a-z][a-z0-9-]{2,40}$') -and ($Name -cnotmatch '^v[0-9]') }
+function Test-ModelName([string]$Name) { return $Name -cmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$' }
 function Test-FreeSpace([double]$Free, [double]$Needed, [double]$Reserve) { return $Free -ge ($Needed + $Reserve) }
 function ConvertFrom-Sums([string[]]$Lines) {
   $sums = @{}
@@ -269,6 +282,23 @@ function Test-NamesRoot([string]$Text, $Roots) {
   foreach ($root in $Roots) { if ([regex]::IsMatch($Text, [regex]::Escape($root) + '(\\|["''\s]|$)')) { return $true } }
   return $false
 }
+# DSH texts name a linked bundle folder in three spellings: backslashes, forward slashes and JSON-escaped backslashes.
+# Each is replaced by the new folder in the same spelling, case-insensitively and only at a name boundary.
+function Convert-DshText([string]$Text, $TextMap) {
+  $result = $Text
+  foreach ($entry in $TextMap) {
+    $from = ([string]$entry.From).TrimEnd('\')
+    $to = ([string]$entry.To).TrimEnd('\')
+    $spellings = @(@($from.Replace('\', '\\'), $to.Replace('\', '\\')), @($from, $to), @($from.Replace('\', '/'), $to.Replace('\', '/')))
+    foreach ($pair in $spellings) {
+      $pattern = [regex]::Escape($pair[0]) + '(?=[\\/"''\s,;)\]}]|$)'
+      $result = [regex]::Replace($result, $pattern, $pair[1].Replace('$', '$$'), [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+  }
+  return $result
+}
+# A link: or file: dependency that climbs out with .. would resolve elsewhere once the DSH home has moved.
+function Test-ClimbingLink([string]$Text) { return [regex]::IsMatch($Text, '(?i)(?<![A-Za-z0-9])(link|file):\.\.[\\/]') }
 function Find-ForeignPaths($Value, [string]$Pointer, $Roots, [string]$Install, $Found) {
   if ($Value -is [string]) {
     $normal = $Value.Replace('/', '\').ToLowerInvariant()
@@ -306,6 +336,16 @@ function Convert-Config($Config, $plan) {
   Set-Prop $Config 'dependencies' $dependencies
   $update = Get-Prop $Config 'update'
   if ($null -eq $update) { Set-Prop $Config 'update' ([pscustomobject][ordered]@{ policy = 'off' }) } else { Set-Prop $update 'policy' 'off' }
+  if ($plan.DigestModel) {
+    # The memory digest runs on the relay (Q5): memory.digest.model; the model origin and the key follow elsewhere.
+    $memory = Get-Prop $Config 'memory'
+    if ($null -eq $memory) { $memory = [pscustomobject][ordered]@{}; Set-Prop $Config 'memory' $memory }
+    if ($memory -isnot [Management.Automation.PSCustomObject]) { Stop-Refused 'memory in the configuration is not an object' }
+    $digest = Get-Prop $memory 'digest'
+    if ($null -eq $digest) { $digest = [pscustomobject][ordered]@{}; Set-Prop $memory 'digest' $digest }
+    if ($digest -isnot [Management.Automation.PSCustomObject]) { Stop-Refused 'memory.digest in the configuration is not an object' }
+    Set-Prop $digest 'model' ([string]$plan.DigestModel)
+  }
   $found = [Collections.Generic.List[string]]::new()
   Find-ForeignPaths $Config '' @($plan.Roots) ($script:Root.ToLowerInvariant()) $found
   $dir = [string](Get-Prop (Get-Prop $Config 'backup') 'dir')
@@ -319,9 +359,16 @@ function Convert-Config($Config, $plan) {
 function Convert-Dependencies($Dependencies, $plan) {
   [void](Convert-Paths $Dependencies $plan.Map)
   Set-Prop $Dependencies 'relay' ('http://127.0.0.1:' + $plan.RelayPort)
+  if ($plan.DigestModel) { Set-Prop $Dependencies 'model' ('http://127.0.0.1:' + $plan.RelayPort) }
   $found = [Collections.Generic.List[string]]::new()
   Find-ForeignPaths $Dependencies '/dependencies.json' @($plan.Roots) ($script:Root.ToLowerInvariant()) $found
   return ,$found
+}
+# Both lists in one flat array. Never wrap a function that returns ,$list in @(): that nests the list as one element.
+function Get-ForeignPointers($Config, $Dependencies, $plan) {
+  $configFound = Convert-Config $Config $plan
+  $dependencyFound = Convert-Dependencies $Dependencies $plan
+  return ,@(@($configFound) + @($dependencyFound))
 }
 function Get-BackupDestination($Config) {
   $dir = [string](Get-Prop (Get-Prop $Config 'backup') 'dir')
@@ -481,6 +528,20 @@ function Get-Descendants([int]$ProcessId, [DateTime]$StartUtc) {
 function Get-OldImageProcesses([string]$Folder) {
   return @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -match '^[A-Za-z]:\\' -and (Split-Path -Parent $_.ExecutablePath) -ieq $Folder })
 }
+# Processes started from the new layout: an image under releases, current or deps, or the configured Node running a
+# script under deps or runtime (DSH and its tool servers). No process of the old production matches.
+function Get-NewLayoutProcesses($plan) {
+  $images = @(@('releases', 'current', 'deps') | ForEach-Object { (Join-Path $script:Root $_) + '\' })
+  $scripts = @(@('deps', 'runtime') | ForEach-Object { (Join-Path $script:Root $_) + '\' })
+  $node = [string]$plan.NodePath
+  return @(Get-CimInstance -ClassName Win32_Process | Where-Object {
+    $image = [string]$_.ExecutablePath
+    $line = [string]$_.CommandLine
+    $byImage = @($images | Where-Object { $image.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+    $byScript = $node -and ($image -ieq $node) -and @($scripts | Where-Object { $line.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0
+    $byImage -or $byScript
+  })
+}
 function Get-TaskShape([string]$Name) {
   $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $Name })
   if ($tasks.Count -ne 1) { return '' }
@@ -502,7 +563,11 @@ function Get-TaskRecord([string]$Name) {
   return [pscustomobject]@{ Name = $Name; Shape = $shape; Xml = $xml; Enabled = $shape.EndsWith('#True'); State = (Get-TaskState $Name) }
 }
 function Restore-Task($Record) {
-  Enable-ScheduledTask -TaskName $Record.Name -TaskPath '\' -ErrorAction Stop | Out-Null
+  # A deleted task is recreated from its saved definition first: Enable-ScheduledTask needs an existing task.
+  if (-not (Get-TaskShape $Record.Name)) {
+    Register-ScheduledTask -TaskName $Record.Name -TaskPath '\' -Xml $Record.Xml -Force -ErrorAction Stop | Out-Null
+  }
+  if ((Get-TaskShape $Record.Name) -ne $Record.Shape) { Enable-ScheduledTask -TaskName $Record.Name -TaskPath '\' -ErrorAction Stop | Out-Null }
   if ((Get-TaskShape $Record.Name) -ne $Record.Shape) {
     Register-ScheduledTask -TaskName $Record.Name -TaskPath '\' -Xml $Record.Xml -Force -ErrorAction Stop | Out-Null
   }
@@ -650,11 +715,11 @@ function Protect-Folder([string]$Path) {
   if ($foreign.Count -gt 0) { Stop-Failed 'the install root grants access to another account' }
   Write-Step 'the install root is restricted to the owner, SYSTEM and Administrators'
 }
-function Compare-DshStub([string]$Stub, [string]$DshHome) {
+function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude) {
   $differences = [Collections.Generic.List[string]]::new()
   if (-not (Test-Present $Stub)) { return ,$differences }
   $homeIndex = @{}
-  foreach ($entry in (Get-Manifest $DshHome $DshHome @() 'dsh-home')) { $homeIndex[$entry.Path.ToLowerInvariant()] = $entry.Sha256 }
+  foreach ($entry in (Get-Manifest $DshHome $DshHome $Exclude 'dsh-home')) { $homeIndex[$entry.Path.ToLowerInvariant()] = $entry.Sha256 }
   foreach ($entry in (Get-Manifest $Stub $Stub @() 'dsh-stub')) {
     if ($entry.Length -lt 0) { continue }
     $key = $entry.Path.ToLowerInvariant()
@@ -675,20 +740,140 @@ function New-McpProfile([string]$Cli, [string]$Source, [string]$Folder, [int]$Co
   if ($check.Code -ne 0 -or $check.Output.Trim() -ne 'unchanged') { Stop-Failed 'the rewritten DSH profile MCP block does not check as current' }
   return $copy
 }
-function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $Roots) {
+# ---------- linked DSH bundles ----------
+function Get-LinkTarget([string]$Path) {
+  $targets = @((Get-Item -LiteralPath $Path -Force).Target)
+  if ($targets.Count -ne 1 -or -not [string]$targets[0]) { return '' }
+  $target = [string]$targets[0]
+  if ($target.StartsWith('\\?\') -or $target.StartsWith('\??\')) { $target = $target.Substring(4) }
+  if ($target -notmatch '^[A-Za-z]:[\\/]') { $target = Join-Path (Split-Path -Parent $Path) $target }
+  return (Get-Normal $target)
+}
+# Directory links in the DSH home, found without following any link. Only a link to a folder strictly inside the
+# install root's qq-bridge folder is a bundle the move copies and links again; any other link refuses.
+function Find-DshLinks([string]$DshHome, [string]$BridgeRoot) {
+  $links = [Collections.Generic.List[object]]::new()
+  $base = Get-Normal $DshHome
+  $bridge = Get-Normal $BridgeRoot
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push('')
+  while ($pending.Count -gt 0) {
+    $relative = $pending.Pop()
+    $folder = $base
+    if ($relative) { $folder = $base + '\' + $relative }
+    try { $items = [IO.DirectoryInfo]::new($folder).GetFileSystemInfos() }
+    catch [System.IO.PathTooLongException] { Stop-Refused 'a path is longer than 259 characters in dsh-home' }
+    foreach ($item in $items) {
+      if ($item -isnot [IO.DirectoryInfo]) { continue }
+      $child = $item.Name
+      if ($relative) { $child = $relative + '\' + $item.Name }
+      if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $pending.Push($child); continue }
+      $target = Get-LinkTarget $item.FullName
+      if (-not $target -or $target -ieq $bridge -or -not (Test-Within $target $bridge) -or -not (Test-Path -LiteralPath $target -PathType Container)) { Stop-Refused 'a junction or link was found in dsh-home' }
+      if ((Get-Item -LiteralPath $target -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Refused 'a junction or link was found in dsh-home' }
+      $links.Add([pscustomobject]@{ Path = $child; Target = $target })
+    }
+  }
+  return ,$links
+}
+# Every .json, .yml and .yaml file below a folder, without following a junction or link.
+function Get-TextFiles([string]$Folder) {
   $found = [Collections.Generic.List[string]]::new()
-  foreach ($area in @('profiles', 'plugins')) {
-    $folder = Join-Path $DshHome $area
-    if (-not (Test-Present $folder)) { continue }
-    foreach ($file in @(Get-ChildItem -LiteralPath $folder -Recurse -File -Force | Where-Object { @('.yml', '.yaml', '.json') -contains $_.Extension.ToLowerInvariant() })) {
-      $relative = $area + $file.FullName.Substring($folder.Length)
-      $path = $file.FullName
-      if ($relative -ieq 'profiles\web\cordis.patch.yml') { $path = $RenderedProfile }
-      $text = (Read-Text $path).Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
-      if (Test-NamesRoot $text $Roots) { $found.Add($relative) }
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push($Folder)
+  while ($pending.Count -gt 0) {
+    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+      if ($item -is [IO.DirectoryInfo]) { $pending.Push($item.FullName); continue }
+      if (@('.yml', '.yaml', '.json') -contains $item.Extension.ToLowerInvariant()) { $found.Add($item.FullName) }
     }
   }
   return ,$found
+}
+function Get-DshLinkPaths($plan) { return ,@(@($plan.DshLinks) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Path }) }
+function Get-DshTextMap($plan) {
+  $pairs = @(@($plan.Bundles) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ From = [string]$_.From; To = [string]$_.NewPath } })
+  $map = New-PathMap $pairs
+  return ,$map
+}
+# The roots no DSH text may name: the old production folders and the install root's qq-bridge folder.
+function Get-ScanRoots($plan) {
+  return ,@((@($plan.Roots) + @([string]$plan.BridgeRoot)) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() })
+}
+function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $Roots, $Bundles, $TextMap, [switch]$Moved) {
+  $found = [Collections.Generic.List[string]]::new()
+  $areas = @()
+  foreach ($name in @('profiles', 'plugins')) { $areas += [pscustomobject]@{ Folder = (Join-Path $DshHome $name); Label = $name } }
+  foreach ($bundle in @(@($Bundles) | Where-Object { $null -ne $_ })) {
+    $folder = [string]$bundle.From
+    if ($Moved) { $folder = [string]$bundle.NewPath }
+    $areas += [pscustomobject]@{ Folder = $folder; Label = ('bundles\' + (Split-Path -Leaf ([string]$bundle.NewPath))) }
+  }
+  foreach ($area in $areas) {
+    if (-not (Test-Path -LiteralPath $area.Folder -PathType Container)) { continue }
+    foreach ($file in (Get-TextFiles $area.Folder)) {
+      $relative = $area.Label + $file.Substring($area.Folder.Length)
+      $path = $file
+      if ($RenderedProfile -and $relative -ieq 'profiles\web\cordis.patch.yml') { $path = $RenderedProfile }
+      $text = Convert-DshText (Read-Text $path) $TextMap
+      $normal = $text.Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
+      if ((Test-NamesRoot $normal $Roots) -or (Test-ClimbingLink $text)) { $found.Add($relative) }
+    }
+  }
+  return ,$found
+}
+# Packages a bundle needs that are not inside its own folder: Node would look for them in qq-bridge's parent folders.
+function Find-BundleOutsideDependencies($Bundles) {
+  $found = [Collections.Generic.List[string]]::new()
+  foreach ($bundle in @(@($Bundles) | Where-Object { $null -ne $_ })) {
+    $leaf = Split-Path -Leaf ([string]$bundle.NewPath)
+    $manifestPath = Join-Path ([string]$bundle.From) 'package.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { $found.Add($leaf + ': no package.json'); continue }
+    $needs = Get-Prop (Read-Json $manifestPath) 'dependencies'
+    if ($needs -isnot [Management.Automation.PSCustomObject]) { continue }
+    foreach ($property in @($needs.PSObject.Properties)) {
+      if (-not (Test-Path -LiteralPath (Join-Path ([string]$bundle.From) ('node_modules\' + $property.Name + '\package.json')) -PathType Leaf)) { $found.Add($leaf + ': ' + $property.Name) }
+    }
+  }
+  return ,$found
+}
+function New-BundleLinks($plan) {
+  $newHome = Join-Path $script:Root 'runtime\user\dsh'
+  $made = 0
+  foreach ($link in @(@($plan.DshLinks) | Where-Object { $null -ne $_ })) {
+    $path = Join-Path $newHome ([string]$link.Path)
+    if (Test-Present $path) { Stop-Failed 'a linked DSH bundle path already exists in the new DSH home' }
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $path))
+    [void](New-Item -ItemType Junction -Path $path -Target ([string]$link.NewTarget))
+    $item = Get-Item -LiteralPath $path -Force
+    if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (Get-LinkTarget $path) -ine (Get-Normal ([string]$link.NewTarget))) { Stop-Failed 'a linked DSH bundle could not be linked in the new DSH home' }
+    $made++
+  }
+  if ($made -gt 0) { Write-Step ('linked ' + $made + ' DSH bundles in the new DSH home') }
+}
+# Rewrites the bundle paths in the new DSH home's copied texts; files that are not UTF-8 are left alone (the scan after
+# the rewrite still fails the move if one of them names an old path).
+function Update-DshTexts($plan) {
+  $map = Get-DshTextMap $plan
+  if (@($map).Count -eq 0) { return }
+  $newHome = Join-Path $script:Root 'runtime\user\dsh'
+  $folders = @((Join-Path $newHome 'profiles'), (Join-Path $newHome 'plugins')) + @(@($plan.Bundles) | ForEach-Object { [string]$_.NewPath })
+  $changed = 0
+  foreach ($folder in $folders) {
+    if (-not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+    foreach ($file in (Get-TextFiles $folder)) {
+      $bytes = [IO.File]::ReadAllBytes($file)
+      $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+      $offset = 0
+      if ($bom) { $offset = 3 }
+      try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset) } catch { continue }
+      $converted = Convert-DshText $text $map
+      if ($converted -ceq $text) { continue }
+      [IO.File]::WriteAllText($file, $converted, [Text.UTF8Encoding]::new($bom))
+      $changed++
+    }
+  }
+  Write-Step ('the linked DSH bundle paths are rewritten in ' + $changed + ' DSH files')
 }
 
 # ---------- state ----------
@@ -714,6 +899,8 @@ function Initialize-Run {
   if ($Rehearsal) {
     if (-not (Test-Within $script:Root $script:Temp) -or $script:Root -ieq $script:Temp) { Stop-Refused 'a rehearsal install root must be a folder inside the temporary folder' }
     if (-not $env:HER_TASK_SCHEDULER_FILE -or -not (Test-Within $env:HER_TASK_SCHEDULER_FILE $script:Temp) -or (Test-Within $env:HER_TASK_SCHEDULER_FILE $script:Root)) { Stop-Refused 'a rehearsal needs HER_TASK_SCHEDULER_FILE in the temporary folder, outside the install root' }
+    Assert-RehearsalPath $script:Root
+    Assert-RehearsalPath $env:HER_TASK_SCHEDULER_FILE
     foreach ($name in @($OldSupervisorTask, $OldRelayTask)) { if ($name -cnotmatch '^HER-Test-67-[0-9a-f]{32}-(supervisor|relay)$') { Stop-Refused 'a rehearsal uses only HER-Test-67 fixture tasks' } }
     if (-not $ProfileFolder) { Stop-Refused 'a rehearsal needs -ProfileFolder inside the temporary folder' }
     $script:RehearsalOldRoot = Join-Path (Split-Path -Parent $script:Root) 'unused-root'
@@ -760,6 +947,10 @@ function Get-MovePlan {
   $plan.ReleaseName = $ReleaseName
   $plan.OldSupervisorTask = $OldSupervisorTask
   $plan.OldRelayTask = $OldRelayTask
+  $plan.BridgeRoot = Join-Path $script:Root 'qq-bridge'
+  $plan.DigestModel = $DigestModel
+  $plan.DshLinks = @()
+  $plan.Bundles = @()
   $plan.Identities = [ordered]@{}
   $plan.DshChildren = @()
   $script:OldRuntimePath = $plan.OldRuntime
@@ -768,9 +959,11 @@ function Get-MovePlan {
     if (Test-Within $folder $script:Root) { Stop-Refused 'the old runtime, relay folder, profile DSH home and release source must be outside the install root' }
     if (Test-Within $script:Root $folder) { Stop-Refused 'the install root must not be inside an old production folder' }
   }
+  # Inventory lists every finding at once, so an earlier layout entry is a blocker, not a stop (Move refuses on it).
   foreach ($name in @('runtime', 'releases', 'deps', 'current', 'last-good', 'herupdate.exe', 'update-starts.json', 'update-alert.json', '.current-previous', '.last-good-previous')) {
-    if (Test-Present (Join-Path $script:Root $name)) { Stop-Refused ('the install root already has ' + $name + '; roll back the earlier attempt or move it aside first') }
+    if (Test-Present (Join-Path $script:Root $name)) { Add-Blocker ('the install root already has ' + $name + '; roll back the earlier attempt or move it aside first') }
   }
+  if ($DigestModel -and -not (Test-ModelName $DigestModel)) { Add-Blocker '-DigestModel must be 1 to 80 letters, digits, dots, colons, underscores and dashes, starting with a letter or digit' }
   $config = $null; $dependencies = $null; $relayConfig = $null
 
   try {
@@ -929,7 +1122,9 @@ function Get-MovePlan {
     $plan.RelayPin = Join-Path $script:Root ('deps\relay\' + $plan.RelayVersion)
     $relayExe = Get-Normal $relay.Exe
     $plan.RelayProgram = $plan.RelayPin + $relayExe.Substring($plan.OldRelayFolder.Length)
-    $plan.RelayArguments = @(Convert-RelayArguments $tokens $plan.OldRelayFolder $plan.RelayPin)
+    # Assigned directly: Convert-RelayArguments returns ,$result, and @() around it would nest the array.
+    $relayArguments = Convert-RelayArguments $tokens $plan.OldRelayFolder $plan.RelayPin
+    $plan.RelayArguments = @($relayArguments)
     $relayConfigPath = Find-RelayConfig $tokens $plan.OldRelayFolder
     if (-not (Test-Within $relayConfigPath $plan.OldRelayFolder) -or -not (Test-Path -LiteralPath $relayConfigPath -PathType Leaf)) { Stop-Refused 'the relay configuration file is not inside the old relay folder' }
     $plan.RelayConfigRelative = $relayConfigPath.Substring($plan.OldRelayFolder.Length + 1)
@@ -940,6 +1135,11 @@ function Get-MovePlan {
     if ((Get-ListenerPid $plan.RelayPort) -ne $relay.Pid) { Add-Blocker 'the relay port is not served by the relay process' }
     if (@($plan.OneBotPort, $plan.OneBotWsPort, $plan.DshPort, $plan.ConsolePort) -contains $plan.RelayPort) { Add-Blocker 'the relay port is not distinct from the OneBot, DSH and console ports' }
     foreach ($argument in $plan.RelayArguments) { if ($argument.Contains($script:RelayKey)) { Add-Blocker 'the relay command line carries the client key' } }
+    if ($DigestModel) {
+      # The digest key is the relay client key (Q5); an existing different key needs a decision first.
+      $harnessKey = Join-Path $plan.OldRuntime 'config\harness-api-key'
+      if ((Test-Path -LiteralPath $harnessKey -PathType Leaf) -and (Read-Text $harnessKey).Trim() -cne $script:RelayKey) { Add-Blocker 'config\harness-api-key holds another key than the relay client key; it needs a decision' }
+    }
     $plan.Identities['relay'] = $relay
     if ((Get-OwnerSid ([int]$relay.Pid)) -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { Add-Blocker 'the relay process runs as another account than this PowerShell' }
     $plan.RelayParents = Get-ParentImages ([int]$relay.Pid)
@@ -948,14 +1148,33 @@ function Get-MovePlan {
   } catch { Add-Failure $_ 'relay' }
 
   try {
+    # Linked DSH bundles: each link target inside qq-bridge is copied once into the new DSH home's bundles folder;
+    # the links themselves stay out of the DSH home copy and are recreated after it (New-BundleLinks).
+    if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
+    if (Test-Present (Join-Path $plan.DshHome 'bundles')) { Stop-Refused 'the profile DSH home already has a bundles entry, so the linked bundles cannot be placed there' }
+    $newHome = Join-Path $script:Root 'runtime\user\dsh'
+    $links = @(); $bundles = @()
+    foreach ($found in (Find-DshLinks $plan.DshHome $plan.BridgeRoot)) {
+      Assert-RehearsalPath $found.Target
+      $leaf = Split-Path -Leaf $found.Target
+      if ($leaf -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $leaf -match '^\.+$') { Stop-Refused 'a linked DSH bundle folder has a name the move cannot use' }
+      $newTarget = Join-Path $newHome ('bundles\' + $leaf)
+      $same = @($bundles | Where-Object { $_.NewPath -ieq $newTarget })
+      if ($same.Count -gt 0 -and $same[0].From -ine $found.Target) { Stop-Refused 'two linked DSH bundles share a folder name' }
+      if ($same.Count -eq 0) { $bundles += [pscustomobject]@{ From = $found.Target; NewPath = $newTarget; Label = ('dsh-bundle-' + $leaf.ToLowerInvariant()) } }
+      $links += [pscustomobject]@{ Path = $found.Path; Target = $found.Target; NewTarget = $newTarget }
+    }
+    $plan.DshLinks = $links
+    $plan.Bundles = $bundles
     # Copies, path map and the roots no new path may keep.
     $copies = @(
       [pscustomobject]@{ From = $plan.OldRuntime; To = (Join-Path $script:Root 'runtime'); Exclude = $plan.RuntimeExclude; Label = 'runtime' },
-      [pscustomobject]@{ From = $plan.DshHome; To = (Join-Path $script:Root 'runtime\user\dsh'); Exclude = @(); Label = 'dsh-home' },
+      [pscustomobject]@{ From = $plan.DshHome; To = $newHome; Exclude = (Get-DshLinkPaths $plan); Label = 'dsh-home' },
       [pscustomobject]@{ From = $plan.SnowLuma; To = (Join-Path $script:Root ('deps\snowluma\' + $plan.SnowLumaVersion)); Exclude = @(); Label = 'snowluma' },
       [pscustomobject]@{ From = $plan.NpxRoot; To = (Join-Path $script:Root ('deps\dsh\' + $plan.DshVersion)); Exclude = @(); Label = 'dsh' },
       [pscustomobject]@{ From = $plan.OldRelayFolder; To = $plan.RelayPin; Exclude = @(); Label = 'relay' }
     )
+    foreach ($bundle in $bundles) { $copies += [pscustomobject]@{ From = $bundle.From; To = $bundle.NewPath; Exclude = @(); Label = $bundle.Label } }
     $pairs = @(
       [pscustomobject]@{ From = $plan.OldRuntime; To = (Join-Path $script:Root 'runtime') },
       [pscustomobject]@{ From = $plan.DshHome; To = (Join-Path $script:Root 'runtime\user\dsh') },
@@ -990,20 +1209,23 @@ function Get-MovePlan {
     if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
     $profileFile = Join-Path $plan.DshHome 'profiles\web\cordis.patch.yml'
     if (-not (Test-Path -LiteralPath $profileFile -PathType Leaf)) { Stop-Refused 'the profile DSH home has no profiles\web\cordis.patch.yml' }
-    $differences = Compare-DshStub (Join-Path $plan.OldRuntime 'user\dsh') $plan.DshHome
+    $differences = Compare-DshStub (Join-Path $plan.OldRuntime 'user\dsh') $plan.DshHome (Get-DshLinkPaths $plan)
     Write-Utf8 (Join-Path $script:Evidence 'dsh-stub-differences.txt') ((@($differences) -join "`r`n") + "`r`n")
     if ($differences.Count -gt 0 -and -not $AcceptDshProfileFiles) { Add-Blocker ('' + $differences.Count + ' runtime DSH files differ from the profile DSH home (list in the evidence folder); pass -AcceptDshProfileFiles to take the profile copies') }
     $rendered = New-McpProfile $plan.SourceCli $profileFile (Join-Path $script:Evidence 'mcp-preview') $plan.ConsolePort
-    $references = Find-OldProfileReferences $plan.DshHome $rendered $plan.Roots
+    # The same bundle rewrite the move applies, in memory: what is left must name no old folder and climb nowhere.
+    $references = Find-OldProfileReferences $plan.DshHome $rendered (Get-ScanRoots $plan) $plan.Bundles (Get-DshTextMap $plan)
     Write-Utf8 (Join-Path $script:Evidence 'dsh-profile-references.txt') ((@($references) -join "`r`n") + "`r`n")
-    if ($references.Count -gt 0) { Add-Blocker ('' + $references.Count + ' DSH profile or plugin files name old production paths (list in the evidence folder)') }
+    if ($references.Count -gt 0) { Add-Blocker ('' + $references.Count + ' DSH profile, plugin or bundle files name old production paths or climb out with a link (list in the evidence folder)') }
+    $outside = Find-BundleOutsideDependencies $plan.Bundles
+    Write-Utf8 (Join-Path $script:Evidence 'dsh-bundle-dependencies.txt') ((@($outside) -join "`r`n") + "`r`n")
+    if ($outside.Count -gt 0) { Add-Blocker 'a linked DSH bundle depends on a package outside its own folder (list in the evidence folder)' }
   } catch { Add-Failure $_ 'dsh home' }
 
   try {
     # Configuration dry run on separate copies; only JSON pointers are written, never values.
     $preview = Read-Json (Join-Path $plan.OldRuntime 'config\config.json')
-    $foreign = @(Convert-Config $preview $plan)
-    $foreign += @(Convert-Dependencies (Read-Json (Join-Path $plan.OldRuntime 'dependencies.json')) $plan)
+    $foreign = Get-ForeignPointers $preview (Read-Json (Join-Path $plan.OldRuntime 'dependencies.json')) $plan
     Write-Utf8 (Join-Path $script:Evidence 'config-foreign-pointers.txt') ((@($foreign) -join "`r`n") + "`r`n")
     if ($foreign.Count -gt 0) { Add-Blocker ('' + $foreign.Count + ' configuration paths need a decision (pointers in the evidence folder)') }
   } catch { Add-Failure $_ 'configuration rewrite' }
@@ -1120,11 +1342,24 @@ function Set-NewConfiguration($plan) {
   $keyFile = Join-Path $plan.RelayPin 'her-relay-client.key'
   if (Test-Present $keyFile) { Stop-Failed 'the relay pin already has her-relay-client.key' }
   [IO.File]::WriteAllText($keyFile, $script:RelayKey, [Text.ASCIIEncoding]::new())
+  if ($plan.DigestModel) {
+    # The digest authenticates to the relay with its client key (Q5).
+    $harnessKey = Join-Path $runtime 'config\harness-api-key'
+    if (Test-Present $harnessKey) {
+      if ((Read-Text $harnessKey).Trim() -cne $script:RelayKey) { Stop-Failed 'config\harness-api-key holds another key than the relay client key' }
+    } else { [IO.File]::WriteAllText($harnessKey, $script:RelayKey, [Text.ASCIIEncoding]::new()) }
+    Write-Step 'the memory digest uses the relay: memory.digest.model, the model origin and config\harness-api-key are set'
+  }
+  # DSH texts: the linked bundle paths follow the bundle copies.
+  Update-DshTexts $plan
   # DSH profile: the three MCP servers point at the installed image and the new runtime.
   $profileFile = Join-Path $runtime 'user\dsh\profiles\web\cordis.patch.yml'
   $rendered = New-McpProfile $plan.Cli $profileFile (Join-Path $script:Evidence 'mcp-move') $plan.ConsolePort
   Copy-Item -LiteralPath $rendered -Destination $profileFile -Force
   if ((Get-FileSha $rendered) -ne (Get-FileSha $profileFile)) { Stop-Failed 'the DSH profile could not be replaced' }
+  $left = Find-OldProfileReferences (Join-Path $runtime 'user\dsh') '' (Get-ScanRoots $plan) $plan.Bundles @() -Moved
+  Write-Utf8 (Join-Path $script:Evidence 'dsh-references-after.txt') ((@($left) -join "`r`n") + "`r`n")
+  if ($left.Count -gt 0) { Stop-Failed 'DSH profile, plugin or bundle files in the new DSH home still name old production paths (list in the evidence folder)' }
   Write-Step 'configuration, dependencies, relay login and key, and the DSH MCP block are rewritten'
 }
 function Register-HerTask($plan) {
@@ -1209,15 +1444,14 @@ function Test-OldProductionUp($plan) {
 function Start-OldProduction($plan) {
   if (Test-OldProductionUp $plan) { return }
   [void](Invoke-Old @('lifecycle', 'set', 'running', '--runtime-root', $plan.OldRuntime, '--by', 'owner-67', '--reason', 'rollback of the move') 'rollback-old-running')
-  if ((Get-OldOwnerStates).supervisor -ne 'held') {
-    $tasks = @()
-    if ((Get-ListenerPid ([int]$plan.RelayPort)) -eq 0) { $tasks += [string]$plan.OldRelayTask }
-    $tasks += [string]$plan.OldSupervisorTask
-    foreach ($name in $tasks) {
-      # A task instance still running (its launcher waits) would ignore the start.
-      Wait-Until { (Get-TaskState $name) -ne 'Running' } 60 ('the old task ' + $name + ' still has a running instance, so it cannot start the old production')
-      Start-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction Stop
-    }
+  # The relay and the supervisor are judged apart: a rerun may find the supervisor back but the relay still down.
+  $tasks = @()
+  if ((Get-ListenerPid ([int]$plan.RelayPort)) -eq 0) { $tasks += [string]$plan.OldRelayTask }
+  if ((Get-OldOwnerStates).supervisor -ne 'held') { $tasks += [string]$plan.OldSupervisorTask }
+  foreach ($name in $tasks) {
+    # A task instance still running (its launcher waits) would ignore the start.
+    Wait-Until { (Get-TaskState $name) -ne 'Running' } 60 ('the old task ' + $name + ' still has a running instance, so it cannot start the old production')
+    Start-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction Stop
   }
   Wait-Until { Test-OldProductionUp $plan } 300 'the old production did not come back within 5 minutes'
 }
@@ -1268,7 +1502,14 @@ function Invoke-Rollback([string]$Why) {
       try {
         [void](Invoke-Cli $runtimeCli @('stop', '--runtime-root', $runtime, '--confirm', '--with-dependencies') 'rollback-new-stop' @(0, 3))
         if ((Get-NewOwnerStates $runtimeCli).supervisor -eq 'held') { [void](Invoke-Cli $runtimeCli @('lifecycle', 'stop-supervisor', '--runtime-root', $runtime, '--confirm') 'rollback-new-stop-supervisor') }
-        Wait-Until { $states = Get-NewOwnerStates $runtimeCli; $states.supervisor -ne 'held' -and $states.live -ne 'held' -and $states.console -ne 'held' } 30 'the new owners did not stop'
+        # Only "free" counts: an owner the CLI cannot identify ("unknown") may still run.
+        Wait-Until { $states = Get-NewOwnerStates $runtimeCli; $states.supervisor -eq 'free' -and $states.live -eq 'free' -and $states.console -eq 'free' } 30 'the new owners did not stop'
+        # Whatever the stop left of the new layout (a DSH child, a refused dependency) is stopped by verified identity.
+        foreach ($process in (Get-NewLayoutProcesses $plan)) {
+          $identity = Get-Identity ([int]$process.ProcessId) 'new-layout process'
+          if ($null -ne $identity) { Stop-Identity $identity }
+        }
+        Wait-Until { @(Get-NewLayoutProcesses $plan).Count -eq 0 } 30 'a process still runs from the new layout'
         if (-not $oldAlreadyUp) { Wait-Until { @(Get-ProductionPortList $plan | Where-Object { (Get-ListenerPid $_) -ne 0 }).Count -eq 0 } 30 'a production port is still held by the new runtime' }
         if (-not [string]$script:State.NewStoppedAt) { $script:State.NewStoppedAt = [DateTime]::UtcNow.ToString('o'); Save-State ([string]$script:State.Phase) }
         Write-Step 'the new runtime and its dependencies are stopped'
@@ -1358,6 +1599,7 @@ function Invoke-Move {
     $after = Get-IdleState $plan.Cli $plan.OldRuntime 'idle-after-stop'
     if ($after.Busy -gt 0) { Write-Step ('' + $after.Busy + ' turns were cut by the stop; the new bridge pauses them for the owner') }
     foreach ($copy in $plan.Copies) { Copy-Verified $copy.From $copy.To $copy.Exclude $copy.Label }
+    New-BundleLinks $plan
     Save-State 'Copied'
     Assert-AbortPoint 'Copied'
     Set-NewConfiguration $plan
@@ -1463,6 +1705,22 @@ function Invoke-SelfTest {
   Check ((Get-SafeMessage 'path C:\x not found') -eq 'an unexpected error (details in the evidence log)') 'raw error text stays private'
   Check ((Get-SafeMessage 'REFUSED: fixed text') -eq 'REFUSED: fixed text') 'fixed refusal text is shown'
   Check ((Format-HashGroups ('1' * 64)) -notmatch '[0-9]{7}') 'a grouped hash has no long digit run'
+  $bundleMap = New-PathMap @([pscustomobject]@{ From = 'C:\Q\qq-bridge\b'; To = 'C:\Q\runtime\user\dsh\bundles\b' })
+  Check ((Convert-DshText '"b": "link:C:\Q\qq-bridge\b"' $bundleMap) -ceq '"b": "link:C:\Q\runtime\user\dsh\bundles\b"') 'bundle path with backslashes'
+  Check ((Convert-DshText 'b: link:c:/q/qq-bridge/b/x' $bundleMap) -ceq 'b: link:C:/Q/runtime/user/dsh/bundles/b/x') 'bundle path with forward slashes in another case'
+  Check ((Convert-DshText '{"b":"link:C:\\Q\\qq-bridge\\b"}' $bundleMap) -ceq '{"b":"link:C:\\Q\\runtime\\user\\dsh\\bundles\\b"}') 'bundle path with JSON escapes'
+  Check ((Convert-DshText '"C:\Q\qq-bridge\b2"' $bundleMap) -ceq '"C:\Q\qq-bridge\b2"') 'a sibling bundle name is not rewritten'
+  Check (Test-ClimbingLink '{"x":"link:../y"}') 'a link: dependency that climbs out'
+  Check (-not (Test-ClimbingLink '{"x":"link:C:/y","z":"file:./w"}')) 'an absolute or inner link: dependency'
+  Check (Test-ModelName 'gemini-3-flash') 'model id'
+  foreach ($bad in @('a b', '-x', ('m' * 81))) { Check (-not (Test-ModelName $bad)) ('bad model id ' + $bad) }
+  # The two finding lists come back as one flat list: a clean configuration has none (not one empty list per file).
+  $script:Root = 'C:\qqbot'
+  $samplePlan = [ordered]@{ Map = (New-PathMap @()); SnowLumaVersion = '1.2.3'; NodePath = 'C:\Node\node.exe'; DshVersion = '9.9.9'; RelayProgram = 'C:\qqbot\deps\relay\1.0.0\r.exe'; RelayArguments = @('-config', 'C:\qqbot\deps\relay\1.0.0\c.yaml'); RelayPin = 'C:\qqbot\deps\relay\1.0.0'; RelayVersion = '1.0.0'; Auth = [pscustomobject]@{ NewPath = 'C:\qqbot\deps\relay\1.0.0\auth' }; RelayPort = 8317; Roots = @('c:\old\rt'); DigestModel = '' }
+  $clean = Get-ForeignPointers ('{"consolePort":1,"tasks":{"nodePath":"C:\\Node\\node.exe"}}' | ConvertFrom-Json) ('{"dsh":"http://127.0.0.1:1"}' | ConvertFrom-Json) $samplePlan
+  Check ($clean.Count -eq 0) 'a clean configuration has no foreign pointers'
+  $dirty = Get-ForeignPointers ('{"x":"C:\\Old\\Rt\\y"}' | ConvertFrom-Json) ('{"dsh":"http://127.0.0.1:1"}' | ConvertFrom-Json) $samplePlan
+  Check ((@($dirty) -join ',') -eq '/x') 'the foreign pointers of both files form one flat list'
   Write-Step ('PASS self-test: ' + $script:SelfChecks + ' checks')
 }
 

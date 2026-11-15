@@ -28,14 +28,25 @@ if (!['dsh', 'onebot', 'relay'].includes(config.role) || !Number.isInteger(confi
 // The health-failure scenario: DSH refuses to start from the new dependency folder while the marker exists.
 const fromNewDeps = here.toLowerCase().split(path.sep).join('/').includes('/deps/dsh/');
 if (config.role === 'dsh' && config.failMarker && fromNewDeps && fs.existsSync(config.failMarker)) process.exit(7);
+// The bundle scenario: like the real web profile, DSH loads each bundle through the link in its home's plugins folder.
+const loaded = [];
+if (config.role === 'dsh' && Array.isArray(config.bundles) && process.env.DSH_HOME) {
+  for (const name of config.bundles) {
+    const link = path.join(process.env.DSH_HOME, 'plugins', 'node_modules', name);
+    if (!fs.existsSync(link)) continue;
+    const real = fs.realpathSync(link);
+    const manifest = JSON.parse(fs.readFileSync(path.join(real, 'package.json'), 'utf8'));
+    loaded.push({ name: manifest.name, real });
+  }
+}
 
 const server = http.createServer((request, response) => {
   const chunks = [];
   request.on('data', (chunk) => chunks.push(chunk));
   request.on('end', () => {
-    // The late-child scenario: DSH starts a child process after the move script's checks.
+    // The late-child scenarios: DSH starts a child process; its command line names DSH's own folder, like a tool server.
     if (config.role === 'dsh' && request.url === '/fixture/spawn-child') {
-      spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'her-67-late-child'], { stdio: 'ignore' }).unref();
+      spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'her-67-late-child', here], { stdio: 'ignore' }).unref();
     }
     let status = 200;
     let body;
@@ -43,6 +54,8 @@ const server = http.createServer((request, response) => {
       const authorized = request.headers.authorization === `Bearer ${relayKey}`;
       status = request.url === '/v1/models' && authorized ? 200 : 401;
       body = { object: 'list', data: [] };
+    } else if (config.role === 'dsh' && request.url === '/fixture/bundles') {
+      body = { loaded };
     } else if (config.role === 'dsh') {
       let rpcId = null;
       try { rpcId = JSON.parse(Buffer.concat(chunks).toString('utf8')).rpcId ?? null; } catch { rpcId = null; }
