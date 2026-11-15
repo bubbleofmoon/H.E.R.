@@ -642,17 +642,21 @@ function Get-BackupDestination($Config) {
 # the plain shape only and refuses whatever it cannot read exactly (fail closed). A first pass registers every secret
 # before anything can refuse. Nesting is read by indentation under exactly those four top-level keys; in the nested
 # shape the only other top-level key allowed is config-version (the flat shape keeps its other keys, as the S1u fixture
-# has them). A value it uses is value, "value" or 'value' with nothing after it, on one line. Anywhere in the file a
-# quoted or explicit key, flow style, a tab indent, a document marker and a merge key refuse; so do a list item at the
-# indentation of api-keys and a secret-key, api-keys or auth-dir line in any other place. Blank and comment lines are
-# allowed anywhere except inside the api-keys list. Top-level port, auth-dir or api-keys beside the nested blocks is a
-# mixed shape and refuses. Any other line holding an absolute path, nested or not, counts toward the "other absolute
-# paths" refusal.
-# One configured secret for hiding: the text as written and the text cut at its first quote or comment (a quoted or
-# refused value). Pieces under 4 characters are skipped; they would hide ordinary evidence text.
+# has them). A value it uses is value, "value" or 'value' with nothing after it, on one line. Every other line is a
+# plain key line or a list item; anything else (anchors, tags, aliases, quoted, escaped, explicit or merge keys, tabs,
+# document markers) refuses with one reason, and so does flow style. So do a list item at the indentation of api-keys
+# and a secret-key, api-keys or auth-dir line in any other place. Blank and comment lines are allowed anywhere except
+# inside the api-keys list. Top-level port, auth-dir or api-keys beside the nested blocks is a mixed shape and refuses.
+# Any other line holding an absolute path, nested or not, counts toward the "other absolute paths" refusal.
+# One configured secret for hiding: the text as written, the text without one pair of surrounding quotes, and the text
+# cut at its first quote or comment (a quoted or refused value). Pieces under 4 characters are skipped; they would hide
+# ordinary evidence text.
 function Add-RelaySecret([string]$Text) {
   $raw = $Text.Trim()
-  foreach ($candidate in @($raw, (($raw.TrimStart('"', "'") -split '["'']|\s#')[0]).Trim())) {
+  $pieces = @($raw, (($raw.TrimStart('"', "'") -split '["'']|\s#')[0]).Trim())
+  $unquoted = [regex]::Match($raw, '^(?:"(?<v>.*)"|''(?<v>.*)'')$')
+  if ($unquoted.Success) { $pieces += $unquoted.Groups['v'].Value }
+  foreach ($candidate in $pieces) {
     if ($candidate.Length -ge 4 -and -not $script:SecretTexts.Contains($candidate)) { $script:SecretTexts.Add($candidate) }
   }
 }
@@ -707,9 +711,13 @@ function Read-RelayConfig([string[]]$Lines) {
   $list = ''; $listIndent = -1; $itemIndent = -1; $listGap = $false; $scalarIndent = -1
   $misplaced = @('auth-dir', 'api-keys', 'secret-key')
   # First pass, before anything can refuse: every secret-key value and every list item (the api-keys entries), in block
-  # or flow form, is registered for hiding, so a refusal on an earlier line cannot leave a later secret unhidden. It also
-  # tells the nested shape (a server, access, oauth or management block anywhere) from the flat one.
+  # or flow form, is registered for hiding, so a refusal on an earlier line cannot leave a later secret unhidden. A
+  # secret-key line registers its whole rest (a block value may hold a comma or a bracket) and its flow-form value cut
+  # at a comma, brace or bracket. It also tells the nested shape (a server, access, oauth or management block anywhere)
+  # from the flat one.
   foreach ($source in $Lines) {
+    $whole = [regex]::Match([string]$source, 'secret-key["'']?\s*:(?<v>.*)$')
+    if ($whole.Success) { Add-RelaySecret ($whole.Groups['v'].Value) }
     foreach ($hit in [regex]::Matches([string]$source, 'secret-key["'']?\s*:\s*(?<v>[^,}\]]*)')) { Add-RelaySecret ($hit.Groups['v'].Value) }
     $listed = [regex]::Match([string]$source, '^\s*-\s+(?<v>.*)$')
     if ($listed.Success) { Add-RelaySecret ($listed.Groups['v'].Value) }
@@ -730,7 +738,10 @@ function Read-RelayConfig([string[]]$Lines) {
       # A deeper line right after a value the parser reads would continue that value (a multi-line scalar).
       if ($scalarIndent -ge 0 -and $indent -gt $scalarIndent) { Stop-Refused 'the relay configuration continues a value it reads on a deeper line' }
       $scalarIndent = -1
-      if ($text.StartsWith("`t") -or $text -match '^(---|\.\.\.)(\s|$)' -or $text.StartsWith('<<') -or $text -match '^["'']' -or $text -match '^[?:](\s|$)' -or $text -match '^[\[{]|:\s+[\[{]|^-\s+[\[{]') { Stop-Refused 'the relay configuration uses YAML this check does not read (a tab indent, a document marker, a merge key, a quoted or explicit key, or flow style)' }
+      # Every other line is a plain key line ("key:", or "- key:" in a list) or a list item ("- value"). This refuses
+      # anchors, tags, aliases, quoted, escaped, explicit and merge keys, tabs and document markers with one reason.
+      if ($text -cnotmatch '^(- )?[A-Za-z0-9_.-]+:' -and -not ($indent -gt 0 -and $text -cmatch '^- \S')) { Stop-Refused 'the relay configuration has a line the relay parser does not understand' }
+      if ($text -match ':\s+[\[{]|^-\s+[\[{]') { Stop-Refused 'the relay configuration uses flow style (a value or list item starting with { or [)' }
       if ($list) {
         $item = $text -match '^-(\s|$)'
         if ($indent -gt $listIndent) {
@@ -2519,7 +2530,8 @@ function Invoke-SelfTest {
   $listHeader = 'the relay configuration has an api-keys line with text after it (a comment or flow style)'
   $elsewhere = 'the relay configuration has a secret-key, api-keys or auth-dir line in a place this check does not read'
   $hostOnly = 'the relay configuration has a host other than 127.0.0.1 or localhost'
-  $oddYaml = 'the relay configuration uses YAML this check does not read (a tab indent, a document marker, a merge key, a quoted or explicit key, or flow style)'
+  $notUnderstood = 'the relay configuration has a line the relay parser does not understand'
+  $flowStyle = 'the relay configuration uses flow style (a value or list item starting with { or [)'
   $listGap = 'the relay configuration has a blank or comment line inside the api-keys list'
   $topLevel = 'the nested relay configuration has a top-level key other than config-version, server, management, access and oauth'
   $relay = Read-RelayConfig @('# comment C:\x', 'port: 8317', 'auth-dir: "~/.cli-proxy-api"', 'api-keys:', '  - "flat-key-number-one"', '  - flat-key-number-two', 'proxy-url: "http://127.0.0.1:9"')
@@ -2574,10 +2586,10 @@ function Invoke-SelfTest {
   Check ($script:SecretTexts.Contains('nested-key-number-four')) 'a refused api key is still kept out of the evidence'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @('  auth-dir: "~/.cli-proxy-api')) } ('the relay configuration value of auth-dir' + $notPlain)) 'an odd quote'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @('  auth-dir: "auth\nfolder"')) } ('the relay configuration value of auth-dir' + $notPlain)) 'an escape in a double-quoted value'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port: [8317]')) } $oddYaml) 'a flow-style value'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 12 @('  api-keys: ["nested-key-number-one"]')) } $oddYaml) 'flow-style api-keys'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  allow-remote: [false]')) } $oddYaml) 'flow style on a line the parser does not read'
-  Check (Test-RefusedWith { Read-RelayConfig @('api-keys:', '  - "flat-key-number-one"', 'remote-management: {secret-key: hidden-secret-number-two}') } $oddYaml) 'a flow map holding a secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port: [8317]')) } $flowStyle) 'a flow-style value'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 12 @('  api-keys: ["nested-key-number-one"]')) } $flowStyle) 'flow-style api-keys'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  allow-remote: [false]')) } $flowStyle) 'flow style on a line the parser does not read'
+  Check (Test-RefusedWith { Read-RelayConfig @('api-keys:', '  - "flat-key-number-one"', 'remote-management: {secret-key: hidden-secret-number-two}') } $flowStyle) 'a flow map holding a secret-key'
   Check ($script:SecretTexts.Contains('hidden-secret-number-two')) 'a secret-key inside a refused flow map is still kept out of the evidence'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 12 @('  api-keys: # keys')) } $listHeader) 'a comment after api-keys'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 1 @('server: # note')) } 'the relay configuration has a block line (server, access, oauth or management) with text after it') 'a comment after a block line'
@@ -2592,13 +2604,21 @@ function Invoke-SelfTest {
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 5 @('    enabled: false', '    api-keys:')) } $elsewhere) 'api-keys deeper inside a block'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('  host: 0.0.0.0')) } $hostOnly) 'a server.host open to the network'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('  host: ""')) } $hostOnly) 'an empty server.host'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @("`tport: 8317")) } $oddYaml) 'a tab indent'
-  Check (Test-RefusedWith { Read-RelayConfig (@('---') + $nestedBase) } $oddYaml) 'a document marker'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  <<: *defaults')) } $oddYaml) 'a merge key'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  "port": 8317')) } $oddYaml) 'a quoted key'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  ''secret-key'': hidden-secret-number-one')) } $oddYaml) 'a quoted secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @("`tport: 8317")) } $notUnderstood) 'a tab indent'
+  Check (Test-RefusedWith { Read-RelayConfig (@('---') + $nestedBase) } $notUnderstood) 'a document marker'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  <<: *defaults')) } $notUnderstood) 'a merge key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  "port": 8317')) } $notUnderstood) 'a quoted key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  ''secret-key'': hidden-secret-number-one')) } $notUnderstood) 'a quoted secret-key'
   Check ($script:SecretTexts.Contains('hidden-secret-number-one')) 'a secret under a refused quoted key is still kept out of the evidence'
-  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  ? secret-key', '  : nested-secret-number-four')) } $oddYaml) 'an explicit key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  "secret' + '\' + 'u002dkey": hidden-secret-number-five')) } $notUnderstood) 'an escaped quoted secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  &mgmt "secret-key": hidden-secret-number-six')) } $notUnderstood) 'an anchored quoted secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  !!str secret-key: hidden-secret-number-seven')) } $notUnderstood) 'a tagged secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  ? secret-key', '  : nested-secret-number-four')) } $notUnderstood) 'an explicit key'
+  # A block value may hold a comma; the first pass registers the whole value before the earlier port line refuses.
+  $commaSecret = Edit-Base 8 @('  secret-key: abc,hidden-secret-number-one')
+  $commaSecret[3] = '  port: eighty'
+  Check (Test-RefusedWith { Read-RelayConfig $commaSecret } 'the relay configuration has a port line that cannot be read') 'a port that cannot be read before a secret with a comma'
+  Check ($script:SecretTexts.Contains('abc,hidden-secret-number-one')) 'a secret with a comma is kept out of the evidence whole'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port:8317')) } 'the relay configuration has a key with no space after its colon') 'a key with no space after its colon'
   Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('    host: 127.0.0.1')) } 'the relay configuration has a line indented less than the first key of its block') 'a line indented less than its block'
   $found = [Collections.Generic.List[string]]::new()

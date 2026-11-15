@@ -658,7 +658,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 127 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 132 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -927,6 +927,9 @@ try {
   Assert-True ($refusedFolder.FullName -ne $keyedFolder.FullName) 'S1t: the refused run wrote its own inventory folder'
   $refusedText = [IO.File]::ReadAllText((Join-Path $refusedFolder.FullName 'inventory.json'))
   foreach ($key in @('fixture-relay-key-67', $second)) { Assert-True ($refusedText.IndexOf($key, [StringComparison]::Ordinal) -lt 0) ('S1t: inventory.json holds a relay key after a refused configuration') }
+  # The configuration's file name and the relay program path are stored only after a successful read.
+  $refusedNames = @(($refusedText | ConvertFrom-Json).PSObject.Properties.Name)
+  Assert-True ($refusedNames -notcontains 'RelayConfigRelative' -and $refusedNames -notcontains 'RelayProgram') 'S1t: the refused inventory.json holds the relay configuration name or the relay program'
   Assert-OldUntouched 'S1t'
 
   Step 'S1u relay configuration without a top-level port'
