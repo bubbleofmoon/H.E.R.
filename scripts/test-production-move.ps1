@@ -250,10 +250,29 @@ function Assert-OldRunning([string]$Scenario, [switch]$Restricted) {
   $task = Invoke-Her @('scheduled-task', 'read', '--install-root', $root) | ConvertFrom-Json
   Assert-True ($null -eq $task.xml) ($Scenario + ': the HER task is still registered')
   Assert-NoNewLayout $Scenario
-  Assert-True (@(Get-ChildItem -LiteralPath $root -Directory -Filter 'move-67-attempt-*').Count -ge 1) ($Scenario + ': no moved-aside attempt folder')
+  $attempts = @(Get-ChildItem -LiteralPath $root -Directory -Filter 'move-67-attempt-*')
+  Assert-True ($attempts.Count -ge 1) ($Scenario + ': no moved-aside attempt folder')
+  # A link kept in an attempt folder would reach live folders after a later move (and a recursive delete would follow it).
+  foreach ($attempt in $attempts) {
+    $attemptLinks = Get-FixtureLinks $attempt.FullName
+    Assert-True ($attemptLinks.Count -eq 0) ($Scenario + ': a moved-aside attempt folder still holds a junction or link')
+  }
   Assert-RootAcl $Scenario -Restricted:$Restricted
   Assert-Originals $Scenario
   $script:baselineSupervisor = (Get-Owners $oldRuntime $unused $cli).supervisorPid
+}
+# Every junction or link below a folder, found without following any (Get-ChildItem -Recurse would follow them).
+function Get-FixtureLinks([string]$Folder) {
+  $found = [Collections.Generic.List[string]]::new()
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push($Folder)
+  while ($pending.Count -gt 0) {
+    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $found.Add($item.FullName); continue }
+      if ($item -is [IO.DirectoryInfo]) { $pending.Push($item.FullName) }
+    }
+  }
+  return ,$found
 }
 function Get-LateChildren {
   return @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.IndexOf('her-67-late-child', [StringComparison]::OrdinalIgnoreCase) -ge 0 })
@@ -408,14 +427,23 @@ try {
   $credentialText = 'secret: ' + $secret + "`nrecords:`n  client-connection/browser-session:`n    kind: grant`n    payload:`n      version: 1`n      secret: " + $secret + "`n"
   Write-Fixture (Join-Path $dshHome '.credentials.yaml') $credentialText
   Write-Fixture (Join-Path $oldRuntime 'user\dsh\.credentials.yaml') $credentialText
-  # Two bundles in the install root's qq-bridge folder, linked from the profile's plugins folder (production uses
-  # directory symbolic links, which need a privilege; junctions are the same kind of directory link to the script) and
-  # named by link: dependencies in two spellings.
+  # Two bundles in the install root's qq-bridge folder, linked from the profile's plugins folder and named by link:
+  # dependencies in two spellings. Production uses directory symbolic links, which need a privilege (or developer
+  # mode): qq-agent-presets gets one when this account may create it, otherwise a junction; the line says which.
   [void][IO.Directory]::CreateDirectory((Join-Path $dshHome 'plugins\node_modules'))
   foreach ($name in $bundleNames) {
     Write-FixtureJson (Join-Path $bridgeBundles ($name + '\package.json')) ([ordered]@{ name = $name; version = '0.0.1'; private = $true })
-    [void](New-Item -ItemType Junction -Path (Join-Path $dshHome ('plugins\node_modules\' + $name)) -Target (Join-Path $bridgeBundles $name))
+    $linkPath = Join-Path $dshHome ('plugins\node_modules\' + $name)
+    $linkTarget = Join-Path $bridgeBundles $name
+    $shape = 'junction'
+    if ($name -eq 'qq-agent-presets') {
+      try { [void](New-Item -ItemType SymbolicLink -Path $linkPath -Target $linkTarget -ErrorAction Stop); $shape = 'symbolic link' } catch { $shape = 'junction' }
+    }
+    if ($shape -eq 'junction') { [void](New-Item -ItemType Junction -Path $linkPath -Target $linkTarget) }
+    Write-Host ('bundle link ' + $name + ': ' + $shape)
   }
+  # A DSH-home file outside profiles and plugins that names a bundle's old folder: Inventory lists it for F3.
+  Write-FixtureJson (Join-Path $dshHome 'state\fixture-index.json') ([ordered]@{ bundle = (Join-Path $bridgeBundles 'qq-mode-console') })
   Write-Fixture (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2.patch.yml') "# fixture preset`n"
   Write-FixtureJson (Join-Path $dshHome 'plugins\package.json') ([ordered]@{ name = 'dsh-plugins-fixture'; private = $true; dependencies = [ordered]@{ 'qq-mode-console' = ('link:' + (Join-Path $bridgeBundles 'qq-mode-console').Replace('\', '/')); 'qq-agent-presets' = ('link:' + (Join-Path $bridgeBundles 'qq-agent-presets')) } })
   Write-Fixture (Join-Path $dshHome 'sessions\fixture-workdir\fixture.bin') ('fixture bytes ' * 50)
@@ -502,6 +530,9 @@ try {
   Step 'S1b inventory'
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new')) 'S1b'
   Assert-Run $run 0 'INVENTORY: 0 blockers' 'S1b'
+  $inventoryFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
+  $otherList = [IO.File]::ReadAllText((Join-Path $inventoryFolder.FullName 'dsh-other-bundle-references.txt'))
+  Assert-True ($otherList.IndexOf('state\fixture-index.json', [StringComparison]::OrdinalIgnoreCase) -ge 0) 'S1b: Inventory does not list the other DSH-home file that names a bundle'
   Assert-OldUntouched 'S1b'
 
   Step 'S1c busy turn'
@@ -635,13 +666,31 @@ try {
   try { $run = Invoke-MoveScript $moveArgs 'S1r-twin' }
   finally { [IO.Directory]::Delete($twinLink); Remove-Item -LiteralPath (Join-Path $dshHome 'plugins\extra') -Recurse -Force; Remove-Item -LiteralPath (Join-Path $root 'qq-bridge\other') -Recurse -Force }
   Assert-Run $run 1 'two linked DSH bundles share a folder name' 'S1r same folder name'
+  # The next three runs are Inventory runs: read-only, so a missing check shows as exit 0 and nothing moves.
+  $inventoryArgs = $rehearsalArgs + @('-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new')
   $bundleManifest = Join-Path $bridgeBundles 'qq-mode-console\package.json'
   $manifestBytes = [IO.File]::ReadAllBytes($bundleManifest)
   $manifestTime = (Get-Item -LiteralPath $bundleManifest).LastWriteTimeUtc
-  Write-FixtureJson $bundleManifest ([ordered]@{ name = 'qq-mode-console'; version = '0.0.1'; dependencies = [ordered]@{ 'fixture-outside' = '1.0.0' } })
-  try { $run = Invoke-MoveScript $moveArgs 'S1r-dependency' }
+  Write-FixtureJson $bundleManifest ([ordered]@{ name = 'qq-mode-console'; version = '0.0.1'; peerDependencies = [ordered]@{ 'fixture-peer' = '1.0.0' } })
+  try { $run = Invoke-MoveScript $inventoryArgs 'S1r-dependency' }
   finally { [IO.File]::WriteAllBytes($bundleManifest, $manifestBytes); (Get-Item -LiteralPath $bundleManifest).LastWriteTimeUtc = $manifestTime }
-  Assert-Run $run 1 'depends on a package outside its own folder' 'S1r outside dependency'
+  Assert-Run $run 1 'depends on a package outside its own folder' 'S1r undeclared peer dependency'
+  # An undeclared package in a node_modules above the bundle that the new place cannot reach.
+  $ancestorModules = Join-Path $bridgeBundles 'node_modules'
+  Write-FixtureJson (Join-Path $ancestorModules 'fixture-shared\package.json') ([ordered]@{ name = 'fixture-shared'; version = '1.0.0' })
+  try { $run = Invoke-MoveScript $inventoryArgs 'S1r-ancestor' } finally { Remove-Item -LiteralPath $ancestorModules -Recurse -Force }
+  Assert-Run $run 1 'depends on a package outside its own folder' 'S1r ancestor node_modules'
+  # A bundle reached through a junction inside qq-bridge.
+  $realFolder = Join-Path $root 'qq-bridge\real'
+  $alias = Join-Path $root 'qq-bridge\alias'
+  $thirdLink = Join-Path $dshHome 'plugins\extra\fixture-third'
+  Write-FixtureJson (Join-Path $realFolder 'fixture-third\package.json') ([ordered]@{ name = 'fixture-third'; version = '0.0.1' })
+  [void](New-Item -ItemType Junction -Path $alias -Target $realFolder)
+  [void][IO.Directory]::CreateDirectory((Split-Path -Parent $thirdLink))
+  [void](New-Item -ItemType Junction -Path $thirdLink -Target (Join-Path $alias 'fixture-third'))
+  try { $run = Invoke-MoveScript $inventoryArgs 'S1r-chain' }
+  finally { [IO.Directory]::Delete($thirdLink); Remove-Item -LiteralPath (Join-Path $dshHome 'plugins\extra') -Recurse -Force; [IO.Directory]::Delete($alias); Remove-Item -LiteralPath $realFolder -Recurse -Force }
+  Assert-Run $run 1 'a junction or link was found on the way to a linked DSH bundle' 'S1r junction inside qq-bridge'
   Assert-OldUntouched 'S1r'
 
   Step 'S1s digest key conflict'
@@ -791,7 +840,15 @@ try {
   Remove-Item -Path Env:HER_TASK_SCHEDULER_FILE -ErrorAction SilentlyContinue
   if ($savedScheduler) { $env:HER_TASK_SCHEDULER_FILE = $savedScheduler }
   if ($savedInstallRoot) { $env:HER_INSTALL_ROOT = $savedInstallRoot }
-  if ($passed -and -not $KeepFixture) { Remove-Item -LiteralPath $F -Recurse -Force -ErrorAction SilentlyContinue }
+  if ($passed -and -not $KeepFixture) {
+    # Links first, as links, so the recursive delete never follows one.
+    try {
+      foreach ($link in (Get-FixtureLinks $F)) {
+        if ((Get-Item -LiteralPath $link -Force) -is [IO.DirectoryInfo]) { [IO.Directory]::Delete($link) } else { [IO.File]::Delete($link) }
+      }
+    } catch { Write-Warning ('Cleanup of the fixture links: ' + $_.Exception.Message) }
+    Remove-Item -LiteralPath $F -Recurse -Force -ErrorAction SilentlyContinue
+  }
 }
 if (-not $passed) { exit 1 }
 exit 0

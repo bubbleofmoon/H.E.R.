@@ -528,19 +528,38 @@ function Get-Descendants([int]$ProcessId, [DateTime]$StartUtc) {
 function Get-OldImageProcesses([string]$Folder) {
   return @(Get-CimInstance -ClassName Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath -match '^[A-Za-z]:\\' -and (Split-Path -Parent $_.ExecutablePath) -ieq $Folder })
 }
-# Processes started from the new layout: an image under releases, current or deps, or the configured Node running a
-# script under deps or runtime (DSH and its tool servers). No process of the old production matches.
+# Processes of the new layout: an image under releases, current or deps; the configured Node running the DSH entry
+# under deps\dsh (the new DSH); and every descendant of such a DSH, created after its parent (its tool servers, which
+# may run any image). Descendants of SnowLuma are never included (QQ may be one, T2), nor anything of the old production.
 function Get-NewLayoutProcesses($plan) {
   $images = @(@('releases', 'current', 'deps') | ForEach-Object { (Join-Path $script:Root $_) + '\' })
-  $scripts = @(@('deps', 'runtime') | ForEach-Object { (Join-Path $script:Root $_) + '\' })
+  $dshEntry = (Join-Path $script:Root 'deps\dsh') + '\'
   $node = [string]$plan.NodePath
-  return @(Get-CimInstance -ClassName Win32_Process | Where-Object {
-    $image = [string]$_.ExecutablePath
-    $line = [string]$_.CommandLine
+  $all = @(Get-CimInstance -ClassName Win32_Process)
+  $found = [Collections.Generic.List[object]]::new()
+  $ids = @{}
+  $dshTree = @{}
+  foreach ($process in $all) {
+    $image = [string]$process.ExecutablePath
     $byImage = @($images | Where-Object { $image.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
-    $byScript = $node -and ($image -ieq $node) -and @($scripts | Where-Object { $line.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0
-    $byImage -or $byScript
-  })
+    $byDsh = $node -and ($image -ieq $node) -and ([string]$process.CommandLine).IndexOf($dshEntry, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    if ($byImage -or $byDsh) { $found.Add($process); $ids[[int]$process.ProcessId] = $true }
+    if ($byDsh) { $dshTree[[int]$process.ProcessId] = $process.CreationDate }
+  }
+  $grew = $true
+  while ($grew) {
+    $grew = $false
+    foreach ($process in $all) {
+      $id = [int]$process.ProcessId
+      $parent = [int]$process.ParentProcessId
+      if ($dshTree.ContainsKey($id) -or -not $dshTree.ContainsKey($parent) -or $id -eq $parent) { continue }
+      if ($process.CreationDate -lt $dshTree[$parent]) { continue }
+      $dshTree[$id] = $process.CreationDate
+      if (-not $ids.ContainsKey($id)) { $found.Add($process); $ids[$id] = $true }
+      $grew = $true
+    }
+  }
+  return @($found)
 }
 function Get-TaskShape([string]$Name) {
   $tasks = @(Get-ScheduledTask -TaskPath '\' -ErrorAction Stop | Where-Object { $_.TaskName -ceq $Name })
@@ -678,6 +697,69 @@ function Assert-SameManifest($Source, $Copy, [string]$Label) {
     if ($null -eq $copied -or $copied.Length -ne $entry.Length -or $copied.Sha256 -ne $entry.Sha256) { Stop-Failed ('the copy of ' + $Label + ' differs from its source (manifests in the evidence folder)') }
   }
 }
+# Every junction or link below a folder, found without following any.
+function Get-ReparsePoints([string]$Folder) {
+  $found = [Collections.Generic.List[string]]::new()
+  if (-not (Test-Path -LiteralPath $Folder -PathType Container)) { return ,$found }
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push($Folder)
+  while ($pending.Count -gt 0) {
+    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $found.Add($item.FullName); continue }
+      if ($item -is [IO.DirectoryInfo]) { $pending.Push($item.FullName) }
+    }
+  }
+  return ,$found
+}
+# Deletes each junction or link below a folder as a link, never its target. Windows PowerShell 5.1's
+# Remove-Item -Recurse descends through junctions, so no tree that may hold one is ever deleted that way first.
+function Remove-LinksUnder([string]$Folder) {
+  foreach ($path in (Get-ReparsePoints $Folder)) {
+    $item = Get-Item -LiteralPath $path -Force
+    Write-Log ('removed link ' + $path)
+    if ($item -is [IO.DirectoryInfo]) { [IO.Directory]::Delete($path) } else { [IO.File]::Delete($path) }
+    if (Test-Present $path) { Stop-Failed 'a link in the new layout could not be removed' }
+  }
+}
+function Remove-TreeSafely([string]$Path) {
+  $item = Get-Item -LiteralPath $Path -Force
+  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    if ($item -is [IO.DirectoryInfo]) { [IO.Directory]::Delete($Path) } else { [IO.File]::Delete($Path) }
+    return
+  }
+  if ($item -is [IO.DirectoryInfo]) { Remove-LinksUnder $Path; Remove-Item -LiteralPath $Path -Recurse -Force } else { Remove-Item -LiteralPath $Path -Force }
+}
+function Get-RobocopyExclusions([string]$From, [string[]]$Exclude) {
+  $directories = @(); $files = @()
+  foreach ($relative in @($Exclude)) {
+    if (-not $relative) { continue }
+    $full = Join-Path $From $relative
+    if (Test-Path -LiteralPath $full -PathType Container) { $directories += $full } else { $files += $full }
+  }
+  $arguments = @()
+  if ($directories.Count -gt 0) { $arguments += '/XD'; $arguments += $directories }
+  if ($files.Count -gt 0) { $arguments += '/XF'; $arguments += $files }
+  return ,$arguments
+}
+# A list-only robocopy with the copy's own switches must list nothing below an excluded path: production's bundle
+# links are directory symbolic links, which the rehearsal can make only with a privilege, so this proves on the real
+# shape, before anything is copied, that robocopy skips them instead of following them. Live files that come and go
+# between two listings do not matter here, so no counts are compared.
+function Test-RobocopyView([string]$From, [string]$To, [string[]]$Exclude, [string]$Label) {
+  $arguments = @($From, $To, '/L', '/E', '/XJ', '/R:0', '/W:0', '/NP', '/NDL', '/NJH', '/NJS', '/FP', '/NS', '/NC')
+  $exclusions = Get-RobocopyExclusions $From $Exclude
+  foreach ($item in @($exclusions)) { if ($item) { $arguments += $item } }
+  $list = Invoke-Native (Join-Path $env:WINDIR 'System32\robocopy.exe') $arguments ('robocopy-list-' + $Label)
+  if ($list.Code -ge 8) { Stop-Refused ('a list-only copy of ' + $Label + ' failed') }
+  $prefixes = @(@($Exclude) | Where-Object { $_ } | ForEach-Object { (Join-Path $From $_) + '\' })
+  $lines = Split-Lines $list.Output
+  foreach ($line in $lines) {
+    $listed = $line.Trim()
+    foreach ($prefix in $prefixes) {
+      if ($listed.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { Stop-Refused ('a list-only copy of ' + $Label + ' would follow an excluded link or copy an excluded folder') }
+    }
+  }
+}
 function Copy-Verified([string]$From, [string]$To, [string[]]$Exclude, [string]$Label) {
   if (Test-Present $To) { Stop-Failed ('the copy target for ' + $Label + ' already exists') }
   $source = Get-Manifest $From $To $Exclude $Label
@@ -697,7 +779,7 @@ function Copy-Verified([string]$From, [string]$To, [string[]]$Exclude, [string]$
   foreach ($relative in @($Exclude)) {
     if (-not $relative) { continue }
     $stray = Join-Path $To $relative
-    if (Test-Present $stray) { Remove-Item -LiteralPath $stray -Recurse -Force }
+    if (Test-Present $stray) { Remove-TreeSafely $stray }
   }
   if ($Rehearsal -and $RehearsalFault -eq 'CorruptCopy' -and $Label -eq 'snowluma') { [IO.File]::AppendAllText((Join-Path $To 'package.json'), ' ') }
   $copied = Get-Manifest $To $To @() $Label
@@ -770,7 +852,14 @@ function Find-DshLinks([string]$DshHome, [string]$BridgeRoot) {
       if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { $pending.Push($child); continue }
       $target = Get-LinkTarget $item.FullName
       if (-not $target -or $target -ieq $bridge -or -not (Test-Within $target $bridge) -or -not (Test-Path -LiteralPath $target -PathType Container)) { Stop-Refused 'a junction or link was found in dsh-home' }
-      if ((Get-Item -LiteralPath $target -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Refused 'a junction or link was found in dsh-home' }
+      # The target, every folder above it up to qq-bridge and qq-bridge itself must be real folders: a junction on
+      # the way would make the bundle live somewhere else than its path says.
+      $step = $target
+      while ($true) {
+        if ((Get-Item -LiteralPath $step -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Refused 'a junction or link was found on the way to a linked DSH bundle' }
+        if ($step -ieq $bridge) { break }
+        $step = Split-Path -Parent $step
+      }
       $links.Add([pscustomobject]@{ Path = $child; Target = $target })
     }
   }
@@ -822,17 +911,62 @@ function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $
   }
   return ,$found
 }
-# Packages a bundle needs that are not inside its own folder: Node would look for them in qq-bridge's parent folders.
+# What a bundle could load from outside its own folder after the move. Node resolves from the bundle's real path
+# upward, so (1) a node_modules in any folder above the old place that is not also above the new place (for example
+# qq-bridge\dsh\node_modules or qq-bridge\node_modules) would be lost, declared or not, and (2) a declared package
+# (dependencies, peerDependencies, optionalDependencies) found neither in the bundle's own node_modules nor in a
+# node_modules both places reach is unresolved. The drive root is shared by both places and not walked.
 function Find-BundleOutsideDependencies($Bundles) {
   $found = [Collections.Generic.List[string]]::new()
   foreach ($bundle in @(@($Bundles) | Where-Object { $null -ne $_ })) {
-    $leaf = Split-Path -Leaf ([string]$bundle.NewPath)
-    $manifestPath = Join-Path ([string]$bundle.From) 'package.json'
+    $from = [string]$bundle.From
+    $newPath = [string]$bundle.NewPath
+    $leaf = Split-Path -Leaf $newPath
+    $shared = @()
+    $current = Split-Path -Parent $from
+    while ($current.Length -gt 3) {
+      $modules = Join-Path $current 'node_modules'
+      if (Test-Path -LiteralPath $modules -PathType Container) {
+        if (Test-Within $newPath $current) { $shared += $modules } else { $found.Add($leaf + ': ' + $modules + ' is not reachable after the move') }
+      }
+      $current = Split-Path -Parent $current
+    }
+    $manifestPath = Join-Path $from 'package.json'
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { $found.Add($leaf + ': no package.json'); continue }
-    $needs = Get-Prop (Read-Json $manifestPath) 'dependencies'
-    if ($needs -isnot [Management.Automation.PSCustomObject]) { continue }
-    foreach ($property in @($needs.PSObject.Properties)) {
-      if (-not (Test-Path -LiteralPath (Join-Path ([string]$bundle.From) ('node_modules\' + $property.Name + '\package.json')) -PathType Leaf)) { $found.Add($leaf + ': ' + $property.Name) }
+    $manifest = Read-Json $manifestPath
+    $places = @((Join-Path $from 'node_modules')) + $shared
+    foreach ($kind in @('dependencies', 'peerDependencies', 'optionalDependencies')) {
+      $needs = Get-Prop $manifest $kind
+      if ($needs -isnot [Management.Automation.PSCustomObject]) { continue }
+      foreach ($property in @($needs.PSObject.Properties)) {
+        $present = @($places | Where-Object { Test-Path -LiteralPath (Join-Path $_ ($property.Name + '\package.json')) -PathType Leaf })
+        if ($present.Count -eq 0) { $found.Add($leaf + ': ' + $kind + ' ' + $property.Name) }
+      }
+    }
+  }
+  return ,$found
+}
+# DSH-home files outside profiles, plugins and sessions that name a linked bundle's old folder. The move does not
+# rewrite them (they are not its configuration); the list goes to the evidence folder, and F3 deletes qq-bridge only
+# after each listed file is settled.
+function Find-OtherBundleReferences([string]$DshHome, $Bundles) {
+  $found = [Collections.Generic.List[string]]::new()
+  $roots = @(@($Bundles) | Where-Object { $null -ne $_ } | ForEach-Object { ([string]$_.From).ToLowerInvariant() })
+  if ($roots.Count -eq 0) { return ,$found }
+  $base = Get-Normal $DshHome
+  $pending = [Collections.Generic.Stack[string]]::new()
+  $pending.Push($base)
+  while ($pending.Count -gt 0) {
+    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+      $relative = $item.FullName.Substring($base.Length + 1)
+      if ($item -is [IO.DirectoryInfo]) {
+        if (@('profiles', 'plugins', 'sessions') -notcontains $relative.ToLowerInvariant()) { $pending.Push($item.FullName) }
+        continue
+      }
+      if ($item.Length -gt 16MB) { $found.Add($relative + ' (not read: larger than 16 MiB)'); continue }
+      $text = (Read-Text $item.FullName).Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
+      if (Test-NamesRoot $text $roots) { $found.Add($relative) }
     }
   }
   return ,$found
@@ -1220,6 +1354,10 @@ function Get-MovePlan {
     $outside = Find-BundleOutsideDependencies $plan.Bundles
     Write-Utf8 (Join-Path $script:Evidence 'dsh-bundle-dependencies.txt') ((@($outside) -join "`r`n") + "`r`n")
     if ($outside.Count -gt 0) { Add-Blocker 'a linked DSH bundle depends on a package outside its own folder (list in the evidence folder)' }
+    # Not a blocker: other DSH-home files naming a bundle's old folder keep naming it; F3 settles them before deleting qq-bridge.
+    $others = Find-OtherBundleReferences $plan.DshHome $plan.Bundles
+    Write-Utf8 (Join-Path $script:Evidence 'dsh-other-bundle-references.txt') ((@($others) -join "`r`n") + "`r`n")
+    $plan.OtherBundleReferences = $others.Count
   } catch { Add-Failure $_ 'dsh home' }
 
   try {
@@ -1253,7 +1391,9 @@ function Get-MovePlan {
     # Sizes, path lengths and junctions of every copy; free disk space.
     $bytes = 0.0
     foreach ($copy in $plan.Copies) {
-      foreach ($item in (Get-Manifest $copy.From $copy.To $copy.Exclude $copy.Label -NoHash)) { if ($item.Length -gt 0) { $bytes += $item.Length } }
+      $listing = Get-Manifest $copy.From $copy.To $copy.Exclude $copy.Label -NoHash
+      foreach ($item in $listing) { if ($item.Length -gt 0) { $bytes += $item.Length } }
+      Test-RobocopyView $copy.From $copy.To $copy.Exclude $copy.Label
     }
     foreach ($name in @('her.exe', 'her-cli.exe', 'herupdate.exe')) { $image = Get-Item -LiteralPath (Join-Path $plan.ReleaseSource $name); $bytes += 2 * $image.Length }
     $plan.CopyBytes = $bytes
@@ -1412,6 +1552,10 @@ function Move-NewLayoutAside {
     if (-not ($link.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Failed ($name + ' is not a junction; it was left in place') }
     [IO.Directory]::Delete($path)
   }
+  # Links inside the new layout (the bundle junctions, anything DSH made there) are removed as links first: kept in an
+  # attempt folder, their absolute targets would reach the live bundles after a later move, and a recursive delete of
+  # the attempt folder would then follow them.
+  foreach ($name in @('runtime', 'releases', 'deps')) { Remove-LinksUnder (Join-Path $script:Root $name) }
   $aside = Join-Path $script:Root ('move-67-attempt-' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff'))
   foreach ($name in @('herupdate.exe', 'update-starts.json', 'update-alert.json', 'releases', 'deps', 'runtime')) {
     $path = Join-Path $script:Root $name
@@ -1532,6 +1676,12 @@ function Invoke-Rollback([string]$Why) {
   # The install root restriction stays only after a finished move (coordinator decision); any earlier phase restores it.
   if ($phase -lt (Get-PhaseIndex 'Done')) {
     try { Restore-RootAcl $plan } catch { $problems.Add((Get-SafeMessage $_.Exception.Message)) }
+  }
+  # An installed app launch after the move registers HERDesktop for the current/her.exe of this root; once current
+  # is gone, that logon entry fails. Read only: the owner decides (a later move makes it valid again).
+  $desktop = Get-ItemProperty -LiteralPath 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'HERDesktop' -ErrorAction SilentlyContinue
+  if ($null -ne $desktop -and ([string]$desktop.HERDesktop).Replace('/', '\').IndexOf((Join-Path $script:Root 'current\her.exe'), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+    Write-Step 'NOTE: the desktop logon entry HERDesktop still starts the install root app, which is rolled back. Remove it with: Remove-ItemProperty -LiteralPath HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name HERDesktop'
   }
   if ($problems.Count -eq 0) {
     Save-State 'RolledBack'
