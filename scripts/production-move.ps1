@@ -37,7 +37,7 @@ param(
   [switch]$AcceptDshProfileFiles,
   [switch]$AfterDone,
   [string]$DigestModel = '',
-  [ValidateSet('', 'Staged', 'Stopped', 'Copied', 'Registered')][string]$RehearsalAbortAfter = '',
+  [ValidateSet('', 'Staged', 'TasksDisabled', 'Stopped', 'Copied', 'Registered')][string]$RehearsalAbortAfter = '',
   [ValidateSet('', 'StaleIdentity', 'DisturbAfterDisable', 'CorruptCopy', 'LateDshChild')][string]$RehearsalFault = '',
   [switch]$RehearsalConfirm
 )
@@ -135,7 +135,20 @@ public static class HerMove67Native {
 function Write-Log([string]$Text) {
   if ($script:Log) { [IO.File]::AppendAllText($script:Log, ([DateTime]::UtcNow.ToString('o') + ' ' + $Text + "`r`n"), [Text.UTF8Encoding]::new($false)) }
 }
-function Write-Step([string]$Text) { Write-Host ('[67] ' + $Text); Write-Log $Text }
+# Account-home paths never reach the console or inventory.json: the profile root (the -ProfileFolder in use and
+# USERPROFILE) becomes <profile>, in backslash, forward-slash and JSON-escaped spellings. state.json keeps real paths
+# (the rollback reads them); like every evidence file it stays private and goes to the vault.
+function Hide-ProfilePath([string]$Text) {
+  $result = $Text
+  $roots = @(@($script:ProfilePath, $env:USERPROFILE) | Where-Object { $_ } | ForEach-Object { ([string]$_).TrimEnd('\') } | Where-Object { $_.Length -gt 3 } | Select-Object -Unique | Sort-Object -Property Length -Descending)
+  foreach ($root in $roots) {
+    foreach ($spelling in @($root.Replace('\', '\\'), $root, $root.Replace('\', '/'))) {
+      $result = [regex]::Replace($result, [regex]::Escape($spelling), '<profile>', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
+  }
+  return $result
+}
+function Write-Step([string]$Text) { $shown = Hide-ProfilePath $Text; Write-Host ('[67] ' + $shown); Write-Log $shown }
 function Stop-Refused([string]$Reason) { throw ('REFUSED: ' + $Reason) }
 function Stop-Failed([string]$Reason) { throw ('FAILED: ' + $Reason) }
 function Get-SafeMessage([string]$Text) {
@@ -175,6 +188,17 @@ function Assert-RehearsalPath([string]$Path) {
   while ($current.Length -gt $script:Temp.Length) {
     $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
     if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused 'a rehearsal path passes through a junction or link' }
+    $current = Split-Path -Parent $current
+  }
+}
+# No existing step of a path, from the path itself up to below the drive root, may be a junction or link: one above a
+# source or above the install root would lead hashing, copies, ACL changes and cleanup elsewhere. Production and
+# rehearsal alike (Assert-RehearsalPath only covers the steps below the temporary folder).
+function Assert-NoLinkAbove([string]$Path, [string]$What) {
+  $current = Get-Normal $Path
+  while ($current.Length -gt 3) {
+    $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused ('a junction or link lies on the path of ' + $What) }
     $current = Split-Path -Parent $current
   }
 }
@@ -753,7 +777,7 @@ function Get-RobocopyExclusions([string]$From, [string[]]$Exclude) {
 # links are directory symbolic links, which the rehearsal can make only with a privilege, so this proves on the real
 # shape, before anything is copied, that robocopy skips them instead of following them. Live files that come and go
 # between two listings do not matter here, so no counts are compared.
-function Test-RobocopyView([string]$From, [string]$To, [string[]]$Exclude, [string]$Label) {
+function Test-RobocopyView([string]$From, [string]$To, [string[]]$Exclude, [string]$Label, [int]$Files) {
   $arguments = @($From, $To, '/L', '/E', '/XJ', '/R:0', '/W:0', '/NP', '/NDL', '/NJH', '/NJS', '/FP', '/NS', '/NC')
   $exclusions = Get-RobocopyExclusions $From $Exclude
   foreach ($item in @($exclusions)) { if ($item) { $arguments += $item } }
@@ -761,12 +785,16 @@ function Test-RobocopyView([string]$From, [string]$To, [string[]]$Exclude, [stri
   if ($list.Code -ge 8) { Stop-Refused ('a list-only copy of ' + $Label + ' failed') }
   $prefixes = @(@($Exclude) | Where-Object { $_ } | ForEach-Object { (Join-Path $From $_) + '\' })
   $lines = Split-Lines $list.Output
+  $underSource = 0
   foreach ($line in $lines) {
     $listed = $line.Trim()
+    if ($listed.StartsWith($From.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { $underSource++ }
     foreach ($prefix in $prefixes) {
       if ($listed.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { Stop-Refused ('a list-only copy of ' + $Label + ' would follow an excluded link or copy an excluded folder') }
     }
   }
+  # The listing must be the one this check expects (full source paths), or the check above would pass on nothing.
+  if ($Files -gt 0 -and $underSource -eq 0) { Stop-Refused ('a list-only copy of ' + $Label + ' listed none of its files') }
 }
 function Copy-Verified([string]$From, [string]$To, [string[]]$Exclude, [string]$Label) {
   if (Test-Present $To) { Stop-Failed ('the copy target for ' + $Label + ' already exists') }
@@ -795,15 +823,18 @@ function Copy-Verified([string]$From, [string]$To, [string[]]$Exclude, [string]$
   Assert-SameManifest $source $copied $Label
   Write-Step ('copied and verified ' + $Label + ': ' + $source.Count + ' entries')
 }
-function Protect-Folder([string]$Path) {
+# Restricts a folder (and what inherits from it) to this account, SYSTEM and Administrators: the install root after
+# staging, and in a rollback the attempt folder and any new-layout folder left in the root, which hold credential
+# copies (DSH home, relay login and key, harness key) and must stay closed once the root's own access is restored.
+function Protect-Folder([string]$Path, [string]$What = 'the install root') {
   $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   $result = Invoke-Native (Join-Path $env:WINDIR 'System32\icacls.exe') @($Path, '/inheritance:r', '/grant:r', ('*' + $sid + ':(OI)(CI)F'), '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F') 'protect'
-  if ($result.Code -ne 0) { Stop-Failed 'the install root could not be restricted' }
+  if ($result.Code -ne 0) { Stop-Failed ($What + ' could not be restricted') }
   $acl = Get-Acl -LiteralPath $Path
-  if (-not $acl.AreAccessRulesProtected) { Stop-Failed 'the install root still inherits access' }
+  if (-not $acl.AreAccessRulesProtected) { Stop-Failed ($What + ' still inherits access') }
   $foreign = @($acl.Access | Where-Object { @($sid, 'S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value })
-  if ($foreign.Count -gt 0) { Stop-Failed 'the install root grants access to another account' }
-  Write-Step 'the install root is restricted to the owner, SYSTEM and Administrators'
+  if ($foreign.Count -gt 0) { Stop-Failed ($What + ' grants access to another account') }
+  Write-Step ($What + ' is restricted to the owner, SYSTEM and Administrators')
 }
 function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude) {
   $differences = [Collections.Generic.List[string]]::new()
@@ -1056,10 +1087,12 @@ function Initialize-Run {
     $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { Stop-Refused 'run this script from an administrator PowerShell' }
   }
+  Assert-NoLinkAbove $script:Root 'the install root'
   $script:ProfilePath = $ProfileFolder
   if (-not $script:ProfilePath) { $script:ProfilePath = $env:USERPROFILE }
   $base = Get-Normal $EvidenceRoot
   Assert-RehearsalPath $base
+  Assert-NoLinkAbove $base 'the evidence folder'
   if (Test-Within $base $script:Root) { Stop-Refused 'the evidence folder must be outside the install root' }
   [void][IO.Directory]::CreateDirectory($base)
   try { $script:LockStream = [IO.File]::Open((Join-Path $base 'move.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
@@ -1097,6 +1130,7 @@ function Get-MovePlan {
   $plan.DshChildren = @()
   $script:OldRuntimePath = $plan.OldRuntime
   foreach ($folder in @($plan.OldRuntime, $plan.OldRelayFolder, $plan.DshHome, $plan.ReleaseSource)) {
+    Assert-NoLinkAbove $folder 'an old production folder'
     Assert-RehearsalPath $folder
     if (Test-Within $folder $script:Root) { Stop-Refused 'the old runtime, relay folder, profile DSH home and release source must be outside the install root' }
     if (Test-Within $script:Root $folder) { Stop-Refused 'the install root must not be inside an old production folder' }
@@ -1133,7 +1167,7 @@ function Get-MovePlan {
     $plan.OldRelease = Get-ConfigPath (Get-Prop $tasks 'installRoot') 'tasks.installRoot'
     $plan.SnowLuma = Get-ConfigPath (Get-Prop $startAll 'snowLumaDirectory') 'tasks.start-all.snowLumaDirectory'
     $plan.DshScript = Get-ConfigPath (Get-Prop $startAll 'dshScript') 'tasks.start-all.dshScript'
-    foreach ($folder in @($plan.OldRelease, $plan.SnowLuma, $plan.DshScript)) { Assert-RehearsalPath $folder }
+    foreach ($folder in @($plan.OldRelease, $plan.SnowLuma, $plan.DshScript)) { Assert-NoLinkAbove $folder 'an old production folder'; Assert-RehearsalPath $folder }
     $plan.ConsolePort = [int](Get-Prop $config 'consolePort')
     if ($plan.ConsolePort -le 0) { Stop-Refused 'the old configuration has no consolePort' }
     Assert-RehearsalPort $plan.ConsolePort
@@ -1143,7 +1177,7 @@ function Get-MovePlan {
     $plan.DshPort = Get-Port (Get-Prop $dependencies 'dsh') 'dsh'
     $plan.RuntimeExclude = @('user\dsh', 'import-manifest.json', 'data\lifecycle\session-handover.json', 'data\lifecycle\session-handover-required.json')
     $plan.BackupDestination = Get-BackupDestination $config
-    if ($plan.BackupDestination) { Assert-RehearsalPath $plan.BackupDestination }
+    if ($plan.BackupDestination) { Assert-NoLinkAbove $plan.BackupDestination 'the backup folder'; Assert-RehearsalPath $plan.BackupDestination }
   } catch { Add-Failure $_ 'configuration' }
 
   try {
@@ -1165,6 +1199,7 @@ function Get-MovePlan {
     $match = [regex]::Match($plan.DshScript, '^(?<root>.+)\\node_modules\\@deepseek-ai\\dsh\\.+$', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if (-not $match.Success) { Stop-Refused 'the configured DSH script is not inside an @deepseek-ai/dsh package' }
     $plan.NpxRoot = $match.Groups['root'].Value
+    Assert-NoLinkAbove $plan.NpxRoot 'an old production folder'
     Assert-RehearsalPath $plan.NpxRoot
     if ($plan.NpxRoot -notmatch '\\_npx\\[^\\]+$') { Add-Blocker 'the DSH package is not in an npx cache folder' }
     $packageFolder = Join-Path $plan.NpxRoot 'node_modules\@deepseek-ai\dsh'
@@ -1276,7 +1311,12 @@ function Get-MovePlan {
     $script:RelayKey = $relayConfig.Key
     if ((Get-ListenerPid $plan.RelayPort) -ne $relay.Pid) { Add-Blocker 'the relay port is not served by the relay process' }
     if (@($plan.OneBotPort, $plan.OneBotWsPort, $plan.DshPort, $plan.ConsolePort) -contains $plan.RelayPort) { Add-Blocker 'the relay port is not distinct from the OneBot, DSH and console ports' }
-    foreach ($argument in $plan.RelayArguments) { if ($argument.Contains($script:RelayKey)) { Add-Blocker 'the relay command line carries the client key' } }
+    # A command line that carries the client key blocks; the key never stays in the plan, so inventory.json cannot hold it.
+    $carriesKey = @($plan.RelayArguments | Where-Object { ([string]$_).Contains($script:RelayKey) }).Count -gt 0
+    if ($carriesKey) {
+      $plan.RelayArguments = @($plan.RelayArguments | ForEach-Object { if (([string]$_).Contains($script:RelayKey)) { '[redacted: carries the client key]' } else { [string]$_ } })
+      Add-Blocker 'the relay command line carries the client key'
+    }
     if ($DigestModel) {
       # The digest key is the relay client key (Q5); an existing different key needs a decision first.
       $harnessKey = Join-Path $plan.OldRuntime 'config\harness-api-key'
@@ -1286,6 +1326,7 @@ function Get-MovePlan {
     if ((Get-OwnerSid ([int]$relay.Pid)) -ne [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { Add-Blocker 'the relay process runs as another account than this PowerShell' }
     $plan.RelayParents = Get-ParentImages ([int]$relay.Pid)
     $plan.Auth = Resolve-RelayAuth $relayConfig $plan.OldRelayFolder $plan.RelayPin $plan.Profile
+    Assert-NoLinkAbove $plan.Auth.Source 'an old production folder'
     Assert-RehearsalPath $plan.Auth.Source
   } catch { Add-Failure $_ 'relay' }
 
@@ -1401,7 +1442,8 @@ function Get-MovePlan {
     foreach ($copy in $plan.Copies) {
       $listing = Get-Manifest $copy.From $copy.To $copy.Exclude $copy.Label -NoHash
       foreach ($item in $listing) { if ($item.Length -gt 0) { $bytes += $item.Length } }
-      Test-RobocopyView $copy.From $copy.To $copy.Exclude $copy.Label
+      $fileCount = @($listing | Where-Object { $_.Length -ge 0 }).Count
+      Test-RobocopyView $copy.From $copy.To $copy.Exclude $copy.Label $fileCount
     }
     foreach ($name in @('her.exe', 'her-cli.exe', 'herupdate.exe')) { $image = Get-Item -LiteralPath (Join-Path $plan.ReleaseSource $name); $bytes += 2 * $image.Length }
     $plan.CopyBytes = $bytes
@@ -1620,6 +1662,13 @@ function Write-Done {
 }
 
 # ---------- rollback ----------
+# The attempt folder is restricted before anything moves into it: it keeps the copied credentials (DSH home, relay
+# login and key, harness key), and the rollback then restores the install root's original, possibly wider, access.
+function New-AttemptFolder([string]$Aside) {
+  if (Test-Present $Aside) { return }
+  [void][IO.Directory]::CreateDirectory($Aside)
+  Protect-Folder $Aside 'the moved-aside attempt folder'
+}
 function Move-NewLayoutAside {
   foreach ($name in @('current', 'last-good', '.current-previous', '.last-good-previous')) {
     $path = Join-Path $script:Root $name
@@ -1636,7 +1685,7 @@ function Move-NewLayoutAside {
   foreach ($name in @('herupdate.exe', 'update-starts.json', 'update-alert.json', 'releases', 'deps', 'runtime')) {
     $path = Join-Path $script:Root $name
     if (-not (Test-Present $path)) { continue }
-    [void][IO.Directory]::CreateDirectory($aside)
+    New-AttemptFolder $aside
     if (Test-Path -LiteralPath $path -PathType Container) { [IO.Directory]::Move($path, (Join-Path $aside $name)) } else { [IO.File]::Move($path, (Join-Path $aside $name)) }
   }
   # Archives the new runtime wrote would make a later run refuse (owner decision a); they stay with the attempt.
@@ -1648,6 +1697,7 @@ function Move-NewLayoutAside {
     $until = [DateTime]::UtcNow
     if ([string]$script:State.NewStoppedAt) { $until = [DateTime]::Parse([string]$script:State.NewStoppedAt, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
     foreach ($archive in @(Get-ChildItem -LiteralPath $destination -File -Force | Where-Object { $_.Name -match $ArchivePattern -and $_.LastWriteTimeUtc -ge $since -and $_.LastWriteTimeUtc -le $until })) {
+      New-AttemptFolder $aside
       $keep = Join-Path $aside 'backups-new'
       [void][IO.Directory]::CreateDirectory($keep)
       [IO.File]::Move($archive.FullName, (Join-Path $keep $archive.Name))
@@ -1748,7 +1798,9 @@ function Invoke-Rollback([string]$Why) {
   if ($phase -ge (Get-PhaseIndex 'OldTasksDisabled')) {
     foreach ($task in @($plan.OldTasks)) { try { Restore-Task $task } catch { $problems.Add((Get-SafeMessage $_.Exception.Message)) } }
   }
-  if ($phase -ge (Get-PhaseIndex 'Stopping')) {
+  # From OldTasksDisabled on, the old production may be down even before the stop phase (a reboot while its tasks were
+  # disabled): Start-OldProduction checks the real state and starts only what is not running.
+  if ($phase -ge (Get-PhaseIndex 'OldTasksDisabled')) {
     if ($newRunning) { $oldUp = $false }
     else {
       try { Start-OldProduction $plan; Write-Step 'the old production runs again' }
@@ -1756,11 +1808,19 @@ function Invoke-Rollback([string]$Why) {
     }
   }
   if (-not $newRunning) {
-    try { Move-NewLayoutAside } catch { $problems.Add('the new layout could not be moved aside: ' + (Get-SafeMessage $_.Exception.Message)) }
+    try { Move-NewLayoutAside } catch { $problems.Add('the new layout could not be moved aside (a process, possibly QQ through its SnowLuma hook, still uses files under the new layout: close or restart it, then run the rollback again): ' + (Get-SafeMessage $_.Exception.Message)) }
   }
   # The install root restriction stays only after a finished move (coordinator decision); any earlier phase restores it.
   if ($phase -lt (Get-PhaseIndex 'Done')) {
-    try { Restore-RootAcl $plan } catch { $problems.Add((Get-SafeMessage $_.Exception.Message)) }
+    try {
+      # New-layout folders the move-aside left in the root hold credential copies: restricted on their own first,
+      # so restoring the root's original access does not open them.
+      foreach ($name in @('runtime', 'deps', 'releases')) {
+        $left = Join-Path $script:Root $name
+        if (Test-Path -LiteralPath $left -PathType Container) { Protect-Folder $left ('the leftover ' + $name + ' folder') }
+      }
+      Restore-RootAcl $plan
+    } catch { $problems.Add((Get-SafeMessage $_.Exception.Message)) }
   }
   # An installed app launch after the move registers HERDesktop for the current/her.exe of this root; once current
   # is gone, that logon entry fails. Read only: the owner decides (a later move makes it valid again).
@@ -1789,7 +1849,7 @@ function Invoke-Inventory {
   foreach ($key in @($plan.Keys)) { if ($key -ne 'OldTasks') { $copy[$key] = $plan[$key] } }
   $copy['OldTasks'] = @($plan.OldTasks | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Shape = $_.Shape; Enabled = $_.Enabled; State = $_.State } })
   $copy['Blockers'] = @($script:Blockers)
-  Write-JsonFile (Join-Path $script:Evidence 'inventory.json') $copy
+  Write-Utf8 (Join-Path $script:Evidence 'inventory.json') (Hide-ProfilePath ($copy | ConvertTo-Json -Depth 100))
   Write-Step ('INVENTORY: ' + $script:Blockers.Count + ' blockers; details in ' + (Join-Path $script:Evidence 'inventory.json'))
   if ($script:Blockers.Count -gt 0) { return 1 }
   return 0
@@ -1817,6 +1877,7 @@ function Invoke-Move {
       if ((Get-TaskShape $task.Name).EndsWith('#True')) { Stop-Failed ('the scheduled task ' + $task.Name + ' could not be disabled') }
     }
     Write-Step 'the old scheduled tasks are disabled'
+    Assert-AbortPoint 'TasksDisabled'
     if ($Rehearsal -and $RehearsalFault -eq 'LateDshChild') {
       # The fake DSH starts a child now, after the checks; the stop must still find and end it.
       [void](Invoke-WebRequest -UseBasicParsing -Uri ('http://127.0.0.1:' + $plan.DshPort + '/fixture/spawn-child') -TimeoutSec 10)
@@ -1859,6 +1920,7 @@ function Invoke-RollbackMode {
   if (-not $StateFile) { Stop-Refused '-StateFile is required' }
   $script:StatePath = Get-Normal $StateFile
   Assert-RehearsalPath $script:StatePath
+  Assert-NoLinkAbove $script:StatePath 'the state file'
   $loaded = Read-Json $script:StatePath
   if ([bool]$loaded.Rehearsal -ne [bool]$Rehearsal) { Stop-Refused 'the state file belongs to a run of the other kind (rehearsal or production)' }
   if ((Get-Normal ([string]$loaded.Root)) -ine $script:Root) { Stop-Refused 'the state file belongs to another install root' }
@@ -1881,6 +1943,7 @@ function Invoke-RollbackMode {
 }
 function Invoke-OperatorFolders {
   $from = Get-Normal $OperatorSource
+  Assert-NoLinkAbove $from 'the ops folder'
   Assert-RehearsalPath $from
   $to = Join-Path $script:Root 'ops'
   if (-not (Test-Path -LiteralPath $from -PathType Container)) { Stop-Refused 'the ops folder is missing' }

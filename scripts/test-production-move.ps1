@@ -273,6 +273,25 @@ function Assert-RootAcl([string]$Scenario, [switch]$Restricted) {
     Assert-True ((Get-RootSddl) -eq $rootSddl) ($Scenario + ': the install root access was not restored')
   }
 }
+# A folder that holds credential copies after a rollback: no inheritance, and no account but this one, SYSTEM and
+# Administrators (the fixture grants Users read access from above, so an inheriting folder fails here).
+function Assert-Protected([string]$Path, [string]$What) {
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  $acl = Get-Acl -LiteralPath $Path
+  Assert-True ($acl.AreAccessRulesProtected) ($What + ' still inherits access')
+  $foreign = @($acl.Access | Where-Object { @($sid, 'S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value })
+  Assert-True ($foreign.Count -eq 0) ($What + ' grants access to another account')
+}
+# Stops one fixture process by its verified identity (a reboot simulation); never a process outside the fixture.
+function Stop-FixtureProcess([int]$ProcessId) {
+  $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+  if ($null -eq $process) { return }
+  $image = [string]$process.Path
+  if (-not $image.StartsWith($F + '\', [StringComparison]::OrdinalIgnoreCase)) { throw ('FAIL fixture: process ' + $ProcessId + ' is not a fixture process') }
+  $start = [uint64]$process.StartTime.ToUniversalTime().ToFileTimeUtc()
+  $result = [HerMove67RehearsalNative]::Stop([uint32]$ProcessId, $start, $image)
+  if (@('stopped', 'gone') -notcontains $result) { throw ('FAIL fixture: process ' + $ProcessId + ' could not be stopped: ' + $result) }
+}
 function Assert-OldUntouched([string]$Scenario) {
   $owners = Get-Owners $oldRuntime $unused $cli
   Assert-True ($owners.supervisor -eq 'held' -and $owners.supervisorPid -eq $script:baselineSupervisor) ($Scenario + ': the old supervisor was restarted or stopped')
@@ -296,6 +315,8 @@ function Assert-OldRunning([string]$Scenario, [switch]$Restricted) {
   foreach ($attempt in $attempts) {
     $attemptLinks = Get-FixtureLinks $attempt.FullName
     Assert-True ($attemptLinks.Count -eq 0) ($Scenario + ': a moved-aside attempt folder still holds a junction or link')
+    # It keeps copied credentials, and the root's original (here wider) access is back: it must be closed on its own.
+    Assert-Protected $attempt.FullName ($Scenario + ': a moved-aside attempt folder')
   }
   Assert-RootAcl $Scenario -Restricted:$Restricted
   Assert-Originals $Scenario
@@ -422,6 +443,11 @@ try {
   [void][IO.Directory]::CreateDirectory($F)
   # Fixture guard against an unused boundary (rust-validation.md); this never stats the production root.
   [void](Invoke-Her @('install-root', 'check-development', '--runtime-root', $F, '--install-root', $boundary))
+  # Users may read the fixture (an inherited entry, as a wider production root ACL would give), so a folder the move
+  # leaves inheriting after a rollback is visible to another account and Assert-Protected catches it.
+  $fixtureAcl = Get-Acl -LiteralPath $F
+  $fixtureAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'), [Security.AccessControl.FileSystemRights]::ReadAndExecute, [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit', [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+  [IO.Directory]::SetAccessControl($F, [Security.AccessControl.DirectorySecurity]$fixtureAcl)
 
   # A private copy of Node inside the fixture runs the whole synthetic production, so a production node.exe (possibly
   # under another account) never matches the fixture's configured program. The managed DSH pin is used in place; the
@@ -610,6 +636,13 @@ try {
   $inventoryFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
   $otherList = [IO.File]::ReadAllText((Join-Path $inventoryFolder.FullName 'dsh-other-bundle-references.txt'))
   Assert-True ($otherList.IndexOf('state\fixture-index.json', [StringComparison]::OrdinalIgnoreCase) -ge 0) 'S1b: Inventory does not list the other DSH-home file that names a bundle'
+  # No account-home path on the console or in inventory.json (the fixture lives under the profile's temporary folder).
+  Assert-True ($run.Text.IndexOf($env:USERPROFILE, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: the console shows an account-home path'
+  $inventoryText = [IO.File]::ReadAllText((Join-Path $inventoryFolder.FullName 'inventory.json'))
+  foreach ($private in @($profileFolder, $env:USERPROFILE)) {
+    Assert-True ($inventoryText.IndexOf($private.Replace('\', '\\'), [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds an account-home path'
+  }
+  Assert-True ($inventoryText.IndexOf('<profile>', [StringComparison]::Ordinal) -ge 0) 'S1b: inventory.json has no profile placeholder'
   Assert-OldUntouched 'S1b'
 
   Step 'S1c busy turn'
@@ -705,6 +738,12 @@ try {
   try { $run = Invoke-MoveScript $behind 'S1m-junction' } finally { [IO.Directory]::Delete($redirect) }
   Assert-Run $run 1 'a rehearsal path passes through a junction or link' 'S1m junction'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $F 'redirect-target\evidence'))) 'S1m: the rehearsal wrote behind the junction'
+  # A source reached through a junction above it: refused by the check production runs too, before the rehearsal rule.
+  $aliasOrch = Join-Path $F 'alias-orch'
+  [void](New-Item -ItemType Junction -Path $aliasOrch -Target (Join-Path $F 'her-orch'))
+  $aliased = $rehearsalArgs + @('-Mode', 'Inventory', '-OldRuntime', $oldRuntime, '-OldRelayFolder', (Join-Path $aliasOrch 'relay\cliproxy-0.0.1'), '-ReleaseSource', $releaseSource, '-ReleaseName', 'fixture-new')
+  try { $run = Invoke-MoveScript $aliased 'S1m-ancestor' } finally { [IO.Directory]::Delete($aliasOrch) }
+  Assert-Run $run 1 'a junction or link lies on the path of an old production folder' 'S1m junction above a source'
   Assert-OldUntouched 'S1m'
 
   Step 'S1n process changed after the checks'
@@ -778,6 +817,25 @@ try {
   Assert-Run $run 1 'holds another key than the relay client key' 'S1s'
   Assert-OldUntouched 'S1s'
 
+  Step 'S1t client key on the relay command line'
+  # The relay runs once with the key in an argument: Inventory blocks, and inventory.json must not hold the key.
+  Stop-FixtureListener $relayPort
+  Wait-For { $null -eq (Get-Listener $relayPort) } 'S1t: the relay stops' 30
+  Wait-For { (Get-ScheduledTask -TaskName $relayTask -TaskPath '\').State -ne 'Running' } 'S1t: the relay task instance ends' 60
+  [void](Start-Process -FilePath (Join-Path $relayFolder 'cli-proxy-api.exe') -ArgumentList @(('"' + (Join-Path $relayFolder 'fake-relay.mjs') + '"'), '-config', ('"' + (Join-Path $relayFolder 'config.yaml') + '"'), '--note=fixture-relay-key-67') -WindowStyle Hidden -PassThru)
+  Wait-For { $null -ne (Get-Listener $relayPort) } 'S1t: the keyed relay listens' 30
+  try { $run = Invoke-MoveScript $inventoryArgs 'S1t' }
+  finally {
+    Stop-FixtureListener $relayPort
+    Wait-For { $null -eq (Get-Listener $relayPort) } 'S1t: the keyed relay stops' 30
+    Start-ScheduledTask -TaskName $relayTask -TaskPath '\'
+    Wait-For { Test-OldUp } 'S1t: the relay runs from its task again' 60
+  }
+  Assert-Run $run 1 'the relay command line carries the client key' 'S1t'
+  $keyedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
+  Assert-True ([IO.File]::ReadAllText((Join-Path $keyedFolder.FullName 'inventory.json')).IndexOf('fixture-relay-key-67', [StringComparison]::Ordinal) -lt 0) 'S1t: inventory.json holds the relay client key'
+  Assert-OldUntouched 'S1t'
+
   Step 'S2 health failure rolls back'
   Write-Fixture $failMarker 'fail'
   try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '45')) 'S2' }
@@ -839,6 +897,10 @@ try {
   try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3c-held' } finally { $hold.Dispose() }
   Assert-Run $run 3 'THE OLD PRODUCTION RUNS AGAIN' 'S3c held folder'
   Assert-True ($run.Text.IndexOf('could not be moved aside', [StringComparison]::OrdinalIgnoreCase) -ge 0) 'S3c: the move-aside problem is not named'
+  Assert-True ($run.Text.IndexOf('possibly QQ', [StringComparison]::OrdinalIgnoreCase) -ge 0) 'S3c: the move-aside hint is missing'
+  # The copied runtime stayed in the root and the root's original access is back: the runtime must be closed on its own.
+  Assert-Protected (Join-Path $root 'runtime') 'S3c: the leftover runtime'
+  Assert-RootAcl 'S3c held'
   Wait-For { Test-OldUp } 'S3c: the old production runs while the rollback is incomplete' 60
   # The relay fails before the rerun while the old supervisor stays up: the rerun must start the relay task alone.
   Stop-FixtureListener $relayPort
@@ -846,6 +908,19 @@ try {
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3c-rollback'
   Assert-Run $run 0 'ROLLED BACK' 'S3c rollback'
   Assert-OldRunning 'S3c'
+
+  Step 'S3d reboot after the old tasks were disabled'
+  # The move stops after disabling both old tasks; a reboot then ends every old process and nothing starts them.
+  $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'TasksDisabled')) 'S3d'
+  Assert-Run $run 4 'REHEARSAL ABORT after TasksDisabled' 'S3d'
+  $owners = Get-Owners $oldRuntime $unused $cli
+  foreach ($processId in @($owners.supervisorPid, $owners.livePid)) { if ($processId -gt 0) { Stop-FixtureProcess $processId } }
+  foreach ($port in @($consolePort, $onebotPort, $dshPort, $relayPort)) { Stop-FixtureListener $port }
+  Wait-For { $null -eq (Get-Listener $onebotPort) -and $null -eq (Get-Listener $relayPort) -and $null -eq (Get-Listener $dshPort) -and $null -eq (Get-Listener $consolePort) } 'S3d: the simulated reboot ends the old production' 30
+  $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', (Get-LatestState))) 'S3d-rollback'
+  Assert-Run $run 0 'ROLLED BACK' 'S3d rollback'
+  Assert-Run $run 0 'the old production runs again' 'S3d old production started'
+  Assert-OldRunning 'S3d'
 
   Step 'S4 interrupted after registration, then a logon starts HER'
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalAbortAfter', 'Registered')) 'S4'
