@@ -110,6 +110,8 @@ $failMarker = Join-Path $F 'fail-new-dsh'
 $decoy = Join-Path $F 'decoy-root'
 $bridgeBundles = Join-Path $root 'qq-bridge\dsh'
 $bundleNames = @('qq-mode-console', 'qq-agent-presets')
+# The rehearsal's owner go folder: beside the install root, as the script expects in a rehearsal.
+$goFolder = Join-Path $F 'go'
 $boundary = Join-Path $temp ('her-67-boundary-' + [guid]::NewGuid().ToString('N'))
 $registered = @()
 $passed = $false
@@ -122,6 +124,13 @@ function Write-Fixture([string]$Path, [string]$Text) {
   [IO.File]::WriteAllText($Path, $Text, [Text.UTF8Encoding]::new($false))
 }
 function Write-FixtureJson([string]$Path, $Value) { Write-Fixture $Path ($Value | ConvertTo-Json -Depth 20) }
+# A one-line owner go file in the go folder; -AgeMinutes dates it back.
+function Write-GoFile([string]$Line, [int]$AgeMinutes = 0) {
+  $path = Join-Path $goFolder ('go-' + [guid]::NewGuid().ToString('N') + '.txt')
+  Write-Fixture $path ($Line + "`r`n")
+  if ($AgeMinutes -gt 0) { (Get-Item -LiteralPath $path).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-$AgeMinutes) }
+  return $path
+}
 function Add-LedgerRecord($Record) {
   [IO.File]::AppendAllText((Join-Path $oldRuntime 'data\turn-ledger.jsonl'), (($Record | ConvertTo-Json -Compress -Depth 5) + "`n"), [Text.UTF8Encoding]::new($false))
 }
@@ -411,6 +420,11 @@ function Assert-Moved([string]$Scenario, [switch]$Digest) {
     $target = ([string]@($link.Target)[0]) -replace '^\\\\\?\\', ''
     Assert-True ($target.TrimEnd('\') -ieq (Join-Path $newHome ('bundles\' + $name))) ($Scenario + ': the bundle link ' + $name + ' does not point at the new bundles folder')
     Assert-True ((Get-FileHashText (Join-Path $newHome ('bundles\' + $name + '\package.json'))) -eq (Get-FileHashText (Join-Path $bridgeBundles ($name + '\package.json')))) ($Scenario + ': the bundle ' + $name + ' was not copied')
+    # The web profile's node_modules link is recreated to the new home's plugins link and reaches the copied bundle.
+    $profileLink = Get-Item -LiteralPath (Join-Path $newHome ('profiles\web\node_modules\' + $name)) -Force
+    $profileTarget = ([string]@($profileLink.Target)[0]) -replace '^\\\\\?\\', ''
+    Assert-True ([bool]($profileLink.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $profileTarget.TrimEnd('\') -ieq (Join-Path $newHome ('plugins\node_modules\' + $name))) ($Scenario + ': the profile node_modules link ' + $name + ' does not point at the new plugins link')
+    Assert-True (Test-Path -LiteralPath (Join-Path $newHome ('profiles\web\node_modules\' + $name + '\package.json')) -PathType Leaf) ($Scenario + ': the profile node_modules link ' + $name + ' does not reach the copied bundle')
   }
   Assert-True ((Get-FileHashText (Join-Path $newHome 'bundles\qq-agent-presets\presets\qq-chat-v2.patch.yml')) -eq (Get-FileHashText (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2.patch.yml'))) ($Scenario + ': the bundle preset was not copied')
   $pluginsText = [IO.File]::ReadAllText((Join-Path $newHome 'plugins\package.json'))
@@ -554,6 +568,13 @@ try {
     if ($shape -eq 'junction') { [void](New-Item -ItemType Junction -Path $linkPath -Target $linkTarget) }
     Write-Host ('bundle link ' + $name + ': ' + $shape)
   }
+  # The second link of each bundle that link: dependencies make, from the web profile's node_modules to the plugins
+  # link. Production's are relative symbolic links; a junction must be absolute and a symbolic link needs a privilege,
+  # so the fixture's are absolute junctions. The relative shape is covered by reading Get-LinkTarget, not here.
+  [void][IO.Directory]::CreateDirectory((Join-Path $dshHome 'profiles\web\node_modules'))
+  foreach ($name in $bundleNames) {
+    [void](New-Item -ItemType Junction -Path (Join-Path $dshHome ('profiles\web\node_modules\' + $name)) -Target (Join-Path $dshHome ('plugins\node_modules\' + $name)))
+  }
   # A DSH-home file outside profiles and plugins that names a bundle's old folder: Inventory lists it for F3.
   Write-FixtureJson (Join-Path $dshHome 'state\fixture-index.json') ([ordered]@{ bundle = (Join-Path $bridgeBundles 'qq-mode-console') })
   Write-Fixture (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2.patch.yml') "# fixture preset`n"
@@ -632,13 +653,15 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 55 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 64 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
   Assert-Run $run 1 'pass -Production for the live move or -Rehearsal' 'S1a no switch'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-Production', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-production'
   Assert-Run $run 1 'the production install root is C:\qqbot' 'S1a production switch'
+  $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory', '-OwnerGoFile', (Join-Path $goFolder 'unused.txt')) + $sourceArgs + @('-ReleaseName', 'fixture-new')) 'S1a-go-inventory'
+  Assert-Run $run 1 'Inventory changes nothing and takes no owner go file' 'S1a inventory with a go file'
   Assert-OldUntouched 'S1a'
 
   Step 'S1b inventory'
@@ -884,6 +907,25 @@ try {
   foreach ($key in @('fixture-relay-key-67', $second)) { Assert-True ($refusedText.IndexOf($key, [StringComparison]::Ordinal) -lt 0) ('S1t: inventory.json holds a relay key after a refused configuration') }
   Assert-OldUntouched 'S1t'
 
+  Step 'S1u relay configuration without a top-level port'
+  # Production's shape: no top-level port line, one indented port under another block. The relay's default port is
+  # used and confirmed against the live relay listener (here the fixture port stands in for 8317).
+  $relayConfigFile = Join-Path $relayFolder 'config.yaml'
+  $relayConfigBytes = [IO.File]::ReadAllBytes($relayConfigFile)
+  $relayConfigTime = (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc
+  try {
+    Write-Fixture $relayConfigFile ("remote-management:`n  port: 83`nauth-dir: `"~/.cli-proxy-api`"`napi-keys:`n  - `"fixture-relay-key-67`"`n")
+    $run = Invoke-MoveScript ($inventoryArgs + @('-RelayDefaultPort', [string]$relayPort)) 'S1u'
+    $wrongPort = Invoke-MoveScript ($inventoryArgs + @('-RelayDefaultPort', [string]$consolePort)) 'S1u-wrong-default'
+  }
+  finally {
+    [IO.File]::WriteAllBytes($relayConfigFile, $relayConfigBytes)
+    (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc = $relayConfigTime
+  }
+  Assert-Run $run 0 'INVENTORY: 0 blockers' 'S1u default port confirmed by the listener'
+  Assert-Run $wrongPort 1 'the relay port is not served by the relay process' 'S1u default port not served by the relay'
+  Assert-OldUntouched 'S1u'
+
   Step 'S2 health failure rolls back'
   Write-Fixture $failMarker 'fail'
   try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '45')) 'S2' }
@@ -1025,20 +1067,53 @@ try {
   Assert-True (@(Get-LateChildren).Count -eq 0) 'S6: a child of the new DSH survived the rollback'
   Assert-OldRunning 'S6' -Restricted
 
-  Step 'S7 move again after rollbacks; DSH starts a child after the checks'
-  $run = Invoke-MoveScript ($moveArgs + @('-RehearsalFault', 'LateDshChild')) 'S7'
+  Step 'S7 move again after rollbacks, on an owner go file; DSH starts a child after the checks'
+  # A go file naming another release is consumed and refused before any change.
+  $goFile = Write-GoFile 'MOVE another-release'
+  $run = Invoke-MoveScript ($moveArgs + @('-OwnerGoFile', $goFile)) 'S7-go-release'
+  Assert-Run $run 1 'the owner go file does not name this action and release' 'S7 go file for another release'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S7: a refused go file was left for reuse'
+  Assert-OldUntouched 'S7'
+  # The right go file starts the move and is gone afterwards.
+  $goFile = Write-GoFile 'MOVE fixture-new'
+  $run = Invoke-MoveScript ($moveArgs + @('-RehearsalFault', 'LateDshChild', '-OwnerGoFile', $goFile)) 'S7'
   Assert-Run $run 0 'MOVE DONE' 'S7'
+  Assert-Run $run 0 'the owner go file names MOVE; it is deleted' 'S7 go file accepted'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S7: the go file was not consumed'
   Assert-True (@(Get-LateChildren).Count -eq 0) 'S7: a DSH child started after the checks survived the stop'
   Assert-Moved 'S7'
 
   Step 'S8 operator folder'
   $operatorArgs = $rehearsalArgs + @('-Mode', 'OperatorFolders', '-OperatorSource', $opsSource)
+  # Owner go files that must refuse before the copy; each one read is consumed (one behind a link is never read).
+  $goFile = Write-GoFile 'MOVE'
+  $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-word'
+  Assert-Run $run 1 'the owner go file does not name this action and release' 'S8 go file with another word'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S8: a refused go file was left for reuse'
+  $goFile = Write-GoFile 'COPY' 150
+  $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8-go-stale'
+  Assert-Run $run 1 'the owner go file is older than 2 hours' 'S8 stale go file'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S8: a stale go file was left for reuse'
+  $elsewhere = Join-Path $F 'elsewhere\go.txt'
+  Write-Fixture $elsewhere "COPY`r`n"
+  $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $elsewhere)) 'S8-go-folder'
+  Assert-Run $run 1 'the owner go file must lie directly in the go folder' 'S8 go file outside the go folder'
+  $goReal = Join-Path $F 'go-real'
+  Write-Fixture (Join-Path $goReal 'go.txt') "COPY`r`n"
+  Remove-Item -LiteralPath $goFolder -Recurse -Force
+  [void](New-Item -ItemType Junction -Path $goFolder -Target $goReal)
+  try { $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', (Join-Path $goFolder 'go.txt'))) 'S8-go-link' }
+  finally { [IO.Directory]::Delete($goFolder); Remove-Item -LiteralPath $goReal -Recurse -Force }
+  Assert-Run $run 1 'a junction or link lies on the path of the owner go file' 'S8 go folder behind a link'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'ops'))) 'S8: a refused go file let the copy run'
   # A copy that fails its hash check leaves neither ops nor its staging folder, so the retry below can run.
   $run = Invoke-MoveScript ($operatorArgs + @('-RehearsalFault', 'CorruptCopy')) 'S8-corrupt'
   Assert-Run $run 1 'differs from its source' 'S8 failed copy'
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $root 'ops')) -and -not (Test-Path -LiteralPath (Join-Path $root '.ops-copy'))) 'S8: a failed copy left an ops folder behind'
-  $run = Invoke-MoveScript $operatorArgs 'S8'
+  $goFile = Write-GoFile 'COPY'
+  $run = Invoke-MoveScript ($operatorArgs + @('-OwnerGoFile', $goFile)) 'S8'
   Assert-Run $run 0 'OPERATOR FOLDER COPIED' 'S8'
+  Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S8: the go file was not consumed'
   Assert-True ((Get-FileHashText (Join-Path $root 'ops\fixture-op.ps1')) -eq (Get-FileHashText (Join-Path $opsSource 'fixture-op.ps1'))) 'S8: the ops copy differs'
   $run = Invoke-MoveScript $operatorArgs 'S8-again'
   Assert-Run $run 1 'the install root already has ops' 'S8 second copy'
