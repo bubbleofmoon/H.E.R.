@@ -63,6 +63,7 @@ $script:SelfChecks = 0
 $script:Blockers = [Collections.Generic.List[string]]::new()
 $script:SecretTexts = [Collections.Generic.List[string]]::new()
 $script:ProfileRoots = $null
+$script:RootAclChanging = $false
 
 if (-not ('HerMove67Native' -as [type])) {
   Add-Type -TypeDefinition @'
@@ -782,7 +783,10 @@ function Get-ReparsePoints([string]$Folder) {
   $pending = [Collections.Generic.Stack[string]]::new()
   $pending.Push($Folder)
   while ($pending.Count -gt 0) {
-    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+    # A path too long to list cannot be checked: a fixed refusal, never an unexpected error.
+    try { $items = [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos() }
+    catch [System.IO.PathTooLongException] { Stop-Failed 'a path is too long to check for junctions or links' }
+    foreach ($item in $items) {
       if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { $found.Add($item.FullName); continue }
       if ($item -is [IO.DirectoryInfo]) { $pending.Push($item.FullName) }
     }
@@ -922,10 +926,14 @@ function New-McpProfile([string]$Cli, [string]$Source, [string]$Folder, [int]$Co
 function Get-LinkTarget([string]$Path) {
   $targets = @((Get-Item -LiteralPath $Path -Force).Target)
   if ($targets.Count -ne 1 -or -not [string]$targets[0]) { return '' }
-  $target = [string]$targets[0]
+  $raw = [string]$targets[0]
+  $target = $raw
   if ($target.StartsWith('\\?\') -or $target.StartsWith('\??\')) { $target = $target.Substring(4) }
-  if ($target -notmatch '^[A-Za-z]:[\\/]') { $target = Join-Path (Split-Path -Parent $Path) $target }
-  return (Get-Normal $target)
+  if ($target -match '^[A-Za-z]:[\\/]') { return (Get-Normal $target) }
+  # A volume GUID, UNC, rooted or other non-drive-letter target is never inside anything: '' makes every caller refuse.
+  if ($raw.StartsWith('\\') -or $raw.StartsWith('\??\') -or $target.StartsWith('\') -or $target.StartsWith('/') -or $target -match '^(Volume\{|UNC[\\/])' -or $target.Contains(':')) { return '' }
+  # A relative target (a symbolic link's) is resolved against the link's own folder.
+  return (Get-Normal (Join-Path (Split-Path -Parent $Path) $target))
 }
 # Directory links in the DSH home, found without following any link. Only a link to a folder strictly inside the
 # install root's qq-bridge folder is a bundle the move copies and links again; any other link refuses.
@@ -1778,10 +1786,13 @@ function Test-OldProductionUp($plan) {
   foreach ($port in (Get-ProductionPortList $plan)) { if ((Get-ListenerPid $port) -eq 0) { return $false } }
   return $true
 }
-# Returns $true when it had to start something, $false when the old production was already up. A transient view (an
-# owner between states, one failed status call) gets 30 seconds to settle before anything is started.
-function Start-OldProduction($plan) {
-  $settle = [DateTime]::UtcNow.AddSeconds(30)
+# Returns $true when it had to start something, $false when the old production was already up. -Settle (only before
+# the stop phase, when this script stopped nothing) gives a transient view (an owner between states, one failed status
+# call) 30 seconds to settle before anything is started; after the script's own stop it would only add downtime.
+function Start-OldProduction($plan, [switch]$Settle) {
+  $settleSeconds = 0
+  if ($Settle) { $settleSeconds = 30 }
+  $settle = [DateTime]::UtcNow.AddSeconds($settleSeconds)
   while ($true) {
     $up = $false
     try { $up = [bool](Test-OldProductionUp $plan) } catch { $up = $false }
@@ -1805,16 +1816,19 @@ function Start-OldProduction($plan) {
 function Restore-RootAcl($plan) {
   $saved = [string]$plan.RootAccessSddl
   if (-not $saved) { return }
-  # The restored, inheriting DACL propagates into the root: no link in it may lead outside.
-  Assert-LinksInside $script:Root 'the install root'
   $sections = [Security.AccessControl.AccessControlSections]::Access
   $acl = Get-Acl -LiteralPath $script:Root
   if ($acl.GetSecurityDescriptorSddlForm($sections) -eq $saved) { return }
+  # The restored, inheriting DACL propagates into the root: no link in it may lead outside.
+  Assert-LinksInside $script:Root 'the install root'
   $acl.SetSecurityDescriptorSddlForm($saved, $sections)
-  # Persist only the DACL section that changed; the owner is left alone.
+  # Persist only the DACL section that changed; the owner is left alone. From here on, the root's access is unknown
+  # until the check below confirms it.
+  $script:RootAclChanging = $true
   [IO.Directory]::SetAccessControl($script:Root, [Security.AccessControl.DirectorySecurity]$acl)
   $restored = Get-Acl -LiteralPath $script:Root
   if ($restored.GetSecurityDescriptorSddlForm($sections) -ne $saved) { Stop-Failed 'the install root access could not be restored' }
+  $script:RootAclChanging = $false
   Write-Step 'the install root access is restored to what it was before the move'
 }
 function Invoke-Rollback([string]$Why, [switch]$NothingStopped) {
@@ -1884,7 +1898,7 @@ function Invoke-Rollback([string]$Why, [switch]$NothingStopped) {
     if ($newRunning) { $oldUp = $false }
     else {
       try {
-        $started = [bool](@(Start-OldProduction $plan)[-1])
+        $started = [bool](@(Start-OldProduction $plan -Settle:($phase -lt (Get-PhaseIndex 'Stopping')))[-1])
         if ($started) { Write-Step 'the old production runs again' } else { Write-Step 'the old production is running' }
       }
       catch { $oldUp = $false; $problems.Add((Get-SafeMessage $_.Exception.Message)) }
@@ -1904,8 +1918,10 @@ function Invoke-Rollback([string]$Why, [switch]$NothingStopped) {
       }
       Restore-RootAcl $plan
     } catch {
-      # No ACL was changed outside the root; the root keeps its restriction rather than reopening around a link.
-      $problems.Add((Get-SafeMessage $_.Exception.Message) + '; the install root stays restricted to the owner, SYSTEM and Administrators')
+      # No ACL was changed outside the root. The text says what is known about the root itself.
+      if ($script:RootAclChanging) { $known = '; the install root access may be only partly restored: compare it with RootAccessSddl in the state file' }
+      else { $known = '; the install root access was left unchanged by this step (restricted to the owner, SYSTEM and Administrators if the move had restricted it)' }
+      $problems.Add((Get-SafeMessage $_.Exception.Message) + $known)
     }
   }
   # An installed app launch after the move registers HERDesktop for the current/her.exe of this root; once current

@@ -43,7 +43,9 @@ public issue, comment or commit names those vault paths and nothing else.
   word (`MOVE`, `ROLLBACK`, `COPY`) before the first change. Development runs it only with
   `-Rehearsal`, through `scripts/test-production-move.ps1` under a temporary root. Its evidence
   folder holds production detail (`state.json` keeps real paths for the rollback) and goes to
-  the vault; the console and `inventory.json` show the profile root as `<profile>`.
+  the vault; the console and `inventory.json` show the profile root as `<profile>`. In
+  production the evidence folder may not lie under the account profile, so printed rollback
+  commands keep usable paths.
 
 ## Crate contracts
 

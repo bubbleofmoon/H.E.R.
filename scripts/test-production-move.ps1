@@ -657,6 +657,12 @@ try {
       Assert-True ($inventoryText.IndexOf($spelling, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds an account-home path'
     }
   }
+  # The fixture profile's own folder name must be gone too, plain or as ConvertTo-Json writes it (the apostrophe as a
+  # unicode escape): a profile root hidden only after serialization leaves "<profile>\\...\\<escaped name>" behind.
+  $profileLeaf = Split-Path -Leaf $profileFolder
+  foreach ($spelling in @($profileLeaf, ($profileLeaf | ConvertTo-Json).Trim('"'))) {
+    Assert-True ($inventoryText.IndexOf($spelling, [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds the fixture profile folder name'
+  }
   # Task actions are command lines: the relay task's launcher must not appear.
   Assert-True ($inventoryText.IndexOf('old-relay.vbs', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1b: inventory.json holds a task action'
   Assert-True ($inventoryText.IndexOf('<profile>', [StringComparison]::Ordinal) -ge 0) 'S1b: inventory.json has no profile placeholder'
@@ -787,6 +793,11 @@ try {
   [void](New-Item -ItemType Junction -Path $nested -Target (Join-Path $bridgeBundles 'qq-agent-presets'))
   try { $run = Invoke-MoveScript $moveArgs 'S1q' } finally { [IO.Directory]::Delete($nested) }
   Assert-Run $run 1 'a junction or link was found in dsh-bundle-qq-mode-console' 'S1q'
+  # A link under the install root leading outside it: Inventory blocks before any ACL change could follow it.
+  $outsideLink = Join-Path $root 'qq-bridge\outside-link'
+  [void](New-Item -ItemType Junction -Path $outsideLink -Target (Join-Path $F 'npm-cache'))
+  try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new')) 'S1q-root' } finally { [IO.Directory]::Delete($outsideLink) }
+  Assert-Run $run 1 'the install root is or holds a junction or link that leads outside it' 'S1q link under the root leading outside'
   Assert-OldUntouched 'S1q'
 
   Step 'S1r bundle placement and dependencies'
@@ -850,6 +861,7 @@ try {
   $relayConfigTime = (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc
   try {
     $run = Invoke-MoveScript $inventoryArgs 'S1t'
+    $keyedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
     # The same command line while the configuration is refused (a second key, then another absolute path): the
     # relay section stops before its key check, and neither key may reach inventory.json.
     [IO.File]::AppendAllText($relayConfigFile, "  - `"fixture-second-key-67`"`nlogs-dir: C:\fixture-elsewhere`n", [Text.UTF8Encoding]::new($false))
@@ -864,10 +876,10 @@ try {
     Wait-For { Test-OldUp } 'S1t: the relay runs from its task again' 60
   }
   Assert-Run $run 1 'the relay command line carries the client key' 'S1t'
-  $keyedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
   Assert-True ([IO.File]::ReadAllText((Join-Path $keyedFolder.FullName 'inventory.json')).IndexOf('fixture-relay-key-67', [StringComparison]::Ordinal) -lt 0) 'S1t: inventory.json holds the relay client key'
   Assert-Run $refused 1 'names other absolute paths' 'S1t refused configuration'
   $refusedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
+  Assert-True ($refusedFolder.FullName -ne $keyedFolder.FullName) 'S1t: the refused run wrote its own inventory folder'
   $refusedText = [IO.File]::ReadAllText((Join-Path $refusedFolder.FullName 'inventory.json'))
   foreach ($key in @('fixture-relay-key-67', $second)) { Assert-True ($refusedText.IndexOf($key, [StringComparison]::Ordinal) -lt 0) ('S1t: inventory.json holds a relay key after a refused configuration') }
   Assert-OldUntouched 'S1t'
@@ -972,7 +984,7 @@ try {
   [void][IO.Directory]::CreateDirectory((Join-Path $root 'current'))
   [void](New-Item -ItemType Junction -Path (Join-Path $root 'deps') -Target $outsideAcl)
   $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Rollback', '-StateFile', $state)) 'S3e-rollback'
-  Assert-Run $run 3 'the install root stays restricted' 'S3e rollback'
+  Assert-Run $run 3 'the install root access was left unchanged by this step' 'S3e rollback'
   Assert-True ((Get-Acl -LiteralPath $outsideAcl).GetSecurityDescriptorSddlForm($accessSection) -eq $outsideSddl) 'S3e: the rollback changed the access of a folder outside the install root'
   Assert-True ((Get-Acl -LiteralPath $root).AreAccessRulesProtected) 'S3e: the install root was reopened around a junction'
   [IO.Directory]::Delete((Join-Path $root 'deps'))
