@@ -165,6 +165,7 @@ function Get-Owners([string]$Runtime, [string]$InstallRoot, [string]$Exe) {
     supervisor = [string]$status.owners.supervisor.state; live = [string]$status.owners.live.state; console = [string]$status.owners.console.state
     supervisorPid = [int]$status.owners.supervisor.owner.identity.pid; supervisorExe = [string]$status.owners.supervisor.owner.identity.exe
     consolePid = [int]$status.owners.console.owner.identity.pid
+    livePid = [int]$status.owners.live.owner.identity.pid
   }
 }
 function Get-Listener([int]$Port) {
@@ -337,6 +338,9 @@ function Assert-Moved([string]$Scenario, [switch]$Digest) {
   $owners = Get-Owners (Join-Path $root 'runtime') $root $newCli
   Assert-True ($owners.supervisor -eq 'held' -and $owners.live -eq 'held' -and $owners.console -eq 'held') ($Scenario + ': the new owners are not all held')
   Assert-True ($owners.supervisorExe.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) ($Scenario + ': the new supervisor does not run from the install root')
+  # The move waited for the new live: a heartbeat names the new live owner (the copied old heartbeat never does).
+  $beats = @(@('rust-heartbeat-live.json', 'rust-heartbeat.json') | ForEach-Object { Join-Path $root ('runtime\data\' + $_) } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | ForEach-Object { [int](Get-Content -LiteralPath $_ -Raw | ConvertFrom-Json).pid })
+  Assert-True ($owners.livePid -gt 0 -and $beats -contains $owners.livePid) ($Scenario + ': no heartbeat names the new live owner')
   $old = Get-Owners $oldRuntime $unused $cli
   Assert-True ($old.supervisor -ne 'held' -and $old.live -ne 'held' -and $old.console -ne 'held') ($Scenario + ': an old owner still runs')
   Assert-True ((Get-Listener $onebotPort).Exe -ieq (Join-Path $root 'deps\snowluma\1.2.3\node.exe')) ($Scenario + ': OneBot is not served from deps\snowluma')
@@ -859,6 +863,7 @@ try {
   Assert-Run $run 0 'MOVE DONE' 'S5'
   Assert-Run $run 0 'Type MOVE to go on' 'S5 confirmation prompt'
   Assert-Run $run 0 'linked 2 DSH bundles in the new DSH home' 'S5 bundle links'
+  Assert-Run $run 0 'live: every new owner is held and the new live bridge publishes its heartbeat' 'S5 live owner'
   Assert-Moved 'S5' -Digest
   $doneState = Get-LatestState
 

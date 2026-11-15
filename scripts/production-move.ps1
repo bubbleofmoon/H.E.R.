@@ -32,6 +32,7 @@ param(
   [string]$StateFile = '',
   [string]$OperatorSource = 'C:\her-orch\ops',
   [int]$HealthWaitSeconds = 300,
+  [int]$LiveWaitSeconds = 300,
   [long]$FreeSpaceReserveBytes = 1GB,
   [switch]$AcceptDshProfileFiles,
   [switch]$AfterDone,
@@ -1544,15 +1545,40 @@ function Save-HealthDiagnostics($plan) {
       $start = [string](Get-Prop (Get-Prop (Read-Json $marker) 'identity') 'start')
       $lines.Add('owner ' + $role + ' started ' + [DateTime]::FromFileTimeUtc([long]$start).ToString('o'))
     }
+    foreach ($name in @('rust-heartbeat-live.json', 'rust-heartbeat.json')) {
+      $path = Join-Path $runtime ('data\' + $name)
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { $lines.Add('heartbeat ' + $name + ' none'); continue }
+      $beat = Read-Json $path
+      $lines.Add('heartbeat ' + $name + ' pid ' + [string]$beat.pid + ' at ' + [DateTimeOffset]::FromUnixTimeMilliseconds([long]$beat.ts).UtcDateTime.ToString('o'))
+    }
     foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $runtime 'data') -File -Force -Filter 'dependenc*.json')) {
       Write-Utf8 (Join-Path $script:Evidence ('health-' + $file.Name)) (Read-Text $file.FullName)
     }
   } catch { $lines.Add('diagnostics incomplete: ' + [string]$_.Exception.Message) }
   Write-Utf8 (Join-Path $script:Evidence 'health-diagnostics.txt') ((@($lines) -join "`r`n") + "`r`n")
 }
+# The new live bridge is ready when every new owner is held and a heartbeat (data\rust-heartbeat-live.json or
+# data\rust-heartbeat.json) names the live owner's process with a time after the start. The live bridge publishes its
+# heartbeat only after its gateway connection (her/src/entry.rs:2059-2091), and the copy brought the old live's
+# heartbeat along, so neither an old nor a stale heartbeat counts. The health check has no live part.
+function Test-NewLiveReady($plan, [long]$SinceMs) {
+  $runtime = Join-Path $script:Root 'runtime'
+  $status = (Invoke-Cli $plan.Cli @('lifecycle', 'status', '--runtime-root', $runtime) 'live-ready' @(0, 3)).Output | ConvertFrom-Json
+  foreach ($role in @('supervisor', 'live', 'console')) { if ([string]$status.owners.$role.state -ne 'held') { return $false } }
+  $livePid = [int]$status.owners.live.owner.identity.pid
+  if ($livePid -le 0) { return $false }
+  foreach ($name in @('rust-heartbeat-live.json', 'rust-heartbeat.json')) {
+    $path = Join-Path $runtime ('data\' + $name)
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+    try { $beat = Read-Json $path } catch { continue }
+    if ([int]$beat.pid -eq $livePid -and [long]$beat.ts -ge $SinceMs) { return $true }
+  }
+  return $false
+}
 function Start-NewProduction($plan) {
   $runtime = Join-Path $script:Root 'runtime'
   [void](Invoke-Cli $plan.Cli @('lifecycle', 'set', 'running', '--runtime-root', $runtime, '--by', 'owner-67', '--reason', 'move into the install root') 'new-set-running')
+  $startedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $script:State.NewStartedAt = [DateTime]::UtcNow.ToString('o')
   Save-State 'Starting'
   if ($Rehearsal) {
@@ -1569,6 +1595,17 @@ function Start-NewProduction($plan) {
     Stop-Failed ('the health check failed: ' + ($failing -join ', '))
   }
   Write-Step ('health: every part passes (' + (@($verdict.parts.PSObject.Properties | ForEach-Object { $_.Name }) -join ', ') + ')')
+  # The live owner too, bounded: a late gateway can make the supervisor's watchdog give up on the first live and
+  # recover it once, which LiveWaitSeconds (default 300) covers. Polled every 5 seconds.
+  $liveDeadline = [DateTime]::UtcNow.AddSeconds($LiveWaitSeconds)
+  while (-not (Test-NewLiveReady $plan $startedMs)) {
+    if ([DateTime]::UtcNow -ge $liveDeadline) {
+      Save-HealthDiagnostics $plan
+      Stop-Failed ('the health check failed: live (no heartbeat from the new live owner within ' + $LiveWaitSeconds + ' seconds)')
+    }
+    Start-Sleep -Seconds 5
+  }
+  Write-Step 'live: every new owner is held and the new live bridge publishes its heartbeat'
   $report = Invoke-Cli $plan.Cli @('report', '--runtime-root', $runtime, '--since', '30m', '--json') 'report-after' @(0, 1)
   $partial = $report.Code -ne 0
   try { if (($report.Output | ConvertFrom-Json).partial -eq $true) { $partial = $true } } catch { $partial = $true }
@@ -1760,7 +1797,7 @@ function Invoke-Inventory {
 function Invoke-Move {
   $plan = Get-MovePlan
   $megabytes = [math]::Ceiling([double]$plan.CopyBytes / 1MB)
-  Confirm-Owner 'MOVE' ('Ready: about ' + $megabytes + ' MB to copy; expected downtime 3 to 6 minutes, about 13 at most with a rollback. Nothing is stopped before you confirm.')
+  Confirm-Owner 'MOVE' ('Ready: about ' + $megabytes + ' MB to copy; expected downtime 3 to 6 minutes, about 18 at most with a rollback. Nothing is stopped before you confirm.')
   $script:StatePath = Join-Path $script:Evidence 'state.json'
   $script:State = [ordered]@{ v = 1; Phase = ''; UpdatedAt = ''; StartedAt = [DateTime]::UtcNow.ToString('o'); NewStartedAt = ''; NewStoppedAt = ''; Root = $script:Root; Rehearsal = [bool]$Rehearsal; Plan = $plan }
   Save-State 'Preflight'
