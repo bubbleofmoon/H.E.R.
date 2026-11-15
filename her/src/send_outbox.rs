@@ -39,11 +39,25 @@ pub fn token_epoch(token: &str) -> String {
 /// Read every outbox record in append order. A truncated record (crash mid-append) is skipped with a
 /// warning; any other damaged line is an error (see `runtime::parse_evidence_jsonl`).
 pub fn read_records(context: &RuntimeContext) -> Result<Vec<Value>, String> {
+    read_records_in(context, false)
+}
+
+/// `read_records` that waits out a Windows lock violation for `APPEND_CONFLICT_WAIT` and names the OS error
+/// when it gives up. Only for a caller that holds no lock, gate or chain (a console read view).
+pub fn read_records_waiting(context: &RuntimeContext) -> Result<Vec<Value>, String> {
+    read_records_in(context, true)
+}
+
+fn read_records_in(context: &RuntimeContext, wait: bool) -> Result<Vec<Value>, String> {
     let text = if context.is_isolated() {
-        context
-            .read_optional_text(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)
-            .map_err(str::to_string)?
-            .unwrap_or_default()
+        let text = if wait {
+            context.read_optional_text_waiting(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)?
+        } else {
+            context
+                .read_optional_text(RuntimeArea::Data, ISOLATED_OUTBOX_FILE)
+                .map_err(str::to_string)?
+        };
+        text.unwrap_or_default()
     } else {
         match std::fs::read_to_string(LEGACY_OUTBOX_FILE) {
             Ok(text) => text,
