@@ -471,6 +471,43 @@ impl RuntimeContext {
         }
     }
 
+    /// `read_optional_text` for a caller that holds no lock, gate or chain and can afford to wait: on
+    /// Windows a file another process appends under its exclusive lock (the ledgers) is mandatory-locked
+    /// for each write, and a read that meets the lock fails with a sharing/lock violation (32/33). That is
+    /// retried for `APPEND_CONFLICT_WAIT` per call. Every attempt re-resolves and re-checks the path, as the
+    /// append path does. A failed read names the OS error (`class=read/file kind=… os=…`), never a path.
+    /// The default read stays one-shot: scheduler, cancellation, send-chain, token and gate paths must not
+    /// wait here.
+    pub(crate) fn read_optional_text_waiting(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+    ) -> Result<Option<String>, String> {
+        if !self.is_isolated() {
+            return Err("optional runtime reads require an isolated context".to_string());
+        }
+        let path = self
+            .resolve_path(area, relative, PathIntent::ReadOptionalFile)
+            .map_err(str::to_string)?;
+        let unavailable = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "runtime path is unavailable");
+        let deadline = std::time::Instant::now() + APPEND_CONFLICT_WAIT;
+        let bytes = wait_io(deadline, || {
+            if self.resolve_path(area, relative, PathIntent::ReadOptionalFile).ok().as_ref() != Some(&path) {
+                return Err(unavailable());
+            }
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(metadata) if !is_link(&metadata) && metadata.is_file() => fs::read(&path).map(Some),
+                Err(error) => Err(error),
+                _ => Err(unavailable()),
+            }
+        })
+        .map_err(|error| format!("runtime path is unavailable ({})", runtime_io_error("read/file", &error)))?;
+        bytes
+            .map(|bytes| String::from_utf8(bytes).map_err(|_| "runtime file is invalid".to_string()))
+            .transpose()
+    }
+
     /// The length of an optional selected-root file (`Ok(0)` when absent), with the guards of
     /// `read_optional_text`.
     pub fn optional_file_len(&self, area: RuntimeArea, relative: &str) -> Result<u64, &'static str> {
@@ -1320,6 +1357,18 @@ pub(crate) const APPEND_CONFLICT_WAIT: std::time::Duration = std::time::Duration
 #[cfg(any(windows, test))]
 pub(crate) fn retry_append_io<T>(
     deadline: std::time::Instant,
+    operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    retry_conflict_io("[turn-ledger] append", "append/conflict", deadline, operation)
+}
+
+/// The retry loop behind `retry_append_io` and `wait_io`; `what` and `class` only name the operation in the
+/// content-free exhaustion diagnostic.
+#[cfg(any(windows, test))]
+fn retry_conflict_io<T>(
+    what: &str,
+    class: &str,
+    deadline: std::time::Instant,
     mut operation: impl FnMut() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
     loop {
@@ -1327,20 +1376,41 @@ pub(crate) fn retry_append_io<T>(
             Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    eprintln!("[turn-ledger] append conflict retry budget exhausted: {}", runtime_io_error("append/conflict", &error));
+                    eprintln!("{what} conflict retry budget exhausted: {}", runtime_io_error(class, &error));
                     return Err(error);
                 }
                 #[cfg(test)]
                 append_io_test_hook("sleep")?;
                 std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
                 if std::time::Instant::now() >= deadline {
-                    eprintln!("[turn-ledger] append conflict retry budget exhausted: {}", runtime_io_error("append/conflict", &error));
+                    eprintln!("{what} conflict retry budget exhausted: {}", runtime_io_error(class, &error));
                     return Err(error);
                 }
             }
             result => return result,
         }
     }
+}
+
+/// The waiting read's retry: Windows sharing/lock violations (32/33) only, until `deadline`; every other
+/// error, and every other host, is a single attempt.
+fn wait_io<T>(
+    deadline: std::time::Instant,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    #[cfg(any(windows, test))]
+    {
+        // Tests can exercise the Windows policy through the real caller on a Unix host.
+        #[cfg(test)]
+        let windows_policy = cfg!(windows) || APPEND_IO_TEST_HOOK.with(|hook| hook.borrow().is_some());
+        #[cfg(not(test))]
+        let windows_policy = true;
+        if windows_policy {
+            return retry_conflict_io("[runtime] read", "read/conflict", deadline, operation);
+        }
+    }
+    let _ = deadline;
+    operation()
 }
 
 pub(crate) fn append_io<T>(
