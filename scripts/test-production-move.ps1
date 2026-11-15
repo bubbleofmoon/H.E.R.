@@ -307,12 +307,12 @@ function Stop-FixtureProcess([int]$ProcessId) {
   $result = [HerMove67RehearsalNative]::Stop([uint32]$ProcessId, $start, $image)
   if (@('stopped', 'gone') -notcontains $result) { throw ('FAIL fixture: process ' + $ProcessId + ' could not be stopped: ' + $result) }
 }
-function Assert-OldUntouched([string]$Scenario) {
+function Assert-OldUntouched([string]$Scenario, [switch]$Restricted) {
   $owners = Get-Owners $oldRuntime $unused $cli
   Assert-True ($owners.supervisor -eq 'held' -and $owners.supervisorPid -eq $script:baselineSupervisor) ($Scenario + ': the old supervisor was restarted or stopped')
   foreach ($name in @($supervisorTask, $relayTask)) { Assert-True ((Get-TaskShape $name) -eq $taskShapes[$name]) ($Scenario + ': the task ' + $name + ' changed') }
   Assert-NoNewLayout $Scenario
-  Assert-RootAcl $Scenario
+  Assert-RootAcl $Scenario -Restricted:$Restricted
   Assert-Originals $Scenario
 }
 function Assert-OldRunning([string]$Scenario, [switch]$Restricted) {
@@ -1092,7 +1092,8 @@ try {
   $run = Invoke-MoveScript ($moveArgs + @('-OwnerGoFile', $goFile)) 'S7-go-release'
   Assert-Run $run 1 'the owner go file does not name this action and release' 'S7 go file for another release'
   Assert-True (-not (Test-Path -LiteralPath $goFile)) 'S7: a refused go file was left for reuse'
-  Assert-OldUntouched 'S7'
+  # S6 left the root restricted after a finished move; a refused run keeps it that way.
+  Assert-OldUntouched 'S7' -Restricted
   # The right go file starts the move and is gone afterwards.
   $goFile = Write-GoFile 'MOVE fixture-new'
   $run = Invoke-MoveScript ($moveArgs + @('-RehearsalFault', 'LateDshChild', '-OwnerGoFile', $goFile)) 'S7'
