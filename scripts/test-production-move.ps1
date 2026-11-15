@@ -658,7 +658,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 110 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 127 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -906,9 +906,10 @@ try {
   try {
     $run = Invoke-MoveScript $inventoryArgs 'S1t'
     $keyedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
-    # The same command line while the configuration is refused (a second key, then another absolute path): the
-    # relay section stops before its key check, and neither key may reach inventory.json.
-    [IO.File]::AppendAllText($relayConfigFile, ("    - `"" + $second + "`"`nlogs-dir: C:\fixture-elsewhere`n"), [Text.UTF8Encoding]::new($false))
+    # The same command line while the configuration is refused (a second key, then another absolute path inside the
+    # access block, since the nested shape allows no other top-level key): the relay section stops before its key
+    # check, and neither key may reach inventory.json.
+    [IO.File]::AppendAllText($relayConfigFile, ("    - `"" + $second + "`"`n  logs-dir: C:\fixture-elsewhere`n"), [Text.UTF8Encoding]::new($false))
     $refused = Invoke-MoveScript $inventoryArgs 'S1t-refused'
   }
   finally {
