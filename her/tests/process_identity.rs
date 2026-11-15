@@ -378,3 +378,188 @@ fn matches_relative_script_but_never_a_program_or_argument_lookalike() {
         "mismatch"
     );
 }
+
+#[test]
+fn an_unclassifiable_switch_is_unknown_for_the_script_it_names_and_foreign_for_any_other() {
+    let mut f = Fixture::node("switch", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::write(f.root.join("other.js"), "").unwrap();
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    std::fs::remove_file(f.root.join("ready")).unwrap();
+    // --no-deprecation is a valid node switch the matcher cannot classify.
+    f.child = hidden(&program)
+        .args(["--no-deprecation", "entry.js", "her-process-fixture-05"])
+        .current_dir(&f.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait_ready();
+    let pid = f.child.id().to_string();
+    for (script, expected) in [("entry.js", "unknown"), ("other.js", "mismatch")] {
+        let result = f.run(&[
+            "match",
+            "--pid",
+            &pid,
+            "--program",
+            &program,
+            "--script",
+            script,
+        ]);
+        assert_eq!(result["state"], expected, "{script}: {result}");
+    }
+    // An operand that no longer resolves but carries the script's file name stays unknown.
+    std::fs::create_dir(f.root.join("sub")).unwrap();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("sub/entry.js")).unwrap();
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    std::fs::remove_file(f.root.join("ready")).unwrap();
+    f.child = hidden(&program)
+        .args(["--no-deprecation", "sub/entry.js", "her-process-fixture-05"])
+        .current_dir(&f.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait_ready();
+    std::fs::rename(f.root.join("sub"), f.root.join("moved")).unwrap();
+    let moved = f.root.join("moved/entry.js");
+    let result = f.run(&[
+        "match",
+        "--pid",
+        &f.child.id().to_string(),
+        "--program",
+        &program,
+        "--script",
+        moved.to_str().unwrap(),
+    ]);
+    assert_eq!(result["state"], "unknown", "{result}");
+}
+
+/// Replaces the fixture's process with `program args...`, run from the fixture folder.
+fn respawn(f: &mut Fixture, program: &str, args: &[&str]) {
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    let _ = std::fs::remove_file(f.root.join("ready"));
+    f.child = hidden(program)
+        .args(args)
+        .current_dir(&f.root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    f.wait_ready();
+}
+
+fn match_state(f: &Fixture, program: &str, script: &str) -> String {
+    let script = f.root.join(script);
+    let result = f.run(&[
+        "match",
+        "--pid",
+        &f.child.id().to_string(),
+        "--program",
+        program,
+        "--script",
+        script.to_str().unwrap(),
+    ]);
+    result["state"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn a_package_launcher_with_an_unclassifiable_switch_is_a_wrapper_never_foreign() {
+    let mut f = Fixture::node("launcher", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    // A launcher that runs the same body under npm's file name.
+    std::fs::copy(f.root.join("entry.js"), f.root.join("npm-cli.js")).unwrap();
+    respawn(
+        &mut f,
+        &program,
+        &["--no-deprecation", "npm-cli.js", "her-process-fixture-05"],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "wrapper");
+}
+
+#[test]
+fn operands_after_double_dash_and_option_values_keep_an_unclassifiable_switch_unknown() {
+    let mut f = Fixture::node("operands", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::write(f.root.join("preload.js"), "").unwrap();
+    std::fs::write(f.root.join("other.js"), "").unwrap();
+    // Operands after `--` are never switches.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "--",
+            "entry.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "unknown");
+    assert_eq!(match_state(&f, &program, "other.js"), "mismatch");
+    // An `--option=value` value can name the script.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "--require=./preload.js",
+            "entry.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "preload.js"), "unknown");
+    assert_eq!(match_state(&f, &program, "other.js"), "mismatch");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_script_whose_operand_no_longer_resolves_stays_unknown() {
+    let mut f = Fixture::node("alias", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::create_dir(f.root.join("sub")).unwrap();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("sub/real.js")).unwrap();
+    std::os::unix::fs::symlink("real.js", f.root.join("sub/entry.js")).unwrap();
+    respawn(
+        &mut f,
+        &program,
+        &["--no-deprecation", "sub/entry.js", "her-process-fixture-05"],
+    );
+    std::fs::rename(f.root.join("sub"), f.root.join("moved")).unwrap();
+    // The configured spelling is the link; its resolved target has another file name.
+    assert_eq!(match_state(&f, &program, "moved/entry.js"), "unknown");
+}
+
+#[test]
+fn an_npm_launcher_name_after_the_entry_keeps_an_unclassifiable_switch_unknown() {
+    let mut f = Fixture::node("late-launcher", "entry.js", &[]);
+    let program = f.identify()["process"]["exe"].as_str().unwrap().to_string();
+    std::fs::copy(f.root.join("entry.js"), f.root.join("other.js")).unwrap();
+    std::fs::write(f.root.join("npm-cli.js"), "").unwrap();
+    // The script is entry.js; npm-cli.js is only an application argument.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "entry.js",
+            "npm-cli.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "unknown");
+    // Another script followed by npm's name: ambiguous, so never foreign and never a wrapper.
+    respawn(
+        &mut f,
+        &program,
+        &[
+            "--no-deprecation",
+            "other.js",
+            "npm-cli.js",
+            "her-process-fixture-05",
+        ],
+    );
+    assert_eq!(match_state(&f, &program, "entry.js"), "unknown");
+}

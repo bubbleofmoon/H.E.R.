@@ -42,6 +42,12 @@ pub fn identity_of(pid: u32) -> Result<Option<ProcessIdentity>, String> {
     os::identity_of(pid)
 }
 
+/// Whether an `identity_of` or `identify` error says the OS refused access (another token or
+/// user), not that the process vanished or the table was unreadable.
+pub fn is_access_denied(reason: &str) -> bool {
+    reason.ends_with(": access denied") || reason.ends_with("permission denied")
+}
+
 /// Foreground an existing QQ window while retaining a handle to the verified instance.
 #[cfg(windows)]
 pub fn focus_qq_window(expected: &ProcessIdentity) -> Result<(), String> {
@@ -115,11 +121,36 @@ pub fn matches(
         let Some(script) = script else {
             return Ok(Match::Matches);
         };
-        let Some(entry) = script_operand(&process.args)? else {
+        let entry = match script_operand(&process.args) {
+            Ok(entry) => entry,
+            // A switch this module cannot classify leaves the entry unknown. A package launcher
+            // stays a launcher, and a process of the same image that never names the configured
+            // script cannot be that dependency.
+            Err(reason) => {
+                let candidates = operand_candidates(&process.args);
+                // Only the script position can make a launcher; an npm launcher's name anywhere
+                // else is ambiguous (the entry may still be the dependency) and stays unknown.
+                if first_plain_operand(&process.args).is_some_and(is_package_launcher) {
+                    return Ok(Match::Wrapper);
+                }
+                let expected = resolve_script(process, script)?;
+                return if candidates
+                    .iter()
+                    .any(|operand| is_package_launcher(operand))
+                    || names_script(process, &candidates, script, &expected)
+                {
+                    Err(reason)
+                } else {
+                    Ok(Match::Mismatch(
+                        "process does not name the configured script".into(),
+                    ))
+                };
+            }
+        };
+        let Some(entry) = entry else {
             return Ok(Match::Mismatch("process has no script entry".into()));
         };
-        let name = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
-        if name.eq_ignore_ascii_case("npm-cli.js") || name.eq_ignore_ascii_case("npx-cli.js") {
+        if is_package_launcher(entry) {
             return Ok(Match::Wrapper);
         }
         let actual = resolve_script(process, std::path::Path::new(entry))?;
@@ -131,6 +162,71 @@ pub fn matches(
         }
     }
     compare(process, program, script).unwrap_or_else(Match::Unknown)
+}
+
+/// npm and npx run their own CLI script as the node entry.
+fn is_package_launcher(entry: &str) -> bool {
+    let name = entry.rsplit(['/', '\\']).next().unwrap_or(entry);
+    name.eq_ignore_ascii_case("npm-cli.js") || name.eq_ignore_ascii_case("npx-cli.js")
+}
+
+/// Every argument that could name a script: plain arguments, the value of an `--option=value`,
+/// and every operand after `--`. Bare switches are skipped.
+fn operand_candidates(args: &[String]) -> Vec<&str> {
+    let mut operands = false;
+    let mut found = Vec::new();
+    for arg in args.iter().skip(1) {
+        if operands {
+            found.push(arg.as_str());
+        } else if arg == "--" {
+            operands = true;
+        } else if let Some(option) = arg.strip_prefix('-') {
+            if let Some((_, value)) = option.split_once('=') {
+                found.push(value);
+            }
+        } else {
+            found.push(arg.as_str());
+        }
+    }
+    found
+}
+
+/// The first argument that is not a switch (or the first after `--`): where node takes the script.
+fn first_plain_operand(args: &[String]) -> Option<&str> {
+    let mut operands = false;
+    for arg in args.iter().skip(1) {
+        if operands || !arg.starts_with('-') {
+            return Some(arg.as_str());
+        }
+        if arg == "--" {
+            operands = true;
+        }
+    }
+    None
+}
+
+/// Whether any candidate names the configured script. A candidate that cannot be resolved (its
+/// working folder may have changed) still counts when its file name is the configured spelling's
+/// or the resolved target's (the entry may be a link), so an unresolved entry stays unknown.
+fn names_script(
+    process: &Process,
+    candidates: &[&str],
+    configured: &std::path::Path,
+    expected: &std::path::Path,
+) -> bool {
+    candidates.iter().any(|candidate| {
+        let candidate = std::path::Path::new(candidate);
+        match resolve_script(process, candidate) {
+            Ok(actual) => same_exe(&actual.to_string_lossy(), &expected.to_string_lossy()),
+            Err(_) => candidate.file_name().is_some_and(|name| {
+                [configured, expected].iter().any(|script| {
+                    script.file_name().is_some_and(|known| {
+                        same_exe(&name.to_string_lossy(), &known.to_string_lossy())
+                    })
+                })
+            }),
+        }
+    })
 }
 
 fn canonical(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
@@ -1052,5 +1148,38 @@ mod os {
 
     pub(super) fn kill_verified(_expected: &ProcessIdentity) -> KillOutcome {
         KillOutcome::Unknown("process identity is not supported on this platform".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    #[test]
+    fn operand_candidates_include_every_operand_after_double_dash_even_with_a_leading_dash() {
+        let found = args(&["node", "--no-deprecation", "--", "-dash.js", "x"]);
+        assert_eq!(operand_candidates(&found), vec!["-dash.js", "x"]);
+    }
+
+    #[test]
+    fn operand_candidates_take_plain_arguments_and_option_values_but_not_bare_switches() {
+        let found = args(&["node", "--no-deprecation", "--require=./p.js", "entry.js"]);
+        assert_eq!(operand_candidates(&found), vec!["./p.js", "entry.js"]);
+    }
+
+    #[test]
+    fn the_script_position_is_the_first_plain_operand_or_the_first_after_double_dash() {
+        let plain = args(&["node", "--no-deprecation", "entry.js", "npm-cli.js"]);
+        assert_eq!(first_plain_operand(&plain), Some("entry.js"));
+        let dashed = args(&["node", "--no-deprecation", "--", "-dash.js"]);
+        assert_eq!(first_plain_operand(&dashed), Some("-dash.js"));
+        assert_eq!(
+            first_plain_operand(&args(&["node", "--no-deprecation"])),
+            None
+        );
     }
 }

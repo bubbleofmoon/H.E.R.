@@ -91,6 +91,8 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        #[cfg(windows)]
+        disable_debug_privilege();
         let root = install_root::development_root(std::env::temp_dir().join(format!(
                 "her-deps-中文 it's {}-{}",
                 std::process::id(),
@@ -1535,10 +1537,72 @@ fn foreign_port_holders_are_alerted_and_left_running() {
     }
 }
 
+/// An administrator token with SeDebugPrivilege enabled bypasses every process DACL, so the hosted
+/// runner could not model another token's process. Disabling it in the test process also disables
+/// it for the supervisor and its children, which inherit this token.
 #[cfg(windows)]
-fn deny_full_inspection(dsh: &Owned) {
+fn disable_debug_privilege() {
     use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Luid {
+        low: u32,
+        high: i32,
+    }
+    #[repr(C)]
+    struct TokenPrivileges {
+        count: u32,
+        luid: Luid,
+        attributes: u32,
+    }
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut Luid) -> i32;
+        fn AdjustTokenPrivileges(
+            token: *mut c_void,
+            disable_all: i32,
+            new: *const TokenPrivileges,
+            length: u32,
+            previous: *mut c_void,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let name: Vec<u16> = "SeDebugPrivilege".encode_utf16().chain(Some(0)).collect();
+        let mut luid = Luid { low: 0, high: 0 };
+        let mut token = std::ptr::null_mut();
+        // TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY. A token without the privilege has nothing to disable.
+        if OpenProcessToken(GetCurrentProcess(), 0x20 | 0x8, &mut token) != 0 {
+            if LookupPrivilegeValueW(std::ptr::null(), name.as_ptr(), &mut luid) != 0 {
+                let disable = TokenPrivileges {
+                    count: 1,
+                    luid,
+                    attributes: 0,
+                };
+                AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &disable,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+            }
+            CloseHandle(token);
+        }
+    });
+}
+
+/// Replaces the DACL of a process handle we hold, to model a process owned by another token.
+#[cfg(windows)]
+fn set_process_dacl(process: *mut std::ffi::c_void, sddl: &str) {
+    use std::ffi::c_void;
     #[link(name = "advapi32")]
     extern "system" {
         fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -1557,12 +1621,7 @@ fn deny_full_inspection(dsh: &Owned) {
     extern "system" {
         fn LocalFree(memory: *mut c_void) -> *mut c_void;
     }
-    // Model the native access boundary of an elevated process, using only our
-    // fake: VM_READ is denied while limited-query liveness and termination work.
-    let text: Vec<u16> = "D:(D;;0x0010;;;WD)(A;;GA;;;OW)"
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    let text: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = std::ptr::null_mut();
     unsafe {
         assert_ne!(
@@ -1574,7 +1633,7 @@ fn deny_full_inspection(dsh: &Owned) {
             ),
             0
         );
-        let changed = SetKernelObjectSecurity(dsh.child.as_raw_handle(), 4, descriptor);
+        let changed = SetKernelObjectSecurity(process, 4, descriptor);
         LocalFree(descriptor);
         assert_ne!(
             changed,
@@ -1583,6 +1642,37 @@ fn deny_full_inspection(dsh: &Owned) {
             std::io::Error::last_os_error()
         );
     }
+}
+
+/// Denies even limited-information access, so the image path cannot be read; restores on drop so
+/// the fixture can still stop the process.
+#[cfg(windows)]
+struct ImageHidden(*mut std::ffi::c_void);
+#[cfg(windows)]
+impl Drop for ImageHidden {
+    fn drop(&mut self) {
+        set_process_dacl(self.0, "D:(A;;GA;;;WD)");
+    }
+}
+#[cfg(windows)]
+fn deny_image_access(process: &Owned) -> ImageHidden {
+    use std::os::windows::io::AsRawHandle;
+    let handle = process.child.as_raw_handle();
+    // QUERY_INFORMATION, VM_READ and QUERY_LIMITED_INFORMATION are denied; the owner keeps the rest.
+    set_process_dacl(handle, "D:(D;;0x1410;;;WD)(A;;GA;;;OW)");
+    assert!(
+        process_identity::identity_of(process.identity.pid).is_err(),
+        "native image access must actually be denied"
+    );
+    ImageHidden(handle)
+}
+
+#[cfg(windows)]
+fn deny_full_inspection(dsh: &Owned) {
+    // Model the native access boundary of an elevated process, using only our
+    // fake: VM_READ is denied while limited-query liveness and termination work.
+    use std::os::windows::io::AsRawHandle;
+    set_process_dacl(dsh.child.as_raw_handle(), "D:(D;;0x0010;;;WD)(A;;GA;;;OW)");
     assert!(
         process_identity::identify(dsh.identity.pid).is_err(),
         "native full inspection must actually be denied"
@@ -1621,6 +1711,39 @@ fn denied_inspection_reports_an_elevated_or_access_restricted_dependency_and_lea
 
 #[cfg(windows)]
 #[test]
+fn a_node_process_whose_image_cannot_be_read_does_not_block_dsh_startup() {
+    let mut fixture = Fixture::new();
+    let foreign_dir = fixture.root.join("foreign");
+    std::fs::create_dir(&foreign_dir).unwrap();
+    let program = foreign_dir.join("node.exe");
+    std::fs::copy(
+        fixture.config["dependencies"]["dsh"]["program"]
+            .as_str()
+            .unwrap(),
+        &program,
+    )
+    .unwrap();
+    let script = foreign_dir.join("unrelated.js");
+    std::fs::write(&script, "setInterval(()=>{},1000);").unwrap();
+    let mut foreign = Owned::new(
+        hidden(&program)
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    // Like a production node under another token: even its image path cannot be read.
+    let hidden_image = deny_image_access(&foreign);
+    fixture.start();
+    fixture.healthy();
+    assert_eq!(fixture.states()["dsh"]["state"], "started");
+    assert!(foreign.child.try_wait().unwrap().is_none());
+    drop(hidden_image);
+}
+
+#[cfg(windows)]
+#[test]
 fn an_uninspectable_foreign_node_image_does_not_block_configured_dependency_startup() {
     let mut fixture = Fixture::new();
     let foreign_dir = fixture.root.join("foreign");
@@ -1651,6 +1774,149 @@ fn an_uninspectable_foreign_node_image_does_not_block_configured_dependency_star
         process_identity::check_identity(&foreign.identity),
         process_identity::Liveness::Matches
     );
+}
+
+/// The legacy `tasks.nodePath` form, as the lifecycle fixture script and production configure it.
+fn legacy_node_config(fixture: &mut Fixture, node: &std::path::Path) {
+    let root = fixture.root.clone();
+    fixture
+        .config
+        .as_object_mut()
+        .unwrap()
+        .remove("dependencies");
+    fixture.config["ownerQQ"] = json!(42);
+    fixture.config["tasks"]["nodePath"] = json!(node);
+    fixture.config["tasks"]["start-all"] = json!({
+        "snowLumaDirectory": root.join("snow"),
+        "dshScript": root.join("dsh/index.mjs"),
+        "dshWorkingDirectory": root.join("dsh"),
+    });
+    std::fs::write(root.join("config/config.json"), fixture.config.to_string()).unwrap();
+}
+
+/// A node image whose folder name contains a space: the hosted Windows runner's own install under
+/// Program Files, else a copy inside a spaced folder.
+fn spaced_node(fixture: &Fixture) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let installed = PathBuf::from(r"C:\Program Files\nodejs\node.exe");
+        if installed.is_file() {
+            return installed;
+        }
+    }
+    let folder = fixture.root.join("node folder with spaces");
+    std::fs::create_dir(&folder).unwrap();
+    let copy = folder.join(if cfg!(windows) { "node.exe" } else { "node" });
+    std::fs::copy(
+        fixture.config["dependencies"]["dsh"]["program"]
+            .as_str()
+            .unwrap(),
+        &copy,
+    )
+    .unwrap();
+    copy
+}
+
+/// A characterisation test: a node path with spaces (the runner's own install under Program
+/// Files) was never what refused DSH, and this pins that it keeps starting.
+#[test]
+fn spaced_node_path_starts_dsh_from_the_legacy_configuration() {
+    let mut fixture = Fixture::new();
+    let node = spaced_node(&fixture);
+    assert!(node.to_string_lossy().contains(' '), "{node:?}");
+    legacy_node_config(&mut fixture, &node);
+    fixture.start();
+    fixture.healthy();
+    let states = fixture.states();
+    assert_eq!(states["dsh"]["state"], "started", "{states}");
+    let identity: process_identity::ProcessIdentity =
+        serde_json::from_value(states["dsh"]["identity"].clone()).unwrap();
+    assert!(
+        identity.exe.eq_ignore_ascii_case(&node.to_string_lossy()) || cfg!(unix),
+        "DSH ran {} instead of {node:?}",
+        identity.exe
+    );
+    assert!(fixture.root.join("dsh/starts").exists());
+}
+
+#[test]
+fn an_unrelated_process_of_the_same_node_image_does_not_block_dsh_startup() {
+    let mut fixture = Fixture::new();
+    let node = spaced_node(&fixture);
+    legacy_node_config(&mut fixture, &node);
+    // Another tool on the host runs the same node image with a switch the supervisor cannot classify.
+    let script = fixture.root.join("unrelated.js");
+    std::fs::write(&script, "setInterval(()=>{},1000);").unwrap();
+    let bystander = Owned::new(
+        hidden(&node)
+            .arg("--no-deprecation")
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    fixture.start();
+    fixture.healthy();
+    assert_eq!(fixture.states()["dsh"]["state"], "started");
+    assert_eq!(
+        process_identity::check_identity(&bystander.identity),
+        process_identity::Liveness::Matches
+    );
+}
+
+#[test]
+fn a_refused_dsh_start_leaves_a_log_line_and_an_owner_alert() {
+    let mut fixture = Fixture::new();
+    let node = spaced_node(&fixture);
+    legacy_node_config(&mut fixture, &node);
+    fixture.config["tasks"]["start-all"]["dshScript"] = json!(fixture.root.join("dsh/missing.mjs"));
+    std::fs::write(
+        fixture.root.join("config/config.json"),
+        fixture.config.to_string(),
+    )
+    .unwrap();
+    fixture.start();
+    fixture.wait(|| fixture.states()["dsh"]["state"] == "refused");
+    let reason = "script or working directory is unavailable";
+    let log = fixture.root.join("data/logs/dependency-dsh.err.log");
+    // The err log also takes the dependency's own stderr once it has run; count only our lines.
+    let lines = || -> Vec<String> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains("] refused: "))
+            .map(str::to_string)
+            .collect()
+    };
+    fixture.wait(|| lines().iter().any(|line| line.contains(reason)));
+    fixture.wait(|| {
+        std::fs::read_to_string(fixture.root.join("snow/alerts"))
+            .unwrap_or_default()
+            .contains(reason)
+    });
+    assert!(!fixture.root.join("dsh/starts").exists());
+    // One `[epoch-ms] refused: <reason>` line per refusal episode, not one per reconcile pass.
+    std::thread::sleep(Duration::from_millis(1500));
+    let first = lines();
+    assert_eq!(first.len(), 1, "{first:?}");
+    let (stamp, text) = first[0][1..].split_once("] refused: ").expect("line shape");
+    assert!(first[0].starts_with('['));
+    stamp.parse::<i64>().expect("epoch-ms stamp");
+    assert!(text.contains(reason), "{text}");
+    // The episode ends when DSH runs again; a later refusal for the same reason logs again.
+    std::fs::copy(
+        fixture.root.join("dsh/index.mjs"),
+        fixture.root.join("dsh/missing.mjs"),
+    )
+    .unwrap();
+    // "started" is recorded at spawn; wait until node has loaded the script and listens.
+    fixture.wait(|| fixture.states()["dsh"]["state"] == "started");
+    fixture.wait(|| fixture.root.join("dsh/starts").exists());
+    std::fs::remove_file(fixture.root.join("dsh/missing.mjs")).unwrap();
+    fixture.wait(|| lines().len() == 2);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(lines().len(), 2, "{:?}", lines());
 }
 
 #[test]
@@ -3692,4 +3958,53 @@ fn unfinished_candidate_retirement_keeps_its_pin_across_restart_until_authority_
             .unwrap_or_default()
             .contains("依赖升级失败")
     });
+}
+
+#[cfg(windows)]
+#[test]
+fn stop_still_refuses_while_a_same_name_process_cannot_be_read() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    fixture.healthy();
+    let foreign_dir = fixture.root.join("foreign");
+    std::fs::create_dir(&foreign_dir).unwrap();
+    let program = foreign_dir.join("node.exe");
+    std::fs::copy(
+        fixture.config["dependencies"]["dsh"]["program"]
+            .as_str()
+            .unwrap(),
+        &program,
+    )
+    .unwrap();
+    let script = foreign_dir.join("unrelated.js");
+    std::fs::write(&script, "setInterval(()=>{},1000);").unwrap();
+    let foreign = Owned::new(
+        hidden(&program)
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let before = fixture.states();
+    let hidden_image = deny_image_access(&foreign);
+    // Only a start may skip an unreadable image; stopping must not act around a process it
+    // cannot identify, so nothing is stopped.
+    let output = fixture
+        .command(&fixture.cli)
+        .args(["stop", "--with-dependencies", "--confirm", "--runtime-root"])
+        .arg(&fixture.root)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    for name in ["snowluma", "dsh"] {
+        let identity: process_identity::ProcessIdentity =
+            serde_json::from_value(before[name]["identity"].clone()).unwrap();
+        assert_eq!(
+            process_identity::check_identity(&identity),
+            process_identity::Liveness::Matches,
+            "{name} must not be stopped"
+        );
+    }
+    drop(hidden_image);
 }
