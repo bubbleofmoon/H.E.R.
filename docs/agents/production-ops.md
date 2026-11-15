@@ -34,6 +34,18 @@ public issue, comment or commit names those vault paths and nothing else.
   vault, not that the rule needs widening.
 - The `her-cli report` contract that product code must keep is under Crate contracts below; its
   file list, window semantics and format details are in the vault document.
+- The owner's move into the install root (#67) is `scripts/production-move.ps1`, run by the
+  owner with `-Production` from an interactive administrator PowerShell: `-Mode Inventory`
+  (read-only checks) first, then `-Mode Move` (`-DigestModel <id>` also points the memory
+  digest at the relay), and `-Mode Rollback -Production -StateFile <evidence>\state.json`
+  returns to the untouched originals. `-Mode OperatorFolders` copies the ops scripts into
+  `C:\qqbot\ops` afterwards. Move, Rollback and OperatorFolders each ask the owner to type a
+  word (`MOVE`, `ROLLBACK`, `COPY`) before the first change. Development runs it only with
+  `-Rehearsal`, through `scripts/test-production-move.ps1` under a temporary root. Its evidence
+  folder holds production detail (`state.json` keeps real paths for the rollback) and goes to
+  the vault; the console and `inventory.json` show the profile root as `<profile>`. In
+  production the evidence folder may not lie under the account profile, so printed rollback
+  commands keep usable paths.
 
 ## Crate contracts
 
