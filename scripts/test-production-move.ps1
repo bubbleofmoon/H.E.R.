@@ -658,7 +658,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 76 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 110 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -929,8 +929,9 @@ try {
   Assert-OldUntouched 'S1t'
 
   Step 'S1u relay configuration without a top-level port'
-  # Production's shape: no top-level port line, one indented port under another block. The relay's default port is
-  # used and confirmed against the live relay listener (here the fixture port stands in for 8317).
+  # The flat shape without a port line (production's nested shape names server.port instead): a port under another
+  # block is not the relay's, so the relay's default port is used and confirmed against the live relay listener (here
+  # the fixture port stands in for 8317).
   $relayConfigFile = Join-Path $relayFolder 'config.yaml'
   $relayConfigBytes = [IO.File]::ReadAllBytes($relayConfigFile)
   $relayConfigTime = (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc
