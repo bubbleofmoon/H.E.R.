@@ -546,16 +546,29 @@ function Test-NamesRoot([string]$Text, $Roots) {
   foreach ($root in $Roots) { if ([regex]::IsMatch($Text, [regex]::Escape($root) + '(\\|["''\s]|$)')) { return $true } }
   return $false
 }
-# DSH texts name a linked bundle folder in three spellings: backslashes, forward slashes and JSON-escaped backslashes.
-# Each is replaced by the new folder in the same spelling, case-insensitively and only at a name boundary.
+# JSON may spell any character as \uXXXX; Windows PowerShell 5.1's ConvertTo-Json writes ' < > & that way. A path
+# with such a character (the rehearsal profile's apostrophe) is then spelled with every character outside letters,
+# digits, path separators, colon, dot, dash, underscore and space escaped so (Revision 19 fix round).
+function ConvertTo-JsonEscapes([string]$Text) { return [regex]::Replace($Text, '[^A-Za-z0-9\\/:._ -]', { param($found) '\u' + ([int][char]$found.Value).ToString('x4') }) }
+# The reverse, for scans: every \uXXXX escape read as its character.
+function ConvertFrom-JsonEscapes([string]$Text) { return [regex]::Replace($Text, '\\u(?<hex>[0-9A-Fa-f]{4})', { param($found) [string][char][Convert]::ToInt32($found.Groups['hex'].Value, 16) }) }
+# DSH texts name a linked bundle folder in three spellings: backslashes, forward slashes and JSON-escaped backslashes,
+# and the two JSON spellings once more with \uXXXX escapes when the path holds such a character. Each is replaced by
+# the new folder in the same spelling, case-insensitively and only at a full-name boundary: a path separator, a quote
+# or the end of a line, never a space or another name character, so a sibling such as "<folder> archive" or
+# "<file> helper" is not rewritten (Revision 19 fix round).
 function Convert-DshText([string]$Text, $TextMap) {
   $result = $Text
   foreach ($entry in $TextMap) {
     $from = ([string]$entry.From).TrimEnd('\')
     $to = ([string]$entry.To).TrimEnd('\')
     $spellings = @(@($from.Replace('\', '\\'), $to.Replace('\', '\\')), @($from, $to), @($from.Replace('\', '/'), $to.Replace('\', '/')))
+    foreach ($json in @(@($from.Replace('\', '\\'), $to.Replace('\', '\\')), @($from.Replace('\', '/'), $to.Replace('\', '/')))) {
+      $escaped = ConvertTo-JsonEscapes $json[0]
+      if ($escaped -cne $json[0]) { $spellings += ,@($escaped, (ConvertTo-JsonEscapes $json[1])) }
+    }
     foreach ($pair in $spellings) {
-      $pattern = [regex]::Escape($pair[0]) + '(?=[\\/"''\s,;)\]}]|$)'
+      $pattern = [regex]::Escape($pair[0]) + '(?=[\\/"'']|\r|\n|$)'
       $result = [regex]::Replace($result, $pattern, $pair[1].Replace('$', '$$'), [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     }
   }
@@ -564,10 +577,14 @@ function Convert-DshText([string]$Text, $TextMap) {
 # A link: or file: dependency that climbs out with .. would resolve elsewhere once the DSH home has moved. Given the
 # file's folder and the folder that moves with it, a relative one that resolves inside that folder moves along and is
 # fine (pnpm's link:../../plugins/<bundle> in the web profile, Revision 19); without them every climbing one counts.
+# The whole value counts, up to a quote, comma, bracket or line end: a value holding whitespace is ambiguous and counts
+# as climbing (Revision 19 fix round).
 function Test-ClimbingLink([string]$Text, [string]$Folder = '', [string]$Inside = '') {
-  foreach ($match in [regex]::Matches($Text, '(?i)(?<![A-Za-z0-9])(?:link|file):(?<path>\.\.[\\/][^\s"''`,;)\]}]*)')) {
+  foreach ($match in [regex]::Matches($Text, '(?i)(?<![A-Za-z0-9])(?:link|file):(?<path>\.\.[\\/][^"''`,;)\]}\r\n]*)')) {
     if (-not $Folder -or -not $Inside) { return $true }
-    try { $resolved = [IO.Path]::GetFullPath([IO.Path]::Combine($Folder, $match.Groups['path'].Value)).TrimEnd('\') } catch { return $true }
+    $value = $match.Groups['path'].Value.TrimEnd()
+    if ($value -match '\s') { return $true }
+    try { $resolved = [IO.Path]::GetFullPath([IO.Path]::Combine($Folder, $value)).TrimEnd('\') } catch { return $true }
     if ($resolved.Length -le 3 -or -not (Test-Within $resolved $Inside)) { return $true }
   }
   return $false
@@ -1400,7 +1417,9 @@ function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $
       if ($RenderedProfile -and $relative -ieq 'profiles\web\cordis.patch.yml') { $path = $RenderedProfile }
       $text = Convert-DshText (Read-Text $path) $TextMap
       $normal = $text.Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
-      if ((Test-NamesRoot $normal $Roots) -or (Test-ClimbingLink $text (Split-Path -Parent $file) $area.Inside)) { $found.Add($relative) }
+      # A path spelled with \uXXXX escapes is found too: the text is read once more with them decoded.
+      $decoded = (ConvertFrom-JsonEscapes $text).Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
+      if ((Test-NamesRoot $normal $Roots) -or (Test-NamesRoot $decoded $Roots) -or (Test-ClimbingLink $text (Split-Path -Parent $file) $area.Inside)) { $found.Add($relative) }
     }
   }
   return ,$found
@@ -2842,6 +2861,13 @@ function Invoke-SelfTest {
   $toolNames = @($toolConfig.snowluma.PSObject.Properties | ForEach-Object { $_.Name }) -join ','
   Check ($toolNames -ceq 'httpUrl,accessToken' -and $toolConfig.snowluma.httpUrl -ceq 'http://127.0.0.1:3010' -and $toolConfig.snowluma.accessToken -ceq 'tool-token-sample' -and @($toolConfig.PSObject.Properties).Count -eq 1 -and $script:SecretTexts.Contains('tool-token-sample')) 'the dev tool config holds only the runtime SnowLuma URL and token, and the token is a secret'
   Check (@((New-ToolConfig ('{"snowluma":{"homeDir":"C:\\x"}}' | ConvertFrom-Json)).snowluma.PSObject.Properties).Count -eq 0) 'a missing SnowLuma URL or token is left to the script default'
+  # Revision 19 fix round: JSON escapes, whitespace in a relative link: and full-name boundaries.
+  $quotedMap = Get-DshTextMap ([ordered]@{ Bundles = @(); DshHome = "C:\P\it's\.dsh"; ToolFiles = @() })
+  Check ((Convert-DshText ('{"x":"link:C:/P/it' + '\' + 'u0027s/.dsh/plugins/b","y":"C:\\P\\it' + '\' + 'u0027s\\.dsh\\profiles"}') $quotedMap) -ceq '{"x":"link:C:/qqbot/runtime/user/dsh/plugins/b","y":"C:\\qqbot\\runtime\\user\\dsh\\profiles"}') 'a path spelled with a JSON escape for its apostrophe is rewritten too'
+  Check ((ConvertFrom-JsonEscapes ('it' + '\' + 'u0027s')) -ceq "it's") 'JSON escapes are read as their characters for the scan'
+  Check (Test-ClimbingLink '{"dependencies":{"x":"link:../../space dir/../../outside"}}' 'C:\H\profiles\web' 'C:\H') 'a relative link: holding whitespace counts as climbing'
+  Check ((Convert-DshText 'args: ["C:/qqbot/qq-bridge/src/mcp-snowluma-full.js helper"]' $toolMap) -ceq 'args: ["C:/qqbot/qq-bridge/src/mcp-snowluma-full.js helper"]') 'a mapped file name followed by more text is not rewritten'
+  Check ((Convert-DshText 'C:\P\.dsh archive' $toolMap) -ceq 'C:\P\.dsh archive') 'a sibling folder whose name continues after a space is not rewritten'
   Write-Step ('PASS self-test: ' + $script:SelfChecks + ' checks')
 }
 

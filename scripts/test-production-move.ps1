@@ -449,7 +449,7 @@ function Assert-Moved([string]$Scenario, [switch]$Digest) {
   }
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $toolRoot 'src\other-tool.js'))) ($Scenario + ': a qq-bridge file the move does not carry is in the tool folder')
   $toolConfig = Get-Content -LiteralPath (Join-Path $toolRoot 'config.json') -Raw | ConvertFrom-Json
-  Assert-True ($toolConfig.snowluma.accessToken -ceq 'fixture-snow' -and $null -eq $toolConfig.snowluma.PSObject.Properties['httpUrl'] -and @($toolConfig.PSObject.Properties).Count -eq 1) ($Scenario + ': the tool config does not hold exactly the new runtime SnowLuma values')
+  Assert-True ((@($toolConfig.snowluma.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') -ceq 'httpUrl,accessToken' -and $toolConfig.snowluma.httpUrl -ceq ('http://127.0.0.1:' + $onebotPort) -and $toolConfig.snowluma.accessToken -ceq 'fixture-snow' -and @($toolConfig.PSObject.Properties).Count -eq 1) ($Scenario + ': the tool config does not hold exactly the new runtime SnowLuma values')
   $resolved = (& $NodePath -e "process.stdout.write(require.resolve('fixture-shared-dep', { paths: [process.argv[1]] }))" (Join-Path $toolRoot 'qq-mode-console')) | Out-String
   Assert-True ($resolved.Trim() -ieq (Join-Path $toolRoot 'node_modules\fixture-shared-dep\index.js')) ($Scenario + ': the bundle does not resolve its package from the carried node_modules')
   $devText = [IO.File]::ReadAllText((Join-Path $toolRoot 'qq-agent-presets\presets\qq-chat-v2-dev.patch.yml'))
@@ -683,7 +683,7 @@ try {
     allow = [ordered]@{ groups = @(1); private = @() }
     backends = [ordered]@{ mcpRustBridge = $true }
     rollout = [ordered]@{ rustGroups = @('group:1') }
-    snowluma = [ordered]@{ accessToken = 'fixture-snow'; homeDir = $snowFolder; launcherPath = (Join-Path $snowFolder 'index.mjs') }
+    snowluma = [ordered]@{ httpUrl = ('http://127.0.0.1:' + $onebotPort); accessToken = 'fixture-snow'; homeDir = $snowFolder; launcherPath = (Join-Path $snowFolder 'index.mjs') }
     tasks = [ordered]@{ installRoot = $oldRelease; nodePath = $NodePath; 'start-all' = [ordered]@{ snowLumaDirectory = $snowFolder; dshScript = (Join-Path $dshPackage 'bin\dsh.mjs'); dshWorkingDirectory = (Join-Path $F 'dsh-work') } }
     backup = [ordered]@{ keepDays = 7 }
     memory = [ordered]@{ digest = [ordered]@{ timeoutSecs = 90 } }
@@ -740,7 +740,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 149 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 154 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
