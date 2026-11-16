@@ -2694,7 +2694,7 @@ const SETTINGS_WRITABLE: [&str; 17] = [
 ];
 
 const SETTINGS_READONLY_HINT: &str =
-    "白名单 allow.* / ownerQQ / dsh.* / snowluma.* / consoleToken / 任何路径类字段只能本地改";
+    "白名单 allow.* / ownerQQ / 后端与网关配置 / consoleToken / 任何路径类字段只能本地改";
 
 /// 是否允许对话式修改：**黑名单优先** —— 只要看起来像凭据/白名单/路径就一律拒绝。
 fn is_setting_writable(path: &str) -> bool {
@@ -3779,7 +3779,7 @@ fn social_projection_write_denial(
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
         return Err((
             403,
-            "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+            "当前已暂停，不允许执行 v2 工具".to_string(),
         ));
     }
 
@@ -3901,7 +3901,7 @@ where
         if state.get("paused").and_then(Value::as_bool) == Some(true) {
             return Err((
                 403,
-                "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+                "当前已暂停，不允许执行 v2 工具".to_string(),
             ));
         }
         let cfg = context
@@ -7290,7 +7290,7 @@ where
         .cloned()
         .unwrap_or_else(|| json!({}));
     if collect_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-        return Err((403, "AI 收藏表情功能已关闭".to_string()));
+        return Err((403, "收藏表情功能已关闭".to_string()));
     }
     // 频率限制（state 里的 stickerCollectTimes）
     if context.is_isolated() {
@@ -8405,35 +8405,35 @@ fn handle_self_image(
     }
     let path = crate::legacy_path!("qq-bridge/assets/deepseek娘.png");
     let _source = crate::media::admit_source()
-        .ok_or_else(|| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?;
+        .ok_or_else(|| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let bytes = if context.is_isolated() {
         let (area, relative) = runtime_location(path)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?;
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
         let selected = context.resolve_path(area, &relative, PathIntent::ReadOptionalFile)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?;
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
         match std::fs::symlink_metadata(&selected) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err((404, "未找到 AI 形象图片 assets/deepseek娘.png".to_string()));
+                return Err((404, "未找到形象图片".to_string()));
             }
-            Err(_) => return Err((503, "selected AI image is unavailable".to_string())),
+            Err(_) => return Err((503, "selected self image is unavailable".to_string())),
             Ok(_) => {}
         }
         let checked = context.resolve_path(area, &relative, PathIntent::ReadFile)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?;
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
         if checked != selected {
-            return Err((503, "selected AI image is unavailable".to_string()));
+            return Err((503, "selected self image is unavailable".to_string()));
         }
         crate::media::read_image_path(&selected, crate::media_normalize::MAX_INPUT_BYTES)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?
     } else {
         if !std::path::Path::new(path).exists() {
-            return Err((404, "未找到 AI 形象图片 assets/deepseek娘.png".to_string()));
+            return Err((404, "未找到形象图片".to_string()));
         }
         crate::media::read_image_path(std::path::Path::new(path), crate::media_normalize::MAX_INPUT_BYTES)
-            .map_err(|_| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?
+            .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?
     };
     let normalized = crate::media_normalize::normalize(&bytes, crate::media::Limits::from_config(cfg).pixels)
-        .map_err(|_| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?;
+        .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let images = crate::media::image_values(&normalized);
     Ok(json!({ "ok": true, "key": key, "image": images[0], "images": images }))
 }
@@ -11435,7 +11435,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
             "recommendedSleepMinMs": 300000,
             "recommendedSleepMaxMs": 7200000,
             "recommendedProbability": 0.05,
-            "recommendedKeywords": ["小鲸鱼", "DeepSeek", "deepseek", "DS", "D老师", "d老师", "D指导", "d指导", "D师傅", "d师傅", "深度求索", "大肥鱼", "鲸鱼", "DeepSeek V3", "DeepSeek R1", "R1"],
+            "recommendedKeywords": ["小鲸鱼", "大肥鱼", "鲸鱼"],
             "recommendedAtMention": true,
             "recommendedNameMention": true,
             "recommendedQuestion": true,
@@ -11674,7 +11674,7 @@ fn tool_log_agent_denial(
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
         return Some((
             403,
-            "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+            "当前已暂停，不允许执行 v2 工具".to_string(),
         ));
     }
     if cfg
@@ -11768,7 +11768,7 @@ fn social_agent_policy_denial(
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
         return Some((
             403,
-            "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+            "当前已暂停，不允许执行 v2 工具".to_string(),
         ));
     }
     if cfg
@@ -11904,7 +11904,7 @@ fn send_message_global_agent_denial(
         Err((status, message)) => return Some((status, message)),
     };
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
-        return Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()));
+        return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
     }
     if cfg
         .get("socialV2")
@@ -21185,7 +21185,7 @@ mod tests {
         std::fs::write(root_a.0.join("data/social-v2.json"), paused).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg_a, &context_a),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
         std::fs::write(&root_a.0.join("data/social-v2.json"), &state_a_before).unwrap();
 
@@ -23192,7 +23192,7 @@ mod tests {
         let request = make_request(Some("session-token"), "/api/socialV2/send-message", "POST");
         assert_eq!(
             send_message_global_agent_denial(&request, &cfg, &context),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
 
         std::fs::write(
@@ -24254,7 +24254,7 @@ mod tests {
             ),
             (
                 "paused",
-                (403, "AI 已暂停，当前不允许执行 v2 工具".to_string()),
+                (403, "当前已暂停，不允许执行 v2 工具".to_string()),
             ),
             (
                 "disabled",
@@ -24566,7 +24566,7 @@ mod tests {
         let key = "private:7001";
         let cases = [
             ("token", "agent token 无效"),
-            ("paused", "AI 已暂停，当前不允许执行 v2 工具"),
+            ("paused", "当前已暂停，不允许执行 v2 工具"),
             ("enabled", "二代模式已关闭，当前不允许执行 v2 工具"),
             ("mode", "该接口仅 reserved2 模式可用"),
             ("tool", "工具未启用：qq_memory_append"),
@@ -25683,7 +25683,7 @@ mod tests {
         std::fs::write(&state_path, paused).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), paused);
 
@@ -25931,7 +25931,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),

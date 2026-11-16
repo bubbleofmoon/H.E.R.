@@ -530,7 +530,7 @@ async fn tool_loop(
         drop(call_ids);
         for call in calls {
             let prepared = if exhausted {
-                Err(tools::error("harness token limit exceeded"))
+                Err(tools::error("token limit exceeded"))
             } else {
                 request.tools.prepare(&call)
             };
@@ -546,7 +546,7 @@ async fn tool_loop(
             let cancel = cancelled.clone();
             let mut outcome = tokio::task::spawn_blocking(move || {
                 if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                    return tools::error("harness tool dispatch cancelled or expired");
+                    return tools::error("tool dispatch cancelled or expired");
                 }
                 match prepared {
                     Ok(args) => tools.dispatch(&invocation, &args),

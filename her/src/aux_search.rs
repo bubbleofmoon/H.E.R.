@@ -236,7 +236,7 @@ pub fn map_deepseek_response(response: &Value, max_results: usize) -> Result<Vec
     let blocks: &[Value] = response.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let result_blocks: Vec<&Value> = blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("web_search_tool_result")).collect();
     if result_blocks.is_empty() {
-        return Err(SearchError::new("NO_RESULT_BLOCK", "DeepSeek 没有返回 web_search_tool_result（可能未触发联网搜索）"));
+        return Err(SearchError::new("NO_RESULT_BLOCK", "主搜索没有返回搜索结果块（可能未触发联网搜索）"));
     }
     let mut snippets: HashMap<String, String> = HashMap::new();
     for block in blocks {
@@ -404,7 +404,7 @@ fn validate_search_endpoint(base_url: &str, net: &Network) -> Result<(Url, Vec<I
 }
 
 fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext, net: &Network) -> Result<Vec<Value>, SearchError> {
-    let key = resolve_api_key(context, config).ok_or_else(|| SearchError::new("NO_KEY", "没有可用的 DeepSeek API key"))?;
+    let key = resolve_api_key(context, config).ok_or_else(|| SearchError::new("NO_KEY", "没有可用的主搜索 API key"))?;
     let base_url = if !config.base_url.is_empty() {
         config.base_url.clone()
     } else {
@@ -443,10 +443,10 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
                 message.map(|m| slice_utf16(&m, 200))
             })
             .unwrap_or_default();
-        let message = if detail.is_empty() { format!("DeepSeek 搜索接口 HTTP {status}") } else { format!("DeepSeek 搜索接口 HTTP {status}：{detail}") };
+        let message = if detail.is_empty() { format!("主搜索接口 HTTP {status}") } else { format!("主搜索接口 HTTP {status}：{detail}") };
         return Err(SearchError::new("HTTP_ERROR", message));
     }
-    let parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "DeepSeek 搜索接口返回了无法解析的响应"))?;
+    let parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主搜索接口返回了无法解析的响应"))?;
     map_deepseek_response(&parsed, config.max_results as usize)
 }
 
@@ -503,7 +503,8 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
         }
     }
     let attempt_deepseek = || -> Result<Value, SearchError> {
-        deepseek_search(q, &config, context, net).map(|results| json!({"query": q, "provider": "deepseek", "results": results}))
+        // The result is model-visible: the first provider is labelled `primary`, never by its vendor name.
+        deepseek_search(q, &config, context, net).map(|results| json!({"query": q, "provider": "primary", "results": results}))
     };
     let attempt_bing = || -> Result<Value, String> { bing_search(q, &config, net).map(|results| json!({"query": q, "provider": "bing", "results": results})) };
     let mut value = match wanted.as_str() {
@@ -512,9 +513,9 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
         _ => match attempt_deepseek() {
             Ok(v) => v,
             Err(error) => {
-                let reason = if error.code == "NO_KEY" { "未配置 DeepSeek 搜索凭据".to_string() } else { format!("DeepSeek 搜索不可用：{}", error.message) };
+                let reason = if error.code == "NO_KEY" { "未配置主搜索凭据".to_string() } else { format!("主搜索不可用：{}", error.message) };
                 let mut bing = attempt_bing().map_err(|bing_error| format!("{reason}；Bing 兜底也失败：{bing_error}"))?;
-                bing["fallbackFrom"] = json!("deepseek");
+                bing["fallbackFrom"] = json!("primary");
                 bing["note"] = json!(format!("{reason}，已回退 Bing"));
                 bing
             }

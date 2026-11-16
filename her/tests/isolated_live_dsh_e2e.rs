@@ -1544,7 +1544,7 @@ fn isolated_live_dsh_routes_selected_prompt_through_public_console_to_fake_onebo
     // Live 114e5c25 replaces the compatibility full render at DSH submission, including
     // bootstrap wakes: concise status plus one authenticated packet carry the live event.
     assert!(
-        prompt.contains("【此刻状态】未读 1 条；lastAiReplyAt=null"),
+        prompt.contains("【此刻状态】未读 1 条；lastReplyAt=null"),
         "status must carry the selected live unread count and reply state"
     );
     assert_eq!(

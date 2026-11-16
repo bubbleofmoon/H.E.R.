@@ -21,7 +21,7 @@
         "tools": [
           {
             "name": "web_search",
-            "description": "只读联网搜索：优先使用与 DSH 相同的 DeepSeek 联网搜索（结果更准、不把群里的词发给搜索引擎广告网络），不可用时自动回退 Bing。返回标题/URL/摘要，不执行任何本地操作。适合查网络用语、梗、事实性问题和热点。",
+            "description": "只读联网搜索：优先使用内置联网搜索（结果更准、不把群里的词发给搜索引擎广告网络），不可用时自动回退 Bing。返回标题/URL/摘要，不执行任何本地操作。适合查网络用语、梗、事实性问题和热点。",
             "inputSchema": {
               "$schema": "http://json-schema.org/draft-07/schema#",
               "type": "object",

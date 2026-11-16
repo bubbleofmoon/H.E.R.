@@ -1262,7 +1262,7 @@ pub fn normalize_wake_config(
     if is_infinite(&out) && !has_any_trigger(&out) {
         return Err((
             400,
-            "无限期潜水必须至少保留一个唤醒条件（@/名字/拍一拍/关键词/提问/anyMessage/概率>0），否则 AI 可能永眠"
+            "无限期潜水必须至少保留一个唤醒条件（@/名字/拍一拍/关键词/提问/anyMessage/概率>0），否则你可能再也不会被唤醒"
                 .to_string(),
         ));
     }

@@ -1345,7 +1345,7 @@ fn send_message_rejects_oversized_chunked_body_after_auth_without_side_effects()
     )
     .expect("read the paused gate response before the body limit");
     assert_eq!(paused.status, 403, "paused gate must precede body limits");
-    assert_eq!(paused.body["error"], "AI 已暂停，当前不允许执行 v2 工具");
+    assert_eq!(paused.body["error"], "当前已暂停，不允许执行 v2 工具");
     assert_eq!(fs::read(&state_a).unwrap(), paused_before);
     fs::write(&state_a, &state_a_before).unwrap();
 

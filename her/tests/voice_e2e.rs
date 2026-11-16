@@ -533,9 +533,9 @@ fn ai_send_route_checks_follow_the_baseline_order_and_messages() {
         ("http://example.invalid/a.mp3", "语音只接受语音库里的本地文件；不接受 base64://、data: 或 http(s):// 来源"),
         ("base64://AAAA", "语音只接受语音库里的本地文件；不接受 base64://、data: 或 http(s):// 来源"),
         ("../outside.mp3", "语音只能从语音库取文件：路径里出现了「..」或绝对路径，已拒绝（防止读到库外的本机文件）"),
-        ("/etc/passwd", "语音只能从语音库取文件（语音库目录：audio）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽 AI 通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。"),
+        ("/etc/passwd", "语音只能从语音库取文件（语音库目录：audio）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽工具通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。"),
         #[cfg(windows)]
-        (r"\etc\passwd", "语音只能从语音库取文件（语音库目录：audio）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽 AI 通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。"),
+        (r"\etc\passwd", "语音只能从语音库取文件（语音库目录：audio）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽工具通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。"),
         ("nothing", "语音库里找不到「nothing」。语音库里现有：a.mp3"),
     ] {
         let (s, b) = post(json!({"key": key, "voice": voice}));
@@ -1245,7 +1245,7 @@ fn operator_send_works_even_when_the_ai_voice_switch_is_off_and_does_not_need_a_
     assert_eq!((s, b["error"].as_str()), (500, Some("语音发送频率超限（每分钟最多 2 条），请稍后再试")), "{b}");
     // The AI is told to use its own route.
     let (s, b) = console.agent("POST", "/api/send/voice", json!({"target": "private:222", "file": "a.mp3"}));
-    assert_eq!((s, b["error"].as_str()), (403, Some("AI 请改用 /api/socialV2/send-voice（带 key + token）")), "{b}");
+    assert_eq!((s, b["error"].as_str()), (403, Some("请改用 /api/socialV2/send-voice（带 key + token）")), "{b}");
 }
 
 #[test]

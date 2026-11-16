@@ -634,13 +634,13 @@
      }
     ]
    },
-   "error": "DeepSeek 没有返回 web_search_tool_result（可能未触发联网搜索）",
+   "error": "主搜索没有返回搜索结果块（可能未触发联网搜索）",
    "code": "NO_RESULT_BLOCK"
   },
   {
    "max": 8,
    "response": {},
-   "error": "DeepSeek 没有返回 web_search_tool_result（可能未触发联网搜索）",
+   "error": "主搜索没有返回搜索结果块（可能未触发联网搜索）",
    "code": "NO_RESULT_BLOCK"
   },
   {

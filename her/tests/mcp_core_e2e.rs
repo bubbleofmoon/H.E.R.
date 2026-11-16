@@ -1501,7 +1501,7 @@ fn a_rotated_session_token_voids_the_receipts_it_was_given() {
     assert!(is_error(&refused), "receipts given to the old session must not count for the new one: {refused}");
     let old = f.mcp.call("qq_mark_read", group(json!({"throughSeq": 8})));
     assert!(is_error(&old));
-    assert!(text_of(&old).contains("智能体调用携带的会话令牌无效"), "{}", text_of(&old));
+    assert!(text_of(&old).contains("未授权：调用携带的会话令牌无效"), "{}", text_of(&old));
 }
 
 #[test]

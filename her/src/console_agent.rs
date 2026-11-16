@@ -262,11 +262,11 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
         if token_present {
             match is_live_agent_token(context, token.unwrap()) {
                 Ok(true) => {}
-                Ok(false) => return Some((403, "未授权：智能体调用携带的会话令牌无效".to_string())),
+                Ok(false) => return Some((403, "未授权：调用携带的会话令牌无效".to_string())),
                 Err(error) => return Some(error),
             }
         } else if !(path == "/api/status" || path.starts_with("/api/send/") || path.starts_with("/api/images/")) {
-            return Some((403, "未授权：该接口的智能体调用必须携带有效的会话令牌".to_string()));
+            return Some((403, "未授权：该接口的工具调用必须携带有效的会话令牌".to_string()));
         }
     }
     let token = token?;
@@ -278,7 +278,7 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
         match load_social_state_for(context) {
             Ok(state) => {
                 if state.get("paused").and_then(Value::as_bool) == Some(true) {
-                    return Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()));
+                    return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
                 }
             }
             Err(error) => return Some(error),
@@ -445,7 +445,7 @@ fn send_poke_inner(
     }
     let state = load_social_state_for(context)?;
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
-        return Err((403, "二代 AI 已暂停，不能发送拍一拍".to_string()));
+        return Err((403, "当前已暂停，不能发送拍一拍".to_string()));
     }
     let Some((kind, id_s, id)) = parse_key(&key) else {
         return Err((400, KEY_FORMAT_ERROR.to_string()));
@@ -1105,7 +1105,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     }
     let state = load_social_state_for(context)?;
     if state.get("paused").and_then(Value::as_bool) == Some(true) && !token.is_empty() {
-        return Err((403, "AI 已暂停，当前不允许执行发送工具".to_string()));
+        return Err((403, "当前已暂停，不允许执行发送工具".to_string()));
     }
     if target_id.is_empty() || message.is_empty() {
         return Err((400, "目标 id 和 message 不能为空".to_string()));

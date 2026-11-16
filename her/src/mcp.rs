@@ -69,7 +69,7 @@ fn memory_tools() -> Value {
         "tools": [
             {
                 "name": "memory_write",
-                "description": "记一条长期记忆。适合：用户的偏好/要求、重要决定、踩过的坑、群里的长期话题。不要记流水账。",
+                "description": "记一条长期记忆。适合：群友的偏好/要求、重要决定、踩过的坑、群里的长期话题。不要记流水账。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

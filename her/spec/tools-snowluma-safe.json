@@ -2,7 +2,7 @@
  "tools": [
   {
    "name": "qq_status",
-   "description": "查询 QQ 机器人登录状态与账号信息（只读）。",
+   "description": "查询你的 QQ 登录状态与账号信息（只读）。",
    "inputSchema": {
     "type": "object",
     "properties": {},
@@ -14,7 +14,7 @@
   },
   {
    "name": "qq_list_groups",
-   "description": "列出机器人所在的全部 QQ 群（只读）：群号、群名。",
+   "description": "列出你所在的全部 QQ 群（只读）：群号、群名。",
    "inputSchema": {
     "type": "object",
     "properties": {},
@@ -708,7 +708,7 @@
   },
   {
    "name": "qq_report_feedback",
-   "description": "向控制台/管理端反馈 AI 遇到的问题、困惑或需要管理员介入的情况。",
+   "description": "向控制台/管理端反馈你遇到的问题、困惑或需要管理员介入的情况。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1086,7 +1086,7 @@
   },
   {
    "name": "qq_get_message_images",
-   "description": "获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。",
+   "description": "获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给你（你能直接看到图片）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1159,7 +1159,7 @@
   },
   {
    "name": "qq_get_sticker_image",
-   "description": "获取指定收藏表情的图片内容并直接以图像返回给模型（视觉模型可“看懂”）。当 qq_list_stickers 返回的表情 desc/localNote 为空、或你想确认表情实际长什么样时调用。stickerId 可用 qq_list_stickers 返回的 id / md5 / url。",
+   "description": "获取指定收藏表情的图片内容并直接以图像返回给你（你能直接看到图片）。当 qq_list_stickers 返回的表情 desc/localNote 为空、或你想确认表情实际长什么样时调用。stickerId 可用 qq_list_stickers 返回的 id / md5 / url。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1275,7 +1275,7 @@
   },
   {
    "name": "qq_send_voice",
-   "description": "在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。",
+   "description": "在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对别人说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1317,7 +1317,7 @@
   },
   {
    "name": "qq_list_voices",
-   "description": "查看可用的语音库（qq-bridge 的 audio 目录里准备好的音频文件）：文件名、时长、大小。想发语音前先调用这个看有哪些能发（名字用返回的 name）。返回里 limits 是时长/体积/频率上限。语音库里没有合适内容时不要硬发，也不要假装发了语音。",
+   "description": "查看可用的语音库（管理员准备好的音频文件）：文件名、时长、大小。想发语音前先调用这个看有哪些能发（名字用返回的 name）。返回里 limits 是时长/体积/频率上限。语音库里没有合适内容时不要硬发，也不要假装发了语音。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1346,7 +1346,7 @@
   },
   {
    "name": "qq_get_self_image",
-   "description": "查看你自己的默认 Q 版形象图片（DeepSeek 小鲸鱼形象）。当你被问“你长什么样/发张自拍/你是什么形象”时，可以调用这个工具看自己的样子；返回的图片会直接进入你的视觉上下文。",
+   "description": "查看你自己的默认 Q 版形象图片（小鲸鱼形象）。当你被问“你长什么样/发张自拍/你是什么形象”时，可以调用这个工具看自己的样子；返回的图片会直接进入你的视觉上下文。",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -1451,7 +1451,7 @@
   },
   {
    "name": "qq_get_forward_msg",
-   "description": "查看当前会话中出现的合并转发消息/聊天记录内容（只读）。当消息文本里出现 `[转发消息 id=...]`，或 `qq_get_unread_messages` / `qq_get_recent_messages` / `qq_get_message_detail` 返回的某条消息带 `forwardIds` / `hasForward: true` 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。返回内容会包含每条消息的 text、media（图片/表情元数据）与 nestedForwardIds；如果合并转发里有图片，工具会直接把最多 5 张图片以图像内容返回给视觉模型；如果里面有嵌套合并转发，会附带嵌套转发 id 和前几条预览，必要时可继续用本工具查看嵌套 id。",
+   "description": "查看当前会话中出现的合并转发消息/聊天记录内容（只读）。当消息文本里出现 `[转发消息 id=...]`，或 `qq_get_unread_messages` / `qq_get_recent_messages` / `qq_get_message_detail` 返回的某条消息带 `forwardIds` / `hasForward: true` 时调用。只能查看当前会话确实收到过的转发消息 id，不能任意读取。返回内容会包含每条消息的 text、media（图片/表情元数据）与 nestedForwardIds；如果合并转发里有图片，工具会直接把最多 5 张图片以图像内容返回给你；如果里面有嵌套合并转发，会附带嵌套转发 id 和前几条预览，必要时可继续用本工具查看嵌套 id。",
    "inputSchema": {
     "type": "object",
     "properties": {
