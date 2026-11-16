@@ -477,8 +477,7 @@ pub(crate) mod test_support {
         for dir in ["config", "data", "resources"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        let cfg = json!({"ownerQQ": 8808, "consoleToken": "synthetic-console-token-183", "harness": {"model": "fake-chat"}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("config/config.json"), config().to_string()).unwrap();
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-183").unwrap();
         std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
@@ -489,6 +488,12 @@ pub(crate) mod test_support {
         .unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         (FixtureRoot(root), context)
+    }
+
+    /// The fixture runtime's configuration.
+    pub(crate) fn config() -> Value {
+        json!({"ownerQQ": 8808, "consoleToken": "synthetic-console-token-183", "harness": {"model": "fake-chat"},
+            "socialV2": {"context": {"stripFromModelText": ["STRIPPED183"]}}})
     }
 
     /// Arms a capture for `route` now, for the default 30 minutes.
@@ -710,48 +715,97 @@ mod tests {
         assert_eq!(disarm(&context).unwrap(), json!({"removed": ["captured"]}));
     }
 
+    #[test]
+    fn a_key_outside_the_request_structure_is_never_printed() {
+        let keys = sweep(&json!({"messages": [{"content": "dsh", "private-token-183": "dsh"}]}));
+        let paths: Vec<&str> = keys["fields"].as_array().unwrap().iter().map(|field| field["path"].as_str().unwrap()).collect();
+        assert_eq!(paths, vec!["/messages/0/content", "/messages/0/<key>"]);
+        assert!(!keys.to_string().contains("private-token-183"), "{keys}");
+    }
+
+    #[test]
+    fn an_invalid_capture_prints_none_of_its_values() {
+        let (_root, context) = runtime("invalid", "http://127.0.0.1:1");
+        // Metadata of the wrong type, and a capture of another shape, are refused without a value.
+        for record in [
+            r#"{"v":1,"route":"dsh","capturedAt":"PRIVATE_CHAT","request":{}}"#,
+            r#"{"v":1,"route":"dsh","capturedAt":0,"tooLarge":true,"bytes":"PRIVATE_TOKEN"}"#,
+            r#"{"v":2}"#,
+        ] {
+            context.write_atomic(RuntimeArea::Data, CAPTURED_FILE, record.as_bytes()).unwrap();
+            assert_eq!(sweep_capture(&context).unwrap_err(), (1, "capture file invalid; run disarm".to_string()), "{record}");
+        }
+        assert_eq!(disarm(&context).unwrap(), json!({"removed": ["captured"]}));
+    }
+
+    #[test]
+    fn the_capture_module_never_uses_panicking_print_macros() {
+        // `println!` and `eprintln!` panic when their stream fails; this module writes through `note`.
+        let print = ["print", "ln!("].concat();
+        assert!(!include_str!("upstream_capture.rs").contains(&print), "the capture module uses a panicking print macro");
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn an_armed_harness_capture_holds_the_request_the_relay_receives() {
+    async fn an_armed_harness_capture_holds_the_filtered_request_with_its_replayed_tool_call() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let model = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", model.local_addr().unwrap());
         let (_root, context) = runtime("harness", &endpoint);
-        // The fixture's configuration, as the harness cancellation tests pass it.
-        let cfg = json!({"ownerQQ": 8808, "consoleToken": "synthetic-console-token-183", "harness": {"model": "fake-chat"}});
+        let cfg = super::test_support::config();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
-        super::test_support::arm(&context, "harness");
-        let chunk = json!({"id": "fake-183", "object": "chat.completion.chunk", "model": "fake-chat",
-            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "fixture reply 183"}, "finish_reason": null}]});
-        let end = json!({"id": "fake-183", "object": "chat.completion.chunk", "model": "fake-chat",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
-        let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
-        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        // Two model steps: a call to a tool that does not exist (its error result is replayed), then
+        // the reply. The relay arms the capture while it holds the first step, so the capture takes
+        // the second: the filtered prompt, the replayed tool call and its result.
+        let call = json!([{"index": 0, "id": "call-183", "type": "function", "function": {"name": "fixture_tool_183", "arguments": "{}"}}]);
+        let steps = [
+            (json!({"role": "assistant", "tool_calls": call}), "tool_calls"),
+            (json!({"role": "assistant", "content": "fixture reply 183"}), "stop"),
+        ];
+        let responses: Vec<String> = steps
+            .iter()
+            .map(|(delta, finish)| {
+                let chunk = json!({"id": "fake-183", "object": "chat.completion.chunk", "model": "fake-chat",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": null}]});
+                let end = json!({"id": "fake-183", "object": "chat.completion.chunk", "model": "fake-chat",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]});
+                let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            })
+            .collect();
+        let arming = context.clone();
         let relay = tokio::spawn(async move {
-            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), model.accept())
-                .await
-                .expect("the relay received no request")
-                .unwrap();
-            let mut bytes = Vec::new();
-            let (start, length) = loop {
-                let mut chunk = [0; 4096];
-                let count = socket.read(&mut chunk).await.unwrap();
-                assert_ne!(count, 0, "truncated relay request");
-                bytes.extend_from_slice(&chunk[..count]);
-                if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let length = String::from_utf8_lossy(&bytes[..split])
-                        .lines()
-                        .filter_map(|line| line.split_once(':'))
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
-                        .unwrap();
-                    if bytes.len() >= split + 4 + length {
-                        break (split + 4, length);
+            let mut requests = Vec::new();
+            for (step, response) in responses.into_iter().enumerate() {
+                let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), model.accept())
+                    .await
+                    .expect("the relay received no request")
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let (start, length) = loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0, "truncated relay request");
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let length = String::from_utf8_lossy(&bytes[..split])
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                            .unwrap();
+                        if bytes.len() >= split + 4 + length {
+                            break (split + 4, length);
+                        }
                     }
+                };
+                if step == 0 {
+                    super::test_support::arm(&arming, "harness");
                 }
-            };
-            socket.write_all(response.as_bytes()).await.unwrap();
-            serde_json::from_slice::<Value>(&bytes[start..start + length]).unwrap()
+                socket.write_all(response.as_bytes()).await.unwrap();
+                requests.push(serde_json::from_slice::<Value>(&bytes[start..start + length]).unwrap());
+            }
+            requests
         });
         let harness = crate::harness::Harness::open(&context).unwrap();
         let mut turn = harness
@@ -759,7 +813,7 @@ mod tests {
                 id: "capture-183".into(),
                 conversation: "private:8808".into(),
                 generation: generation.clone(),
-                prompt: "fixture prompt 183".into(),
+                prompt: "fixture prompt 183 STRIPPED183".into(),
                 profile: "closed-agent".into(),
                 route: crate::harness::ModelRoute::from_runtime(&context, &cfg).unwrap(),
                 deadline: Duration::from_secs(10),
@@ -773,9 +827,10 @@ mod tests {
         let record = captured(&context).expect("the armed harness request was captured");
         assert_eq!(record["route"], "harness");
         assert_eq!(record["request"]["model"], "fake-chat");
-        assert_eq!(wire["model"], "fake-chat");
+        assert_eq!(wire[1]["model"], "fake-chat");
         assert_eq!(armed_or_claimed(&context), (false, false));
-        // Every message text and tool name the relay received is in the capture.
+        // Every text, tool call id and tool name the relay received in the second step is in the
+        // capture, and the stripped word reached neither.
         fn strings(value: &Value, out: &mut Vec<String>) {
             match value {
                 Value::String(text) => out.push(text.clone()),
@@ -788,20 +843,31 @@ mod tests {
         strings(&record["request"]["request"], &mut held);
         // The wire spells content as a string or as parts with a "text" field.
         let mut sent = Vec::new();
-        for message in wire["messages"].as_array().unwrap() {
+        for message in wire[1]["messages"].as_array().unwrap() {
             match &message["content"] {
                 Value::String(text) => sent.push(text.clone()),
                 Value::Array(parts) => sent.extend(parts.iter().filter_map(|part| part["text"].as_str().map(str::to_string))),
                 _ => {}
             }
+            for call in message["tool_calls"].as_array().into_iter().flatten() {
+                sent.push(call["id"].as_str().unwrap().to_string());
+                sent.push(call["function"]["name"].as_str().unwrap().to_string());
+            }
+            if let Some(id) = message["tool_call_id"].as_str() {
+                sent.push(id.to_string());
+            }
         }
-        for tool in wire["tools"].as_array().into_iter().flatten() {
+        for tool in wire[1]["tools"].as_array().into_iter().flatten() {
             sent.push(tool["function"]["name"].as_str().unwrap().to_string());
         }
-        assert!(sent.iter().any(|text| text == "fixture prompt 183"), "{sent:?}");
+        sent.retain(|text| !text.is_empty());
+        assert!(sent.iter().any(|text| text == "call-183"), "the second step replays the tool call: {sent:?}");
+        assert!(sent.iter().any(|text| text.starts_with("fixture prompt 183")), "{sent:?}");
+        assert!(!wire[1].to_string().contains("STRIPPED183"), "the relay received text the model view strips");
         for text in &sent {
             assert!(held.contains(text), "the relay received text the capture lacks: {text}");
         }
+        assert!(!record.to_string().contains("STRIPPED183"), "the capture holds text the model view strips");
         // The capture holds no credential.
         assert!(!record.to_string().contains("synthetic-model-key-183"));
     }

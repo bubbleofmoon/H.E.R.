@@ -69,7 +69,7 @@ fn a_capture_is_armed_swept_into_counts_and_paths_and_gone() {
     assert_eq!(report["counts"], json!({"dsh": 1, "harness": 1}));
     assert_eq!(report["fields"], json!([
         {"path": "/payload/args/request/content/0/text", "part": "value", "terms": ["dsh"]},
-        {"path": "/payload/args/request/harness", "part": "key", "terms": ["harness"]},
+        {"path": "/payload/args/request/<key>", "part": "key", "terms": ["harness"]},
     ]));
     assert_eq!(report["removed"], true);
     for text in ["今天天气不错", "你好", "fixture chat line", "s-183", "rpc-183"] {
