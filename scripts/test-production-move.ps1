@@ -248,7 +248,8 @@ function Remove-McpBlock([string]$Text) { return [regex]::Replace($Text, '(?ms)^
 function Get-ComparableConfig([string]$Text) {
   $value = $Text | ConvertFrom-Json
   foreach ($name in @('dependencies', 'update')) { if ($null -ne $value.PSObject.Properties[$name]) { $value.PSObject.Properties.Remove($name) } }
-  foreach ($pair in @(@('tasks', 'start-all'), @('tasks', 'installRoot'), @('snowluma', 'homeDir'), @('snowluma', 'launcherPath'))) {
+  # The move drops the description note under backends (Revision 18): the key "_" followed by U+8BF4 U+660E.
+  foreach ($pair in @(@('tasks', 'start-all'), @('tasks', 'installRoot'), @('snowluma', 'homeDir'), @('snowluma', 'launcherPath'), @('backends', ('_' + [string][char]0x8BF4 + [string][char]0x660E)))) {
     $parent = $value.PSObject.Properties[$pair[0]]
     if ($null -ne $parent -and $null -ne $parent.Value.PSObject.Properties[$pair[1]]) { $parent.Value.PSObject.Properties.Remove($pair[1]) }
   }
@@ -397,6 +398,7 @@ function Assert-Moved([string]$Scenario, [switch]$Digest) {
   Assert-True ($config.dependencies.relay.version -eq '0.0.1' -and $config.dependencies.relay.program -ieq (Join-Path $pin 'cli-proxy-api.exe') -and $config.dependencies.relay.clientKeyFile -ieq (Join-Path $pin 'her-relay-client.key') -and $config.dependencies.relay.loginDirectory -ieq (Join-Path $pin 'auth')) ($Scenario + ': dependencies.relay')
   Assert-True ((@($config.dependencies.relay.arguments) -join '|') -ieq ((Join-Path $pin 'fake-relay.mjs') + '|-config|' + (Join-Path $pin 'config.yaml'))) ($Scenario + ': relay arguments')
   Assert-True ($config.update.policy -eq 'off') ($Scenario + ': update.policy is not off')
+  Assert-True ($null -eq $config.backends.PSObject.Properties[('_' + [string][char]0x8BF4 + [string][char]0x660E)] -and $config.backends.mcpRustBridge -eq $true) ($Scenario + ': the backends description note was not dropped, or the rest of backends was')
   Assert-True ($null -eq $config.tasks.'start-all' -and $null -eq $config.tasks.installRoot) ($Scenario + ': legacy task paths remain')
   Assert-True ($config.snowluma.homeDir -ieq (Join-Path $root 'deps\snowluma\1.2.3') -and $config.snowluma.launcherPath -ieq (Join-Path $root 'deps\snowluma\1.2.3\index.mjs')) ($Scenario + ': SnowLuma paths were not remapped')
   $dependencies = Get-Content -LiteralPath (Join-Path $root 'runtime\dependencies.json') -Raw | ConvertFrom-Json
@@ -557,6 +559,20 @@ try {
   $credentialText = 'secret: ' + $secret + "`nrecords:`n  client-connection/browser-session:`n    kind: grant`n    payload:`n      version: 1`n      secret: " + $secret + "`n"
   Write-Fixture (Join-Path $dshHome '.credentials.yaml') $credentialText
   Write-Fixture (Join-Path $oldRuntime 'user\dsh\.credentials.yaml') $credentialText
+  # The Antigravity CLI's own log link in the old DSH stub, in production's shape: a file symbolic link with a relative
+  # target (cli.log -> log\cli-<stamp>.log). The stub comparison leaves this folder out (Revision 18). mklink stores the
+  # relative target as given (New-Item would store it absolute). A symbolic link needs a privilege (or developer mode):
+  # without one the fixture uses a junction to the log folder instead; the line says which.
+  $antigravity = Join-Path $oldRuntime 'user\dsh\.gemini\antigravity-cli'
+  Write-Fixture (Join-Path $antigravity 'log\cli-fixture.log') 'fixture log'
+  $antigravityLink = Join-Path $antigravity 'cli.log'
+  $antigravityShape = 'junction'
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { [void](& cmd.exe /d /c mklink $antigravityLink 'log\cli-fixture.log' 2>&1); $mklinkCode = $LASTEXITCODE } finally { $ErrorActionPreference = $previous }
+  if ($mklinkCode -eq 0 -and (Test-Path -LiteralPath $antigravityLink -PathType Leaf)) { $antigravityShape = 'symbolic link' }
+  else { [void](New-Item -ItemType Junction -Path $antigravityLink -Target (Join-Path $antigravity 'log')) }
+  Write-Host ('antigravity log link: ' + $antigravityShape)
   # Two bundles in the install root's qq-bridge folder, linked from the profile's plugins folder and named by link:
   # dependencies in two spellings. Production uses directory symbolic links, which need a privilege (or developer
   # mode): qq-agent-presets gets one when this account may create it, otherwise a junction; the line says which.
@@ -614,6 +630,9 @@ try {
       text = ('quote " backslash \ angle <tag> amp & apostrophe ' + "'" + ' ' + [string][char]0x5C0F + [string][char]0x9CB8)
     }
   }
+  # The description note under backends, naming an old folder in prose as production's does: the move drops exactly
+  # this property (Revision 18), so Inventory stays clean and the rewritten configuration lacks it.
+  $config.backends[('_' + [string][char]0x8BF4 + [string][char]0x660E)] = ('fixture note: the old runtime lived in ' + $oldRuntime)
   Write-FixtureJson (Join-Path $oldRuntime 'config\config.json') $config
   Write-FixtureJson (Join-Path $oldRuntime 'dependencies.json') ([ordered]@{ dsh = ('http://127.0.0.1:' + $dshPort); model = ('http://127.0.0.1:' + $dshPort); onebot = ('http://127.0.0.1:' + $onebotPort); onebot_ws = ('ws://127.0.0.1:' + $onebotPort) })
   Write-Fixture (Join-Path $oldRuntime 'data\social-v2.json') '{}'
@@ -658,7 +677,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 132 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 138 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'

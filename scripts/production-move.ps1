@@ -64,6 +64,12 @@ $script:RelayKey = ''
 $script:SelfChecks = 0
 $script:Blockers = [Collections.Generic.List[string]]::new()
 $script:SecretTexts = [Collections.Generic.List[string]]::new()
+# Owner decisions on the c70fd204 Inventory (Revision 18). The old DSH stub's Antigravity CLI folder holds that tool's
+# own log links; the stub comparison leaves exactly this relative path out (any case), and every other link in the
+# stub still refuses. The configuration's description note under backends (the key "_" followed by U+8BF4 U+660E)
+# names old folders in prose; the rewrite drops exactly that property, and the kept originals still hold it.
+$script:DshStubExclude = @('.gemini\antigravity-cli')
+$script:BackendsNoteKey = '_' + [string][char]0x8BF4 + [string][char]0x660E
 $script:ProfileRoots = $null
 $script:RootAclChanging = $false
 $script:GoClaim = $null
@@ -580,7 +586,10 @@ function Find-ForeignPaths($Value, [string]$Pointer, $Roots, [string]$Install, $
     for ($index = 0; $index -lt $Value.Count; $index++) { Find-ForeignPaths $Value[$index] ($Pointer + '/' + $index) $Roots $Install $Found }
   }
 }
+# Drops the description note under backends and nothing else; the same key anywhere else stays and is scanned.
+function Remove-BackendsNote($Config) { Remove-Prop (Get-Prop $Config 'backends') $script:BackendsNoteKey }
 function Convert-Config($Config, $plan) {
+  Remove-BackendsNote $Config
   $tasks = Get-Prop $Config 'tasks'
   Remove-Prop $tasks 'start-all'
   Remove-Prop $tasks 'installRoot'
@@ -1065,14 +1074,18 @@ function Get-IdleState([string]$Cli, [string]$Runtime, [string]$Label) {
 }
 
 # ---------- trees, manifests and copies ----------
+# Whether a manifest walk leaves this relative path out: exactly an excluded relative path, in any case. Its subtree
+# goes with it, since the walk never enters a left-out folder; a near-miss name is walked, and a link there refuses.
+function Test-ManifestSkip([string]$Child, [string[]]$Exclude) {
+  foreach ($relative in @($Exclude)) { if ($relative -and [string]::Equals($relative, $Child, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+  return $false
+}
 function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [string]$Label, [switch]$NoHash) {
   $base = Get-Normal $Root
   $target = Get-Normal $TargetRoot
   # The start folder too: a source that is itself a junction or link would be copied from somewhere else.
   $start = Get-Item -LiteralPath $base -Force -ErrorAction SilentlyContinue
   if ($null -ne $start -and ($start.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused ('a junction or link was found in ' + $Label) }
-  $skip = @{}
-  foreach ($relative in @($Exclude)) { if ($relative) { $skip[$relative.ToLowerInvariant()] = $true } }
   $entries = [Collections.Generic.List[object]]::new()
   $pending = [Collections.Generic.Stack[string]]::new()
   $pending.Push('')
@@ -1085,7 +1098,7 @@ function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [s
     foreach ($item in $items) {
       $child = $item.Name
       if ($relative) { $child = $relative + '\' + $item.Name }
-      if ($skip.ContainsKey($child.ToLowerInvariant())) { continue }
+      if (Test-ManifestSkip $child $Exclude) { continue }
       if ($base.Length + 1 + $child.Length -gt 259 -or $target.Length + 1 + $child.Length -gt 259) { Stop-Refused ('a path is longer than 259 characters in ' + $Label) }
       if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Refused ('a junction or link was found in ' + $Label) }
       if ($item -is [IO.DirectoryInfo]) {
@@ -1243,7 +1256,7 @@ function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude) {
   if (-not (Test-Present $Stub)) { return ,$differences }
   $homeIndex = @{}
   foreach ($entry in (Get-Manifest $DshHome $DshHome $Exclude 'dsh-home')) { $homeIndex[$entry.Path.ToLowerInvariant()] = $entry.Sha256 }
-  foreach ($entry in (Get-Manifest $Stub $Stub @() 'dsh-stub')) {
+  foreach ($entry in (Get-Manifest $Stub $Stub $script:DshStubExclude 'dsh-stub')) {
     if ($entry.Length -lt 0) { continue }
     $key = $entry.Path.ToLowerInvariant()
     if (-not $homeIndex.ContainsKey($key) -or $homeIndex[$key] -ne $entry.Sha256) { $differences.Add($entry.Path) }
@@ -2629,6 +2642,20 @@ function Invoke-SelfTest {
   $command = '{"cmd":"node C:\\Old\\Rt\\x.mjs --flag","other":"C:\\Old\\Rt2\\y"}' | ConvertFrom-Json
   Find-ForeignPaths $command '' @('c:\old\rt') 'c:\qqbot' $embedded
   Check (($embedded -join ',') -eq '/cmd') 'an old root inside a command string, and not its sibling'
+  # Owner decisions of Revision 18: the description note under backends is dropped and nothing else; another note key
+  # under backends and the same key elsewhere stay foreign pointers.
+  $noted = ('{"backends":{"mcpRustBridge":true,"' + $script:BackendsNoteKey + '":"see C:\\Old\\Rt\\x","_note":"see C:\\Old\\Rt\\y"},"other":{"' + $script:BackendsNoteKey + '":"see C:\\Old\\Rt\\z"}}') | ConvertFrom-Json
+  Remove-BackendsNote $noted
+  Check ($null -eq $noted.backends.PSObject.Properties[$script:BackendsNoteKey] -and $noted.backends.mcpRustBridge -eq $true) 'the backends description note is dropped and the rest of backends stays'
+  $notedFound = [Collections.Generic.List[string]]::new()
+  Find-ForeignPaths $noted '' @('c:\old\rt') 'c:\qqbot' $notedFound
+  Check (($notedFound -join ',') -ceq ('/backends/_note,/other/' + $script:BackendsNoteKey)) 'another note key under backends and the same key elsewhere stay foreign pointers'
+  # The DSH stub walk leaves exactly the Antigravity CLI folder out (its links with it); every other path is walked,
+  # so a link there still refuses.
+  Check (Test-ManifestSkip '.gemini\antigravity-cli' $script:DshStubExclude) 'the Antigravity CLI folder is left out of the DSH stub walk'
+  Check (Test-ManifestSkip '.GEMINI\Antigravity-CLI' $script:DshStubExclude) 'the Antigravity CLI folder is left out in any case'
+  Check (-not (Test-ManifestSkip '.gemini\antigravity-cli2' $script:DshStubExclude)) 'a near-miss folder name in the DSH stub is still walked'
+  Check (-not (Test-ManifestSkip '.gemini' $script:DshStubExclude) -and -not (Test-ManifestSkip 'plugins\cli.log' $script:DshStubExclude)) 'other DSH stub paths are still walked'
   $hash = 'a' * 64
   $sums = ConvertFrom-Sums @(($hash + '  her.exe'), ($hash + ' *her-cli.exe'), ($hash + '  herupdate.exe'), '# comment')
   Check ($sums.Count -eq 3) 'three sums'
