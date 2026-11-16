@@ -2696,6 +2696,42 @@ const SETTINGS_WRITABLE: [&str; 17] = [
 const SETTINGS_READONLY_HINT: &str =
     "白名单 allow.* / ownerQQ / 后端与网关配置 / consoleToken / 任何路径类字段只能本地改";
 
+/// What `settings-get` shows in place of a secret.
+const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
+
+/// A secret config path: everything under `security.*`, and every key whose last segment (lower case,
+/// `-` and `_` removed) ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
+/// credential(s), such as `accessToken`, `api-keys`, `bearer_token` or `privateKey`.
+fn setting_is_secret(path: &str) -> bool {
+    if path.split('.').next().is_some_and(|first| first.eq_ignore_ascii_case("security")) {
+        return true;
+    }
+    let last: String = path.rsplit('.').next().unwrap_or("").chars().filter(|c| *c != '-' && *c != '_').collect::<String>().to_lowercase();
+    ["token", "tokens", "secret", "secrets", "password", "passwd", "apikey", "apikeys", "key", "keys", "credential", "credentials"]
+        .iter()
+        .any(|suffix| last.ends_with(suffix))
+}
+
+/// `value`, read at `path`, with every secret replaced by the marker, nested members and array items included.
+fn redact_setting(path: &str, value: Value) -> Value {
+    if setting_is_secret(path) {
+        return json!(SETTINGS_SECRET_MARKER);
+    }
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .into_iter()
+                .map(|(name, member)| {
+                    let redacted = redact_setting(&format!("{path}.{name}"), member);
+                    (name, redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(|item| redact_setting(path, item)).collect()),
+        other => other,
+    }
+}
+
 /// 是否允许对话式修改：**黑名单优先** —— 只要看起来像凭据/白名单/路径就一律拒绝。
 fn is_setting_writable(path: &str) -> bool {
     let p = path.trim();
@@ -2814,7 +2850,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                 let mut all = serde_json::Map::new();
                 for p in SETTINGS_WRITABLE {
                     if let Some(v) = read_setting_path(cfg, p) {
-                        all.insert(p.to_string(), v);
+                        all.insert(p.to_string(), redact_setting(p, v));
                     }
                 }
                 return Ok(json!({
@@ -2834,7 +2870,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
             let first = path.split('.').next().unwrap_or("");
             if first != "consoleToken" {
                 if let Some(value) = read_setting_path(cfg, &path) {
-                    result["value"] = value;
+                    result["value"] = redact_setting(&path, value);
                 }
             }
             return Ok(result);
