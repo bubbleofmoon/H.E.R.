@@ -16,9 +16,11 @@ Size every ticket before routing and record the size on the ticket. Decided: can
 | Size | Signals | Route |
 |---|---|---|
 | XS | decided, 1–2 files, one Linux test target | `ticket-implementer` on Haiku with an exact coordinator brief |
-| S | ≤ ~4 files in one crate, short loop, small design call | `ticket-implementer` on Sonnet |
-| M/L | several crates, long loop or real design | `planner` agent (Opus; writes `/root/orch/her/<n>/plan.md`) → Haiku executes; a part the plan cannot make exact goes back to the planner, never to Sonnet |
+| S | ≤ ~4 files in one crate, short loop, small design call | `ticket-implementer` on Haiku; Sonnet on escalation |
+| M/L | several crates, long loop or real design | `planner` agent (Opus; writes `/root/orch/her/<n>/plan.md`) → Haiku executes; a step Haiku cannot finish goes back to the planner once to be made exact, then to Sonnet on escalation |
 | ? | cause or approach unknown | investigate (Sonnet, Opus if hard), then size the resulting plan |
+
+Escalation: Haiku runs first at every size. Escalate when Haiku hands back that it cannot do the step, or when CI fails the same way twice on its runs; the escalated step does not return to Haiku. XS and S go straight to Sonnet; M/L first goes back to the planner, and to Sonnet only if Haiku fails the revised step. Escalate before review, never after: a Haiku defect caught in a review round costs more than the Sonnet run. Escalation never changes the review route, and the ledger records the escalated run under the same ticket and size.
 
 Record every run with `scripts/agent_usage.py record --agent <id> --ticket <n> --size <size> --host <linux|windows>` (ledger `.scratch/her-supervisor/agent-usage.jsonl`, private run data that stays untracked and is never published); after merge compare the predicted size with the measured cost and adjust the borders. The baseline and the weekly verdict live in the vault (`C:/her-vault/.scratch/her-supervisor/agent-usage.md`).
 
