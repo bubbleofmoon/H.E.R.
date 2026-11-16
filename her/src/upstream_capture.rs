@@ -18,11 +18,18 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 const ARMED_FILE: &str = "upstream-capture/armed.json";
 const CLAIMED_FILE: &str = "upstream-capture/claimed.json";
 const CAPTURED_FILE: &str = "upstream-capture/captured.json";
+const FAILURE_FILE: &str = "upstream-capture/last-failure.json";
+/// The fixed reasons a writer thread records in `FAILURE_FILE`; `status` shows only these.
+const FAILURE_REASONS: &[&str] = &[
+    "thread-start", "expired", "claim-unreadable", "restore-failed", "claim-not-removed", "write-failed",
+    "disarmed-during-write", "stray-capture",
+];
 /// A request whose JSON is longer than this is recorded by its size only.
 const CAPTURE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_MINUTES: i64 = 30;
@@ -51,6 +58,10 @@ const USAGE: &str = "usage: her-cli upstream-capture arm --runtime-root <root> -
 /// per runtime at a time, so a burst of requests while armed starts no pile of threads; a request
 /// that meets an attempt in flight is not captured.
 static IN_FLIGHT: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Capture threads that could not start in this process. The send path only counts them, with no
+/// I/O and no diagnostic; the next writer thread records the count in `FAILURE_FILE`.
+static THREAD_START_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Latin terms, matched case-insensitively as whole words (an ASCII letter or digit on either side
 /// is not a match, so `dshReady` or `qq_send_message` pass while `user/dsh` and `deepseek娘` fail).
@@ -157,13 +168,11 @@ impl Drop for Flight {
 }
 
 /// Called right before HER sends a model request upstream on `route`. It never waits on the
-/// capture: without an arming file it does one metadata lookup and `request` is never built; with
-/// one, it takes the snapshot `request` returns and hands it to a detached thread (`persist`).
+/// capture and never writes a diagnostic: without an arming file it does one metadata lookup and
+/// `request` is never built; with one, it takes the snapshot `request` returns and hands it to a
+/// detached thread (`persist`).
 pub(crate) fn offer(context: &RuntimeContext, route: Route, request: impl FnOnce() -> Value) {
-    // TEMPORARY red mutation (#183 fix round 2): offer joins its writer handle. F6 removes it.
-    if let Some(handle) = offer_at(context, route, crate::turn_ledger::now_ms(), request, writer(context)) {
-        let _ = handle.join();
-    }
+    let _ = offer_at(context, route, crate::turn_ledger::now_ms(), request, writer(context));
 }
 
 /// The writer `offer` hands its snapshot to.
@@ -212,16 +221,30 @@ fn offer_at(
     match spawned {
         Ok(handle) => Some(handle),
         Err(_) => {
-            note("the capture thread could not start; nothing was captured");
+            // Counted only: the next writer thread records it for `status`.
+            THREAD_START_FAILURES.fetch_add(1, Ordering::Relaxed);
             None
         }
     }
 }
 
+/// Records in `FAILURE_FILE`, for `status`, why a capture attempt failed, with the thread starts that
+/// failed since the last record. Only writer threads call it, never the send path; it writes no
+/// diagnostic, and a failed write is ignored.
+fn record_failure(context: &RuntimeContext, reason: &str, now: i64) {
+    let thread_starts = THREAD_START_FAILURES.swap(0, Ordering::Relaxed);
+    let record = json!({"v": 1, "reason": reason, "at": now, "threadStartFailures": thread_starts});
+    let _ = context.write_atomic(RuntimeArea::Data, FAILURE_FILE, record.to_string().as_bytes());
+}
+
 /// Claims an arming for `route` by an atomic rename (one winner across threads and processes), judges
 /// the claimed file and writes the capture. A slow or failing disk delays only this thread. An
-/// expired arming of any route is removed without a capture.
+/// expired arming of any route is removed without a capture. Failures go to `record_failure`, after
+/// the claim is cleaned up.
 fn persist(context: &RuntimeContext, route: Route, now: i64, request: Value) -> bool {
+    if THREAD_START_FAILURES.load(Ordering::Relaxed) > 0 {
+        record_failure(context, "thread-start", now);
+    }
     let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, ARMED_FILE) else {
         return false;
     };
@@ -242,29 +265,29 @@ fn persist(context: &RuntimeContext, route: Route, now: i64, request: Value) -> 
         .and_then(|text| parse_arming(&text));
     match claimed {
         Some(arming) if now > arming.expires_at => {
-            note("the arming expired; nothing was captured");
-            release_claim(context);
+            release_claim(context, now);
+            record_failure(context, "expired", now);
             false
         }
         Some(arming) if arming.route == route => write_claimed(context, route, now, &request),
         Some(_) => {
             // A newer arming for the other route replaced the one read above: give it back.
             if context.rename_file(RuntimeArea::Data, CLAIMED_FILE, ARMED_FILE).is_err() {
-                note("an arming for another route could not be restored; run disarm");
+                record_failure(context, "restore-failed", now);
             }
             false
         }
         None => {
-            note("the claimed arming is unreadable; nothing was captured");
-            release_claim(context);
+            release_claim(context, now);
+            record_failure(context, "claim-unreadable", now);
             false
         }
     }
 }
 
-fn release_claim(context: &RuntimeContext) {
+fn release_claim(context: &RuntimeContext, now: i64) {
     if context.remove_file(RuntimeArea::Data, CLAIMED_FILE).is_err() {
-        note("the claim could not be removed; run disarm");
+        record_failure(context, "claim-not-removed", now);
     }
 }
 
@@ -273,17 +296,16 @@ fn release_claim(context: &RuntimeContext) {
 fn write_claimed(context: &RuntimeContext, route: Route, now: i64, request: &Value) -> bool {
     let record = capture_record(route, now, request, CAPTURE_LIMIT_BYTES);
     if context.create_new_file(RuntimeArea::Data, CAPTURED_FILE, &record).is_err() {
-        note("the request could not be written; nothing was captured");
-        release_claim(context);
+        release_claim(context, now);
+        record_failure(context, "write-failed", now);
         return false;
     }
     if !matches!(present(context, CLAIMED_FILE), Ok(true)) {
-        if context.remove_file(RuntimeArea::Data, CAPTURED_FILE).is_err() {
-            note("a capture written after disarm could not be removed; run disarm");
-        }
+        let reason = if context.remove_file(RuntimeArea::Data, CAPTURED_FILE).is_ok() { "disarmed-during-write" } else { "stray-capture" };
+        record_failure(context, reason, now);
         return false;
     }
-    release_claim(context);
+    release_claim(context, now);
     true
 }
 
@@ -418,7 +440,26 @@ fn arm(context: &RuntimeContext, route: Option<&str>, minutes: Option<&str>, now
     context
         .create_new_file(RuntimeArea::Data, ARMED_FILE, arming.to_string().as_bytes())
         .map_err(|_| (1, "the arming could not be written".to_string()))?;
+    // A new arming starts with no recorded failure; an absent record is fine.
+    let _ = context.remove_file(RuntimeArea::Data, FAILURE_FILE);
     Ok(json!({"armed": true, "route": route.id(), "expiresAt": expires_at}))
+}
+
+/// The last failure a writer thread recorded, with fixed values only: a reason from
+/// `FAILURE_REASONS`, its time and the failed thread starts; `null` when none is recorded or the
+/// record has another shape.
+fn last_failure(context: &RuntimeContext) -> Value {
+    let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, FAILURE_FILE) else {
+        return Value::Null;
+    };
+    let Ok(record) = serde_json::from_str::<Value>(&text) else {
+        return Value::Null;
+    };
+    let reason = record["reason"].as_str().filter(|reason| FAILURE_REASONS.contains(reason));
+    match (record["v"].as_i64(), reason, record["at"].as_i64(), record["threadStartFailures"].as_u64()) {
+        (Some(1), Some(reason), Some(at), Some(count)) => json!({"reason": reason, "at": at, "threadStartFailures": count}),
+        _ => Value::Null,
+    }
 }
 
 fn status(context: &RuntimeContext, now: i64) -> Result<Value, (i32, String)> {
@@ -434,6 +475,7 @@ fn status(context: &RuntimeContext, now: i64) -> Result<Value, (i32, String)> {
         "expired": arming.as_ref().is_some_and(|arming| now > arming.expires_at),
         "interrupted": present(context, CLAIMED_FILE)?,
         "captured": present(context, CAPTURED_FILE)?,
+        "lastFailure": last_failure(context),
     }))
 }
 

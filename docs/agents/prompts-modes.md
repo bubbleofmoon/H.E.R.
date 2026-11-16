@@ -34,7 +34,7 @@ Read for personas, roles, prompt delivery, scheduling, chat, closed-agent intera
   - The send path never waits for a capture. When an arming file exists, it takes an in-memory snapshot of the request and hands it to a detached thread.
   - That thread claims the arming by an atomic rename, so concurrent senders in any process capture at most once. It writes the snapshot once to `data/upstream-capture/captured.json` and removes the claim.
   - A request that meets a capture attempt still in flight for the same runtime is not captured. A `disarm` during the write removes the capture.
-  - Diagnostics are fixed stderr lines, and a failed stderr write is ignored.
+  - Neither the send path nor the writer thread writes a diagnostic. A writer thread that cannot start is only counted. The writer records why an attempt failed in `data/upstream-capture/last-failure.json`; `status` reports it as `lastFailure` (a fixed reason, its time and the failed thread starts), and `arm` clears it.
   - An arming outlives a bridge restart until it is used or expires: it means the next request, before or after the restart.
   - `dsh` captures the `session/prompt` envelope `dsh::Rpc` posts (wake, chat and learner prompts). `harness` captures each model step's request as it is handed to the model client: the provider-neutral `ChatRequest` with the model id and token limit. The client adds only the OpenAI wire framing.
   - An expired arming is removed without a capture. A request over 16 MiB is recorded by size only.
