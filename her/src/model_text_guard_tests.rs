@@ -83,32 +83,96 @@ fn the_denied_term_matcher_finds_whole_words_and_ai_next_to_han_text() {
 }
 
 #[test]
-fn settings_get_never_returns_a_secret_at_any_depth() {
+fn the_secret_rule_checks_every_path_segment() {
+    for secret in ["relay.credentials.0", "relay.credentials", "snowluma.accessToken", "relay.auth.bearer_token", "relay.api-keys.1",
+        "upstreams.privateKey.x", "security", "security.outboundGuard", "socialV2.send.apiKey", "consoleToken"] {
+        assert!(super::super::setting_is_secret(secret), "{secret}");
+    }
+    for plain in ["socialV2.send.burstEnabled", "socialV2.wake.recommendedKeywords", "sendDelayMs", "memory.inject.relatedTopK", "role.maxInjectChars"] {
+        assert!(!super::super::setting_is_secret(plain), "{plain}");
+    }
+    assert_eq!(super::super::redact_setting("relay.credentials.0", json!("fixture-relay-value-142")), json!("(已隐藏)"));
+    assert_eq!(super::super::redact_setting("relay", json!({"credentials": {"0": "fixture-relay-value-142"}, "name": "a"})),
+        json!({"credentials": "(已隐藏)", "name": "a"}));
+}
+
+#[test]
+fn settings_get_reads_only_writable_settings_and_never_a_secret() {
     let (_root, context) = fixture_runtime("settings secrets", "fixture-console-token-142s");
     context.write_atomic(RuntimeArea::Data, "social-v2.json", br#"{"conversations":{"private:7001":{"agentToken":"owner-token-142"}}}"#).unwrap();
     let mut cfg = context.load_config().unwrap();
     cfg["snowluma"] = json!({"httpUrl": "http://127.0.0.1:3000", "accessToken": "fixture-gateway-value-142"});
-    cfg["webSearch"] = json!({"provider": "bing", "apiKey": "fixture-search-value-142", "maxResults": 8});
-    cfg["relay"] = json!({"auth": {"bearer_token": "fixture-relay-value-142"}, "api-keys": ["fixture-listed-value-142"],
-        "upstreams": [{"name": "a", "privateKey": "fixture-item-value-142"}]});
+    cfg["webSearch"] = json!({"provider": "bing", "apiKey": "fixture-search-value-142"});
+    cfg["relay"] = json!({"credentials": {"0": "fixture-relay-value-142"}, "auth": {"bearer_token": "fixture-bearer-value-142"}});
     cfg["security"] = json!({"outboundGuard": true});
+    cfg["dsh"]["model"] = json!("fixture-backend-model-142");
+    cfg["sendDelayMs"] = json!(321);
     context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
-    let read = |setting: &str| {
-        memory_tool_action(&context, "settings-get", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": setting})).unwrap()
-    };
-    assert_eq!(read("snowluma.accessToken")["value"], "(已隐藏)");
-    assert_eq!(read("snowluma")["value"], json!({"httpUrl": "http://127.0.0.1:3000", "accessToken": "(已隐藏)"}));
-    assert_eq!(read("webSearch")["value"], json!({"provider": "bing", "apiKey": "(已隐藏)", "maxResults": 8}));
-    assert_eq!(read("relay.auth.bearer_token")["value"], "(已隐藏)");
-    assert_eq!(read("relay")["value"], json!({"auth": {"bearer_token": "(已隐藏)"}, "api-keys": "(已隐藏)",
-        "upstreams": [{"name": "a", "privateKey": "(已隐藏)"}]}));
-    assert_eq!(read("security.outboundGuard")["value"], "(已隐藏)");
-    assert_eq!(read("security")["value"], "(已隐藏)");
-    // Ordinary settings are unchanged.
-    assert_eq!(read("snowluma.httpUrl")["value"], "http://127.0.0.1:3000");
-    assert_eq!(read("ownerQQ")["value"], 7001);
-    let text = crate::mcp::call_tool_with_context("settings_get", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": "relay"}), &context).unwrap();
-    assert!(!text.contains("fixture-") && text.contains("(已隐藏)"), "{text}");
+    let args = |setting: &str| json!({"key": "private:7001", "token": "owner-token-142", "settingKey": setting});
+    for setting in ["relay.credentials.0", "relay.credentials", "relay", "relay.auth.bearer_token", "snowluma.accessToken", "snowluma",
+        "snowluma.httpUrl", "webSearch", "security", "security.outboundGuard", "dsh.model", "dsh", "consoleToken", "ownerQQ",
+        "dependencies", "no.such.setting"] {
+        assert_eq!(memory_tool_action(&context, "settings-get", &args(setting)), Err(SETTINGS_READ_REFUSED.to_string()), "{setting}");
+        let text = crate::mcp::call_prepared("settings_get", &args(setting), &context).to_string();
+        assert!(text.contains(SETTINGS_READ_REFUSED) && !text.contains(setting) && !text.contains("fixture-"), "{setting}: {text}");
+    }
+    // A writable setting still reads, alone and in the full list.
+    assert_eq!(memory_tool_action(&context, "settings-get", &args("sendDelayMs")).unwrap()["value"], 321);
+    let all = crate::mcp::call_tool_with_context("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
+    assert!(all.contains("sendDelayMs = 321") && !all.contains("fixture-"), "{all}");
+    // A refused write does not name the key either.
+    let refused = crate::mcp::call_prepared("settings_set", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": "dsh.model", "value": "x"}), &context).to_string();
+    assert!(refused.contains("该项不可通过对话修改") && !refused.contains("dsh"), "{refused}");
+}
+
+#[test]
+fn qq_get_prompt_hides_secrets_in_the_config_sections_it_copies() {
+    let (_root, context) = fixture_runtime("prompt secrets", "fixture-console-token-142p");
+    let mut cfg = context.load_config().unwrap();
+    cfg["socialV2"] = json!({"send": {"burstEnabled": true, "apiKey": "fixture-send-value-142"},
+        "wake": {"recommendedKeywords": ["小鲸鱼"], "auth": {"token": "fixture-wake-value-142"}}});
+    let prompt = super::super::handle_prompt(&context, &cfg, "group:101");
+    assert_eq!(prompt["recommended"]["send"], json!({"burstEnabled": true, "apiKey": "(已隐藏)"}));
+    assert_eq!(prompt["recommended"]["wake"]["recommendedKeywords"], json!(["小鲸鱼"]));
+    assert_eq!(prompt["recommended"]["wake"]["auth"]["token"], "(已隐藏)");
+    assert!(!prompt.to_string().contains("fixture-send-value-142") && !prompt.to_string().contains("fixture-wake-value-142"), "{prompt}");
+}
+
+/// Every name resolves to one public address (the policy refuses private ones).
+fn public_resolver(_host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    Ok(vec!["93.184.216.34".parse().unwrap()])
+}
+
+/// Every request is refused with HTTP 401 and a body that names the provider.
+fn refusing_transfer(
+    _transfer: &crate::aux_fetch::Transfer,
+    on_head: &mut dyn FnMut(&crate::aux_fetch::Head) -> crate::aux_fetch::Flow,
+    on_body: &mut dyn FnMut(&[u8]) -> crate::aux_fetch::Flow,
+) -> Result<(crate::aux_fetch::Head, bool), crate::aux_fetch::TransferError> {
+    let _ = on_head(&crate::aux_fetch::Head { status: 401, location: None });
+    let _ = on_body(br#"{"error":{"message":"DeepSeek API key invalid"}}"#);
+    Ok((crate::aux_fetch::Head { status: 401, location: None }, true))
+}
+
+/// The web search errors the model reads when the primary search answers 401: with the primary
+/// provider selected, then in auto mode (Bing is refused too).
+fn search_errors(context: &RuntimeContext) -> (String, String) {
+    let net = crate::aux_search::Network { resolver: &public_resolver, transfer: &refusing_transfer };
+    let config = |provider: &str| json!({"webSearch": {"provider": provider, "apiKey": "fixture-search-value-142", "baseURL": "https://search.example.test/v1"}});
+    let primary = crate::aux_search::web_search("weather 142 primary", &config("deepseek"), context, &net).unwrap_err();
+    let auto = crate::aux_search::web_search("weather 142 auto", &config("auto"), context, &net).unwrap_err();
+    (primary, auto)
+}
+
+#[test]
+fn web_search_errors_never_copy_the_provider_text() {
+    let (_root, context) = fixture_runtime("search errors", "fixture-console-token-142w");
+    let (primary, auto) = search_errors(&context);
+    assert_eq!(primary, "主搜索接口 HTTP 401");
+    assert!(auto.starts_with("主搜索不可用：主搜索接口 HTTP 401；Bing 兜底也失败："), "{auto}");
+    for text in [&primary, &auto] {
+        assert!(denied_terms(text).is_empty() && !text.contains("API key invalid"), "{text}");
+    }
 }
 
 #[test]
@@ -191,6 +255,14 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
     let settings = crate::mcp::call_tool_with_context("settings_get", &json!({"key": "private:7001", "token": "owner-token-142"}), &context).unwrap();
     assert!(settings.contains("不可通过对话修改"), "{settings}");
     surfaces.push(("settings_get result".into(), settings));
+    for setting in ["socialV2.send.burstEnabled", "dsh.model", "relay.credentials.0"] {
+        let read = crate::mcp::call_prepared("settings_get", &json!({"key": "private:7001", "token": "owner-token-142", "settingKey": setting}), &context);
+        surfaces.push((format!("settings_get {setting}"), read.to_string()));
+    }
+    surfaces.push(("harness session line".into(), crate::harness::session_instruction(key)));
+    let (primary_search_error, auto_search_error) = search_errors(&context);
+    surfaces.push(("web search error (primary)".into(), primary_search_error));
+    surfaces.push(("web search error (auto)".into(), auto_search_error));
     surfaces.push(("harness tool errors".into(), format!("{}\n{}", error_literals(include_str!("harness.rs")), error_literals(include_str!("harness/tools.rs")))));
     mutate_social_state_for(&context, |state| {
         state["paused"] = json!(true);

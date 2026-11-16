@@ -2,6 +2,8 @@
 pub(crate) mod store;
 mod tools;
 pub use tools::Tools;
+#[cfg(test)]
+pub(crate) use tools::session_instruction;
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use futures_util::StreamExt;

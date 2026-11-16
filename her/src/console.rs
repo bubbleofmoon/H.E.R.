@@ -2699,6 +2699,9 @@ const SETTINGS_READONLY_HINT: &str =
 /// What `settings-get` shows in place of a secret.
 const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
 
+/// The refusal for a settings read outside `SETTINGS_WRITABLE`. It never repeats the requested key.
+const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
+
 /// A secret config path: everything under `security.*`, and every key whose last segment (lower case,
 /// `-` and `_` removed) ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
 /// credential(s), such as `accessToken`, `api-keys`, `bearer_token` or `privateKey`.

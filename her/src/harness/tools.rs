@@ -98,9 +98,7 @@ impl Tools {
     }
 
     pub(super) fn instruction(&self) -> String {
-        self.authority.as_ref().map(|a| format!(
-            "Tool session: {}. For tools with key/token fields, use this key and an empty token string; the bridge binds it to this turn. A successful QQ send tool already delivers the reply.", a.conversation
-        )).unwrap_or_default()
+        self.authority.as_ref().map(|a| session_instruction(&a.conversation)).unwrap_or_default()
     }
 
     pub(super) fn model_tools(&self) -> Vec<Tool> {
@@ -247,4 +245,9 @@ fn definitions(cfg: &Value, conversation: &str) -> Vec<Value> {
 
 pub(super) fn error(reason: &str) -> Value {
     json!({"content":[{"type":"text","text":reason}],"isError":true})
+}
+
+/// The system line of an admitted harness turn; the model reads it.
+pub(crate) fn session_instruction(conversation: &str) -> String {
+    format!("Tool session: {conversation}. For tools with key/token fields, use this key and an empty token string; the bridge binds it to this turn. A successful QQ send tool already delivers the reply.")
 }
