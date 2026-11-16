@@ -263,7 +263,7 @@ pub fn token_line(token: &str) -> String {
     format!("【会话令牌】{token}（调用二代状态工具时请在参数中带上此令牌）\n\n")
 }
 
-pub const ANTI_AI_LINE: &str = "【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n";
+pub const NOT_A_CLERK_LINE: &str = "【别像客服】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n";
 
 pub const PROACTIVE_LINE: &str = "【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n";
 
@@ -1276,7 +1276,7 @@ fn build_inner(
         out.push_str(&initial);
         out.push_str("\n\n");
     }
-    out.push_str(ANTI_AI_LINE);
+    out.push_str(NOT_A_CLERK_LINE);
     out.push_str(PROACTIVE_LINE);
     out.push_str(GROUP_LINE);
     out.push_str(REPEAT_LINE);
@@ -1623,7 +1623,7 @@ mod tests {
         let (root, context) = runtime_fixture("build");
         let p = build_with_runtime(&context, "private:不存在的会话", "atMention", "Fixture Bot", "7004");
         assert!(p.contains("【你的身份】"));
-        assert!(p.contains("【反AI味】"));
+        assert!(p.contains("【别像客服】"));
         assert!(p.contains("【积极性】"));
         assert!(p.contains("【此刻状态】"));
         assert!(p.contains("【当前唤醒】"));
@@ -2094,7 +2094,7 @@ pub(crate) fn prepare_dsh_wake_layered(
         Section::parts("participation", Some(Layer::Conversation),
             vec![format!("参与参考基准：最后活动时间 {activity_at}\n{}",participation_block_at(st,activity_at))]),
         Section::parts("slang", Some(Layer::Conversation), vec![slang]),
-        Section::parts("behaviour", None, vec![format!("{ANTI_AI_LINE}{PROACTIVE_LINE}{GROUP_LINE}{REPEAT_LINE}")]),
+        Section::parts("behaviour", None, vec![format!("{NOT_A_CLERK_LINE}{PROACTIVE_LINE}{GROUP_LINE}{REPEAT_LINE}")]),
         Section::parts("stickers", None, vec![sticker_line_with_runtime(context,cfg)]),
         Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg))]),
         Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
