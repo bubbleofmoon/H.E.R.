@@ -788,7 +788,7 @@ fn first_wake_delivers_a_briefing_before_current_authority_state_and_snapshot() 
     );
     assert!(!text.contains("qq_wait_for_messages(purpose=\"reply\""), "{text}");
     let briefing=text.split("【会话令牌】").next().unwrap();
-    for rule in ["【反AI味】","【积极性】","【在群里怎么说话】","【别反复用同一个梗】","【回复节奏】"] {
+    for rule in ["【别像客服】","【积极性】","【在群里怎么说话】","【别反复用同一个梗】","【回复节奏】"] {
         assert!(briefing.contains(rule),"briefing omitted {rule}: {text}");
     }
     assert!(text.contains("readThroughSeq") && text.contains("throughSeq"));
