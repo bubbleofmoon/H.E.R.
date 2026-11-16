@@ -586,8 +586,14 @@ function Find-ForeignPaths($Value, [string]$Pointer, $Roots, [string]$Install, $
     for ($index = 0; $index -lt $Value.Count; $index++) { Find-ForeignPaths $Value[$index] ($Pointer + '/' + $index) $Roots $Install $Found }
   }
 }
-# Drops the description note under backends and nothing else; the same key anywhere else stays and is scanned.
-function Remove-BackendsNote($Config) { Remove-Prop (Get-Prop $Config 'backends') $script:BackendsNoteKey }
+# Drops the description note under backends and nothing else. Both names compare case-sensitively, so another spelling
+# of either, and the same key anywhere else, stay and are scanned.
+function Remove-BackendsNote($Config) {
+  if ($Config -isnot [Management.Automation.PSCustomObject]) { return }
+  foreach ($parent in @($Config.PSObject.Properties | Where-Object { $_.Name -ceq 'backends' -and $_.Value -is [Management.Automation.PSCustomObject] })) {
+    foreach ($note in @($parent.Value.PSObject.Properties | Where-Object { $_.Name -ceq $script:BackendsNoteKey })) { $parent.Value.PSObject.Properties.Remove($note.Name) }
+  }
+}
 function Convert-Config($Config, $plan) {
   Remove-BackendsNote $Config
   $tasks = Get-Prop $Config 'tasks'
@@ -1074,11 +1080,13 @@ function Get-IdleState([string]$Cli, [string]$Runtime, [string]$Label) {
 }
 
 # ---------- trees, manifests and copies ----------
-# Whether a manifest walk leaves this relative path out: exactly an excluded relative path, in any case. Its subtree
-# goes with it, since the walk never enters a left-out folder; a near-miss name is walked, and a link there refuses.
+# Whether a manifest walk leaves this relative path out: exactly an excluded relative path, in any case, compared as
+# Get-Manifest always did (lower-cased invariant keys in a hashtable). Its subtree goes with it, since the walk never
+# enters a left-out folder; a near-miss name is walked, and a link there refuses.
 function Test-ManifestSkip([string]$Child, [string[]]$Exclude) {
-  foreach ($relative in @($Exclude)) { if ($relative -and [string]::Equals($relative, $Child, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
-  return $false
+  $skip = @{}
+  foreach ($relative in @($Exclude)) { if ($relative) { $skip[$relative.ToLowerInvariant()] = $true } }
+  return $skip.ContainsKey($Child.ToLowerInvariant())
 }
 function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [string]$Label, [switch]$NoHash) {
   $base = Get-Normal $Root
@@ -2650,12 +2658,20 @@ function Invoke-SelfTest {
   $notedFound = [Collections.Generic.List[string]]::new()
   Find-ForeignPaths $noted '' @('c:\old\rt') 'c:\qqbot' $notedFound
   Check (($notedFound -join ',') -ceq ('/backends/_note,/other/' + $script:BackendsNoteKey)) 'another note key under backends and the same key elsewhere stay foreign pointers'
+  $upper = ('{"BACKENDS":{"' + $script:BackendsNoteKey + '":"see C:\\Old\\Rt\\x"}}') | ConvertFrom-Json
+  Remove-BackendsNote $upper
+  $upperFound = [Collections.Generic.List[string]]::new()
+  Find-ForeignPaths $upper '' @('c:\old\rt') 'c:\qqbot' $upperFound
+  Check ($null -ne $upper.BACKENDS.PSObject.Properties[$script:BackendsNoteKey] -and ($upperFound -join ',') -ceq ('/BACKENDS/' + $script:BackendsNoteKey)) 'another spelling of backends keeps the note, and it stays a foreign pointer'
   # The DSH stub walk leaves exactly the Antigravity CLI folder out (its links with it); every other path is walked,
-  # so a link there still refuses.
+  # so a link there still refuses. Each check that a path is walked also asserts the folder itself is left out, so an
+  # empty exclusion list fails it too.
   Check (Test-ManifestSkip '.gemini\antigravity-cli' $script:DshStubExclude) 'the Antigravity CLI folder is left out of the DSH stub walk'
   Check (Test-ManifestSkip '.GEMINI\Antigravity-CLI' $script:DshStubExclude) 'the Antigravity CLI folder is left out in any case'
-  Check (-not (Test-ManifestSkip '.gemini\antigravity-cli2' $script:DshStubExclude)) 'a near-miss folder name in the DSH stub is still walked'
-  Check (-not (Test-ManifestSkip '.gemini' $script:DshStubExclude) -and -not (Test-ManifestSkip 'plugins\cli.log' $script:DshStubExclude)) 'other DSH stub paths are still walked'
+  Check ((Test-ManifestSkip '.gemini\antigravity-cli' $script:DshStubExclude) -and -not (Test-ManifestSkip '.gemini\antigravity-cli2' $script:DshStubExclude)) 'a near-miss folder name in the DSH stub is still walked'
+  Check ((Test-ManifestSkip '.gemini\antigravity-cli' $script:DshStubExclude) -and -not (Test-ManifestSkip 'x\.gemini\antigravity-cli' $script:DshStubExclude)) 'a deeper folder of the same name in the DSH stub is still walked'
+  Check ((Test-ManifestSkip '.gemini\antigravity-cli' $script:DshStubExclude) -and -not (Test-ManifestSkip '.gemini' $script:DshStubExclude) -and -not (Test-ManifestSkip 'plugins\cli.log' $script:DshStubExclude)) 'other DSH stub paths are still walked'
+  Check (Test-ManifestSkip ('plugins\' + [string][char]0x212A) @('plugins\k')) 'manifest exclusions keep their lower-cased comparison (the Kelvin sign matches k)'
   $hash = 'a' * 64
   $sums = ConvertFrom-Sums @(($hash + '  her.exe'), ($hash + ' *her-cli.exe'), ($hash + '  herupdate.exe'), '# comment')
   Check ($sums.Count -eq 3) 'three sums'

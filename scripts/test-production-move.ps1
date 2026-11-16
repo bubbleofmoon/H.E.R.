@@ -677,7 +677,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 138 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 141 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -901,6 +901,14 @@ try {
   try { $run = Invoke-MoveScript $inventoryArgs 'S1r-chain' }
   finally { [IO.Directory]::Delete($thirdLink); Remove-Item -LiteralPath (Join-Path $dshHome 'plugins\extra') -Recurse -Force; [IO.Directory]::Delete($alias); Remove-Item -LiteralPath $realFolder -Recurse -Force }
   Assert-Run $run 1 'a junction or link was found on the way to a linked DSH bundle' 'S1r junction inside qq-bridge'
+  # A link in the old DSH stub next to the left-out Antigravity CLI folder, under a near-miss name: it still refuses
+  # (Revision 18), so the exclusion leaves out exactly that one folder.
+  $nearMiss = Join-Path $oldRuntime 'user\dsh\.gemini\antigravity-cli2'
+  [void][IO.Directory]::CreateDirectory((Join-Path $nearMiss 'target'))
+  [void](New-Item -ItemType Junction -Path (Join-Path $nearMiss 'x') -Target (Join-Path $nearMiss 'target'))
+  try { $run = Invoke-MoveScript $inventoryArgs 'S1r-stub' }
+  finally { [IO.Directory]::Delete((Join-Path $nearMiss 'x')); Remove-Item -LiteralPath $nearMiss -Recurse -Force }
+  Assert-Run $run 1 'a junction or link was found in dsh-stub' 'S1r link in the DSH stub next to the left-out folder'
   Assert-OldUntouched 'S1r'
 
   Step 'S1s digest key conflict'
