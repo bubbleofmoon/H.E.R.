@@ -101,6 +101,7 @@ mod health_check;
 mod gateway_health;
 mod dependency_watch;
 mod snowluma_heal;
+mod upstream_capture;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
