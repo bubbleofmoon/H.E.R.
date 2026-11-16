@@ -807,6 +807,28 @@ try {
   Assert-Run $inventory 1 'INVENTORY: 1 blockers' 'S1e inventory'
   Assert-OldUntouched 'S1e'
 
+  Step 'S1e2 two independent blockers'
+  # #182: one Inventory must report two independent preflight findings — an earlier attempt's folder and a link in
+  # the old DSH stub next to the left-out Antigravity CLI folder — and the summary must count both.
+  [void][IO.Directory]::CreateDirectory((Join-Path $root 'runtime'))
+  $nearMissTwo = Join-Path $oldRuntime 'user\dsh\.gemini\antigravity-cli2'
+  [void][IO.Directory]::CreateDirectory((Join-Path $nearMissTwo 'target'))
+  [void](New-Item -ItemType Junction -Path (Join-Path $nearMissTwo 'x') -Target (Join-Path $nearMissTwo 'target'))
+  try {
+    $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory') + $sourceArgs + @('-ReleaseName', 'fixture-new')) 'S1e2-inventory'
+    # Move still refuses on the same two findings (it may stop at the first; refusing is the contract).
+    $moveRun = Invoke-MoveScript $moveArgs 'S1e2-move'
+  } finally {
+    [IO.Directory]::Delete((Join-Path $nearMissTwo 'x'))
+    Remove-Item -LiteralPath $nearMissTwo -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $root 'runtime') -Recurse -Force
+  }
+  Assert-Run $run 1 'the install root already has runtime' 'S1e2 first blocker reported'
+  Assert-Run $run 1 'a junction or link was found in dsh-stub' 'S1e2 second blocker reported'
+  Assert-Run $run 1 'INVENTORY: 2 blockers' 'S1e2 the summary counts both findings'
+  Assert-Run $moveRun 1 'REFUSED:' 'S1e2 Move still refuses with both findings present'
+  Assert-OldUntouched 'S1e2'
+
   Step 'S1f disk space'
   $run = Invoke-MoveScript ($moveArgs + @('-FreeSpaceReserveBytes', [string]([long]::MaxValue - 1))) 'S1f'
   Assert-Run $run 1 'not enough free disk space' 'S1f'
