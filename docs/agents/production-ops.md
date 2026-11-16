@@ -56,6 +56,11 @@ public issue, comment or commit names those vault paths and nothing else.
   assignment through the console. The script's own automatic rollback needs no go. Without
   `-OwnerGoFile`, Move, Rollback and OperatorFolders need an interactive session and the
   typed word (`MOVE`, `ROLLBACK`, `COPY`). Every other production action stays the owner's.
+  The Windows session's guard accepts a relayed go only for Move and Rollback through a go
+  file. OperatorFolders (its own `COPY` go), installing a release, editing the live DSH profile
+  or presets, restarting DSH and lifecycle changes need the owner's own words in the Windows
+  session. Linux hands those to the owner (`baton:owner`) with the exact sentence to type,
+  rather than relaying them.
   Development runs the script only with `-Rehearsal`, through
   `scripts/test-production-move.ps1` under a temporary root. Its evidence folder holds
   production detail (`state.json` keeps real paths for the rollback) and goes to the vault;
