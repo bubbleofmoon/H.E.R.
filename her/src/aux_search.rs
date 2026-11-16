@@ -524,12 +524,12 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
     let attempt_bing = || -> Result<Value, String> { bing_search(q, &config, net).map(|results| json!({"query": q, "provider": "bing", "results": results})) };
     let mut value = match wanted.as_str() {
         "deepseek" => attempt_deepseek().map_err(|e| primary_failure_text(&e))?,
-        "bing" => attempt_bing()?,
+        "bing" => attempt_bing().map_err(|e| { eprintln!("aux search: bing failed: {e}"); "Bing 搜索失败".to_string() })?,
         _ => match attempt_deepseek() {
             Ok(v) => v,
             Err(error) => {
                 let reason = if error.code == "NO_KEY" { "未配置主搜索凭据".to_string() } else { format!("主搜索不可用：{}", primary_failure_text(&error)) };
-                let mut bing = attempt_bing().map_err(|bing_error| format!("{reason}；Bing 兜底也失败：{bing_error}"))?;
+                let mut bing = attempt_bing().map_err(|bing_error| { eprintln!("aux search: bing fallback failed: {bing_error}"); format!("{reason}；Bing 兜底也失败") })?;
                 bing["fallbackFrom"] = json!("primary");
                 bing["note"] = json!(format!("{reason}，已回退 Bing"));
                 bing
