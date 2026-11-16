@@ -334,7 +334,7 @@ function Assert-OldRunning([string]$Scenario, [switch]$Restricted) {
     # It keeps copied credentials, and the root's original (here wider) access is back: it must be closed on its own.
     Assert-Protected $attempt.FullName ($Scenario + ': a moved-aside attempt folder')
     # And so must the credential copies inside it (their ACEs may be their own or inherited from the attempt folder).
-    foreach ($relative in @('runtime\user\dsh\.credentials.yaml', 'runtime\config\harness-api-key', 'deps\relay\0.0.1\her-relay-client.key', 'deps\relay\0.0.1\auth\antigravity-fixture.json')) {
+    foreach ($relative in @('runtime\user\dsh\.credentials.yaml', 'runtime\config\harness-api-key', 'deps\relay\0.0.1\her-relay-client.key', 'deps\relay\0.0.1\auth\antigravity-fixture.json', 'runtime\user\dsh\bundles\config.json')) {
       $file = Join-Path $attempt.FullName $relative
       if (Test-Path -LiteralPath $file -PathType Leaf) { Assert-NoForeignAccess $file ($Scenario + ': a credential copy in a moved-aside attempt folder') }
     }
@@ -441,6 +441,41 @@ function Assert-Moved([string]$Scenario, [switch]$Digest) {
     $real = [string]$entry.real
     Assert-True ($real.EndsWith(('\runtime\user\dsh\bundles\' + [string]$entry.name), [StringComparison]::OrdinalIgnoreCase) -and $real.IndexOf('qq-bridge', [StringComparison]::OrdinalIgnoreCase) -lt 0) ($Scenario + ': DSH loaded ' + [string]$entry.name + ' from outside the new bundles folder')
   }
+  # Revision 19: the slim tool folder in the new bundles folder, the dev preset and pnpm paths rewritten, and no
+  # configuration text in the new DSH home naming qq-bridge or the profile DSH home, nor any backup copy.
+  $toolRoot = Join-Path $newHome 'bundles'
+  foreach ($relative in @('src\mcp-snowluma-full.js', '_snowluma-catalog.json', 'state\snowluma-full-calls.jsonl', 'node_modules\fixture-shared-dep\package.json', 'node_modules\fixture-shared-dep\index.js')) {
+    Assert-True ((Test-Path -LiteralPath (Join-Path $toolRoot $relative) -PathType Leaf) -and (Get-FileHashText (Join-Path $toolRoot $relative)) -eq (Get-FileHashText (Join-Path $root ('qq-bridge\' + $relative)))) ($Scenario + ': the tool file ' + $relative + ' was not carried')
+  }
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $toolRoot 'src\other-tool.js'))) ($Scenario + ': a qq-bridge file the move does not carry is in the tool folder')
+  $toolConfig = Get-Content -LiteralPath (Join-Path $toolRoot 'config.json') -Raw | ConvertFrom-Json
+  Assert-True ((@($toolConfig.snowluma.PSObject.Properties | ForEach-Object { $_.Name }) -join ',') -ceq 'httpUrl,accessToken' -and $toolConfig.snowluma.httpUrl -ceq ('http://127.0.0.1:' + $onebotPort) -and $toolConfig.snowluma.accessToken -ceq 'fixture-snow' -and @($toolConfig.PSObject.Properties).Count -eq 1) ($Scenario + ': the tool config does not hold exactly the new runtime SnowLuma values')
+  $resolved = (& $NodePath -e "process.stdout.write(require.resolve('fixture-shared-dep', { paths: [process.argv[1]] }))" (Join-Path $toolRoot 'qq-mode-console')) | Out-String
+  Assert-True ($resolved.Trim() -ieq (Join-Path $toolRoot 'node_modules\fixture-shared-dep\index.js')) ($Scenario + ': the bundle does not resolve its package from the carried node_modules')
+  $devText = [IO.File]::ReadAllText((Join-Path $toolRoot 'qq-agent-presets\presets\qq-chat-v2-dev.patch.yml'))
+  Assert-True ($devText.Contains(('      - ' + (Join-Path $toolRoot 'src\mcp-snowluma-full.js')))) ($Scenario + ': the dev preset does not name the carried script')
+  $webText = [IO.File]::ReadAllText((Join-Path $newHome 'profiles\web\package.json'))
+  Assert-True ($webText.Contains(('link:' + $newHome.Replace('\', '/') + '/plugins/qq-mode-console'))) ($Scenario + ': the web profile package.json link: was not rewritten')
+  $lockText = [IO.File]::ReadAllText((Join-Path $newHome 'profiles\web\pnpm-lock.yaml'))
+  Assert-True ($lockText.Contains(('specifier: link:' + $newHome.Replace('\', '/') + '/plugins/qq-agent-presets')) -and $lockText.Contains('version: link:../../plugins/qq-agent-presets')) ($Scenario + ': the pnpm lock links were not rewritten, or its relative links changed')
+  $modulesText = [IO.File]::ReadAllText((Join-Path $newHome 'profiles\web\node_modules\.modules.yaml'))
+  Assert-True ($modulesText.Contains(('virtualStoreDir: ' + (Join-Path $newHome 'profiles\web\node_modules\.pnpm'))) -and $modulesText.Contains(('storeDir: ' + (Join-Path $F 'pnpm-store\v11')))) ($Scenario + ': the pnpm virtual store was not rewritten, or the store outside the DSH home was')
+  $workspace = Get-Content -LiteralPath (Join-Path $newHome 'profiles\web\node_modules\.pnpm-workspace-state-v1.json') -Raw | ConvertFrom-Json
+  Assert-True ($null -ne $workspace.projects.PSObject.Properties[(Join-Path $newHome 'profiles\web')]) ($Scenario + ': the pnpm workspace path was not rewritten')
+  $needles = @(@((Join-Path $root 'qq-bridge'), $dshHome) | ForEach-Object { $_; $_.Replace('\', '/'); $_.Replace('\', '\\') })
+  $leftover = [Collections.Generic.List[string]]::new()
+  $pending = [Collections.Generic.Stack[string]]::new()
+  foreach ($area in @('profiles', 'plugins', 'bundles')) { $pending.Push((Join-Path $newHome $area)) }
+  while ($pending.Count -gt 0) {
+    foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+      if ($item -is [IO.DirectoryInfo]) { $pending.Push($item.FullName); continue }
+      if ($item.Name -match '(?i)\.bak(-[^\\/]*)?$') { $leftover.Add($item.FullName); continue }
+      $text = [IO.File]::ReadAllText($item.FullName)
+      if (@($needles | Where-Object { $text.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0) { $leftover.Add($item.FullName) }
+    }
+  }
+  Assert-True ($leftover.Count -eq 0) ($Scenario + ': the new DSH home still names qq-bridge or the profile DSH home, or holds a backup copy: ' + ($leftover -join ', '))
   foreach ($name in @('import-manifest.json', 'data\lifecycle\session-handover.json', 'data\lifecycle\session-handover-required.json')) { Assert-True (-not (Test-Path -LiteralPath (Join-Path $root ('runtime\' + $name)))) ($Scenario + ': the new runtime kept ' + $name) }
   Assert-True ((Get-FileHashText (Join-Path $root 'runtime\user\dsh\.credentials.yaml')) -eq (Get-FileHashText (Join-Path $dshHome '.credentials.yaml'))) ($Scenario + ': the DSH credentials')
   $newCordis = Join-Path $root 'runtime\user\dsh\profiles\web\cordis.patch.yml'
@@ -558,7 +593,10 @@ try {
   $secret = 'A' * 43
   $credentialText = 'secret: ' + $secret + "`nrecords:`n  client-connection/browser-session:`n    kind: grant`n    payload:`n      version: 1`n      secret: " + $secret + "`n"
   Write-Fixture (Join-Path $dshHome '.credentials.yaml') $credentialText
-  Write-Fixture (Join-Path $oldRuntime 'user\dsh\.credentials.yaml') $credentialText
+  # The old runtime's DSH stub is stale, as production's is: a different .credentials.yaml and a stub-only preset file.
+  # Every run passes -AcceptDshProfileFiles (the profile copies win, as R6 does); S1r-stub-files runs without it.
+  Write-Fixture (Join-Path $oldRuntime 'user\dsh\.credentials.yaml') ($credentialText + "# stale stub copy`n")
+  Write-Fixture (Join-Path $oldRuntime 'user\dsh\.agent-presets\qq-chat\preset.yml') "# stale stub preset`n"
   # The Antigravity CLI's own log link in the old DSH stub, in production's shape: a file symbolic link with a relative
   # target (cli.log -> log\cli-<stamp>.log). The stub comparison leaves this folder out (Revision 18). mklink stores the
   # relative target as given (New-Item would store it absolute). A symbolic link needs a privilege (or developer mode):
@@ -599,6 +637,31 @@ try {
   Write-FixtureJson (Join-Path $dshHome 'state\fixture-index.json') ([ordered]@{ bundle = (Join-Path $bridgeBundles 'qq-mode-console') })
   Write-Fixture (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2.patch.yml') "# fixture preset`n"
   Write-FixtureJson (Join-Path $dshHome 'plugins\package.json') ([ordered]@{ name = 'dsh-plugins-fixture'; private = $true; dependencies = [ordered]@{ 'qq-mode-console' = ('link:' + (Join-Path $bridgeBundles 'qq-mode-console').Replace('\', '/')); 'qq-agent-presets' = ('link:' + (Join-Path $bridgeBundles 'qq-agent-presets')) } })
+  # Revision 19, the gate Inventory's three DSH blockers in production's shape.
+  # pnpm's bookkeeping in the web profile names the profile DSH home absolutely (link: entries, virtualStoreDir, the
+  # workspace path) and relatively (link:../../plugins/<bundle>); its store lies outside the DSH home and stays.
+  $homeSlash = $dshHome.Replace('\', '/')
+  Write-FixtureJson (Join-Path $dshHome 'profiles\web\package.json') ([ordered]@{ name = 'web-profile'; private = $true; dependencies = [ordered]@{ 'qq-mode-console' = ('link:' + $homeSlash + '/plugins/qq-mode-console'); 'qq-agent-presets' = ('link:' + $homeSlash + '/plugins/qq-agent-presets') } })
+  $pnpmLock = "lockfileVersion: '9.0'`nimporters:`n  .:`n    dependencies:`n      qq-agent-presets:`n        specifier: link:" + $homeSlash + "/plugins/qq-agent-presets`n        version: link:../../plugins/qq-agent-presets`n      qq-mode-console:`n        specifier: link:" + $homeSlash + "/plugins/qq-mode-console`n        version: link:../../plugins/qq-mode-console`n"
+  Write-Fixture (Join-Path $dshHome 'profiles\web\pnpm-lock.yaml') $pnpmLock
+  Write-Fixture (Join-Path $dshHome 'profiles\web\node_modules\.pnpm\lock.yaml') $pnpmLock
+  Write-Fixture (Join-Path $dshHome 'profiles\web\node_modules\.modules.yaml') ("layoutVersion: 5`nstoreDir: " + (Join-Path $F 'pnpm-store\v11') + "`nvirtualStoreDir: " + (Join-Path $dshHome 'profiles\web\node_modules\.pnpm') + "`n")
+  Write-FixtureJson (Join-Path $dshHome 'profiles\web\node_modules\.pnpm-workspace-state-v1.json') ([ordered]@{ projects = [ordered]@{ (Join-Path $dshHome 'profiles\web') = [ordered]@{ name = 'web-profile' } } })
+  # A bundle that resolves a package from qq-bridge's node_modules, as both production bundles do.
+  Write-FixtureJson (Join-Path $bridgeBundles 'qq-mode-console\package.json') ([ordered]@{ name = 'qq-mode-console'; version = '0.0.1'; private = $true; dependencies = [ordered]@{ 'fixture-shared-dep' = '1.0.0' } })
+  Write-FixtureJson (Join-Path $root 'qq-bridge\node_modules\fixture-shared-dep\package.json') ([ordered]@{ name = 'fixture-shared-dep'; version = '1.0.0'; main = 'index.js' })
+  Write-Fixture (Join-Path $root 'qq-bridge\node_modules\fixture-shared-dep\index.js') "module.exports = 'fixture';`n"
+  # The dev preset names qq-bridge's SnowLuma MCP script; the script's data files and a stale qq-bridge config sit
+  # beside it, with a file the move does not carry. Backup copies in the presets and the web profile name old folders.
+  $devPatch = "# fixture dev preset`nmcp:`n  snowluma-full:`n    command: node`n    args:`n      - " + (Join-Path $root 'qq-bridge\src\mcp-snowluma-full.js') + "`n"
+  Write-Fixture (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2-dev.patch.yml') $devPatch
+  Write-Fixture (Join-Path $bridgeBundles 'qq-agent-presets\presets\qq-chat-v2-dev.patch.yml.bak-old') $devPatch
+  Write-Fixture (Join-Path $dshHome 'profiles\web\cordis.patch.yml.bak-old') ("# an old profile naming " + $oldRuntime + "`n")
+  Write-Fixture (Join-Path $root 'qq-bridge\src\mcp-snowluma-full.js') "// fixture dev MCP script`n"
+  Write-Fixture (Join-Path $root 'qq-bridge\src\other-tool.js') "// a qq-bridge file the move does not carry`n"
+  Write-FixtureJson (Join-Path $root 'qq-bridge\config.json') ([ordered]@{ snowluma = [ordered]@{ httpUrl = 'http://127.0.0.1:1'; accessToken = 'stale-bridge-token-67' } })
+  Write-Fixture (Join-Path $root 'qq-bridge\_snowluma-catalog.json') '[{"name":"get_status","readOnly":true}]'
+  Write-Fixture (Join-Path $root 'qq-bridge\state\snowluma-full-calls.jsonl') ('{"action":"get_status","ok":true}' + "`n")
   Write-Fixture (Join-Path $dshHome 'sessions\fixture-workdir\fixture.bin') ('fixture bytes ' * 50)
   $cordis = Join-Path $dshHome 'profiles\web\cordis.patch.yml'
   Write-Fixture $cordis "# fixture profile head`nbundles:`n  - qq-mode-console`n  - qq-agent-presets`n"
@@ -620,7 +683,7 @@ try {
     allow = [ordered]@{ groups = @(1); private = @() }
     backends = [ordered]@{ mcpRustBridge = $true }
     rollout = [ordered]@{ rustGroups = @('group:1') }
-    snowluma = [ordered]@{ accessToken = 'fixture-snow'; homeDir = $snowFolder; launcherPath = (Join-Path $snowFolder 'index.mjs') }
+    snowluma = [ordered]@{ httpUrl = ('http://127.0.0.1:' + $onebotPort); accessToken = 'fixture-snow'; homeDir = $snowFolder; launcherPath = (Join-Path $snowFolder 'index.mjs') }
     tasks = [ordered]@{ installRoot = $oldRelease; nodePath = $NodePath; 'start-all' = [ordered]@{ snowLumaDirectory = $snowFolder; dshScript = (Join-Path $dshPackage 'bin\dsh.mjs'); dshWorkingDirectory = (Join-Path $F 'dsh-work') } }
     backup = [ordered]@{ keepDays = 7 }
     memory = [ordered]@{ digest = [ordered]@{ timeoutSecs = 90 } }
@@ -671,13 +734,13 @@ try {
   Write-Fixture (Join-Path $opsSource 'fixture-op.ps1') "# fixture operator script`r`n"
   $env:HER_TASK_SCHEDULER_FILE = $herScheduler
   [void][IO.Directory]::CreateDirectory($evidence)
-  $rehearsalArgs = @('-Rehearsal', '-InstallRoot', $root, '-EvidenceRoot', $evidence, '-OldSupervisorTask', $supervisorTask, '-OldRelayTask', $relayTask, '-ProfileFolder', $profileFolder)
+  $rehearsalArgs = @('-Rehearsal', '-InstallRoot', $root, '-EvidenceRoot', $evidence, '-OldSupervisorTask', $supervisorTask, '-OldRelayTask', $relayTask, '-ProfileFolder', $profileFolder, '-AcceptDshProfileFiles')
   $sourceArgs = @('-OldRuntime', $oldRuntime, '-OldRelayFolder', $relayFolder, '-ReleaseSource', $releaseSource)
   $moveArgs = $rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '180')
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 141 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 154 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -913,6 +976,10 @@ try {
   # not from the Antigravity CLI log link that the exclusion leaves out (Revision 18 fix round 2).
   $run = Invoke-MoveScript $inventoryArgs 'S1r-stub-clean'
   Assert-Run $run 0 'INVENTORY: 0 blockers' 'S1r the DSH stub without the near-miss link is clean'
+  # The stale stub differs from the profile DSH home: without -AcceptDshProfileFiles Inventory blocks (Revision 19).
+  $withoutAccept = @($inventoryArgs | Where-Object { $_ -ne '-AcceptDshProfileFiles' })
+  $run = Invoke-MoveScript $withoutAccept 'S1r-stub-files'
+  Assert-Run $run 1 'runtime DSH files differ from the profile DSH home' 'S1r a stale DSH stub without -AcceptDshProfileFiles'
   Assert-OldUntouched 'S1r'
 
   Step 'S1s digest key conflict'

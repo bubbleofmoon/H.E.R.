@@ -546,23 +546,49 @@ function Test-NamesRoot([string]$Text, $Roots) {
   foreach ($root in $Roots) { if ([regex]::IsMatch($Text, [regex]::Escape($root) + '(\\|["''\s]|$)')) { return $true } }
   return $false
 }
-# DSH texts name a linked bundle folder in three spellings: backslashes, forward slashes and JSON-escaped backslashes.
-# Each is replaced by the new folder in the same spelling, case-insensitively and only at a name boundary.
+# JSON may spell any character as \uXXXX; Windows PowerShell 5.1's ConvertTo-Json writes ' < > & that way. A path
+# with such a character (the rehearsal profile's apostrophe) is then spelled with every character outside letters,
+# digits, path separators, colon, dot, dash, underscore and space escaped so (Revision 19 fix round).
+function ConvertTo-JsonEscapes([string]$Text) { return [regex]::Replace($Text, '[^A-Za-z0-9\\/:._ -]', { param($found) '\u' + ([int][char]$found.Value).ToString('x4') }) }
+# The reverse, for scans: every \uXXXX escape read as its character.
+function ConvertFrom-JsonEscapes([string]$Text) { return [regex]::Replace($Text, '\\u(?<hex>[0-9A-Fa-f]{4})', { param($found) [string][char][Convert]::ToInt32($found.Groups['hex'].Value, 16) }) }
+# DSH texts name a linked bundle folder in three spellings: backslashes, forward slashes and JSON-escaped backslashes,
+# and the two JSON spellings once more with \uXXXX escapes when the path holds such a character. Each is replaced by
+# the new folder in the same spelling, case-insensitively and only at a full-name boundary: a path separator, a quote
+# or the end of a line, never a space or another name character, so a sibling such as "<folder> archive" or
+# "<file> helper" is not rewritten (Revision 19 fix round).
 function Convert-DshText([string]$Text, $TextMap) {
   $result = $Text
   foreach ($entry in $TextMap) {
     $from = ([string]$entry.From).TrimEnd('\')
     $to = ([string]$entry.To).TrimEnd('\')
     $spellings = @(@($from.Replace('\', '\\'), $to.Replace('\', '\\')), @($from, $to), @($from.Replace('\', '/'), $to.Replace('\', '/')))
+    foreach ($json in @(@($from.Replace('\', '\\'), $to.Replace('\', '\\')), @($from.Replace('\', '/'), $to.Replace('\', '/')))) {
+      $escaped = ConvertTo-JsonEscapes $json[0]
+      if ($escaped -cne $json[0]) { $spellings += ,@($escaped, (ConvertTo-JsonEscapes $json[1])) }
+    }
     foreach ($pair in $spellings) {
-      $pattern = [regex]::Escape($pair[0]) + '(?=[\\/"''\s,;)\]}]|$)'
+      $pattern = [regex]::Escape($pair[0]) + '(?=[\\/"'']|\r|\n|$)'
       $result = [regex]::Replace($result, $pattern, $pair[1].Replace('$', '$$'), [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     }
   }
   return $result
 }
-# A link: or file: dependency that climbs out with .. would resolve elsewhere once the DSH home has moved.
-function Test-ClimbingLink([string]$Text) { return [regex]::IsMatch($Text, '(?i)(?<![A-Za-z0-9])(link|file):\.\.[\\/]') }
+# A link: or file: dependency that climbs out with .. would resolve elsewhere once the DSH home has moved. Given the
+# file's folder and the folder that moves with it, a relative one that resolves inside that folder moves along and is
+# fine (pnpm's link:../../plugins/<bundle> in the web profile, Revision 19); without them every climbing one counts.
+# The whole value counts, up to a quote, comma, bracket or line end: a value holding whitespace is ambiguous and counts
+# as climbing (Revision 19 fix round).
+function Test-ClimbingLink([string]$Text, [string]$Folder = '', [string]$Inside = '') {
+  foreach ($match in [regex]::Matches($Text, '(?i)(?<![A-Za-z0-9])(?:link|file):(?<path>\.\.[\\/][^"''`,;)\]}\r\n]*)')) {
+    if (-not $Folder -or -not $Inside) { return $true }
+    $value = $match.Groups['path'].Value.TrimEnd()
+    if ($value -match '\s') { return $true }
+    try { $resolved = [IO.Path]::GetFullPath([IO.Path]::Combine($Folder, $value)).TrimEnd('\') } catch { return $true }
+    if ($resolved.Length -le 3 -or -not (Test-Within $resolved $Inside)) { return $true }
+  }
+  return $false
+}
 function Find-ForeignPaths($Value, [string]$Pointer, $Roots, [string]$Install, $Found) {
   if ($Value -is [string]) {
     $normal = $Value.Replace('/', '\').ToLowerInvariant()
@@ -1360,6 +1386,11 @@ function Get-TextFiles([string]$Folder) {
 function Get-DshLinkPaths($plan) { return ,@(@($plan.DshLinks) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Path }) }
 function Get-DshTextMap($plan) {
   $pairs = @(@($plan.Bundles) | Where-Object { $null -ne $_ } | ForEach-Object { [pscustomobject]@{ From = [string]$_.From; To = [string]$_.NewPath } })
+  # The profile DSH home's own absolute paths (pnpm's link: entries, virtualStoreDir and workspace path) name the new
+  # DSH home, and each carried dev tool file names its new place (Revision 19). A pnpm store outside the DSH home is
+  # left as it is: only pnpm reads it, and the move runs no pnpm.
+  if ($plan.DshHome) { $pairs += [pscustomobject]@{ From = [string]$plan.DshHome; To = (Join-Path $script:Root 'runtime\user\dsh') } }
+  foreach ($file in @(@($plan.ToolFiles) | Where-Object { $null -ne $_ })) { $pairs += [pscustomobject]@{ From = [string]$file.From; To = [string]$file.To } }
   $map = New-PathMap $pairs
   return ,$map
 }
@@ -1370,11 +1401,13 @@ function Get-ScanRoots($plan) {
 function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $Roots, $Bundles, $TextMap, [switch]$Moved) {
   $found = [Collections.Generic.List[string]]::new()
   $areas = @()
-  foreach ($name in @('profiles', 'plugins')) { $areas += [pscustomobject]@{ Folder = (Join-Path $DshHome $name); Label = $name } }
+  # A relative link: is judged against the folder that moves with it: the DSH home for profiles and plugins, the bundle
+  # folder for a bundle.
+  foreach ($name in @('profiles', 'plugins')) { $areas += [pscustomobject]@{ Folder = (Join-Path $DshHome $name); Label = $name; Inside = $DshHome } }
   foreach ($bundle in @(@($Bundles) | Where-Object { $null -ne $_ })) {
     $folder = [string]$bundle.From
     if ($Moved) { $folder = [string]$bundle.NewPath }
-    $areas += [pscustomobject]@{ Folder = $folder; Label = ('bundles\' + (Split-Path -Leaf ([string]$bundle.NewPath))) }
+    $areas += [pscustomobject]@{ Folder = $folder; Label = ('bundles\' + (Split-Path -Leaf ([string]$bundle.NewPath))); Inside = $folder }
   }
   foreach ($area in $areas) {
     if (-not (Test-Path -LiteralPath $area.Folder -PathType Container)) { continue }
@@ -1384,7 +1417,9 @@ function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $
       if ($RenderedProfile -and $relative -ieq 'profiles\web\cordis.patch.yml') { $path = $RenderedProfile }
       $text = Convert-DshText (Read-Text $path) $TextMap
       $normal = $text.Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
-      if ((Test-NamesRoot $normal $Roots) -or (Test-ClimbingLink $text)) { $found.Add($relative) }
+      # A path spelled with \uXXXX escapes is found too: the text is read once more with them decoded.
+      $decoded = (ConvertFrom-JsonEscapes $text).Replace('\\', '\').Replace('/', '\').ToLowerInvariant()
+      if ((Test-NamesRoot $normal $Roots) -or (Test-NamesRoot $decoded $Roots) -or (Test-ClimbingLink $text (Split-Path -Parent $file) $area.Inside)) { $found.Add($relative) }
     }
   }
   return ,$found
@@ -1393,8 +1428,16 @@ function Find-OldProfileReferences([string]$DshHome, [string]$RenderedProfile, $
 # upward, so (1) a node_modules in any folder above the old place that is not also above the new place (for example
 # qq-bridge\dsh\node_modules or qq-bridge\node_modules) would be lost, declared or not, and (2) a declared package
 # (dependencies, peerDependencies, optionalDependencies) found neither in the bundle's own node_modules nor in a
-# node_modules both places reach is unresolved. The drive root is shared by both places and not walked.
-function Find-BundleOutsideDependencies($Bundles) {
+# node_modules both places reach is unresolved. The drive root is shared by both places and not walked. A node_modules
+# the move carries ($Carried: From and To) is reachable when its new place's folder lies above the bundle's new place
+# (qq-bridge\node_modules, carried into the new bundles folder, Revision 19).
+function Test-CarriedModules([string]$Modules, [string]$NewPath, $Carried) {
+  foreach ($entry in @(@($Carried) | Where-Object { $null -ne $_ })) {
+    if ([string]$entry.From -ieq $Modules -and (Test-Within $NewPath (Split-Path -Parent ([string]$entry.To)))) { return $true }
+  }
+  return $false
+}
+function Find-BundleOutsideDependencies($Bundles, $Carried) {
   $found = [Collections.Generic.List[string]]::new()
   foreach ($bundle in @(@($Bundles) | Where-Object { $null -ne $_ })) {
     $from = [string]$bundle.From
@@ -1405,7 +1448,7 @@ function Find-BundleOutsideDependencies($Bundles) {
     while ($current.Length -gt 3) {
       $modules = Join-Path $current 'node_modules'
       if (Test-Path -LiteralPath $modules -PathType Container) {
-        if (Test-Within $newPath $current) { $shared += $modules } else { $found.Add($leaf + ': ' + $modules + ' is not reachable after the move') }
+        if ((Test-Within $newPath $current) -or (Test-CarriedModules $modules $newPath $Carried)) { $shared += $modules } else { $found.Add($leaf + ': ' + $modules + ' is not reachable after the move') }
       }
       $current = Split-Path -Parent $current
     }
@@ -1486,6 +1529,62 @@ function Update-DshTexts($plan) {
     }
   }
   Write-Step ('the linked DSH bundle paths are rewritten in ' + $changed + ' DSH files')
+}
+# Stale backup copies (a file name ending in .bak or in .bak-<anything>, as the presets' and the web profile's
+# .bak-<stamp> files): DSH never reads them, they name old folders, and the originals stay where they are until #127.
+# The copies leave them out (Revision 19), so the new layout holds no backup naming qq-bridge.
+function Test-BackupCopyName([string]$Name) { return $Name -match '(?i)\.bak(-[^\\/]*)?$' }
+# The backup copies below the given areas of a folder ('' is the folder itself), as paths relative to the folder,
+# found without following any junction or link.
+function Find-BackupCopies([string]$Folder, [string[]]$Areas) {
+  $found = [Collections.Generic.List[string]]::new()
+  $base = Get-Normal $Folder
+  foreach ($area in @($Areas)) {
+    $start = $base
+    if ($area) { $start = Join-Path $base $area }
+    if (-not (Test-Path -LiteralPath $start -PathType Container)) { continue }
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($start)
+    while ($pending.Count -gt 0) {
+      foreach ($item in [IO.DirectoryInfo]::new($pending.Pop()).GetFileSystemInfos()) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+        if ($item -is [IO.DirectoryInfo]) { $pending.Push($item.FullName); continue }
+        if (Test-BackupCopyName $item.Name) { $found.Add($item.FullName.Substring($base.Length + 1)) }
+      }
+    }
+  }
+  return ,$found
+}
+# The dev preset's SnowLuma MCP script and its data files, each copied alone into the tool folder and verified by
+# SHA-256 (Revision 19).
+function Copy-ToolFiles($plan) {
+  $files = @(@($plan.ToolFiles) | Where-Object { $null -ne $_ })
+  if ($files.Count -eq 0) { return }
+  foreach ($file in $files) {
+    $from = [string]$file.From
+    $to = [string]$file.To
+    if ((Get-Item -LiteralPath $from -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Failed 'a dev tool file in qq-bridge is a junction or link' }
+    if (Test-Present $to) { Stop-Failed 'a dev tool file already exists in the new layout' }
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $to))
+    [IO.File]::Copy($from, $to)
+    if ((Get-FileSha $from) -ne (Get-FileSha $to)) { Stop-Failed 'a dev tool file differs from its source after the copy' }
+  }
+  Write-Step ('copied and verified the dev tool files: ' + $files.Count)
+}
+# The dev MCP script reads only snowluma.httpUrl and snowluma.accessToken from ROOT\config.json, on every call. They
+# come from the new runtime's configuration (the values HER itself uses and the move's health check proves), each only
+# when it is a non-empty string; a missing one falls back to the script's own default, as in HER. The token is
+# registered as a secret, so no evidence or console line shows it.
+function New-ToolConfig($Config) {
+  $snowluma = [pscustomobject][ordered]@{}
+  $source = Get-Prop $Config 'snowluma'
+  foreach ($name in @('httpUrl', 'accessToken')) {
+    $value = Get-Prop $source $name
+    if ($value -is [string] -and $value) { $snowluma | Add-Member -NotePropertyName $name -NotePropertyValue $value }
+  }
+  $token = Get-Prop $snowluma 'accessToken'
+  if ($token) { Add-RelaySecret $token }
+  return [pscustomobject][ordered]@{ snowluma = $snowluma }
 }
 
 # ---------- state ----------
@@ -1841,20 +1940,48 @@ function Get-MovePlan {
     }
     $plan.DshLinks = $links
     $plan.Bundles = $bundles
+    # The slim tool folder (Revision 19): the new DSH home's bundles folder takes qq-bridge's node_modules (both bundles
+    # resolve their packages from it, as Node looks upward from a bundle's real path) and the dev preset's SnowLuma MCP
+    # script with its data files, in the shape the script expects (its ROOT is its own folder's parent). So nothing in
+    # the new layout needs qq-bridge, which goes with the other originals later (#127).
+    $plan.ToolRoot = Join-Path $newHome 'bundles'
+    $plan.ToolModules = ''
+    $plan.ToolFiles = @()
+    if ($bundles.Count -gt 0) {
+      $toolNames = @('node_modules', 'src', 'state', 'config.json', '_snowluma-catalog.json')
+      if (@($bundles | Where-Object { $toolNames -contains (Split-Path -Leaf ([string]$_.NewPath)).ToLowerInvariant() }).Count -gt 0) { Stop-Refused 'a linked DSH bundle folder name is one the tool folder uses' }
+      $bridgeModules = Join-Path $plan.BridgeRoot 'node_modules'
+      if (Test-Path -LiteralPath $bridgeModules -PathType Container) { Assert-RehearsalPath $bridgeModules; $plan.ToolModules = $bridgeModules }
+      if (Test-Path -LiteralPath (Join-Path $plan.BridgeRoot 'src\mcp-snowluma-full.js') -PathType Leaf) {
+        foreach ($relative in @('src\mcp-snowluma-full.js', '_snowluma-catalog.json', 'state\snowluma-full-calls.jsonl')) {
+          $source = Join-Path $plan.BridgeRoot $relative
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { continue }
+          Assert-RehearsalPath $source
+          if ((Get-Item -LiteralPath $source -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Refused 'a dev tool file in qq-bridge is a junction or link' }
+          $plan.ToolFiles += [pscustomobject]@{ From = $source; To = (Join-Path $plan.ToolRoot $relative) }
+        }
+      }
+    }
     Assert-PlanHas $plan @('SnowLuma', 'OldRelease') 'the configuration check'
     Assert-PlanHas $plan @('SnowLumaVersion') 'the SnowLuma check'
     Assert-PlanHas $plan @('NpxRoot', 'DshVersion') 'the DSH package check'
     Assert-PlanHas $plan @('OldExe') 'the old bridge check'
     Assert-PlanHas $plan @('RelayPin', 'Auth') 'the relay check'
     # Copies, path map and the roots no new path may keep.
+    # The DSH home copy leaves out its links (recreated by New-BundleLinks) and the backup copies in profiles and
+    # plugins; each bundle copy leaves out its backup copies (Revision 19).
+    $homeExclude = [Collections.Generic.List[string]]::new()
+    foreach ($excluded in (Get-DshLinkPaths $plan)) { $homeExclude.Add([string]$excluded) }
+    foreach ($excluded in (Find-BackupCopies $plan.DshHome @('profiles', 'plugins'))) { $homeExclude.Add($excluded) }
     $copies = @(
       [pscustomobject]@{ From = $plan.OldRuntime; To = (Join-Path $script:Root 'runtime'); Exclude = $plan.RuntimeExclude; Label = 'runtime' },
-      [pscustomobject]@{ From = $plan.DshHome; To = $newHome; Exclude = (Get-DshLinkPaths $plan); Label = 'dsh-home' },
+      [pscustomobject]@{ From = $plan.DshHome; To = $newHome; Exclude = $homeExclude.ToArray(); Label = 'dsh-home' },
       [pscustomobject]@{ From = $plan.SnowLuma; To = (Join-Path $script:Root ('deps\snowluma\' + $plan.SnowLumaVersion)); Exclude = @(); Label = 'snowluma' },
       [pscustomobject]@{ From = $plan.NpxRoot; To = (Join-Path $script:Root ('deps\dsh\' + $plan.DshVersion)); Exclude = @(); Label = 'dsh' },
       [pscustomobject]@{ From = $plan.OldRelayFolder; To = $plan.RelayPin; Exclude = @(); Label = 'relay' }
     )
-    foreach ($bundle in $bundles) { $copies += [pscustomobject]@{ From = $bundle.From; To = $bundle.NewPath; Exclude = @(); Label = $bundle.Label } }
+    foreach ($bundle in $bundles) { $copies += [pscustomobject]@{ From = $bundle.From; To = $bundle.NewPath; Exclude = (Find-BackupCopies $bundle.From @('')).ToArray(); Label = $bundle.Label } }
+    if ($plan.ToolModules) { $copies += [pscustomobject]@{ From = $plan.ToolModules; To = (Join-Path $plan.ToolRoot 'node_modules'); Exclude = @(); Label = 'dsh-tool-modules' } }
     $pairs = @(
       [pscustomobject]@{ From = $plan.OldRuntime; To = (Join-Path $script:Root 'runtime') },
       [pscustomobject]@{ From = $plan.DshHome; To = (Join-Path $script:Root 'runtime\user\dsh') },
@@ -1902,7 +2029,9 @@ function Get-MovePlan {
     $references = Find-OldProfileReferences $plan.DshHome $rendered (Get-ScanRoots $plan) $plan.Bundles (Get-DshTextMap $plan)
     Write-Utf8 (Join-Path $script:Evidence 'dsh-profile-references.txt') ((@($references) -join "`r`n") + "`r`n")
     if ($references.Count -gt 0) { Add-Blocker ('' + $references.Count + ' DSH profile, plugin or bundle files name old production paths or climb out with a link (list in the evidence folder)') }
-    $outside = Find-BundleOutsideDependencies $plan.Bundles
+    $carried = @()
+    if ($plan.ToolModules) { $carried += [pscustomobject]@{ From = $plan.ToolModules; To = (Join-Path $plan.ToolRoot 'node_modules') } }
+    $outside = Find-BundleOutsideDependencies $plan.Bundles $carried
     Write-Utf8 (Join-Path $script:Evidence 'dsh-bundle-dependencies.txt') ((@($outside) -join "`r`n") + "`r`n")
     if ($outside.Count -gt 0) { Add-Blocker 'a linked DSH bundle depends on a package outside its own folder (list in the evidence folder)' }
     # Not a blocker: other DSH-home files naming a bundle's old folder keep naming it; F3 settles them before deleting qq-bridge.
@@ -2028,6 +2157,11 @@ function Set-NewConfiguration($plan) {
   $foreign = Convert-Config $config $plan
   if ($foreign.Count -gt 0) { Stop-Failed 'configuration paths need a decision (pointers in the evidence folder)' }
   Write-JsonFile $configPath $config
+  if (@(@($plan.ToolFiles) | Where-Object { $null -ne $_ }).Count -gt 0) {
+    # The dev MCP script's configuration comes from the new runtime's, never from qq-bridge's copy (Revision 19).
+    Write-JsonFile (Join-Path $plan.ToolRoot 'config.json') (New-ToolConfig $config)
+    Write-Step 'the dev tool configuration is written from the new runtime configuration'
+  }
   $dependenciesPath = Join-Path $runtime 'dependencies.json'
   $dependencies = Read-Json $dependenciesPath
   $foreign = Convert-Dependencies $dependencies $plan
@@ -2441,6 +2575,7 @@ function Invoke-Move {
     $after = Get-IdleState $plan.Cli $plan.OldRuntime 'idle-after-stop'
     if ($after.Busy -gt 0) { Write-Step ('' + $after.Busy + ' turns were cut by the stop; the new bridge pauses them for the owner') }
     foreach ($copy in $plan.Copies) { Copy-Verified $copy.From $copy.To $copy.Exclude $copy.Label }
+    Copy-ToolFiles $plan
     New-BundleLinks $plan
     Save-State 'Copied'
     Assert-AbortPoint 'Copied'
@@ -2710,6 +2845,29 @@ function Invoke-SelfTest {
   Check ($clean.Count -eq 0) 'a clean configuration has no foreign pointers'
   $dirty = Get-ForeignPointers ('{"x":"C:\\Old\\Rt\\y"}' | ConvertFrom-Json) ('{"dsh":"http://127.0.0.1:1"}' | ConvertFrom-Json) $samplePlan
   Check ((@($dirty) -join ',') -eq '/x') 'the foreign pointers of both files form one flat list'
+  # Revision 19 (owner decisions on the gate Inventory). The DSH text map also moves the profile DSH home's own absolute
+  # paths (pnpm's link:, virtualStoreDir and workspace path) and the carried dev script; a pnpm store outside the DSH
+  # home and a qq-bridge file the move does not carry stay as they are.
+  $toolPlan = [ordered]@{ Bundles = @([pscustomobject]@{ From = 'C:\qqbot\qq-bridge\plugins\b'; NewPath = 'C:\qqbot\runtime\user\dsh\bundles\b' }); DshHome = 'C:\P\.dsh'; ToolFiles = @([pscustomobject]@{ From = 'C:\qqbot\qq-bridge\src\mcp-snowluma-full.js'; To = 'C:\qqbot\runtime\user\dsh\bundles\src\mcp-snowluma-full.js' }) }
+  $toolMap = Get-DshTextMap $toolPlan
+  Check ((Convert-DshText ('a: link:C:/P/.dsh/plugins/b' + "`n" + 'virtualStoreDir: C:\P\.dsh\profiles\web\node_modules\.pnpm' + "`n" + '{"C:\\P\\.dsh\\profiles\\web":{}}' + "`n" + 'storeDir: C:\P\AppData\Local\pnpm\store\v11') $toolMap) -ceq ('a: link:C:/qqbot/runtime/user/dsh/plugins/b' + "`n" + 'virtualStoreDir: C:\qqbot\runtime\user\dsh\profiles\web\node_modules\.pnpm' + "`n" + '{"C:\\qqbot\\runtime\\user\\dsh\\profiles\\web":{}}' + "`n" + 'storeDir: C:\P\AppData\Local\pnpm\store\v11')) 'the profile DSH home paths move to the new DSH home and the pnpm store stays'
+  Check ((Convert-DshText ('- C:\qqbot\qq-bridge\src\mcp-snowluma-full.js' + "`n" + '- C:\qqbot\qq-bridge\src\other.js') $toolMap) -ceq ('- C:\qqbot\runtime\user\dsh\bundles\src\mcp-snowluma-full.js' + "`n" + '- C:\qqbot\qq-bridge\src\other.js')) 'the carried dev script moves and an uncarried qq-bridge file does not'
+  Check ((-not (Test-ClimbingLink 'v: link:../../plugins/b' 'C:\H\profiles\web' 'C:\H')) -and (Test-ClimbingLink 'v: link:../../../x' 'C:\H\profiles\web' 'C:\H')) 'a relative link: inside the DSH home is fine and one out of it still refuses'
+  $carried = @([pscustomobject]@{ From = 'C:\qqbot\qq-bridge\node_modules'; To = 'C:\qqbot\runtime\user\dsh\bundles\node_modules' })
+  Check (Test-CarriedModules 'C:\qqbot\qq-bridge\node_modules' 'C:\qqbot\runtime\user\dsh\bundles\b' $carried) 'the carried qq-bridge node_modules is reachable from the new bundles'
+  Check ((Test-CarriedModules 'C:\qqbot\qq-bridge\node_modules' 'C:\qqbot\runtime\user\dsh\bundles\b' $carried) -and -not (Test-CarriedModules 'C:\qqbot\qq-bridge\dsh\node_modules' 'C:\qqbot\runtime\user\dsh\bundles\b' $carried) -and -not (Test-CarriedModules 'C:\qqbot\qq-bridge\node_modules' 'C:\qqbot\deps\b' $carried)) 'another node_modules, or a bundle the carried one is not above, stays unreachable'
+  Check ((Test-BackupCopyName 'qq-chat-v2-dev.patch.yml.bak-old') -and (Test-BackupCopyName 'cordis.patch.yml.BAK') -and -not (Test-BackupCopyName 'qq-chat-v2-dev.patch.yml') -and -not (Test-BackupCopyName 'bakery.yml')) 'backup copies are recognised by name and other files are not'
+  $toolConfig = New-ToolConfig ('{"snowluma":{"httpUrl":"http://127.0.0.1:3010","accessToken":"tool-token-sample","homeDir":"C:\\x"},"consoleToken":"other-secret"}' | ConvertFrom-Json)
+  $toolNames = @($toolConfig.snowluma.PSObject.Properties | ForEach-Object { $_.Name }) -join ','
+  Check ($toolNames -ceq 'httpUrl,accessToken' -and $toolConfig.snowluma.httpUrl -ceq 'http://127.0.0.1:3010' -and $toolConfig.snowluma.accessToken -ceq 'tool-token-sample' -and @($toolConfig.PSObject.Properties).Count -eq 1 -and $script:SecretTexts.Contains('tool-token-sample')) 'the dev tool config holds only the runtime SnowLuma URL and token, and the token is a secret'
+  Check (@((New-ToolConfig ('{"snowluma":{"homeDir":"C:\\x"}}' | ConvertFrom-Json)).snowluma.PSObject.Properties).Count -eq 0) 'a missing SnowLuma URL or token is left to the script default'
+  # Revision 19 fix round: JSON escapes, whitespace in a relative link: and full-name boundaries.
+  $quotedMap = Get-DshTextMap ([ordered]@{ Bundles = @(); DshHome = "C:\P\it's\.dsh"; ToolFiles = @() })
+  Check ((Convert-DshText ('{"x":"link:C:/P/it' + '\' + 'u0027s/.dsh/plugins/b","y":"C:\\P\\it' + '\' + 'u0027s\\.dsh\\profiles"}') $quotedMap) -ceq '{"x":"link:C:/qqbot/runtime/user/dsh/plugins/b","y":"C:\\qqbot\\runtime\\user\\dsh\\profiles"}') 'a path spelled with a JSON escape for its apostrophe is rewritten too'
+  Check ((ConvertFrom-JsonEscapes ('it' + '\' + 'u0027s')) -ceq "it's") 'JSON escapes are read as their characters for the scan'
+  Check (Test-ClimbingLink '{"dependencies":{"x":"link:../../space dir/../../outside"}}' 'C:\H\profiles\web' 'C:\H') 'a relative link: holding whitespace counts as climbing'
+  Check ((Convert-DshText 'args: ["C:/qqbot/qq-bridge/src/mcp-snowluma-full.js helper"]' $toolMap) -ceq 'args: ["C:/qqbot/qq-bridge/src/mcp-snowluma-full.js helper"]') 'a mapped file name followed by more text is not rewritten'
+  Check ((Convert-DshText 'C:\P\.dsh archive' $toolMap) -ceq 'C:\P\.dsh archive') 'a sibling folder whose name continues after a space is not rewritten'
   Write-Step ('PASS self-test: ' + $script:SelfChecks + ' checks')
 }
 
