@@ -786,19 +786,37 @@ class IssueWatch(unittest.TestCase):
         self.assertEqual(out.getvalue(), 'BATON #5 a held baton https://github.example.invalid/i/5\n')
 
     def test_follow_waits_out_a_rate_limit_and_goes_on(self):
-        answers = iter([(None, None, 500), (None, [issue(5)], None)])
-        self.module.fetch = lambda url, tok, etag: (None, [], None) if '/comments' in url else next(answers)
-        run = self.follow([lambda: None])
+        answers = iter([(None, None, 500), (None, [issue(5)], None), (None, [issue(5)], None)])
+        polls = []
+
+        def fetch(url, tok, etag):
+            if '/comments' in url:
+                return None, [], None
+            polls.append(url)
+            return next(answers)
+
+        self.module.fetch = fetch
+        run = self.follow([lambda: None, lambda: None])
         self.assertEqual(run.outcome, 'running', run.err)
-        self.assertEqual(run.slept, [500, 180])
+        self.assertEqual(len(polls), 3, polls)      # the poll after the event ran: the run went on
+        self.assertEqual(run.slept, [500, 180, 180])
         self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n')
 
     def test_follow_retries_a_poll_nobody_answered(self):
-        answers = iter([(None, None, 0), (None, [issue(5)], None)])
-        self.module.fetch = lambda url, tok, etag: (None, [], None) if '/comments' in url else next(answers)
-        run = self.follow([lambda: None])
+        answers = iter([(None, None, 0), (None, [issue(5)], None), (None, [issue(5)], None)])
+        polls = []
+
+        def fetch(url, tok, etag):
+            if '/comments' in url:
+                return None, [], None
+            polls.append(url)
+            return next(answers)
+
+        self.module.fetch = fetch
+        run = self.follow([lambda: None, lambda: None])
         self.assertEqual(run.outcome, 'running', run.err)
-        self.assertEqual(run.slept, [180, 180])
+        self.assertEqual(len(polls), 3, polls)      # the poll after the event ran: the run went on
+        self.assertEqual(run.slept, [180, 180, 180])
         self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n')
 
     def test_follow_waits_out_a_comment_read_limit_after_an_event(self):
@@ -848,7 +866,8 @@ class IssueWatch(unittest.TestCase):
 
     def test_follow_and_once_exclude_each_other(self):
         err = io.StringIO()
-        with redirect_stderr(err), self.assertRaises(SystemExit) as stop:
+        with mock.patch.object(self.module.time, 'sleep', side_effect=StopFollow), redirect_stderr(err), \
+                self.assertRaises(SystemExit) as stop:
             self.run_watch('--machine', 'linux', '--once', '--follow')
         self.assertEqual(stop.exception.code, 2)
         self.assertIn('not allowed with', err.getvalue())
