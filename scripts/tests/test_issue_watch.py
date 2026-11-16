@@ -5,6 +5,7 @@ The module is loaded from its file, HOME and USERPROFILE point at a temporary fo
 token and the HTTP fetch are replaced, so no case contacts GitHub or touches the real home.
 Run: python -I scripts/tests/test_issue_watch.py
 """
+import calendar
 import email.message
 import gc
 import importlib.util
@@ -39,7 +40,9 @@ class FakeGitHub:
     """Answers the issue listing of each repository from `issues`; `unchanged` answers 304.
 
     Comment pages come from `comments` (issue number -> list of comments, oldest first), cut to the comments updated
-    since the `since` argument when there is one; `fail_comments` makes them unanswered.
+    since the `since` argument when there is one; `fail_comments` makes them unanswered. `reads` lists every answered
+    comment page as (issue number, page, since or None); `after_page`, when set, is called with (issue number, page)
+    after a page was answered, so a test can change the comments between two pages.
     """
 
     def __init__(self):
@@ -50,6 +53,8 @@ class FakeGitHub:
         self.unchanged = False
         self.urls = []
         self.etags = []
+        self.reads = []
+        self.after_page = None
 
     def __call__(self, url, tok, etag):
         self.urls.append(url)
@@ -61,9 +66,14 @@ class FakeGitHub:
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
             page = int(query['page'][0])
             items = self.comments.get(number, [])
-            if 'since' in query:
-                items = [c for c in items if c['updated_at'] >= query['since'][0]]
-            return None, items[(page - 1) * 100:page * 100], None
+            since = query['since'][0] if 'since' in query else None
+            if since:
+                items = [c for c in items if c['updated_at'] >= since]
+            answer = items[(page - 1) * 100:page * 100]
+            self.reads.append((number, page, since))
+            if self.after_page:
+                self.after_page(number, page)
+            return None, answer, None
         if self.unchanged:
             return etag, None, None
         for repo, issues in self.issues.items():
@@ -342,11 +352,26 @@ class IssueWatch(unittest.TestCase):
         self.github.issues = {PUBLIC: [issue(67, comments=200)]}
         self.github.comments[67] += [comment(k, 'progress') for k in range(2, 200)]
         self.github.comments[67].append(comment(200, '**Handoff → linux: R5 green'))
+        first = len(self.github.reads)
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/200\n')
-        comment_urls = [u for u in self.github.urls if '/comments?' in u]
-        for page in (1, 2, 3):
-            self.assertTrue(any(f'&page={page}&' in u for u in comment_urls), (page, comment_urls))
+        self.assertEqual({page for number, page, since in self.github.reads[first:]}, {1, 2, 3}, self.github.reads)
+
+    def test_a_deletion_between_two_pages_never_hides_a_handoff(self):
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.github.issues = {PUBLIC: [issue(67, comments=101)]}
+        self.github.comments[67] += [comment(k, 'progress') for k in range(2, 101)]
+        self.github.comments[67].append(comment(101, '**Handoff → linux: R5 green'))
+
+        def delete_the_first(number, page):
+            if page == 1 and self.github.comments[67][0]['id'] == 1:
+                del self.github.comments[67][0]      # after page 1 was served, comment 101 moves up to place 100
+
+        self.github.after_page = delete_the_first
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/101\n')
 
     def test_an_old_state_file_without_comment_counts_loads(self):
         state = self.home / 'state.json'
@@ -356,7 +381,7 @@ class IssueWatch(unittest.TestCase):
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
         self.assertEqual(code, 0)
         self.assertEqual(out.strip(), 'no batons', out)
-        self.assertFalse(any('/comments?' in u for u in self.github.urls), self.github.urls)
+        self.assertEqual(len(self.github.reads), 1, self.github.reads)      # the first sighting is read once
         self.github.issues = {PUBLIC: [issue(67, comments=6)]}
         self.github.comments[67].append(comment(6, '**Handoff → linux: R4 green'))
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
@@ -375,6 +400,16 @@ class IssueWatch(unittest.TestCase):
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
         self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
 
+    def test_a_plain_count_with_a_deleted_comment_still_reports_the_handoff(self):
+        state = self.home / 'state.json'
+        state.write_text(json.dumps({'etag': None, 'holding': [67], 'comments': {'67': 1}}), encoding='utf-8')
+        self.github.issues = {PUBLIC: [issue(67, comments=2)]}      # the old comment and the handoff were counted
+        self.github.comments = {67: [comment(2, '**Handoff → linux: R4 green')]}      # the old one is gone at the read
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out.strip(), 'no batons', out)
+
     # --- a deleted comment never hides a handoff (#136) ----------------------------------------------
     def test_a_comment_deleted_before_the_read_never_hides_a_handoff(self):
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
@@ -384,8 +419,7 @@ class IssueWatch(unittest.TestCase):
         self.github.comments = {67: [comment(2, '**Handoff → linux: R4 green')]}      # the old one is gone at the read
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
-        comment_urls = [u for u in self.github.urls if '/comments?' in u]
-        self.assertTrue(all('&since=2026-01-01T10%3A00%3A00Z' in u for u in comment_urls), comment_urls)
+        self.assertEqual({since for number, page, since in self.github.reads}, {'2026-01-01T09:50:01Z'}, self.github.reads)
         self.github.issues = {PUBLIC: [issue(67, comments=1, updated_at=stamp(3))]}      # the deletion itself
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out.strip(), 'no batons', out)
@@ -403,25 +437,95 @@ class IssueWatch(unittest.TestCase):
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
 
-    def test_an_unchanged_listing_reads_no_comments(self):
+    def test_an_unchanged_old_listing_reads_no_comments_after_the_first_sighting(self):
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
         self.github.comments = {67: [comment(1, '**Handoff → linux: old')]}
         self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(len(self.github.reads), 1, self.github.reads)      # the first sighting is read once
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out.strip(), 'no batons', out)
-        self.assertFalse(any('/comments?' in u for u in self.github.urls), self.github.urls)
+        self.assertEqual(len(self.github.reads), 1, self.github.reads)
 
-    def test_two_comments_in_one_second_are_both_seen(self):
+    def test_a_same_second_arrival_after_the_first_sighting_is_reported(self):
+        self.github.issues = {PUBLIC: [issue(67, comments=1, updated_at=stamp(5))]}
+        self.github.comments = {67: [comment(1, 'progress', at=stamp(5))]}
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out, 'BATON #67 a held baton https://github.example.invalid/i/67\n')
+        self.github.issues = {PUBLIC: [issue(67, comments=2, updated_at=stamp(5))]}
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green', at=stamp(5)))
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+
+    def test_a_replaced_comment_with_an_equal_count_and_time_is_read_while_the_update_is_young(self):
+        state = self.home / 'state.json'
+        now = calendar.timegm(time.strptime(stamp(5), '%Y-%m-%dT%H:%M:%SZ')) + 1
+        self.github.issues = {PUBLIC: [issue(67, comments=2, updated_at=stamp(5))]}
+        self.github.comments = {67: [comment(1, 'progress', at=stamp(4)), comment(2, 'progress', at=stamp(5))]}
+        with mock.patch.object(self.module.time, 'time', return_value=now):
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+            self.assertEqual(out, 'BATON #67 a held baton https://github.example.invalid/i/67\n')
+            self.assertIsNone(json.loads(state.read_text(encoding='utf-8'))['etag'])      # the listing is asked again
+            self.github.comments = {67: [comment(1, 'progress', at=stamp(4)),
+                                         comment(3, '**Handoff → linux: R4 green', at=stamp(5))]}      # 2 deleted, 3 added
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
+
+    def test_an_old_unchanged_update_is_not_read_again(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=2)]}
+        self.github.comments = {67: [comment(1, 'progress'), comment(2, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertIsNotNone(json.loads(state.read_text(encoding='utf-8'))['etag'])
+        self.assertEqual(len(self.github.reads), 1, self.github.reads)
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(len(self.github.reads), 1, self.github.reads)
+
+    def test_a_reported_handoff_is_never_reported_again(self):
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
         self.github.comments = {67: [comment(1, 'progress')]}
         self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.github.issues = {PUBLIC: [issue(67, comments=2)]}
-        self.github.comments[67].append(comment(2, 'progress'))
-        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
-        self.github.issues = {PUBLIC: [issue(67, comments=3, updated_at=stamp(2))]}
-        self.github.comments[67].append(comment(3, '**Handoff → linux: R4 green', at=stamp(2)))
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
-        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+        self.github.issues = {PUBLIC: [issue(67, comments=3)]}      # a progress comment and an edit of the handoff
+        self.github.comments[67][1]['updated_at'] = stamp(3)
+        self.github.comments[67].append(comment(3, 'progress'))
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out.strip(), 'no batons', out)
+
+    def test_an_old_handoff_edited_later_is_not_new(self):
+        state = self.home / 'state.json'
+        state.write_text(json.dumps({'etag': None, 'holding': [67], 'comments': {
+            '67': {'count': 3, 'updated_at': stamp(2000), 'seen': [], 'recent': False}}}), encoding='utf-8')
+        self.github.issues = {PUBLIC: [issue(67, comments=4, updated_at=stamp(2100))]}
+        old = dict(comment(1, '**Handoff → linux: old', at=stamp(1)), updated_at=stamp(2050))      # edited in the window
+        self.github.comments = {67: [old, comment(2, '**Handoff → linux: new', at=stamp(2100))]}
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+
+    def test_only_the_newest_handoff_ids_are_kept(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=60)]}
+        self.github.comments = {67: [comment(k, '**Handoff → linux: round') for k in range(1, 61)]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        saved = json.loads(state.read_text(encoding='utf-8'))
+        self.assertEqual(saved['comments']['67']['seen'], list(range(11, 61)))
+
+    def test_a_failed_first_read_is_made_again(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, '**Handoff → linux: old')]}
+        self.github.fail_comments = True
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out, 'BATON #67 a held baton https://github.example.invalid/i/67\n')
+        saved = json.loads(state.read_text(encoding='utf-8'))
+        self.assertNotIn('67', saved['comments'])
+        self.assertIsNone(saved['etag'])
+        self.github.fail_comments = False
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out.strip(), 'no batons', out)
+        self.assertIn('67', json.loads(state.read_text(encoding='utf-8'))['comments'])
 
     def test_a_newly_landed_baton_prints_only_baton(self):
         self.github.issues = {PUBLIC: [issue(67, comments=3)]}
@@ -429,7 +533,7 @@ class IssueWatch(unittest.TestCase):
                                      comment(3, '**Handoff → linux: R4 green')]}
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out, 'BATON #67 a held baton https://github.example.invalid/i/67\n')
-        self.assertFalse(any('/comments?' in u for u in self.github.urls), self.github.urls)
+        self.assertEqual(len(self.github.reads), 1, self.github.reads)      # the existing handoff is read, not reported
         self.github.issues = {PUBLIC: [issue(67, comments=4)]}
         self.github.comments[67].append(comment(4, '**Handoff → linux: next'))
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
@@ -445,7 +549,7 @@ class IssueWatch(unittest.TestCase):
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out.strip(), 'no batons', out)
 
-    def test_comments_beyond_the_listed_count_wait_for_the_next_poll(self):
+    def test_a_comment_after_the_listing_wakes_once_and_early(self):
         state = self.home / 'state.json'
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
         self.github.comments = {67: [comment(1, 'progress')]}
@@ -454,10 +558,10 @@ class IssueWatch(unittest.TestCase):
         self.github.comments[67] = [comment(1, 'progress'), comment(2, 'progress'),
                                     comment(3, '**Handoff → linux: R4 green')]
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
-        self.assertEqual(out.strip(), 'no batons', out)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
         self.github.issues = {PUBLIC: [issue(67, comments=3)]}
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
-        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
+        self.assertEqual(out.strip(), 'no batons', out)
 
     def test_a_rate_limited_comment_read_waits_for_the_reset(self):
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
