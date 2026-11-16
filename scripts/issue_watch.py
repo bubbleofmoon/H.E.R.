@@ -129,14 +129,19 @@ def new_events(holding, issues):
 def handoff_events(repo, machine, tok, issues, held_before, counts):
     """(events, counts, complete, wait): a new comment on an already held issue whose first line starts with
     `**Handoff → <machine>`. Counts come from the listing's `comments` field; comments are read only when it grows.
-    A failed read keeps the old count and reports complete=False so the next poll re-reads the listing. wait is the
-    longest rate-limit wait a failed read asked for (0 for none)."""
+    The first failed read stops all further reads in this poll; it and every unread issue keep their old counts. It
+    reports complete=False so the next poll re-reads the listing. wait is the longest rate-limit wait a failed read
+    asked for (0 for none)."""
     prefix = HANDOFF + machine
-    events, fresh, complete, longest = [], {}, True, 0
+    events, fresh, complete, longest, stopped = [], {}, True, 0, False
     for i in sorted((i for i in issues if "pull_request" not in i), key=lambda i: i["number"]):
         n, total = i["number"], int(i.get("comments", 0))
         seen = counts.get(str(n))
         fresh[str(n)] = total
+        if stopped:
+            if seen is not None:
+                fresh[str(n)] = seen
+            continue
         if seen is None or n not in held_before or total <= seen:
             continue
         found = []
@@ -150,7 +155,7 @@ def handoff_events(repo, machine, tok, issues, held_before, counts):
             found += items[max(0, seen - (page - 1) * PAGE):]
         if found is None:
             fresh[str(n)] = seen
-            complete = False
+            complete, stopped = False, True
             continue
         found = found[:total - seen]      # comments posted after the listing wait for the next poll
         events += [f"HANDOFF #{n} {i['title']} {c['html_url']}" for c in found
@@ -177,13 +182,20 @@ def main(argv=None):
             state = json.load(f)
     except (OSError, ValueError):
         state = {"etag": None, "holding": [], "comments": {}}
-    state.setdefault("comments", {})
+    if "comments" not in state:
+        state["comments"] = {}
+        state["etag"] = None      # a state file from before comment counts: re-read the listing to set them
+    pause = state.get("retry_after", 0) - time.time()
+    if pause > 0:
+        time.sleep(pause)         # a comment read's rate limit outlives the run that hit it
+    state["retry_after"] = 0
     tok = token()
     url = f"https://api.github.com/repos/{a.repo}/issues?state=open&labels=baton:{a.machine}&per_page={PAGE}"
     while True:
         etag, issues, wait = fetch(url, tok, state["etag"])
         state["etag"] = etag
         events = []
+        complete, comment_wait = True, 0
         if issues is not None:
             if len(issues) >= PAGE:
                 print(f"{PAGE} or more open issues and pull requests carry this baton; the watcher reads one page only",
@@ -196,11 +208,17 @@ def main(argv=None):
             events += more
             if not complete:
                 state["etag"] = None
+                state["retry_after"] = time.time() + comment_wait if comment_wait else 0
                 if comment_wait and not events:
                     wait = comment_wait
+            else:
+                state["retry_after"] = 0
         write_state(state_path, state)
         if wait == 0 and a.once:
             print("GitHub did not answer; no baton state was read", file=sys.stderr)
+            return 2
+        if a.once and not complete and not comment_wait and not events:
+            print("GitHub did not answer a comment read; no handoff state was read", file=sys.stderr)
             return 2
         if wait is not None:
             time.sleep(max(wait, a.interval))

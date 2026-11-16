@@ -48,9 +48,11 @@ class FakeGitHub:
         self.comment_wait = 0
         self.unchanged = False
         self.urls = []
+        self.etags = []
 
     def __call__(self, url, tok, etag):
         self.urls.append(url)
+        self.etags.append(etag)
         if '/comments?' in url:
             if self.fail_comments:
                 return None, None, self.comment_wait
@@ -284,6 +286,10 @@ class IssueWatch(unittest.TestCase):
         self.github.comments[67].append(comment(2, 'progress note'))
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out.strip(), 'no batons', out)
+        self.github.issues = {PUBLIC: [issue(67, comments=3)]}
+        self.github.comments[67].append(comment(3, '**Handoff → linux: next'))
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
 
     def test_a_handoff_to_the_other_side_never_wakes(self):
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
@@ -293,6 +299,10 @@ class IssueWatch(unittest.TestCase):
         self.github.comments[67].append(comment(2, '**Handoff → windows**'))
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out.strip(), 'no batons', out)
+        self.github.issues = {PUBLIC: [issue(67, comments=3)]}
+        self.github.comments[67].append(comment(3, '**Handoff → linux: next'))
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/3\n')
 
     def test_a_failed_comment_read_is_retried(self):
         state = self.home / 'state.json'
@@ -303,7 +313,8 @@ class IssueWatch(unittest.TestCase):
         self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
         self.github.fail_comments = True
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
-        self.assertEqual(out.strip(), 'no batons', out)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, '')
         saved = json.loads(state.read_text(encoding='utf-8'))
         self.assertIsNone(saved['etag'])
         self.assertEqual(saved['comments'], {'67': 1})
@@ -339,8 +350,12 @@ class IssueWatch(unittest.TestCase):
         code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(out, 'BATON #67 a held baton https://github.example.invalid/i/67\n')
         self.assertFalse(any('/comments?' in u for u in self.github.urls), self.github.urls)
+        self.github.issues = {PUBLIC: [issue(67, comments=4)]}
+        self.github.comments[67].append(comment(4, '**Handoff → linux: next'))
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/4\n')
 
-    # --- fix round 1 (#134 self-review) -------------------------------------------------------
+    # --- fix round 1 (#134 self-review)-------------------------------------------------------
     def test_a_handoff_must_be_the_first_line(self):
         self.github.issues = {PUBLIC: [issue(67, comments=1)]}
         self.github.comments = {67: [comment(1, 'progress')]}
@@ -381,6 +396,78 @@ class IssueWatch(unittest.TestCase):
             code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         sleep.assert_called_once_with(600)
         self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+
+    # --- fix round 2 (#134 Codex gate) -----------------------------------------------------------
+    def test_a_rate_limit_stops_further_comment_reads(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=1), issue(68, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')], 68: [comment(1, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.github.issues = {PUBLIC: [issue(67, comments=2), issue(68, comments=2)]}
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
+        self.github.comments[68].append(comment(2, '**Handoff → linux: R4 green'))
+        self.github.fail_comments = True
+        self.github.comment_wait = 600
+        first_read = len(self.github.urls)
+
+        class Stop(Exception):
+            pass
+
+        def stop(seconds):
+            raise Stop
+
+        with mock.patch.object(self.module.time, 'sleep', stop), self.assertRaises(Stop):
+            self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        comment_urls = [u for u in self.github.urls[first_read:] if '/comments?' in u]
+        self.assertTrue(any('/issues/67/' in u for u in comment_urls), comment_urls)
+        self.assertFalse(any('/issues/68/' in u for u in comment_urls), comment_urls)
+        saved = json.loads(state.read_text(encoding='utf-8'))
+        self.assertEqual(saved['comments'], {'67': 1, '68': 1})
+
+    def test_a_rate_limit_wait_survives_an_event_exit(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.github.issues = {PUBLIC: [issue(67, comments=2), issue(68)]}
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
+        self.github.fail_comments = True
+        self.github.comment_wait = 600
+        with mock.patch.object(self.module.time, 'sleep') as sleep:
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out, 'BATON #68 a held baton https://github.example.invalid/i/68\n')
+        sleep.assert_not_called()
+        saved = json.loads(state.read_text(encoding='utf-8'))
+        self.assertGreater(saved['retry_after'], time.time() + 500)
+        self.github.fail_comments = False
+        with mock.patch.object(self.module.time, 'sleep') as sleep:
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        first = sleep.call_args_list[0].args[0]
+        self.assertTrue(500 <= first <= 600, first)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+
+    def test_an_old_state_file_drops_its_etag(self):
+        state = self.home / 'state.json'
+        state.write_text(json.dumps({'etag': '"E"', 'holding': [67]}), encoding='utf-8')
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertIsNone(self.github.etags[0])
+
+    def test_once_exits_2_when_a_comment_read_gets_no_answer(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.github.issues = {PUBLIC: [issue(67, comments=2)]}
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
+        self.github.fail_comments = True
+        self.github.comment_wait = 0
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(code, 2)
+        self.assertEqual(out, '')
+        saved = json.loads(state.read_text(encoding='utf-8'))
+        self.assertIsNone(saved['etag'])
+        self.assertEqual(saved['comments'], {'67': 1})
 
 
 if __name__ == '__main__':
