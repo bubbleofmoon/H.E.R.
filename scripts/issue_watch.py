@@ -5,6 +5,8 @@ interval with a conditional request; an unchanged result answers 304, which cost
 wakes nobody. It exits when an issue newly carries the label (or carries it again after losing it).
 On an issue it already holds, it also exits on a new comment whose first line starts with "**Handoff → <side>"
 (printed as HANDOFF #<n> <title> <comment url>); other comments, pushes and progress elsewhere never wake it.
+It reads an issue's comments only when the listing's comment count or `updated_at` changes, with `since=` taken from the
+newest comment it has seen (by id), so a comment deleted between the listing and the read never hides a newer one.
 Run it hidden in the background; its exit is the wake-up signal, so start it again after acting on the baton.
 
 usage: python -I scripts/issue_watch.py --machine windows|linux|owner [--repo bubbleofmoon/H.E.R.]
@@ -15,13 +17,14 @@ another repository never makes this one's held issues look new.
 --interval is at least 180 seconds, and every wait, a short rate-limit wait included, lasts at least one interval.
 A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time; a 403 naming a secondary rate limit without either header waits 180 s. Exit 0 after printing; 2 on an API failure, a --once poll or comment read GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
 """
-import argparse, http.client, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.request
+import argparse, datetime, http.client, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 
 REPO = re.compile(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)")
 RATE_LIMIT_CAP = 3600
 PAGE = 100
 MIN_INTERVAL = 180
 HANDOFF = "**Handoff → "
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def interval_arg(value):
@@ -126,39 +129,79 @@ def new_events(holding, issues):
     return events, sorted(now)
 
 
-def handoff_events(repo, machine, tok, issues, held_before, counts):
-    """(events, counts, complete, wait): a new comment on an already held issue whose first line starts with
-    `**Handoff → <machine>`. Counts come from the listing's `comments` field; comments are read only when it grows.
-    The first failed read stops all further reads in this poll; it and every unread issue keep their old counts. It
-    reports complete=False so the next poll re-reads the listing. wait is the longest rate-limit wait a failed read
-    asked for (0 for none)."""
+def minus_second(stamp):
+    """GitHub's `YYYY-MM-DDTHH:MM:SSZ` stamp one second earlier (so a `since=` bound never skips the second of the
+    newest comment seen); None when it is missing or does not parse."""
+    try:
+        moment = datetime.datetime.strptime(stamp, STAMP)
+    except (TypeError, ValueError):
+        return None
+    return (moment - datetime.timedelta(seconds=1)).strftime(STAMP)
+
+
+def read_comments(repo, n, tok, since):
+    """(comments, wait): the comments of issue n updated since `since` (all of them when it is None), oldest first,
+    read page by page until a short page. comments is None when a page got no answer; wait is that read's rate-limit
+    wait (0 for none)."""
+    found, page = [], 1
+    while True:
+        url = f"https://api.github.com/repos/{repo}/issues/{n}/comments?per_page={PAGE}&page={page}"
+        if since:
+            url += "&since=" + urllib.parse.quote(since, safe="")
+        _, items, wait = fetch(url, tok, None)
+        if items is None:
+            return None, wait or 0
+        found += items
+        if len(items) < PAGE:
+            return found, 0
+        page += 1
+
+
+def handoff_events(repo, machine, tok, issues, held_before, marks):
+    """(events, marks, complete, wait): a new comment on an already held issue whose first line starts with
+    `**Handoff → <machine>`. marks maps an issue number to {"count", "updated_at", "id", "at"}: the listing's
+    `comments` and `updated_at` when it was last read, and the id and creation time of the newest comment seen (id
+    None until one is seen: a first sighting is only the listing's `updated_at`, and newer means created after it).
+    A legacy mark (id and at both None, from a state file that held a plain count) takes the comments past that
+    count once. Comments are read, with `since=`, only when the listing's count or `updated_at` differs from the
+    mark; a comment is new when its id is above the mark's, so a comment deleted meanwhile never hides one. A comment
+    created after the listing's `updated_at` waits for the next poll. The first failed read stops all further reads
+    in this poll; it and every unread issue keep their old marks. It reports complete=False so the next poll
+    re-reads the listing. wait is the longest rate-limit wait a failed read asked for (0 for none)."""
     prefix = HANDOFF + machine
     events, fresh, complete, longest, stopped = [], {}, True, 0, False
     for i in sorted((i for i in issues if "pull_request" not in i), key=lambda i: i["number"]):
-        n, total = i["number"], int(i.get("comments", 0))
-        seen = counts.get(str(n))
-        fresh[str(n)] = total
-        if stopped:
-            if seen is not None:
-                fresh[str(n)] = seen
+        n, key = i["number"], str(i["number"])
+        total, stamp = int(i.get("comments", 0)), i.get("updated_at")
+        mark = marks.get(key)
+        entry = {"count": total, "updated_at": stamp, "id": None, "at": stamp}
+        if mark is None or n not in held_before:
+            fresh[key] = entry                # a first sighting is a baseline: nothing is read
             continue
-        if seen is None or n not in held_before or total <= seen:
+        if stopped or (mark["count"], mark["updated_at"]) == (total, stamp):
+            fresh[key] = mark
             continue
-        found = []
-        for page in range(seen // PAGE + 1, (total - 1) // PAGE + 2):
-            url = f"https://api.github.com/repos/{repo}/issues/{n}/comments?per_page={PAGE}&page={page}"
-            _, items, wait = fetch(url, tok, None)
-            if items is None:
-                longest = max(longest, wait or 0)
-                found = None
-                break
-            found += items[max(0, seen - (page - 1) * PAGE):]
-        if found is None:
-            fresh[str(n)] = seen
+        items, wait = read_comments(repo, n, tok, minus_second(mark["at"]))
+        if items is None:
+            longest = max(longest, wait)
+            fresh[key] = mark
             complete, stopped = False, True
             continue
-        found = found[:total - seen]      # comments posted after the listing wait for the next poll
-        events += [f"HANDOFF #{n} {i['title']} {c['html_url']}" for c in found
+        bounded = [c for c in items if stamp is None or (c.get("created_at") or "") <= stamp]   # later ones wait
+        legacy = mark["id"] is None and mark["at"] is None
+        if legacy:
+            new, newest = bounded[mark["count"]:], bounded[-1:]
+        elif mark["id"] is None:
+            new = [c for c in bounded if (c.get("created_at") or "") > mark["at"]]
+            newest = new[-1:]
+        else:
+            new = [c for c in bounded if c.get("id", 0) > mark["id"]]
+            newest = new[-1:]
+        entry["id"], entry["at"] = mark["id"], mark["at"]
+        if newest:
+            entry["id"], entry["at"] = newest[0].get("id"), newest[0].get("created_at")
+        fresh[key] = entry
+        events += [f"HANDOFF #{n} {i['title']} {c['html_url']}" for c in new
                    if (c.get("body") or "").startswith(prefix)]
     return events, fresh, complete, longest
 
@@ -185,6 +228,11 @@ def main(argv=None):
     if "comments" not in state:
         state["comments"] = {}
         state["etag"] = None      # a state file from before comment counts: re-read the listing to set them
+    legacy = {k: v for k, v in state["comments"].items() if isinstance(v, int)}
+    if legacy:
+        state["etag"] = None      # a state file that held plain counts: re-read the listing to replace them
+        for k, count in legacy.items():
+            state["comments"][k] = {"count": count, "updated_at": None, "id": None, "at": None}
     pause = state.get("retry_after", 0) - time.time()
     if pause > 0:
         time.sleep(pause)         # a comment read's rate limit outlives the run that hit it
