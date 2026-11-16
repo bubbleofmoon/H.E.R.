@@ -127,11 +127,12 @@ def new_events(holding, issues):
 
 
 def handoff_events(repo, machine, tok, issues, held_before, counts):
-    """(events, counts, complete): a new comment on an already held issue whose first line starts with
+    """(events, counts, complete, wait): a new comment on an already held issue whose first line starts with
     `**Handoff → <machine>`. Counts come from the listing's `comments` field; comments are read only when it grows.
-    A failed read keeps the old count and reports complete=False so the next poll re-reads the listing."""
+    A failed read keeps the old count and reports complete=False so the next poll re-reads the listing. wait is the
+    longest rate-limit wait a failed read asked for (0 for none)."""
     prefix = HANDOFF + machine
-    events, fresh, complete = [], {}, True
+    events, fresh, complete, longest = [], {}, True, 0
     for i in sorted((i for i in issues if "pull_request" not in i), key=lambda i: i["number"]):
         n, total = i["number"], int(i.get("comments", 0))
         seen = counts.get(str(n))
@@ -141,8 +142,9 @@ def handoff_events(repo, machine, tok, issues, held_before, counts):
         found = []
         for page in range(seen // PAGE + 1, (total - 1) // PAGE + 2):
             url = f"https://api.github.com/repos/{repo}/issues/{n}/comments?per_page={PAGE}&page={page}"
-            _, items, _ = fetch(url, tok, None)
+            _, items, wait = fetch(url, tok, None)
             if items is None:
+                longest = max(longest, wait or 0)
                 found = None
                 break
             found += items[max(0, seen - (page - 1) * PAGE):]
@@ -150,9 +152,10 @@ def handoff_events(repo, machine, tok, issues, held_before, counts):
             fresh[str(n)] = seen
             complete = False
             continue
+        found = found[:total - seen]      # comments posted after the listing wait for the next poll
         events += [f"HANDOFF #{n} {i['title']} {c['html_url']}" for c in found
-                   if (c.get("body") or "").lstrip().startswith(prefix)]
-    return events, fresh, complete
+                   if (c.get("body") or "").startswith(prefix)]
+    return events, fresh, complete, longest
 
 
 def main(argv=None):
@@ -188,11 +191,13 @@ def main(argv=None):
                 return 2
             held_before = set(state["holding"])
             events, state["holding"] = new_events(state["holding"], issues)
-            more, state["comments"], complete = handoff_events(a.repo, a.machine, tok, issues, held_before,
-                                                               state["comments"])
+            more, state["comments"], complete, comment_wait = handoff_events(a.repo, a.machine, tok, issues,
+                                                                             held_before, state["comments"])
             events += more
             if not complete:
                 state["etag"] = None
+                if comment_wait and not events:
+                    wait = comment_wait
         write_state(state_path, state)
         if wait == 0 and a.once:
             print("GitHub did not answer; no baton state was read", file=sys.stderr)
