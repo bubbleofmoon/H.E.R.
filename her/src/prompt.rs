@@ -2123,7 +2123,7 @@ pub(crate) fn prepare_dsh_wake_layered(
     }
     let mut delta = String::new();
     delta.push_str(&token_line(epoch));
-    delta.push_str(&format!("【此刻状态】未读 {} 条；lastAiReplyAt={}\n\n", st["unread"].as_array().map_or(0,Vec::len), st["lastAiReplyAt"]));
+    delta.push_str(&format!("【此刻状态】未读 {} 条；lastReplyAt={}\n\n", st["unread"].as_array().map_or(0,Vec::len), st["lastAiReplyAt"]));
     delta.push_str(&wake_line(st));
     delta.push_str(&format!("【当前唤醒配置】{}\n\n", st["wakeConfig"]));
     delta.push_str("【回复节奏】直接调用发送工具；桥接自动等待。reviseRequired=true 时先看 newMessages 再修改或重发；沉睡观察另计。\n\n");

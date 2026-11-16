@@ -805,7 +805,7 @@ fn model_reads_the_selected_root_portrait_each_time_and_never_the_default_one() 
     fs::remove_file(assets.join("deepseek娘.png")).unwrap();
     let (status, gone) = console.call("GET", path, true, Value::Null);
     assert_eq!(status, 404, "{gone}");
-    assert!(gone["error"].as_str().unwrap().contains("未找到 AI 形象图片"));
+    assert!(gone["error"].as_str().unwrap().contains("未找到形象图片"));
 }
 
 struct Mcp {

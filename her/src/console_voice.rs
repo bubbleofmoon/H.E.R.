@@ -290,7 +290,7 @@ fn resolve_for_ai(lib: &Library, context: &RuntimeContext, input: &str) -> Resul
             None => {
                 // Only the directory name: this message goes back to a model facing untrusted chat.
                 return Err(format!(
-                    "语音只能从语音库取文件（语音库目录：{}）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽 AI 通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。",
+                    "语音只能从语音库取文件（语音库目录：{}）；即使是绝对路径也必须位于语音库之内（socialV2.voice.allowAbsolutePath 已不再放宽工具通道）。请把音频放进语音库，或用操作者通道（CLI / 控制台）发送库外文件。",
                     lib.dir_name()
                 ));
             }
@@ -745,7 +745,7 @@ pub(super) fn operator_send(
     let agent_token = headers.get("x-agent-token").map(|t| t.trim().to_string()).unwrap_or_default();
     // /api/send/voice is the AI tool entrance when a token is present: never a way around "own session only".
     if path == "/api/send/voice" && !agent_token.is_empty() {
-        return err(403, "AI 请改用 /api/socialV2/send-voice（带 key + token）");
+        return err(403, "请改用 /api/socialV2/send-voice（带 key + token）");
     }
     let key = first_member(&b, &["target", "key"]).trim().to_string();
     let Some((kind, id_s)) = voice::parse_target_key(&key) else {

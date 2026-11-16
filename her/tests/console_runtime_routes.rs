@@ -3953,7 +3953,7 @@ fn missing_self_image_public_http_matches_js_not_found() {
     let response = http_request(port, "GET", "/api/socialV2/self-image?key=private%3A7001", Some(token), None, None).unwrap();
     let body = expect_json(response, 404, "missing selected self image");
     assert_eq!(body["ok"], false);
-    assert!(body["error"].as_str().unwrap().contains("未找到 AI 形象图片"));
+    assert!(body["error"].as_str().unwrap().contains("未找到形象图片"));
     drop(console);
 }
 
@@ -3968,7 +3968,7 @@ fn selected_self_image_invalid_paths_return_unavailable() {
     let request = || {
         let response = http_request(port, "GET", "/api/socialV2/self-image?key=private%3A7001", Some(token), None, None).unwrap();
         let body = expect_json(response, 503, "invalid selected self image path");
-        assert_eq!(body["error"], "selected AI image is unavailable");
+        assert_eq!(body["error"], "selected self image is unavailable");
     };
 
     let assets = root.join("resources/assets");

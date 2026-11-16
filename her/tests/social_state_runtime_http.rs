@@ -960,7 +960,7 @@ fn social_state_routes_use_each_selected_runtime_root() {
     assert_error(
         paused_agent,
         403,
-        "AI 已暂停，当前不允许执行 v2 工具",
+        "当前已暂停，不允许执行 v2 工具",
         "agent request in paused B",
     );
 

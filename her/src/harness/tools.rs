@@ -98,9 +98,7 @@ impl Tools {
     }
 
     pub(super) fn instruction(&self) -> String {
-        self.authority.as_ref().map(|a| format!(
-            "HER tool session: {}. For tools with key/token fields, use this key and an empty token string; HER binds it to this admitted turn. A successful QQ send tool already delivers the reply.", a.conversation
-        )).unwrap_or_default()
+        self.authority.as_ref().map(|a| session_instruction(&a.conversation)).unwrap_or_default()
     }
 
     pub(super) fn model_tools(&self) -> Vec<Tool> {
@@ -125,7 +123,7 @@ impl Tools {
             Err(outcome) => return Err(outcome),
         };
         let Some(authority) = &self.authority else {
-            return Err(error("harness tool authority is unavailable"));
+            return Err(error("tool authority is unavailable"));
         };
         let current = match authority
             .check()
@@ -133,13 +131,13 @@ impl Tools {
             .and_then(|_| authority.context.load_config().map_err(str::to_string))
         {
             Ok(cfg) => cfg,
-            Err(_) => return Err(error("harness tool authority changed")),
+            Err(_) => return Err(error("tool authority changed")),
         };
         if !definitions(&current, &authority.conversation)
             .iter()
             .any(|d| d["name"] == call.fn_name)
         {
-            return Err(error("harness tool is no longer enabled"));
+            return Err(error("tool is no longer enabled"));
         }
         // Validate before applying defaults, as the MCP server does. Never consult QQ_SESSION_*.
         let definition = self
@@ -179,19 +177,19 @@ impl Tools {
     /// Recheck after scheduling the blocking worker; QQ effects also reauthorize in the console.
     pub(super) fn dispatch(&self, call: &ToolCall, args: &Value) -> Value {
         let Some(authority) = &self.authority else {
-            return error("harness tool authority is unavailable");
+            return error("tool authority is unavailable");
         };
         if authority.check().is_err() {
-            return error("harness tool authority changed");
+            return error("tool authority changed");
         }
         let Ok(cfg) = authority.context.load_config() else {
-            return error("harness tool authority changed");
+            return error("tool authority changed");
         };
         if !definitions(&cfg, &authority.conversation)
             .iter()
             .any(|d| d["name"] == call.fn_name)
         {
-            return error("harness tool is no longer enabled");
+            return error("tool is no longer enabled");
         }
         match call.fn_name.as_str() {
             "web_search" | "web_fetch" | "snowluma_status" => {
@@ -247,4 +245,9 @@ fn definitions(cfg: &Value, conversation: &str) -> Vec<Value> {
 
 pub(super) fn error(reason: &str) -> Value {
     json!({"content":[{"type":"text","text":reason}],"isError":true})
+}
+
+/// The system line of an admitted harness turn; the model reads it.
+pub(crate) fn session_instruction(conversation: &str) -> String {
+    format!("Tool session: {conversation}. For tools with key/token fields, use this key and an empty token string; the bridge binds it to this turn. A successful QQ send tool already delivers the reply.")
 }

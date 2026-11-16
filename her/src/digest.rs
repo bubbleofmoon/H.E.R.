@@ -10,6 +10,9 @@ pub(crate) use model::{model_for, DigestModel, ModelError};
 use conversation::Hold;
 #[cfg(test)]
 pub(crate) use model::install_test_model;
+/// The digest's model prompt, for the model-visible text guard (`console::tests::model_text_guard_tests`).
+#[cfg(test)]
+pub(crate) use conversation::PROMPT as DIGEST_PROMPT;
 
 use crate::{runtime::{RuntimeArea, RuntimeContext}, task_runs::{Finish, LogStream, RunHandle}, tasks::{TaskDef, TaskId}};
 use serde_json::Value;

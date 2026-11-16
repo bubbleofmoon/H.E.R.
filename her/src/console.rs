@@ -1506,6 +1506,8 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
     } else {
         Value::Null
     };
+    // The copied config sections pass the settings redaction: a secret in them reads as the marker.
+    let recommended = redact_setting("socialV2", recommended);
 
     let reply_window = reply_timing::QuietWindow::configured(&cfg,reply_timing::urgent(&cfg,key,&st));
 
@@ -2694,7 +2696,49 @@ const SETTINGS_WRITABLE: [&str; 17] = [
 ];
 
 const SETTINGS_READONLY_HINT: &str =
-    "白名单 allow.* / ownerQQ / dsh.* / snowluma.* / consoleToken / 任何路径类字段只能本地改";
+    "白名单 allow.* / ownerQQ / 后端与网关配置 / consoleToken / 任何路径类字段只能本地改";
+
+/// What `settings-get` shows in place of a secret.
+const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
+
+/// The refusal for a settings read outside `SETTINGS_WRITABLE`. It never repeats the requested key.
+const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
+
+/// A secret config path: everything under `security.*`, and every path with a segment (lower case,
+/// `-` and `_` removed) that ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
+/// credential(s), such as `accessToken`, `api-keys`, `bearer_token` or `privateKey`. Every segment
+/// counts, ancestors included, so `relay.credentials.0` is as secret as `relay.credentials`.
+fn setting_is_secret(path: &str) -> bool {
+    if path.split('.').next().is_some_and(|first| first.eq_ignore_ascii_case("security")) {
+        return true;
+    }
+    path.split('.').any(|segment| {
+        let segment: String = segment.chars().filter(|c| *c != '-' && *c != '_').collect::<String>().to_lowercase();
+        ["token", "tokens", "secret", "secrets", "password", "passwd", "apikey", "apikeys", "key", "keys", "credential", "credentials"]
+            .iter()
+            .any(|suffix| segment.ends_with(suffix))
+    })
+}
+
+/// `value`, read at `path`, with every secret replaced by the marker, nested members and array items included.
+fn redact_setting(path: &str, value: Value) -> Value {
+    if setting_is_secret(path) {
+        return json!(SETTINGS_SECRET_MARKER);
+    }
+    match value {
+        Value::Object(members) => Value::Object(
+            members
+                .into_iter()
+                .map(|(name, member)| {
+                    let redacted = redact_setting(&format!("{path}.{name}"), member);
+                    (name, redacted)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(|item| redact_setting(path, item)).collect()),
+        other => other,
+    }
+}
 
 /// 是否允许对话式修改：**黑名单优先** —— 只要看起来像凭据/白名单/路径就一律拒绝。
 fn is_setting_writable(path: &str) -> bool {
@@ -2814,7 +2858,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                 let mut all = serde_json::Map::new();
                 for p in SETTINGS_WRITABLE {
                     if let Some(v) = read_setting_path(cfg, p) {
-                        all.insert(p.to_string(), v);
+                        all.insert(p.to_string(), redact_setting(p, v));
                     }
                 }
                 return Ok(json!({
@@ -2824,18 +2868,18 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
             }
+            // Only the settings the model may also change are readable. Any other key (a console token,
+            // a gateway, backend, relay or model setting, an unknown path) is refused without naming it.
+            if !SETTINGS_WRITABLE.contains(&path.as_str()) {
+                return Err((403, SETTINGS_READ_REFUSED.to_string()));
+            }
             let mut result = json!({
                 "ok": true,
                 "key": path,
                 "writable": is_setting_writable(&path),
             });
-            // Accepted deviation 19 (security): a console token, generated or manual, is never
-            // returned; JS answers `cfg.consoleToken` here.
-            let first = path.split('.').next().unwrap_or("");
-            if first != "consoleToken" {
-                if let Some(value) = read_setting_path(cfg, &path) {
-                    result["value"] = value;
-                }
+            if let Some(value) = read_setting_path(cfg, &path) {
+                result["value"] = redact_setting(&path, value);
             }
             return Ok(result);
         }
@@ -2844,7 +2888,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         if !is_setting_writable(&path) {
             return Err((
                 403,
-                format!("该项不可通过对话修改：{path}（白名单/令牌/路径类必须本地改）"),
+                "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）".to_string(),
             ));
         }
         let value = b.get("value").cloned().unwrap_or(Value::Null);
@@ -3779,7 +3823,7 @@ fn social_projection_write_denial(
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
         return Err((
             403,
-            "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+            "当前已暂停，不允许执行 v2 工具".to_string(),
         ));
     }
 
@@ -3901,7 +3945,7 @@ where
         if state.get("paused").and_then(Value::as_bool) == Some(true) {
             return Err((
                 403,
-                "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+                "当前已暂停，不允许执行 v2 工具".to_string(),
             ));
         }
         let cfg = context
@@ -7290,7 +7334,7 @@ where
         .cloned()
         .unwrap_or_else(|| json!({}));
     if collect_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-        return Err((403, "AI 收藏表情功能已关闭".to_string()));
+        return Err((403, "收藏表情功能已关闭".to_string()));
     }
     // 频率限制（state 里的 stickerCollectTimes）
     if context.is_isolated() {
@@ -8405,35 +8449,35 @@ fn handle_self_image(
     }
     let path = crate::legacy_path!("qq-bridge/assets/deepseek娘.png");
     let _source = crate::media::admit_source()
-        .ok_or_else(|| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?;
+        .ok_or_else(|| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let bytes = if context.is_isolated() {
         let (area, relative) = runtime_location(path)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?;
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
         let selected = context.resolve_path(area, &relative, PathIntent::ReadOptionalFile)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?;
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
         match std::fs::symlink_metadata(&selected) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err((404, "未找到 AI 形象图片 assets/deepseek娘.png".to_string()));
+                return Err((404, "未找到形象图片".to_string()));
             }
-            Err(_) => return Err((503, "selected AI image is unavailable".to_string())),
+            Err(_) => return Err((503, "selected self image is unavailable".to_string())),
             Ok(_) => {}
         }
         let checked = context.resolve_path(area, &relative, PathIntent::ReadFile)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?;
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
         if checked != selected {
-            return Err((503, "selected AI image is unavailable".to_string()));
+            return Err((503, "selected self image is unavailable".to_string()));
         }
         crate::media::read_image_path(&selected, crate::media_normalize::MAX_INPUT_BYTES)
-            .map_err(|_| (503, "selected AI image is unavailable".to_string()))?
+            .map_err(|_| (503, "selected self image is unavailable".to_string()))?
     } else {
         if !std::path::Path::new(path).exists() {
-            return Err((404, "未找到 AI 形象图片 assets/deepseek娘.png".to_string()));
+            return Err((404, "未找到形象图片".to_string()));
         }
         crate::media::read_image_path(std::path::Path::new(path), crate::media_normalize::MAX_INPUT_BYTES)
-            .map_err(|_| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?
+            .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?
     };
     let normalized = crate::media_normalize::normalize(&bytes, crate::media::Limits::from_config(cfg).pixels)
-        .map_err(|_| (500, "读取 AI 形象图片失败：（图片获取失败）".to_string()))?;
+        .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let images = crate::media::image_values(&normalized);
     Ok(json!({ "ok": true, "key": key, "image": images[0], "images": images }))
 }
@@ -11435,7 +11479,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
             "recommendedSleepMinMs": 300000,
             "recommendedSleepMaxMs": 7200000,
             "recommendedProbability": 0.05,
-            "recommendedKeywords": ["小鲸鱼", "DeepSeek", "deepseek", "DS", "D老师", "d老师", "D指导", "d指导", "D师傅", "d师傅", "深度求索", "大肥鱼", "鲸鱼", "DeepSeek V3", "DeepSeek R1", "R1"],
+            "recommendedKeywords": ["小鲸鱼", "大肥鱼", "鲸鱼"],
             "recommendedAtMention": true,
             "recommendedNameMention": true,
             "recommendedQuestion": true,
@@ -11674,7 +11718,7 @@ fn tool_log_agent_denial(
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
         return Some((
             403,
-            "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+            "当前已暂停，不允许执行 v2 工具".to_string(),
         ));
     }
     if cfg
@@ -11768,7 +11812,7 @@ fn social_agent_policy_denial(
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
         return Some((
             403,
-            "AI 已暂停，当前不允许执行 v2 工具".to_string(),
+            "当前已暂停，不允许执行 v2 工具".to_string(),
         ));
     }
     if cfg
@@ -11904,7 +11948,7 @@ fn send_message_global_agent_denial(
         Err((status, message)) => return Some((status, message)),
     };
     if state.get("paused").and_then(Value::as_bool) == Some(true) {
-        return Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()));
+        return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
     }
     if cfg
         .get("socialV2")
@@ -21185,7 +21229,7 @@ mod tests {
         std::fs::write(root_a.0.join("data/social-v2.json"), paused).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg_a, &context_a),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
         std::fs::write(&root_a.0.join("data/social-v2.json"), &state_a_before).unwrap();
 
@@ -21448,7 +21492,7 @@ mod tests {
             .unwrap_err(),
             (
                 403,
-                "该项不可通过对话修改：socialV2.send.mergeMultiIntoOne（白名单/令牌/路径类必须本地改）"
+                "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）"
                     .to_string()
             )
         );
@@ -23192,7 +23236,7 @@ mod tests {
         let request = make_request(Some("session-token"), "/api/socialV2/send-message", "POST");
         assert_eq!(
             send_message_global_agent_denial(&request, &cfg, &context),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
 
         std::fs::write(
@@ -24254,7 +24298,7 @@ mod tests {
             ),
             (
                 "paused",
-                (403, "AI 已暂停，当前不允许执行 v2 工具".to_string()),
+                (403, "当前已暂停，不允许执行 v2 工具".to_string()),
             ),
             (
                 "disabled",
@@ -24566,7 +24610,7 @@ mod tests {
         let key = "private:7001";
         let cases = [
             ("token", "agent token 无效"),
-            ("paused", "AI 已暂停，当前不允许执行 v2 工具"),
+            ("paused", "当前已暂停，不允许执行 v2 工具"),
             ("enabled", "二代模式已关闭，当前不允许执行 v2 工具"),
             ("mode", "该接口仅 reserved2 模式可用"),
             ("tool", "工具未启用：qq_memory_append"),
@@ -25683,7 +25727,7 @@ mod tests {
         std::fs::write(&state_path, paused).unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), paused);
 
@@ -25931,7 +25975,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             social_agent_policy_denial(&request, &cfg, &context),
-            Some((403, "AI 已暂停，当前不允许执行 v2 工具".to_string()))
+            Some((403, "当前已暂停，不允许执行 v2 工具".to_string()))
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -26495,4 +26539,5 @@ mod tests {
     mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
+    mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
 }

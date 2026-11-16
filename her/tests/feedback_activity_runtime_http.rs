@@ -515,7 +515,7 @@ fn feedback_is_refused_for_the_model_while_paused_but_not_for_the_operator() {
     let (s, _) = console.admin("POST", "/api/socialV2/activity", json!({"paused": true}));
     assert_eq!(s, 200);
     let (s, b) = console.agent(AGENT_A, "POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "x"}));
-    assert_eq!((s, b["error"].as_str().unwrap()), (403, "AI 已暂停，当前不允许执行 v2 工具"));
+    assert_eq!((s, b["error"].as_str().unwrap()), (403, "当前已暂停，不允许执行 v2 工具"));
     let (s, _) = console.admin("POST", "/api/socialV2/feedback", json!({"key": KEY_A, "message": "operator note"}));
     assert_eq!(s, 200);
     let (s, _) = console.admin("POST", "/api/socialV2/activity", json!({"paused": false}));
