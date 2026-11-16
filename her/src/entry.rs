@@ -1034,6 +1034,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("report") {
         std::process::exit(report::run_cli(&args[2..]));
     }
+    // #183: one-shot capture and denylist sweep of the next upstream model request (selected root).
+    if args.get(1).map(String::as_str) == Some("upstream-capture") {
+        std::process::exit(upstream_capture::run_cli(&args[2..]));
+    }
     // Ticket 27: desired state and task history of a selected root (explicit root, works with a broken config).
     if args.get(1).map(String::as_str) == Some("process") {
         std::process::exit(process_identity::run_cli(&args[2..]));

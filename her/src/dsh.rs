@@ -390,6 +390,10 @@ impl Rpc {
             "method": endpoint,
             "payload": { "args": args },
         });
+        if endpoint == "session/prompt" {
+            // #183: a capture the operator armed takes this prompt exactly as it is posted.
+            crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
+        }
 
         let host_port = self
             .base
@@ -520,6 +524,10 @@ impl Rpc {
             "payload": { "args": args },
         });
         let (host_port, address) = bounded_loopback_endpoint(&self.base)?;
+        if endpoint == "session/prompt" {
+            // #183: a capture the operator armed takes this prompt exactly as it is posted.
+            crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
+        }
         let body_text = envelope.to_string();
         let (mut status, mut text) = http_post_with_deadline(
             &host_port,
