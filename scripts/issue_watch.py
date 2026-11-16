@@ -208,7 +208,7 @@ def main(argv=None):
             events += more
             if not complete:
                 state["etag"] = None
-                state["retry_after"] = time.time() + comment_wait if comment_wait else 0
+                state["retry_after"] = time.time() + max(comment_wait, a.interval) if comment_wait else 0
                 if comment_wait and not events:
                     wait = comment_wait
             else:

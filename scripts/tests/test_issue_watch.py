@@ -446,6 +446,28 @@ class IssueWatch(unittest.TestCase):
         self.assertTrue(500 <= first <= 600, first)
         self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
 
+    def test_a_short_comment_wait_still_keeps_the_minimum_interval(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.github.issues = {PUBLIC: [issue(67, comments=2), issue(68)]}
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
+        self.github.fail_comments = True
+        self.github.comment_wait = 8
+        with mock.patch.object(self.module.time, 'sleep') as sleep:
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out, 'BATON #68 a held baton https://github.example.invalid/i/68\n')
+        sleep.assert_not_called()
+        saved = json.loads(state.read_text(encoding='utf-8'))
+        self.assertGreater(saved['retry_after'], time.time() + 170)
+        self.github.fail_comments = False
+        with mock.patch.object(self.module.time, 'sleep') as sleep:
+            code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        first = sleep.call_args_list[0].args[0]
+        self.assertTrue(170 <= first <= 180, first)
+        self.assertEqual(out, 'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+
     def test_an_old_state_file_drops_its_etag(self):
         state = self.home / 'state.json'
         state.write_text(json.dumps({'etag': '"E"', 'holding': [67]}), encoding='utf-8')
