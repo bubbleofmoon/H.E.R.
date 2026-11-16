@@ -1506,6 +1506,8 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
     } else {
         Value::Null
     };
+    // The copied config sections pass the settings redaction: a secret in them reads as the marker.
+    let recommended = redact_setting("socialV2", recommended);
 
     let reply_window = reply_timing::QuietWindow::configured(&cfg,reply_timing::urgent(&cfg,key,&st));
 
@@ -2702,17 +2704,20 @@ const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
 /// The refusal for a settings read outside `SETTINGS_WRITABLE`. It never repeats the requested key.
 const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
 
-/// A secret config path: everything under `security.*`, and every key whose last segment (lower case,
-/// `-` and `_` removed) ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
-/// credential(s), such as `accessToken`, `api-keys`, `bearer_token` or `privateKey`.
+/// A secret config path: everything under `security.*`, and every path with a segment (lower case,
+/// `-` and `_` removed) that ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
+/// credential(s), such as `accessToken`, `api-keys`, `bearer_token` or `privateKey`. Every segment
+/// counts, ancestors included, so `relay.credentials.0` is as secret as `relay.credentials`.
 fn setting_is_secret(path: &str) -> bool {
     if path.split('.').next().is_some_and(|first| first.eq_ignore_ascii_case("security")) {
         return true;
     }
-    let last: String = path.rsplit('.').next().unwrap_or("").chars().filter(|c| *c != '-' && *c != '_').collect::<String>().to_lowercase();
-    ["token", "tokens", "secret", "secrets", "password", "passwd", "apikey", "apikeys", "key", "keys", "credential", "credentials"]
-        .iter()
-        .any(|suffix| last.ends_with(suffix))
+    path.split('.').any(|segment| {
+        let segment: String = segment.chars().filter(|c| *c != '-' && *c != '_').collect::<String>().to_lowercase();
+        ["token", "tokens", "secret", "secrets", "password", "passwd", "apikey", "apikeys", "key", "keys", "credential", "credentials"]
+            .iter()
+            .any(|suffix| segment.ends_with(suffix))
+    })
 }
 
 /// `value`, read at `path`, with every secret replaced by the marker, nested members and array items included.
@@ -2863,18 +2868,18 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
             }
+            // Only the settings the model may also change are readable. Any other key (a console token,
+            // a gateway, backend, relay or model setting, an unknown path) is refused without naming it.
+            if !SETTINGS_WRITABLE.contains(&path.as_str()) {
+                return Err((403, SETTINGS_READ_REFUSED.to_string()));
+            }
             let mut result = json!({
                 "ok": true,
                 "key": path,
                 "writable": is_setting_writable(&path),
             });
-            // Accepted deviation 19 (security): a console token, generated or manual, is never
-            // returned; JS answers `cfg.consoleToken` here.
-            let first = path.split('.').next().unwrap_or("");
-            if first != "consoleToken" {
-                if let Some(value) = read_setting_path(cfg, &path) {
-                    result["value"] = redact_setting(&path, value);
-                }
+            if let Some(value) = read_setting_path(cfg, &path) {
+                result["value"] = redact_setting(&path, value);
             }
             return Ok(result);
         }
@@ -2883,7 +2888,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         if !is_setting_writable(&path) {
             return Err((
                 403,
-                format!("该项不可通过对话修改：{path}（白名单/令牌/路径类必须本地改）"),
+                "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）".to_string(),
             ));
         }
         let value = b.get("value").cloned().unwrap_or(Value::Null);
@@ -21487,7 +21492,7 @@ mod tests {
             .unwrap_err(),
             (
                 403,
-                "该项不可通过对话修改：socialV2.send.mergeMultiIntoOne（白名单/令牌/路径类必须本地改）"
+                "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）"
                     .to_string()
             )
         );

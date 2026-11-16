@@ -443,11 +443,26 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
                 message.map(|m| slice_utf16(&m, 200))
             })
             .unwrap_or_default();
-        let message = if detail.is_empty() { format!("主搜索接口 HTTP {status}") } else { format!("主搜索接口 HTTP {status}：{detail}") };
-        return Err(SearchError::new("HTTP_ERROR", message));
+        // The provider's own error text stays in the log; the model reads the HTTP status only.
+        if !detail.is_empty() {
+            crate::safe_eprintln!("[web_search] 主搜索接口 HTTP {status}：{detail}");
+        }
+        return Err(SearchError::new("HTTP_ERROR", format!("主搜索接口 HTTP {status}")));
     }
     let parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主搜索接口返回了无法解析的响应"))?;
     map_deepseek_response(&parsed, config.max_results as usize)
+}
+
+/// What the model reads about a failed primary search: the fixed text of a coded failure (at most an
+/// HTTP status), never the endpoint's or the transport's own wording, which goes to the log.
+fn primary_failure_text(error: &SearchError) -> String {
+    match error.code {
+        "NO_KEY" | "HTTP_ERROR" | "BAD_BODY" | "NO_RESULT_BLOCK" => error.message.clone(),
+        _ => {
+            crate::safe_eprintln!("[web_search] 主搜索失败：{}", error.message);
+            "主搜索暂时不可用".to_string()
+        }
+    }
 }
 
 fn bing_url(extra: &[(&str, &str)], query: &str, count: i64) -> String {
@@ -508,12 +523,12 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
     };
     let attempt_bing = || -> Result<Value, String> { bing_search(q, &config, net).map(|results| json!({"query": q, "provider": "bing", "results": results})) };
     let mut value = match wanted.as_str() {
-        "deepseek" => attempt_deepseek().map_err(|e| e.message)?,
+        "deepseek" => attempt_deepseek().map_err(|e| primary_failure_text(&e))?,
         "bing" => attempt_bing()?,
         _ => match attempt_deepseek() {
             Ok(v) => v,
             Err(error) => {
-                let reason = if error.code == "NO_KEY" { "未配置主搜索凭据".to_string() } else { format!("主搜索不可用：{}", error.message) };
+                let reason = if error.code == "NO_KEY" { "未配置主搜索凭据".to_string() } else { format!("主搜索不可用：{}", primary_failure_text(&error)) };
                 let mut bing = attempt_bing().map_err(|bing_error| format!("{reason}；Bing 兜底也失败：{bing_error}"))?;
                 bing["fallbackFrom"] = json!("primary");
                 bing["note"] = json!(format!("{reason}，已回退 Bing"));

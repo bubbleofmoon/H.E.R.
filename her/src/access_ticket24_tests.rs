@@ -613,8 +613,8 @@ fn ticket24_fix2_a_generated_token_stays_out_of_config_settings_and_audit() {
     assert!(!all.to_string().contains(&generated), "settings-get returned the generated token: {all}");
     let mut named = args.clone();
     named["settingKey"] = json!("consoleToken");
-    let one = memory_tool_action(&context, "settings-get", &named).unwrap();
-    assert!(!one.to_string().contains(&generated), "settings-get returned the generated token: {one}");
+    let one = memory_tool_action(&context, "settings-get", &named);
+    assert_eq!(one, Err(SETTINGS_READ_REFUSED.to_string()), "settings-get must refuse the console token");
     let cfg = context.load_config().unwrap();
     let headers = HashMap::from([("x-console-token".to_string(), generated.clone())]);
     let acl = handle_memory_action("acl", &headers, &HashMap::new(), "{}", &cfg, &context);
@@ -813,8 +813,8 @@ fn ticket24_fix2_settings_get_never_returns_a_manual_console_token() {
     let (root, context) = seeded("票据24 fix2 settings manual", manual);
     with_owner_session(&root, &context);
     let named = json!({"key": OWNER_KEY, "token": OWNER_AGENT_TOKEN, "settingKey": "consoleToken"});
-    let one = memory_tool_action(&context, "settings-get", &named).unwrap();
-    assert!(!one.to_string().contains(manual), "{one}");
+    let one = memory_tool_action(&context, "settings-get", &named);
+    assert_eq!(one, Err(SETTINGS_READ_REFUSED.to_string()), "settings-get must refuse the console token");
     drop(root);
 }
 
