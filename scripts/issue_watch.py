@@ -3,8 +3,9 @@
 Protocol: `docs/agents/baton.md` ("Watcher"). The watcher asks GitHub for open issues labelled `baton:<side>` once per
 interval with a conditional request; an unchanged result answers 304, which costs nothing against the rate limit and
 wakes nobody. It exits when an issue newly carries the label (or carries it again after losing it).
-Comments, pushes and progress elsewhere never wake it. Run it hidden in the background; its exit is the wake-up
-signal, so start it again after acting on the baton.
+On an issue it already holds, it also exits on a new comment whose first line starts with "**Handoff → <side>"
+(printed as HANDOFF #<n> <title> <comment url>); other comments, pushes and progress elsewhere never wake it.
+Run it hidden in the background; its exit is the wake-up signal, so start it again after acting on the baton.
 
 usage: python -I scripts/issue_watch.py --machine windows|linux|owner [--repo bubbleofmoon/H.E.R.]
                                         [--state <file>] [--interval 180] [--once]
@@ -20,6 +21,7 @@ REPO = re.compile(r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)")
 RATE_LIMIT_CAP = 3600
 PAGE = 100
 MIN_INTERVAL = 180
+HANDOFF = "**Handoff → "
 
 
 def interval_arg(value):
@@ -124,6 +126,35 @@ def new_events(holding, issues):
     return events, sorted(now)
 
 
+def handoff_events(repo, machine, tok, issues, held_before, counts):
+    """(events, counts, complete): a new comment on an already held issue whose first line starts with
+    `**Handoff → <machine>`. Counts come from the listing's `comments` field; comments are read only when it grows.
+    A failed read keeps the old count and reports complete=False so the next poll re-reads the listing."""
+    prefix = HANDOFF + machine
+    events, fresh, complete = [], {}, True
+    for i in sorted((i for i in issues if "pull_request" not in i), key=lambda i: i["number"]):
+        n, total = i["number"], int(i.get("comments", 0))
+        seen = counts.get(str(n))
+        fresh[str(n)] = total
+        if seen is None or n not in held_before or total <= seen:
+            continue
+        found = []
+        for page in range(seen // PAGE + 1, (total - 1) // PAGE + 2):
+            url = f"https://api.github.com/repos/{repo}/issues/{n}/comments?per_page={PAGE}&page={page}"
+            _, items, _ = fetch(url, tok, None)
+            if items is None:
+                found = None
+                break
+            found += items[max(0, seen - (page - 1) * PAGE):]
+        if found is None:
+            fresh[str(n)] = seen
+            complete = False
+            continue
+        events += [f"HANDOFF #{n} {i['title']} {c['html_url']}" for c in found
+                   if (c.get("body") or "").lstrip().startswith(prefix)]
+    return events, fresh, complete
+
+
 def main(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument("--machine", required=True, choices=["windows", "linux", "owner"])
@@ -142,7 +173,8 @@ def main(argv=None):
         with open(state_path, encoding="utf-8") as f:
             state = json.load(f)
     except (OSError, ValueError):
-        state = {"etag": None, "holding": []}
+        state = {"etag": None, "holding": [], "comments": {}}
+    state.setdefault("comments", {})
     tok = token()
     url = f"https://api.github.com/repos/{a.repo}/issues?state=open&labels=baton:{a.machine}&per_page={PAGE}"
     while True:
@@ -154,7 +186,13 @@ def main(argv=None):
                 print(f"{PAGE} or more open issues and pull requests carry this baton; the watcher reads one page only",
                       file=sys.stderr)
                 return 2
+            held_before = set(state["holding"])
             events, state["holding"] = new_events(state["holding"], issues)
+            more, state["comments"], complete = handoff_events(a.repo, a.machine, tok, issues, held_before,
+                                                               state["comments"])
+            events += more
+            if not complete:
+                state["etag"] = None
         write_state(state_path, state)
         if wait == 0 and a.once:
             print("GitHub did not answer; no baton state was read", file=sys.stderr)
