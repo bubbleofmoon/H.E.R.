@@ -13,7 +13,7 @@ The default state file is ~/.her-baton-watch-<machine>-<owner>-<repo>.json (each
 another repository never makes this one's held issues look new.
 --once polls a single time and prints the newly held issues ("no batons" when none are new).
 --interval is at least 180 seconds, and every wait, a short rate-limit wait included, lasts at least one interval.
-A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time; a 403 naming a secondary rate limit without either header waits 180 s. Exit 0 after printing; 2 on an API failure, a --once poll GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
+A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time; a 403 naming a secondary rate limit without either header waits 180 s. Exit 0 after printing; 2 on an API failure, a --once poll or comment read GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
 """
 import argparse, http.client, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
