@@ -232,7 +232,7 @@ class IssueWatch(unittest.TestCase):
 
     def test_the_watcher_sleeps_out_a_rate_limit_then_reports(self):
         answers = iter([(None, None, 500), (None, [issue(5)], None)])
-        self.module.fetch = lambda url, tok, etag: next(answers)
+        self.module.fetch = lambda url, tok, etag: (None, [], None) if '/comments' in url else next(answers)
         with mock.patch.object(self.module.time, 'sleep') as sleep:
             code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(code, 0)
@@ -274,7 +274,7 @@ class IssueWatch(unittest.TestCase):
 
     def test_a_short_rate_limit_wait_still_waits_one_interval(self):
         answers = iter([(None, None, 5), (None, [issue(5)], None)])
-        self.module.fetch = lambda url, tok, etag: next(answers)
+        self.module.fetch = lambda url, tok, etag: (None, [], None) if '/comments' in url else next(answers)
         with mock.patch.object(self.module.time, 'sleep') as sleep:
             code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC)
         self.assertEqual(code, 0)
