@@ -2086,13 +2086,14 @@ mod tests {
         assert!(capture::captured(&context).is_none());
         rpc.call_with_rpc_id("session.prompt", prompt("fixture wake 183 one"), "rpc-183-1").unwrap();
         rpc.call_with_rpc_id("session.prompt", prompt("fixture wake 183 two"), "rpc-183-2").unwrap();
-        let first = capture::captured(&context).expect("the first prompt was captured");
+        // The capture is written on its own thread: wait for it before the next step.
+        let first = capture::settled(&context).expect("the first prompt was captured");
         // The bounded call path captures the same way.
         capture::disarm(&context);
         capture::arm(&context, "dsh");
         rpc.call_with_cancellation_as("session.prompt", prompt("fixture wake 183 three"), "rpc-183-3", deadline(), &|| false).unwrap();
         rpc.call_with_cancellation_as("session.prompt", prompt("fixture wake 183 four"), "rpc-183-4", deadline(), &|| false).unwrap();
-        let second = capture::captured(&context).expect("the third prompt was captured");
+        let second = capture::settled(&context).expect("the third prompt was captured");
         let bodies = server.join().expect("join fake DSH server");
         assert_eq!(first["route"], "dsh");
         assert_eq!(first["request"], bodies[1], "the capture is the envelope DSH received");

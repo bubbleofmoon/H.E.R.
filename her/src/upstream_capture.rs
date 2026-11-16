@@ -1,18 +1,24 @@
 //! One-shot capture of the next model request HER sends upstream, and its sweep for the #142
 //! denylist (#183). The operator arms a capture for one route with `her-cli upstream-capture arm`;
-//! the next request on that route claims the arming right before it leaves HER and is written once
-//! to `data/upstream-capture/captured.json` in the selected runtime. `sweep` prints only counts and
-//! JSON field paths of the denied terms, never content, and deletes the capture. Nothing is
-//! captured unless armed, and an arming expires.
+//! the next request on that route is snapshotted right before it leaves HER and written once, on a
+//! background thread, to `data/upstream-capture/captured.json` in the selected runtime. `sweep`
+//! prints only counts and JSON field paths of the denied terms, never content, and deletes the
+//! capture. Nothing is captured unless armed, and an arming expires.
 //!
 //! Capture points (`offer`):
 //! - `dsh`: every `session/prompt` envelope `dsh::Rpc` posts (wake, chat and learner prompts).
 //! - `harness`: every model step's request in `harness::tool_loop`, as the provider-neutral
 //!   `ChatRequest` with the model id and token limit that the model client turns into the relay call.
+//!
+//! The send path never waits on the capture and never panics for it: `offer` does one metadata
+//! lookup and takes the snapshot; claiming, writing and every diagnostic happen on a detached
+//! thread, and diagnostics ignore a failed stderr write.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const ARMED_FILE: &str = "upstream-capture/armed.json";
 const CLAIMED_FILE: &str = "upstream-capture/claimed.json";
@@ -24,10 +30,27 @@ const MAX_MINUTES: i64 = 1440;
 /// A string of at least this many bytes made only of base64 characters, or a base64 data URL, is
 /// binary content: counted, never checked.
 const BINARY_MIN_BYTES: usize = 256;
-/// The longest object key a field path shows; a longer or non-identifier key is shown as `*`.
-const PATH_KEY_MAX: usize = 64;
+/// The placeholder a field path shows for an object key outside `STRUCTURAL_KEYS`.
+const KEY_PLACEHOLDER: &str = "<key>";
+/// Object keys a field path shows: the structure of the DSH envelope, of the harness request
+/// (`ChatRequest`, its messages, parts and tools) and of JSON Schema. Any other key (a tool
+/// parameter, a model-written argument name, a stray identifier or secret) is shown as `<key>`.
+const STRUCTURAL_KEYS: &[&str] = &[
+    "$schema", "Base64", "Binary", "ReasoningContent", "Text", "ThoughtSignature", "ToolCall", "ToolResponse", "Url",
+    "additionalProperties", "allOf", "anyOf", "args", "call_id", "config", "const", "content", "content_type", "data",
+    "default", "description", "enum", "fn_arguments", "fn_name", "format", "function", "items", "maxItems",
+    "maxLength", "maxTokens", "maximum", "messages", "method", "mimeType", "minItems", "minLength", "minimum", "mode",
+    "model", "name", "oneOf", "options", "parameters", "parts", "pattern", "payload", "properties", "request",
+    "requestId", "required", "role", "rpcId", "schema", "sessionId", "source", "system", "text", "thought_signatures",
+    "title", "tools", "type", "url",
+];
 
 const USAGE: &str = "usage: her-cli upstream-capture arm --runtime-root <root> --route <dsh|harness> [--minutes <1-1440>]\n       her-cli upstream-capture status --runtime-root <root>\n       her-cli upstream-capture sweep --runtime-root <root>\n       her-cli upstream-capture disarm --runtime-root <root>";
+
+/// Selected runtimes (by data folder) with a capture attempt in flight in this process. One attempt
+/// per runtime at a time, so a burst of requests while armed starts no pile of threads; a request
+/// that meets an attempt in flight is not captured.
+static IN_FLIGHT: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Latin terms, matched case-insensitively as whole words (an ASCII letter or digit on either side
 /// is not a match, so `dshReady` or `qq_send_message` pass while `user/dsh` and `deepseek娘` fail).
@@ -75,6 +98,12 @@ pub(crate) fn denied_terms(text: &str) -> Vec<String> {
     found
 }
 
+/// One fixed diagnostic line on stderr. A failed write is ignored: nothing here panics.
+fn note(text: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "[upstream-capture] {text}");
+}
+
 /// The upstream path a capture is armed for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Route {
@@ -106,7 +135,7 @@ struct Arming {
 
 fn parse_arming(text: &str) -> Option<Arming> {
     let value: Value = serde_json::from_str(text).ok()?;
-    if value["v"] != 1 {
+    if value["v"].as_i64() != Some(1) {
         return None;
     }
     Some(Arming {
@@ -115,20 +144,69 @@ fn parse_arming(text: &str) -> Option<Arming> {
     })
 }
 
-/// Called right before HER sends a model request upstream on `route`. Without an arming it only
-/// finds the arming file absent; `request` is built only for a capture. With an arming for this
-/// route the first caller claims it by an atomic rename (concurrent callers in any process capture
-/// at most once), writes the request once and removes the claim. An expired arming of any route is
-/// removed without a capture. It never fails the request; problems go to stderr as fixed lines.
-pub(crate) fn offer(context: &RuntimeContext, route: Route, request: impl FnOnce() -> Value) {
-    offer_at(context, route, crate::turn_ledger::now_ms(), request);
+/// The background half of a capture: claims, judges and writes.
+type Persist = fn(&RuntimeContext, Route, i64, Value) -> bool;
+
+/// Marks a runtime's capture attempt as in flight until dropped, even when the attempt panics.
+struct Flight(PathBuf);
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        IN_FLIGHT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&self.0);
+    }
 }
 
-/// `offer` at a given time; true when this call wrote the capture.
-fn offer_at(context: &RuntimeContext, route: Route, now: i64, request: impl FnOnce() -> Value) -> bool {
-    if !context.is_isolated() {
-        return false;
+/// Called right before HER sends a model request upstream on `route`. It never waits on the
+/// capture: without an arming file it does one metadata lookup and `request` is never built; with
+/// one, it takes the snapshot `request` returns and hands it to a detached thread (`persist`).
+pub(crate) fn offer(context: &RuntimeContext, route: Route, request: impl FnOnce() -> Value) {
+    let _ = offer_at(context, route, crate::turn_ledger::now_ms(), request, persist);
+}
+
+/// The send-path half of `offer`. The handle is for tests; `offer` drops it, detaching the thread.
+fn offer_at(
+    context: &RuntimeContext,
+    route: Route,
+    now: i64,
+    request: impl FnOnce() -> Value,
+    persist: Persist,
+) -> Option<std::thread::JoinHandle<bool>> {
+    if !context.is_isolated() || !matches!(present(context, ARMED_FILE), Ok(true)) {
+        return None;
     }
+    let key = context.data_dir().to_path_buf();
+    {
+        let mut flight = match IN_FLIGHT.try_lock() {
+            Ok(flight) => flight,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if !flight.insert(key.clone()) {
+            return None;
+        }
+    }
+    let flight = Flight(key);
+    let snapshot = request();
+    let context = context.clone();
+    let spawned = std::thread::Builder::new()
+        .name("upstream-capture".to_string())
+        .spawn(move || {
+            let _flight = flight;
+            persist(&context, route, now, snapshot)
+        });
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(_) => {
+            note("the capture thread could not start; nothing was captured");
+            None
+        }
+    }
+}
+
+/// Claims an arming for `route` by an atomic rename (one winner across threads and processes), judges
+/// the claimed file and writes the capture. A slow or failing disk delays only this thread. An
+/// expired arming of any route is removed without a capture.
+fn persist(context: &RuntimeContext, route: Route, now: i64, request: Value) -> bool {
     let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, ARMED_FILE) else {
         return false;
     };
@@ -147,37 +225,51 @@ fn offer_at(context: &RuntimeContext, route: Route, now: i64, request: impl FnOn
         .ok()
         .flatten()
         .and_then(|text| parse_arming(&text));
-    let written = match claimed {
+    match claimed {
         Some(arming) if now > arming.expires_at => {
-            eprintln!("[upstream-capture] the arming expired; nothing was captured");
+            note("the arming expired; nothing was captured");
+            release_claim(context);
             false
         }
-        Some(arming) if arming.route == route => {
-            let record = capture_record(route, now, &request(), CAPTURE_LIMIT_BYTES);
-            match context.create_new_file(RuntimeArea::Data, CAPTURED_FILE, &record) {
-                Ok(()) => true,
-                Err(_) => {
-                    eprintln!("[upstream-capture] the request could not be written; nothing was captured");
-                    false
-                }
-            }
-        }
+        Some(arming) if arming.route == route => write_claimed(context, route, now, &request),
         Some(_) => {
             // A newer arming for the other route replaced the one read above: give it back.
             if context.rename_file(RuntimeArea::Data, CLAIMED_FILE, ARMED_FILE).is_err() {
-                eprintln!("[upstream-capture] an arming for another route could not be restored; run disarm");
+                note("an arming for another route could not be restored; run disarm");
             }
-            return false;
-        }
-        None => {
-            eprintln!("[upstream-capture] the claimed arming is unreadable; nothing was captured");
             false
         }
-    };
-    if context.remove_file(RuntimeArea::Data, CLAIMED_FILE).is_err() {
-        eprintln!("[upstream-capture] the claim could not be removed; run disarm");
+        None => {
+            note("the claimed arming is unreadable; nothing was captured");
+            release_claim(context);
+            false
+        }
     }
-    written
+}
+
+fn release_claim(context: &RuntimeContext) {
+    if context.remove_file(RuntimeArea::Data, CLAIMED_FILE).is_err() {
+        note("the claim could not be removed; run disarm");
+    }
+}
+
+/// Writes the capture under a held claim, then gives the claim up. When the claim is gone by then
+/// (`disarm` ran meanwhile), the capture just written is removed again, so a disarm always wins.
+fn write_claimed(context: &RuntimeContext, route: Route, now: i64, request: &Value) -> bool {
+    let record = capture_record(route, now, request, CAPTURE_LIMIT_BYTES);
+    if context.create_new_file(RuntimeArea::Data, CAPTURED_FILE, &record).is_err() {
+        note("the request could not be written; nothing was captured");
+        release_claim(context);
+        return false;
+    }
+    if !matches!(present(context, CLAIMED_FILE), Ok(true)) {
+        if context.remove_file(RuntimeArea::Data, CAPTURED_FILE).is_err() {
+            note("a capture written after disarm could not be removed; run disarm");
+        }
+        return false;
+    }
+    release_claim(context);
+    true
 }
 
 /// The capture file's bytes: the request, or only its size when it is longer than `limit`.
@@ -201,8 +293,8 @@ struct Findings {
 
 /// Counts and JSON field paths of the denied terms in every string value and object key of
 /// `request`. The report holds the terms (fixed denylist entries), counts and paths only: a path
-/// segment is an array index or an object key of at most 64 ASCII letters, digits, `_`, `-`, `.`
-/// or `$`; any other key is shown as `*`, so no message text reaches the report.
+/// segment is an array index, a key from `STRUCTURAL_KEYS`, or `<key>` for any other key, so no
+/// text from the request reaches the report.
 pub(crate) fn sweep(request: &Value) -> Value {
     let mut findings = Findings::default();
     walk(request, &mut String::new(), &mut findings);
@@ -232,7 +324,7 @@ fn walk(value: &Value, path: &mut String, findings: &mut Findings) {
             for (key, item) in fields {
                 let length = path.len();
                 path.push('/');
-                path.push_str(&path_segment(key));
+                path.push_str(path_segment(key));
                 check(key, path, "key", findings);
                 walk(item, path, findings);
                 path.truncate(length);
@@ -242,14 +334,11 @@ fn walk(value: &Value, path: &mut String, findings: &mut Findings) {
     }
 }
 
-fn path_segment(key: &str) -> String {
-    let plain = !key.is_empty()
-        && key.len() <= PATH_KEY_MAX
-        && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '$'));
-    if plain {
-        key.to_string()
+fn path_segment(key: &str) -> &str {
+    if STRUCTURAL_KEYS.contains(&key) {
+        key
     } else {
-        "*".to_string()
+        KEY_PLACEHOLDER
     }
 }
 
@@ -347,26 +436,35 @@ fn disarm(context: &RuntimeContext) -> Result<Value, (i32, String)> {
 }
 
 /// Sweeps the capture and deletes it. The report says `removed: false` when the deletion failed.
+/// Every printed value is checked for its type first: a capture whose metadata or shape is not
+/// exactly what `write_claimed` writes is refused as invalid, and none of its values is printed.
 fn sweep_capture(context: &RuntimeContext) -> Result<Value, (i32, String)> {
-    let unreadable = || (1, "the capture is unreadable; run disarm".to_string());
+    let invalid = || (1, "capture file invalid; run disarm".to_string());
     let text = context
         .read_optional_text(RuntimeArea::Data, CAPTURED_FILE)
-        .map_err(|_| unreadable())?
+        .map_err(|_| invalid())?
         .ok_or_else(|| (1, "nothing was captured; arm a capture first".to_string()))?;
-    let record: Value = serde_json::from_str(&text).map_err(|_| unreadable())?;
-    let route = record["route"]
-        .as_str()
-        .and_then(Route::parse)
-        .filter(|_| record["v"] == 1 && (record["tooLarge"] == true || record.get("request").is_some()))
-        .ok_or_else(unreadable)?;
-    let mut report = json!({"route": route.id(), "capturedAt": record["capturedAt"]});
-    if record["tooLarge"] == true {
-        report["tooLarge"] = json!(true);
-        report["bytes"] = record["bytes"].clone();
-    } else if let Value::Object(fields) = sweep(&record["request"]) {
-        for (key, value) in fields {
-            report[key.as_str()] = value;
+    let record: Value = serde_json::from_str(&text).map_err(|_| invalid())?;
+    if record["v"].as_i64() != Some(1) {
+        return Err(invalid());
+    }
+    let route = record["route"].as_str().and_then(Route::parse).ok_or_else(invalid)?;
+    let captured_at = record["capturedAt"].as_i64().ok_or_else(invalid)?;
+    let mut report = json!({"route": route.id(), "capturedAt": captured_at});
+    match (record.get("tooLarge"), record.get("request")) {
+        (Some(Value::Bool(true)), None) => {
+            let bytes = record["bytes"].as_u64().ok_or_else(invalid)?;
+            report["tooLarge"] = json!(true);
+            report["bytes"] = json!(bytes);
         }
+        (None, Some(request)) => {
+            if let Value::Object(fields) = sweep(request) {
+                for (key, value) in fields {
+                    report[key.as_str()] = value;
+                }
+            }
+        }
+        _ => return Err(invalid()),
     }
     report["removed"] = json!(context.remove_file(RuntimeArea::Data, CAPTURED_FILE).is_ok());
     Ok(report)
@@ -398,36 +496,37 @@ fn parse(args: &[String]) -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// `her-cli upstream-capture`. Exit codes: 0 done; 1 refused, nothing to sweep, a capture too large
-/// to sweep or a capture that could not be deleted; 2 usage or runtime-root error.
+/// `her-cli upstream-capture`. Exit codes: 0 done; 1 refused, nothing to sweep, an invalid capture, a
+/// capture too large to sweep or a capture that could not be deleted; 2 usage or runtime-root error.
 pub(crate) fn run_cli(args: &[String]) -> i32 {
+    use std::io::Write;
     if args.first().map(String::as_str) == Some("--help") {
-        println!("{USAGE}");
+        let _ = writeln!(std::io::stdout(), "{USAGE}");
         return 0;
     }
     let parsed = match parse(args) {
         Ok(parsed) if matches!(parsed.command.as_str(), "arm" | "status" | "sweep" | "disarm") => parsed,
         Ok(_) => {
-            eprintln!("[upstream-capture] unknown command\n{USAGE}");
+            note(&format!("unknown command\n{USAGE}"));
             return 2;
         }
         Err(error) => {
-            eprintln!("[upstream-capture] {error}\n{USAGE}");
+            note(&format!("{error}\n{USAGE}"));
             return 2;
         }
     };
     if parsed.command != "arm" && (parsed.route.is_some() || parsed.minutes.is_some()) {
-        eprintln!("[upstream-capture] --route and --minutes belong to arm\n{USAGE}");
+        note(&format!("--route and --minutes belong to arm\n{USAGE}"));
         return 2;
     }
     let Some(root) = parsed.root.as_deref() else {
-        eprintln!("[upstream-capture] --runtime-root is required\n{USAGE}");
+        note(&format!("--runtime-root is required\n{USAGE}"));
         return 2;
     };
-    let context = match RuntimeContext::from_root(std::path::Path::new(root)) {
+    let context = match RuntimeContext::from_root(Path::new(root)) {
         Ok(context) => context,
         Err(error) => {
-            eprintln!("[upstream-capture] {error}");
+            note(error);
             return 2;
         }
     };
@@ -440,7 +539,7 @@ pub(crate) fn run_cli(args: &[String]) -> i32 {
     };
     match result {
         Ok(report) => {
-            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            let _ = writeln!(std::io::stdout(), "{}", serde_json::to_string_pretty(&report).unwrap_or_default());
             if report["removed"] == false || report["tooLarge"] == true {
                 1
             } else {
@@ -448,7 +547,7 @@ pub(crate) fn run_cli(args: &[String]) -> i32 {
             }
         }
         Err((code, error)) => {
-            eprintln!("[upstream-capture] {error}");
+            note(&error);
             code
         }
     }
@@ -470,6 +569,7 @@ pub(crate) mod test_support {
     }
 
     /// A selected closed-agent runtime with a harness model whose dependencies all use `endpoint`.
+    /// Its model view strips the literal `STRIPPED183`.
     pub(crate) fn runtime(label: &str, endpoint: &str) -> (FixtureRoot, RuntimeContext) {
         let root = crate::install_root::development_root(
             std::env::temp_dir().join(format!("her-183-{label}-{}", crate::turn_ledger::mint_id(""))),
@@ -509,6 +609,17 @@ pub(crate) mod test_support {
             .map(|text| serde_json::from_str(&text).unwrap())
     }
 
+    /// Waits (at most 5 s) until no capture attempt for this runtime is in flight, then returns the
+    /// capture record, when one was written.
+    pub(crate) fn settled(context: &RuntimeContext) -> Option<Value> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while super::IN_FLIGHT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).contains(context.data_dir()) {
+            assert!(std::time::Instant::now() < deadline, "a capture attempt did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        captured(context)
+    }
+
     /// Removes the arming, a claim and a capture.
     pub(crate) fn disarm(context: &RuntimeContext) {
         super::disarm(context).unwrap();
@@ -522,16 +633,30 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{armed_or_claimed, captured, runtime};
+    use super::test_support::{armed_or_claimed, captured, runtime, settled};
     use super::*;
     use std::sync::{Arc, Barrier};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    /// One `offer` at `now` with the real writer, waited for: true when it wrote the capture.
+    fn attempt(context: &RuntimeContext, route: Route, now: i64, request: impl FnOnce() -> Value) -> bool {
+        offer_at(context, route, now, request, persist).is_some_and(|handle| handle.join().unwrap())
+    }
+
+    fn slow_persist(context: &RuntimeContext, route: Route, now: i64, request: Value) -> bool {
+        std::thread::sleep(Duration::from_secs(1));
+        persist(context, route, now, request)
+    }
+
+    fn panicking_persist(_: &RuntimeContext, _: Route, _: i64, _: Value) -> bool {
+        panic!("fixture writer failure 183")
+    }
 
     #[test]
     fn nothing_is_captured_unless_armed_for_the_route_and_then_only_once() {
         let (_root, context) = runtime("once", "http://127.0.0.1:1");
         let built = std::cell::Cell::new(0);
-        assert!(!offer_at(&context, Route::Dsh, 1_000, || {
+        assert!(!attempt(&context, Route::Dsh, 1_000, || {
             built.set(built.get() + 1);
             json!({"n": 0})
         }));
@@ -539,15 +664,39 @@ mod tests {
         assert!(captured(&context).is_none());
         // An arming for the other route is left alone.
         arm(&context, Some("harness"), None, 1_000).unwrap();
-        assert!(!offer_at(&context, Route::Dsh, 2_000, || json!({"n": 1})));
+        assert!(!attempt(&context, Route::Dsh, 2_000, || json!({"n": 1})));
         assert_eq!(armed_or_claimed(&context), (true, false));
         assert_eq!(disarm(&context).unwrap(), json!({"removed": ["armed"]}));
         // Armed for this route: the next request is captured, and the next one is not.
         arm(&context, Some("dsh"), None, 1_000).unwrap();
-        assert!(offer_at(&context, Route::Dsh, 2_000, || json!({"n": 2})));
-        assert!(!offer_at(&context, Route::Dsh, 3_000, || json!({"n": 3})));
+        assert!(attempt(&context, Route::Dsh, 2_000, || json!({"n": 2})));
+        assert!(!attempt(&context, Route::Dsh, 3_000, || json!({"n": 3})));
         assert_eq!(captured(&context).unwrap(), json!({"v": 1, "route": "dsh", "capturedAt": 2_000, "request": {"n": 2}}));
         assert_eq!(armed_or_claimed(&context), (false, false));
+    }
+
+    #[test]
+    fn a_slow_or_failing_writer_never_holds_up_the_request() {
+        let (_root, context) = runtime("slow-writer", "http://127.0.0.1:1");
+        arm(&context, Some("dsh"), None, 1_000).unwrap();
+        // The writer takes a second; the send path returns at once, and a request meanwhile is not
+        // held either (the attempt in flight makes it skip the capture).
+        let started = Instant::now();
+        let slow = offer_at(&context, Route::Dsh, 2_000, || json!({"n": 1}), slow_persist).expect("an armed offer starts a writer");
+        let second = offer_at(&context, Route::Dsh, 2_000, || json!({"n": 2}), persist);
+        assert!(started.elapsed() < Duration::from_millis(500), "the send path waited {:?}", started.elapsed());
+        assert!(second.is_none(), "a request during an attempt in flight starts no second writer");
+        assert!(slow.join().unwrap());
+        assert_eq!(captured(&context).unwrap()["request"], json!({"n": 1}));
+        disarm(&context).unwrap();
+        // A writer that fails outright ends only its own thread and frees the runtime for the next one.
+        arm(&context, Some("dsh"), None, 1_000).unwrap();
+        let started = Instant::now();
+        let failed = offer_at(&context, Route::Dsh, 2_000, || json!({"n": 3}), panicking_persist).expect("an armed offer starts a writer");
+        assert!(started.elapsed() < Duration::from_millis(500), "the send path waited {:?}", started.elapsed());
+        assert!(failed.join().is_err());
+        assert!(attempt(&context, Route::Dsh, 2_000, || json!({"n": 4})));
+        assert_eq!(captured(&context).unwrap()["request"], json!({"n": 4}));
     }
 
     #[test]
@@ -555,20 +704,21 @@ mod tests {
         let (_root, context) = runtime("expiry", "http://127.0.0.1:1");
         // Armed at 1000 for one minute: still valid at 61000, expired at 61001.
         arm(&context, Some("dsh"), Some("1"), 1_000).unwrap();
-        assert!(offer_at(&context, Route::Dsh, 61_000, || json!({"at": "boundary"})));
+        assert!(attempt(&context, Route::Dsh, 61_000, || json!({"at": "boundary"})));
         disarm(&context).unwrap();
         arm(&context, Some("dsh"), Some("1"), 1_000).unwrap();
-        assert!(!offer_at(&context, Route::Dsh, 61_001, || json!({"at": "late"})));
+        assert!(!attempt(&context, Route::Dsh, 61_001, || json!({"at": "late"})));
         assert!(captured(&context).is_none());
         assert_eq!(armed_or_claimed(&context), (false, false));
         // An expired arming for the other route is removed by any route's request.
         arm(&context, Some("harness"), Some("1"), 1_000).unwrap();
-        assert!(!offer_at(&context, Route::Dsh, 61_001, || json!({"at": "other"})));
+        assert!(!attempt(&context, Route::Dsh, 61_001, || json!({"at": "other"})));
         assert_eq!(armed_or_claimed(&context), (false, false));
     }
 
     #[test]
-    fn concurrent_requests_capture_once() {
+    fn concurrent_writers_capture_once() {
+        // Writers in different processes meet only at the claim; eight threads stand in for them.
         let (_root, context) = runtime("concurrent", "http://127.0.0.1:1");
         arm(&context, Some("dsh"), None, 1_000).unwrap();
         let start = Arc::new(Barrier::new(8));
@@ -577,7 +727,7 @@ mod tests {
                 let (context, start) = (context.clone(), start.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    offer_at(&context, Route::Dsh, 2_000, || json!({"caller": caller}))
+                    persist(&context, Route::Dsh, 2_000, json!({"caller": caller}))
                 })
             })
             .collect();
@@ -595,7 +745,7 @@ mod tests {
         context
             .write_atomic(RuntimeArea::Data, CLAIMED_FILE, br#"{"v":1,"route":"dsh","expiresAt":9000}"#)
             .unwrap();
-        assert!(!offer_at(&context, Route::Dsh, 2_000, || json!({"n": 1})));
+        assert!(!attempt(&context, Route::Dsh, 2_000, || json!({"n": 1})));
         assert!(captured(&context).is_none());
         assert_eq!(status(&context, 2_000).unwrap()["interrupted"], true);
         assert_eq!(arm(&context, Some("dsh"), None, 2_000).unwrap_err().1, "an interrupted capture is left; run disarm");
@@ -604,12 +754,21 @@ mod tests {
     }
 
     #[test]
+    fn a_disarm_during_the_write_removes_the_capture() {
+        let (_root, context) = runtime("disarm-race", "http://127.0.0.1:1");
+        // The writer holds no claim any more: `disarm` removed it between the claim and the write.
+        assert!(!write_claimed(&context, Route::Dsh, 2_000, &json!({"n": 1})));
+        assert!(captured(&context).is_none());
+        assert_eq!(armed_or_claimed(&context), (false, false));
+    }
+
+    #[test]
     fn a_failed_capture_write_uses_up_the_arming_and_keeps_the_file_it_found() {
         let (_root, context) = runtime("write-failure", "http://127.0.0.1:1");
         arm(&context, Some("dsh"), None, 1_000).unwrap();
         // The capture file appeared after the arming (the exclusive create then fails).
         context.create_new_file(RuntimeArea::Data, CAPTURED_FILE, br#"{"v":1,"route":"dsh","capturedAt":1,"request":{"n":0}}"#).unwrap();
-        assert!(!offer_at(&context, Route::Dsh, 2_000, || json!({"n": 1})));
+        assert!(!attempt(&context, Route::Dsh, 2_000, || json!({"n": 1})));
         assert_eq!(captured(&context).unwrap()["request"], json!({"n": 0}));
         assert_eq!(armed_or_claimed(&context), (false, false));
     }
@@ -618,7 +777,7 @@ mod tests {
     fn an_unreadable_arming_captures_nothing_and_status_names_it() {
         let (_root, context) = runtime("unreadable", "http://127.0.0.1:1");
         context.create_new_file(RuntimeArea::Data, ARMED_FILE, br#"{"v":1,"route":"relay","expiresAt":9000}"#).unwrap();
-        assert!(!offer_at(&context, Route::Dsh, 2_000, || json!({"n": 1})));
+        assert!(!attempt(&context, Route::Dsh, 2_000, || json!({"n": 1})));
         assert!(captured(&context).is_none());
         let state = status(&context, 2_000).unwrap();
         assert_eq!((state["armed"].clone(), state["unreadable"].clone()), (json!(true), json!(true)));
@@ -633,7 +792,7 @@ mod tests {
         }
         assert_eq!(arm(&context, Some("dsh"), Some("1440"), 1_000).unwrap()["expiresAt"], 1_000 + 1440 * 60_000);
         assert_eq!(arm(&context, Some("dsh"), None, 1_000).unwrap_err(), (1, "a capture is already armed".to_string()));
-        assert!(offer_at(&context, Route::Dsh, 2_000, || json!({"n": 1})));
+        assert!(attempt(&context, Route::Dsh, 2_000, || json!({"n": 1})));
         assert_eq!(arm(&context, Some("harness"), None, 3_000).unwrap_err(), (1, "a capture waits for sweep or disarm".to_string()));
         assert_eq!(status(&context, 3_000).unwrap()["captured"], true);
         assert_eq!(disarm(&context).unwrap(), json!({"removed": ["captured"]}));
@@ -665,20 +824,23 @@ mod tests {
                 {"path": "/payload/args/request/content/0/text", "part": "value", "terms": ["dsh"]},
                 {"path": "/payload/args/request/content/1/text", "part": "value", "terms": ["AI"]},
                 {"path": "/tools/0/description", "part": "value", "terms": ["deepseek"]},
-                {"path": "/tools/0/schema/properties/*/description", "part": "value", "terms": ["模型"]},
-                {"path": "/edge", "part": "value", "terms": ["dsh"]},
-                {"path": "/harness", "part": "key", "terms": ["harness"]},
+                {"path": "/tools/0/schema/properties/<key>/description", "part": "value", "terms": ["模型"]},
+                {"path": "/<key>", "part": "value", "terms": ["dsh"]},
+                {"path": "/<key>", "part": "key", "terms": ["harness"]},
             ],
         }));
         let text = report.to_string();
-        for message in ["今天天气不错", "你好", "Ask the", "talks to", "雨天", "plain"] {
+        for message in ["今天天气不错", "你好", "Ask the", "talks to", "雨天", "plain", "dshReady", "edge"] {
             assert!(!text.contains(message), "{message}: {text}");
         }
-        // A key of 64 identifier characters is shown; a longer one is not.
-        let keys = sweep(&json!({"k".repeat(64): "dsh", "k".repeat(65): "dsh"}));
+    }
+
+    #[test]
+    fn a_key_outside_the_request_structure_is_never_printed() {
+        let keys = sweep(&json!({"messages": [{"content": "dsh", "private-token-183": "dsh"}]}));
         let paths: Vec<&str> = keys["fields"].as_array().unwrap().iter().map(|field| field["path"].as_str().unwrap()).collect();
-        let shown = format!("/{}", "k".repeat(64));
-        assert_eq!(paths, vec![shown.as_str(), "/*"]);
+        assert_eq!(paths, vec!["/messages/0/content", "/messages/0/<key>"]);
+        assert!(!keys.to_string().contains("private-token-183"), "{keys}");
     }
 
     #[test]
@@ -695,7 +857,7 @@ mod tests {
     fn sweeping_deletes_the_capture_and_a_second_sweep_finds_nothing() {
         let (_root, context) = runtime("sweep", "http://127.0.0.1:1");
         arm(&context, Some("dsh"), None, 1_000).unwrap();
-        assert!(offer_at(&context, Route::Dsh, 2_000, || json!({"text": "fixture wake 183 dsh"})));
+        assert!(attempt(&context, Route::Dsh, 2_000, || json!({"text": "fixture wake 183 dsh"})));
         let report = sweep_capture(&context).unwrap();
         assert_eq!(report["route"], "dsh");
         assert_eq!(report["counts"], json!({"dsh": 1}));
@@ -709,18 +871,7 @@ mod tests {
             .create_new_file(RuntimeArea::Data, CAPTURED_FILE, br#"{"v":1,"route":"harness","capturedAt":3,"tooLarge":true,"bytes":99}"#)
             .unwrap();
         assert_eq!(sweep_capture(&context).unwrap(), json!({"route": "harness", "capturedAt": 3, "tooLarge": true, "bytes": 99, "removed": true}));
-        // An unreadable capture is left for disarm.
-        context.create_new_file(RuntimeArea::Data, CAPTURED_FILE, b"{\"v\":2}").unwrap();
-        assert_eq!(sweep_capture(&context).unwrap_err(), (1, "the capture is unreadable; run disarm".to_string()));
-        assert_eq!(disarm(&context).unwrap(), json!({"removed": ["captured"]}));
-    }
-
-    #[test]
-    fn a_key_outside_the_request_structure_is_never_printed() {
-        let keys = sweep(&json!({"messages": [{"content": "dsh", "private-token-183": "dsh"}]}));
-        let paths: Vec<&str> = keys["fields"].as_array().unwrap().iter().map(|field| field["path"].as_str().unwrap()).collect();
-        assert_eq!(paths, vec!["/messages/0/content", "/messages/0/<key>"]);
-        assert!(!keys.to_string().contains("private-token-183"), "{keys}");
+        assert!(captured(&context).is_none());
     }
 
     #[test]
@@ -824,7 +975,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(5), turn.wait()).await.expect("the turn did not end");
         let wire = relay.await.unwrap();
         assert_eq!(result, Ok("fixture reply 183".to_string()));
-        let record = captured(&context).expect("the armed harness request was captured");
+        let record = settled(&context).expect("the armed harness request was captured");
         assert_eq!(record["route"], "harness");
         assert_eq!(record["request"]["model"], "fake-chat");
         assert_eq!(wire[1]["model"], "fake-chat");

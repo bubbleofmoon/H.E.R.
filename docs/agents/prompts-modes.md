@@ -31,12 +31,17 @@ Read for personas, roles, prompt delivery, scheduling, chat, closed-agent intera
 - Text the code renders for a model (briefings, wake deltas, compatibility, reminder and CLI renders, tool names, descriptions, schemas, results and errors, the generated MCP server names and serve flags, digest and learner prompts) never names a harness, the model, its platform or its developer, never shows the install layout, and never calls her an AI, a robot or an assistant. `console::tests::model_text_guard_tests` renders each of these surfaces and fails on the denylist (`upstream_capture::denied_terms`). Persona, role card, operator background, memory, slang and chat text is data, outside that check; the model-view strip above is the tool for it.
 - `her-cli upstream-capture` (`upstream_capture.rs`) captures the next model request HER sends upstream and sweeps it for that denylist. Nothing is captured unless armed:
   - `arm --runtime-root <root> --route dsh|harness [--minutes 1-1440]` (default 30) writes `data/upstream-capture/armed.json`. It refuses while an arming, an interrupted claim or an unswept capture exists.
-  - The next request on that route claims the arming by an atomic rename, so concurrent senders in any process capture at most once. It is written once to `data/upstream-capture/captured.json`, and the claim is removed.
+  - The send path never waits for a capture. When an arming file exists, it takes an in-memory snapshot of the request and hands it to a detached thread.
+  - That thread claims the arming by an atomic rename, so concurrent senders in any process capture at most once. It writes the snapshot once to `data/upstream-capture/captured.json` and removes the claim.
+  - A request that meets a capture attempt still in flight for the same runtime is not captured. A `disarm` during the write removes the capture.
+  - Diagnostics are fixed stderr lines, and a failed stderr write is ignored.
+  - An arming outlives a bridge restart until it is used or expires: it means the next request, before or after the restart.
   - `dsh` captures the `session/prompt` envelope `dsh::Rpc` posts (wake, chat and learner prompts). `harness` captures each model step's request as it is handed to the model client: the provider-neutral `ChatRequest` with the model id and token limit. The client adds only the OpenAI wire framing.
   - An expired arming is removed without a capture. A request over 16 MiB is recorded by size only.
-  - `sweep` prints the counts and JSON field paths of the denied terms in every string and object key, never content. Paths use array indexes and keys of at most 64 ASCII letters, digits, `_`, `-`, `.` or `$`; any other key is shown as `*`. Base64 strings of 256 bytes or more are counted as binary and not checked. Then it deletes the capture.
+  - `sweep` prints the counts and JSON field paths of the denied terms in every string and object key, never content. Paths use array indexes and the request's structural keys (the DSH envelope, `ChatRequest` and JSON Schema names); any other key is shown as `<key>`. Base64 strings of 256 bytes or more are counted as binary and not checked. Then it deletes the capture.
+  - A capture whose metadata has another type, or whose shape is not the one the writer writes, is refused as `capture file invalid`, and none of its values is printed.
   - `status` reports the state. `disarm` removes the arming, an interrupted claim and an unswept capture.
-  - The capture holds chat text. It stays in the runtime's data folder (and its backups) until swept or disarmed; never copy it into the vault or the repository.
+  - The capture holds chat text. It stays in the runtime's data folder until swept or disarmed; never copy it into the vault or the repository. Runtime backups take only the top-level `data/*.json` files, so they never include it.
   - Digest and CLI-backend requests are not captured. Arming production is an owner action (`docs/agents/production-ops.md`).
 
 ## Wait batching and turn allowance
