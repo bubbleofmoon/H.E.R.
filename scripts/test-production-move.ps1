@@ -909,6 +909,10 @@ try {
   try { $run = Invoke-MoveScript $inventoryArgs 'S1r-stub' }
   finally { [IO.Directory]::Delete((Join-Path $nearMiss 'x')); Remove-Item -LiteralPath $nearMiss -Recurse -Force }
   Assert-Run $run 1 'a junction or link was found in dsh-stub' 'S1r link in the DSH stub next to the left-out folder'
+  # With only the near-miss link gone, the same Inventory is clean: the refusal above came from the near-miss link,
+  # not from the Antigravity CLI log link that the exclusion leaves out (Revision 18 fix round 2).
+  $run = Invoke-MoveScript $inventoryArgs 'S1r-stub-clean'
+  Assert-Run $run 0 'INVENTORY: 0 blockers' 'S1r the DSH stub without the near-miss link is clean'
   Assert-OldUntouched 'S1r'
 
   Step 'S1s digest key conflict'
