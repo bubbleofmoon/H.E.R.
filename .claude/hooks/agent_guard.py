@@ -22,8 +22,10 @@ stay inside their word. Publishing and moving refs pass only as exact whole comm
 - `gh` only as one plain read (`gh [-R x] pr|run|issue|workflow view|list|diff|checks|status|download ...`, never watch
   or --watch, or `gh api rate_limit [--jq <x>]`), or for an implementer exactly
   `gh workflow run quick.yml --ref <cwd branch> -f target=<x> [-f filter=<y>] [-f os=linux|windows]`, where <cwd branch>
-  is the branch checked out in the effective folder, so a worker dispatches only its own ref (a second dispatch of the
-  same ref, target and os cancels the first run); a session that does not start in its worktree needs the `cd`;
+  is the branch checked out in the effective folder (after an optional `cd <dir> &&`): this stops a mistyped or foreign
+  ref, not a `cd` into another worktree (the guard has no ticket binding: T1/T2 in docs/agents/coordinator.md, containment
+  is #85); a second dispatch of the same ref, target and os cancels the first run; a session that does not start in its
+  worktree needs the `cd`;
 - Codex only as the implementer's self-review through /root/her/scripts/codex-task.sh or C:/her/scripts/codex-task.ps1
   with gpt-6-astra, high and read-only, its own worktree as the workdir and
   <orch>/<n>/review/codex-self-<k>.md (its branch's ticket, not a link) as the prompt.

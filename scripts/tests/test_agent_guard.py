@@ -122,6 +122,7 @@ IMPLEMENTER_ALLOWED = [
     ('dsh', QUICK_DSH),                                  # #185: the exact form from its own worktree
     ('repo', 'cd {dsh} && ' + QUICK_DSH),                # the same from a session that starts elsewhere, after the cd
     ('detached', 'cd {dsh} && ' + QUICK_DSH),
+    ('wt', 'cd {dsh} && ' + QUICK_DSH),                  # KNOWN GAP (T1/T2, #85): no ticket binding, so a cd into another worktree with its own ref passes
     ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
     ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6-astra high read-only 120'),
     ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
