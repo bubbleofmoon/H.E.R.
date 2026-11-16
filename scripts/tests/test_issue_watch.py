@@ -17,6 +17,7 @@ import shutil
 import sys
 import tempfile
 import time
+import types
 import urllib.error
 import urllib.parse
 import warnings
@@ -99,6 +100,19 @@ def issue(number, title='a held baton', pull_request=False, comments=0, updated_
 def comment(k, body, at=None):
     return {'id': k, 'html_url': f'https://github.example.invalid/c/{k}', 'body': body,
             'created_at': at or stamp(k), 'updated_at': at or stamp(k)}
+
+
+class StopFollow(Exception):
+    """Raised by the replaced sleep to end a `--follow` run, which never ends by itself."""
+
+
+class Lines(io.StringIO):
+    """Standard output that remembers how much of its text was flushed."""
+    flushed = 0
+
+    def flush(self):
+        self.flushed = len(self.getvalue())
+        super().flush()
 
 
 class IssueWatch(unittest.TestCase):
@@ -675,6 +689,188 @@ class IssueWatch(unittest.TestCase):
         saved = json.loads(state.read_text(encoding='utf-8'))
         self.assertIsNone(saved['etag'])
         self.assertEqual(saved['comments'], before)
+
+    # --- --follow keeps running and prints one line per event (#184) ------------------------------------
+    def follow(self, steps, *extra):
+        """Runs `--follow` with `time.sleep` replaced: the k-th sleep calls steps[k], and the first sleep after the last
+        step raises StopFollow, which ends the run. Returns a namespace: `outcome` (the exit code, or 'running' when
+        StopFollow ended the run), `out`, `err`, `slept` (the seconds of every sleep) and `unflushed` (at every sleep,
+        the characters printed but not flushed)."""
+        slept, unflushed, todo, out, err = [], [], iter(steps), Lines(), io.StringIO()
+
+        def sleep(seconds):
+            slept.append(seconds)
+            unflushed.append(len(out.getvalue()) - out.flushed)
+            step = next(todo, None)
+            if step is None:
+                raise StopFollow
+            step()
+
+        argv = ['issue_watch.py', '--machine', 'linux', '--follow', '--repo', PUBLIC, *extra]
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(self.module.time, 'sleep', sleep), \
+                redirect_stdout(out), redirect_stderr(err):
+            try:
+                outcome = self.module.main()
+            except StopFollow:
+                outcome = 'running'
+            except SystemExit as stop:
+                outcome = stop.code
+        return types.SimpleNamespace(outcome=outcome, out=out.getvalue(), err=err.getvalue(), slept=slept,
+                                     unflushed=unflushed)
+
+    def test_follow_prints_each_event_and_keeps_running(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(5)]}
+
+        def second_baton():
+            self.github.issues = {PUBLIC: [issue(5), issue(6)]}
+
+        run = self.follow([second_baton], '--state', str(state))
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n'
+                                  'BATON #6 a held baton https://github.example.invalid/i/6\n')
+        self.assertEqual(run.slept, [180, 180])
+        code, out = self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.assertEqual(out.strip(), 'no batons', out)      # both events were recorded in the state file
+
+    def test_follow_prints_a_handoff_after_a_baton_without_restarting(self):
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')]}
+
+        def handoff():
+            self.github.issues = {PUBLIC: [issue(67, comments=2)]}
+            self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
+
+        run = self.follow([handoff])
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(run.out, 'BATON #67 a held baton https://github.example.invalid/i/67\n'
+                                  'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+
+    def test_follow_sends_the_etag_and_an_unchanged_listing_prints_nothing(self):
+        def unchanged():
+            self.github.unchanged = True
+
+        def changed():
+            self.github.unchanged = False
+            self.github.issues = {PUBLIC: [issue(5), issue(6)]}
+
+        self.github.issues = {PUBLIC: [issue(5)]}
+        run = self.follow([unchanged, changed])
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n'
+                                  'BATON #6 a held baton https://github.example.invalid/i/6\n')
+        tag = '"etag-' + PUBLIC + '"'
+        listing = [etag for url, etag in zip(self.github.urls, self.github.etags) if '/comments?' not in url]
+        self.assertEqual(listing, [None, tag, tag])
+        self.assertEqual(run.slept, [180, 180, 180])
+
+    def test_follow_flushes_every_event_before_it_sleeps(self):
+        self.github.issues = {PUBLIC: [issue(5)]}
+
+        def two_more():
+            self.github.issues = {PUBLIC: [issue(5), issue(6), issue(7)]}
+
+        run = self.follow([two_more])
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(run.out.count('\n'), 3, run.out)
+        self.assertEqual(run.unflushed, [0, 0])
+
+    def test_follow_prints_an_event_before_it_writes_the_state(self):
+        self.github.issues = {PUBLIC: [issue(5)]}
+        out = Lines()
+        argv = ['issue_watch.py', '--machine', 'linux', '--follow', '--repo', PUBLIC]
+        with mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(self.module, 'write_state', side_effect=OSError('disk full')), \
+                redirect_stdout(out), self.assertRaises(OSError):
+            self.module.main()
+        self.assertEqual(out.getvalue(), 'BATON #5 a held baton https://github.example.invalid/i/5\n')
+
+    def test_follow_waits_out_a_rate_limit_and_goes_on(self):
+        answers = iter([(None, None, 500), (None, [issue(5)], None), (None, [issue(5)], None)])
+        polls = []
+
+        def fetch(url, tok, etag):
+            if '/comments' in url:
+                return None, [], None
+            polls.append(url)
+            return next(answers)
+
+        self.module.fetch = fetch
+        run = self.follow([lambda: None, lambda: None])
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(len(polls), 3, polls)      # the poll after the event ran: the run went on
+        self.assertEqual(run.slept, [500, 180, 180])
+        self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n')
+
+    def test_follow_retries_a_poll_nobody_answered(self):
+        answers = iter([(None, None, 0), (None, [issue(5)], None), (None, [issue(5)], None)])
+        polls = []
+
+        def fetch(url, tok, etag):
+            if '/comments' in url:
+                return None, [], None
+            polls.append(url)
+            return next(answers)
+
+        self.module.fetch = fetch
+        run = self.follow([lambda: None, lambda: None])
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(len(polls), 3, polls)      # the poll after the event ran: the run went on
+        self.assertEqual(run.slept, [180, 180, 180])
+        self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n')
+
+    def test_follow_waits_out_a_comment_read_limit_after_an_event(self):
+        state = self.home / 'state.json'
+        self.github.issues = {PUBLIC: [issue(67, comments=1)]}
+        self.github.comments = {67: [comment(1, 'progress')]}
+        self.run_watch('--machine', 'linux', '--once', '--repo', PUBLIC, '--state', str(state))
+        self.github.issues = {PUBLIC: [issue(67, comments=2), issue(68)]}
+        self.github.comments[67].append(comment(2, '**Handoff → linux: R4 green'))
+        self.github.fail_comments = True
+        self.github.comment_wait = 600
+
+        def recover():
+            self.github.fail_comments = False
+
+        run = self.follow([recover], '--state', str(state))
+        self.assertEqual(run.outcome, 'running', run.err)
+        self.assertEqual(run.out, 'BATON #68 a held baton https://github.example.invalid/i/68\n'
+                                  'HANDOFF #67 a held baton https://github.example.invalid/c/2\n')
+        self.assertEqual(run.slept, [600, 180])
+
+    def test_follow_exits_2_on_an_api_failure_after_an_event(self):
+        answers = iter([(None, [issue(5)], None)])
+
+        def fetch(url, tok, etag):
+            if '/comments' in url:
+                return None, [], None
+            answer = next(answers, None)
+            return answer if answer else self.real_fetch(url, tok, etag)
+
+        self.module.fetch = fetch
+        error = self.http_error(401, {}, b'{"message": "Bad credentials"}')
+        with mock.patch.object(self.module.urllib.request, 'urlopen', side_effect=error):
+            run = self.follow([lambda: None])
+        self.assertEqual(run.outcome, 2, run.err)
+        self.assertEqual(run.out, 'BATON #5 a held baton https://github.example.invalid/i/5\n')
+        self.assertEqual(run.slept, [180])
+        self.assertIn('GitHub API 401', run.err)
+
+    def test_follow_exits_2_on_a_full_page(self):
+        self.module.fetch = lambda url, tok, etag: (None, [issue(n) for n in range(1, 101)], None)
+        run = self.follow([])
+        self.assertEqual(run.outcome, 2)
+        self.assertEqual(run.out, '')
+        self.assertEqual(run.slept, [])
+        self.assertIn('carry this baton', run.err)
+
+    def test_follow_and_once_exclude_each_other(self):
+        err = io.StringIO()
+        with mock.patch.object(self.module.time, 'sleep', side_effect=StopFollow), redirect_stderr(err), \
+                self.assertRaises(SystemExit) as stop:
+            self.run_watch('--machine', 'linux', '--once', '--follow')
+        self.assertEqual(stop.exception.code, 2)
+        self.assertIn('not allowed with', err.getvalue())
 
 
 if __name__ == '__main__':
