@@ -1050,6 +1050,79 @@ try {
   Assert-Run $wrongPort 1 'the relay port is not served by the relay process' 'S1u default port not served by the relay'
   Assert-OldUntouched 'S1u'
 
+  Step 'S1v every blocker at once'
+  # Independent blockers seeded together (#182): Inventory reports each one and none hides another. A link in the old
+  # DSH stub beside its differing files (the run leaves out -AcceptDshProfileFiles), a profile file naming the old
+  # runtime, a bundle dependency outside its folder, a configuration path with a parent step, and links in two copies
+  # (SnowLuma and the relay folder), so the free space is skipped. Every seed is removed before the checks below.
+  $nearMiss = Join-Path $oldRuntime 'user\dsh\.gemini\antigravity-cli2'
+  [void][IO.Directory]::CreateDirectory((Join-Path $nearMiss 'target'))
+  [void](New-Item -ItemType Junction -Path (Join-Path $nearMiss 'x') -Target (Join-Path $nearMiss 'target'))
+  $staleProfile = Join-Path $dshHome 'profiles\web\fixture-stale.json'
+  Write-FixtureJson $staleProfile ([ordered]@{ old = $oldRuntime })
+  $bundleManifest = Join-Path $bridgeBundles 'qq-mode-console\package.json'
+  $manifestBytes = [IO.File]::ReadAllBytes($bundleManifest)
+  $manifestTime = (Get-Item -LiteralPath $bundleManifest).LastWriteTimeUtc
+  Write-FixtureJson $bundleManifest ([ordered]@{ name = 'qq-mode-console'; version = '0.0.1'; peerDependencies = [ordered]@{ 'fixture-peer' = '1.0.0' } })
+  $configPath = Join-Path $oldRuntime 'config\config.json'
+  $edited = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $edited.snowluma.launcherPath = Join-Path $snowFolder '..\..\elsewhere\x.mjs'
+  Write-FixtureJson $configPath $edited
+  $snowLink = Join-Path $snowFolder 'fixture-link'
+  [void](New-Item -ItemType Junction -Path $snowLink -Target (Join-Path $snowFolder 'logs'))
+  $relayTarget = Join-Path $relayFolder 'fixture-target'
+  $relayLink = Join-Path $relayFolder 'fixture-link'
+  [void][IO.Directory]::CreateDirectory($relayTarget)
+  [void](New-Item -ItemType Junction -Path $relayLink -Target $relayTarget)
+  $withoutAccept = @($inventoryArgs | Where-Object { $_ -ne '-AcceptDshProfileFiles' })
+  try { $run = Invoke-MoveScript $withoutAccept 'S1v' }
+  finally {
+    [IO.Directory]::Delete($relayLink); [IO.Directory]::Delete($relayTarget)
+    [IO.Directory]::Delete($snowLink)
+    [IO.File]::WriteAllBytes($configPath, $originalConfig)
+    [IO.File]::WriteAllBytes($bundleManifest, $manifestBytes); (Get-Item -LiteralPath $bundleManifest).LastWriteTimeUtc = $manifestTime
+    Remove-Item -LiteralPath $staleProfile -Force
+    [IO.Directory]::Delete((Join-Path $nearMiss 'x')); Remove-Item -LiteralPath $nearMiss -Recurse -Force
+  }
+  Assert-Run $run 1 'a junction or link was found in dsh-stub' 'S1v link in the DSH stub'
+  Assert-Run $run 1 'runtime DSH files differ from the profile DSH home' 'S1v stub files beside a stub link'
+  Assert-Run $run 1 'DSH profile, plugin or bundle files name old production paths' 'S1v profile file naming the old runtime'
+  Assert-Run $run 1 'depends on a package outside its own folder' 'S1v bundle dependency'
+  Assert-Run $run 1 'configuration paths need a decision' 'S1v configuration pointer'
+  Assert-Run $run 1 'sizes of snowluma: REFUSED: a junction or link was found in snowluma' 'S1v link in the SnowLuma copy'
+  Assert-Run $run 1 'sizes of relay: REFUSED: a junction or link was found in relay' 'S1v link in the relay copy'
+  Assert-Run $run 1 'sizes: REFUSED: skipped: needs the size of every copy' 'S1v free space skipped'
+  Assert-Run $run 1 'INVENTORY: 8 blockers' 'S1v every blocker counted once'
+  Assert-True ($run.Text.IndexOf('an unexpected error', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1v: a section failed with an unexpected error'
+  # Two bad configuration paths and two old task names that name no task: each one reported, and every section that
+  # needs one of them reports it was skipped. The fixture tasks keep running; the names only point elsewhere.
+  $edited = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $edited.tasks.installRoot = 'fixture-relative\release'
+  $edited.tasks.'start-all'.dshScript = 'fixture-relative\dsh.mjs'
+  Write-FixtureJson $configPath $edited
+  $ghost = 'HER-Test-67-' + ('0' * 32)
+  $ghostArgs = @($inventoryArgs | ForEach-Object { if ($_ -ceq $supervisorTask) { $ghost + '-supervisor' } elseif ($_ -ceq $relayTask) { $ghost + '-relay' } else { $_ } })
+  try { $run = Invoke-MoveScript $ghostArgs 'S1v-config' } finally { [IO.File]::WriteAllBytes($configPath, $originalConfig) }
+  Assert-Run $run 1 'tasks.installRoot is not an absolute path' 'S1v-config installRoot'
+  Assert-Run $run 1 'tasks.start-all.dshScript is not an absolute path' 'S1v-config dshScript'
+  Assert-Run $run 1 'skipped: needs the configuration check' 'S1v-config skipped sections'
+  Assert-Run $run 1 ('the scheduled task ' + $ghost + '-supervisor was not found exactly once') 'S1v-config old supervisor task'
+  Assert-Run $run 1 ('the scheduled task ' + $ghost + '-relay was not found exactly once') 'S1v-config old relay task'
+  Assert-True ($run.Text.IndexOf('an unexpected error', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1v-config: a section failed with an unexpected error'
+  # A release folder with one image missing and another changed: both reported, and the sections that need the
+  # release check report they were skipped.
+  $mixed = Join-Path $F 'release-mixed'
+  [void][IO.Directory]::CreateDirectory($mixed)
+  foreach ($name in @('her-cli.exe', 'herupdate.exe', 'SHA256SUMS')) { Copy-Item -LiteralPath (Join-Path $releaseSource $name) -Destination (Join-Path $mixed $name) }
+  [IO.File]::AppendAllText((Join-Path $mixed 'herupdate.exe'), ' ')
+  try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Inventory', '-OldRuntime', $oldRuntime, '-OldRelayFolder', $relayFolder, '-ReleaseSource', $mixed, '-ReleaseName', 'fixture-new')) 'S1v-release' }
+  finally { Remove-Item -LiteralPath $mixed -Recurse -Force }
+  Assert-Run $run 1 'the release folder has no her.exe' 'S1v-release missing image'
+  Assert-Run $run 1 'the release source herupdate.exe differs from SHA256SUMS' 'S1v-release changed image'
+  Assert-Run $run 1 'skipped: needs the release check' 'S1v-release skipped sections'
+  Assert-True ($run.Text.IndexOf('an unexpected error', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1v-release: a section failed with an unexpected error'
+  Assert-OldUntouched 'S1v'
+
   Step 'S2 health failure rolls back'
   Write-Fixture $failMarker 'fail'
   try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '45')) 'S2' }
