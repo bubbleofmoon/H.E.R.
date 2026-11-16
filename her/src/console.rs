@@ -26495,4 +26495,5 @@ mod tests {
     mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
+    mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
 }
