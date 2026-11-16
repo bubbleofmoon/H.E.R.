@@ -14,8 +14,9 @@ let relayKey = '';
 const configAt = args.findIndex((arg) => arg === '-config' || arg === '--config');
 if (configAt >= 0) {
   const text = fs.readFileSync(args[configAt + 1], 'utf8');
-  const port = /^port:\s*["']?(\d{1,5})["']?\s*$/m.exec(text);
-  const key = /^api-keys:\s*\r?\n\s+-\s*["']?([^"'\r\n]+?)["']?\s*$/m.exec(text);
+  // The nested production shape (server.port, access.api-keys) or the flat one (top-level port and api-keys).
+  const port = /^server:\s*\r?\n(?:  .*\r?\n)*?  port:\s*["']?(\d{1,5})["']?\s*$/m.exec(text) || /^port:\s*["']?(\d{1,5})["']?\s*$/m.exec(text);
+  const key = /^access:\s*\r?\n(?:  .*\r?\n)*?  api-keys:\s*\r?\n\s+-\s*["']?([^"'\r\n]+?)["']?\s*$/m.exec(text) || /^api-keys:\s*\r?\n\s+-\s*["']?([^"'\r\n]+?)["']?\s*$/m.exec(text);
   if (!port || !key) throw new Error('invalid fixture relay configuration');
   config = { role: 'relay', port: Number(port[1]) };
   relayKey = key[1];

@@ -446,7 +446,11 @@ function Assert-Moved([string]$Scenario, [switch]$Digest) {
   Assert-True ($check.Trim() -eq 'unchanged') ($Scenario + ': the MCP block does not name the new image and runtime')
   Assert-True ((Remove-McpBlock ([IO.File]::ReadAllText($newCordis))) -eq (Remove-McpBlock $originalCordis)) ($Scenario + ': the DSH profile outside the MCP block changed')
   $relayLines = [IO.File]::ReadAllLines((Join-Path $pin 'config.yaml'))
-  Assert-True ($relayLines -contains ("auth-dir: '" + (Join-Path $pin 'auth') + "'")) ($Scenario + ': the relay auth-dir line')
+  # The nested auth-dir is rewritten in place under oauth:, keeping its indentation; no top-level line is added.
+  Assert-True ($relayLines -contains ("  auth-dir: '" + (Join-Path $pin 'auth') + "'")) ($Scenario + ': the relay auth-dir line')
+  Assert-True (@($relayLines | Where-Object { $_ -match '^auth-dir:' }).Count -eq 0) ($Scenario + ': a top-level auth-dir line was added to the nested relay configuration')
+  $oauthAt = [Array]::IndexOf($relayLines, 'oauth:')
+  Assert-True ($oauthAt -ge 0 -and $relayLines[$oauthAt + 1] -ceq ("  auth-dir: '" + (Join-Path $pin 'auth') + "'")) ($Scenario + ': the relay auth-dir line is not under oauth')
   Assert-True ((Get-FileHashText (Join-Path $pin 'auth\antigravity-fixture.json')) -eq (Get-FileHashText (Join-Path $authFolder 'antigravity-fixture.json'))) ($Scenario + ': the relay login file')
   Assert-True ([IO.File]::ReadAllText((Join-Path $pin 'her-relay-client.key')) -eq 'fixture-relay-key-67') ($Scenario + ': the relay client key file')
   $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -590,7 +594,8 @@ try {
   [void][IO.Directory]::CreateDirectory($relayFolder)
   Copy-Item -LiteralPath $NodePath -Destination (Join-Path $relayFolder 'cli-proxy-api.exe')
   Copy-Item -LiteralPath $fake -Destination (Join-Path $relayFolder 'fake-relay.mjs')
-  Write-Fixture (Join-Path $relayFolder 'config.yaml') ('port: ' + $relayPort + "`nauth-dir: `"~/.cli-proxy-api`"`napi-keys:`n  - `"fixture-relay-key-67`"`n")
+  # Production's nested relay shape: server.port, management.secret-key, oauth.auth-dir and access.api-keys.
+  Write-Fixture (Join-Path $relayFolder 'config.yaml') ("config-version: 1`nserver:`n  host: 127.0.0.1`n  port: " + $relayPort + "`n  discovery:`n    enabled: false`nmanagement:`n  allow-remote: false`n  secret-key: `"fixture-management-secret-67`"`n  disable-control-panel: true`noauth:`n  auth-dir: `"~/.cli-proxy-api`"`naccess:`n  api-keys:`n    - `"fixture-relay-key-67`"`n")
   Write-Fixture (Join-Path $authFolder 'antigravity-fixture.json') '{"type":"fixture"}'
 
   # Old runtime in the fixed shape of today's production, with values PowerShell 5.1 must carry through a rewrite.
@@ -653,7 +658,7 @@ try {
 
   Step 'S0 self-test'
   $run = Invoke-MoveScript @('-Mode', 'SelfTest') 'S0'
-  Assert-Run $run 0 'PASS self-test: 68 checks' 'S0 self-test'
+  Assert-Run $run 0 'PASS self-test: 132 checks' 'S0 self-test'
 
   Step 'S1a production guards'
   $run = Invoke-MoveScript @('-Mode', 'Inventory', '-InstallRoot', $root, '-EvidenceRoot', $evidence) 'S1a-no-switch'
@@ -901,9 +906,10 @@ try {
   try {
     $run = Invoke-MoveScript $inventoryArgs 'S1t'
     $keyedFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0]
-    # The same command line while the configuration is refused (a second key, then another absolute path): the
-    # relay section stops before its key check, and neither key may reach inventory.json.
-    [IO.File]::AppendAllText($relayConfigFile, "  - `"fixture-second-key-67`"`nlogs-dir: C:\fixture-elsewhere`n", [Text.UTF8Encoding]::new($false))
+    # The same command line while the configuration is refused (a second key, then another absolute path inside the
+    # access block, since the nested shape allows no other top-level key): the relay section stops before its key
+    # check, and neither key may reach inventory.json.
+    [IO.File]::AppendAllText($relayConfigFile, ("    - `"" + $second + "`"`n  logs-dir: C:\fixture-elsewhere`n"), [Text.UTF8Encoding]::new($false))
     $refused = Invoke-MoveScript $inventoryArgs 'S1t-refused'
   }
   finally {
@@ -921,11 +927,15 @@ try {
   Assert-True ($refusedFolder.FullName -ne $keyedFolder.FullName) 'S1t: the refused run wrote its own inventory folder'
   $refusedText = [IO.File]::ReadAllText((Join-Path $refusedFolder.FullName 'inventory.json'))
   foreach ($key in @('fixture-relay-key-67', $second)) { Assert-True ($refusedText.IndexOf($key, [StringComparison]::Ordinal) -lt 0) ('S1t: inventory.json holds a relay key after a refused configuration') }
+  # The configuration's file name and the relay program path are stored only after a successful read.
+  $refusedNames = @(($refusedText | ConvertFrom-Json).PSObject.Properties.Name)
+  Assert-True ($refusedNames -notcontains 'RelayConfigRelative' -and $refusedNames -notcontains 'RelayProgram') 'S1t: the refused inventory.json holds the relay configuration name or the relay program'
   Assert-OldUntouched 'S1t'
 
   Step 'S1u relay configuration without a top-level port'
-  # Production's shape: no top-level port line, one indented port under another block. The relay's default port is
-  # used and confirmed against the live relay listener (here the fixture port stands in for 8317).
+  # The flat shape without a port line (production's nested shape names server.port instead): a port under another
+  # block is not the relay's, so the relay's default port is used and confirmed against the live relay listener (here
+  # the fixture port stands in for 8317).
   $relayConfigFile = Join-Path $relayFolder 'config.yaml'
   $relayConfigBytes = [IO.File]::ReadAllBytes($relayConfigFile)
   $relayConfigTime = (Get-Item -LiteralPath $relayConfigFile).LastWriteTimeUtc

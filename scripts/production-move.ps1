@@ -637,37 +637,183 @@ function Get-BackupDestination($Config) {
 }
 
 # ---------- relay configuration ----------
-function Read-RelayConfig([string[]]$Lines) {
-  $ports = @(); $auth = @(); $keys = @(); $absolute = 0; $unreadablePorts = 0
-  for ($index = 0; $index -lt $Lines.Count; $index++) {
-    $line = $Lines[$index]
-    if ($line.Trim().StartsWith('#')) { continue }
-    if ($line -match '^port:\s*["'']?(?<port>[0-9]{1,5})["'']?\s*(#.*)?$') { $ports += [int]$Matches['port']; continue }
-    # A top-level port line in another form is not "no port line": it must not fall back to the default.
-    if ($line -match '^port\s*:') { $unreadablePorts++; continue }
-    if ($line -match '^auth-dir:\s*(?<value>.*?)\s*$') { $auth += [pscustomobject]@{ Index = $index; Value = $Matches['value'].Trim('"', "'") }; continue }
-    if ($line -match '^api-keys:\s*$') {
-      while ($index + 1 -lt $Lines.Count -and $Lines[$index + 1] -match '^\s+-\s*(?<key>.+?)\s*$') { $keys += $Matches['key'].Trim('"', "'"); $index++ }
-      continue
-    }
-    if ($line -match '(^|[\s"''=])[A-Za-z]:[\\/]') { $absolute++ }
+# Two shapes: the flat one (top-level port, host, auth-dir, api-keys) and the nested one production's relay uses
+# (server.port, server.host, oauth.auth-dir, access.api-keys, management.secret-key). This is no YAML parser: it reads
+# the plain shape only and refuses whatever it cannot read exactly (fail closed). A first pass registers every secret
+# before anything can refuse. Nesting is read by indentation under exactly those four top-level keys; in the nested
+# shape the only other top-level key allowed is config-version (the flat shape keeps its other keys, as the S1u fixture
+# has them). A value it uses is value, "value" or 'value' with nothing after it, on one line. Every other line is a
+# plain key line or a list item; anything else (anchors, tags, aliases, quoted, escaped, explicit or merge keys, tabs,
+# document markers) refuses with one reason, and so does flow style. So do a list item at the indentation of api-keys
+# and a secret-key, api-keys or auth-dir line in any other place. Blank and comment lines are allowed anywhere except
+# inside the api-keys list. Top-level port, auth-dir or api-keys beside the nested blocks is a mixed shape and refuses.
+# Any other line holding an absolute path, nested or not, counts toward the "other absolute paths" refusal.
+# One configured secret for hiding: the text as written, the text without one pair of surrounding quotes, and the text
+# cut at its first quote or comment (a quoted or refused value). Pieces under 4 characters are skipped; they would hide
+# ordinary evidence text.
+function Add-RelaySecret([string]$Text) {
+  $raw = $Text.Trim()
+  $pieces = @($raw, (($raw.TrimStart('"', "'") -split '["'']|\s#')[0]).Trim())
+  $unquoted = [regex]::Match($raw, '^(?:"(?<v>.*)"|''(?<v>.*)'')$')
+  if ($unquoted.Success) { $pieces += $unquoted.Groups['v'].Value }
+  foreach ($candidate in $pieces) {
+    if ($candidate.Length -ge 4 -and -not $script:SecretTexts.Contains($candidate)) { $script:SecretTexts.Add($candidate) }
   }
-  # Every configured key is a secret for the evidence, also when this configuration is refused below.
-  foreach ($key in $keys) { if ($key -and -not $script:SecretTexts.Contains($key)) { $script:SecretTexts.Add($key) } }
-  # Only top-level keys count (an indented port belongs to another block); none means the relay's default port (0
-  # here; the caller uses -RelayDefaultPort and checks the live listener).
-  if ($unreadablePorts -gt 0 -or @($ports | Where-Object { $_ -lt 1 -or $_ -gt 65535 }).Count -gt 0) { Stop-Refused 'the relay configuration has a top-level port line that cannot be read' }
-  if ($ports.Count -gt 1) { Stop-Refused 'the relay configuration has more than one top-level port line' }
-  if ($auth.Count -gt 1) { Stop-Refused 'the relay configuration has more than one auth-dir line' }
-  if ($keys.Count -lt 1) { Stop-Refused 'the relay configuration lists no api-keys entry' }
-  if ($absolute -gt 0) { Stop-Refused 'the relay configuration names other absolute paths; they need a decision first' }
-  $first = $keys[0]
-  if ($first -notmatch '^[\x21-\x7e]{1,4096}$') { Stop-Refused 'the first relay api key is not printable ASCII' }
+}
+# The bridge reaches the relay on loopback only. A missing host is the relay's own default, so the live listener's
+# addresses are judged too (an empty list is judged by the listener-owner check instead).
+function Test-LoopbackOnly([string[]]$Addresses) { return @($Addresses | Where-Object { @('127.0.0.1', '::1') -notcontains $_ }).Count -eq 0 }
+function Read-RelayScalar([string]$Text, [string]$What, [bool]$Secret) {
+  # A value the move uses: value, "value" or 'value' and nothing after it; inside double quotes only \\ is read (as one
+  # backslash). A comment, an odd or inner quote, another escape and flow style refuse, so the move never reads a value
+  # other than the relay's. A refused secret is still kept out of the evidence, cut at its first quote or comment. An
+  # empty value comes back empty; the caller decides.
+  $raw = $Text.Trim()
+  $double = [regex]::Match($raw, '^"(?<v>(?:[^"\\]|\\\\)*)"$')
+  $single = [regex]::Match($raw, '^''(?<v>[^'']*)''$')
+  if ($double.Success) { $value = $double.Groups['v'].Value.Replace('\\', '\') }
+  elseif ($single.Success) { $value = $single.Groups['v'].Value }
+  elseif ($raw -notmatch '["'']|(^|\s)#|:(\s|$)|^[\[\]{}&*!|>%@`,]|^[-?](\s|$)') { $value = $raw }
+  else {
+    if ($Secret) { Add-RelaySecret $raw }
+    Stop-Refused ('the relay configuration value of ' + $What + ' is not plain or simply quoted (a comment, an odd quote, an escape or flow style)')
+  }
+  return $value
+}
+function Read-RelayPort([string]$Text) {
+  $value = Read-RelayScalar $Text 'port' $false
+  if ($value -notmatch '^[0-9]{1,5}$' -or [int]$value -lt 1 -or [int]$value -gt 65535) { Stop-Refused 'the relay configuration has a port line that cannot be read' }
+  return [int]$value
+}
+# One "key: rest" line of a key the parser knows; $null for any other line. "key:value" is no key for YAML, so it
+# refuses rather than being read differently from the relay.
+function Split-RelayKey([string]$Text) {
+  $match = [regex]::Match($Text, '^(?<key>port|host|auth-dir|api-keys|secret-key)\s*:(?<rest>.*)$')
+  if (-not $match.Success) { return $null }
+  if ($match.Groups['rest'].Value -match '^\S') { Stop-Refused 'the relay configuration has a key with no space after its colon' }
+  return [pscustomobject]@{ Key = $match.Groups['key'].Value; Rest = $match.Groups['rest'].Value }
+}
+function Assert-RelayListHeader([string]$Rest) {
+  if ($Rest.Trim()) { Stop-Refused 'the relay configuration has an api-keys line with text after it (a comment or flow style)' }
+}
+function Add-RelayPlace([hashtable]$Seen, [string]$Place) {
+  if ($Seen.ContainsKey($Place)) { Stop-Refused ('the relay configuration names ' + $Place + ' more than once') }
+  $Seen[$Place] = $true
+}
+function Assert-RelayHost([string]$Rest) {
+  # An empty host or another address opens the relay to the network.
+  if (@('127.0.0.1', 'localhost') -notcontains (Read-RelayScalar $Rest 'host' $false)) { Stop-Refused 'the relay configuration has a host other than 127.0.0.1 or localhost' }
+}
+function Read-RelayConfig([string[]]$Lines) {
+  $ports = @(); $serverPorts = @(); $auth = @(); $nestedAuth = @(); $keys = @(); $nestedKeys = @(); $secrets = @()
+  $absolute = 0; $flatLists = 0; $seen = @{}; $first = ''
+  $parent = ''; $childIndent = -1; $nested = $false
+  $list = ''; $listIndent = -1; $itemIndent = -1; $listGap = $false; $scalarIndent = -1
+  $misplaced = @('auth-dir', 'api-keys', 'secret-key')
+  # First pass, before anything can refuse: every secret-key value and every list item (the api-keys entries), in block
+  # or flow form, is registered for hiding, so a refusal on an earlier line cannot leave a later secret unhidden. A
+  # secret-key line registers its whole rest (a block value may hold a comma or a bracket) and its flow-form value cut
+  # at a comma, brace or bracket. It also tells the nested shape (a server, access, oauth or management block anywhere)
+  # from the flat one.
+  foreach ($source in $Lines) {
+    $whole = [regex]::Match([string]$source, 'secret-key["'']?\s*:(?<v>.*)$')
+    if ($whole.Success) { Add-RelaySecret ($whole.Groups['v'].Value) }
+    foreach ($hit in [regex]::Matches([string]$source, 'secret-key["'']?\s*:\s*(?<v>[^,}\]]*)')) { Add-RelaySecret ($hit.Groups['v'].Value) }
+    $listed = [regex]::Match([string]$source, '^\s*-\s+(?<v>.*)$')
+    if ($listed.Success) { Add-RelaySecret ($listed.Groups['v'].Value) }
+    $flow = [regex]::Match([string]$source, 'api-keys["'']?\s*:\s*\[(?<v>[^\]]*)')
+    if ($flow.Success) { foreach ($piece in ($flow.Groups['v'].Value -split ',')) { Add-RelaySecret $piece } }
+    if ([regex]::IsMatch([string]$source, '^(server|access|oauth|management)\s*:')) { $nested = $true }
+  }
+  try {
+    for ($index = 0; $index -lt $Lines.Count; $index++) {
+      $line = $Lines[$index].TrimEnd()
+      $indent = $line.Length - $line.TrimStart(' ').Length
+      $text = $line.Substring($indent)
+      if (-not $text -or $text.StartsWith('#')) {
+        # Allowed anywhere but inside the api-keys list, where one could hide where the list ends (a cut list).
+        if ($list) { $listGap = $true }
+        continue
+      }
+      # A deeper line right after a value the parser reads would continue that value (a multi-line scalar).
+      if ($scalarIndent -ge 0 -and $indent -gt $scalarIndent) { Stop-Refused 'the relay configuration continues a value it reads on a deeper line' }
+      $scalarIndent = -1
+      # Every other line is a plain key line ("key:", or "- key:" in a list) or a list item ("- value"). This refuses
+      # anchors, tags, aliases, quoted, escaped, explicit and merge keys, tabs and document markers with one reason.
+      if ($text -cnotmatch '^(- )?[A-Za-z0-9_.-]+:' -and -not ($indent -gt 0 -and $text -cmatch '^- \S')) { Stop-Refused 'the relay configuration has a line the relay parser does not understand' }
+      if ($text -match ':\s+[\[{]|^-\s+[\[{]') { Stop-Refused 'the relay configuration uses flow style (a value or list item starting with { or [)' }
+      if ($list) {
+        $item = $text -match '^-(\s|$)'
+        if ($indent -gt $listIndent) {
+          if ($listGap) { Stop-Refused 'the relay configuration has a blank or comment line inside the api-keys list' }
+          if ($itemIndent -lt 0) { $itemIndent = $indent }
+          if (-not $item -or $indent -ne $itemIndent) { Stop-Refused 'the relay configuration has a line inside the api-keys list that is not one list item' }
+          $value = Read-RelayScalar ($text.Substring(1)) 'an api-keys item' $true
+          if ($list -eq 'flat') { $keys += $value } else { $nestedKeys += $value }
+          continue
+        }
+        if ($item -and $indent -eq $listIndent) { Stop-Refused 'the relay configuration has an api-keys list item at the indentation of api-keys itself' }
+        $list = ''; $listGap = $false
+      }
+      if ($indent -eq 0) {
+        $parent = ''; $childIndent = -1
+        $block = [regex]::Match($text, '^(?<key>server|access|oauth|management)\s*:(?<rest>.*)$')
+        if ($block.Success) {
+          if ($block.Groups['rest'].Value.Trim()) { Stop-Refused 'the relay configuration has a block line (server, access, oauth or management) with text after it' }
+          Add-RelayPlace $seen ($block.Groups['key'].Value)
+          $parent = $block.Groups['key'].Value; $nested = $true
+          continue
+        }
+        # Top-level port, auth-dir and api-keys pass here and refuse below as a mixed shape.
+        if ($nested -and $text -cnotmatch '^(config-version|port|auth-dir|api-keys)\s*:') { Stop-Refused 'the nested relay configuration has a top-level key other than config-version, server, management, access and oauth' }
+        $pair = Split-RelayKey $text
+        if ($null -ne $pair -and $pair.Key -ceq 'port') { Add-RelayPlace $seen 'port'; $ports += (Read-RelayPort $pair.Rest); $scalarIndent = 0; continue }
+        if ($null -ne $pair -and $pair.Key -ceq 'host') { Add-RelayPlace $seen 'host'; Assert-RelayHost $pair.Rest; $scalarIndent = 0; continue }
+        if ($null -ne $pair -and $pair.Key -ceq 'auth-dir') { Add-RelayPlace $seen 'auth-dir'; $auth += [pscustomobject]@{ Index = $index; Value = (Read-RelayScalar $pair.Rest 'auth-dir' $false); Indent = '' }; $scalarIndent = 0; continue }
+        if ($null -ne $pair -and $pair.Key -ceq 'api-keys') { Add-RelayPlace $seen 'api-keys'; Assert-RelayListHeader $pair.Rest; $flatLists++; $list = 'flat'; $listIndent = 0; $itemIndent = -1; $listGap = $false; continue }
+      }
+      else {
+        $pair = Split-RelayKey $text
+        if ($parent) {
+          if ($childIndent -lt 0) { $childIndent = $indent }
+          if ($indent -lt $childIndent) { Stop-Refused 'the relay configuration has a line indented less than the first key of its block' }
+          $place = ''
+          if ($null -ne $pair -and $indent -eq $childIndent) { $place = $parent + '.' + $pair.Key }
+          if ($place -ceq 'server.port') { Add-RelayPlace $seen $place; $serverPorts += (Read-RelayPort $pair.Rest); $scalarIndent = $indent; continue }
+          if ($place -ceq 'server.host') { Add-RelayPlace $seen $place; Assert-RelayHost $pair.Rest; $scalarIndent = $indent; continue }
+          if ($place -ceq 'oauth.auth-dir') { Add-RelayPlace $seen $place; $nestedAuth += [pscustomobject]@{ Index = $index; Value = (Read-RelayScalar $pair.Rest 'auth-dir' $false); Indent = $line.Substring(0, $indent) }; $scalarIndent = $indent; continue }
+          if ($place -ceq 'access.api-keys') { Add-RelayPlace $seen $place; Assert-RelayListHeader $pair.Rest; $list = 'nested'; $listIndent = $indent; $itemIndent = -1; $listGap = $false; continue }
+          # The management secret is never shown in any evidence either. An empty one means no management key.
+          if ($place -ceq 'management.secret-key') { Add-RelayPlace $seen $place; $secrets += (Read-RelayScalar $pair.Rest 'secret-key' $true); $scalarIndent = $indent; continue }
+        }
+      }
+      if ($null -ne $pair -and $misplaced -ccontains $pair.Key) { Stop-Refused 'the relay configuration has a secret-key, api-keys or auth-dir line in a place this check does not read' }
+      if ($line -match '(^|[\s"''=])[A-Za-z]:[\\/]') { $absolute++ }
+    }
+    $allKeys = @($keys) + @($nestedKeys)
+    if ($nested -and ($ports.Count + $auth.Count + $flatLists) -gt 0) { Stop-Refused 'the relay configuration mixes top-level port, auth-dir or api-keys with the nested blocks' }
+    if ($allKeys.Count -lt 1) { Stop-Refused 'the relay configuration lists no api-keys entry' }
+    if ($nested -and $nestedAuth.Count -eq 0) { Stop-Refused 'the nested relay configuration has no oauth.auth-dir; its login folder needs a decision' }
+    if (@(@($auth) + @($nestedAuth) | Where-Object { -not $_.Value }).Count -gt 0) { Stop-Refused 'the relay configuration has an empty auth-dir' }
+    # The production key has 52 characters; a short key or secret is a placeholder or a cut value.
+    if (@($allKeys | Where-Object { $_.Length -lt 16 }).Count -gt 0 -or @($secrets | Where-Object { $_ -and $_.Length -lt 16 }).Count -gt 0) { Stop-Refused 'the relay configuration has a management secret-key or an api key shorter than 16 characters' }
+    if ($absolute -gt 0) { Stop-Refused 'the relay configuration names other absolute paths; they need a decision first' }
+    $first = $allKeys[0]
+    if ($first -notmatch '^[\x21-\x7e]{1,4096}$') { Stop-Refused 'the first relay api key is not printable ASCII' }
+  }
+  finally {
+    # Every key and secret as read (a doubled backslash read as one) stays out of the evidence too, also when this
+    # configuration is refused. The caller stores the relay arguments and the configuration's file name only after this
+    # function returns, so a refusal stores neither.
+    foreach ($secret in @(@($keys) + @($nestedKeys) + @($secrets))) { Add-RelaySecret $secret }
+  }
   $authEntry = $null
   if ($auth.Count -eq 1) { $authEntry = $auth[0] }
-  $port = 0
-  if ($ports.Count -eq 1) { $port = $ports[0] }
-  return [pscustomobject]@{ Port = $port; Auth = $authEntry; Key = $first }
+  if ($nestedAuth.Count -eq 1) { $authEntry = $nestedAuth[0] }
+  $port = 0; $portSource = 'default'
+  if ($ports.Count -eq 1) { $port = $ports[0]; $portSource = 'top-level port' }
+  if ($serverPorts.Count -eq 1) { $port = $serverPorts[0]; $portSource = 'server.port' }
+  return [pscustomobject]@{ Port = $port; PortSource = $portSource; Auth = $authEntry; Key = $first }
 }
 function Convert-RelayArguments([string[]]$Tokens, [string]$From, [string]$To) {
   $result = @()
@@ -699,8 +845,8 @@ function Find-RelayConfig([string[]]$Tokens, [string]$OldFolder) {
   return (Join-Path $OldFolder 'config.yaml')
 }
 function Resolve-RelayAuth($Relay, [string]$OldFolder, [string]$Pin, [string]$ProfilePath) {
-  $value = '~/.cli-proxy-api'; $index = -1
-  if ($null -ne $Relay.Auth) { $value = [string]$Relay.Auth.Value; $index = [int]$Relay.Auth.Index }
+  $value = '~/.cli-proxy-api'; $index = -1; $indent = ''
+  if ($null -ne $Relay.Auth) { $value = [string]$Relay.Auth.Value; $index = [int]$Relay.Auth.Index; $indent = [string]$Relay.Auth.Indent }
   $relativeForm = $false
   if ($value.StartsWith('~/') -or $value.StartsWith('~\')) { $source = Get-Normal (Join-Path $ProfilePath $value.Substring(2)) }
   elseif ($value -match '^[A-Za-z]:[\\/]') { $source = Get-Normal $value }
@@ -714,7 +860,7 @@ function Resolve-RelayAuth($Relay, [string]$OldFolder, [string]$Pin, [string]$Pr
   }
   $action = 'replace'
   if ($inside -and $relativeForm) { $action = 'keep' } elseif ($index -lt 0) { $action = 'append' }
-  return [pscustomobject]@{ Source = $source; Inside = $inside; NewPath = $newPath; Action = $action; LineIndex = $index }
+  return [pscustomobject]@{ Source = $source; Inside = $inside; NewPath = $newPath; Action = $action; LineIndex = $index; Indent = $indent }
 }
 
 # ---------- processes, ports and scheduled tasks ----------
@@ -1606,20 +1752,26 @@ function Get-MovePlan {
     if (-not (Test-ExactVersion $plan.RelayVersion)) { Add-Blocker 'the relay version is not one exact release version; pass -RelayVersion' }
     $plan.RelayPin = Join-Path $script:Root ('deps\relay\' + $plan.RelayVersion)
     $relayExe = Get-Normal $relay.Exe
-    $plan.RelayProgram = $plan.RelayPin + $relayExe.Substring($plan.OldRelayFolder.Length)
+    $relayProgram = $plan.RelayPin + $relayExe.Substring($plan.OldRelayFolder.Length)
     # Kept local until the configuration is read and the key check is done: a refusal on the way must not leave raw
     # arguments (possibly carrying a key) in the plan. Assigned directly: Convert-RelayArguments returns ,$result.
     $relayArguments = Convert-RelayArguments $tokens $plan.OldRelayFolder $plan.RelayPin
     $relayConfigPath = Find-RelayConfig $tokens $plan.OldRelayFolder
     if (-not (Test-Within $relayConfigPath $plan.OldRelayFolder) -or -not (Test-Path -LiteralPath $relayConfigPath -PathType Leaf)) { Stop-Refused 'the relay configuration file is not inside the old relay folder' }
-    $plan.RelayConfigRelative = $relayConfigPath.Substring($plan.OldRelayFolder.Length + 1)
     $relayConfig = Read-RelayConfig (Read-Lines $relayConfigPath)
+    # Stored only now: reading the configuration registered its secrets, so a secret in a file or program name is
+    # hidden in the evidence, and a refused configuration stores neither name.
+    $plan.RelayConfigRelative = $relayConfigPath.Substring($plan.OldRelayFolder.Length + 1)
+    $plan.RelayProgram = $relayProgram
     $plan.RelayPort = $relayConfig.Port
-    # No top-level port line: the relay listens on its default port. The listener check below confirms it.
-    if ($plan.RelayPort -eq 0) { $plan.RelayPort = $RelayDefaultPort; Write-Log 'the relay configuration has no top-level port line; the relay default port is checked against the live listener' }
+    # No port line (neither top-level port nor server.port): the relay listens on its default port. The listener check
+    # below confirms it.
+    if ($plan.RelayPort -eq 0) { $plan.RelayPort = $RelayDefaultPort; Write-Log 'the relay configuration has no port line; the relay default port is checked against the live listener' }
+    else { Write-Log ('the relay port comes from the configuration (' + [string]$relayConfig.PortSource + ') and is checked against the live listener') }
     Assert-RehearsalPort $plan.RelayPort
     $script:RelayKey = $relayConfig.Key
     if ((Get-ListenerPid $plan.RelayPort) -ne $relay.Pid) { Add-Blocker 'the relay port is not served by the relay process' }
+    if (-not (Test-LoopbackOnly @(Get-NetTCPConnection -State Listen -LocalPort $plan.RelayPort -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.LocalAddress }))) { Add-Blocker 'the relay listens on an address other than loopback' }
     if (@($plan.OneBotPort, $plan.OneBotWsPort, $plan.DshPort, $plan.ConsolePort) -contains $plan.RelayPort) { Add-Blocker 'the relay port is not distinct from the OneBot, DSH and console ports' }
     # A command line that carries any configured key blocks; only redacted arguments reach the plan.
     $redacted = @(@($relayArguments) | ForEach-Object {
@@ -1863,7 +2015,9 @@ function Set-NewConfiguration($plan) {
   # Relay: the login folder line and the client key file HER uses for its health probe.
   $relayConfig = Join-Path $plan.RelayPin $plan.RelayConfigRelative
   $lines = [Collections.Generic.List[string]]::new([string[]](Read-Lines $relayConfig))
-  $authLine = "auth-dir: '" + $plan.Auth.NewPath + "'"
+  # The auth-dir line is rewritten where it stands, with its own indentation (under oauth: in the nested shape); only
+  # a flat configuration without one gets a top-level line appended.
+  $authLine = [string]$plan.Auth.Indent + "auth-dir: '" + $plan.Auth.NewPath + "'"
   if ($plan.Auth.Action -eq 'replace') { $lines[[int]$plan.Auth.LineIndex] = $authLine } elseif ($plan.Auth.Action -eq 'append') { $lines.Add($authLine) }
   [IO.File]::WriteAllLines($relayConfig, $lines, [Text.UTF8Encoding]::new($false))
   $keyFile = Join-Path $plan.RelayPin 'her-relay-client.key'
@@ -2341,6 +2495,10 @@ function Invoke-OperatorFolders {
 function Test-Refused([scriptblock]$Block) {
   try { [void](& $Block); return $false } catch { return $_.Exception.Message.StartsWith('REFUSED: ') }
 }
+# A refusal with exactly this reason, so a check fails when its own guard is gone and another refusal fires instead.
+function Test-RefusedWith([scriptblock]$Block, [string]$Reason) {
+  try { [void](& $Block); return $false } catch { return $_.Exception.Message -ceq ('REFUSED: ' + $Reason) }
+}
 function Invoke-SelfTest {
   function Check([bool]$Condition, [string]$Label) { if (-not $Condition) { throw ('self-test failed: ' + $Label) }; $script:SelfChecks++ }
   $map = New-PathMap @([pscustomobject]@{ From = 'C:\Old\Rt'; To = 'C:\qqbot\runtime' }, [pscustomobject]@{ From = 'C:\Old'; To = 'C:\qqbot\elsewhere' })
@@ -2364,12 +2522,105 @@ function Invoke-SelfTest {
   Check (Test-Refused { Convert-RelayArguments @('..\x') 'C:\R' 'C:\N' }) 'relay argument with a parent step'
   Check ((Find-RelayConfig @('--config=C:\R\c.yaml') 'C:\R') -eq 'C:\R\c.yaml') 'relay config in the = form'
   Check ((Find-RelayConfig @() 'C:\R') -eq 'C:\R\config.yaml') 'relay config default'
-  $relay = Read-RelayConfig @('# comment C:\x', 'port: 8317', 'auth-dir: "~/.cli-proxy-api"', 'api-keys:', '  - "key-one"', '  - key-two', 'proxy-url: "http://127.0.0.1:9"')
-  Check ($relay.Port -eq 8317 -and $relay.Auth.Value -eq '~/.cli-proxy-api' -and $relay.Key -eq 'key-one') 'relay configuration subset'
-  Check (Test-Refused { Read-RelayConfig @('port: 1', 'port: 2', 'api-keys:', '  - k') }) 'two port lines'
-  Check (Test-Refused { Read-RelayConfig @('port: 1', 'api-keys:', '  - k', 'logs-dir: C:\x') }) 'another absolute path'
-  Check (Test-Refused { Read-RelayConfig @('port: 1', 'api-keys:', '  - "a b"') }) 'a key with a space'
-  Check (Test-Refused { Read-RelayConfig @('port: 1') }) 'no key'
+  # Relay configuration. Each refusal changes one line of a valid configuration and expects its own reason, so a check
+  # fails when its guard is gone and another refusal fires instead.
+  $mixed = 'the relay configuration mixes top-level port, auth-dir or api-keys with the nested blocks'
+  $notPlain = ' is not plain or simply quoted (a comment, an odd quote, an escape or flow style)'
+  $tooShort = 'the relay configuration has a management secret-key or an api key shorter than 16 characters'
+  $listHeader = 'the relay configuration has an api-keys line with text after it (a comment or flow style)'
+  $elsewhere = 'the relay configuration has a secret-key, api-keys or auth-dir line in a place this check does not read'
+  $hostOnly = 'the relay configuration has a host other than 127.0.0.1 or localhost'
+  $notUnderstood = 'the relay configuration has a line the relay parser does not understand'
+  $flowStyle = 'the relay configuration uses flow style (a value or list item starting with { or [)'
+  $listGap = 'the relay configuration has a blank or comment line inside the api-keys list'
+  $topLevel = 'the nested relay configuration has a top-level key other than config-version, server, management, access and oauth'
+  $relay = Read-RelayConfig @('# comment C:\x', 'port: 8317', 'auth-dir: "~/.cli-proxy-api"', 'api-keys:', '  - "flat-key-number-one"', '  - flat-key-number-two', 'proxy-url: "http://127.0.0.1:9"')
+  Check ($relay.Port -eq 8317 -and $relay.PortSource -eq 'top-level port' -and $relay.Auth.Value -eq '~/.cli-proxy-api' -and $relay.Key -eq 'flat-key-number-one') 'relay configuration subset'
+  $flatPort = Read-RelayConfig @('remote-management:', '  port: 83', 'api-keys:', '  - "flat-key-number-three"')
+  Check ($flatPort.Port -eq 0 -and $flatPort.PortSource -eq 'default') 'no port line means the relay default port; a port under another block is not the relay port'
+  Check (Test-RefusedWith { Read-RelayConfig @('port: 8317', 'port: 8318', 'api-keys:', '  - "flat-key-number-one"') } 'the relay configuration names port more than once') 'two port lines'
+  Check (Test-RefusedWith { Read-RelayConfig @('port: eighty', 'api-keys:', '  - "flat-key-number-one"') } 'the relay configuration has a port line that cannot be read') 'a top-level port line that cannot be read'
+  Check (Test-RefusedWith { Read-RelayConfig @('port: 8317', 'api-keys:', '  - "flat-key-number-one"', 'logs-dir: C:\x') } 'the relay configuration names other absolute paths; they need a decision first') 'another absolute path'
+  Check ((Read-RelayConfig @('host: localhost', 'api-keys:', '  - "flat-key-number-one"')).Port -eq 0) 'a flat top-level host on loopback'
+  Check (Test-RefusedWith { Read-RelayConfig @('host: 0.0.0.0', 'api-keys:', '  - "flat-key-number-one"') } $hostOnly) 'a flat top-level host open to the network'
+  $nestedBase = @('config-version: 1', 'server:', '  host: 127.0.0.1', '  port: 8317', '  discovery:', '    enabled: false', 'management:', '  allow-remote: false', '  secret-key: "nested-secret-number-one"', 'oauth:', '  auth-dir: "~/.cli-proxy-api"', 'access:', '  api-keys:', '    - "nested-key-number-one"')
+  # The nested shape with line At replaced by the lines With (none: the line is deleted).
+  function Edit-Base([int]$At, [string[]]$With) {
+    $before = @(); if ($At -gt 0) { $before = @($nestedBase[0..($At - 1)]) }
+    $after = @(); if ($At -lt $nestedBase.Count - 1) { $after = @($nestedBase[($At + 1)..($nestedBase.Count - 1)]) }
+    return $before + @($With) + $after
+  }
+  $nestedConfig = Read-RelayConfig $nestedBase
+  Check ($nestedConfig.Key -ceq 'nested-key-number-one' -and $nestedConfig.Port -eq 8317 -and $nestedConfig.PortSource -eq 'server.port') 'nested relay configuration: key and port'
+  Check ($nestedConfig.Auth.Value -ceq '~/.cli-proxy-api' -and $nestedConfig.Auth.Indent -ceq '  ' -and $nestedConfig.Auth.Index -eq 10) 'nested relay configuration: auth-dir with its line and indentation'
+  Check ($script:SecretTexts.Contains('nested-secret-number-one')) 'nested relay configuration: the management secret is kept out of the evidence'
+  $plainConfig = Read-RelayConfig (Edit-Base 13 @('    - nested-key-number-two', "    - 'nested-key-number-three'"))
+  Check ($plainConfig.Key -ceq 'nested-key-number-two' -and $script:SecretTexts.Contains('nested-key-number-three')) 'nested relay configuration: plain and single-quoted list items'
+  Check ((Read-RelayConfig (Edit-Base 10 @('  auth-dir: "C:\\relay\\auth"'))).Auth.Value -ceq 'C:\relay\auth') 'a double-quoted value with doubled backslashes'
+  Check ((Read-RelayConfig (Edit-Base 2 @("  host: 'localhost'"))).Port -eq 8317) 'server.host localhost'
+  Check ((Read-RelayConfig (Edit-Base 8 @('  secret-key: ""'))).Key -ceq 'nested-key-number-one') 'an empty management secret-key means no management key'
+  Check ((Read-RelayConfig (Edit-Base 2 @())).Port -eq 8317) 'a missing server.host is the relay default, judged by the live listener'
+  $spaced = Read-RelayConfig (@('# head', '') + (Edit-Base 7 @('', '  # note', '  allow-remote: false')) + @('', '# tail'))
+  Check ($spaced.Key -ceq 'nested-key-number-one' -and $spaced.Auth.Index -eq 14) 'blank and comment lines between and inside blocks'
+  Add-RelaySecret 'abc'
+  Check (-not $script:SecretTexts.Contains('abc')) 'a secret piece under 4 characters is not registered'
+  Check (Test-LoopbackOnly @('127.0.0.1', '::1')) 'a relay listener on loopback'
+  Check (-not (Test-LoopbackOnly @('0.0.0.0'))) 'a relay listener on every IPv4 interface'
+  Check (-not (Test-LoopbackOnly @('127.0.0.1', '::'))) 'a relay listener also on every IPv6 interface'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port: eighty')) } 'the relay configuration has a port line that cannot be read') 'a server.port that cannot be read'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port: 8317', '  port: 8318')) } 'the relay configuration names server.port more than once') 'two server.port lines'
+  Check (Test-RefusedWith { Read-RelayConfig ($nestedBase + @('port: 8317')) } $mixed) 'a top-level port beside the nested blocks'
+  Check (Test-RefusedWith { Read-RelayConfig ($nestedBase + @('auth-dir: "~/.cli-proxy-api"')) } $mixed) 'a top-level auth-dir beside oauth.auth-dir'
+  Check (Test-RefusedWith { Read-RelayConfig ((Edit-Base 10 @()) + @('auth-dir: "~/.cli-proxy-api"')) } $mixed) 'a top-level auth-dir instead of oauth.auth-dir'
+  Check (Test-RefusedWith { Read-RelayConfig ($nestedBase + @('api-keys:', '  - "flat-key-number-one"')) } $mixed) 'top-level api-keys beside the nested blocks'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @()) } 'the nested relay configuration has no oauth.auth-dir; its login folder needs a decision') 'a nested configuration without oauth.auth-dir'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @("  auth-dir: ''")) } 'the relay configuration has an empty auth-dir') 'an empty auth-dir'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @()) } 'the relay configuration lists no api-keys entry') 'an api-keys list without items'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  log-dir: C:\x')) } 'the relay configuration names other absolute paths; they need a decision first') 'another absolute path inside a nested block'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('    - "a key with spaces in it"')) } 'the first relay api key is not printable ASCII') 'a key with spaces'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('    - "short-key"')) } $tooShort) 'an api key shorter than 16 characters'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  secret-key: "short"')) } $tooShort) 'a management secret-key shorter than 16 characters'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  secret-key: "nested-secret-number-two" # note')) } ('the relay configuration value of secret-key' + $notPlain)) 'a comment after the management secret-key'
+  Check ($script:SecretTexts.Contains('nested-secret-number-two')) 'a refused management secret is still kept out of the evidence'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('    - nested-key-number-four # note')) } ('the relay configuration value of an api-keys item' + $notPlain)) 'a comment after an api key'
+  Check ($script:SecretTexts.Contains('nested-key-number-four')) 'a refused api key is still kept out of the evidence'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @('  auth-dir: "~/.cli-proxy-api')) } ('the relay configuration value of auth-dir' + $notPlain)) 'an odd quote'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @('  auth-dir: "auth\nfolder"')) } ('the relay configuration value of auth-dir' + $notPlain)) 'an escape in a double-quoted value'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port: [8317]')) } $flowStyle) 'a flow-style value'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 12 @('  api-keys: ["nested-key-number-one"]')) } $flowStyle) 'flow-style api-keys'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  allow-remote: [false]')) } $flowStyle) 'flow style on a line the parser does not read'
+  Check (Test-RefusedWith { Read-RelayConfig @('api-keys:', '  - "flat-key-number-one"', 'remote-management: {secret-key: hidden-secret-number-two}') } $flowStyle) 'a flow map holding a secret-key'
+  Check ($script:SecretTexts.Contains('hidden-secret-number-two')) 'a secret-key inside a refused flow map is still kept out of the evidence'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 12 @('  api-keys: # keys')) } $listHeader) 'a comment after api-keys'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 1 @('server: # note')) } 'the relay configuration has a block line (server, access, oauth or management) with text after it') 'a comment after a block line'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('    - "nested-key-number-one"', '', '    - "nested-key-number-five"')) } $listGap) 'a blank line inside the api-keys list'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('    - "nested-key-number-one"', '    # note', '    - "nested-key-number-five"')) } $listGap) 'a comment line inside the api-keys list'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 10 @('  auth-dir: C:/relay/auth', '    suffix')) } 'the relay configuration continues a value it reads on a deeper line') 'a value continued on a deeper line'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('  - "nested-key-number-one"')) } 'the relay configuration has an api-keys list item at the indentation of api-keys itself') 'a list item at the indentation of api-keys'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 13 @('    - "nested-key-number-one"', '      - "nested-key-number-six"')) } 'the relay configuration has a line inside the api-keys list that is not one list item') 'list items at two indentations'
+  Check (Test-RefusedWith { Read-RelayConfig ($nestedBase + @('remote-management:', '  secret-key: "nested-secret-number-three"')) } $topLevel) 'another top-level key after the nested blocks'
+  Check (Test-RefusedWith { Read-RelayConfig (@('debug: false') + $nestedBase) } $topLevel) 'another top-level key before the nested blocks'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('  host: 127.0.0.1', '  secret-key: "nested-secret-number-three"')) } $elsewhere) 'a secret-key under another block'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 5 @('    enabled: false', '    api-keys:')) } $elsewhere) 'api-keys deeper inside a block'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('  host: 0.0.0.0')) } $hostOnly) 'a server.host open to the network'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('  host: ""')) } $hostOnly) 'an empty server.host'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @("`tport: 8317")) } $notUnderstood) 'a tab indent'
+  Check (Test-RefusedWith { Read-RelayConfig (@('---') + $nestedBase) } $notUnderstood) 'a document marker'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 7 @('  <<: *defaults')) } $notUnderstood) 'a merge key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  "port": 8317')) } $notUnderstood) 'a quoted key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  ''secret-key'': hidden-secret-number-one')) } $notUnderstood) 'a quoted secret-key'
+  Check ($script:SecretTexts.Contains('hidden-secret-number-one')) 'a secret under a refused quoted key is still kept out of the evidence'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  "secret' + '\' + 'u002dkey": hidden-secret-number-five')) } $notUnderstood) 'an escaped quoted secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  &mgmt "secret-key": hidden-secret-number-six')) } $notUnderstood) 'an anchored quoted secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  !!str secret-key: hidden-secret-number-seven')) } $notUnderstood) 'a tagged secret-key'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 8 @('  ? secret-key', '  : nested-secret-number-four')) } $notUnderstood) 'an explicit key'
+  # A block value may hold a comma; the first pass registers the whole value before the earlier port line refuses.
+  $commaSecret = Edit-Base 8 @('  secret-key: abc,hidden-secret-number-one')
+  $commaSecret[3] = '  port: eighty'
+  Check (Test-RefusedWith { Read-RelayConfig $commaSecret } 'the relay configuration has a port line that cannot be read') 'a port that cannot be read before a secret with a comma'
+  Check ($script:SecretTexts.Contains('abc,hidden-secret-number-one')) 'a secret with a comma is kept out of the evidence whole'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 3 @('  port:8317')) } 'the relay configuration has a key with no space after its colon') 'a key with no space after its colon'
+  Check (Test-RefusedWith { Read-RelayConfig (Edit-Base 2 @('    host: 127.0.0.1')) } 'the relay configuration has a line indented less than the first key of its block') 'a line indented less than its block'
   $found = [Collections.Generic.List[string]]::new()
   $sample = '{"a":"C:\\qqbot-rust\\x","b":"C:\\qqbot\\runtime\\y","c":["C:\\qqbot\\qq-bridge\\z","plain"],"d":"C:\\a\\..\\b","e":"https://h/x","f":"C:\\Old\\Rt\\f"}' | ConvertFrom-Json
   Find-ForeignPaths $sample '' @('c:\old\rt') 'c:\qqbot' $found
@@ -2395,14 +2646,11 @@ function Invoke-SelfTest {
   $goNow = [DateTime]::new(2026, 11, 15, 12, 0, 0, [DateTimeKind]::Utc)
   Check (Test-GoAge ($goNow.AddMinutes(-119)) $goNow) 'owner go file inside two hours'
   Check (-not (Test-GoAge ($goNow.AddMinutes(-121)) $goNow)) 'owner go file older than two hours'
-  $nestedPort = Read-RelayConfig @('remote-management:', '  port: 83', 'api-keys:', '  - "key-three"')
-  Check ($nestedPort.Port -eq 0) 'no top-level port line means the relay default port; a nested port is not the relay port'
   Check (Test-Refused { Assert-PlanHas ([ordered]@{}) @('ReleaseChecked') 'the release check' }) 'a missing earlier result skips the section'
   Check (-not (Test-Refused { Assert-PlanHas ([ordered]@{ ReleaseChecked = 'yes' }) @('ReleaseChecked') 'the release check' })) 'a present earlier result lets the section run'
   Check (Test-Refused { Assert-PlanHas ([ordered]@{ ConsolePort = 0 }) @('ConsolePort') 'the configuration check' }) 'a port of 0 counts as missing'
   Check (-not (Test-OwnerGoLine @('MOVE') 'MOVE' '')) 'a MOVE go line always names a release'
   Check (-not (Test-GoAge ($goNow.AddMinutes(6)) $goNow)) 'owner go file dated more than five minutes ahead'
-  Check (Test-Refused { Read-RelayConfig @('port: eighty', 'api-keys:', '  - "key-four"') }) 'a top-level port line that cannot be read'
   $bundleMap = New-PathMap @([pscustomobject]@{ From = 'C:\Q\qq-bridge\b'; To = 'C:\Q\runtime\user\dsh\bundles\b' })
   Check ((Convert-DshText '"b": "link:C:\Q\qq-bridge\b"' $bundleMap) -ceq '"b": "link:C:\Q\runtime\user\dsh\bundles\b"') 'bundle path with backslashes'
   Check ((Convert-DshText 'b: link:c:/q/qq-bridge/b/x' $bundleMap) -ceq 'b: link:C:/Q/runtime/user/dsh/bundles/b/x') 'bundle path with forward slashes in another case'
