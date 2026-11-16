@@ -451,7 +451,7 @@ async fn tool_loop(
         // #183: a capture the operator armed takes this request as `model_step` hands it to the
         // model client, which adds only the OpenAI wire framing.
         crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
-            let chat = ChatRequest::new(model_messages(delivered.clone()))
+            let chat = ChatRequest::new(delivered.clone())
                 .with_tools(request.tools.model_tools());
             serde_json::json!({
                 "model": request.route.model_name(),

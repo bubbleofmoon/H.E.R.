@@ -145,7 +145,7 @@ fn parse_arming(text: &str) -> Option<Arming> {
 }
 
 /// The background half of a capture: claims, judges and writes.
-type Persist = fn(&RuntimeContext, Route, i64, Value) -> bool;
+pub(crate) type Persist = fn(&RuntimeContext, Route, i64, Value) -> bool;
 
 /// Marks a runtime's capture attempt as in flight until dropped, even when the attempt panics.
 struct Flight(PathBuf);
@@ -160,7 +160,22 @@ impl Drop for Flight {
 /// capture: without an arming file it does one metadata lookup and `request` is never built; with
 /// one, it takes the snapshot `request` returns and hands it to a detached thread (`persist`).
 pub(crate) fn offer(context: &RuntimeContext, route: Route, request: impl FnOnce() -> Value) {
-    let _ = offer_at(context, route, crate::turn_ledger::now_ms(), request, persist);
+    // TEMPORARY red mutation (#183 fix round 2): offer joins its writer handle. F6 removes it.
+    if let Some(handle) = offer_at(context, route, crate::turn_ledger::now_ms(), request, writer(context)) {
+        let _ = handle.join();
+    }
+}
+
+/// The writer `offer` hands its snapshot to.
+#[cfg(not(test))]
+fn writer(_: &RuntimeContext) -> Persist {
+    persist
+}
+
+/// The writer `offer` hands its snapshot to: the one a test registered for this runtime, or `persist`.
+#[cfg(test)]
+fn writer(context: &RuntimeContext) -> Persist {
+    test_support::WRITERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(context.data_dir()).copied().unwrap_or(persist)
 }
 
 /// The send-path half of `offer`. The handle is for tests; `offer` drops it, detaching the thread.
@@ -558,6 +573,17 @@ pub(crate) fn run_cli(args: &[String]) -> i32 {
 pub(crate) mod test_support {
     use crate::runtime::{RuntimeArea, RuntimeContext};
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Writers tests put in place of `persist` for one runtime (by data folder); `offer` uses them.
+    pub(crate) static WRITERS: Mutex<BTreeMap<PathBuf, super::Persist>> = Mutex::new(BTreeMap::new());
+
+    /// Makes `offer` hand this runtime's snapshots to `writer`.
+    pub(crate) fn use_writer(context: &RuntimeContext, writer: super::Persist) {
+        WRITERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(context.data_dir().to_path_buf(), writer);
+    }
 
     /// A disposable selected runtime, removed on drop.
     pub(crate) struct FixtureRoot(pub(crate) std::path::PathBuf);
@@ -700,6 +726,27 @@ mod tests {
     }
 
     #[test]
+    fn offer_returns_while_its_writer_is_stalled() {
+        // The production entry, with persistence stalled for a second: the request goes on at once.
+        let (_root, context) = runtime("stalled", "http://127.0.0.1:1");
+        arm(&context, Some("dsh"), None, crate::turn_ledger::now_ms()).unwrap();
+        super::test_support::use_writer(&context, slow_persist);
+        let started = Instant::now();
+        offer(&context, Route::Dsh, || json!({"n": 1}));
+        assert!(started.elapsed() < Duration::from_millis(500), "the send path waited {:?}", started.elapsed());
+        assert_eq!(settled(&context).expect("the stalled writer still captured")["request"], json!({"n": 1}));
+    }
+
+    #[test]
+    fn the_capture_path_writes_no_diagnostics() {
+        // A stalled stderr would block the request: from `offer` to the capture write, problems are
+        // only counted or recorded in the runtime's failure file.
+        let source = include_str!("upstream_capture.rs");
+        let path = &source[source.find("pub(crate) fn offer(").unwrap()..source.find("fn capture_record(").unwrap()];
+        assert!(!path.contains(&["note", "("].concat()), "the capture path writes a diagnostic");
+    }
+
+    #[test]
     fn an_arming_expires_at_its_minute_boundary_without_a_capture() {
         let (_root, context) = runtime("expiry", "http://127.0.0.1:1");
         // Armed at 1000 for one minute: still valid at 61000, expired at 61001.
@@ -708,6 +755,8 @@ mod tests {
         disarm(&context).unwrap();
         arm(&context, Some("dsh"), Some("1"), 1_000).unwrap();
         assert!(!attempt(&context, Route::Dsh, 61_001, || json!({"at": "late"})));
+        // The writer recorded why, without a diagnostic; `status` reports it.
+        assert_eq!(status(&context, 61_001).unwrap()["lastFailure"]["reason"], "expired");
         assert!(captured(&context).is_none());
         assert_eq!(armed_or_claimed(&context), (false, false));
         // An expired arming for the other route is removed by any route's request.
@@ -905,6 +954,42 @@ mod tests {
         let cfg = super::test_support::config();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
+        // An earlier completed turn of this conversation replays a tool result with an image. Before
+        // delivery, `model_messages` moves tool images into a user message of their own ("Images from
+        // tool call <id>:"), so the capture shows whether it holds the request after that move.
+        let seed_call = genai::chat::ToolCall {
+            call_id: "seed-call-183".into(),
+            fn_name: "fixture_seed_tool_183".into(),
+            fn_arguments: json!({}),
+            thought_signatures: None,
+        };
+        let seed = crate::harness::TurnRequest {
+            id: "seed-183".into(),
+            conversation: "private:8808".into(),
+            generation: generation.clone(),
+            prompt: "seed prompt 183".into(),
+            profile: "closed-agent".into(),
+            route: crate::harness::ModelRoute::from_runtime(&context, &cfg).unwrap(),
+            deadline: Duration::from_secs(10),
+            tools: crate::harness::Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(),
+            limits: crate::harness::Limits::from_config(&cfg),
+        };
+        let store = crate::harness::store::Store::open(&context).unwrap();
+        store.admit(&seed).unwrap();
+        let calling = genai::chat::ChatMessage::assistant(vec![genai::chat::ContentPart::ToolCall(seed_call.clone())]);
+        let attempt = store
+            .complete_step("seed-183", &crate::harness::Event::Assistant { text: String::new(), raw: json!({}), message: calling })
+            .unwrap();
+        let run = store.tool_start("seed-183", &attempt, &seed_call).unwrap();
+        let mut result = genai::chat::ChatMessage::tool(genai::chat::ToolResponse::from_tool_call(&seed_call, r#"{"content":[{"type":"text","text":"seed tool text 183"}]}"#));
+        result.content.extend(vec![genai::chat::ContentPart::Binary(genai::chat::Binary::from_base64("image/png", "iVBORw0KGgo=", None))]);
+        store.tool_result("seed-183", &run, &result, &json!({"content": [{"type": "text", "text": "seed tool text 183"}]})).unwrap();
+        store.next_attempt(&seed).unwrap();
+        let reply = genai::chat::ChatMessage::assistant("seed reply 183");
+        store
+            .finish("seed-183", &crate::harness::Status::Completed("seed reply 183".into()), Some(&crate::harness::Event::Assistant { text: "seed reply 183".into(), raw: json!({}), message: reply }))
+            .unwrap();
+        drop(store);
         // Two model steps: a call to a tool that does not exist (its error result is replayed), then
         // the reply. The relay arms the capture while it holds the first step, so the capture takes
         // the second: the filtered prompt, the replayed tool call and its result.
@@ -1014,6 +1099,7 @@ mod tests {
         sent.retain(|text| !text.is_empty());
         assert!(sent.iter().any(|text| text == "call-183"), "the second step replays the tool call: {sent:?}");
         assert!(sent.iter().any(|text| text.starts_with("fixture prompt 183")), "{sent:?}");
+        assert!(sent.iter().any(|text| text.starts_with("Images from tool call ")), "the replayed tool image is delivered on its own: {sent:?}");
         assert!(!wire[1].to_string().contains("STRIPPED183"), "the relay received text the model view strips");
         for text in &sent {
             assert!(held.contains(text), "the relay received text the capture lacks: {text}");
