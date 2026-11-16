@@ -199,6 +199,14 @@ impl Credential {
         credential
     }
 
+    /// `fixed`, bound to a selected runtime (the upstream capture tests).
+    #[cfg(test)]
+    pub fn fixed_in(context: &RuntimeContext, base: &str, cookie: String) -> Self {
+        let credential = Self::with_cookie(base, cookie, context.clone());
+        credential.disable_refresh();
+        credential
+    }
+
     /// The runtime whose credentials this login uses.
     pub fn context(&self) -> &RuntimeContext {
         &self.context

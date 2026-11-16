@@ -448,6 +448,17 @@ async fn tool_loop(
         // Capture only structured references from the request being issued. Later read
         // results and recalled tool facts may add sources absent from the inbound wake.
         *request_refs.lock().unwrap_or_else(|p| p.into_inner()) = model_request_refs(&delivered);
+        // #183: a capture the operator armed takes this request as `model_step` hands it to the
+        // model client, which adds only the OpenAI wire framing.
+        crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
+            let chat = ChatRequest::new(model_messages(delivered.clone()))
+                .with_tools(request.tools.model_tools());
+            serde_json::json!({
+                "model": request.route.model_name(),
+                "maxTokens": request.limits.max_tokens.saturating_sub(spent).min(4096),
+                "request": serde_json::to_value(&chat).unwrap_or(Value::Null),
+            })
+        });
         let model = model_step(
             client,
             &request.route,

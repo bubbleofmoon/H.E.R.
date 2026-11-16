@@ -390,6 +390,10 @@ impl Rpc {
             "method": endpoint,
             "payload": { "args": args },
         });
+        if endpoint == "session/prompt" {
+            // #183: a capture the operator armed takes this prompt exactly as it is posted.
+            crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
+        }
 
         let host_port = self
             .base
@@ -520,6 +524,10 @@ impl Rpc {
             "payload": { "args": args },
         });
         let (host_port, address) = bounded_loopback_endpoint(&self.base)?;
+        if endpoint == "session/prompt" {
+            // #183: a capture the operator armed takes this prompt exactly as it is posted.
+            crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
+        }
         let body_text = envelope.to_string();
         let (mut status, mut text) = http_post_with_deadline(
             &host_port,
@@ -2045,6 +2053,55 @@ mod tests {
                 assert_eq!(result, expected, "{path}: {reply} reply");
             }
         }
+    }
+
+    #[test]
+    fn upstream_capture_takes_the_next_prompt_envelope_once_on_both_call_paths() {
+        use crate::upstream_capture::test_support as capture;
+        let (_root, context) = capture::runtime("dsh-capture", "http://127.0.0.1:1");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake DSH");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let rpc = Rpc {
+            base: base.clone(),
+            credential: Credential::fixed_in(&context, &base, "dsh-auth-ticket04=synthetic-cookie".into()),
+        };
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for _ in 0..5 {
+                let mut stream = accept_test_stream(&listener);
+                let request = test_rpc_request_body(&read_test_request(&mut stream));
+                write_test_rpc_response(
+                    &mut stream,
+                    test_rpc_success(request["rpcId"].clone(), serde_json::json!({"accepted": true})),
+                );
+                bodies.push(request);
+            }
+            bodies
+        });
+        let prompt = |text: &str| serde_json::json!({"sessionId": "s-183", "mode": "queue", "content": [{"type": "text", "text": text}]});
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(2);
+        capture::arm(&context, "dsh");
+        // Another method leaves the arming alone; the next prompt takes it and the one after is not captured.
+        rpc.call("session.list", serde_json::json!({})).unwrap();
+        assert!(capture::captured(&context).is_none());
+        rpc.call_with_rpc_id("session.prompt", prompt("fixture wake 183 one"), "rpc-183-1").unwrap();
+        rpc.call_with_rpc_id("session.prompt", prompt("fixture wake 183 two"), "rpc-183-2").unwrap();
+        // The capture is written on its own thread: wait for it before the next step.
+        let first = capture::settled(&context).expect("the first prompt was captured");
+        // The bounded call path captures the same way.
+        capture::disarm(&context);
+        capture::arm(&context, "dsh");
+        rpc.call_with_cancellation_as("session.prompt", prompt("fixture wake 183 three"), "rpc-183-3", deadline(), &|| false).unwrap();
+        rpc.call_with_cancellation_as("session.prompt", prompt("fixture wake 183 four"), "rpc-183-4", deadline(), &|| false).unwrap();
+        let second = capture::settled(&context).expect("the third prompt was captured");
+        let bodies = server.join().expect("join fake DSH server");
+        assert_eq!(first["route"], "dsh");
+        assert_eq!(first["request"], bodies[1], "the capture is the envelope DSH received");
+        assert_eq!(second["request"], bodies[3], "the capture is the envelope DSH received");
+        for record in [&first, &second] {
+            assert!(!record.to_string().contains("synthetic-cookie"), "{record}");
+        }
+        assert_eq!(capture::armed_or_claimed(&context), (false, false));
     }
 
     #[test]
