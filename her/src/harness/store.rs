@@ -583,8 +583,7 @@ pub(crate) fn assistant_texts(context: &RuntimeContext, conversation: &str, afte
 #[allow(dead_code)]
 pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation: &str) -> Result<Option<super::rotation::LastCall>, String> {
     let path = context.resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR)?;
-    if true || !path.exists() {
-        // RED (run 1): run 2 restores the read.
+    if !path.exists() {
         return Ok(None);
     }
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)

@@ -20,22 +20,16 @@ pub(crate) struct LastCall {
 /// The cache life of the route that served `model`: `harness.cacheTtlMinutes.<model>`, a positive finite number of
 /// minutes. There is no built-in value: `None` means the route never idle-rotates.
 pub(crate) fn cache_life_minutes(cfg: &Value, model: &str) -> Option<f64> {
-    // RED (run 1): DSH's rule applied unchanged; run 2 restores the harness rule.
-    cfg.pointer("/dsh/cacheTtlMinutes")
+    cfg.pointer("/harness/cacheTtlMinutes")
         .and_then(|table| table.get(model))
         .and_then(Value::as_f64)
-        .or(match model {
-            "local-relay" => Some(5.0),
-            "opencode-go" => Some(120.0),
-            _ => None,
-        })
         .filter(|minutes| minutes.is_finite() && *minutes > 0.0)
 }
 
 /// The rotation cap of the route that served `model`: `harness.rotation.caps.<model>`, then
 /// `harness.rotation.caps.default`, each only when a positive integer, then `DEFAULT_CAP`.
 pub(crate) fn cap(cfg: &Value, model: &str) -> u64 {
-    let caps = cfg.pointer("/dsh/rotation/caps"); // RED (run 1)
+    let caps = cfg.pointer("/harness/rotation/caps");
     let entry = |name: &str| {
         caps.and_then(|table| table.get(name))
             .and_then(Value::as_u64)
@@ -52,7 +46,7 @@ pub(crate) fn cap(cfg: &Value, model: &str) -> u64 {
 /// no cache life of its own, the provider reported no input, or the input stayed below the cap.
 pub(crate) fn due_at(cfg: &Value, last: &LastCall, idle_from: i64) -> Option<i64> {
     let minutes = cache_life_minutes(cfg, &last.model)?;
-    if last.input.unwrap_or(u64::MAX) < cap(cfg, &last.model) { // RED (run 1)
+    if last.input? < cap(cfg, &last.model) {
         return None;
     }
     let lead_ms = ((minutes - 1.0).max(0.0) * 60_000.0).ceil() as i64;
