@@ -230,6 +230,17 @@ fn enable_wal(context: &RuntimeContext, conn: &Connection) -> Result<(), String>
     }
 }
 
+/// Whether both tables of schema version 1 exist. A store that claims the version without them is refused before it is
+/// touched, so the WAL switch never rewrites its header.
+fn has_settings_schema(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('settings', 'settings_audit')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok_and(|count| count == 2)
+}
+
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
 /// schema is newer than this release's (checked before anything is written).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
@@ -243,6 +254,9 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     let version = schema_version(&conn)?;
     if version != 0 && version != SCHEMA_VERSION {
         return Err(refuse_version(version));
+    }
+    if version == SCHEMA_VERSION && !has_settings_schema(&conn) {
+        return Err(STORAGE_ERROR.to_string());
     }
     enable_wal(context, &conn)?;
     conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
