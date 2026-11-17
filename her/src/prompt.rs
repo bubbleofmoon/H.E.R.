@@ -1247,7 +1247,7 @@ fn build_inner(
         out.push_str(&initial);
         out.push_str("\n\n");
     }
-    out.push_str(&crate::prompt_text::behaviour(&cfg));
+    out.push_str(&crate::prompt_text::behaviour(context, &cfg));
     out.push_str(&sticker_line_with_runtime(context, &cfg));
     out.push_str(&send_line(&cfg));
     out.push_str(&reply_line(&cfg, &st));
@@ -2061,7 +2061,7 @@ pub(crate) fn prepare_dsh_wake_layered(
         Section::parts("participation", Some(Layer::Conversation),
             vec![format!("参与参考基准：最后活动时间 {activity_at}\n{}",participation_block_at(st,activity_at))]),
         Section::parts("slang", Some(Layer::Conversation), vec![slang]),
-        Section::parts("behaviour", None, vec![crate::prompt_text::behaviour(cfg)]),
+        Section::parts("behaviour", None, vec![crate::prompt_text::behaviour(context, cfg)]),
         Section::parts("stickers", None, vec![sticker_line_with_runtime(context,cfg)]),
         Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg))]),
         Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
@@ -2070,7 +2070,11 @@ pub(crate) fn prepare_dsh_wake_layered(
         Section::parts("wakeWords", None, vec![crate::wake_words::briefing_line(context,key,st)]),
     ], &crate::briefing::Budgets::from_cfg(cfg));
     let mut sections = assembly.sections.clone();
-    for text in sections.values_mut() { *text = crate::model_view::strip_from_model_text(text,cfg); }
+    // The behaviour rules are stripped and checked one by one in `prompt_text::behaviour`; stripping them again could
+    // make a new match, so that section is skipped here.
+    for (name, text) in sections.iter_mut() {
+        if *name != "behaviour" { *text = crate::model_view::strip_from_model_text(text,cfg); }
+    }
     after_sections();
     let hashes: BTreeMap<&str,String> = sections.iter().filter(|(_,v)| !v.is_empty())
         .map(|(k,v)| (*k, format!("{:x}",Sha256::digest(v.as_bytes())))).collect();

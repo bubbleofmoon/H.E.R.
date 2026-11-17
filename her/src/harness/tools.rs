@@ -68,14 +68,10 @@ impl Tools {
         };
         authority.check().map_err(String::from)?;
         // #140: read from the settings store with this turn's configuration, so an edit is in
-        // effect from the next turn; the model-view strip applies as it does to briefing sections.
+        // effect from the next turn; the model-view strip applies, and the stripped text is checked again.
         let mode_prompt = profile
             .prompt_key()
-            .map(|key| {
-                let delivery = crate::model_view::with_blacklist(context, cfg);
-                let text = crate::prompt_text::mode_prompt(cfg, key);
-                crate::model_view::strip_from_model_text(&text, &delivery).trim().to_string()
-            })
+            .map(|key| crate::prompt_text::model_text(context, cfg, key).trim().to_string())
             .unwrap_or_default();
         Ok(Self {
             definitions: definitions(cfg, profile),

@@ -64,9 +64,35 @@ pub(crate) fn text(cfg: &Value, key: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// One rule as its own paragraph: the text without trailing whitespace, then a blank line; nothing when it is empty.
-fn paragraph(cfg: &Value, key: &str) -> String {
-    let full = text(cfg, key);
+/// The model-visible text of text setting `key`, checked after the model-view strip (`with_blacklist`): the configured
+/// text when the strip leaves it without a denied term, else its newest audited text that the strip leaves so, else the
+/// compiled default, each stripped the same way. When none passes the text is empty, so nothing is sent. A key outside
+/// the registry, or one that is not a text setting, reads as empty.
+pub(crate) fn model_text(context: &crate::runtime::RuntimeContext, cfg: &Value, key: &str) -> String {
+    let Some(setting) = crate::settings::find(key) else {
+        return String::new();
+    };
+    let crate::settings::Kind::Text { default, .. } = setting.kind else {
+        return String::new();
+    };
+    let delivery = crate::model_view::with_blacklist(context, cfg);
+    let visible = |text: &str| {
+        let stripped = crate::model_view::strip_from_model_text(text, &delivery);
+        crate::settings::denied_in_text(&stripped).is_empty().then_some(stripped)
+    };
+    visible(&text(cfg, key))
+        .or_else(|| {
+            crate::settings::last_good_text(context, key, |candidate| visible(candidate).is_some())
+                .and_then(|candidate| visible(&candidate))
+        })
+        .or_else(|| visible(default))
+        .unwrap_or_default()
+}
+
+/// One rule as its own paragraph: the model-visible text without trailing whitespace, then a blank line; nothing when it
+/// is empty.
+fn paragraph(context: &crate::runtime::RuntimeContext, cfg: &Value, key: &str) -> String {
+    let full = model_text(context, cfg, key);
     let trimmed = full.trim_end();
     if trimmed.is_empty() {
         String::new()
@@ -75,16 +101,17 @@ fn paragraph(cfg: &Value, key: &str) -> String {
     }
 }
 
-/// The behaviour rules of the briefing's `behaviour` section and of the compatibility render: 【别像客服】, 【积极性】,
-/// group conduct and the repeat rule, in that order.
-pub(crate) fn behaviour(cfg: &Value) -> String {
+/// The behaviour rules of the briefing's `behaviour` section and of the compatibility render, each checked after the
+/// model-view strip (`model_text`): 【别像客服】, 【积极性】, group conduct and the repeat rule, in that order.
+pub(crate) fn behaviour(context: &crate::runtime::RuntimeContext, cfg: &Value) -> String {
     [NOT_A_CLERK_KEY, PROACTIVE_KEY, GROUP_CONDUCT_KEY, REPEAT_KEY]
         .into_iter()
-        .map(|key| paragraph(cfg, key))
+        .map(|key| paragraph(context, cfg, key))
         .collect()
 }
 
-/// The mode prompt `key` names, without surrounding whitespace; empty when none is set.
+/// The mode prompt `key` names, without surrounding whitespace; empty when none is set. Delivery reads `model_text`.
+#[cfg(test)]
 pub(crate) fn mode_prompt(cfg: &Value, key: &str) -> String {
     text(cfg, key).trim().to_string()
 }

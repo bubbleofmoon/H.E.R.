@@ -89,6 +89,15 @@ fn is_invisible_format(c: char) -> bool {
     )
 }
 
+/// One character folded for matching: full-width ASCII becomes ASCII and the ideographic space a space.
+fn fold_char(c: char) -> char {
+    match c {
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
 /// The text folded for matching: each invisible format character becomes `invisible`, full-width ASCII is folded and
 /// letters are upper case.
 fn fold_for_match(text: &str, invisible: &str) -> String {
@@ -97,24 +106,75 @@ fn fold_for_match(text: &str, invisible: &str) -> String {
             if is_invisible_format(c) {
                 invisible.chars().collect::<Vec<char>>()
             } else {
-                vec![match c {
-                    '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-                    '\u{3000}' => ' ',
-                    other => other,
-                }]
+                vec![fold_char(c)]
             }
         })
         .collect::<String>()
         .to_uppercase()
 }
 
+/// The denied words of `text` (`upstream_capture::DENIED_WORDS`, and `AI`) when each invisible format character is both
+/// a word boundary and a joiner. The text is the folded upper-case characters, each marked when a removed format run
+/// precedes it. A word matches with its inner characters contiguous, and each side of it may be a removed run or a
+/// character that is not a word character (`word_char` names the word characters).
+fn denied_words_across_format(text: &str) -> Vec<String> {
+    let mut upper: Vec<(char, bool)> = Vec::new();
+    let mut lower: Vec<(char, bool)> = Vec::new();
+    let mut run = false;
+    for c in text.chars() {
+        if is_invisible_format(c) {
+            run = true;
+            continue;
+        }
+        let mut boundary = std::mem::take(&mut run);
+        for u in fold_char(c).to_uppercase() {
+            upper.push((u, boundary));
+            for (i, l) in u.to_lowercase().enumerate() {
+                lower.push((l, boundary && i == 0));
+            }
+            boundary = false;
+        }
+    }
+    let mut found = Vec::new();
+    for word in crate::upstream_capture::DENIED_WORDS {
+        if spans_with_edges(&lower, word, |c| c.is_ascii_alphanumeric()) {
+            found.push(word.to_string());
+        }
+    }
+    if spans_with_edges(&upper, "AI", |c| c.is_ascii_alphabetic()) {
+        found.push("AI".to_string());
+    }
+    found
+}
+
+/// Whether `term` occurs in `units` (character, removed-run-before flag) with both edges boundaries: the character
+/// before it is a removed run or not a word character, and so is the character after it.
+fn spans_with_edges(units: &[(char, bool)], term: &str, word_char: fn(char) -> bool) -> bool {
+    let term: Vec<char> = term.chars().collect();
+    if term.is_empty() || units.len() < term.len() {
+        return false;
+    }
+    (0..=units.len() - term.len()).any(|start| {
+        let end = start + term.len();
+        units[start..end].iter().map(|unit| unit.0).eq(term.iter().copied())
+            && (start == 0 || units[start].1 || !word_char(units[start - 1].0))
+            && (end == units.len() || units[end].1 || !word_char(units[end].0))
+    })
+}
+
 /// The #142 denied terms (`upstream_capture::denied_terms`) in model-visible text, each once. The check reads the text
-/// twice: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
-/// found, and with them read as word boundaries, as the text is shown, so a refusal the text earns with them kept still
-/// holds. Full-width ASCII is folded and letters are upper case, so `ＤＳＨ` and `ai` are found too.
+/// three ways: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
+/// found; with them read as word boundaries, as the text is shown, so a refusal the text earns with them kept still
+/// holds; and with each of them both a boundary and a joiner (`denied_words_across_format`), so a word split by a mix
+/// of the two is found too. Full-width ASCII is folded and letters are upper case, so `ＤＳＨ` and `ai` are found too.
 pub(crate) fn denied_in_text(text: &str) -> Vec<String> {
     let mut denied = crate::upstream_capture::denied_terms(&fold_for_match(text, ""));
     for term in crate::upstream_capture::denied_terms(&fold_for_match(text, " ")) {
+        if !denied.contains(&term) {
+            denied.push(term);
+        }
+    }
+    for term in denied_words_across_format(text) {
         if !denied.contains(&term) {
             denied.push(term);
         }
@@ -754,7 +814,7 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
             Some(value) => values.push((setting, value)),
             None if matches!(setting.kind, Kind::Text { .. }) => {
                 report_refused_text(setting.key);
-                if let Some(value) = last_good(&conn, setting) {
+                if let Some(value) = last_good(&conn, setting, |_| true) {
                     values.push((setting, value));
                 }
             }
@@ -768,18 +828,30 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
 /// term a later release added): the newest audited value the setting accepts, such as the default a reset stored. An
 /// audit row without a new value (an undo that removed the stored value) ends the search, and so does the oldest row;
 /// `None` then, and the file's value or the default applies.
-fn last_good(conn: &Connection, setting: &Setting) -> Option<Value> {
+fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> bool) -> Option<Value> {
     let mut statement =
         conn.prepare("SELECT new_value FROM settings_audit WHERE key=?1 ORDER BY id DESC").ok()?;
     let mut rows = statement.query([setting.key]).ok()?;
     while let Ok(Some(row)) = rows.next() {
         let text: Option<String> = row.get(0).ok()?;
-        let value = serde_json::from_str::<Value>(&text?).ok().and_then(|value| setting.normalize(&value));
+        let value = serde_json::from_str::<Value>(&text?)
+            .ok()
+            .and_then(|value| setting.normalize(&value))
+            .filter(|value| accepted(value));
         if value.is_some() {
             return value;
         }
     }
     None
+}
+
+/// The newest audited text of text setting `key` that the registry accepts and that `accepted` takes, read through the
+/// store's read-only connection; `None` when there is no store, no such row, or the search ends (`last_good`). Used when
+/// a text that passed the load check fails a later check, such as the model-view strip.
+pub(crate) fn last_good_text(context: &RuntimeContext, key: &str, accepted: impl Fn(&str) -> bool) -> Option<String> {
+    let setting = find(key)?;
+    let Ok(Inspection::Ready(conn)) = inspect(context) else { return None };
+    last_good(&conn, setting, |value| value.as_str().is_some_and(&accepted))?.as_str().map(str::to_string)
 }
 
 /// One stderr line per text setting and process when its stored value is refused at load.
