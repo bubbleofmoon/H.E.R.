@@ -274,7 +274,7 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         // A written configuration the runtime cannot load revokes everything the old one allowed.
         let effective_after = context.effective_config(&file).unwrap_or_else(|_| json!({}));
         let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
-        write_config_or_forget(context, &file, &pending)?;
+        write_config_or_forget(context, &file, &before, &pending)?;
         (effective_before, effective_after, file, pending)
     };
     let (retired, failures) = finish_access_change(context, &interaction, &before, &after, "access-revoked", pending);
@@ -336,6 +336,8 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         let _gate = acquire_social_state_gate(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         let mut file = read_config_object(context)?;
+        // #192: the file as read, to tell a write that failed before publication from one that published.
+        let unchanged = file.clone();
         #[cfg(test)]
         {
             // Bound first, so the hook never runs while the seam's own lock is held.
@@ -387,7 +389,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
             // A written configuration the runtime cannot load revokes everything the old one allowed.
             let effective_after = context.effective_config(&file).unwrap_or_else(|_| json!({}));
             let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
-            write_config_or_forget(context, &file, &pending)?;
+            write_config_or_forget(context, &file, &unchanged, &pending)?;
             (effective_before, effective_after, changed, pending)
         }
     };
@@ -695,7 +697,8 @@ pub(super) static AFTER_ACCESS_WRITE: std::sync::Mutex<Option<std::sync::Arc<dyn
     std::sync::Mutex::new(None);
 
 /// The pending entries; none when the file does not exist (a runtime that never recorded one). An unreadable or
-/// malformed file is an error: its entries cannot be finished, and nothing may be added to it.
+/// malformed file, or an entry without usable policies, is an error: its entries cannot be finished, and nothing may
+/// be added to it.
 fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     let Some(text) = context
         .read_optional_text(RuntimeArea::Data, PENDING_REVOCATIONS)
@@ -703,10 +706,26 @@ fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     else {
         return Ok(Vec::new());
     };
-    serde_json::from_str::<Value>(&text)
+    let pending = serde_json::from_str::<Value>(&text)
         .ok()
         .and_then(|value| value.get("pending").and_then(Value::as_array).cloned())
-        .ok_or_else(|| format!("data/{PENDING_REVOCATIONS} is not a pending-revocation record; repair or remove it"))
+        .ok_or_else(|| format!("data/{PENDING_REVOCATIONS} is not a pending-revocation record; repair or remove it"))?;
+    if let Some(index) = pending.iter().position(|entry| false && !usable_entry(entry)) { // #192 TEMPORARY RED MUTATION
+        return Err(format!("data/{PENDING_REVOCATIONS} entry {index} has no usable before/after policy; repair or remove it"));
+    }
+    Ok(pending)
+}
+
+/// An entry carries both policies (`before`, `after`) as objects whose `allow` and `deny`, when present, are objects,
+/// as `begin_access_change` writes them. `mode` and `why` may be missing: the current mode and `access-revoked` are
+/// used.
+fn usable_entry(entry: &Value) -> bool {
+    ["before", "after"].iter().all(|side| {
+        entry
+            .get(*side)
+            .and_then(Value::as_object)
+            .is_some_and(|policy| ["allow", "deny"].iter().all(|list| policy.get(*list).is_none_or(Value::is_object)))
+    })
 }
 
 fn write_pending_revocations(context: &RuntimeContext, pending: &[Value]) -> Result<(), String> {
@@ -749,13 +768,39 @@ pub(super) fn forget_access_change(context: &RuntimeContext, id: &Option<String>
     write_pending_revocations(context, &pending)
 }
 
-/// Write `config.json` for an access change recorded as `pending`. A failed write changed nothing, so its entry is
-/// removed; if that removal fails too, the entry stays and its revocation runs later (fail closed).
-fn write_config_or_forget(context: &RuntimeContext, file: &Value, pending: &Option<String>) -> Result<(), (u16, String)> {
+/// Write `config.json` for an access change recorded as `pending`; `unchanged` is the file as the change read it. A
+/// failed write is settled by `settle_failed_write`.
+fn write_config_or_forget(
+    context: &RuntimeContext,
+    file: &Value,
+    unchanged: &Value,
+    pending: &Option<String>,
+) -> Result<(), (u16, String)> {
     let Err((status, error)) = write_config_object(context, file) else { return Ok(()) };
+    Err((status, format!("{error}{}", settle_failed_write(context, unchanged, pending))))
+}
+
+/// The raw `config.json` as an access change finds it before its write, for `settle_failed_write` (`Null` when it
+/// cannot be read: a failed write then always keeps its entry).
+pub(super) fn config_snapshot(context: &RuntimeContext) -> Value {
+    read_config_object(context).unwrap_or(Value::Null)
+}
+
+/// After a failed configuration write: the pending entry is removed only when `config.json` still holds `unchanged`
+/// (the failure came before the atomic replace published anything). A file that changed, or cannot be read, may hold
+/// the new policy (a failure after publication, such as the folder sync): the entry stays, and the next console start
+/// or access change finishes its revocation. Returns the note added to the write error.
+pub(super) fn settle_failed_write(context: &RuntimeContext, unchanged: &Value, pending: &Option<String>) -> String {
+    if pending.is_none() {
+        return String::new();
+    }
+    let published = false; // #192 TEMPORARY RED MUTATION
+    if published {
+        return "; the configuration may have been written, so its revocation stays pending and is finished at the next console start or access change".to_string();
+    }
     match forget_access_change(context, pending) {
-        Ok(()) => Err((status, error)),
-        Err(cleanup) => Err((status, format!("{error}; the recorded revocation stays pending: {cleanup}"))),
+        Ok(()) => String::new(),
+        Err(cleanup) => format!("; the recorded revocation stays pending: {cleanup}"),
     }
 }
 

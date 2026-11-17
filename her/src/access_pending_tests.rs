@@ -228,3 +228,74 @@ fn t192_console_start_keeps_the_record_while_the_interaction_gate_is_busy() {
     assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
     assert!(pending(&root).is_empty());
 }
+
+/// Fail the second guarded-write step named `failing` on this thread: the first such step belongs to the pending
+/// record's write, the second to `config.json`'s.
+fn fail_config_write_at(failing: &'static str) {
+    let mut seen = 0u32;
+    crate::guarded_file::STEP_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |step: &'static str| -> std::io::Result<()> {
+            if step == failing {
+                seen += 1;
+                if seen == 2 {
+                    return Err(std::io::Error::other("t192: injected write failure"));
+                }
+            }
+            Ok(())
+        }))
+    });
+}
+
+fn clear_write_failures() {
+    crate::guarded_file::STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[test]
+fn t192_a_failed_config_write_keeps_its_revocation_unless_nothing_was_published() {
+    let (root, context) = admitted("t192 failed write");
+    let config = root.0.join("config/config.json");
+    let before = std::fs::read(&config).unwrap();
+    // Before publication (the temporary file's sync): nothing changed, so nothing stays pending.
+    fail_config_write_at("temp/sync");
+    let refused = conversation_scope_change(&context, GROUP, "remove");
+    clear_write_failures();
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(std::fs::read(&config).unwrap(), before, "nothing was published");
+    assert!(pending(&root).is_empty(), "a write that never landed leaves nothing pending");
+    // After publication (the folder sync): the new policy is in force, so its revocation stays pending.
+    fail_config_write_at("dir/sync");
+    let failed = conversation_scope_change(&context, GROUP, "remove");
+    clear_write_failures();
+    let error = failed.unwrap_err();
+    assert!(error.1.contains("revocation stays pending"), "{error:?}");
+    assert_eq!(file(&root)["allow"]["groups"], json!([]), "the configuration was published");
+    assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
+    assert_eq!(pending(&root).len(), 1, "the published change keeps its pending revocation");
+    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
+    assert_ne!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN));
+    assert!(pending(&root).is_empty());
+}
+
+#[test]
+fn t192_an_entry_without_usable_policies_refuses_access_changes() {
+    let (root, context) = admitted("t192 unusable entry");
+    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let config = root.0.join("config/config.json");
+    for entry in [
+        json!({}),
+        json!({"id": "revoke-t192-half", "before": {"allow": {"groups": [420042]}}}),
+        json!({"id": "revoke-t192-list", "before": {"allow": [420042]}, "after": {}}),
+    ] {
+        let text = json!({"pending": [entry.clone()]}).to_string();
+        std::fs::write(&record, &text).unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let error = conversation_scope_change(&context, "group:420043", "admit").unwrap_err();
+        assert_eq!(error.0, 503, "{entry}: {error:?}");
+        assert!(error.1.contains("no usable before/after policy"), "{entry}: {error:?}");
+        assert_eq!(std::fs::read(&config).unwrap(), before, "{entry}: nothing is written");
+        assert!(access::finish_pending_revocations(&context).is_err(), "{entry}: console start reports it");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "{entry}: the record is kept for repair");
+        assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN), "{entry}: nothing is revoked");
+    }
+}

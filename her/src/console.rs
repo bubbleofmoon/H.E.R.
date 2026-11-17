@@ -14296,6 +14296,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
             let mut restored = Vec::with_capacity(pending.len());
             // #192: the restored configuration's effective policy and its pending revocation, recorded before its write.
             let mut planned: Option<(Value, Option<String>, Option<String>)> = None;
+            // #192: `config.json` as found before its restore, to tell a failed write that published from one that did not.
+            let mut unchanged_config = Value::Null;
             for (file, old) in pending {
                 // Undo never changes the console credential: the restored configuration keeps the
                 // current `consoleToken` (backups hold a redacted one).
@@ -14319,6 +14321,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     };
                     let change = access::begin_access_change(context, &config_before, &after, "audit-undo")?;
                     planned = Some((after, load_error, change));
+                    unchanged_config = access::config_snapshot(context);
                     text
                 } else {
                     old
@@ -14326,9 +14329,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                 if let Err(error) = audit_write_file(context, &file, &text) {
                     let mut message = format!("写回失败 {file}: {error}");
                     if let Some((_, _, change)) = planned.as_ref().filter(|_| file == "config/config.json") {
-                        if let Err(cleanup) = access::forget_access_change(context, change) {
-                            message.push_str(&format!("; the recorded revocation stays pending: {cleanup}"));
-                        }
+                        message.push_str(&access::settle_failed_write(context, &unchanged_config, change));
                     }
                     return Err((500, message));
                 }

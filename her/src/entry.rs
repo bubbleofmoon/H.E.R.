@@ -418,9 +418,32 @@ fn take_held(cfg: &Value, held: &[String], saved: Vec<inbound::Replayable>) -> (
     split_replayable(Some(cfg), items)
 }
 
+/// #192 (F3): what the ingress loop does with one event. `readable`: the configuration read for it succeeded; `holds`:
+/// reserved2 serves its conversation here (`--live-groups`); `held_any`: events are held already; `refusable`: another
+/// mode would serve it. A served event is held while the configuration cannot be read, and also while earlier events
+/// are still held, so it never overtakes them once the configuration reads again.
+#[derive(Debug, PartialEq, Eq)]
+enum Ingress {
+    Handle,
+    Hold,
+    Refuse,
+    Skip,
+}
+
+fn ingress_for(readable: bool, holds: bool, held_any: bool, refusable: bool) -> Ingress {
+    if holds && !readable { // #192 TEMPORARY RED MUTATION
+        Ingress::Hold
+    } else if readable {
+        Ingress::Handle
+    } else if refusable {
+        Ingress::Refuse
+    } else {
+        Ingress::Skip
+    }
+}
+
 /// #192 (F3): events refused while the configuration cannot be read (outside reserved2, which holds them) go to the
-/// run record at most once a minute, with the number refused since the previous record; the rest is recorded when
-/// the configuration reads again.
+/// run record at most once a minute, also across a recovery, with the number refused since the previous record.
 #[derive(Default)]
 struct UnreadableRefusals {
     count: u64,
@@ -433,17 +456,22 @@ impl UnreadableRefusals {
     /// One more refused event; the number to record now, when a record is due.
     fn note(&mut self, now: std::time::Instant) -> Option<u64> {
         self.count += 1;
-        if self.recorded_at.is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY) {
+        self.due(now)
+    }
+
+    /// The configuration reads again: the number refused since the last record, once a record is due (the ingress
+    /// loop asks again until it is recorded).
+    fn flush(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.recorded_at = None; // #192 TEMPORARY RED MUTATION
+        self.due(now)
+    }
+
+    fn due(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.count == 0 || self.recorded_at.is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY) {
             return None;
         }
         self.recorded_at = Some(now);
         Some(std::mem::take(&mut self.count))
-    }
-
-    /// The configuration reads again: the number refused since the last record, if any.
-    fn flush(&mut self) -> Option<u64> {
-        self.recorded_at = None;
-        (self.count > 0).then(|| std::mem::take(&mut self.count))
     }
 }
 
@@ -2364,10 +2392,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         replay_queue.extend(turn_recovery::take_resumable());
         // #192 (F3): once the configuration reads again, the held events go to the front of the replay queue in
         // arrival order (events of conversations it no longer admits are settled), and the refusals not recorded yet
-        // are recorded.
+        // are recorded once a record is due (at most one a minute).
         if !held.is_empty() || refusals.count > 0 {
             if let Ok(now_cfg) = runtime_context.load_config() {
-                if let Some(count) = refusals.flush() {
+                if let Some(count) = refusals.flush(std::time::Instant::now()) {
                     record_unreadable_refusals(&runtime_context, count);
                 }
                 let keys = std::mem::take(&mut held);
@@ -2608,38 +2636,43 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
         // #192 (F3): the configuration this event is handled with, read once here. While it cannot be read, reserved2
         // saves a message or poke of a conversation this process serves and holds it until it reads again (replayed
-        // above, in arrival order); every other mode records the refusal. Nothing is dropped silently.
+        // above, in arrival order); while events are held, a newer served event is held behind them even when the
+        // configuration reads again, so it never overtakes them. Every other mode records the refusal. Nothing is
+        // dropped silently.
         let event_cfg = if runtime_context.is_isolated() {
-            match runtime_context.load_config() {
-                Ok(cfg) => Some(cfg),
-                Err(error) => {
-                    let key = held_conversation(&ev);
-                    let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
-                    match key {
-                        Some(key) if reserved2_now && live_groups.iter().any(|g| g == &key) => {
-                            let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
-                            let saved = replayed
-                                || journal.record_received(inbound_key.clone(), key.clone(), text.clone(), now_ms() as i64).await?
-                                    == inbound::Receipt::New;
-                            // A duplicate (not saved again) was saved, and so held or replayed, before.
-                            if saved {
-                                if hold(&mut held, inbound_key) {
-                                    println!("[her] ⚠️ configuration unreadable ({error}): {key} event saved and held until it reads again");
-                                } else {
-                                    println!("[her] ⚠️ configuration unreadable ({error}): {key} event saved; {HELD_LIMIT} are held already, so it replays at the next connection");
-                                }
-                            }
+            let read = runtime_context.load_config();
+            let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
+            let key = held_conversation(&ev).unwrap_or_default();
+            let served = !key.is_empty() && live_groups.iter().any(|g| g == &key);
+            let refusable = !key.is_empty() && !reserved2_now && live_mode && (live_groups.is_empty() || served);
+            match ingress_for(read.is_ok(), reserved2_now && served, !held.is_empty(), refusable) {
+                Ingress::Handle => read.ok(),
+                Ingress::Hold => {
+                    let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
+                    let saved = replayed
+                        || journal.record_received(inbound_key.clone(), key.clone(), text.clone(), now_ms() as i64).await?
+                            == inbound::Receipt::New;
+                    // A duplicate (not saved again) was saved, and so held or replayed, before.
+                    if saved {
+                        if !hold(&mut held, inbound_key) {
+                            println!("[her] ⚠️ {key} event saved; {HELD_LIMIT} are held already, so it replays at the next connection");
+                        } else if let Err(error) = &read {
+                            println!("[her] ⚠️ configuration unreadable ({error}): {key} event saved and held until it reads again");
+                        } else {
+                            println!("[her] {key} event saved and held behind the events held earlier");
                         }
-                        Some(key) if !reserved2_now && live_mode && (live_groups.is_empty() || live_groups.iter().any(|g| g == &key)) => {
-                            println!("[her] ❌ configuration unreadable ({error}): {key} event not processed");
-                            if let Some(count) = refusals.note(std::time::Instant::now()) {
-                                record_unreadable_refusals(&runtime_context, count);
-                            }
-                        }
-                        _ => {}
                     }
                     continue;
                 }
+                Ingress::Refuse => {
+                    let error = read.err().unwrap_or_default();
+                    println!("[her] ❌ configuration unreadable ({error}): {key} event not processed");
+                    if let Some(count) = refusals.note(std::time::Instant::now()) {
+                        record_unreadable_refusals(&runtime_context, count);
+                    }
+                    continue;
+                }
+                Ingress::Skip => continue,
             }
         } else {
             None
@@ -3540,15 +3573,42 @@ mod tests {
     #[test]
     fn t192_refusals_are_recorded_at_most_once_a_minute() {
         let start = std::time::Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
         let mut refusals = UnreadableRefusals::default();
-        assert_eq!(refusals.note(start), Some(1), "the first refusal is recorded at once");
-        assert_eq!(refusals.note(start + std::time::Duration::from_secs(30)), None);
-        assert_eq!(refusals.note(start + std::time::Duration::from_millis(59_999)), None, "just under a minute: not yet");
-        assert_eq!(refusals.note(start + std::time::Duration::from_secs(60)), Some(3), "a minute later: the three since the last record");
-        assert_eq!(refusals.note(start + std::time::Duration::from_secs(61)), None);
-        assert_eq!(refusals.flush(), Some(1), "the configuration reads again: the one not recorded yet");
-        assert_eq!(refusals.flush(), None, "nothing is recorded twice");
-        assert_eq!(refusals.note(start + std::time::Duration::from_secs(62)), Some(1), "after a flush the next refusal is recorded at once");
+        assert_eq!(refusals.note(at(0)), Some(1), "the first refusal is recorded at once");
+        assert_eq!(refusals.note(at(1_000)), None);
+        assert_eq!(refusals.flush(at(2_000)), None, "a recovery within the minute records nothing yet");
+        assert_eq!(refusals.note(at(3_000)), None, "nor does a refusal after that recovery");
+        assert_eq!(refusals.flush(at(59_999)), None, "just under a minute: not yet");
+        assert_eq!(refusals.flush(at(60_000)), Some(2), "a minute after the last record: the two since then");
+        assert_eq!(refusals.flush(at(60_001)), None, "nothing is recorded twice");
+        assert_eq!(refusals.note(at(61_000)), None, "the next record is a minute after this one");
+        assert_eq!(refusals.note(at(119_999)), None);
+        assert_eq!(refusals.note(at(120_000)), Some(3));
+    }
+
+    #[test]
+    fn t192_a_served_event_waits_behind_held_events_even_once_the_configuration_reads() {
+        // (readable, holds, held_any, refusable) and the action.
+        let cases = [
+            // The interleaving: the configuration reads again, but earlier events of the served conversations are
+            // still held: the newer event is held behind them.
+            ((true, true, true, false), Ingress::Hold),
+            ((true, true, false, false), Ingress::Handle),
+            ((false, true, false, false), Ingress::Hold),
+            ((false, true, true, false), Ingress::Hold),
+            // A conversation reserved2 does not serve here is never held behind them.
+            ((true, false, true, true), Ingress::Handle),
+            ((false, false, false, true), Ingress::Refuse),
+            ((false, false, true, false), Ingress::Skip),
+        ];
+        for ((readable, holds, held_any, refusable), expected) in cases {
+            assert_eq!(
+                ingress_for(readable, holds, held_any, refusable),
+                expected,
+                "readable={readable} holds={holds} held_any={held_any} refusable={refusable}"
+            );
+        }
     }
 
     fn ev(group: bool, text: &str) -> Event {
