@@ -3,6 +3,7 @@
 use super::*;
 
 const QUIET_KEY: &str = "reply.wakeQuietMs";
+const LEFTOVER_JOURNAL_ERROR: &str = "settings storage has a leftover journal; remove settings.db and settings.db-journal";
 
 fn settings_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {
     fixture_runtime(label, "fixture-settings-token-abcdefghij")
@@ -553,29 +554,48 @@ fn settings_store_refuses_a_newer_store_with_a_journal_and_leaves_both() {
 
 #[test]
 fn settings_store_recovers_its_own_store_left_with_a_journal() {
-    // Our store cut off in the rollback-journal phase of its creation: readers apply no values until a writer has
-    // checked a recovered copy and recovered the store itself.
+    // A leftover journal makes the store unusable: readers report it, and a writer is refused without recovering it,
+    // so the store and its journal keep every byte.
     let (root, context) = settings_fixture("settings own journal");
     let journal = root.0.join("data/settings.db-journal");
     let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
     conn.execute_batch("CREATE TABLE scratch (x INTEGER); DROP TABLE scratch;").unwrap();
     drop(conn);
     std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
+    let db_before = std::fs::read(settings_db(&root)).unwrap();
     assert_eq!(next_use_quiet(&context), Some(3000));
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["storeError"], "settings storage is unavailable", "readers wait for a writer to recover the journal");
-    assert!(journal.is_file(), "readers leave the journal to a writer");
+    assert_eq!(body["storeError"], LEFTOVER_JOURNAL_ERROR);
+    assert!(journal.is_file(), "readers leave the journal alone");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], LEFTOVER_JOURNAL_ERROR);
+    assert_eq!(std::fs::read(&journal).unwrap(), vec![0xff_u8; 512], "the journal keeps every byte");
+    assert_eq!(std::fs::read(settings_db(&root)).unwrap(), db_before, "the store keeps every byte");
+    assert_eq!(next_use_quiet(&context), Some(3000), "a leftover journal applies nothing");
+}
+
+#[test]
+fn settings_store_never_makes_a_journal_copy() {
+    // A journal is never recovered on a copy of the store: a store with one is refused and no copy appears.
+    let (root, context) = settings_fixture("settings no journal copy");
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 200, "{body}");
-    assert_eq!(next_use_quiet(&context), Some(4500));
-    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
-    assert_eq!(status, 200, "{body}");
-    assert!(body.get("storeError").is_none(), "the recovered store is readable: {body}");
-    assert!(!journal.exists(), "the writer recovered the journal");
-    for suffix in ["", "-journal", "-wal", "-shm"] {
-        assert!(!root.0.join(format!("data/settings-inspect.db{suffix}")).exists(), "settings-inspect.db{suffix} was left");
-    }
+    let journal = root.0.join("data/settings.db-journal");
+    std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
+    let db_before = std::fs::read(settings_db(&root)).unwrap();
+    let (status, body) = set_quiet(&context, json!(5000));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], LEFTOVER_JOURNAL_ERROR);
+    assert_eq!(std::fs::read(&journal).unwrap(), vec![0xff_u8; 512], "the journal keeps every byte");
+    assert_eq!(std::fs::read(settings_db(&root)).unwrap(), db_before, "the store keeps every byte");
+    let copies: Vec<String> = std::fs::read_dir(root.0.join("data"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("settings-inspect.db"))
+        .collect();
+    assert!(copies.is_empty(), "no journal copy was made: {copies:?}");
 }
 
 #[test]
