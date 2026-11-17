@@ -618,7 +618,7 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     assert_eq!(recall_hits(&conn), 0, "preparing wakes counts nothing");
 
     // Compaction starts a new generation: the briefing is full again and the memories return.
-    crate::session_map::update_context(&context, key, "sid-148", "epoch-148", |r| crate::briefing_delivery::next_generation(r)).unwrap();
+    crate::session_map::update_context(&context, key, "sid-148", "epoch-148", crate::briefing_delivery::next_generation).unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());

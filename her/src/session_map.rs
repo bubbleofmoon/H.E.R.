@@ -327,14 +327,14 @@ mod tests {
         token("epoch-1");
         let context = RuntimeContext::from_root(&root).unwrap();
         bind(&context, "group:1", "sid-1", None).unwrap();
-        assert!(update_context(&context, "group:1", "sid-1", "epoch-1", |r| crate::briefing_delivery::next_generation(r)).unwrap());
+        assert!(update_context(&context, "group:1", "sid-1", "epoch-1", crate::briefing_delivery::next_generation).unwrap());
         assert_eq!(context_record(&context, "group:1", "sid-1", "epoch-1").unwrap()["generation"], 1);
         // Rotation or reset: the mapping moves to a new session and the epoch is replaced.
         bind(&context, "group:1", "sid-2", None).unwrap();
         token("epoch-2");
         assert_eq!(context_record(&context, "group:1", "sid-2", "epoch-2").unwrap(), json!({"generation": 0}));
         assert!(
-            !update_context(&context, "group:1", "sid-1", "epoch-1", |r| crate::briefing_delivery::next_generation(r)).unwrap(),
+            !update_context(&context, "group:1", "sid-1", "epoch-1", crate::briefing_delivery::next_generation).unwrap(),
             "a late writer of the old session changes nothing"
         );
         assert!(update_context(&context, "group:1", "sid-2", "epoch-2", |r| {
