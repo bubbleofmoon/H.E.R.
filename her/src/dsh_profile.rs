@@ -539,7 +539,19 @@ struct Item {
     plugins: Option<(usize, usize)>,
 }
 
+/// A line break the YAML loader takes but this reader would not: a carriage return that is not followed by a line
+/// feed, or U+0085, U+2028 or U+2029. Text holding one is refused before any line is read.
+fn bare_line_break(text: &str) -> bool {
+    if text.contains(['\u{85}', '\u{2028}', '\u{2029}']) {
+        return true;
+    }
+    text.match_indices('\r').any(|(at, _)| text.as_bytes().get(at + 1) != Some(&b'\n'))
+}
+
 fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
+    if bare_line_break(text) {
+        return Err("a bare line break");
+    }
     let mut out: Vec<Entry> = Vec::new();
     // Lines that belong to the last entry's scalar: a block scalar (deeper than its key) or an open quoted one.
     let mut block: Option<usize> = None;
