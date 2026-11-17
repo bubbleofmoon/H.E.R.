@@ -778,6 +778,34 @@ pub(crate) fn history(
     Ok(json!({"ok": true, "entries": entries, "next": next}))
 }
 
+/// For a whole `config.json` an audit undo restores: keeps `current`'s value at every registry pointer in `restored`,
+/// and removes it where `current` has none, because registry settings change and undo through the store only. A
+/// non-object on the way in `restored` leaves that value as restored, as the overlay does. Returns the keys whose
+/// value in `restored` differed from `current`'s.
+pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Vec<&'static str> {
+    let mut kept = Vec::new();
+    for setting in REGISTRY {
+        let now = current.pointer(setting.pointer).cloned();
+        if restored.pointer(setting.pointer) == now.as_ref() {
+            continue;
+        }
+        kept.push(setting.key);
+        match now {
+            Some(value) => set_at(restored, setting.pointer, value),
+            None => remove_at(restored, setting.pointer),
+        }
+    }
+    kept
+}
+
+/// Removes the member a pointer of plain member names ends at, if its parent is an object.
+fn remove_at(document: &mut Value, pointer: &str) {
+    let Some((parent, last)) = pointer.rsplit_once('/') else { return };
+    if let Some(object) = document.pointer_mut(parent).and_then(Value::as_object_mut) {
+        object.remove(last);
+    }
+}
+
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
 /// (`null` when none) and `value`, what the next use reads. `storeError` says why stored values are not applied.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
