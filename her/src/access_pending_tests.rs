@@ -299,3 +299,71 @@ fn t192_an_entry_without_usable_policies_refuses_access_changes() {
         assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN), "{entry}: nothing is revoked");
     }
 }
+
+/// The recorded DSH session stops that have not finished.
+fn stops(root: &FixtureRoot) -> Vec<Value> {
+    match std::fs::read(root.0.join("data").join(access::PENDING_REVOCATIONS)) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap()["stops"].as_array().cloned().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+#[test]
+fn t192_a_retired_session_stays_recorded_until_its_stop_finished() {
+    const SESSION: &str = "dsh-t192-recorded-stop";
+    static STOP_WORKS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let (root, context) = admitted("t192 recorded stop");
+    std::fs::write(
+        root.0.join("data/sessions.json"),
+        json!({"sessions": {GROUP: SESSION}, "sessionPolicies": {GROUP: "[\"reserved2\",\"qq-chat-v2\",null]"}}).to_string(),
+    )
+    .unwrap();
+    // Only this test's session: its DSH stop fails until the test lets it succeed.
+    *access::STOP_SEAM.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(|session: &str| {
+        (session == SESSION).then(|| {
+            if STOP_WORKS.load(std::sync::atomic::Ordering::SeqCst) { Ok(()) } else { Err("t192: DSH unreachable".to_string()) }
+        })
+    }));
+    // The CLI entry waits for its background stops, so the failed stop has ended when it returns.
+    let reply = conversation_scope_change(&context, GROUP, "remove").expect("the remove applies");
+    assert_eq!(reply["revoked"], json!([GROUP]), "{reply}");
+    assert!(pending(&root).is_empty(), "the revocation itself finished");
+    assert_eq!(crate::session_map::lookup(&context, GROUP).unwrap(), None, "the mapping is retired");
+    assert_eq!(stops(&root), [json!({"key": GROUP, "session": SESSION})], "the failed stop stays recorded");
+    // Console start runs it again; once it succeeds, the record is gone.
+    STOP_WORKS.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(access::finish_pending_revocations(&context).unwrap(), (Vec::new(), Vec::new()));
+    assert!(access::wait_background_stops(std::time::Duration::from_secs(15)), "the stop ended");
+    assert!(stops(&root).is_empty(), "a finished stop is no longer recorded");
+}
+
+#[test]
+fn t192_an_owner_change_retried_after_a_crash_still_selects_a_retired_mapping() {
+    let (root, context) = admitted("t192 owner retry");
+    // State a crash leaves between `retire_if` and the token rotation: an owner change in closed-agent mode, the other
+    // conversation's mapping already retired and its stop recorded, its token still the old one.
+    std::fs::write(
+        root.0.join("data").join(access::PENDING_REVOCATIONS),
+        json!({
+            "pending": [{"id": "revoke-t192-owner", "why": "access-revoked", "mode": "closed-agent",
+                         "before": {"ownerQQ": 8808}, "after": {"ownerQQ": 8809}}],
+            "stops": [{"key": "group:420046", "session": "dsh-t192-owner-stop"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    mutate_social_state_for(&context, |state| {
+        state["conversations"]["group:420046"] = json!({"agentToken": "old-owner-token-abcdefghij", "bootstrapSent": true});
+        Ok(())
+    })
+    .unwrap();
+    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(revoked.contains(&"group:420046".to_string()), "the recorded stop still selects it: {revoked:?}");
+    assert_ne!(
+        conversation_token(&context, "group:420046").unwrap().as_deref(),
+        Some("old-owner-token-abcdefghij"),
+        "its token is rotated before the entry clears"
+    );
+    assert!(pending(&root).is_empty());
+}

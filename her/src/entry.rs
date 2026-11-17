@@ -442,6 +442,12 @@ fn ingress_for(readable: bool, holds: bool, held_any: bool, refusable: bool) -> 
     }
 }
 
+/// #192 (F3): whether this process's reserved2 hub serves `key`, by the rule of `Hub::taken` (reserved2.rs): every
+/// conversation with `--live-all` (the flag the hub is built with), otherwise those listed in `--live-groups`.
+fn reserved2_serves(live_all: bool, live_groups: &[String], key: &str) -> bool {
+    !key.is_empty() && live_groups.iter().any(|g| g == key) // #192 TEMPORARY RED MUTATION
+}
+
 /// #192 (F3): events refused while the configuration cannot be read (outside reserved2, which holds them) go to the
 /// run record at most once a minute, also across a recovery, with the number refused since the previous record.
 #[derive(Default)]
@@ -2166,7 +2172,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // 灰度：只接管列出来的会话（"group:123,private:456"）。空 = 不接管任何会话。
-    let (live_groups, _live_all, mut pipeline) = match isolated_live_startup {
+    let (live_groups, live_all, mut pipeline) = match isolated_live_startup {
         Some((live_groups, live_all, pipeline)) => {
             if !live_groups.is_empty() {
                 println!("[her] 灰度接管：{live_groups:?}");
@@ -2642,8 +2648,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             let read = runtime_context.load_config();
             let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
             let key = held_conversation(&ev).unwrap_or_default();
-            let served = !key.is_empty() && live_groups.iter().any(|g| g == &key);
-            let refusable = !key.is_empty() && !reserved2_now && live_mode && (live_groups.is_empty() || served);
+            let served = reserved2_serves(live_all, &live_groups, &key);
+            let listed = !key.is_empty() && live_groups.iter().any(|g| g == &key);
+            let refusable = !key.is_empty() && !reserved2_now && live_mode && (live_groups.is_empty() || listed);
             match ingress_for(read.is_ok(), reserved2_now && served, !held.is_empty(), refusable) {
                 Ingress::Handle => read.ok(),
                 Ingress::Hold => {
@@ -3608,6 +3615,18 @@ mod tests {
                 "readable={readable} holds={holds} held_any={held_any} refusable={refusable}"
             );
         }
+    }
+
+    #[test]
+    fn t192_live_all_is_served_and_held_like_the_reserved2_hub_serves_it() {
+        let listed = vec!["group:420042".to_string()];
+        assert!(reserved2_serves(false, &listed, "group:420042"));
+        assert!(!reserved2_serves(false, &listed, "group:420043"), "an unlisted conversation without --live-all");
+        assert!(reserved2_serves(true, &listed, "group:420043"), "--live-all serves an unlisted conversation, as Hub::taken does");
+        assert!(reserved2_serves(true, &[], "private:7001"), "--live-all with no explicit groups");
+        assert!(!reserved2_serves(true, &[], ""), "a frame without a conversation is never served");
+        // With --live-all and no explicit groups, an unreadable configuration holds the event instead of skipping it.
+        assert_eq!(ingress_for(false, reserved2_serves(true, &[], "group:420043"), false, false), Ingress::Hold);
     }
 
     fn ev(group: bool, text: &str) -> Event {
