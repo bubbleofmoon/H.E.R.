@@ -232,7 +232,7 @@ fn guard179_a_missing_profile_row_refuses_the_turn_before_any_dsh_call() {
         .unwrap();
     let result = rt.block_on(pipe.ask_with_failover("group:42", "synthetic guard test", 10, &json!({})));
     let error = result.unwrap_err();
-    assert_eq!(error, format!("{}local-tools:fixture-chat", crate::dsh_profile::REFUSAL_PREFIX));
+    assert_eq!(error, format!("{}local-tools:preset1", crate::dsh_profile::REFUSAL_PREFIX));
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "no DSH call may be made"

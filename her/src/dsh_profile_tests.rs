@@ -11,7 +11,7 @@ fn own_backups(context: &RuntimeContext) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(home(context).join(PROFILE_DIR))
         .unwrap()
         .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
-        .filter(|name| name.starts_with(BACKUP_PREFIX))
+        .filter(|name| is_own_backup(name))
         .collect();
     names.sort();
     names
@@ -22,6 +22,10 @@ fn problems(context: &RuntimeContext) -> Vec<String> {
         Ok(()) => Vec::new(),
         Err(problems) => problems,
     }
+}
+
+fn codes(list: &[&str]) -> Vec<String> {
+    list.iter().map(|code| code.to_string()).collect()
 }
 
 #[test]
@@ -82,18 +86,51 @@ fn guard179_restore_refuses_broken_markers_and_a_too_large_file_and_changes_noth
 fn guard179_restore_keeps_five_own_backups_and_never_touches_other_backups() {
     let (_root, context) = fixture("prune");
     for minute in 0..6 {
-        write(&context, &format!("{PROFILE_DIR}/{BACKUP_PREFIX}2000-01-01T00-0{minute}-00-000Z"), "old\n");
+        write(&context, &format!("{PROFILE_DIR}/{BACKUP_PREFIX}2000-01-01T00-0{minute}-00-000Z-00"), "old\n");
     }
-    write(&context, &format!("{PROFILE_DIR}/cordis.patch.yml.bak-by-hand"), "kept\n");
+    let others = [
+        "cordis.patch.yml.bak-by-hand",
+        "cordis.patch.yml.bak-her-0-manual",
+        "cordis.patch.yml.bak-her-2000-01-01T00-00-00-000Z",
+    ];
+    for other in others {
+        write(&context, &format!("{PROFILE_DIR}/{other}"), "kept\n");
+    }
     write(&context, PROFILE_FILE, PROFILE_HAND);
     assert_eq!(restore(&context), Ok(true));
+    for other in others {
+        assert_eq!(read(&context, &format!("{PROFILE_DIR}/{other}")), "kept\n", "{other}");
+    }
     let backups = own_backups(&context);
     assert_eq!(backups.len(), 5, "{backups:?}");
     let expected: Vec<String> =
-        (2..6).map(|minute| format!("{BACKUP_PREFIX}2000-01-01T00-0{minute}-00-000Z")).collect();
+        (2..6).map(|minute| format!("{BACKUP_PREFIX}2000-01-01T00-0{minute}-00-000Z-00")).collect();
     assert_eq!(backups[..4], expected[..], "{backups:?}");
     assert!(!backups[4].starts_with(&format!("{BACKUP_PREFIX}2000")), "{backups:?}");
-    assert_eq!(read(&context, &format!("{PROFILE_DIR}/cordis.patch.yml.bak-by-hand")), "kept\n");
+}
+
+#[test]
+fn guard179_backup_names_are_unique_and_only_own_names_are_pruned() {
+    let stamp = "2026-01-02T03-04-05-006Z";
+    assert_eq!(backup_name(stamp, |_| false), Some(format!("{BACKUP_PREFIX}{stamp}-00")));
+    let taken = |name: &str| name.ends_with("-00") || name.ends_with("-01");
+    assert_eq!(
+        backup_name(stamp, taken),
+        Some(format!("{BACKUP_PREFIX}{stamp}-02")),
+        "a third backup in the same millisecond"
+    );
+    assert_eq!(backup_name(stamp, |_| true), None);
+    assert!(is_own_backup(&format!("{BACKUP_PREFIX}{stamp}-07")));
+    let others = [
+        format!("{BACKUP_PREFIX}{stamp}"),
+        format!("{BACKUP_PREFIX}0-manual"),
+        format!("{BACKUP_PREFIX}{stamp}-7x"),
+        format!("{BACKUP_PREFIX}{stamp}-07-old"),
+        "cordis.patch.yml.bak-by-hand".to_string(),
+    ];
+    for other in others {
+        assert!(!is_own_backup(&other), "{other}");
+    }
 }
 
 #[test]
@@ -116,7 +153,7 @@ fn guard179_a_restore_cut_off_after_its_backup_is_finished_by_the_next_start() {
     let (_root, context) = fixture("resume");
     write_compliant(&context);
     // What a restore leaves when it stops between its backup and its write.
-    write(&context, &format!("{PROFILE_DIR}/{BACKUP_PREFIX}2000-01-01T00-00-00-000Z"), PROFILE_HAND);
+    write(&context, &format!("{PROFILE_DIR}/{BACKUP_PREFIX}2000-01-01T00-00-00-000Z-00"), PROFILE_HAND);
     write(&context, PROFILE_FILE, PROFILE_HAND);
     assert_eq!(problems(&context), vec!["profile-file".to_string()]);
     assert_eq!(restore(&context), Ok(true));
@@ -155,28 +192,28 @@ fn guard179_each_guarded_profile_row_is_required() {
         assert_eq!(problems(&context), vec!["profile-file".to_string()], "{row}");
     }
     let cases = [
-        (format!("{good}- id: system-prompt\n  config:\n    includeHarnessIdentity: true\n"), "system-prompt:profile"),
-        (format!("{good}- id: harness-dev-context\n  disabled: false\n"), "dev-context:profile"),
-        (format!("{good}- id: tool-pwsh\n  disabled: false\n"), "local-tools:profile"),
-        (format!("{good}- id: agent-instructions\n  config:\n    maxBytes: 65536\n"), "agent-instructions:profile"),
+        (format!("{good}- id: system-prompt\n  config:\n    includeHarnessIdentity: true\n"), codes(&["system-prompt:profile"])),
+        (format!("{good}- id: harness-dev-context\n  disabled: false\n"), codes(&["dev-context:profile"])),
+        (format!("{good}- id: tool-pwsh\n  disabled: false\n"), codes(&["local-tools:profile"])),
+        (format!("{good}- id: agent-instructions\n  config:\n    maxBytes: 65536\n"), codes(&["agent-instructions:profile"])),
         (
             format!("- insert:\n    - id: second-context\n      name: '@deepseek-ai/dsh-harness-dev-context'\n{good}"),
-            "dev-context:profile",
+            codes(&["dev-context:profile"]),
         ),
         (
             format!("- id: preset-fixture-chat\n  config:\n    plugins:\n      - id: tool-bash\n        name: '@deepseek-ai/dsh-tool-bash'\n{good}"),
-            "local-tools:profile",
+            codes(&["local-tools:profile", "missing-rows:profile"]),
         ),
         (
             format!("- id: preset-fixture-chat\n  config:\n    plugins:\n      - id: persona\n        name: '@deepseek-ai/dsh-persona'\n        config:\n          prefix: 像 AI 一样回答\n{good}"),
-            "persona-text:profile",
+            codes(&["missing-rows:profile", "persona-text:profile"]),
         ),
-        (format!("[]\n{good}"), "profile-file"),
-        (format!("{good}{}", render_block()), "profile-file"),
+        (format!("[]\n{good}"), codes(&["profile-file"])),
+        (format!("{good}{}", render_block()), codes(&["profile-file"])),
     ];
     for (text, expected) in cases {
         write(&context, PROFILE_FILE, &text);
-        assert_eq!(problems(&context), vec![expected.to_string()], "{text}");
+        assert_eq!(problems(&context), expected, "{text}");
     }
     write(&context, PROFILE_FILE, &format!("- id: system-prompt\n  config:\n    personaPrefix: anything\n{good}"));
     assert_eq!(check(&context), Ok(()), "a row above HER's block is overridden by it");
@@ -188,53 +225,71 @@ fn guard179_each_guarded_profile_row_is_required() {
 }
 
 #[test]
+fn guard179_rows_above_the_block_are_checked_unless_the_block_overrides_them() {
+    let (_root, context) = fixture("above");
+    write_compliant(&context);
+    let good = read(&context, PROFILE_FILE);
+    let above = [
+        "- id: shell-two\n  name: '@deepseek-ai/dsh-tool-pwsh'\n",
+        "- id: persistent-pwsh\n  disabled: false\n",
+        "- id: tool-terminal\n  disabled: false\n",
+    ];
+    for row in above {
+        write(&context, PROFILE_FILE, &format!("{row}{good}"));
+        assert_eq!(problems(&context), vec!["local-tools:profile".to_string()], "{row}");
+    }
+    write(&context, PROFILE_FILE, &format!("- id: harness-dev-context\n  disabled: false\n{good}"));
+    assert_eq!(check(&context), Ok(()), "HER's block disables harness-dev-context after this row");
+}
+
+#[test]
 fn guard179_each_guarded_preset_row_is_required() {
     let (_root, context) = fixture("preset-rows");
     write_compliant(&context);
     let cases = [
-        ("              maxBytes: 0\n", "              maxBytes: 65536\n", "agent-instructions:fixture-chat"),
-        (PWSH_ON.0, PWSH_ON.1, "local-tools:fixture-chat"),
+        ("              maxBytes: 0\n", "              maxBytes: 65536\n", "agent-instructions:preset1"),
+        (PWSH_ON.0, PWSH_ON.1, "local-tools:preset1"),
         (
             "            name: '@deepseek-ai/dsh-tool-fs'\n            disabled: true\n",
             "            name: '@deepseek-ai/dsh-tool-fs'\n",
-            "local-tools:fixture-chat",
+            "local-tools:preset1",
         ),
         (
             "            name: '@deepseek-ai/dsh-tool-fs-search'\n            disabled: true\n",
             "            name: '@deepseek-ai/dsh-tool-fs-search'\n",
-            "local-tools:fixture-chat",
+            "local-tools:preset1",
         ),
         (
             "          - id: qq-tool-restrict\n",
             "          - id: tool-bash\n            name: '@deepseek-ai/dsh-tool-bash'\n          - id: qq-tool-restrict\n",
-            "local-tools:fixture-chat",
+            "local-tools:preset1",
         ),
         (
             "          - id: qq-tool-restrict\n",
             "          - id: shell-two\n            name: '@deepseek-ai/dsh-tool-pwsh-persistent'\n          - id: qq-tool-restrict\n",
-            "local-tools:fixture-chat",
+            "local-tools:preset1",
         ),
         (
             "          - id: qq-tool-restrict\n",
             "          - id: harness-dev-context\n            name: '@deepseek-ai/dsh-harness-dev-context'\n          - id: qq-tool-restrict\n",
-            "dev-context:fixture-chat",
+            "dev-context:preset1",
         ),
-        ("                说话简短。\n", "                说话简短，像 AI 一样。\n", "persona-text:fixture-chat"),
+        ("                说话简短。\n", "                说话简短，像 AI 一样。\n", "persona-text:preset1"),
         (
             "          - id: qq-tool-restrict\n",
             "          - {id: shell-three, name: '@deepseek-ai/dsh-tool-pwsh'}\n          - id: qq-tool-restrict\n",
-            "yaml:fixture-chat",
+            "yaml:preset1",
         ),
         (
             "            name: qq-agent-presets/qq-tool-restrict.mjs\n",
             "            name: qq-agent-presets/qq-tool-restrict.mjs # '@deepseek-ai/dsh-tool-pwsh'\n",
-            "local-tools:fixture-chat",
+            "local-tools:preset1",
         ),
-        ("        plugins:\n", "        plugins: &rows\n", "yaml:fixture-chat"),
+        ("        plugins:\n", "        plugins: &rows\n", "yaml:preset1"),
         (
             "        name: Fixture chat\n",
             "        name: \"Fixture\n          - id: hidden\n            name: '@deepseek-ai/dsh-tool-pwsh'\n          chat\"\n",
-            "local-tools:fixture-chat",
+            "local-tools:preset1",
         ),
     ];
     for (find, replace, expected) in cases {
@@ -243,6 +298,54 @@ fn guard179_each_guarded_preset_row_is_required() {
         write(&context, PRESET_FILE, PRESET);
     }
     assert_eq!(check(&context), Ok(()));
+}
+
+#[test]
+fn guard179_a_preset_missing_a_guarded_row_refuses() {
+    let (_root, context) = fixture("missing-rows");
+    write_compliant(&context);
+    let rows = [
+        "          - id: agent-instructions\n            name: '@deepseek-ai/dsh-agent-instructions'\n            config:\n              maxBytes: 0\n",
+        "          - id: tool-bash\n            name: '@deepseek-ai/dsh-tool-bash'\n            disabled: true\n",
+        "          - id: tool-pwsh\n            name: '@deepseek-ai/dsh-tool-pwsh'\n            disabled: true\n",
+        "          - id: tool-fs\n            name: '@deepseek-ai/dsh-tool-fs'\n            disabled: true\n",
+        "          - id: tool-fs-search\n            name: '@deepseek-ai/dsh-tool-fs-search'\n            disabled: true\n            config:\n              sampleOverCapGlobResults: false\n",
+    ];
+    for row in rows {
+        edit_preset(&context, |text| text.replacen(row, "", 1));
+        assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "{row}");
+        write(&context, PRESET_FILE, PRESET);
+    }
+    write(&context, PRESET_FILE, "# a preset file without a preset\n");
+    assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "an emptied preset file");
+    write(&context, PRESET_FILE, PRESET);
+    let good = read(&context, PROFILE_FILE);
+    let without_pwsh = "- id: preset-fixture-chat\n  config:\n    plugins:\n      - id: agent-instructions\n        disabled: true\n      - id: tool-bash\n        disabled: true\n      - id: tool-fs\n        disabled: true\n      - id: tool-fs-search\n        disabled: true\n";
+    write(&context, PROFILE_FILE, &format!("{without_pwsh}{good}"));
+    assert_eq!(problems(&context), vec!["missing-rows:profile".to_string()], "a profile patch replacing a preset's plugins");
+    let full = without_pwsh.replace("      - id: tool-fs\n", "      - id: tool-pwsh\n        disabled: true\n      - id: tool-fs\n");
+    write(&context, PROFILE_FILE, &format!("{full}{good}"));
+    assert_eq!(check(&context), Ok(()));
+}
+
+#[test]
+fn guard179_quoted_scalars_are_read_fully_or_refused() {
+    let (_root, context) = fixture("quoting");
+    write_compliant(&context);
+    let persona = "              prefix: |-\n                你是群里的普通成员。\n                - 不用列表回答。\n                说话简短。\n";
+    let cases = [
+        ("              prefix: '你好 '' AI'\n", "persona-text:preset1"),
+        ("              prefix: '你好 ''\n                AI 回答'\n", "persona-text:preset1"),
+        ("              prefix: \"\\u0041I\"\n", "yaml:preset1"),
+        ("              prefix: '你好' 回答\n", "yaml:preset1"),
+    ];
+    for (replace, expected) in cases {
+        edit_preset(&context, |text| text.replacen(persona, replace, 1));
+        assert_eq!(problems(&context), vec![expected.to_string()], "{replace}");
+        write(&context, PRESET_FILE, PRESET);
+    }
+    edit_preset(&context, |text| text.replacen(persona, "              prefix: '说话简短，别用''列表'''\n", 1));
+    assert_eq!(check(&context), Ok(()), "escaped quotes alone are read");
 }
 
 #[test]
@@ -256,8 +359,8 @@ fn guard179_the_preset_bundle_is_required() {
         (json!({"dsh": {"bundle": {"patch": []}}}).to_string(), "preset-bundle"),
         (json!({"dsh": {"bundle": {"patch": many}}}).to_string(), "preset-bundle"),
         (json!({"dsh": {"bundle": {"patch": [7]}}}).to_string(), "preset-bundle"),
-        (json!({"dsh": {"bundle": {"patch": ["./presets/missing.patch.yml"]}}}).to_string(), "preset-bundle:missing"),
-        (json!({"dsh": {"bundle": {"patch": ["../escape.patch.yml"]}}}).to_string(), "preset-bundle:escape"),
+        (json!({"dsh": {"bundle": {"patch": ["./presets/missing.patch.yml"]}}}).to_string(), "preset-bundle:preset1"),
+        (json!({"dsh": {"bundle": {"patch": ["../escape.patch.yml"]}}}).to_string(), "preset-bundle:preset1"),
     ];
     for (text, expected) in cases {
         write(&context, &manifest, &text);
@@ -265,12 +368,30 @@ fn guard179_the_preset_bundle_is_required() {
     }
     write(&context, &manifest, MANIFEST);
     write(&context, PRESET_FILE, &format!("{}\n", "#".repeat(1024 * 1024)));
-    assert_eq!(problems(&context), vec!["preset-bundle:fixture-chat".to_string()], "a preset file over 1 MiB");
+    assert_eq!(problems(&context), vec!["preset-bundle:preset1".to_string()], "a preset file over 1 MiB");
     write(&context, PRESET_FILE, PRESET);
     std::fs::remove_file(home(&context).join(&manifest)).unwrap();
     assert_eq!(problems(&context), vec!["preset-bundle".to_string()]);
     write(&context, &manifest, &json!({"dsh": {"bundle": {"patch": "./presets/fixture-chat.patch.yml"}}}).to_string());
     assert_eq!(check(&context), Ok(()), "one preset file named as a string");
+}
+
+#[test]
+fn guard179_codes_name_preset_files_by_position_only() {
+    let (_root, context) = fixture("labels");
+    write_compliant(&context);
+    write(
+        &context,
+        "bundles/qq-agent-presets/presets/openai-chat.patch.yml",
+        &PRESET.replacen(PWSH_ON.0, PWSH_ON.1, 1),
+    );
+    let list = ["./presets/fixture-chat.patch.yml", "./presets/openai-chat.patch.yml", "./presets/deepseek.patch.yml"];
+    write(&context, &format!("{PRESET_BUNDLE}/package.json"), &json!({"dsh": {"bundle": {"patch": list}}}).to_string());
+    let found = problems(&context);
+    assert_eq!(found, codes(&["local-tools:preset2", "preset-bundle:preset3"]));
+    for code in &found {
+        assert!(crate::upstream_capture::denied_terms(code).is_empty(), "{code}");
+    }
 }
 
 #[test]
@@ -283,15 +404,15 @@ fn guard179_admit_refuses_and_alerts_once_per_gap_and_clears_on_fix() {
     let alert_file = context.runtime_root().unwrap().join("data").join(ALERT_FILE);
     edit_preset(&context, |text| text.replacen(PWSH_ON.0, PWSH_ON.1, 1));
     let error = admit(&context).unwrap_err();
-    assert_eq!(error, format!("{REFUSAL_PREFIX}local-tools:fixture-chat"));
+    assert_eq!(error, format!("{REFUSAL_PREFIX}local-tools:preset1"));
     assert_eq!(alerts(&context).len(), 1);
-    assert_eq!(std::fs::read_to_string(&alert_file).unwrap(), "local-tools:fixture-chat");
+    assert_eq!(std::fs::read_to_string(&alert_file).unwrap(), "local-tools:preset1");
     assert!(admit(&context).is_err());
     assert_eq!(alerts(&context).len(), 1, "the same gap alerts once; the codes are kept for a restart");
     edit_preset(&context, |text| text.replacen("maxBytes: 0", "maxBytes: 65536", 1));
     assert_eq!(
         admit(&context).unwrap_err(),
-        format!("{REFUSAL_PREFIX}agent-instructions:fixture-chat, local-tools:fixture-chat")
+        format!("{REFUSAL_PREFIX}agent-instructions:preset1, local-tools:preset1")
     );
     assert_eq!(alerts(&context).len(), 2, "a different gap alerts again");
     write(&context, PRESET_FILE, PRESET);
@@ -304,6 +425,24 @@ fn guard179_admit_refuses_and_alerts_once_per_gap_and_clears_on_fix() {
     for text in raised.iter().chain([&error]) {
         assert!(crate::upstream_capture::denied_terms(text).is_empty(), "{text}");
     }
+}
+
+#[test]
+fn guard179_a_refused_owner_notice_is_offered_again() {
+    let (_root, context) = fixture("notice");
+    force(&context);
+    write_compliant(&context);
+    let alert_file = context.runtime_root().unwrap().join("data").join(ALERT_FILE);
+    refuse_notices(&context, true);
+    edit_preset(&context, |text| text.replacen(PWSH_ON.0, PWSH_ON.1, 1));
+    assert!(admit(&context).is_err());
+    assert!(!alert_file.exists(), "a refused notice is not kept as sent");
+    refuse_notices(&context, false);
+    assert!(admit(&context).is_err());
+    assert_eq!(alerts(&context).len(), 1, "the refused notice is offered again at the next prompt");
+    assert_eq!(std::fs::read_to_string(&alert_file).unwrap(), "local-tools:preset1");
+    assert!(admit(&context).is_err());
+    assert_eq!(alerts(&context).len(), 1);
 }
 
 #[test]
@@ -329,7 +468,7 @@ fn guard179_startup_restores_the_rows_and_alerts_about_what_it_cannot_write() {
     startup(&context);
     let raised = alerts(&context);
     assert_eq!(raised.len(), 1, "{raised:?}");
-    assert!(raised[0].contains("local-tools:fixture-chat"), "{raised:?}");
+    assert!(raised[0].contains("local-tools:preset1"), "{raised:?}");
 }
 
 #[test]
@@ -351,6 +490,85 @@ fn guard179_the_rpc_refuses_a_prompt_while_a_row_is_missing() {
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "no request may reach DSH"
     );
+}
+
+/// Read one HTTP request (head and body) from `stream`.
+fn read_request(stream: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let n = stream.read(&mut chunk).unwrap();
+        assert!(n > 0, "incomplete request");
+        bytes.extend_from_slice(&chunk[..n]);
+        let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else { continue };
+        let head = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+        let len = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+        if bytes.len() >= end + 4 + len {
+            return;
+        }
+    }
+}
+
+/// A fake DSH that answers the first request with 401 after the preset lost its `pwsh` guard, then counts the
+/// requests that still arrive within two seconds (each answered 401 too).
+fn fake_401_breaking_the_preset(
+    listener: std::net::TcpListener,
+    preset: std::path::PathBuf,
+) -> std::thread::JoinHandle<usize> {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let answer = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        let text = std::fs::read_to_string(&preset).unwrap();
+        std::fs::write(&preset, text.replacen(PWSH_ON.0, PWSH_ON.1, 1)).unwrap();
+        stream.write_all(answer).unwrap();
+        drop(stream);
+        listener.set_nonblocking(true).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut repeats = 0;
+        while std::time::Instant::now() < end {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    read_request(&mut stream);
+                    stream.write_all(answer).unwrap();
+                    repeats += 1;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        repeats
+    })
+}
+
+#[test]
+fn guard179_the_rpc_asks_the_guard_again_before_a_401_repeat() {
+    for bounded in [false, true] {
+        let (_root, context) = fixture("retry");
+        force(&context);
+        write_compliant(&context);
+        write(&context, ".credentials.yaml", &format!("secret: \"{}\"\n", "A".repeat(43)));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = fake_401_breaking_the_preset(listener, home(&context).join(PRESET_FILE));
+        let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+        let prompt = json!({"sessionId": "s", "mode": "queue", "content": []});
+        let result = if bounded {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            rpc.call_with_cancellation("session/prompt", prompt, deadline, &|| false)
+        } else {
+            rpc.call("session/prompt", prompt)
+        };
+        let repeats = server.join().unwrap();
+        assert_eq!(repeats, 0, "bounded={bounded}: the repeat after a 401 reached DSH ({result:?})");
+        let error = result.unwrap_err();
+        assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("local-tools:preset1"), "{error}");
+    }
 }
 
 #[test]
@@ -390,7 +608,7 @@ fn guard179_linked_profile_and_preset_files_are_refused() {
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&outside, &path).unwrap();
     }
-    assert_eq!(problems(&context), vec!["preset-bundle:fixture-chat".to_string(), "profile-file".to_string()]);
+    assert_eq!(problems(&context), vec!["preset-bundle:preset1".to_string(), "profile-file".to_string()]);
     assert!(restore(&context).is_err(), "a linked profile is never written through");
     assert!(std::fs::symlink_metadata(home(&context).join(PROFILE_FILE)).unwrap().file_type().is_symlink());
 }

@@ -247,6 +247,17 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Step 3a stand-in with today's behaviour (Step 3b replaces it).
+fn backup_name(stamp: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
+    let _ = taken; // STUB179-3
+    Some(format!("{BACKUP_PREFIX}{stamp}")) // STUB179-3
+}
+
+/// Step 3a stand-in with today's behaviour (Step 3b replaces it).
+fn is_own_backup(name: &str) -> bool {
+    name.starts_with(BACKUP_PREFIX) // STUB179-3
+}
+
 fn read_capped(context: &RuntimeContext, relative: &str) -> Result<Option<String>, String> {
     let len = context.optional_file_len(RuntimeArea::DshUser, relative).map_err(str::to_string)?;
     if len > MAX_FILE_BYTES {
@@ -677,6 +688,8 @@ pub(crate) mod test_support {
     pub(crate) static FORCED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
     /// Owner alerts the guard raised: (runtime scope, text). Tests never send them.
     pub(crate) static ALERTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    /// Runtime scopes whose owner notices the notice queue refuses (a full queue or the hourly cap).
+    pub(crate) static REFUSED_NOTICES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
     pub(crate) const PRESET_FILE: &str = "bundles/qq-agent-presets/presets/fixture-chat.patch.yml";
     pub(crate) const MANIFEST: &str =
@@ -717,6 +730,9 @@ pub(crate) mod test_support {
         "            name: '@deepseek-ai/dsh-agent-instructions'\n",
         "            config:\n",
         "              maxBytes: 0\n",
+        "          - id: tool-bash\n",
+        "            name: '@deepseek-ai/dsh-tool-bash'\n",
+        "            disabled: true\n",
         "          - id: tool-pwsh\n",
         "            name: '@deepseek-ai/dsh-tool-pwsh'\n",
         "            disabled: true\n",
@@ -774,6 +790,17 @@ pub(crate) mod test_support {
     /// Guard this runtime as the install root's runtime.
     pub(crate) fn force(context: &RuntimeContext) {
         FORCED.lock().unwrap_or_else(|p| p.into_inner()).insert(context.runtime_root().unwrap().to_path_buf());
+    }
+
+    /// Make the notice queue refuse (or accept again) this runtime's owner notices.
+    pub(crate) fn refuse_notices(context: &RuntimeContext, refused: bool) {
+        let scope = super::scope(context);
+        let mut set = REFUSED_NOTICES.lock().unwrap_or_else(|p| p.into_inner());
+        if refused {
+            set.insert(scope);
+        } else {
+            set.remove(&scope);
+        }
     }
 
     /// The owner alerts raised for this runtime, oldest first.
