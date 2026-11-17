@@ -47,20 +47,84 @@ fn read_blacklist(context: &crate::runtime::RuntimeContext) -> (&'static str, Ve
     }
 }
 
+/// The last failure state this process reported, per runtime root.
+static PROCESS_STATES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, &'static str>>> =
+    std::sync::OnceLock::new();
+
+fn warn_blacklist_state(state: &'static str) {
+    #[cfg(test)]
+    TEST_WARNINGS.with(|warnings| warnings.borrow_mut().push(state));
+    #[cfg(not(test))]
+    eprintln!("[model-text-blacklist] state={state}; using an empty file list");
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_WARNINGS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test hook: this runtime's in-process record is forgotten, as a new process would have none.
+#[cfg(test)]
+fn forget_process_states(context: &crate::runtime::RuntimeContext) {
+    if let Some(states) = PROCESS_STATES.get() {
+        states.lock().unwrap_or_else(|p| p.into_inner()).remove(context.runtime_root().unwrap());
+    }
+}
+
+/// Test hook: the warnings this thread would have printed, in order.
+#[cfg(test)]
+fn take_warnings() -> Vec<&'static str> {
+    TEST_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
+}
+
+/// The runtime's last reported state, shared by every process that uses the runtime.
+const STATE_FILE: &str = "model-text-blacklist.state";
+/// Serializes the read and write of `STATE_FILE`. Never replaced or unlinked.
+const STATE_LOCK: &str = "locks/model-text-blacklist.lock";
+const STATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Records `state` as the runtime's last reported state under the state lock. Returns whether to warn, or `None`
+/// when the shared record cannot be read or written; the caller then uses the process record.
+fn shared_state_transition(context: &crate::runtime::RuntimeContext, state: &'static str) -> Option<bool> {
+    use crate::runtime::RuntimeArea;
+    let deadline = std::time::Instant::now() + STATE_LOCK_WAIT;
+    let _gate = loop {
+        match context.open_locked_file(RuntimeArea::Data, STATE_LOCK) {
+            Ok(gate) => break gate,
+            Err(error) if error == "runtime file is already locked" && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    };
+    let persisted = context.read_optional_text(RuntimeArea::Data, STATE_FILE).ok()?;
+    if persisted.as_deref().map(str::trim) == Some(state) {
+        return Some(false);
+    }
+    context.write_atomic(RuntimeArea::Data, STATE_FILE, state.as_bytes()).ok()?;
+    Some(state != "ready")
+}
+
+/// Records `state` as this process's last seen state for the runtime, on every read. Returns whether to warn by the
+/// process record alone, which is the fallback when the shared record cannot be used.
+fn process_state_transition(context: &crate::runtime::RuntimeContext, state: &'static str) -> bool {
+    let mut states = PROCESS_STATES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock().unwrap_or_else(|p| p.into_inner());
+    let scope = context.runtime_root().unwrap().to_path_buf();
+    states.insert(scope, state) != Some(state) && state != "ready"
+}
+
 /// A delivery-only overlay. Never save this value back to config.json.
 pub fn with_blacklist(context: &crate::runtime::RuntimeContext, cfg: &Value) -> Value {
-    use std::collections::{HashMap, HashSet};
-    use std::sync::{Mutex, OnceLock};
+    use std::collections::HashSet;
     // The retired legacy layout has no selected config directory.
     if !context.is_isolated() { return cfg.clone(); }
     let (state, file_items) = read_blacklist(context);
-    static STATES: OnceLock<Mutex<HashMap<std::path::PathBuf, &'static str>>> = OnceLock::new();
-    let mut states = STATES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|p| p.into_inner());
-    let scope = context.runtime_root().unwrap().to_path_buf();
-    if states.insert(scope, state) != Some(state) && state != "ready" {
-        eprintln!("[model-text-blacklist] state={state}; using an empty file list");
-    }
-    drop(states);
+    // The process record is updated on every read, so a fallback never compares against a stale state.
+    let process_warn = process_state_transition(context, state);
+    let warn = shared_state_transition(context, state).unwrap_or(process_warn);
+    if warn { warn_blacklist_state(state); }
     let configured = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut seen = HashSet::new();
     let items = configured.into_iter().chain(file_items).filter(|item| {
@@ -311,6 +375,76 @@ mod tests {
         for _ in 0..2 { assert_eq!(render()["messages"][0]["text"], " WORD NEW 83002 [图片]"); }
         assert_eq!(original["messages"][0]["text"], "CFG WORD NEW 83002 [图片]");
         assert_eq!(std::fs::read_to_string(root.join("config/config.json")).unwrap(), cfg.to_string());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blacklist_missing_state_warns_once_per_runtime_across_processes() {
+        use crate::runtime::RuntimeContext;
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-blacklist-state-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        for dir in ["config", "data", "resources", "user/dsh"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        let cfg = json!({"consoleToken":"blacklist-state-fixture"});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let file = root.join("config/model-text-blacklist.json");
+        let view = || with_blacklist(&context, &cfg);
+
+        // First process: the missing state is reported once.
+        forget_process_states(&context);
+        view();
+        assert_eq!(take_warnings(), vec!["missing"]);
+        // Same process, same state: silent.
+        view();
+        assert!(take_warnings().is_empty());
+        // A second process reading the same runtime, same state: silent.
+        forget_process_states(&context);
+        view();
+        assert!(take_warnings().is_empty(), "a second process repeated the missing-state warning");
+        // A state change reports again: missing -> invalid -> ready (silent) -> missing.
+        std::fs::write(&file, "invalid JSON").unwrap();
+        forget_process_states(&context);
+        view();
+        assert_eq!(take_warnings(), vec!["invalid"]);
+        std::fs::write(&file, r#"{"strip":["WORD"]}"#).unwrap();
+        forget_process_states(&context);
+        view();
+        assert!(take_warnings().is_empty());
+        std::fs::remove_file(&file).unwrap();
+        forget_process_states(&context);
+        view();
+        assert_eq!(take_warnings(), vec!["missing"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blacklist_unusable_state_file_falls_back_to_once_per_process() {
+        use crate::runtime::RuntimeContext;
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-blacklist-fallback-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        for dir in ["config", "data", "resources", "user/dsh"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        let cfg = json!({"consoleToken":"blacklist-fallback-fixture","socialV2":{"context":{"stripFromModelText":["CFG"]}}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
+        // A directory where the state file belongs: the shared record can be neither read nor written.
+        std::fs::create_dir(root.join("data/model-text-blacklist.state")).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let view = || with_blacklist(&context, &cfg);
+
+        forget_process_states(&context);
+        let filtered = view();
+        assert_eq!(take_warnings(), vec!["missing"]);
+        assert_eq!(filtered["socialV2"]["context"]["stripFromModelText"], json!(["CFG"]), "delivery must continue");
+        view();
+        assert!(take_warnings().is_empty(), "the process record must stop a repeat");
+        forget_process_states(&context);
+        view();
+        assert_eq!(take_warnings(), vec!["missing"], "each process warns once when the shared record is unusable");
         std::fs::remove_dir_all(root).unwrap();
     }
 
