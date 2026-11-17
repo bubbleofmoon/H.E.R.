@@ -418,6 +418,10 @@ impl Rpc {
                     crate::run_record::Outcome::Ok,
                     &format!("{endpoint} refused with 401; credentials re-read, request repeated once"),
                 );
+                if endpoint == "session/prompt" {
+                    // #179: the repeat is another send; the guard is asked again.
+                    crate::dsh_profile::admit(self.credential.context())?;
+                }
                 (status, text) = http_post(&host_port, &path, Some(&fresh), &body_text)
                     .ok_or_else(|| format!("HTTP 连接失败：{endpoint}"))?;
             }
@@ -547,6 +551,10 @@ impl Rpc {
             io_remaining(deadline, "reauthentication", cancelled)?;
             if let Some(fresh) = self.credential.refresh_after_rejection() {
                 io_remaining(deadline, "reauthentication", cancelled)?;
+                if endpoint == "session/prompt" {
+                    // #179: the repeat is another send; the guard is asked again.
+                    crate::dsh_profile::admit(self.credential.context())?;
+                }
                 (status, text) = http_post_with_deadline(
                     &host_port,
                     address,

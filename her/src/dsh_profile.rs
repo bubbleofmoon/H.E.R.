@@ -56,6 +56,19 @@ const DEV_CONTEXT_PACKAGE: &str = "@deepseek-ai/dsh-harness-dev-context";
 const SYSTEM_PROMPT_PACKAGE: &str = "@deepseek-ai/dsh-system-prompt";
 const AGENT_INSTRUCTIONS_PACKAGE: &str = "@deepseek-ai/dsh-agent-instructions";
 const PERSONA_PACKAGE: &str = "@deepseek-ai/dsh-persona";
+const PRESET_PACKAGE: &str = "@deepseek-ai/dsh-agent-preset";
+/// The rows every preset keeps (disabled, or `maxBytes: 0` for `agent-instructions`); a preset without one refuses.
+const REQUIRED_PRESET_ROWS: &[&str] = &["agent-instructions", "tool-bash", "tool-pwsh", "tool-fs", "tool-fs-search"];
+/// The ids HER's block patches; a top-level patch above the block with one of them is overridden by it.
+const BLOCK_IDS: &[&str] = &[
+    "system-prompt",
+    "harness-dev-context",
+    "agent-instructions",
+    "tool-bash",
+    "tool-pwsh",
+    "tool-fs",
+    "tool-fs-search",
+];
 /// Problem code and the packages whose every mention must be a row the reader read.
 const GUARDED_PACKAGES: &[(&str, &[&str])] = &[
     ("local-tools", TOOL_PACKAGES),
@@ -143,7 +156,6 @@ pub(crate) fn admit(context: &RuntimeContext) -> Result<(), String> {
         Err(problems) => {
             let codes = problems.join(", ");
             if alerted.as_deref() != Some(codes.as_str()) {
-                let _ = context.write_atomic(RuntimeArea::Data, ALERT_FILE, codes.as_bytes());
                 record(
                     context,
                     Trigger::Turn,
@@ -151,22 +163,34 @@ pub(crate) fn admit(context: &RuntimeContext) -> Result<(), String> {
                     Outcome::Failed,
                     &format!("prompts are refused until the profile is fixed: {codes}"),
                 );
-                alert(context, &codes);
+                // Kept only once the notice is accepted, so a refused notice is tried again at the next prompt.
+                if alert(context, &codes) {
+                    let _ = context.write_atomic(RuntimeArea::Data, ALERT_FILE, codes.as_bytes());
+                }
             }
             Err(format!("{REFUSAL_PREFIX}{codes}"))
         }
     }
 }
 
-fn alert(context: &RuntimeContext, codes: &str) {
+/// Offer the owner notice; `true` when the notice queue accepted it.
+fn alert(context: &RuntimeContext, codes: &str) -> bool {
     let text = format!("⚠️ 对话后端配置检查未通过（{codes}），新回合暂停提交。HER 启动时会写回它维护的配置行，其余需手工修复。");
     #[cfg(test)]
-    test_support::ALERTS.lock().unwrap_or_else(|p| p.into_inner()).push((scope(context), text));
+    let accepted = {
+        let scope = scope(context);
+        let refused = test_support::REFUSED_NOTICES.lock().unwrap_or_else(|p| p.into_inner()).contains(&scope);
+        if !refused {
+            test_support::ALERTS.lock().unwrap_or_else(|p| p.into_inner()).push((scope, text));
+        }
+        !refused
+    };
     #[cfg(not(test))]
-    {
+    let accepted = {
         let cfg = context.load_config().unwrap_or_default();
-        let _ = crate::admin_alert::notify_notice(context, &cfg, &text, &format!("dsh-profile-guard:{codes}"));
-    }
+        crate::admin_alert::notify_notice(context, &cfg, &text, &format!("dsh-profile-guard:{codes}"))
+    };
+    accepted
 }
 
 /// At live start: write HER's rows back, then check the whole profile once, so a gap is reported now.
@@ -189,7 +213,7 @@ pub(crate) fn restore_for_start(context: &RuntimeContext) {
 }
 
 /// Write HER's block into the profile's patch layer. `Ok(false)`: already current, nothing written. A changed file is
-/// first saved as `cordis.patch.yml.bak-her-<UTC>` (newest five of those kept; other backups are never touched).
+/// first saved as `cordis.patch.yml.bak-her-<UTC>-<nn>` (newest five of those kept; no other file is pruned).
 pub(crate) fn restore(context: &RuntimeContext) -> Result<bool, String> {
     let _lock = profile_lock(context)?;
     // The DSH home itself may not exist yet on a fresh install (the supervisor creates it before DSH starts too).
@@ -230,15 +254,17 @@ fn profile_lock(context: &RuntimeContext) -> Result<std::fs::File, String> {
 }
 
 fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
-    let name = format!("{BACKUP_PREFIX}{}", crate::dsh_mcp_config::utc_stamp());
-    context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes())?;
     let dir = context
         .resolve_path(RuntimeArea::DshUser, PROFILE_DIR, PathIntent::ReadDirectory)
         .map_err(str::to_string)?;
+    let stamp = crate::dsh_mcp_config::utc_stamp();
+    let name = backup_name(&stamp, |name| std::fs::symlink_metadata(dir.join(name)).is_ok())
+        .ok_or("no free backup name in this millisecond; nothing was written")?;
+    context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes())?;
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map_err(|_| "the profile folder cannot be listed".to_string())?
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.starts_with(BACKUP_PREFIX))
+        .filter(|name| is_own_backup(name))
         .collect();
     names.sort();
     for stale in &names[..names.len().saturating_sub(BACKUPS_KEPT)] {
@@ -247,15 +273,19 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Step 3a stand-in with today's behaviour (Step 3b replaces it).
+/// The first free backup name for `stamp`: the prefix, the stamp, `-` and two digits, so two backups in one
+/// millisecond never share a name.
 fn backup_name(stamp: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
-    let _ = taken; // STUB179-3
-    Some(format!("{BACKUP_PREFIX}{stamp}")) // STUB179-3
+    (0..100).map(|n| format!("{BACKUP_PREFIX}{stamp}-{n:02}")).find(|name| !taken(name))
 }
 
-/// Step 3a stand-in with today's behaviour (Step 3b replaces it).
+/// Exactly the names `backup_name` gives a `utc_stamp`; pruning never touches any other file.
 fn is_own_backup(name: &str) -> bool {
-    name.starts_with(BACKUP_PREFIX) // STUB179-3
+    const SHAPE: &str = "dddd-dd-ddTdd-dd-dd-dddZ-dd";
+    name.strip_prefix(BACKUP_PREFIX).is_some_and(|rest| {
+        rest.len() == SHAPE.len()
+            && rest.chars().zip(SHAPE.chars()).all(|(c, shape)| if shape == 'd' { c.is_ascii_digit() } else { c == shape })
+    })
 }
 
 fn read_capped(context: &RuntimeContext, relative: &str) -> Result<Option<String>, String> {
@@ -326,9 +356,10 @@ fn check_presets(context: &RuntimeContext, problems: &mut BTreeSet<String>) {
         problems.insert("preset-bundle".to_string());
         return;
     }
-    for file in &files {
+    for (index, file) in files.iter().enumerate() {
         let relative = file.strip_prefix("./").unwrap_or(file.as_str());
-        let label = preset_label(relative);
+        // The file's position in `dsh.bundle.patch`, never its name: codes reach the owner and the logs.
+        let label = format!("preset{}", index + 1);
         let safe = !relative.is_empty()
             && !relative.starts_with(['/', '\\'])
             && !relative.contains(':')
@@ -345,16 +376,6 @@ fn check_presets(context: &RuntimeContext, problems: &mut BTreeSet<String>) {
             }
         }
     }
-}
-
-/// The preset file's stem, limited to plain characters (it is shown to the owner).
-fn preset_label(relative: &str) -> String {
-    let leaf = relative.rsplit(['/', '\\']).next().unwrap_or(relative);
-    let stem = leaf.strip_suffix(".patch.yml").unwrap_or(leaf);
-    stem.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .take(40)
-        .collect()
 }
 
 /// Problems of the rows in `text`. `owned` is HER's block (first and last line), left out of the check; a top-level
@@ -383,7 +404,8 @@ fn scan(text: &str, label: &str, owned: Option<(usize, usize)>, problems: &mut B
         }
     }
     for item in &found {
-        if owned.is_some_and(|(begin, _)| item.col == 2 && item.line < begin) {
+        // A top-level patch above HER's block that targets one of the block's ids is overridden by it.
+        if owned.is_some_and(|(begin, _)| item.col == 2 && item.line < begin && BLOCK_IDS.contains(&item.id.as_str())) {
             continue;
         }
         if let Some(code) = row_problem(item) {
@@ -393,6 +415,23 @@ fn scan(text: &str, label: &str, owned: Option<(usize, usize)>, problems: &mut B
             && !crate::upstream_capture::denied_terms(&item.text).is_empty()
         {
             problems.insert(format!("persona-text:{label}"));
+        }
+    }
+    // Every preset (a preset row, or a profile patch that replaces a preset's plugin list) keeps every guarded row;
+    // a preset file without any preset row refuses too.
+    let presets: Vec<&Item> =
+        found.iter().filter(|item| is_package(&item.name, PRESET_PACKAGE) || item.plugins).collect();
+    if owned.is_none() && presets.is_empty() {
+        problems.insert(format!("missing-rows:{label}"));
+    }
+    for preset in presets {
+        let rows: Vec<&Item> = found
+            .iter()
+            .skip_while(|item| item.line <= preset.line)
+            .take_while(|item| item.col > preset.col)
+            .collect();
+        if REQUIRED_PRESET_ROWS.iter().any(|id| !rows.iter().any(|row| row.id == *id)) {
+            problems.insert(format!("missing-rows:{label}"));
         }
     }
 }
@@ -454,6 +493,8 @@ struct Item {
     max_bytes: Option<String>,
     /// The persona text of a `persona` row (`config.prefix`, `config.suffix`).
     text: String,
+    /// The row's `config` carries a `plugins` list (a preset, or a profile patch replacing one).
+    plugins: bool,
 }
 
 fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
@@ -466,10 +507,18 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
         let content = line.trim_start_matches(' ');
         let indent = line.len() - content.len();
         if let Some(quote) = quoted {
+            if quote == '"' && content.contains('\\') {
+                return Err("escape in a double-quoted scalar");
+            }
             if let Some(last) = out.last_mut() {
                 last.body.push(content.to_string());
             }
-            if quote_closes(&format!(" {content}"), quote) {
+            let probe = format!(" {content}");
+            if let Some(end) = quote_end(&probe, quote) {
+                let rest = probe[end + 1..].trim_start();
+                if !rest.is_empty() && !rest.starts_with('#') {
+                    return Err("text after a quoted scalar");
+                }
                 quoted = None;
             }
             continue;
@@ -532,11 +581,21 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
         if (value.starts_with('{') && value != "{}") || (value.starts_with('[') && value != "[]") {
             return Err("flow collection");
         }
+        // Escapes are not decoded here, so a scalar holding one is not read: refuse it.
+        if value.starts_with('"') && value.contains('\\') {
+            return Err("escape in a double-quoted scalar");
+        }
         if value.starts_with('|') || value.starts_with('>') {
             block = Some(col);
         } else if let Some(quote) = value.chars().next().filter(|c| *c == '\'' || *c == '"') {
-            if !quote_closes(&value, quote) {
-                quoted = Some(quote);
+            match quote_end(&value, quote) {
+                Some(end) => {
+                    let rest = value[end + 1..].trim_start();
+                    if !rest.is_empty() && !rest.starts_with('#') {
+                        return Err("text after a quoted scalar");
+                    }
+                }
+                None => quoted = Some(quote),
             }
         }
         out.push(Entry { line: index, col, item, key, value, body: Vec::new() });
@@ -561,34 +620,30 @@ fn split_key(content: &str) -> Option<(String, String)> {
     Some((content[..at].trim_end().to_string(), content[at + 1..].trim().to_string()))
 }
 
-/// Whether the quoted scalar opened by the first character of `value` closes on this line.
-fn quote_closes(value: &str, quote: char) -> bool {
-    let mut chars = value.chars().skip(1).peekable();
-    while let Some(c) = chars.next() {
-        if quote == '"' && c == '\\' {
-            chars.next();
-            continue;
-        }
+/// The byte index of the quote that closes the scalar the first character of `value` opens, when it closes on this
+/// line. In a single-quoted scalar `''` is an escaped quote; double-quoted scalars with a backslash are refused
+/// before this is asked.
+fn quote_end(value: &str, quote: char) -> Option<usize> {
+    let mut chars = value.char_indices().skip(1).peekable();
+    while let Some((at, c)) = chars.next() {
         if c == quote {
-            if quote == '\'' && chars.peek() == Some(&'\'') {
+            if quote == '\'' && chars.peek().map(|(_, next)| *next) == Some('\'') {
                 chars.next();
                 continue;
             }
-            return true;
+            return Some(at);
         }
     }
-    false
+    None
 }
 
-/// A plain or quoted scalar without its quotes or a trailing comment.
+/// A plain or quoted scalar without its quotes (`''` read as `'`) or a trailing comment.
 fn unquote(value: &str) -> String {
     let value = value.trim();
     if let Some(quote) = value.chars().next().filter(|c| *c == '\'' || *c == '"') {
-        let inner = &value[1..];
-        return match inner.find(quote) {
-            Some(end) => inner[..end].to_string(),
-            None => inner.to_string(),
-        };
+        let end = quote_end(value, quote).unwrap_or(value.len());
+        let inner = &value[1..end];
+        return if quote == '\'' { inner.replace("''", "'") } else { inner.to_string() };
     }
     match value.find(" #") {
         Some(at) => value[..at].trim_end().to_string(),
@@ -615,6 +670,7 @@ fn items(entries: &[Entry]) -> Vec<Item> {
                         for child in children.iter().filter(|child| child.col == depth && !child.item) {
                             match child.key.as_str() {
                                 "maxBytes" => item.max_bytes = Some(unquote(&child.value)),
+                                "plugins" => item.plugins = true,
                                 "prefix" | "suffix" => {
                                     if !child.value.starts_with('|') && !child.value.starts_with('>') {
                                         item.text.push_str(&unquote(&child.value));
