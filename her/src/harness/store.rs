@@ -619,7 +619,6 @@ pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation
 // Only `last_call` calls this; remove this line with its own when the idle check (#6) calls it.
 #[allow(dead_code)]
 fn attempt_route(model: String, started: &str) -> String {
-    return model;
     serde_json::from_str::<Value>(started)
         .ok()
         .and_then(|payload| payload["route"].as_str().map(str::to_string))
