@@ -179,7 +179,8 @@ pub(crate) const WAKE_QUIET: Setting = Setting {
     chat: true,
 };
 
-/// Read by `harness::ModelRoute::from_runtime` and, as the digest's fallback, by `digest::model`.
+/// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which `digest::model` falls back
+/// to); its model id rule also checks each route's model.
 pub(crate) const HARNESS_MODEL: Setting = Setting {
     key: "harness.model",
     pointer: "/harness/model",
@@ -187,7 +188,7 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
     applies: "live",
     group: "model and cost",
     label: "Conversation model",
-    hint: "The relay model id harness turns use, read when each turn starts. Not set: harness turns fail as not configured.",
+    hint: "The relay model id harness turns use when harness.routes is not set, read when each turn starts. Neither set: harness turns fail as not configured.",
     chat: false,
 };
 

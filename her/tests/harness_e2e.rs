@@ -2467,18 +2467,22 @@ fn hotfix82_harness_filters_current_and_replayed_chat_only_in_model_copies() {
 
 #[test]
 fn hotfix81_harness_failures_are_failed_turns_with_content_free_owner_alerts() {
-    for (name, reply, class, refusal) in [
-        ("policy",ModelReply::Refusal,"refusal",true),
-        ("error-event",ModelReply::ErrorEvent,"refusal",true),
-        ("policy-http",ModelReply::Error{status:403,message:"safety block CHAT_SECRET".into()},"refusal",true),
-        ("timeout",ModelReply::Delayed{text:"late reply".into(),release:Arc::new(std::sync::atomic::AtomicBool::new(false))},"timeout",false),
-        ("prose",ModelReply::Text("The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET".into()),"refusal",true),
-        ("quota",ModelReply::Error{status:429,message:"CHAT_SECRET quota".into()},"quota",false),
-        ("upstream",ModelReply::Error{status:503,message:"CHAT_SECRET service".into()},"backend",false),
-        ("empty",ModelReply::Text(String::new()),"empty-response",false),
-        ("exit-zero-shape",ModelReply::Text("Error: failed CHAT_SECRET".into()),"backend",false),
+    let quota = || ModelReply::Error{status:429,message:"CHAT_SECRET quota".into()};
+    for (name, replies, class, refusal) in [
+        ("policy",vec![ModelReply::Refusal],"refusal",true),
+        ("error-event",vec![ModelReply::ErrorEvent],"refusal",true),
+        ("policy-http",vec![ModelReply::Error{status:403,message:"safety block CHAT_SECRET".into()}],"refusal",true),
+        ("timeout",vec![ModelReply::Delayed{text:"late reply".into(),release:Arc::new(std::sync::atomic::AtomicBool::new(false))}],"timeout",false),
+        ("prose",vec![ModelReply::Text("The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET".into())],"refusal",true),
+        // #7: a plain 429 is retried once on the one route; the repeat on the unchanged request ends the turn.
+        ("quota",vec![quota(),quota()],"quota",false),
+        ("upstream",vec![ModelReply::Error{status:503,message:"CHAT_SECRET service".into()}],"backend",false),
+        // #7: an empty answer is retried three times (after 1, 2 and 4 s) before the turn fails.
+        ("empty",(0..4).map(|_| ModelReply::Text(String::new())).collect::<Vec<_>>(),"empty-response",false),
+        ("exit-zero-shape",vec![ModelReply::Text("Error: failed CHAT_SECRET".into())],"backend",false),
     ] {
-        let model=FakeModel::script(vec![reply]);
+        let requests=replies.len();
+        let model=FakeModel::script(replies);
         let mut rig=harness_rig(&format!("hotfix81-harness-{name}"),&model);
         if name == "timeout" {
             let path=rig.root.join("config/config.json");
@@ -2489,6 +2493,7 @@ fn hotfix81_harness_failures_are_failed_turns_with_content_free_owner_alerts() {
         rig.start();
         rig.push(group_event(81801,1001,"tester","",vec![text_seg("CHAT_SECRET incoming")]));
         assert!(wait_for(LONG,||rig.ledger().iter().any(|r|r["k"]=="ended"&&r["outcome"]=="failed")),"{name}: {:?}",rig.ledger());
+        assert_eq!(lock(&model.requests).len(),requests,"{name}: model requests");
         rig.wait_texts(OWNER_KEY,1);
         let alerts=rig.texts_to(OWNER_KEY);
         assert_eq!(alerts.len(),1,"{name}: {alerts:?}");
@@ -3304,4 +3309,64 @@ fn menu_a_switch_turned_off_mid_turn_leaves_the_next_model_request() {
         "a switch turned off mid-turn stayed on the next request's menu: {next:?}"
     );
     assert_eq!(next.len(), first.len() - 1, "{next:?}");
+}
+
+/// The owner's notices of a turn that failed over and then ended in the step limit (a non-model failure).
+fn owner_failover_notices(alerts: &[String]) {
+    assert_eq!(alerts.len(), 2, "one route alert and one turn failure notice: {alerts:?}");
+    assert!(
+        alerts.iter().any(|t| t.contains("backend=harness") && t.contains("model=model-a") && t.contains("class=backend")),
+        "the failed route is alerted by its model: {alerts:?}"
+    );
+    assert!(
+        alerts.iter().any(|t| t.contains("回合失败") && t.contains("harness step limit exceeded")),
+        "the turn failure notice is still sent: {alerts:?}"
+    );
+    assert!(alerts.iter().all(|t| !t.contains("CHAT_SECRET")), "{alerts:?}");
+}
+
+#[test]
+fn harness_routes_failover_then_step_limit_keeps_the_turn_failure_notice_across_turns() {
+    // Turn one fails over from route a to route b and completes; turn two starts on route b and loops to the step limit.
+    let loop_call = |id: &str| ModelReply::ToolCalls(vec![json!({"id":id,"name":"bash","arguments":{"command":"unoffered"}})]);
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 500, message: "CHAT_SECRET service".into() },
+        ModelReply::Text("from b".into()),
+        loop_call("loop-1"),
+        loop_call("loop-2"),
+    ]);
+    let mut rig = harness_rig("harness-routes-failover-then-step-limit", &model);
+    set_harness_config(&rig, json!({"maxSteps": 2, "routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "first turn");
+    assert!(wait_for(LONG, || rig.ledger().iter().filter(|r| r["k"] == "ended").count() >= 1));
+    says(&rig, GROUP_KEY, 1001, "tester", "second turn");
+    assert!(wait_for(LONG, || rig.ledger().iter().filter(|r| r["k"] == "ended").count() >= 2));
+    let names: Vec<String> = lock(&model.requests)
+        .iter()
+        .map(|r| r["model"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, ["model-a", "model-b", "model-b", "model-b"], "turn two starts on the degraded route");
+    rig.wait_texts(OWNER_KEY, 2);
+    owner_failover_notices(&rig.texts_to(OWNER_KEY));
+}
+
+#[test]
+fn harness_routes_failover_then_step_limit_in_one_turn_reports_both() {
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 500, message: "CHAT_SECRET service".into() },
+        ModelReply::ToolCalls(vec![json!({"id":"loop-1","name":"bash","arguments":{"command":"unoffered"}})]),
+    ]);
+    let mut rig = harness_rig("harness-routes-failover-then-step-limit-one-turn", &model);
+    set_harness_config(&rig, json!({"maxSteps": 2, "routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "one turn");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended")));
+    let names: Vec<String> = lock(&model.requests)
+        .iter()
+        .map(|r| r["model"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, ["model-a", "model-b"], "the failover is a step of the same turn");
+    rig.wait_texts(OWNER_KEY, 2);
+    owner_failover_notices(&rig.texts_to(OWNER_KEY));
 }

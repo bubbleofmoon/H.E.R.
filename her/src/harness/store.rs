@@ -203,9 +203,11 @@ impl Store {
         let now = crate::parity_clock::now_ms();
         tx.execute("INSERT INTO turns(id,session_id,conversation,profile,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
             params![request.id, session, request.conversation, request.profile, now]).map_err(|_| STORAGE_ERROR)?;
+        // The first attempt goes to the turn's start route (`ModelRoute::start`).
+        let route = request.route.routes.get(request.route.start).ok_or(STORAGE_ERROR)?;
         let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
-            params![attempt, request.id, safe_text(&self.context, &request.route.model), safe_text(&self.context, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
+            params![attempt, request.id, safe_text(&self.context, &route.model), safe_text(&self.context, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
         append(
             &self.context,
             &tx,
@@ -231,7 +233,7 @@ impl Store {
             &request.id,
             Some(&attempt),
             "model_attempt_started",
-            json!({"model":request.route.model,"endpoint":request.route.endpoint}),
+            json!({"model":route.model,"endpoint":request.route.endpoint,"route":route.id}),
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(history)
@@ -262,7 +264,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn next_attempt(&self, request: &TurnRequest) -> Result<(), String> {
+    /// A new attempt of the running turn on route `route` of its chain (a step, a retry or a failover).
+    pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<(), String> {
+        let route = request.route.routes.get(route).ok_or(STORAGE_ERROR)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -270,7 +274,7 @@ impl Store {
         let session = running_session(&tx, &request.id)?;
         let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
-            params![attempt, request.id, safe_text(&self.context, &request.route.model), safe_text(&self.context, &request.route.endpoint), crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
+            params![attempt, request.id, safe_text(&self.context, &route.model), safe_text(&self.context, &request.route.endpoint), crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
         append(
             &self.context,
             &tx,
@@ -278,7 +282,7 @@ impl Store {
             &request.id,
             Some(&attempt),
             "model_attempt_started",
-            json!({"model":request.route.model,"endpoint":request.route.endpoint}),
+            json!({"model":route.model,"endpoint":request.route.endpoint,"route":route.id}),
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())
@@ -589,17 +593,17 @@ pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation
     let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
         .map_err(|_| STORAGE_ERROR)?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORAGE_ERROR)?;
-    let row: Option<(String, String)> = conn
+    let row: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT a.model, a.response FROM events e JOIN sessions s ON e.session_id = s.id JOIN model_attempts a ON e.attempt_id = a.id
+            "SELECT a.model, a.response, e.payload FROM events e JOIN sessions s ON e.session_id = s.id JOIN model_attempts a ON e.attempt_id = a.id
             WHERE s.conversation = ?1 AND s.generation = ?2 AND e.kind = 'model_attempt_started' AND a.response IS NOT NULL
             ORDER BY e.seq DESC LIMIT 1",
             params![conversation, generation],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()
         .map_err(|_| STORAGE_ERROR)?;
-    let Some((model, response)) = row else {
+    let Some((model, response, started)) = row else {
         return Ok(None);
     };
     let response: Value = serde_json::from_str(&response).map_err(|_| STORAGE_ERROR)?;
@@ -607,7 +611,18 @@ pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation
         .pointer("/captured_usage/prompt_tokens")
         .and_then(Value::as_u64)
         .filter(|tokens| *tokens > 0);
-    Ok(Some(super::rotation::LastCall { model, input }))
+    Ok(Some(super::rotation::LastCall { route: attempt_route(model, &started), input }))
+}
+
+/// The route id a `model_attempt_started` payload names. An attempt from before routes names none: its model id was
+/// its route id, the one route of `harness.model`.
+// Only `last_call` calls this; remove this line with its own when the idle check (#6) calls it.
+#[allow(dead_code)]
+fn attempt_route(model: String, started: &str) -> String {
+    serde_json::from_str::<Value>(started)
+        .ok()
+        .and_then(|payload| payload["route"].as_str().map(str::to_string))
+        .unwrap_or(model)
 }
 
 #[cfg(test)]
@@ -694,7 +709,7 @@ mod tests {
         let store = Store::open(&context).unwrap();
         store.admit(&request).unwrap();
         store.finish(&request.id, &Status::Completed("answer".into()), Some(&answer(json!({"captured_usage":{"prompt_tokens":600_000,"total_tokens":600_100}})))).unwrap();
-        let first = Some(LastCall { model: "fake-chat".into(), input: Some(600_000) });
+        let first = Some(LastCall { route: "fake-chat".into(), input: Some(600_000) });
         assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), first, "the answered request's model and total input");
         request.id = "last-call-cancelled".into();
         store.admit(&request).unwrap();
@@ -705,10 +720,51 @@ mod tests {
         store.finish(&request.id, &Status::Completed("answer".into()), Some(&answer(json!({})))).unwrap();
         assert_eq!(
             last_call(&context, "private:8808", &generation).unwrap(),
-            Some(LastCall { model: "fake-chat".into(), input: None }),
+            Some(LastCall { route: "fake-chat".into(), input: None }),
             "the newest answered request counts even without usage; an older one never stands in"
         );
         assert_eq!(last_call(&context, "private:8808", "other-generation").unwrap(), None, "another generation's session has its own evidence");
         assert_eq!(last_call(&context, "private:9909", &generation).unwrap(), None, "another conversation too");
+    }
+
+    #[test]
+    fn harness_idle_rotation_last_call_names_the_route_its_attempt_recorded() {
+        use crate::harness::rotation::LastCall;
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-last-route-7-{}", crate::turn_ledger::mint_id(""))));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(root.clone());
+        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-7","harness":{"routes":[{"id":"flash","model":"fake-flash"}]}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-7").unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let generation = crate::send_outbox::token_epoch(&token);
+        let request = TurnRequest {
+            id:"last-route".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), media:Vec::new(), profile:"closed-agent".into(),
+            route:ModelRoute::from_runtime(&context, &cfg).unwrap(), deadline:std::time::Duration::from_secs(10),
+            tools:Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation).unwrap(), limits:Limits::from_config(&cfg),
+        };
+        let store = Store::open(&context).unwrap();
+        store.admit(&request).unwrap();
+        let answer = Event::Assistant { text: "answer".into(), raw: json!({"captured_usage":{"prompt_tokens":600_000}}), message: ChatMessage::assistant("answer".to_string()) };
+        store.finish(&request.id, &Status::Completed("answer".into()), Some(&answer)).unwrap();
+        assert_eq!(
+            last_call(&context, "private:8808", &generation).unwrap(),
+            Some(LastCall { route: "flash".into(), input: Some(600_000) }),
+            "rotation tables are keyed by the route id, not the model id"
+        );
+    }
+
+    #[test]
+    fn harness_idle_rotation_an_attempt_without_a_route_names_its_model() {
+        assert_eq!(attempt_route("fake-flash".into(), r#"{"model":"fake-flash","endpoint":"x","route":"flash"}"#), "flash");
+        assert_eq!(attempt_route("old-model".into(), r#"{"model":"old-model","endpoint":"x"}"#), "old-model", "an attempt from before routes");
+        assert_eq!(attempt_route("old-model".into(), r#"{"model":"old-model","route":7}"#), "old-model");
+        assert_eq!(attempt_route("m".into(), "not json"), "m");
     }
 }

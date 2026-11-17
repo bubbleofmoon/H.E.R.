@@ -33,8 +33,8 @@ pub(crate) fn model_for(context: &RuntimeContext, cfg: &Value) -> Result<Arc<dyn
     Ok(Arc::new(RelayModel::from_runtime(context, cfg)?))
 }
 
-/// The relay's OpenAI-compatible endpoint: `memory.digest.model`, else `harness.model`, with the
-/// harness credential; one non-streaming request bounded by `memory.digest.timeoutSecs`.
+/// The relay's OpenAI-compatible endpoint: `memory.digest.model`, else the model of the harness chain's first route,
+/// with the harness credential; one non-streaming request bounded by `memory.digest.timeoutSecs`.
 pub(crate) struct RelayModel {
     route: crate::harness::ModelRoute,
     timeout: Duration,
@@ -48,9 +48,13 @@ impl RelayModel {
     }
 }
 
-/// The digest's model id: `memory.digest.model`, else `harness.model`; `None` when neither is configured.
+/// The digest's model id: `memory.digest.model`, else the model of the harness chain's first route
+/// (`harness::routes::chain`: `harness.routes`, else `harness.model`); `None` when neither is configured or the chain
+/// is invalid.
 pub(crate) fn model_id(cfg: &Value) -> Option<String> {
-    crate::settings::DIGEST_MODEL.text(cfg).or_else(|| crate::settings::HARNESS_MODEL.text(cfg))
+    crate::settings::DIGEST_MODEL.text(cfg).or_else(|| {
+        crate::harness::routes::chain(cfg).ok().and_then(|chain| chain.into_iter().next()).map(|route| route.model)
+    })
 }
 
 /// The bound on one digest model request: `memory.digest.timeoutSecs`.

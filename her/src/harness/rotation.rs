@@ -9,33 +9,35 @@ use serde_json::Value;
 /// The cap when neither the route nor `default` sets a valid one, in input tokens.
 pub(crate) const DEFAULT_CAP: u64 = 500_000;
 
-/// A session's last model request (`store::last_call`): the model id its attempt recorded and the total input
-/// tokens its provider reported (`captured_usage.prompt_tokens`, cached tokens included; `None`: none reported).
+/// A session's last model request (`store::last_call`): the route id its attempt recorded (`harness/routes.rs`; an
+/// attempt from before routes recorded none and names its model id, the id of the one `harness.model` route) and the
+/// total input tokens its provider reported (`captured_usage.prompt_tokens`, cached tokens included; `None`: none
+/// reported).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LastCall {
-    pub model: String,
+    pub route: String,
     pub input: Option<u64>,
 }
 
-/// The cache life of the route that served `model`: `harness.cacheTtlMinutes.<model>`, a positive finite number of
+/// The cache life of the route `route` names: `harness.cacheTtlMinutes.<route id>`, a positive finite number of
 /// minutes. There is no built-in value: `None` means the route never idle-rotates.
-pub(crate) fn cache_life_minutes(cfg: &Value, model: &str) -> Option<f64> {
+pub(crate) fn cache_life_minutes(cfg: &Value, route: &str) -> Option<f64> {
     cfg.pointer("/harness/cacheTtlMinutes")
-        .and_then(|table| table.get(model))
+        .and_then(|table| table.get(route))
         .and_then(Value::as_f64)
         .filter(|minutes| minutes.is_finite() && *minutes > 0.0)
 }
 
-/// The rotation cap of the route that served `model`: `harness.rotation.caps.<model>`, then
+/// The rotation cap of the route `route` names: `harness.rotation.caps.<route id>`, then
 /// `harness.rotation.caps.default`, each only when a positive integer, then `DEFAULT_CAP`.
-pub(crate) fn cap(cfg: &Value, model: &str) -> u64 {
+pub(crate) fn cap(cfg: &Value, route: &str) -> u64 {
     let caps = cfg.pointer("/harness/rotation/caps");
     let entry = |name: &str| {
         caps.and_then(|table| table.get(name))
             .and_then(Value::as_u64)
             .filter(|tokens| *tokens > 0)
     };
-    entry(model)
+    entry(route)
         .or_else(|| entry("default"))
         .unwrap_or(DEFAULT_CAP)
 }
@@ -45,8 +47,8 @@ pub(crate) fn cap(cfg: &Value, model: &str) -> u64 {
 /// minute or less), once the request's reported input reached the route's cap. `None`: never, because the route has
 /// no cache life of its own, the provider reported no input, or the input stayed below the cap.
 pub(crate) fn due_at(cfg: &Value, last: &LastCall, idle_from: i64) -> Option<i64> {
-    let minutes = cache_life_minutes(cfg, &last.model)?;
-    if last.input? < cap(cfg, &last.model) {
+    let minutes = cache_life_minutes(cfg, &last.route)?;
+    if last.input? < cap(cfg, &last.route) {
         return None;
     }
     let lead_ms: i128 = if minutes <= 1.0 {
@@ -86,9 +88,9 @@ mod tests {
 
     const IDLE: i64 = 1_000_000;
 
-    fn call(model: &str, input: Option<u64>) -> LastCall {
+    fn call(route: &str, input: Option<u64>) -> LastCall {
         LastCall {
-            model: model.into(),
+            route: route.into(),
             input,
         }
     }

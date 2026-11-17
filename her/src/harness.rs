@@ -1,19 +1,21 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
 pub(crate) mod profile;
 pub(crate) mod rotation;
+pub(crate) mod routes;
 pub(crate) mod store;
 mod tools;
 pub use tools::Tools;
 #[cfg(test)]
 pub(crate) use tools::session_instruction;
 
+use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use futures_util::StreamExt;
 use genai::{
     adapter::AdapterKind,
     chat::{
         Binary, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStreamEvent, ContentPart,
-        StopReason, StreamEnd, ToolCall, ToolResponse,
+        ReasoningEffort, StopReason, StreamEnd, ToolCall, ToolResponse,
     },
     resolver::{AuthData, Endpoint},
     Client, ModelIden, ModelSpec, ServiceTarget,
@@ -32,28 +34,48 @@ pub(crate) const DEADLINE_EXCEEDED: &str = "harness model deadline exceeded";
 /// Default cap, in characters, on the model copy of one tool result (`harness.toolResultChars`).
 const TOOL_RESULT_CHARS: u64 = 8_000;
 
-/// Credentials are opaque: never derive Debug or serialize this target.
-pub struct ModelRoute {
-    key: String,
+/// One route of a turn's chain (`harness/routes.rs`) with its relay target. Credentials are opaque: never derive Debug
+/// or serialize this value.
+pub(crate) struct Route {
+    spec: routes::RouteSpec,
+    /// The route id and model id as records keep them, with the credential redacted.
+    id: String,
     model: String,
-    endpoint: String,
     target: ServiceTarget,
 }
 
+/// A turn's candidate chain on the selected runtime's relay, authenticated with the harness credential: the configured
+/// routes (`routes::chain`), tried in order from `start`. Credentials are opaque: never derive Debug or serialize this
+/// value.
+pub struct ModelRoute {
+    key: String,
+    endpoint: String,
+    routes: Vec<Route>,
+    /// The route the turn starts on: the conversation's sticky degraded route, set at admission.
+    start: usize,
+}
+
 impl ModelRoute {
+    /// The first route's model id (tests).
+    #[cfg(test)]
     pub fn model_name(&self) -> &str {
-        &self.model
+        &self.routes[0].model
     }
+
+    /// The selected runtime's chain (`routes::chain`); without a valid one the turn fails as not configured.
     pub fn from_runtime(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
         if !context.is_isolated() {
             return Err("harness requires a selected runtime".into());
         }
-        let model = crate::settings::HARNESS_MODEL.text(cfg).ok_or("harness model is not configured")?;
-        Self::for_model(context, &model)
+        Self::build(context, routes::chain(cfg)?)
     }
 
-    /// The selected runtime's relay route for `model`, authenticated with the harness credential.
+    /// The selected runtime's relay route for `model` alone, authenticated with the harness credential.
     pub fn for_model(context: &RuntimeContext, model: &str) -> Result<Self, String> {
+        Self::build(context, vec![routes::RouteSpec::implicit(model.to_string())])
+    }
+
+    fn build(context: &RuntimeContext, chain: Vec<routes::RouteSpec>) -> Result<Self, String> {
         if !context.is_isolated() {
             return Err("harness requires a selected runtime".into());
         }
@@ -68,20 +90,36 @@ impl ModelRoute {
             return Err("harness model credential is empty".into());
         }
         let endpoint = format!("{}/v1/", origin.trim_end_matches('/'));
+        let routes = chain
+            .into_iter()
+            .map(|spec| Route {
+                id: spec.id.replace(key, "[REDACTED]"),
+                model: spec.model.replace(key, "[REDACTED]"),
+                target: ServiceTarget {
+                    model: ModelIden::new(AdapterKind::OpenAI, spec.model.clone()),
+                    endpoint: Endpoint::from_owned(endpoint.clone()),
+                    auth: AuthData::Key(key.to_string()),
+                },
+                spec,
+            })
+            .collect();
         Ok(Self {
             key: key.to_string(),
-            model: model.replace(key, "[REDACTED]"),
             endpoint: endpoint.replace(key, "[REDACTED]"),
-            target: ServiceTarget {
-                model: ModelIden::new(AdapterKind::OpenAI, model.to_string()),
-                endpoint: Endpoint::from_owned(endpoint),
-                auth: AuthData::Key(key.to_string()),
-            },
+            routes,
+            start: 0,
         })
     }
 
+    /// The first route's target (the digest's one route).
     pub(crate) fn target(&self) -> ServiceTarget {
-        self.target.clone()
+        self.routes[0].target.clone()
+    }
+
+    /// The chain's fingerprint (`routes::chain_signature`).
+    fn signature(&self) -> String {
+        let specs: Vec<routes::RouteSpec> = self.routes.iter().map(|route| route.spec.clone()).collect();
+        routes::chain_signature(&specs)
     }
 }
 
@@ -94,11 +132,14 @@ pub struct Limits {
     /// part of a delivered request becomes `NO_IMAGE_INPUT` text (`model_messages`).
     image_input: bool,
     tool_result_chars: usize,
+    /// The base wait of the route module's retries (`routes::Situation::unit`): one second; tests shorten it.
+    retry_unit: Duration,
 }
 
 impl Limits {
     pub fn from_config(cfg: &Value) -> Self {
         Self {
+            retry_unit: Duration::from_secs(1),
             max_steps: crate::settings::HARNESS_MAX_STEPS.integer(cfg) as usize,
             max_tokens: crate::settings::HARNESS_MAX_TOKENS.integer(cfg) as u32,
             image_input: cfg
@@ -117,6 +158,13 @@ impl Limits {
     #[cfg(test)]
     pub(crate) fn budgets(&self) -> (usize, u32) {
         (self.max_steps, self.max_tokens)
+    }
+
+    /// These limits with retries waiting `unit` instead of one second (tests).
+    #[cfg(test)]
+    pub(crate) fn with_retry_unit(mut self, unit: Duration) -> Self {
+        self.retry_unit = unit;
+        self
     }
 }
 
@@ -194,6 +242,17 @@ enum Failure {
 
 enum ModelFailure {
     Dropped(String),
+    /// HTTP 429, with the wait the response asked for (`rate_limit_wait`).
+    RateLimited {
+        reason: String,
+        wait: Option<Duration>,
+    },
+    /// A response that ended on a stop no answer may use (a content filter, or a stop other than completion or a
+    /// tool call). Its usage is charged before the miss is decided, so a failover asks the next route for what is left.
+    Stopped {
+        reason: String,
+        end: Box<StreamEnd>,
+    },
     Terminal(String),
 }
 
@@ -201,6 +260,42 @@ impl From<String> for ModelFailure {
     fn from(reason: String) -> Self {
         Self::Terminal(reason)
     }
+}
+
+impl ModelFailure {
+    /// The route module's view of this failure, and its content-free summary.
+    fn miss(self) -> (routes::Miss, String) {
+        match self {
+            Self::Dropped(reason) => (routes::Miss::Dropped, reason),
+            Self::RateLimited { reason, wait } => (routes::Miss::RateLimited { wait }, reason),
+            Self::Terminal(reason) | Self::Stopped { reason, .. } => {
+                let class = crate::model_failure::Failure::classify("", &reason).class;
+                let miss = if class == "empty-response" {
+                    routes::Miss::Empty
+                } else {
+                    routes::Miss::Failed { class }
+                };
+                (miss, reason)
+            }
+        }
+    }
+}
+
+/// One route request that failed over or ended its turn, as the pipeline reports it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RouteFailure {
+    pub route: String,
+    pub model: String,
+    /// The content-free failure summary (`model_failure::Failure::summary`).
+    pub summary: String,
+}
+
+/// The routes a turn has used so far.
+#[derive(Clone, Debug, Default)]
+struct Progress {
+    /// The model of the route the turn's last request went to.
+    model: String,
+    failures: Vec<RouteFailure>,
 }
 
 impl From<String> for Failure {
@@ -228,6 +323,7 @@ pub enum Event {
 pub struct Turn {
     sent: Arc<AtomicBool>,
     request_refs: Arc<std::sync::Mutex<Vec<Value>>>,
+    progress: Arc<std::sync::Mutex<Progress>>,
     status: watch::Receiver<Status>,
     cancel: watch::Sender<bool>,
     events: broadcast::Sender<Event>,
@@ -236,6 +332,16 @@ pub struct Turn {
 impl Turn {
     pub fn message_refs(&self) -> Vec<Value> {
         self.request_refs.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The model of the route the turn's last request went to (its start route before any request).
+    pub fn model(&self) -> String {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).model.clone()
+    }
+
+    /// Each route request that failed over or ended the turn, in order.
+    pub fn route_failures(&self) -> Vec<RouteFailure> {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).failures.clone()
     }
 
     pub fn sent_tool_reply(&self) -> bool {
@@ -327,6 +433,16 @@ impl Harness {
                 part["text"] = Value::String(text);
             }
         }
+        // The turn starts on the conversation's sticky degraded route (`routes::RouteMemory::start`).
+        let chain = routes::ChainKey {
+            conversation: request.conversation.clone(),
+            generation: request.generation.clone(),
+            signature: request.route.signature(),
+        };
+        let len = request.route.routes.len();
+        request.route.start = routes::with_memory(&routes::scope_of(&self.context), |memory| {
+            memory.start(&chain, len, std::time::Instant::now())
+        });
         let mut messages = self.store.admit(&request)?;
         let instruction = request.tools.instruction();
         if !instruction.is_empty() {
@@ -344,6 +460,11 @@ impl Harness {
         let sent_flag = sent.clone();
         let request_refs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let refs_for_task = request_refs.clone();
+        let progress = Arc::new(std::sync::Mutex::new(Progress {
+            model: request.route.routes[request.route.start].model.clone(),
+            failures: Vec::new(),
+        }));
+        let progress_for_task = progress.clone();
         let task_cancel = cancel.clone();
         tokio::spawn(async move {
             // Keep ownership through result persistence and uncertainty publication.
@@ -359,6 +480,7 @@ impl Harness {
                 &notifications,
                 &sent_flag,
                 &refs_for_task,
+                &progress_for_task,
                 cancellation,
             );
             tokio::pin!(execution);
@@ -422,6 +544,7 @@ impl Harness {
         Ok(Turn {
             sent,
             request_refs,
+            progress,
             status,
             cancel,
             events,
@@ -471,17 +594,19 @@ async fn tool_loop(
     events: &broadcast::Sender<Event>,
     sent: &AtomicBool,
     request_refs: &std::sync::Mutex<Vec<Value>>,
+    progress: &std::sync::Mutex<Progress>,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Event, Failure> {
     let deadline = tokio::time::Instant::now() + request.deadline;
+    let mut chain = ChainState::new(context, request);
     let mut spent = 0u32;
-    let mut retried = false;
-    let mut dispatched = false;
     for step in 0..request.limits.max_steps {
         check_bound(request, &cancelled, deadline)?;
         if step > 0 {
-            store.next_attempt(request)?;
+            store.next_attempt(request, chain.route)?;
         }
+        let route = &request.route.routes[chain.route];
+        progress.lock().unwrap_or_else(|p| p.into_inner()).model = route.model.clone();
         let delivered = filter_model_messages(context, messages.clone())?;
         // Capture only structured references from the request being issued. Later read
         // results and recalled tool facts may add sources absent from the inbound wake.
@@ -495,6 +620,12 @@ async fn tool_loop(
             tools::CheckError::Revoked(_) => Failure::Cancelled,
             tools::CheckError::Unavailable(reason) => Failure::Failed(reason),
         })?;
+        // Each request caps its output at the remaining token budget, up to its route's cap.
+        let max_tokens = request
+            .limits
+            .max_tokens
+            .saturating_sub(spent)
+            .min(route.spec.max_output_tokens);
         // #183: a capture the operator armed takes this request as `model_step` hands it to the
         // model client, which adds only the OpenAI wire framing.
         crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
@@ -504,55 +635,53 @@ async fn tool_loop(
             ))
             .with_tools(offered.clone());
             serde_json::json!({
-                "model": request.route.model_name(),
-                "maxTokens": request.limits.max_tokens.saturating_sub(spent).min(4096),
+                "model": route.model,
+                "maxTokens": max_tokens,
                 "request": serde_json::to_value(&chat).unwrap_or(Value::Null),
             })
         });
+        // A request that misses is recorded with its size (`ChainState::missed`).
+        let request_bytes = serde_json::to_vec(&delivered).map_or(0, |bytes| bytes.len());
         let model = model_step(
             client,
-            &request.route,
+            route,
             delivered,
             offered,
-            request.limits.max_tokens.saturating_sub(spent),
+            max_tokens,
             request.limits.image_input,
         );
         let end = tokio::select! { biased;
             _ = cancelled.changed() => return Err(Failure::Cancelled),
             result = model => result,
         };
+        let at = MissAt {
+            step,
+            spent,
+            request_bytes,
+            deadline,
+        };
         let end = match end {
             Ok(end) => end,
-            Err(ModelFailure::Dropped(_))
-                if !retried && !dispatched && step + 1 < request.limits.max_steps =>
-            {
-                check_bound(request, &cancelled, deadline)?;
-                store.fail_attempt(&request.id)?;
-                retried = true;
+            Err(ModelFailure::Stopped { reason, end }) => {
+                // The stop's usage is charged before the miss is decided, as an answer's is.
+                spent = spent.saturating_add(charge_of(&end)?);
+                let at = MissAt { spent, ..at };
+                chain
+                    .missed(context, store, request, progress, sent, at, ModelFailure::Stopped { reason, end }, &mut cancelled)
+                    .await?;
                 continue;
             }
-            Err(ModelFailure::Dropped(reason) | ModelFailure::Terminal(reason)) => {
-                return Err(reason.into());
+            Err(failure) => {
+                chain
+                    .missed(context, store, request, progress, sent, at, failure, &mut cancelled)
+                    .await?;
+                continue;
             }
         };
         check_bound(request, &cancelled, deadline)?;
-        let usage = end
-            .captured_usage
-            .as_ref()
-            .and_then(|u| {
-                u.total_tokens.or_else(|| {
-                    u.prompt_tokens
-                        .zip(u.completion_tokens)
-                        .map(|(a, b)| a.max(0).saturating_add(b.max(0)))
-                })
-            })
-            .filter(|v| *v > 0)
-            .map(|v| v as u32);
+        spent = spent.saturating_add(charge_of(&end)?);
         let mut raw = serde_json::to_value(end)
             .map_err(|_| "harness model response could not be recorded")?;
-        // Providers without usage are charged conservatively for their generated UTF-8 payload.
-        let charge = usage.unwrap_or_else(|| raw.to_string().len().min(u32::MAX as usize) as u32);
-        spent = spent.saturating_add(charge);
         redact(&mut raw, &request.route.key);
         let end: StreamEnd = serde_json::from_value(raw.clone())
             .map_err(|_| "harness model response could not be recorded")?;
@@ -561,7 +690,13 @@ async fn tool_loop(
         let text = content.joined_texts().unwrap_or_default();
         if calls.is_empty() {
             if let Some(failure) = crate::backend::plain_output_failure(&text) {
-                return Err(failure.summary().into());
+                // An empty or failure-shaped answer is a miss too; it was charged above.
+                let at = MissAt { spent, ..at };
+                let failure = ModelFailure::Terminal(failure.summary());
+                chain
+                    .missed(context, store, request, progress, sent, at, failure, &mut cancelled)
+                    .await?;
+                continue;
             }
         }
         let message =
@@ -579,6 +714,7 @@ async fn tool_loop(
                 let _ = events.send(event);
                 return Err("harness token limit exceeded".into());
             }
+            chain.completed();
             return Ok(event);
         }
         let attempt = store.complete_step(&request.id, &event)?;
@@ -604,7 +740,7 @@ async fn tool_loop(
             let run = store.tool_start(&request.id, &attempt, &call)?;
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
-            dispatched |= prepared.is_ok();
+            chain.dispatched |= prepared.is_ok();
             let tools = request.tools.clone();
             let invocation = call.clone();
             let cancel = cancelled.clone();
@@ -641,8 +777,155 @@ async fn tool_loop(
         if exhausted {
             return Err("harness token limit exceeded".into());
         }
+        chain.answered();
     }
     Err("harness step limit exceeded".into())
+}
+
+/// Where a request that missed stood in its turn.
+#[derive(Clone, Copy)]
+struct MissAt {
+    step: usize,
+    /// Tokens the turn has spent, the missed answer's included.
+    spent: u32,
+    /// The size of the request's delivered messages, serialized.
+    request_bytes: usize,
+    deadline: tokio::time::Instant,
+}
+
+/// A turn's place in its candidate chain (`harness/routes.rs`) and what its current request has met so far.
+struct ChainState {
+    scope: String,
+    key: routes::ChainKey,
+    /// The route the next request goes to.
+    route: usize,
+    /// The turn's one dropped-stream retry is spent.
+    retried: bool,
+    /// A validated tool handler was dispatched in this turn.
+    dispatched: bool,
+    /// The current, unchanged request already met a 429 on this route.
+    rate_limited: bool,
+    /// Empty answers the current, unchanged request got on this route.
+    empty_answers: u32,
+}
+
+impl ChainState {
+    fn new(context: &RuntimeContext, request: &TurnRequest) -> Self {
+        Self {
+            scope: routes::scope_of(context),
+            key: routes::ChainKey {
+                conversation: request.conversation.clone(),
+                generation: request.generation.clone(),
+                signature: request.route.signature(),
+            },
+            route: request.route.start,
+            retried: false,
+            dispatched: false,
+            rate_limited: false,
+            empty_answers: 0,
+        }
+    }
+
+    /// The current request was answered: the next request starts with fresh 429 and empty-answer counts.
+    fn answered(&mut self) {
+        self.rate_limited = false;
+        self.empty_answers = 0;
+    }
+
+    /// The turn's model answered in full: the conversation's failover budget starts over.
+    fn completed(&self) {
+        routes::with_memory(&self.scope, |memory| memory.on_completed(&self.key));
+    }
+
+    /// The current request brought no usable answer: retry it on the same route, move it to the next route or end the
+    /// turn (`routes::decide`). A route request that fails over or ends the turn is kept for the pipeline's reports,
+    /// and every outcome goes to the run record with the route and the request's size.
+    #[allow(clippy::too_many_arguments)]
+    async fn missed(
+        &mut self,
+        context: &RuntimeContext,
+        store: &store::Store,
+        request: &TurnRequest,
+        progress: &std::sync::Mutex<Progress>,
+        sent: &AtomicBool,
+        at: MissAt,
+        failure: ModelFailure,
+        cancelled: &mut watch::Receiver<bool>,
+    ) -> Result<(), Failure> {
+        let (miss, summary) = failure.miss();
+        let route = &request.route.routes[self.route];
+        let now = std::time::Instant::now();
+        let next_route = self.route + 1 < request.route.routes.len()
+            && routes::with_memory(&self.scope, |memory| memory.can_fail_over(&self.key, now));
+        let situation = routes::Situation {
+            retry_429: route.spec.retry_429,
+            rate_limited_before: self.rate_limited,
+            empty_answers: self.empty_answers,
+            stream_retried: self.retried,
+            dispatched: self.dispatched,
+            sent: sent.load(Ordering::SeqCst),
+            next_route,
+            steps_left: at.step + 1 < request.limits.max_steps && at.spent < request.limits.max_tokens,
+            unit: request.limits.retry_unit,
+            remaining: at.deadline.saturating_duration_since(tokio::time::Instant::now()),
+        };
+        let next = routes::decide(&miss, &situation);
+        let record = |event: &str, outcome: Outcome, action: String| {
+            let reason = format!(
+                "{}: route {} ({summary}) on a request of {} bytes; {action}",
+                request.conversation, route.id, at.request_bytes
+            );
+            crate::recovery_log::record(context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
+        };
+        let keep = || {
+            progress.lock().unwrap_or_else(|p| p.into_inner()).failures.push(RouteFailure {
+                route: route.id.clone(),
+                model: route.model.clone(),
+                summary: summary.clone(),
+            });
+        };
+        match next {
+            routes::Next::Fail => {
+                keep();
+                record("route-failed", Outcome::Failed, "the turn ends".to_string());
+                Err(summary.into())
+            }
+            routes::Next::FailOver => {
+                keep();
+                let next = self.route + 1;
+                record("failover-step", Outcome::Ok, format!("next route {}", request.route.routes[next].id));
+                routes::with_memory(&self.scope, |memory| memory.on_failover(&self.key, next, now));
+                check_bound(request, cancelled, at.deadline)?;
+                store.fail_attempt(&request.id)?;
+                self.route = next;
+                self.rate_limited = false;
+                self.empty_answers = 0;
+                Ok(())
+            }
+            routes::Next::Retry { wait } => {
+                record(
+                    "route-retry",
+                    Outcome::Ok,
+                    format!("retrying the same route after {} ms", wait.as_millis()),
+                );
+                match miss {
+                    routes::Miss::RateLimited { .. } => self.rate_limited = true,
+                    routes::Miss::Empty => self.empty_answers += 1,
+                    routes::Miss::Dropped => self.retried = true,
+                    routes::Miss::Failed { .. } => {}
+                }
+                check_bound(request, cancelled, at.deadline)?;
+                store.fail_attempt(&request.id)?;
+                if !wait.is_zero() {
+                    tokio::select! { biased;
+                        _ = cancelled.changed() => return Err(Failure::Cancelled),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 fn check_bound(
@@ -662,9 +945,34 @@ fn check_bound(
     })
 }
 
+/// The tokens a model response is charged: its reported usage (total, else prompt plus completion), else its
+/// serialized size, since a provider without usage is charged conservatively for its generated payload.
+fn charge_of(end: &StreamEnd) -> Result<u32, &'static str> {
+    let usage = end
+        .captured_usage
+        .as_ref()
+        .and_then(|u| {
+            u.total_tokens.or_else(|| {
+                u.prompt_tokens
+                    .zip(u.completion_tokens)
+                    .map(|(a, b)| a.max(0).saturating_add(b.max(0)))
+            })
+        })
+        .filter(|v| *v > 0)
+        .map(|v| v as u32);
+    match usage {
+        Some(tokens) => Ok(tokens),
+        None => {
+            let raw = serde_json::to_value(end).map_err(|_| "harness model response could not be recorded")?;
+            Ok(raw.to_string().len().min(u32::MAX as usize) as u32)
+        }
+    }
+}
+
+/// One model request on `route`; `max_tokens` is already capped by the route's limit.
 async fn model_step(
     client: &Client,
-    route: &ModelRoute,
+    route: &Route,
     messages: Vec<ChatMessage>,
     tools: Vec<genai::chat::Tool>,
     max_tokens: u32,
@@ -674,8 +982,8 @@ async fn model_step(
     // boundary; never retain the provider's refusal text in diagnostics or history.
     let refused = Arc::new(AtomicBool::new(false));
     let refusal_flag = refused.clone();
-    let options = ChatOptions::default()
-        .with_max_tokens(max_tokens.min(4096))
+    let mut options = ChatOptions::default()
+        .with_max_tokens(max_tokens)
         .with_capture_content(true)
         .with_capture_tool_calls(true)
         .with_capture_reasoning_content(true)
@@ -699,6 +1007,10 @@ async fn model_step(
                 refusal_flag.store(true, Ordering::SeqCst);
             }
         });
+    // A route without an effort sends none, as before routes.
+    if let Some(effort) = route.spec.effort.as_deref().and_then(ReasoningEffort::from_keyword) {
+        options = options.with_reasoning_effort(effort);
+    }
     // SDK errors may contain provider payloads or URLs. Never format them into HER diagnostics.
     let mut response = client
         .exec_chat_stream(
@@ -710,23 +1022,25 @@ async fn model_step(
         .map_err(model_error)?;
     let mut end = None;
     while let Some(event) = response.stream.next().await {
-        if refused.load(Ordering::SeqCst) {
-            return Err(
-                crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL")
-                    .summary()
-                    .into(),
-            );
-        }
-        if let ChatStreamEvent::End(value) = event.map_err(model_error)? {
-            end = Some(value);
+        match event {
+            Ok(ChatStreamEvent::End(value)) => end = Some(value),
+            Ok(_) => {}
+            // A refusal already seen is the answer's failure, whatever the stream does after it.
+            Err(_) if refused.load(Ordering::SeqCst) => break,
+            Err(error) => return Err(model_error(error)),
         }
     }
     if refused.load(Ordering::SeqCst) {
-        return Err(
-            crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL")
-                .summary()
-                .into(),
-        );
+        let reason = crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL").summary();
+        // A refused answer that reached its end is charged its usage before the miss is decided (`Stopped`); a stream
+        // that ended without its end has no usage to charge.
+        return Err(match end {
+            Some(end) => ModelFailure::Stopped {
+                reason,
+                end: Box::new(end),
+            },
+            None => reason.into(),
+        });
     }
     let end = end.ok_or_else(|| {
         ModelFailure::Dropped(
@@ -734,27 +1048,32 @@ async fn model_step(
         )
     })?;
     if matches!(end.captured_stop_reason, Some(StopReason::ContentFilter(_))) {
-        return Err(
-            crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL")
-                .summary()
-                .into(),
-        );
+        return Err(ModelFailure::Stopped {
+            reason: crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL").summary(),
+            end: Box::new(end),
+        });
     }
     if !matches!(
         end.captured_stop_reason,
         Some(StopReason::Completed(_) | StopReason::ToolCall(_))
     ) {
-        return Err(
-            crate::model_failure::Failure::new("backend", "UNSAFE_FINISH_REASON")
-                .summary()
-                .into(),
-        );
+        return Err(ModelFailure::Stopped {
+            reason: crate::model_failure::Failure::new("backend", "UNSAFE_FINISH_REASON").summary(),
+            end: Box::new(end),
+        });
     }
     Ok(end)
 }
 
 fn model_error(error: genai::Error) -> ModelFailure {
-    let reason = classify_model_error(&error);
+    let failure = model_failure(&error);
+    let reason = failure.summary();
+    if failure.class == "quota" && failure.code == "429" {
+        return ModelFailure::RateLimited {
+            reason,
+            wait: rate_limit_wait(&error),
+        };
+    }
     match &error {
         genai::Error::WebStream { error: inner, .. }
             if inner.downcast_ref::<genai::Error>().is_none()
@@ -766,8 +1085,17 @@ fn model_error(error: genai::Error) -> ModelFailure {
     }
 }
 
-fn classify_model_error(error: &genai::Error) -> String {
-    model_failure(error).summary()
+/// The wait a 429 response asks for (`routes::retry_after`), through the streaming wrapper.
+fn rate_limit_wait(error: &genai::Error) -> Option<Duration> {
+    if let genai::Error::WebStream { error: inner, .. } = error {
+        if let Some(error) = inner.downcast_ref::<genai::Error>() {
+            return rate_limit_wait(error);
+        }
+    }
+    let headers = error.headers()?;
+    let milliseconds = headers.get("retry-after-ms").and_then(|value| value.to_str().ok());
+    let seconds = headers.get("retry-after").and_then(|value| value.to_str().ok());
+    routes::retry_after(milliseconds, seconds)
 }
 
 /// Fixed-vocabulary failure of a provider error; never carries the provider's text.
@@ -1416,3 +1744,7 @@ mod cancellation_tests;
 #[cfg(test)]
 #[path = "harness/media_tests.rs"]
 mod media_tests;
+
+#[cfg(test)]
+#[path = "harness/route_tests.rs"]
+mod route_tests;
