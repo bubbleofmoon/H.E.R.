@@ -47,30 +47,49 @@ fn text_shape_ok(text: &str, max_chars: usize) -> bool {
     text.chars().count() <= max_chars && text.chars().all(|c| c == '\n' || c == '\t' || !c.is_control())
 }
 
+/// Whether `c` is an invisible format character (general category Cf), which the denied-term check reads through.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{13438}' | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// The text folded for matching: each invisible format character becomes `invisible`, full-width ASCII is folded and
+/// letters are upper case.
+fn fold_for_match(text: &str, invisible: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if is_invisible_format(c) {
+                invisible.chars().collect::<Vec<char>>()
+            } else {
+                vec![match c {
+                    '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+                    '\u{3000}' => ' ',
+                    other => other,
+                }]
+            }
+        })
+        .collect::<String>()
+        .to_uppercase()
+}
+
 /// The #142 denied terms (`upstream_capture::denied_terms`) in model-visible text, each once. The check reads the text
-/// with invisible format characters (every Unicode format character, general category Cf) removed, full-width ASCII
-/// folded and letters in upper case, so a split, full-width or lower-case spelling (`D` and `SH` around a zero-width
-/// space, `ＤＳＨ`, `ai`) is found too.
+/// twice: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
+/// found, and with them read as word boundaries, as the text is shown, so a refusal the text earns with them kept still
+/// holds. Full-width ASCII is folded and letters are upper case, so `ＤＳＨ` and `ai` are found too.
 pub(crate) fn denied_in_text(text: &str) -> Vec<String> {
-    let folded: String = text
-        .chars()
-        .filter(|c| {
-            !matches!(
-                *c,
-                '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
-                    | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
-                    | '\u{13430}'..='\u{13455}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
-                    | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
-            )
-        })
-        .map(|c| match c {
-            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            '\u{3000}' => ' ',
-            other => other,
-        })
-        .collect();
-    crate::upstream_capture::denied_terms(&folded.to_uppercase())
+    let mut denied = crate::upstream_capture::denied_terms(&fold_for_match(text, ""));
+    for term in crate::upstream_capture::denied_terms(&fold_for_match(text, " ")) {
+        if !denied.contains(&term) {
+            denied.push(term);
+        }
+    }
+    denied
 }
 
 /// One registry entry.
