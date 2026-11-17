@@ -399,6 +399,22 @@ fn settings_store_waits_for_another_writer_while_it_switches_a_new_store_to_wal(
 }
 
 #[test]
+fn settings_store_refuses_a_version_one_store_without_its_tables_and_leaves_it_unchanged() {
+    // A store that claims schema version 1 but has no tables is refused before anything is written: the WAL switch
+    // rewrites the file header, so the file must not be switched either.
+    let (root, context) = settings_fixture("settings tableless store");
+    let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
+    conn.execute_batch("PRAGMA user_version=1;").unwrap();
+    drop(conn);
+    let before = std::fs::read(settings_db(&root)).unwrap();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "settings storage is unavailable");
+    assert_eq!(std::fs::read(settings_db(&root)).unwrap(), before, "a refused store is never touched");
+    assert!(!root.0.join("data/settings.db-wal").exists(), "no sidecar was created");
+}
+
+#[test]
 fn settings_registry_is_complete_and_agrees_with_its_reader() {
     let registry = crate::settings::REGISTRY;
     assert!(!registry.is_empty(), "the registry has settings");
