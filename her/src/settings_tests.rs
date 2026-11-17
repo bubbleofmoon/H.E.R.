@@ -996,8 +996,8 @@ fn settings_console_start_waits_for_the_configuration_gate_and_never_writes_with
     assert_eq!(status, 200, "{body}");
     // Another writer holds the gate briefly: the start waits for it, then writes back.
     write_config(&root, |config| config["socialV2"]["reply"]["wakeQuietMs"] = json!(9000));
+    let (held, wait) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        let (held, wait) = std::sync::mpsc::channel();
         let holder = scope.spawn(|| {
             let gate = acquire_social_state_gate(&context).unwrap();
             held.send(()).unwrap();
