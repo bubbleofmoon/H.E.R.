@@ -334,9 +334,18 @@ fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path
 }
 
 /// The store's path for a restore's file set: the store and its sidecars pass the runtime's containment checks (no
-/// link; a plain file or missing). A missing store is a path that does not exist.
+/// link; a plain file or missing), and so does the gate file, whether or not the store exists. A missing store is a
+/// path that does not exist.
 pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
-    check_paths(context, PathIntent::ReadOptionalFile)
+    let path = check_paths(context, PathIntent::ReadOptionalFile)?;
+    check_gate_file(context)?;
+    Ok(path)
+}
+
+/// The store gate for a restore, taken with the same wait as a settings write. A writer that holds it makes the restore
+/// wait and then refuse; the gate is held until the returned file is dropped.
+pub(crate) fn restore_gate(context: &RuntimeContext) -> Result<std::fs::File, String> {
+    store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
 }
 
 /// A read-only connection to the store for the backup's online snapshot, `None` when there is no store (or no
@@ -354,6 +363,7 @@ pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connectio
     if !context.is_isolated() {
         return Ok(None);
     }
+    check_gate_file(context)?;
     let path = context
         .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
         .map_err(|_| STORAGE_ERROR.to_string())?;
@@ -470,15 +480,21 @@ fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
     Ok(u64::from(information.nNumberOfLinks))
 }
 
-/// Takes the store gate, waiting until `deadline`. The gate file is opened read-write and locked, so it must be a
-/// plain file with one link before it is opened, and still have one once it is open; a second name for another file
-/// is refused. `Gate::Create`'s other callers keep their own checks.
-fn store_gate(context: &RuntimeContext, deadline: std::time::Instant) -> Result<std::fs::File, String> {
+/// The gate file (`locks/settings-store.lock`) must be a plain file with one link or missing, whether or not the store
+/// exists: a second name for another file would otherwise pass the store's checks and keep an invalid gate.
+fn check_gate_file(context: &RuntimeContext) -> Result<(), String> {
     let path = context
         .resolve_path(RuntimeArea::Data, STORE_GATE, PathIntent::ReadOptionalFile)
         .map_err(|_| STORAGE_ERROR.to_string())?;
     file_len(&path)?;
-    refuse_hard_links(&path)?;
+    refuse_hard_links(&path)
+}
+
+/// Takes the store gate, waiting until `deadline`. The gate file is opened read-write and locked, so it must be a
+/// plain file with one link before it is opened, and still have one once it is open; a second name for another file
+/// is refused. `Gate::Create`'s other callers keep their own checks.
+fn store_gate(context: &RuntimeContext, deadline: std::time::Instant) -> Result<std::fs::File, String> {
+    check_gate_file(context)?;
     loop {
         match context.open_locked_file(RuntimeArea::Data, STORE_GATE) {
             Ok(gate) if file_link_count(&gate).is_ok_and(|links| links == 1) => return Ok(gate),

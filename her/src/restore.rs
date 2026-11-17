@@ -582,6 +582,23 @@ fn resume(context: &RuntimeContext, by: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Stops the writers, then replaces the files. A full restore holds the settings store gate from before the stop
+/// through the replacement and removal, so another process's settings write cannot land between the sidecar cleanup
+/// and the replacement of `settings.db`. A gate that cannot be taken refuses the attempt before anything stops.
+fn stop_and_replace(
+    context: &RuntimeContext,
+    by: &str,
+    prepared: &Prepared,
+    memory_only: bool,
+    control: &mut dyn Control,
+) -> Result<(), String> {
+    let _store = (!memory_only).then(|| crate::settings::restore_gate(context)).transpose()?;
+    let stopped = quiesce(context, by, control)?;
+    apply(context, prepared, memory_only, control)?;
+    drop(stopped);
+    Ok(())
+}
+
 fn apply(
     context: &RuntimeContext,
     prepared: &Prepared,
@@ -794,6 +811,17 @@ fn execute_with(
         }
         control.preflight(context)?;
         let config = context.load_config().map_err(str::to_owned)?;
+        if !memory_only {
+            // The store gate is taken before anything stops, so a writer holding it refuses the restore with nothing changed.
+            if let Err(error) = crate::settings::restore_gate(context) {
+                control.alert(
+                    context,
+                    &config,
+                    &format!("Restore refused before stopping: {error}"),
+                );
+                return Err(error);
+            }
+        }
         audit(
             context,
             by,
@@ -816,9 +844,7 @@ fn execute_with(
             .map(|name| name.to_string_lossy().into_owned());
         let rollback = Prepared::open(context, &previous, memory_only)?;
         let attempt = (|| {
-            let stopped = quiesce(context, by, control)?;
-            apply(context, &prepared, memory_only, control)?;
-            drop(stopped);
+            stop_and_replace(context, by, &prepared, memory_only, control)?;
             resume(context, by)?;
             control.restart(context)?;
             control.health(context, Duration::from_secs(120))?;
@@ -829,9 +855,7 @@ fn execute_with(
             Err(reason) => {
                 // Always re-quiesce; a failed health check may leave live writers running.
                 let undo = (|| {
-                    let stopped = quiesce(context, by, control)?;
-                    apply(context, &rollback, memory_only, control)?;
-                    drop(stopped);
+                    stop_and_replace(context, by, &rollback, memory_only, control)?;
                     resume(context, by)?;
                     control.restart(context)?;
                     crate::backup::protect_pre_restore(&previous, &|| Ok(()))
