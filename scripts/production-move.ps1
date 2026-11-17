@@ -306,7 +306,7 @@ function Add-Failure($ErrorRecord, [string]$Section) {
 # section reports a fixed "skipped" finding instead of running on empty values and hiding its own result.
 function Assert-PlanHas($plan, [string[]]$Keys, [string]$Prerequisite) {
   foreach ($key in $Keys) {
-    # A port is an int; 0 means its section refused it (the configuration sets ConsolePort to 0 before refusing).
+    # A port is an int, and 0 counts as missing: the configuration stores a port only after its checks passed.
     if (-not $plan.Contains($key) -or $null -eq $plan[$key] -or ([string]$plan[$key]) -eq '' -or ($plan[$key] -is [int] -and $plan[$key] -eq 0)) { Stop-Refused ('skipped: needs ' + $Prerequisite) }
   }
 }
@@ -1115,8 +1115,8 @@ function Test-ManifestSkip([string]$Child, [string[]]$Exclude) {
   return $skip.ContainsKey($Child.ToLowerInvariant())
 }
 # -Links (a list) collects each junction or link below the start folder as its relative path and leaves it out, never
-# entering it, instead of refusing. Only the DSH stub comparison passes it, so a stub link does not hide the stub's
-# differing files; every other walk still refuses at the first junction or link.
+# entering it, instead of refusing. Only Inventory's DSH stub comparison passes it, so a stub link does not hide the
+# stub's differing files; every other walk, Move's stub walk included, still refuses at the first junction or link.
 function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [string]$Label, [switch]$NoHash, $Links = $null) {
   $base = Get-Normal $Root
   $target = Get-Normal $TargetRoot
@@ -1289,13 +1289,17 @@ function Protect-Folder([string]$Path, [string]$What = 'the install root') {
   Write-Step ($What + ' is restricted to the owner, SYSTEM and Administrators')
 }
 # The old runtime's DSH stub against the profile DSH home, as paths relative to the stub: Differences holds the stub
-# files the home lacks or holds with other content, Links the stub's junctions and links (listed, never followed).
-function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude) {
+# files the home lacks or holds with other content. With -ListLinks (Inventory only), Links holds the stub's junctions
+# and links (listed, never followed) and the walk goes on; without it the walk refuses at the first one, before it
+# enters any further folder, so Move stops at the first stub blocker.
+function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude, [switch]$ListLinks) {
   $result = [pscustomobject]@{ Differences = [Collections.Generic.List[string]]::new(); Links = [Collections.Generic.List[string]]::new() }
   if (-not (Test-Present $Stub)) { return $result }
   $homeIndex = @{}
   foreach ($entry in (Get-Manifest $DshHome $DshHome $Exclude 'dsh-home')) { $homeIndex[$entry.Path.ToLowerInvariant()] = $entry.Sha256 }
-  foreach ($entry in (Get-Manifest $Stub $Stub $script:DshStubExclude 'dsh-stub' -Links $result.Links)) {
+  $links = $null
+  if ($ListLinks) { $links = $result.Links }
+  foreach ($entry in (Get-Manifest $Stub $Stub $script:DshStubExclude 'dsh-stub' -Links $links)) {
     if ($entry.Length -lt 0) { continue }
     $key = $entry.Path.ToLowerInvariant()
     if (-not $homeIndex.ContainsKey($key) -or $homeIndex[$key] -ne $entry.Sha256) { $result.Differences.Add($entry.Path) }
@@ -1679,10 +1683,12 @@ function Get-ConfigPath($Value, [string]$Name) {
   return (Get-Normal $Value)
 }
 # Inventory runs every check and reports every blocker: each independent check has its own try block, and a check that
-# needs a failed one reports "skipped: needs <check>" (Assert-PlanHas). Only the run's own inputs stop the Inventory
+# needs a failed one reports "skipped: needs <check>" (Assert-PlanHas). A value enters the plan only after its own
+# checks passed, and a check that reads a place another check guards validates that place itself, so a check that
+# does not wait for an earlier one never uses what that one refused. Only the run's own inputs stop the Inventory
 # before the checks: the required parameters and the four old folders (no link above them, inside the temporary
 # folder in a rehearsal, outside the install root), because every check reads through them. Move refuses at the first
-# blocker: Add-Blocker and Add-Failure throw outside Inventory.
+# blocker: Add-Blocker and Add-Failure throw outside Inventory, and Move's DSH stub walk refuses at its first link.
 function Get-MovePlan {
   if (-not $OldRuntime -or -not $OldRelayFolder -or -not $ReleaseSource) { Stop-Refused '-OldRuntime, -OldRelayFolder and -ReleaseSource are required' }
   if (-not (Test-ReleaseName $ReleaseName)) { Stop-Refused '-ReleaseName must be 3 to 41 lower-case letters, digits and dashes, starting with a letter, and not a vX.Y.Z tag' }
@@ -1777,15 +1783,20 @@ function Get-MovePlan {
   } catch { Add-Failure $_ 'configuration' }
   try {
     Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
-    $plan.ConsolePort = [int](Get-Prop $config 'consolePort')
-    if ($plan.ConsolePort -le 0) { Stop-Refused 'the old configuration has no consolePort' }
-    Assert-RehearsalPort $plan.ConsolePort
+    # Like a path, a port is stored only after its own checks passed, so no later check uses a refused port.
+    $port = [int](Get-Prop $config 'consolePort')
+    if ($port -le 0) { Stop-Refused 'the old configuration has no consolePort' }
+    Assert-RehearsalPort $port
+    $plan.ConsolePort = $port
   } catch { Add-Failure $_ 'configuration' }
   try {
     Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
-    $plan.OneBotPort = Get-Port (Get-Prop $dependencies 'onebot') 'onebot'
-    $plan.OneBotWsPort = 0
-    if ($null -ne (Get-Prop $dependencies 'onebot_ws')) { $plan.OneBotWsPort = Get-Port (Get-Prop $dependencies 'onebot_ws') 'onebot_ws' }
+    # Both OneBot ports or neither: the dependency processes check needs the pair.
+    $port = Get-Port (Get-Prop $dependencies 'onebot') 'onebot'
+    $wsPort = 0
+    if ($null -ne (Get-Prop $dependencies 'onebot_ws')) { $wsPort = Get-Port (Get-Prop $dependencies 'onebot_ws') 'onebot_ws' }
+    $plan.OneBotPort = $port
+    $plan.OneBotWsPort = $wsPort
   } catch { Add-Failure $_ 'configuration' }
   try {
     Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
@@ -2082,10 +2093,11 @@ function Get-MovePlan {
   # profile, plugin and bundle texts, and the bundles' dependencies (then the other files that name a bundle).
   try {
     # The runtime's own DSH files must equal the profile copies the move installs, and the stub holds no junction or
-    # link. Its links are listed, not followed, so they do not hide its differing files.
+    # link. Inventory lists its links without following them, so they do not hide its differing files; Move refuses at
+    # the first one.
     Assert-PlanHas $plan @('Roots') 'the copy plan'
     if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
-    $stub = Compare-DshStub (Join-Path $plan.OldRuntime 'user\dsh') $plan.DshHome (Get-DshLinkPaths $plan)
+    $stub = Compare-DshStub (Join-Path $plan.OldRuntime 'user\dsh') $plan.DshHome (Get-DshLinkPaths $plan) -ListLinks:($Mode -eq 'Inventory')
     Write-Utf8 (Join-Path $script:Evidence 'dsh-stub-links.txt') ((@($stub.Links) -join "`r`n") + "`r`n")
     Write-Utf8 (Join-Path $script:Evidence 'dsh-stub-differences.txt') ((@($stub.Differences) -join "`r`n") + "`r`n")
     if ($stub.Links.Count -gt 0) { Add-Blocker 'a junction or link was found in dsh-stub (list in the evidence folder)' }
@@ -2099,6 +2111,14 @@ function Get-MovePlan {
     Assert-PlanHas $plan @('ConsolePort') 'the configuration check'
     if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
     $profileFile = Join-Path $plan.DshHome 'profiles\web\cordis.patch.yml'
+    # The copy plan refuses a folder link in the DSH home, but this check does not wait for it: each step below the DSH
+    # home, the file included, is checked from the top down before anything is read through it.
+    $profileStep = $plan.DshHome
+    foreach ($part in @('profiles', 'web', 'cordis.patch.yml')) {
+      $profileStep = Join-Path $profileStep $part
+      $item = Get-Item -LiteralPath $profileStep -Force -ErrorAction SilentlyContinue
+      if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused 'a junction or link lies on the path of the DSH profile' }
+    }
     if (-not (Test-Path -LiteralPath $profileFile -PathType Leaf)) { Stop-Refused 'the profile DSH home has no profiles\web\cordis.patch.yml' }
     $rendered = New-McpProfile $plan.SourceCli $profileFile (Join-Path $script:Evidence 'mcp-preview') $plan.ConsolePort
   } catch { Add-Failure $_ 'dsh profile' }
