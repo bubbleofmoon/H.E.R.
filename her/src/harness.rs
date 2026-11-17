@@ -862,7 +862,7 @@ impl ChainState {
             empty_answers: self.empty_answers,
             stream_retried: self.retried,
             dispatched: self.dispatched,
-            sent: false,
+            sent: sent.load(Ordering::SeqCst),
             next_route,
             steps_left: at.step + 1 < request.limits.max_steps && at.spent < request.limits.max_tokens,
             unit: request.limits.retry_unit,
