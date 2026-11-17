@@ -25,6 +25,11 @@ thread_local! {
     pub(crate) static AUTHORITY_WRITE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
     static ROOT_RESOLUTION_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
+#[cfg(test)]
+thread_local! {
+    /// Values the configuration overlay applies on this thread, at a JSON pointer, as stored settings would be.
+    static CONFIG_OVERLAY_TEST_VALUES: std::cell::RefCell<Vec<(String, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// A stable logical path area. `relative` passed to `resolve_path` must contain only normal
 /// components; callers should use these areas instead of assembling runtime-root paths themselves.
@@ -48,6 +53,23 @@ pub enum PathIntent {
     ReadDirectory,
     WriteFile,
     CreateDirectory,
+}
+
+/// Why the configuration loader returned no configuration document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigReadError {
+    /// `config.json` is missing, refused by the path checks, unreadable or not UTF-8 (the read's own message).
+    Unavailable(&'static str),
+    /// `config.json` is not JSON.
+    Invalid,
+}
+
+/// A change stamp of the stored `config.json`: equal stamps mean the loader reads the same file, so a cache of a
+/// value derived from the configuration is keyed on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigStamp {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -955,25 +977,58 @@ impl RuntimeContext {
             .unwrap_or_default()
     }
 
-    pub fn load_config(&self) -> Result<Value, &'static str> {
-        if self.is_isolated() {
-            let text = self.read_text(RuntimeArea::Config, "config.json")?;
-            let raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-                .map_err(|_| "runtime config is invalid")?;
-            return self.effective_config(&raw);
-        }
-
-        let text = fs::read_to_string(self.config_file()).unwrap_or_default();
-        Ok(serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_else(|_| json!({})))
+    /// The configuration before normalization: the stored `config/config.json` (a leading UTF-8 BOM accepted) with
+    /// the settings overlay applied. Every reader of configuration values goes through this or `load_config`, which
+    /// normalizes it. Only the writers (they modify the stored file), the backup archive (it keeps the stored bytes)
+    /// and the no-root legacy paths read the file themselves.
+    pub fn load_config_document(&self) -> Result<Value, ConfigReadError> {
+        let text = self
+            .read_text(RuntimeArea::Config, "config.json")
+            .map_err(ConfigReadError::Unavailable)?;
+        let file: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|_| ConfigReadError::Invalid)?;
+        Ok(self.overlay_config(file))
     }
 
-    /// #192: the configuration `load_config` returns once `raw` is the selected runtime's `config.json`, computed
-    /// without reading that file (an access change records the policy it writes before the write). A legacy context
-    /// uses `raw` as it is.
-    pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
-        if !self.is_isolated() {
-            return Ok(raw.clone());
+    /// The one place stored settings are applied over the parsed `config.json`; the settings store plugs in here.
+    /// Without a settings store the file is the configuration.
+    pub(crate) fn overlay_config(&self, file: Value) -> Value {
+        apply_settings_overlay(file)
+    }
+
+    /// The change stamp of the stored `config.json` (`ConfigStamp`); the path checks of the loader apply.
+    pub fn config_stamp(&self) -> Result<ConfigStamp, &'static str> {
+        let path = self.resolve_path(RuntimeArea::Config, "config.json", PathIntent::ReadFile)?;
+        let metadata = fs::metadata(path).map_err(|_| "runtime config metadata is unavailable")?;
+        Ok(ConfigStamp { len: metadata.len(), modified: metadata.modified().ok() })
+    }
+
+    pub fn load_config(&self) -> Result<Value, &'static str> {
+        if self.is_isolated() {
+            let raw = match self.load_config_document() {
+                Ok(raw) => raw,
+                Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
+                Err(ConfigReadError::Unavailable(message)) => return Err(message),
+            };
+            return self.normalized_config(&raw);
         }
+
+        Ok(self.load_config_document().unwrap_or_else(|_| json!({})))
+    }
+
+    /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading
+    /// that file (an access change records the policy it writes before the write). The settings overlay is applied
+    /// first, as `load_config_document` does; a legacy context then uses the document as it is.
+    pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
+        let document = self.overlay_config(raw.clone());
+        if !self.is_isolated() {
+            return Ok(document);
+        }
+        self.normalized_config(&document)
+    }
+
+    /// The normalization `load_config` applies to the overlaid configuration document of a selected runtime.
+    fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
         if !raw.is_object() {
             return Err("runtime config is invalid");
         }
@@ -1213,6 +1268,40 @@ impl RuntimeContext {
         };
         Ok(base)
     }
+}
+
+/// Without a settings store nothing is applied over the file.
+#[cfg(not(test))]
+fn apply_settings_overlay(file: Value) -> Value {
+    file
+}
+
+/// Applies this thread's `with_config_overlay` values over the file.
+#[cfg(test)]
+fn apply_settings_overlay(mut file: Value) -> Value {
+    CONFIG_OVERLAY_TEST_VALUES.with(|values| {
+        for (pointer, value) in values.borrow().iter() {
+            if let Some(slot) = file.pointer_mut(pointer) {
+                *slot = value.clone();
+            }
+        }
+    });
+    file
+}
+
+/// Runs `run` while the configuration overlay applies `value` at `pointer` on this thread, as a stored setting would
+/// be. The pointer names a member the stored file already has.
+#[cfg(test)]
+pub(crate) fn with_config_overlay<T>(pointer: &str, value: Value, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CONFIG_OVERLAY_TEST_VALUES.with(|values| values.borrow_mut().clear());
+        }
+    }
+    CONFIG_OVERLAY_TEST_VALUES.with(|values| values.borrow_mut().push((pointer.to_string(), value)));
+    let _reset = Reset;
+    run()
 }
 
 /// The DSH home comes only from an explicit `DSH_HOME` or `USERPROFILE`. There is no

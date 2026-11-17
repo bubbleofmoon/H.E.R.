@@ -20,6 +20,7 @@ mod pipeline;
 mod harness;
 mod prompt;
 mod briefing;
+mod briefing_delivery;
 mod initial_prompts;
 mod persona;
 mod persona_command;

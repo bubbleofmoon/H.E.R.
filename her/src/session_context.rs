@@ -1,4 +1,6 @@
 //! Durable observed-message, compaction and last-call facts, scoped by the session map and epoch.
+//! The DSH adapter of briefing delivery: a delivered prompt and a completed compaction are reported to
+//! `briefing_delivery.rs`, which owns the briefing rules.
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Value};
 
@@ -38,13 +40,8 @@ pub(crate) fn observe(
             .unwrap_or(&Value::Null);
         match kind {
             "user/message" => {
-                if source["rpcId"].is_string()
-                    && r["pending"]["rpcId"] == source["rpcId"]
-                    && r["pending"]["generation"] == r["generation"]
-                {
-                    r["installed"] = r["pending"].take();
-                    r["needsBriefing"] = json!(false);
-                    r["installed"]["seq"] = json!(seq);
+                if let Some(receipt) = source["rpcId"].as_str() {
+                    crate::briefing_delivery::delivered(r, receipt, seq);
                 }
                 if r["summary"]["seq"].as_i64() == Some(seq - 1)
                     && ((event.pointer("/surfaceOp/op").and_then(Value::as_str) == Some("replace")
@@ -122,6 +119,5 @@ fn invalidate(r: &mut Value, id: &Value, seq: i64) {
     }
     r["compactionId"] = id.clone();
     r["compactionSeq"] = json!(seq);
-    r["generation"] = json!(r["generation"].as_u64().unwrap_or(0) + 1);
-    r["pending"] = Value::Null;
+    crate::briefing_delivery::next_generation(r);
 }

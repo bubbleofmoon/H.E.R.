@@ -9,21 +9,20 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use crate::runtime::{ConfigStamp, RuntimeArea, RuntimeContext};
 
 pub const DIR: &str = "history";
 
-/// Whether `history.enabled` is the boolean true in an isolated runtime. config.json is read only when its
-/// length or modification time changes, so a disabled log costs one stat per frame.
+/// Whether `history.enabled` is the boolean true in an isolated runtime. The configuration is read only when its
+/// stamp (`RuntimeContext::config_stamp`) changes, so a disabled log costs one stat per frame.
 pub fn enabled(context: &RuntimeContext) -> bool {
-    type FlagCache = HashMap<String, ((u64, SystemTime), bool)>;
+    type FlagCache = HashMap<String, (ConfigStamp, bool)>;
     static CACHE: Mutex<Option<FlagCache>> = Mutex::new(None);
     if !context.is_isolated() {
         return false;
     }
-    let Some(identity) = config_identity(context) else { return false };
+    let Ok(identity) = context.config_stamp() else { return false };
     let scope = scope_key(context);
     let mut guard = CACHE.lock().unwrap_or_else(|p| p.into_inner());
     let cache = guard.get_or_insert_with(HashMap::new);
@@ -39,12 +38,6 @@ pub fn enabled(context: &RuntimeContext) -> bool {
 
 fn scope_key(context: &RuntimeContext) -> String {
     context.runtime_root().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
-}
-
-fn config_identity(context: &RuntimeContext) -> Option<(u64, SystemTime)> {
-    let path = context.resolve_path(RuntimeArea::Config, "config.json", PathIntent::ReadOptionalFile).ok()?;
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().unwrap_or(UNIX_EPOCH)))
 }
 
 fn read_flag(context: &RuntimeContext) -> bool {

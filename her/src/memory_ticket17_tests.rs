@@ -618,10 +618,7 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     assert_eq!(recall_hits(&conn), 0, "preparing wakes counts nothing");
 
     // Compaction starts a new generation: the briefing is full again and the memories return.
-    crate::session_map::update_context(&context, key, "sid-148", "epoch-148", |r| {
-        r["generation"] = json!(r["generation"].as_u64().unwrap_or(0) + 1);
-        r["pending"] = Value::Null;
-    }).unwrap();
+    crate::session_map::update_context(&context, key, "sid-148", "epoch-148", crate::briefing_delivery::next_generation).unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
@@ -663,8 +660,7 @@ fn a_history_gap_refresh_within_a_generation_keeps_the_memories_already_carried(
     accept_wake(&context, "rpc-1", 1);
     // A gap in the observed history demands a full briefing without starting a new generation.
     crate::session_map::update_context(&context, key, "sid-148", "epoch-148", |r| {
-        r["needsBriefing"] = json!(true);
-        r["pending"] = Value::Null;
+        crate::briefing_delivery::history_gap(r, 5);
     }).unwrap();
     let (text, second) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-2", "").unwrap();
     server.join().unwrap();

@@ -7,7 +7,7 @@ use std::io::{BufRead, Write};
 use serde_json::{json, Value};
 
 use crate::memory;
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 
 /// 校验会话令牌：读所选运行时 `social-v2.json` 里的 agentToken。
 #[cfg(test)]
@@ -573,11 +573,7 @@ fn call_prepared_inner(name: &str, args: &Value, context: &RuntimeContext, recor
 /// `qq_wait_for_messages` must not hold up another session's tool calls); responses are written whole.
 pub fn serve_with_context(context: &RuntimeContext) -> std::io::Result<()> {
     use std::sync::Arc;
-    let cfg = match context.read_text(RuntimeArea::Config, "config.json") {
-        Ok(text) => serde_json::from_str::<Value>(text.strip_prefix('\u{feff}').unwrap_or(&text))
-            .unwrap_or_else(|_| json!({})),
-        Err(_) => json!({}),
-    };
+    let cfg = served_config(context);
     let tools: Arc<Vec<Value>> = Arc::new(
         tool_list(&cfg)
             .get("tools")
@@ -589,6 +585,11 @@ pub fn serve_with_context(context: &RuntimeContext) -> std::io::Result<()> {
     let registered = Arc::clone(&tools);
     let dispatch: ToolDispatch = Arc::new(move |name, arguments| call_registered(name, arguments, &registered, &context));
     serve_stdio(SERVER_NAME, tools, dispatch)
+}
+
+/// The config document the served tool list is built from, from the loader (`{}` when it cannot be read).
+pub(crate) fn served_config(context: &RuntimeContext) -> Value {
+    context.load_config_document().unwrap_or_else(|_| json!({}))
 }
 
 /// How a server answers `tools/call` for a tool name (after the protocol layer has parsed the request).
