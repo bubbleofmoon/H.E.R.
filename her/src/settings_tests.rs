@@ -599,6 +599,22 @@ fn settings_store_never_makes_a_journal_copy() {
 }
 
 #[test]
+fn settings_store_creates_over_a_journal_beside_an_empty_database() {
+    // An empty database has no page a journal could restore: such a journal is not a leftover to refuse.
+    let (root, context) = settings_fixture("settings empty store journal");
+    let journal = root.0.join("data/settings.db-journal");
+    std::fs::write(settings_db(&root), b"").unwrap();
+    std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("storeError").is_none(), "readers see an empty store: {body}");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use_quiet(&context), Some(4500));
+    assert!(!journal.exists(), "SQLite discarded the journal of the empty database");
+}
+
+#[test]
 fn settings_store_refuses_a_hard_linked_sidecar_without_a_database() {
     // SQLite opens, truncates or removes the sidecars even when it creates the database, so each is checked first.
     let (root, context) = settings_fixture("settings linked sidecar no store");
