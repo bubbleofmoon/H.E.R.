@@ -524,8 +524,24 @@ fn restore_settings_backup_while_the_console_writes_settings() {
     );
 }
 
+/// The restore stopped the owners, could not take the store gate, and refused with nothing changed: the owners are
+/// asked to run again, no rollback ran, and no file was replaced.
+fn assert_refused_without_rollback(f: &Fixture, control: &FakeControl, error: &str, case: &str) {
+    assert!(error.contains("settings"), "{case}: {error}");
+    assert_eq!(control.stops, 1, "{case}: a refused restore never runs a rollback stop");
+    assert_eq!(control.writes, 0, "{case}: nothing was replaced");
+    assert_eq!(control.restarts, 1, "{case}: the stopped owners are asked to start again");
+    assert_eq!(control.alerts.len(), 1, "{case}: {:?}", control.alerts);
+    assert!(!control.alerts[0].contains("rolled back"), "{case}: {:?}", control.alerts);
+    assert_eq!(quiet(f), Some(5000), "{case}: nothing changed");
+    assert!(
+        matches!(crate::lifecycle::DesiredStore::new(f.0.join("data/lifecycle")).read(), crate::lifecycle::DesiredRead::Present(r) if r.state == crate::lifecycle::DesiredState::Running),
+        "{case}: the desired state is running again"
+    );
+}
+
 #[test]
-fn restore_settings_held_store_gate_refuses_the_restore_before_stopping() {
+fn restore_settings_held_store_gate_refuses_the_restore_after_the_stop_without_a_rollback() {
     let f = Fixture::new();
     set_quiet(&f, 4000);
     let archive = f.backup();
@@ -544,9 +560,29 @@ fn restore_settings_held_store_gate_refuses_the_restore_before_stopping() {
     )
     .unwrap_err();
     drop(gate);
-    assert!(error.contains("settings"), "{error}");
-    assert_eq!(control.stops, 0, "a gate the restore cannot take refuses it before anything stops");
-    assert_eq!(quiet(&f), Some(5000), "nothing changed");
+    assert_refused_without_rollback(&f, &control, &error, "gate held before the restore");
+}
+
+#[test]
+fn restore_settings_writer_that_takes_the_gate_during_the_stop_refuses_the_restore_without_a_rollback() {
+    let f = Fixture::new();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    set_quiet(&f, 5000);
+    let plan = preview(&f.context(), &archive, false).unwrap();
+    // A writer gets the gate while the restore waits for the owners: the gate is not the restore's yet.
+    let mut control = FakeControl { writer_takes_gate_during_stop: true, ..Default::default() };
+    let error = execute_with(
+        &f.context(),
+        &archive,
+        false,
+        plan["confirmation"].as_str().unwrap(),
+        "fixture-admin",
+        &mut control,
+    )
+    .unwrap_err();
+    assert!(control.writer_hold.is_some(), "the writer took the gate during the stop");
+    assert_refused_without_rollback(&f, &control, &error, "gate taken during the stop");
 }
 
 #[test]
@@ -619,26 +655,33 @@ fn restore_settings_gate_that_is_not_a_plain_file_fails_the_backup_and_refuses_t
 }
 
 #[test]
-fn restore_settings_writer_cannot_take_the_store_gate_after_admission() {
-    let f = Fixture::new();
-    set_quiet(&f, 4000);
-    let archive = f.backup();
-    set_quiet(&f, 5000);
-    let plan = preview(&f.context(), &archive, false).unwrap();
-    // A writer tries for the store gate as soon as the restore is admitted: the restore must already hold it, so a
-    // gate that is taken between admission and the mutation can never make a rollback run.
-    let mut control = FakeControl { probe_writer_after_admission: true, ..Default::default() };
-    let result = execute_with(
-        &f.context(),
-        &archive,
-        false,
-        plan["confirmation"].as_str().unwrap(),
-        "fixture-admin",
-        &mut control,
-    );
-    assert_eq!(control.writer_got_gate, Some(false), "a writer took the store gate after the restore was admitted");
-    result.unwrap();
-    assert_eq!(quiet(&f), Some(4000));
+fn restore_settings_store_gate_is_not_held_while_the_restore_waits_for_the_owners_and_task_gates() {
+    // A settings writer holds the configuration gate while it waits for the store gate, and a queued console task holds
+    // its task gate while it waits for the configuration gate, so a restore that holds the store gate while it waits
+    // for the task gates closes a cycle. The gate comes after the stop, for the restore and for its rollback.
+    for unhealthy in [false, true] {
+        let f = Fixture::new();
+        set_quiet(&f, 4000);
+        let archive = f.backup();
+        set_quiet(&f, 5000);
+        let plan = preview(&f.context(), &archive, false).unwrap();
+        let mut control = FakeControl { unhealthy, ..Default::default() };
+        let result = execute_with(
+            &f.context(),
+            &archive,
+            false,
+            plan["confirmation"].as_str().unwrap(),
+            "fixture-admin",
+            &mut control,
+        );
+        assert_eq!(result.is_err(), unhealthy);
+        assert_eq!(
+            control.store_free_at_stop,
+            vec![true; if unhealthy { 2 } else { 1 }],
+            "the store gate was held while a stop waited (unhealthy: {unhealthy})"
+        );
+        assert_eq!(quiet(&f), Some(if unhealthy { 5000 } else { 4000 }));
+    }
 }
 
 #[test]

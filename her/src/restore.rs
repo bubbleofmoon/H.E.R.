@@ -1267,9 +1267,10 @@ mod tests {
         replaced: Vec<String>,
         probe_settings_write: bool,
         settings_probe: Option<Result<(), u16>>,
-        probe_writer_after_admission: bool,
-        writer_got_gate: Option<bool>,
+        writer_takes_gate_during_stop: bool,
         writer_hold: Option<fs::File>,
+        store_free_at_stop: Vec<bool>,
+        restarts: usize,
         probe_store_replaced: bool,
         settings_after_replace: Option<Result<(), u16>>,
     }
@@ -1279,6 +1280,17 @@ mod tests {
         }
         fn stop(&mut self, context: &RuntimeContext, _: u64) -> Result<(), String> {
             self.stops += 1;
+            // The store gate is free while the restore waits for the owners and the task gates (a stop is the first
+            // of those waits); a writer that takes it now holds it until the restore gives up.
+            match context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock") {
+                Ok(gate) => {
+                    self.store_free_at_stop.push(true);
+                    if self.writer_takes_gate_during_stop {
+                        self.writer_hold = Some(gate);
+                    }
+                }
+                Err(_) => self.store_free_at_stop.push(false),
+            }
             if self.leave_conversation_sidecars && self.stops == 1 {
                 for suffix in ["-wal", "-shm", "-journal"] {
                     fs::write(
@@ -1320,16 +1332,9 @@ mod tests {
                 Ok(())
             }
         }
-        fn admitted(&mut self, context: &RuntimeContext) {
-            if self.probe_writer_after_admission {
-                match context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock") {
-                    Ok(gate) => {
-                        self.writer_got_gate = Some(true);
-                        self.writer_hold = Some(gate);
-                    }
-                    Err(_) => self.writer_got_gate = Some(false),
-                }
-            }
+        fn restart(&mut self, _: &RuntimeContext) -> Result<(), String> {
+            self.restarts += 1;
+            Ok(())
         }
         fn store_replaced(&mut self, context: &RuntimeContext) {
             if self.probe_store_replaced {
