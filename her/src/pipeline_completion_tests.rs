@@ -137,7 +137,7 @@ fn rejected_completion_cap_case(failover: bool, sleep: bool) {
     let key = "group:42";
     crate::session_map::bind(&context, key, "sid-136", None).unwrap();
     pipe.chat = Some(ChatRun {
-        engine: crate::harness::Engine::Dsh,
+        adapter: crate::turn_engine::Adapter::Dsh,
         reserved: None,
         mode: "chat".into(),
         silent: true,

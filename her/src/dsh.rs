@@ -320,6 +320,14 @@ impl Rpc {
         Ok(Self { base, credential })
     }
 
+    /// An Rpc without a DSH login, for a pipeline whose turns run on another engine. Every call
+    /// fails locally with `dsh_credential::UNBOUND` without contacting DSH.
+    pub fn unbound(context: &RuntimeContext, base: &str) -> Self {
+        let base = base.trim_end_matches('/').to_string();
+        let credential = Credential::unbound(context, &base);
+        Self { base, credential }
+    }
+
     /// Compatibility constructor for callers which already extracted a credentials-file secret.
     /// Isolated handlers must use `connect_with_runtime` so a later 401 refresh stays bound to the
     /// selected runtime credentials rather than consulting the ambient DSH home.
@@ -372,6 +380,9 @@ impl Rpc {
         rpc_id: &str,
         refresh: bool,
     ) -> Result<serde_json::Value, String> {
+        if !self.credential.is_bound() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         let endpoint = method.replace('.', "/");
         let mut body = payload;
         if endpoint == "session/prompt" && body.get("requestId").is_none() {
@@ -505,6 +516,9 @@ impl Rpc {
         deadline: std::time::Instant,
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<serde_json::Value, String> {
+        if !self.credential.is_bound() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         let endpoint = method.replace('.', "/");
         let mut body = payload;
         if endpoint == "session/prompt" && body.get("requestId").is_none() {
@@ -1871,6 +1885,49 @@ mod tests {
     fn test_rpc(base: String) -> Rpc {
         let credential = Credential::fixed(&base, "dsh-auth-ticket04=synthetic-cookie".into());
         Rpc { base, credential }
+    }
+
+    #[test]
+    fn seam_unbound_rpc_refuses_every_call_without_contacting_dsh() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind fake DSH");
+        listener.set_nonblocking(true).expect("set fake listener nonblocking");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        // Answers every request for one second: a call that reaches DSH succeeds and is counted.
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let mut contacts = 0;
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).expect("set fake stream blocking");
+                        let request = test_rpc_request_body(&read_test_request(&mut stream));
+                        write_test_rpc_response(
+                            &mut stream,
+                            test_rpc_success(request["rpcId"].clone(), serde_json::json!({})),
+                        );
+                        contacts += 1;
+                    }
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+            contacts
+        });
+        let (_root, context) = crate::upstream_capture::test_support::runtime("seam-unbound", &base);
+        let mut rpc = Rpc::unbound(&context, &base);
+        assert!(!rpc.credential().is_bound(), "no login was minted");
+        let unbound: Result<serde_json::Value, String> = Err(crate::dsh_credential::UNBOUND.to_string());
+        let plain = rpc.call("settings/describe", serde_json::json!({}));
+        let bounded = rpc.call_with_deadline(
+            "settings/describe",
+            serde_json::json!({}),
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        );
+        let relogin = rpc.relogin().map(|_| serde_json::Value::Null);
+        let contacts = server.join().expect("join fake DSH server");
+        assert_eq!(plain, unbound, "an unbound Rpc refuses locally");
+        assert_eq!(bounded, unbound, "the bounded path refuses locally too");
+        assert_eq!(relogin, unbound, "relogin never binds it");
+        assert_eq!(contacts, 0, "an unbound Rpc never contacts DSH");
     }
 
     fn accept_test_stream(listener: &std::net::TcpListener) -> std::net::TcpStream {

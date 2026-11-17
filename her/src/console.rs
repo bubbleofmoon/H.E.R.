@@ -7924,8 +7924,10 @@ fn handle_session_reset_isolated(
         None => json!({}),
     };
     let cfg = context.load_config().map_err(|_| (503, "runtime configuration is unavailable".to_string()))?;
-    let harness = crate::harness::Engine::selected(&cfg, &key)
-        .map_err(|error| (503, error))? == crate::harness::Engine::Harness;
+    // A conversation whose turn engine needs no DSH resets without a DSH session mapping.
+    let harness = !crate::turn_engine::Engine::selected(&cfg, &key)
+        .map_err(|error| (503, error))?
+        .uses_dsh();
     let mapped = match store.get("sessions") {
         None => false,
         Some(Value::Object(sessions)) => sessions.contains_key(&key),
