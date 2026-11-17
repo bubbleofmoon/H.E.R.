@@ -51,7 +51,7 @@ struct Prepared {
 fn location(name: &str) -> Result<(RuntimeArea, String), String> {
     let simple = |s: &str| !s.is_empty() && !s.contains(['/', '\\', ':']) && s != "." && s != "..";
     match name {
-        "memory.db" | "conversations.db" => Ok((RuntimeArea::Data, name.into())),
+        "memory.db" | "conversations.db" | "settings.db" => Ok((RuntimeArea::Data, name.into())),
         "config.json" => Ok((RuntimeArea::Config, "config.json".into())),
         "说明.md" => Ok((RuntimeArea::Resources, name.into())),
         _ if name.starts_with("state/") => {
@@ -87,14 +87,49 @@ fn label(area: RuntimeArea, relative: &str) -> String {
     )
 }
 
-/// Red-test stub, replaced in Run 2: tries once.
+/// How long a restore retries removing a file another process holds open. The supervisor keeps running through a
+/// restore and reads `settings.db` through the configuration loader, and Windows refuses to remove a file SQLite has
+/// open. The replacement retries the same violations for the same time (`guarded_file::Staged::commit`).
+const OPEN_FILE_WAIT: Duration = Duration::from_secs(1);
+
+/// Runs `operation` again while it fails with a Windows access, sharing or lock violation (OS errors 5, 32 and 33)
+/// and `deadline` has not passed. `windows` is `cfg!(windows)` outside the policy test, so other hosts try once.
 fn retry_open_file(
     windows: bool,
     deadline: Instant,
     mut operation: impl FnMut() -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    let _ = (windows, deadline);
-    operation()
+    loop {
+        match operation() {
+            Err(error)
+                if windows
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Removes a runtime file as `RuntimeContext::remove_file` does (the path resolved twice and compared), retrying
+/// while another process holds it open (`retry_open_file`). A file that is already gone counts as removed.
+fn remove_runtime_file(
+    context: &RuntimeContext,
+    area: RuntimeArea,
+    relative: &str,
+) -> Result<(), String> {
+    let path = context.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
+    if context.resolve_path(area, relative, PathIntent::ReadOptionalFile)? != path {
+        return Err("runtime path is unavailable".into());
+    }
+    match retry_open_file(cfg!(windows), Instant::now() + OPEN_FILE_WAIT, || {
+        fs::remove_file(&path)
+    }) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result.map_err(|e| format!("cannot remove runtime file: {e}")),
+    }
 }
 
 fn current_files(
@@ -108,6 +143,12 @@ fn current_files(
     let conversations = crate::backup::conversation_db_path(context)?;
     if conversations.try_exists().map_err(|e| e.to_string())? {
         files.insert("conversations.db".into(), location("conversations.db")?);
+    }
+    if crate::settings::store_path(context)?
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        files.insert("settings.db".into(), location("settings.db")?);
     }
     files.insert("config.json".into(), location("config.json")?);
     let data = context.resolve_path(RuntimeArea::Data, "", PathIntent::ReadDirectory)?;
@@ -547,22 +588,19 @@ fn apply(
     memory_only: bool,
     control: &mut dyn Control,
 ) -> Result<(), String> {
-    // A stopped writer must not leave an old WAL to replay against the replacement database.
+    // A stopped writer must not leave an old WAL to replay against the replacement database. A reader in a process
+    // the restore does not stop may hold a file open for a moment; removals retry that (`remove_runtime_file`).
     crate::memory::db_path_for_runtime(context)?;
     let databases: &[&str] = if memory_only {
         &["memory.db"]
     } else {
         crate::backup::conversation_db_path(context)?;
-        &["memory.db", "conversations.db"]
+        crate::settings::store_path(context)?;
+        &["memory.db", "conversations.db", "settings.db"]
     };
     for database in databases {
         for suffix in ["-wal", "-shm", "-journal"] {
-            let name = format!("{database}{suffix}");
-            let path =
-                context.resolve_path(RuntimeArea::Data, &name, PathIntent::ReadOptionalFile)?;
-            if path.exists() {
-                context.remove_file(RuntimeArea::Data, &name)?;
-            }
+            remove_runtime_file(context, RuntimeArea::Data, &format!("{database}{suffix}"))?;
         }
     }
     let current = current_files(context, memory_only)?;
@@ -584,7 +622,7 @@ fn apply(
             continue;
         }
         if !prepared.files.contains_key(&name) {
-            context.remove_file(area, &relative)?;
+            remove_runtime_file(context, area, &relative)?;
         }
     }
     if !memory_only && prepared.files.contains_key("conversations.db") {

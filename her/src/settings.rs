@@ -3,7 +3,8 @@
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
-//! A legacy (no-root) context has no store.
+//! A legacy (no-root) context has no store. Backups copy the store through `backup_source`; a restore names it
+//! through `store_path`.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -147,6 +148,39 @@ fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path
         context.resolve_path(RuntimeArea::Data, name, intent).map_err(|_| STORAGE_ERROR.to_string())?;
     }
     context.resolve_path(RuntimeArea::Data, DB, intent).map_err(|_| STORAGE_ERROR.to_string())
+}
+
+/// The store's path for a restore's file set: the store and its sidecars pass the runtime's containment checks (no
+/// link; a plain file or missing). A missing store is a path that does not exist.
+pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
+    check_paths(context, PathIntent::ReadOptionalFile)
+}
+
+/// A read-only connection to the store for the backup's online snapshot, `None` when there is no store (or no
+/// selected runtime). The store and its sidecars pass the same checks as every other open (contained, and a plain
+/// file with one link or missing), and the connection never checkpoints on close, so a backup never changes the
+/// store. The schema is not checked: a store from a newer release is copied as it is. A store SQLite cannot read (a
+/// leftover journal, a file that is not a database) fails the snapshot.
+pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connection>, String> {
+    if !context.is_isolated() {
+        return Ok(None);
+    }
+    let path = store_path(context)?;
+    for name in SIDECARS {
+        let sidecar = context
+            .resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)
+            .map_err(|_| STORAGE_ERROR.to_string())?;
+        file_len(&sidecar)?;
+        refuse_hard_links(&sidecar)?;
+    }
+    if file_len(&path)?.is_none() {
+        return Ok(None);
+    }
+    refuse_hard_links(&path)?;
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
+    Ok(Some(conn))
 }
 
 fn schema_version(conn: &Connection) -> Result<i64, String> {
