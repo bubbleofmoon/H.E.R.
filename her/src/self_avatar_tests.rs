@@ -270,7 +270,7 @@ fn self_avatar_taken_gate_serves_the_portrait_until_its_holder_exits() {
 }
 
 #[test]
-fn self_avatar_failed_store_still_serves_and_the_next_call_refetches() {
+fn self_avatar_failed_store_serves_from_memory_for_fifteen_minutes_then_refetches() {
     let (root, context) = with_identity("206 avatar store failure", json!({"userId": "10001"}));
     let path = root.0.join("data").join(CACHE_FILE);
     std::fs::create_dir(&path).unwrap();
@@ -281,12 +281,15 @@ fn self_avatar_failed_store_still_serves_and_the_next_call_refetches() {
     };
     assert!(current_with(&context, T0, PIXELS, &mut fetch).is_some(), "a failed store does not hide the avatar");
     assert!(path.is_dir(), "the blocked record is left alone");
-    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_some());
-    assert_eq!(calls.get(), 2, "nothing was stored, so the next call fetches");
+    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_some(), "served inside the fifteen minutes");
+    assert_eq!(calls.get(), 1, "a failed store is not retried inside the fifteen minutes");
     std::fs::remove_dir(&path).unwrap();
-    assert!(current_with(&context, T0 + 2, PIXELS, &mut fetch).is_some());
-    assert!(current_with(&context, T0 + 3, PIXELS, &mut fetch).is_some());
-    assert_eq!(calls.get(), 3, "stored again once the record can be written");
+    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS - 1, PIXELS, &mut fetch).is_some());
+    assert_eq!(calls.get(), 1, "still inside the backoff once the record can be written");
+    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS, PIXELS, &mut fetch).is_some());
+    assert_eq!(calls.get(), 2, "after fifteen minutes it fetches and stores again");
+    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS + 1, PIXELS, &mut fetch).is_some());
+    assert_eq!(calls.get(), 2, "the stored record serves the next call");
 }
 
 #[test]
