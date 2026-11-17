@@ -24,6 +24,9 @@ const LEGACY_ERROR: &str = "settings require a selected runtime";
 thread_local! {
     /// Makes the next `apply` on this thread fail after it wrote the value and before the audit row.
     pub(crate) static FAIL_BEFORE_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next `write_back` on this thread that would change `config.json` fail before it writes, as a full
+    /// disk or a crash between the store commit and the write-back would.
+    pub(crate) static FAIL_WRITE_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
@@ -538,6 +541,12 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Creates the store with its schema and no value, as a crash after the schema commit leaves it (test seam).
+#[cfg(test)]
+pub(crate) fn create_store(context: &RuntimeContext) -> Result<(), String> {
+    open_for_write(context).map(drop)
 }
 
 /// Sets one global setting: validated against the registry, then written with one audit row in one transaction.

@@ -14534,6 +14534,10 @@ fn audit_write(
     Ok(())
 }
 
+/// #176 run 1 stub: the console start's settings write-back (run 2 replaces it).
+#[cfg(test)]
+fn finish_settings_write_back(_context: &RuntimeContext) {}
+
 /// 起服务。`port=0` 时用默认 3101。
 /// 当前控制台监听的端口（自重启要用它拉起新进程）。
 static CONSOLE_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
