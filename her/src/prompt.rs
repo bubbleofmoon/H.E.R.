@@ -11,12 +11,8 @@ fn social_state_for_runtime(context: &RuntimeContext) -> Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn config_for_runtime(context: &RuntimeContext) -> Value {
-    let cfg = context
-        .read_text(RuntimeArea::Config, "config.json")
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+pub(crate) fn config_for_runtime(context: &RuntimeContext) -> Value {
+    let cfg = context.load_config_document().unwrap_or_else(|_| serde_json::json!({}));
     crate::model_view::with_blacklist(context, &cfg)
 }
 

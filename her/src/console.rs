@@ -1375,7 +1375,7 @@ fn role_management_dispatch_body(req: &Request) -> Result<Option<String>, (u16, 
 
 /// `role.maxInjectChars`：读到就夹到 1000~20000，读不到回落 6000（与 JS 一致）。
 fn role_inject_max(context: &RuntimeContext) -> usize {
-    let cfg = read_json_for(context, CONFIG_PATH).unwrap_or_default();
+    let cfg = context.load_config_document().unwrap_or_default();
     crate::role::apply_inject_limit(cfg.get("role").and_then(|r| r.get("maxInjectChars")))
 }
 
@@ -12423,7 +12423,7 @@ fn route_with_context(
         // 按群模型覆盖：列出 / 设置 / 清除。
         ("GET", "/api/session-models") => {
             // 重新读文件：设置完立刻 GET 必须看到新值（用启动快照会读到旧值）
-            let fresh = read_json_for(context, CONFIG_PATH).unwrap_or_else(|| json!({}));
+            let fresh = context.load_config_document().unwrap_or_else(|_| json!({}));
             (
                 200,
                 "application/json; charset=utf-8".to_string(),
@@ -26598,4 +26598,5 @@ mod tests {
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
     mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
+    mod config_overlay_tests { include!("config_overlay_tests.rs"); }
 }
