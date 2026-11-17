@@ -1934,6 +1934,50 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// #186: the reserved2 ingress gate reads the allow and deny lists of each event's configuration.
+    #[tokio::test]
+    async fn t186_ingress_reads_allow_and_deny_from_each_events_configuration() {
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-t186-ingress-{}", crate::turn_ledger::mint_id(""))));
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let write_config = |allow: Value, deny: Value| {
+            let config = json!({"consoleToken":"synthetic-scope-token","allow":{"groups":allow},"deny":{"groups":deny},"slang":{"enabled":false}});
+            std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+        };
+        write_config(json!([420042]), json!([]));
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1","onebot_ws":"ws://127.0.0.1:1"}"#).unwrap();
+        let mut state = json!({"conversations":{}});
+        for key in ["group:420042", "group:420044"] {
+            state["conversations"][key] = json!({"agentToken":"test-token","bootstrapSent":true,"unread":[],"recentMessages":[],"wakeConfig":{"confirmedAt":1,"mode":"diving","infinite":true,"triggers":{"atMention":true}}});
+        }
+        std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
+        // Both conversations are served (`--live-groups`); only the configuration decides.
+        let mut hub = Hub::new(&context, journal, vec!["group:420042".into(), "group:420044".into()], false);
+        hub.tick("bot", 9001).await.unwrap();
+        async fn recorded(hub: &mut Hub, message_id: i64) -> bool {
+            let frame = json!({"post_type":"message","message_type":"group","group_id":420044,"user_id":1001,"message_id":message_id,"message":[{"type":"text","data":{"text":"scope probe"}}]});
+            let ev: crate::Event = serde_json::from_value(frame.clone()).unwrap();
+            hub.handle(&ev, &frame.to_string(), false, 9001, "bot", &HashMap::new()).await.unwrap();
+            let id = message_id.to_string();
+            let event = inbound::event_key("group:420044", "message", Some(id.as_str()), &frame.to_string());
+            // Recording the same event again is a duplicate only when the hub recorded it.
+            hub.journal.record_received(event, "group:420044".into(), frame.to_string(), 2).await.unwrap() == inbound::Receipt::Duplicate
+        }
+        assert!(!recorded(&mut hub, 18601).await, "an unlisted conversation must be refused before the journal");
+        write_config(json!([420042, 420044]), json!([]));
+        assert!(recorded(&mut hub, 18602).await, "a conversation added to the allow list mid-run must be admitted and recorded");
+        write_config(json!([420042, 420044]), json!([420044]));
+        assert!(!recorded(&mut hub, 18603).await, "a denied conversation must be refused even when it is listed");
+        write_config(json!([420042]), json!([]));
+        assert!(!recorded(&mut hub, 18604).await, "a conversation removed from the allow list mid-run must be refused");
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     mod ticket24_base { include!("reserved2_ticket24_base_tests.rs"); }
     mod ticket24 { include!("reserved2_ticket24_tests.rs"); }
 

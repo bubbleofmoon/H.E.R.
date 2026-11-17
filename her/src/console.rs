@@ -9579,6 +9579,46 @@ pub(crate) fn key_allowed(cfg: &Value, key: &str) -> bool {
     key_in_allowlist(cfg, key)
 }
 
+/// #186: the inbound gate. `key` is admitted when its id is listed in its allow list and is not in its deny list,
+/// both read from the configuration the caller loaded for this event (`allowAllWhenEmpty` admits nothing here).
+pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
+    key_in_allowlist(cfg, key) // #186 step-1 stub, replaced in step 2
+}
+
+/// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
+/// per-connection work (gap recovery, mute refresh, group cards).
+pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
+    let _ = (cfg, kind); // #186 step-1 stub, replaced in step 2
+    Vec::new()
+}
+
+/// #186: `POST /api/conversations/scope` outside a console request (`her-cli conversation`): the same handler,
+/// gates and revocation; the console audit trail records only console requests. A short-lived caller waits for the
+/// background stop of every retired DSH session before it returns, so the process can exit.
+pub(crate) fn conversation_scope_change(context: &RuntimeContext, conversation: &str, action: &str) -> Result<Value, (u16, String)> {
+    conversation_scope_change_waiting(context, conversation, action, std::time::Duration::from_secs(10))
+}
+
+/// `conversation_scope_change` with its wait for background session stops bounded by `limit`.
+fn conversation_scope_change_waiting(
+    context: &RuntimeContext,
+    conversation: &str,
+    action: &str,
+    limit: std::time::Duration,
+) -> Result<Value, (u16, String)> {
+    let body = json!({"conversation": conversation, "action": action}).to_string();
+    let result = access::conversation_scope(context, &body);
+    // No request takes the write record here (`persist_snowluma_endpoint` does the same).
+    let _ = take_config_writes();
+    let stopped = access::wait_background_stops(limit);
+    result.map(|mut reply| {
+        if !stopped {
+            reply["sessionStops"] = json!("unfinished: check the retired sessions' tasks in DSH");
+        }
+        reply
+    })
+}
+
 /// Shared session-reset mutation. Idle rotation preserves conversation data and refuses a changed
 /// message/wake/epoch under the social gate; explicit reset retains the existing fresh-record behavior.
 fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Option<&str>, guard: Option<&Value>) -> Result<Option<String>, String> {
@@ -26539,5 +26579,6 @@ mod tests {
     mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
+    mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
 }

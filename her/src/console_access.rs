@@ -293,6 +293,19 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
     Ok(json!({"ok": true, "allow": file["allow"], "deny": file["deny"], "ownerQQ": file["ownerQQ"]}))
 }
 
+// ── POST /api/conversations/scope ────────────────────────────────────────────────────────────────
+
+/// #186: admit (`"action":"admit"`) or remove (`"action":"remove"`) one conversation (`"conversation"`: `group:<id>`
+/// or `private:<id>`) in both keys that decide whether it is answered: its allow list (`allow.groups` or
+/// `allow.private`) and `rollout.rustGroups`. One read-modify-write of `config.json` under the gates of
+/// `POST /api/whitelist`, then the same immediate revocation. The running live process keeps the `--live-groups`
+/// list it was started with; `liveRestart` says whether it must restart. The body never names `key`: the console's
+/// key preflight would refuse a conversation that is not admitted yet.
+pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    let _ = (context, body); // #186 step-1 stub, replaced in step 2
+    Err((501, "not implemented".to_string()))
+}
+
 // ── access-change invalidation ───────────────────────────────────────────────────────────────────
 
 fn owner_of(cfg: &Value) -> Value {
@@ -467,12 +480,49 @@ fn cancel_ledger_turns(context: &RuntimeContext, key: &str, why: &str) -> Result
     if failures.is_empty() { Ok(()) } else { Err(failures.join("；")) }
 }
 
+/// #186: background session stops still running in this process; `her-cli conversation` waits for them before exit.
+static BACKGROUND_STOPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// JS `stopRetiredSessionWork`: clear the DSH queue, cancel, archive, in the background.
 fn stop_retired_session_work(context: &RuntimeContext, cfg: &Value, key: &str, session: &str) {
     let (context, cfg, key, session) = (context.clone(), cfg.clone(), key.to_string(), session.to_string());
+    BACKGROUND_STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
         let _ = stop_and_archive_session(&context, &cfg, &key, &session);
+        BACKGROUND_STOPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
+}
+
+/// #186 test seam: counts as one background session stop until dropped.
+#[cfg(test)]
+pub(super) struct BackgroundStopForTest;
+
+#[cfg(test)]
+impl BackgroundStopForTest {
+    pub(super) fn start() -> Self {
+        BACKGROUND_STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackgroundStopForTest {
+    fn drop(&mut self) {
+        BACKGROUND_STOPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// #186: wait at most `limit` for this process's background session stops (each is bounded by
+/// `stop_and_archive_session`'s own eight seconds). True when none is left.
+pub(super) fn wait_background_stops(limit: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while BACKGROUND_STOPS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    true
 }
 
 // ── GET/POST /api/security ───────────────────────────────────────────────────────────────────────

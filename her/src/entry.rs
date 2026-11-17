@@ -337,6 +337,28 @@ fn rollout_mismatch(cfg: &serde_json::Value, live_groups: &[String]) -> Option<V
     }
 }
 
+/// #186: say at live startup where `rollout.rustGroups` (fixed into `--live-groups` at launch) and the allow/deny
+/// lists disagree, one line per kind of gap, on stdout and in the run record. Returns the lines it reported.
+fn report_rollout_scope(context: &runtime::RuntimeContext, cfg: &Value) -> Vec<String> {
+    let _ = (context, cfg); // #186 step-1 stub, replaced in step 2
+    Vec::new()
+}
+
+/// #186: the saved inbound events replayed at a (re)connect, split by the configuration read for that connection:
+/// admitted conversations replay, the other events are settled. Without a readable configuration nothing is decided
+/// and every event stays saved for the next connection.
+fn split_replayable(cfg: Option<&Value>, items: Vec<inbound::Replayable>) -> (Vec<inbound::Replayable>, Vec<String>) {
+    let _ = cfg; // #186 step-1 stub, replaced in step 2
+    (items, Vec::new())
+}
+
+/// #186: the conversations whose disconnect gaps a (re)connect records (`(groups, privates)` ids): those the
+/// configuration read now admits or, when it cannot be read, those of the last readable configuration.
+fn gap_lists(read: Result<Value, &'static str>, last: &(Vec<String>, Vec<String>)) -> (Vec<String>, Vec<String>) {
+    let _ = read; // #186 step-1 stub, replaced in step 2
+    last.clone()
+}
+
 /// Wake configurations written to the state file by a tool or the console (`confirmedAt` changed) reach the
 /// running state machine of the conversation. `synced` remembers the last `session::WakeSync` seen per conversation.
 fn sync_wake_configs(
@@ -3226,6 +3248,52 @@ mod tests {
         // rustGroups 为空 = 还没灰度，谁都不该拦
         let empty = json!({"rollout": {"enabled": true, "rustGroups": []}});
         assert!(rollout_mismatch(&empty, &[]).is_none());
+    }
+
+    #[test]
+    fn t186_startup_reports_each_rollout_scope_gap() {
+        let context = runtime::RuntimeContext::legacy();
+        let split = json!({
+            "allow": {"groups": [420042], "private": ["7001"]},
+            "rollout": {"enabled": true, "rustGroups": ["group:420042", "group:420044"]}
+        });
+        let lines = report_rollout_scope(&context, &split);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("group:420044") && lines[1].contains("private:7001"), "{lines:?}");
+        let agreed = json!({"allow": {"groups": [420042]}, "rollout": {"enabled": true, "rustGroups": ["group:420042"]}});
+        assert!(report_rollout_scope(&context, &agreed).is_empty());
+    }
+
+    #[test]
+    fn t186_replay_after_reconnect_follows_the_configuration_read_now() {
+        let item = |conversation: &str, id: &str| inbound::Replayable {
+            event_key: format!("{conversation}|message:{id}"),
+            conversation: conversation.to_string(),
+            raw: "{}".to_string(),
+        };
+        let items = vec![item("group:420042", "1"), item("group:420043", "2"), item("group:420044", "3"), item("private:7001", "4")];
+        let cfg = json!({"allow": {"groups": [420042, 420043], "private": ["7001"]}, "deny": {"groups": [420043]}});
+        let (replay, settle) = split_replayable(Some(&cfg), items.clone());
+        assert_eq!(
+            replay.iter().map(|r| r.conversation.as_str()).collect::<Vec<_>>(),
+            ["group:420042", "private:7001"],
+            "admitted conversations replay, in order"
+        );
+        assert_eq!(settle, ["group:420043|message:2", "group:420044|message:3"], "denied and unlisted events are settled");
+        let (replay, settle) = split_replayable(None, items);
+        assert!(replay.is_empty() && settle.is_empty(), "an unreadable configuration decides nothing");
+    }
+
+    #[test]
+    fn t186_gap_lists_follow_the_configuration_and_keep_the_last_on_a_read_failure() {
+        let last = (vec!["420042".to_string()], vec!["7001".to_string()]);
+        let cfg = json!({"allow": {"groups": [420042, 420043, 420044], "private": []}, "deny": {"groups": [420044]}});
+        assert_eq!(
+            gap_lists(Ok(cfg), &last),
+            (vec!["420042".to_string(), "420043".to_string()], Vec::new()),
+            "a group added mid-run gets its gaps recorded; a denied one does not"
+        );
+        assert_eq!(gap_lists(Err("runtime config is invalid"), &last), last, "an unreadable configuration keeps the last lists");
     }
 
     fn ev(group: bool, text: &str) -> Event {

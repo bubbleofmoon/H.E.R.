@@ -308,3 +308,38 @@ pub fn assert_running(root: &Path, wait: Option<&str>) -> i32 {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn t186_health_reports_rollout_scope_notices_beside_the_parts() {
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("her-t186-health-{}", crate::turn_ledger::mint_id(""))),
+        );
+        for dir in ["config", "data/logs", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config = json!({
+            "consoleToken": "synthetic-health-scope-token",
+            "consolePort": 1,
+            "allow": {"groups": [420042]},
+            "rollout": {"enabled": false, "rustGroups": ["group:420042", "group:420044"]}
+        });
+        std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+        )
+        .unwrap();
+        let verdict = serde_json::to_value(check(&root, Instant::now() + Duration::from_secs(5))).unwrap();
+        let notices = verdict["scopeNotices"].as_array().cloned().unwrap_or_default();
+        assert_eq!(notices.len(), 1, "one served conversation the allow list refuses: {verdict}");
+        assert!(notices[0].as_str().unwrap().contains("group:420044"), "{verdict}");
+        let parts: Vec<&str> = verdict["parts"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(parts, ["console", "desired", "dsh", "dshLogin", "snowluma", "supervisor"], "a scope gap is never a part");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

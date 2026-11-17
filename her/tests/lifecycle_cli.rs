@@ -391,3 +391,38 @@ fn tasks_list_shows_the_registry_with_next_runs() {
     assert_eq!(run(&["tasks", "runs", "--task", "nope"], &dir).0, 2);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// #186: `her-cli conversation` admits or removes a conversation in its allow list and rollout.rustGroups at once.
+#[test]
+fn t186_conversation_admit_and_remove_through_her_cli() {
+    let dir = root("t186-conversation");
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::fs::create_dir_all(dir.join("resources")).unwrap();
+    std::fs::write(
+        dir.join("config/config.json"),
+        r#"{"consoleToken":"fixture-token","allow":{"groups":[420042],"private":[]},"rollout":{"enabled":true,"rustGroups":["group:420042"]}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("data/social-v2.json"), "{}").unwrap();
+    std::fs::write(dir.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+    std::fs::write(dir.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
+    let cli = env!("CARGO_BIN_EXE_her-cli");
+    let config = || -> Value { serde_json::from_slice(&std::fs::read(dir.join("config/config.json")).unwrap()).unwrap() };
+    let before = std::fs::read(dir.join("config/config.json")).unwrap();
+    assert_eq!(run_image(cli, &["conversation", "admit", "group:420043"], &dir).0, 2, "--confirm is required");
+    assert_eq!(run_image(cli, &["conversation", "admit", "group:abc", "--confirm"], &dir).0, 2, "a malformed conversation");
+    assert_eq!(run_image(cli, &["conversation", "promote", "group:420043", "--confirm"], &dir).0, 2, "an unknown action");
+    assert_eq!(std::fs::read(dir.join("config/config.json")).unwrap(), before, "refused invocations change nothing");
+    let (code, reply, error) = run_image(cli, &["conversation", "admit", "group:420043", "--confirm"], &dir);
+    assert_eq!(code, 0, "{error}");
+    assert_eq!(reply["changed"], serde_json::json!(["allow.groups", "rollout.rustGroups"]), "{reply}");
+    assert_eq!(reply["liveRestart"]["state"], "none", "no live process runs: {reply}");
+    assert_eq!(config()["allow"]["groups"], serde_json::json!([420042, 420043]));
+    assert_eq!(config()["rollout"]["rustGroups"], serde_json::json!(["group:420042", "group:420043"]));
+    let (code, reply, error) = run_image(cli, &["conversation", "remove", "group:420042", "--confirm"], &dir);
+    assert_eq!(code, 0, "{error}");
+    assert_eq!(reply["revoked"], serde_json::json!(["group:420042"]), "{reply}");
+    assert_eq!(config()["allow"]["groups"], serde_json::json!([420043]));
+    assert_eq!(config()["rollout"]["rustGroups"], serde_json::json!(["group:420043"]));
+    let _ = std::fs::remove_dir_all(dir);
+}
