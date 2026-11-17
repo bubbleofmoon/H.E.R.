@@ -391,6 +391,8 @@ impl Rpc {
             "payload": { "args": args },
         });
         if endpoint == "session/prompt" {
+            // #179: no prompt leaves while a guarded DSH profile row is missing (the install root's runtime only).
+            crate::dsh_profile::admit(self.credential.context())?;
             // #183: a capture the operator armed takes this prompt exactly as it is posted.
             crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
         }
@@ -525,6 +527,8 @@ impl Rpc {
         });
         let (host_port, address) = bounded_loopback_endpoint(&self.base)?;
         if endpoint == "session/prompt" {
+            // #179: no prompt leaves while a guarded DSH profile row is missing (the install root's runtime only).
+            crate::dsh_profile::admit(self.credential.context())?;
             // #183: a capture the operator armed takes this prompt exactly as it is posted.
             crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
         }

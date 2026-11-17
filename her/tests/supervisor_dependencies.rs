@@ -2550,6 +2550,9 @@ fn an_installed_release_starts_dependencies_inside_a_throwaway_install_root() {
     for name in ["snowluma", "dsh"] {
         assert_eq!(fixture.states()[name]["state"], "started");
     }
+    // #179: in the install root's runtime the supervisor writes the guarded DSH profile rows before it starts DSH.
+    let profile = std::fs::read_to_string(fixture.root.join("user/dsh/profiles/web/cordis.patch.yml")).unwrap();
+    assert!(profile.contains("# === her profile guard BEGIN ==="), "{profile}");
 }
 
 #[test]

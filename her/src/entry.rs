@@ -9,6 +9,7 @@ mod aux_fetch;
 mod aux_search;
 mod aux_mcp;
 mod dsh_mcp_config;
+mod dsh_profile;
 mod qq_tools;
 mod model_view;
 mod model_failure;
@@ -1071,6 +1072,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("dsh-mcp-config") {
         std::process::exit(dsh_mcp_config::run_cli(&args[2..]));
     }
+    // #179: read-only check of the guarded DSH profile rows of a selected root.
+    if args.get(1).map(String::as_str) == Some("dsh-profile") {
+        std::process::exit(dsh_profile::run_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("report") {
         std::process::exit(report::run_cli(&args[2..]));
     }
@@ -1822,6 +1827,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     }
     if live_mode && runtime_context.is_isolated() {
         dependency_watch::report_last_crash(&runtime_context, &cfg_raw);
+        // #179: write the guarded DSH profile rows back and check the whole profile once at start.
+        dsh_profile::startup(&runtime_context);
     }
     let mut reserved2_hub = if runtime_context.is_isolated() && live_mode {
         let args: Vec<String> = std::env::args().collect();
