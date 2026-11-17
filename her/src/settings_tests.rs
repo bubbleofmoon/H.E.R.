@@ -2600,3 +2600,30 @@ fn audit_undo_keeps_a_stored_value_and_its_write_back() {
     assert_eq!(next_use_quiet(&context), Some(4500));
     assert_eq!(audit_rows(&root).len(), 1, "an audit undo writes nothing to the store");
 }
+
+#[test]
+fn settings_every_writer_closes_the_store_without_sidecars() {
+    // Each writer reads the stored values for its write-back on its own read-write connection, so that connection's
+    // close is the store's last and removes the WAL and its index: no `-wal` or `-shm` is left after any write.
+    let (root, context) = chat_fixture("settings writers leave no sidecar");
+    write_config(&root, |config| config["socialV2"] = json!({"reply": {"wakeQuietMs": 9000}}));
+    let no_sidecars = |writer: &str| {
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "{writer} left settings.db{suffix}");
+        }
+    };
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    no_sidecars("a set that seeds");
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": QUIET_KEY}));
+    assert_eq!(status, 200, "{body}");
+    no_sidecars("a reset");
+    // The history read is a reader; the undo's own close comes after it.
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{body}");
+    no_sidecars("an undo");
+    assert_eq!(chat(&context, "settings-set", json!({"settingKey": CHAT_NAME, "value": 6000})).unwrap()["value"], 6000);
+    no_sidecars("a chat set");
+    assert_eq!(file_quiet(&root), Some(6000), "the write-back still ran");
+}

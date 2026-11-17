@@ -103,7 +103,7 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
     let _gate = authority()?;
     let undone = crate::settings::undo(context, entry, "administrator")?;
     let mut reply = json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored});
-    if let Some(error) = undone.mirror_error.filter(|_| false) {
+    if let Some(error) = undone.mirror_error {
         reply["mirrorError"] = json!(error);
     }
     Ok(reply)

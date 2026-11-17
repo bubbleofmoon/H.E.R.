@@ -596,6 +596,12 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
         Inspection::Missing | Inspection::Fresh => return Ok(Vec::new()),
         Inspection::Ready(conn) => conn,
     };
+    read_stored_values(&conn)
+}
+
+/// The stored values of registry settings on an open connection of the store; rows with a key the registry does not
+/// have, or a value its setting does not accept, are skipped.
+fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)>, String> {
     let mut statement = conn.prepare("SELECT key, value FROM settings").map_err(|_| STORAGE_ERROR.to_string())?;
     let rows = statement
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
@@ -839,7 +845,16 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
     if !context.is_isolated() {
         return Ok(Vec::new());
     }
-    let stored = stored_values(context)?;
+    write_back_values(context, stored_values(context)?)
+}
+
+/// `write_back` of stored values already read: by a writer, on its own read-write connection before it closed, so that
+/// close stays the store's last and removes the WAL and its index (a read-only connection opened after it would leave
+/// `settings.db-wal` and `settings.db-shm` behind).
+fn write_back_values(
+    context: &RuntimeContext,
+    stored: Vec<(&'static Setting, Value)>,
+) -> Result<Vec<&'static str>, String> {
     if stored.is_empty() {
         return Ok(Vec::new());
     }
@@ -860,11 +875,14 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
     Ok(blocked)
 }
 
-/// Runs `write_back` after a write's commit: `None` when `config.json` holds every stored value, else why not. The
-/// stored change stands either way, and the next write or the console's start finishes the write-back. A failure is
-/// reported on stderr.
-fn mirror_after_commit(context: &RuntimeContext) -> Option<String> {
-    let mirror_error = match write_back(context) {
+/// Writes `stored`, read by a writer after its commit, back into `config.json` (`write_back_values`): `None` when
+/// `config.json` holds every stored value, else why not. The stored change stands either way, and the next write or
+/// the console's start finishes the write-back. A failure is reported on stderr.
+fn mirror_after_commit(
+    context: &RuntimeContext,
+    stored: Result<Vec<(&'static Setting, Value)>, String>,
+) -> Option<String> {
+    let mirror_error = match stored.and_then(|stored| write_back_values(context, stored)) {
         Ok(blocked) if blocked.is_empty() => None,
         Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
         Err(error) => Some(error),
@@ -937,16 +955,17 @@ fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(),
 /// `config.json` is read (not a JSON object: 503 before any store is created), the store is opened,
 /// `config.json.pre-settings` is kept (503 when it cannot be) and, in one immediate transaction, the store is seeded
 /// from `config.json` (`seed`) before `write` runs; the transaction commits when `write` returns `Ok` and rolls back,
-/// seed included, otherwise. After the commit, with the store gate released, `write_back` mirrors the store into
-/// `config.json`; the second value says why `config.json` does not hold every stored value (`None` when it does), and
-/// the stored change stands either way.
+/// seed included, otherwise. After the commit the stored values are read on the same connection, so its read-write
+/// close is the store's last and leaves no `-wal` or `-shm`; with the connection closed and the store gate released
+/// they are written back into `config.json` (`write_back_values`). The second value says why `config.json` does not
+/// hold every stored value (`None` when it does); the stored change stands either way.
 fn write_store<T>(
     context: &RuntimeContext,
     existing_only: bool,
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
-    let result = {
+    let (result, stored) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
             return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));
@@ -960,9 +979,12 @@ fn write_store<T>(
         seed(&tx, &document, now_ms()).map_err(unavailable)?;
         let result = write(&tx)?;
         tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-        result
+        // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
+        // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
+        let stored = read_stored_values(&conn);
+        (result, stored)
     };
-    Ok((result, mirror_after_commit(context)))
+    Ok((result, mirror_after_commit(context, stored)))
 }
 
 /// The stored text and revision of a global setting, read in the caller's transaction.
@@ -1118,7 +1140,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
             .map_err(failed)?;
         let (scope, key, source, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
         let setting = find(&key)
-            .filter(|_| scope == "global" && source != "never")
+            .filter(|_| scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
         let later: i64 = conn
             .query_row(
@@ -1141,7 +1163,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
             .transpose()?;
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
-        if restored.is_none() && actor == "never" {
+        if restored.is_none() {
             remove_from_config(context, setting).map_err(|error| (503, error))?;
         }
         Ok(Undone { key: setting.key, stored: restored, mirror_error: None })

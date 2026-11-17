@@ -2944,7 +2944,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                 "note": settings_applies_note(setting.applies),
             });
             // The stored change stands; the write-back's own error names files, so the chat gets one fixed text.
-            if applied.mirror_error.is_some() && path.is_empty() {
+            if applied.mirror_error.is_some() {
                 reply["mirrorError"] = json!(SETTINGS_MIRROR_UNFINISHED);
                 reply["note"] = json!(format!("{}；{SETTINGS_MIRROR_UNFINISHED}", settings_applies_note(setting.applies)));
             }
