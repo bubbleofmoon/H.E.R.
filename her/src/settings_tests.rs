@@ -374,6 +374,31 @@ fn settings_routes_refuse_agents_legacy_contexts_and_oversized_bodies() {
 }
 
 #[test]
+fn settings_store_waits_for_another_writer_while_it_switches_a_new_store_to_wal() {
+    // Another connection (another writer, in any process) holds the new, still rollback-journal store's write lock.
+    // The switch to WAL then gets SQLITE_BUSY at once, without `busy_timeout`; it must wait, not fail.
+    let (root, context) = settings_fixture("settings wal switch");
+    std::fs::write(settings_db(&root), b"").unwrap();
+    let holder = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let applied = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| crate::settings::apply(&context, QUIET_KEY, &json!(4500), "administrator", "console"));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        holder.execute_batch("COMMIT;").unwrap();
+        writer.join().unwrap()
+    });
+    let applied = applied.unwrap();
+    assert_eq!((applied.revision, applied.changed), (1, true));
+    drop(holder);
+    assert_eq!(next_use_quiet(&context), Some(4500));
+    let conn = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap();
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
 fn settings_registry_is_complete_and_agrees_with_its_reader() {
     let registry = crate::settings::REGISTRY;
     assert!(!registry.is_empty(), "the registry has settings");
