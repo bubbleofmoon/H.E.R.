@@ -100,8 +100,33 @@ impl ScopeGaps {
 /// #186: compare `rollout.rustGroups` with the allow/deny lists of `cfg`. No `rollout.rustGroups` array means no
 /// rollout to compare (the watchdog refuses that configuration on its own).
 pub fn rollout_scope_gaps(cfg: &Value) -> ScopeGaps {
-    let _ = cfg; // #186 step-1 stub, replaced in step 2
-    ScopeGaps::default()
+    let Some(entries) = cfg.pointer("/rollout/rustGroups").and_then(Value::as_array) else {
+        return ScopeGaps::default();
+    };
+    let served: Vec<String> = entries
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let mut not_allowed: Vec<String> = Vec::new();
+    for key in &served {
+        if !crate::console::inbound_admitted(cfg, key) && !not_allowed.contains(key) {
+            not_allowed.push(key.clone());
+        }
+    }
+    let mut not_served: Vec<String> = Vec::new();
+    if cfg.pointer("/rollout/enabled").and_then(Value::as_bool) != Some(false) {
+        for kind in ["group", "private"] {
+            for id in crate::console::admitted_ids(cfg, kind) {
+                let key = format!("{kind}:{id}");
+                if !served.contains(&key) && !not_served.contains(&key) {
+                    not_served.push(key);
+                }
+            }
+        }
+    }
+    ScopeGaps { not_allowed, not_served }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

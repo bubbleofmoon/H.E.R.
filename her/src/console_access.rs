@@ -295,6 +295,9 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
 
 // ── POST /api/conversations/scope ────────────────────────────────────────────────────────────────
 
+/// The reply's reason when the running live owner serves another list than `rollout.rustGroups`.
+const LIVE_RESTART_REASON: &str = "the live process serves the --live-groups list it was started with; the supervisor's watchdog restarts it with rollout.rustGroups on its next run (every two minutes), or run the watchdog task now (Schedule page, POST /api/tasks/watchdog/run)";
+
 /// #186: admit (`"action":"admit"`) or remove (`"action":"remove"`) one conversation (`"conversation"`: `group:<id>`
 /// or `private:<id>`) in both keys that decide whether it is answered: its allow list (`allow.groups` or
 /// `allow.private`) and `rollout.rustGroups`. One read-modify-write of `config.json` under the gates of
@@ -302,8 +305,128 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
 /// list it was started with; `liveRestart` says whether it must restart. The body never names `key`: the console's
 /// key preflight would refuse a conversation that is not admitted yet.
 pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    let _ = (context, body); // #186 step-1 stub, replaced in step 2
-    Err((501, "not implemented".to_string()))
+    let body = parse_object_body(body)?;
+    let key = canonical_v2_key(&js_string_or(body.get("conversation"), ""))
+        .ok_or((400, "conversation must be group:<id> or private:<id>".to_string()))?;
+    let admit = match body.get("action").and_then(Value::as_str) {
+        Some("admit") => true,
+        Some("remove") => false,
+        _ => return Err((400, "action must be admit or remove".to_string())),
+    };
+    let (kind, id) = key.split_once(':').expect("canonical keys carry a colon");
+    let (field, alias) = if kind == "group" { ("groups", "group") } else { ("private", "privates") };
+    // Listed ids and served keys are compared in canonical form, whatever spelling the file uses.
+    let listed_same = |value: &Value| {
+        social_policy_normalized_id(value)
+            .and_then(|listed| canonical_v2_key(&format!("{kind}:{listed}")))
+            .is_some_and(|listed| listed == key)
+    };
+    let served_same = |value: &Value| value.as_str().and_then(canonical_v2_key).is_some_and(|served| served == key);
+    let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
+    let (before, after, changed) = {
+        let _gate = acquire_social_state_gate(context)?;
+        let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
+        let mut file = read_config_object(context)?;
+        let Some(mut served) = file.pointer("/rollout/rustGroups").and_then(Value::as_array).cloned() else {
+            return Err((409, "rollout.rustGroups is not configured: the supervisor serves only that explicit list".to_string()));
+        };
+        if admit
+            && social_policy_list(&file, "deny", kind)
+                .unwrap_or_default()
+                .iter()
+                .any(|denied| canonical_v2_key(&format!("{kind}:{denied}")).as_deref() == Some(key.as_str()))
+        {
+            return Err((409, format!("{key} is in deny.{field}; remove it from the deny list first")));
+        }
+        // JS precedence: `groups ?? group`, `private ?? privates`.
+        let preferred = file["allow"][field].clone();
+        let chosen = if preferred.is_null() { file["allow"][alias].clone() } else { preferred };
+        let mut listed = chosen.as_array().cloned().unwrap_or_default();
+        let mut changed: Vec<String> = Vec::new();
+        if admit != listed.iter().any(|value| listed_same(value)) {
+            listed.retain(|value| !listed_same(value));
+            if admit {
+                listed.push(json!(id.parse::<i64>().expect("canonical ids are safe integers")));
+            }
+            if !file["allow"].is_object() {
+                file["allow"] = json!({});
+            }
+            let allow = file["allow"].as_object_mut().expect("allow is an object");
+            allow.remove(alias);
+            allow.insert(field.to_string(), Value::Array(listed));
+            changed.push(format!("allow.{field}"));
+        }
+        if admit != served.iter().any(|value| served_same(value)) {
+            served.retain(|value| !served_same(value));
+            if admit {
+                served.push(json!(key));
+            }
+            file["rollout"]["rustGroups"] = Value::Array(served);
+            changed.push("rollout.rustGroups".to_string());
+        }
+        if !changed.is_empty() {
+            write_config_object(context, &file)?;
+        }
+        // A written configuration the runtime cannot load revokes everything the old one allowed.
+        let effective_after = context.load_config().unwrap_or_else(|_| json!({}));
+        (effective_before, effective_after, changed)
+    };
+    let (retired, failures) = if changed.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        reconcile_access_change(context, &interaction, &before, &after, "access-revoked")
+    };
+    drop(interaction);
+    if !failures.is_empty() {
+        return Err((500, format!("conversation scope saved, but the immediate revocation did not finish: {}", failures.join("; "))));
+    }
+    let target: Vec<String> = after
+        .pointer("/rollout/rustGroups")
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let restart = live_restart(context, &target);
+    let gaps = crate::watchdog::rollout_scope_gaps(&after);
+    Ok(json!({
+        "ok": true,
+        "conversation": key,
+        "action": if admit { "admit" } else { "remove" },
+        "changed": changed,
+        "revoked": retired,
+        "liveRestart": restart,
+        "scope": {"notAllowed": gaps.not_allowed, "notServed": gaps.not_served},
+    }))
+}
+
+/// #186: whether the running live owner must restart to serve `target` (`rollout.rustGroups`). It serves the
+/// `--live-groups` list its owner marker records, fixed at launch: the per-conversation source gates it holds
+/// (`lifecycle::acquire_message_source`) were taken for that list, so it cannot widen it in place.
+fn live_restart(context: &RuntimeContext, target: &[String]) -> Value {
+    let gate = match context.resolve_path(RuntimeArea::Data, &format!("logs/{}", crate::lifecycle::LIVE_LOCK), PathIntent::WriteFile) {
+        Ok(path) => crate::lifecycle::OwnerGate::new(path),
+        Err(_) => return json!({"state": "unknown", "reason": "the live owner gate is unavailable"}),
+    };
+    match gate.probe() {
+        crate::lifecycle::OwnerProbe::Free { .. } => {
+            json!({"state": "none", "reason": "no live process runs; the next start serves rollout.rustGroups"})
+        }
+        crate::lifecycle::OwnerProbe::Held { marker: Some(marker) } if marker.role == "live" => {
+            let serving = marker.groups.clone().unwrap_or_default();
+            // Compared as sets of canonical keys, whatever spelling either list uses.
+            let canonical = |list: &[String]| {
+                let mut keys: Vec<String> = list.iter().filter_map(|entry| canonical_v2_key(entry)).collect();
+                keys.sort();
+                keys.dedup();
+                keys
+            };
+            if canonical(serving.as_slice()) == canonical(target) {
+                json!({"state": "none", "serving": serving, "reason": "the live process already serves rollout.rustGroups"})
+            } else {
+                json!({"state": "required", "serving": serving, "reason": LIVE_RESTART_REASON})
+            }
+        }
+        _ => json!({"state": "unknown", "reason": "the live owner cannot be identified"}),
+    }
 }
 
 // ── access-change invalidation ───────────────────────────────────────────────────────────────────

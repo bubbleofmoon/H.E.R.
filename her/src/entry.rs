@@ -123,8 +123,6 @@ struct Config {
     snowluma: Option<SnowLuma>,
     #[serde(default)]
     ownerqq: Option<String>,
-    #[serde(default)]
-    allow: Option<Allow>,
     #[serde(rename = "socialV2", default)]
     social_v2: Option<SocialV2>,
 }
@@ -139,13 +137,6 @@ struct SnowLuma {
     http_url: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Default)]
-struct Allow {
-    #[serde(default)]
-    groups: Vec<Value>,
-    #[serde(default)]
-    private: Vec<Value>,
-}
 #[derive(Deserialize, Debug, Default, Clone)]
 struct SocialV2 {
     #[serde(default)]
@@ -340,23 +331,50 @@ fn rollout_mismatch(cfg: &serde_json::Value, live_groups: &[String]) -> Option<V
 /// #186: say at live startup where `rollout.rustGroups` (fixed into `--live-groups` at launch) and the allow/deny
 /// lists disagree, one line per kind of gap, on stdout and in the run record. Returns the lines it reported.
 fn report_rollout_scope(context: &runtime::RuntimeContext, cfg: &Value) -> Vec<String> {
-    let _ = (context, cfg); // #186 step-1 stub, replaced in step 2
-    Vec::new()
+    let lines = watchdog::rollout_scope_gaps(cfg).lines();
+    for line in &lines {
+        println!("[her] ⚠️ {line}");
+        recovery_log::record(
+            context,
+            run_record::Trigger::Startup,
+            run_record::Component::Process,
+            "rollout-scope",
+            run_record::Outcome::Failed,
+            line,
+        );
+    }
+    lines
 }
 
 /// #186: the saved inbound events replayed at a (re)connect, split by the configuration read for that connection:
 /// admitted conversations replay, the other events are settled. Without a readable configuration nothing is decided
 /// and every event stays saved for the next connection.
 fn split_replayable(cfg: Option<&Value>, items: Vec<inbound::Replayable>) -> (Vec<inbound::Replayable>, Vec<String>) {
-    let _ = cfg; // #186 step-1 stub, replaced in step 2
-    (items, Vec::new())
+    let Some(cfg) = cfg else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut replay = Vec::new();
+    let mut settle = Vec::new();
+    for item in items {
+        if console::inbound_admitted(cfg, &item.conversation) {
+            replay.push(item);
+        } else {
+            settle.push(item.event_key);
+        }
+    }
+    (replay, settle)
 }
 
 /// #186: the conversations whose disconnect gaps a (re)connect records (`(groups, privates)` ids): those the
 /// configuration read now admits or, when it cannot be read, those of the last readable configuration.
 fn gap_lists(read: Result<Value, &'static str>, last: &(Vec<String>, Vec<String>)) -> (Vec<String>, Vec<String>) {
-    let _ = read; // #186 step-1 stub, replaced in step 2
-    last.clone()
+    match read {
+        Ok(cfg) => (console::admitted_ids(&cfg, "group"), console::admitted_ids(&cfg, "private")),
+        Err(error) => {
+            println!("[her] ❌ 读取配置失败，本次连接按上次读到的允许列表记录断线缺口：{error}");
+            last.clone()
+        }
+    }
 }
 
 /// Wake configurations written to the state file by a tool or the console (`confirmedAt` changed) reach the
@@ -1076,6 +1094,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("tasks") {
         std::process::exit(lifecycle_cli::run_tasks(&args[2..]));
     }
+    // #186: admit or remove one conversation in its allow list and rollout.rustGroups at once.
+    if args.get(1).map(String::as_str) == Some("conversation") {
+        std::process::exit(lifecycle_cli::run_conversation(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("supervise") {
         std::process::exit(supervisor::run_cli(&args[2..]));
     }
@@ -1769,12 +1791,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         })
     };
     let owner_qq = cfg.ownerqq.clone().unwrap_or_default();
-    let allow_groups: Vec<String> = cfg.allow.as_ref().map(|a| a.groups.iter().map(|v| v.to_string().trim_matches('"').to_string()).collect()).unwrap_or_default();
-    let allow_private: Vec<String> = cfg.allow.as_ref().map(|a| a.private.iter().map(|v| v.to_string().trim_matches('"').to_string()).collect()).unwrap_or_default();
 
     println!("[her] mode: --live 已指定（是否真发消息还要看 --live-groups）");
     println!("[her] connect {ws} (token {})", if token.is_some() { "ok" } else { "missing" });
-    println!("[her] allow groups {allow_groups:?} private {allow_private:?}");
+    // #186: the allow lists are read at each use below; startup reports only where they and rollout.rustGroups disagree.
+    report_rollout_scope(&runtime_context, &cfg_raw);
 
     // ── 重连外层循环 ──
     //
@@ -1824,6 +1845,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let mut heal_http_token: Option<String> = None;
     let mut ws = ws;
     let mut token = token;
+    // #186: the gap lists of the last readable configuration, for a reconnect that cannot read it.
+    let mut gap_admitted = (console::admitted_ids(&cfg_raw, "group"), console::admitted_ids(&cfg_raw, "private"));
     'reconnect: loop {
         // Isolated startup validates all selected-root state before contacting its WebSocket.
         // Keep this inside the reconnect loop: a failed handshake drops this candidate pipeline,
@@ -1963,7 +1986,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // 缺口先同步记下（快，只写库），再把含阻塞 HTTP 的补收丢到后台线程：
     // 慢网关不能让 WebSocket 在重连后停止读帧。
     {
-        let (groups, privates) = (allow_groups.clone(), allow_private.clone());
+        // #186: the conversations the allow lists admit at this connection.
+        gap_admitted = gap_lists(runtime_context.load_config(), &gap_admitted);
+        let (groups, privates) = gap_admitted.clone();
         let opened = journal
             .run(move |j| inbound::open_reconnect_gaps(j, &groups, &privates, now_ms() as i64))
             .await;
@@ -2003,17 +2028,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let mut last_mute_recheck = std::time::Instant::now();
     let mut last_prune = std::time::Instant::now();
     let mut replay_queue: std::collections::VecDeque<inbound::Replayable> = std::collections::VecDeque::new();
-    for item in journal.replayable().await? {
-        let allowed = if item.conversation.starts_with("group:") {
-            allow_groups.iter().any(|g| item.conversation == format!("group:{g}"))
-        } else {
-            allow_private.iter().any(|p| item.conversation == format!("private:{p}"))
-        };
-        if allowed {
-            replay_queue.push_back(item);
-        } else {
-            journal.mark_handled(vec![item.event_key.clone()], now_ms() as i64).await?;
-        }
+    // #186: replay what the configuration read for this connection admits; an unreadable one decides nothing.
+    let replay_cfg = runtime_context.load_config();
+    if let Err(error) = &replay_cfg {
+        println!("[her] ❌ 读取配置失败，已保存的入站事件留待下次连接重放：{error}");
+    }
+    let (replay, settle) = split_replayable(replay_cfg.as_ref().ok(), journal.replayable().await?);
+    replay_queue.extend(replay);
+    if !settle.is_empty() {
+        journal.mark_handled(settle, now_ms() as i64).await?;
     }
     if !replay_queue.is_empty() {
         println!("[her] 重放已保存但未处理完的入站事件 {} 条", replay_queue.len());
@@ -2316,7 +2339,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 // #46: QQ's whole-group mute notice has user_id 0, which `Event` refuses.
                 if !replayed && self_id > 0 {
                     if let Some((gid, operator)) = group_mute::whole_group_notice(&text) {
-                        if allow_groups.iter().any(|g| g == &gid.to_string()) {
+                        if runtime_context.load_config().is_ok_and(|now_cfg| console::inbound_admitted(&now_cfg, &format!("group:{gid}"))) {
                             // Older refreshes predate this notice: drop them before the new one starts.
                             let (context, key) = (runtime_context.clone(), format!("group:{gid}"));
                             if let Err(error) = tokio::task::spawn_blocking(move || group_mute::note_whole_group_notice(&context, &key)).await {
@@ -2342,7 +2365,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
             if me > 0 {
                 mute_refresh_armed = true;
-                let groups: Vec<(i64, Option<i64>)> = allow_groups.iter().filter_map(|g| g.parse().ok()).map(|g| (g, None)).collect();
+                // #186: the groups admitted at this connection.
+                let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
+                let groups: Vec<(i64, Option<i64>)> = admitted.iter().filter_map(|g| g.parse().ok()).map(|g| (g, None)).collect();
                 group_mute::spawn_refresh(runtime_context.clone(), http_base.clone(), http_token.clone(), me, groups);
             }
         }
@@ -2382,7 +2407,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // 用 HTTP（JS 版也是走 HTTP 的 onebotCall；WS 不保证支持这个 action）。
         {
             if !http_token.is_empty() && self_id != 0 {
-                for g in &allow_groups {
+                // #186: the groups admitted when the login answer arrives.
+                let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
+                for g in &admitted {
                     if let Ok(gid) = g.parse::<i64>() {
                         match fetch_group_card(&http_host, http_port, &http_token, gid, self_id) {
                             Some(card) => {
@@ -2440,7 +2467,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         if is_notice && ev.notice_type.as_ref().and_then(Value::as_str) == Some("group_ban") {
             let me = if self_id > 0 { self_id } else { ev.self_id.unwrap_or(0) };
             if let (false, Some(gid)) = (replayed, ev.group_id) {
-                if me > 0 && ev.user_id == Some(me) && allow_groups.iter().any(|g| g == &gid.to_string()) {
+                if me > 0 && ev.user_id == Some(me) && runtime_context.load_config().is_ok_and(|now_cfg| console::inbound_admitted(&now_cfg, &format!("group:{gid}"))) {
                     let operator = ev.operator_id.as_ref().and_then(protocol_integer).filter(|id| *id > 0);
                     let (context, sub_type, duration, key) = (runtime_context.clone(), ev.sub_type.clone(), ev.duration.clone(), format!("group:{gid}"));
                     // Settled before the next frame: a message right after the ban never wakes her.
@@ -2612,10 +2639,13 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         };
 
-        let allowed = if key.starts_with("group:") {
-            allow_groups.iter().any(|g| key == format!("group:{g}"))
-        } else {
-            allow_private.iter().any(|p| key == format!("private:{p}"))
+        // #186: the allow and deny lists of this event's configuration, never a startup snapshot.
+        let allowed = match runtime_context.load_config() {
+            Ok(gate_cfg) => console::inbound_admitted(&gate_cfg, &key),
+            Err(error) => {
+                println!("[her] ❌ 读取配置失败，{key} 的事件未处理：{error}");
+                false
+            }
         };
         if !allowed {
             continue;

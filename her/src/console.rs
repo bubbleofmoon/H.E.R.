@@ -9582,14 +9582,32 @@ pub(crate) fn key_allowed(cfg: &Value, key: &str) -> bool {
 /// #186: the inbound gate. `key` is admitted when its id is listed in its allow list and is not in its deny list,
 /// both read from the configuration the caller loaded for this event (`allowAllWhenEmpty` admits nothing here).
 pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
-    key_in_allowlist(cfg, key) // #186 step-1 stub, replaced in step 2
+    key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
 }
 
 /// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
 /// per-connection work (gap recovery, mute refresh, group cards).
 pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
-    let _ = (cfg, kind); // #186 step-1 stub, replaced in step 2
-    Vec::new()
+    social_policy_list(cfg, "allow", kind)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| inbound_admitted(cfg, &format!("{kind}:{id}")))
+        .collect()
+}
+
+/// #186: `POST /api/conversations/scope`, with its console log line (the handler itself prints nothing, so
+/// `her-cli conversation` keeps its stdout for the reply).
+fn conversation_scope_route(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    let reply = access::conversation_scope(context, body)?;
+    let changed: Vec<&str> = reply["changed"].as_array().map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    crate::safe_println!(
+        "[console] conversation scope: {} {} ({}); live restart {}",
+        reply["action"].as_str().unwrap_or(""),
+        reply["conversation"].as_str().unwrap_or(""),
+        if changed.is_empty() { "no change".to_string() } else { changed.join(", ") },
+        reply["liveRestart"]["state"].as_str().unwrap_or("unknown")
+    );
+    Ok(reply)
 }
 
 /// #186: `POST /api/conversations/scope` outside a console request (`her-cli conversation`): the same handler,
@@ -13295,6 +13313,7 @@ fn route_with_context(
         ("POST", "/api/security") if context.is_isolated() => json_result(access::security_post(context, &req.body)),
         ("POST", "/api/authorize/read") if context.is_isolated() => json_result(access::authorize_read(context, cfg, &req.body)),
         ("POST", "/api/whitelist") if context.is_isolated() => json_result(access::whitelist_post(context, &req.body)),
+        ("POST", "/api/conversations/scope") if context.is_isolated() => json_result(conversation_scope_route(context, &req.body)),
         ("GET", "/api/whitelist") if context.is_isolated() => json_result(Ok(access::whitelist_get(context, cfg))),
         ("POST", "/api/socialV2/reset") if context.is_isolated() => json_result(access::social_v2_reset(context)),
         ("POST", "/api/socialV2/wake") if context.is_isolated() => json_result(access::social_v2_wake(context, cfg, &req.body)),

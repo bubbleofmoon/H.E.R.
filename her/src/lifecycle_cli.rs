@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "usage: her lifecycle status --runtime-root <root>\n       her-cli lifecycle assert-running --runtime-root <root> [--wait <duration>]\n       her-cli stop --runtime-root <root> --confirm [--with-dependencies]\n       her lifecycle set <running|stopped|maintenance> --runtime-root <root> [--confirm] [--by <who>] [--reason <text>] [--minutes <n>]\n       her lifecycle stop-supervisor --runtime-root <root> --confirm\n       her lifecycle reset-sessions --runtime-root <root> --confirm\n       her tasks list --runtime-root <root>\n       her tasks runs --runtime-root <root> [--task <id>] [--limit <n>]";
+const CONVERSATION_USAGE: &str = "usage: her-cli conversation <admit|remove> <group:<id>|private:<id>> --runtime-root <root> --confirm";
 
 struct Args {
     positional: Vec<String>,
@@ -472,6 +473,65 @@ pub fn run_tasks(args: &[String]) -> i32 {
         _ => {
             eprintln!("{USAGE}");
             2
+        }
+    }
+}
+
+/// #186: `her-cli conversation <admit|remove> <group:<id>|private:<id>> --runtime-root <root> --confirm` admits or
+/// removes one conversation in its allow list and `rollout.rustGroups` at once, through the console's
+/// `POST /api/conversations/scope` handler (same gates, write and revocation). Its last stdout line is the JSON reply
+/// (a failed background DSH session stop may print a diagnostic line before it).
+/// Exit 0 done, 2 usage or a malformed request (400), 3 refused or failed.
+pub fn run_conversation(args: &[String]) -> i32 {
+    let parsed = match parse(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("[conversation] {error}\n{CONVERSATION_USAGE}");
+            return 2;
+        }
+    };
+    let (action, conversation) = match parsed.positional.as_slice() {
+        [action, conversation] if matches!(action.as_str(), "admit" | "remove") => (action.clone(), conversation.clone()),
+        _ => {
+            eprintln!("{CONVERSATION_USAGE}");
+            return 2;
+        }
+    };
+    if !parsed.confirm
+        || parsed.with_dependencies
+        || parsed.by.is_some()
+        || parsed.reason.is_some()
+        || parsed.minutes.is_some()
+        || parsed.wait.is_some()
+        || parsed.task.is_some()
+        || parsed.limit.is_some()
+        || parsed.expected_revision.is_some()
+    {
+        eprintln!("[conversation] --confirm is required and no other option applies\n{CONVERSATION_USAGE}");
+        return 2;
+    }
+    let root = match root_path(parsed.root.as_deref()) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("[conversation] {error}");
+            return 2;
+        }
+    };
+    let context = match crate::runtime::RuntimeContext::from_root(root) {
+        Ok(context) => context,
+        Err(error) => {
+            eprintln!("[conversation] {error}");
+            return 2;
+        }
+    };
+    match crate::console::conversation_scope_change(&context, &conversation, &action) {
+        Ok(reply) => {
+            println!("{reply}");
+            0
+        }
+        Err((status, message)) => {
+            eprintln!("[conversation] refused ({status}): {message}");
+            if status == 400 { 2 } else { 3 }
         }
     }
 }

@@ -34,6 +34,10 @@ pub struct Verdict {
     parts: BTreeMap<&'static str, Part>,
     #[serde(rename = "dependencyNotices", skip_serializing_if = "Vec::is_empty")]
     dependency_notices: Vec<serde_json::Value>,
+    /// #186: where `rollout.rustGroups` and the allow/deny lists disagree. Reported beside the parts, never a failed
+    /// part: a configuration choice does not make a release unhealthy.
+    #[serde(rename = "scopeNotices", skip_serializing_if = "Vec::is_empty")]
+    scope_notices: Vec<String>,
 }
 
 fn owner(data: &Path, role: &str, lock: &str) -> Part {
@@ -85,6 +89,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 ok: false,
                 parts,
                 dependency_notices: Vec::new(),
+                scope_notices: Vec::new(),
             };
         }
     };
@@ -120,6 +125,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 ok: false,
                 parts,
                 dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
+                scope_notices: Vec::new(),
             };
         }
     };
@@ -180,6 +186,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         ok: parts.values().all(|part| part.verdict == "pass"),
         parts,
         dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
+        scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
     }
 }
 
