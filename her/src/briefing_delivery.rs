@@ -305,4 +305,37 @@ mod tests {
         begin(&mut other_format, "dsh-1", "epoch-1");
         assert_eq!(other_format, fresh("dsh-1", "epoch-1"), "a record of another format is started again");
     }
+
+    #[test]
+    fn a_stale_generation_alone_refuses_to_hold_a_wake_prepared_for_it() {
+        let mut record = fresh("sid", "epoch");
+        next_generation(&mut record);
+        let stale = plan(&record);
+        next_generation(&mut record);
+        assert!(record["needsBriefing"] == true && stale.needs_briefing, "both refresh flags stay set across the two generations");
+        assert!(!hold(&mut record, &stale, "rpc-1", "revision", &sections(&[]), &[]), "the generation moved since the plan, and nothing else did");
+        assert!(record["pending"].is_null());
+    }
+
+    #[test]
+    fn a_new_epoch_alone_starts_a_fresh_record_with_nothing_installed() {
+        let mut record = fresh("dsh-1", "epoch-1");
+        prepare(&mut record, "rpc-1", &[("identity", "h1")], &[7]);
+        assert!(delivered(&mut record, "rpc-1", 1));
+        begin(&mut record, "dsh-1", "epoch-2");
+        assert_eq!(record, fresh("dsh-1", "epoch-2"));
+        assert!(record["installed"].is_null(), "{record}");
+        let next = plan(&record);
+        assert_eq!((next.generation, next.full, next.held), (0, true, vec![]), "the same session under a new epoch holds no recall");
+    }
+
+    #[test]
+    fn a_compaction_sets_needs_briefing_explicitly() {
+        let mut record = fresh("sid", "epoch");
+        prepare(&mut record, "rpc-1", &[("identity", "h1")], &[7]);
+        assert!(delivered(&mut record, "rpc-1", 1));
+        assert_eq!(record["needsBriefing"], false, "a delivery clears the flag");
+        next_generation(&mut record);
+        assert_eq!(record["needsBriefing"], true, "a compaction asks for a full briefing again, as a persona switch does");
+    }
 }
