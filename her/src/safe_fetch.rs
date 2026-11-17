@@ -273,6 +273,18 @@ fn curl_command(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time:
     Ok(command)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests' record, on this thread, of the body and header file paths each curl transfer was given.
+    pub(crate) static CURL_PATHS_TEST_HOOK: std::cell::RefCell<Vec<std::path::PathBuf>> = std::cell::RefCell::new(Vec::new());
+}
+
+/// Red stub (gate round 3): ignores the transfer folder and uses the system temporary folder.
+#[cfg(test)]
+fn curl_once_in(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration, _transfer_dir: &std::path::Path) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    curl_once(p, pin, max_bytes, budget)
+}
+
 /// 调一次 curl：把连接钉死在 `pin` 上，返回 (状态码, Location 头, 正文)。
 fn curl_once(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String> {
     // 临时名必须带**唯一后缀**：控制台是每连接一线程，并发抓两张图时如果只用 pid，
@@ -284,6 +296,8 @@ fn curl_once(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Du
     let sequence = FETCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let out_path = std::env::temp_dir().join(format!("her-fetch-{}-{uniq}-{sequence}.bin", std::process::id()));
     let hdr_path = std::env::temp_dir().join(format!("her-fetch-{}-{uniq}-{sequence}.hdr", std::process::id()));
+    #[cfg(test)]
+    CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow_mut().extend([out_path.clone(), hdr_path.clone()]));
     let status = curl_command(p, pin, max_bytes, budget, &out_path, &hdr_path)?
         .output()
         .map_err(|e| format!("调用 curl 失败：{e}"))?;
@@ -655,6 +669,32 @@ mod tests {
         assert_eq!(direct.bytes, png);
         assert!(fetch_with_hops(&format!("http://fake.test:{port}/go"), 1 << 20, 0, budget, resolve, curl_once).is_err(), "the redirect is not followed");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2, "the redirect target was never requested");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_avatar_exact_fetch_writes_its_files_only_in_the_transfer_folder() {
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let (port, _hits) = fake_media_server(vec![("/g?b=qq&nk=10001&s=640", 200, vec![], png.clone())]);
+        let resolve = |_: &str, _| Ok(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        let budget = std::time::Duration::from_secs(8);
+        let folder = std::env::temp_dir().join(format!("her-transfer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow_mut().clear());
+        let fetched = fetch_with_hops(
+            &format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640"),
+            1 << 20,
+            0,
+            budget,
+            resolve,
+            |p, pin, max, given| curl_once_in(p, pin, max, given, &folder),
+        )
+        .expect("the avatar");
+        assert_eq!(fetched.bytes, png);
+        let paths = CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow().clone());
+        assert_eq!(paths.len(), 2, "one body file and one header file");
+        assert!(paths.iter().all(|path| path.starts_with(&folder)), "the transfer files stay in the transfer folder: {paths:?}");
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     #[test]

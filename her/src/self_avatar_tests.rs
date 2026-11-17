@@ -592,3 +592,61 @@ fn self_avatar_unparsable_reservation_file_means_no_fetch() {
     assert!(current_with(&context, T0, PIXELS, &mut refused).is_none(), "an unparsable reservation serves the portrait");
     assert!(!root.0.join("data").join(CACHE_FILE).exists());
 }
+
+#[test]
+fn self_avatar_identity_change_during_the_store_serves_the_portrait() {
+    let (root, context) = with_identity("206 avatar store identity", json!({"userId": "10001"}));
+    let identity_path = root.0.join("data").join("identity.json");
+    crate::self_avatar::STORE_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::write(&identity_path, json!({"userId": "10002"}).to_string()).unwrap();
+        }));
+    });
+    let mut fetch = |_: &str| -> Fetched { Ok(png(2, 2)) };
+    assert!(current_with(&context, T0, PIXELS, &mut fetch).is_none(), "the account changed while the record was stored");
+    // The record that was stored carries the uin it was fetched for, so the new account does not use it.
+    assert_eq!(record(&root)["uin"], json!("10001"));
+    crate::self_avatar::STORE_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+}
+
+#[test]
+fn self_avatar_future_reservation_counts_as_in_force_and_is_restamped() {
+    let (root, context) = with_identity("206 avatar future reservation", json!({"userId": "10001"}));
+    let attempt = root.0.join("data").join(crate::self_avatar::ATTEMPT_FILE);
+    // The clock moved back: her reservation and another account's are dated one minute ahead of now.
+    let ahead = T0 + 60_000;
+    std::fs::write(&attempt, json!({"version": 1, "attempts": [{"uin": "10001", "attemptAt": ahead}, {"uin": "10002", "attemptAt": ahead}]}).to_string()).unwrap();
+    let mut refused = |_: &str| -> Fetched { panic!("a reservation ahead of the clock allows no fetch") };
+    assert!(current_with(&context, T0, PIXELS, &mut refused).is_none(), "a reservation one minute ahead is in force");
+    let stored: Value = serde_json::from_slice(&std::fs::read(&attempt).unwrap()).unwrap();
+    assert_eq!(
+        stored,
+        json!({"version": 1, "attempts": [{"uin": "10002", "attemptAt": ahead}, {"uin": "10001", "attemptAt": T0}]}),
+        "her entry is restamped now, the other account's entry is kept"
+    );
+}
+
+#[test]
+fn self_avatar_future_failure_record_counts_as_in_force_and_is_restamped() {
+    let (root, context) = with_identity("206 avatar future failure", json!({"userId": "10001"}));
+    std::fs::write(root.0.join("data").join(CACHE_FILE), json!({"version": 1, "uin": "10001", "failedAt": T0 + 60_000}).to_string()).unwrap();
+    let mut refused = |_: &str| -> Fetched { panic!("a failure ahead of the clock allows no fetch") };
+    assert!(current_with(&context, T0, PIXELS, &mut refused).is_none(), "a failure one minute ahead is in force");
+    assert_eq!(record(&root), json!({"version": 1, "uin": "10001", "failedAt": T0}));
+}
+
+#[test]
+fn self_avatar_fetch_prepares_its_transfer_folder_and_clears_leftovers() {
+    let _guard = HookGuard;
+    let (root, context) = with_identity("206 avatar transfer folder", json!({"userId": "10001"}));
+    let folder = root.0.join("data").join("self-avatar-transfer");
+    crate::self_avatar::FETCH_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(|_: &str| -> Fetched { Ok(png(2, 2)) })));
+    assert!(crate::self_avatar::current(&context, &|| T0, PIXELS).is_some());
+    assert!(folder.is_dir(), "the transfer folder is created inside the data folder");
+    // A transfer that did not finish leaves its files behind; the next fetch clears them first.
+    let leftover = folder.join("her-fetch-1-2-3.bin");
+    std::fs::write(&leftover, b"old body").unwrap();
+    std::fs::remove_file(root.0.join("data").join(CACHE_FILE)).unwrap();
+    assert!(crate::self_avatar::current(&context, &|| T0 + FAILURE_BACKOFF_MS, PIXELS).is_some());
+    assert!(!leftover.exists(), "leftovers of an earlier transfer are removed before the fetch");
+}
