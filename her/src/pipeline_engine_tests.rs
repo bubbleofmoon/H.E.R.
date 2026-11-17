@@ -271,3 +271,21 @@ async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
         "an unbound pipeline refuses its ask locally"
     );
 }
+
+/// #197: `pipeline.rs` keeps the turn code every engine shares; the DSH adapter's own code (DSH
+/// sessions and RPCs, model selection, the follow-stream collector, DSH cancellation and usage
+/// rows) lives in `pipeline/dsh_adapter.rs`, reached only through its registration points.
+#[test]
+fn dsh197_pipeline_rs_names_no_dsh_turn_code() {
+    let source = include_str!("pipeline.rs");
+    let production = &source[..source.find("\nmod tests {").expect("pipeline.rs has its test module")];
+    for token in [
+        "FollowStream", "TurnUsage", "\"session/prompt\"", "\"session/create\"", "\"session/selectModel\"",
+        "\"session/cancel\"", "\"session/rename\"", "\"workspace/create\"", "\"workspace/rename\"",
+        "\"agentPresets/list\"", "\"settings/describe\"", "stop_session_work", "archive_session",
+        "probe_prompt", "dsh_profile::", "dsh_health::", ".relogin(", "rpc.call", "fn ensure_session",
+        "fn apply_model", "fn cancel_with_reason",
+    ] {
+        assert!(!production.contains(token), "pipeline.rs still names DSH turn code: {token}");
+    }
+}
