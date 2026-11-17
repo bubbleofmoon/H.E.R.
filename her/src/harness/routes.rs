@@ -47,7 +47,7 @@ impl RouteSpec {
     /// before routes existed (`harness/rotation.rs`) keep naming it.
     pub(crate) fn implicit(model: String) -> Self {
         Self {
-            id: format!("{model}-route"),
+            id: model.clone(),
             model,
             effort: None,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,

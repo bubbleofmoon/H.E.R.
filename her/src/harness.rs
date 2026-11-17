@@ -619,7 +619,7 @@ async fn tool_loop(
             .limits
             .max_tokens
             .saturating_sub(spent)
-            .min(4096);
+            .min(route.spec.max_output_tokens);
         // #183: a capture the operator armed takes this request as `model_step` hands it to the
         // model client, which adds only the OpenAI wire framing.
         crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
@@ -862,13 +862,13 @@ impl ChainState {
             empty_answers: self.empty_answers,
             stream_retried: self.retried,
             dispatched: self.dispatched,
-            sent: sent.load(Ordering::SeqCst),
+            sent: false,
             next_route,
             steps_left: at.step + 1 < request.limits.max_steps && at.spent < request.limits.max_tokens,
             unit: request.limits.retry_unit,
             remaining: at.deadline.saturating_duration_since(tokio::time::Instant::now()),
         };
-        let next = { let _ = &situation; routes::Next::Fail };
+        let next = routes::decide(&miss, &situation);
         let record = |event: &str, outcome: Outcome, action: String| {
             let reason = format!(
                 "{}: route {} ({summary}) on a request of {} bytes; {action}",
@@ -983,7 +983,7 @@ async fn model_step(
             }
         });
     // A route without an effort sends none, as before routes.
-    if let Some(effort) = None::<&str>.and_then(ReasoningEffort::from_keyword) {
+    if let Some(effort) = route.spec.effort.as_deref().and_then(ReasoningEffort::from_keyword) {
         options = options.with_reasoning_effort(effort);
     }
     // SDK errors may contain provider payloads or URLs. Never format them into HER diagnostics.
