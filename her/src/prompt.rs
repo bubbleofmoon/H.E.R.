@@ -11,12 +11,8 @@ fn social_state_for_runtime(context: &RuntimeContext) -> Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn config_for_runtime(context: &RuntimeContext) -> Value {
-    let cfg = context
-        .read_text(RuntimeArea::Config, "config.json")
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+pub(crate) fn config_for_runtime(context: &RuntimeContext) -> Value {
+    let cfg = context.load_config_document().unwrap_or_else(|_| serde_json::json!({}));
     crate::model_view::with_blacklist(context, &cfg)
 }
 
@@ -659,20 +655,8 @@ pub fn recall_block(cfg: &Value, st: &Value, key: &str) -> String {
     recall_block_with_runtime(&RuntimeContext::legacy(), cfg, st, key)
 }
 
-/// The memories the conversation's current session generation already carries: the ids of the
-/// installed briefing, kept while the record's generation is the one that briefing was installed
-/// for. A new generation, session or epoch has none; a history-gap refresh (`needsBriefing`, same
-/// generation) keeps them.
-fn held_recall_ids(record: &Value) -> Vec<i64> {
-    let installed = &record["installed"];
-    if installed["generation"].as_u64() != Some(record["generation"].as_u64().unwrap_or(0)) {
-        return Vec::new();
-    }
-    installed["recalled"].as_array().map(|ids| ids.iter().filter_map(Value::as_i64).collect()).unwrap_or_default()
-}
-
 /// The recall the next DSH wake would deliver (the console preview): memories the conversation's
-/// session generation already carries are left out, as in the wake. Rendering reads memory without
+/// session generation already carries (`briefing_delivery::WakePlan::held`) are left out, as in the wake. Rendering reads memory without
 /// counting search hits: a hit is counted by `record_recall_hits` once the prompt carrying the recall
 /// has been delivered.
 pub fn recall_block_with_runtime(
@@ -683,7 +667,7 @@ pub fn recall_block_with_runtime(
 ) -> String {
     let held = match (crate::session_map::lookup(context, key), st["agentToken"].as_str()) {
         (Ok(Some(sid)), Some(epoch)) => crate::session_map::context_record(context, key, &sid, epoch)
-            .map(|record| held_recall_ids(&record)).unwrap_or_default(),
+            .map(|record| crate::briefing_delivery::plan(&record).held).unwrap_or_default(),
         _ => Vec::new(),
     };
     recall_block_with(context, cfg, st, key, &held, &keep_all).0
@@ -2068,10 +2052,9 @@ pub(crate) fn prepare_dsh_wake_layered(
     // library before it bumps the generation, so sections rendered after this capture are at least
     // as new as it; a bump after it fails the pending guard below and the caller prepares again.
     let record = crate::session_map::context_record(context,key,sid,epoch)?;
-    let generation = record["generation"].as_u64().unwrap_or(0);
-    let installed = &record["installed"];
-    let needs_briefing = record["needsBriefing"] == true;
-    let full = needs_briefing || installed["generation"].as_u64() != Some(generation);
+    // Full or delta, the changed sections and the held recall are `briefing_delivery`'s rules.
+    let delivery = crate::briefing_delivery::plan(&record);
+    let (generation, full) = (delivery.generation, delivery.full);
     let identity = read_data_json(context, "identity.json").unwrap_or(json!({}));
     let saved_identity = identity_line(identity["nickname"].as_str().unwrap_or(""), identity["userId"].as_str().unwrap_or(""));
     let live_identity = if saved_identity.is_empty() {
@@ -2113,7 +2096,7 @@ pub(crate) fn prepare_dsh_wake_layered(
     for (name,text) in &sections {
         if full {
             if !text.is_empty() { body.push_str(&format!("【简报节 {name}】\n{text}\n\n")); }
-        } else if installed["sections"].get(*name).and_then(Value::as_str) != hashes.get(name).map(String::as_str) {
+        } else if delivery.changed(name, hashes.get(name).map(String::as_str)) {
             if text.is_empty() { body.push_str(&format!("【删除简报节 {name}】旧内容已失效。\n\n")); }
             else { body.push_str(&format!("【替换简报节 {name}】完整替换旧节：\n{text}\n\n")); }
         }
@@ -2134,7 +2117,7 @@ pub(crate) fn prepare_dsh_wake_layered(
     // briefing's retrieval section remains the on-demand route (`memory_search`).
     // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
     // wakes already carried; a new generation, session or epoch starts afresh.
-    let held = held_recall_ids(&record);
+    let held = delivery.held.clone();
     // Material: the best-ranked recalled memories that fit what Identity and Relationship left of its budget.
     let offered = std::cell::Cell::new(0usize);
     // The recall block adds its header and footer around the items, and the index hint line (at most
@@ -2166,8 +2149,9 @@ pub(crate) fn prepare_dsh_wake_layered(
     body.push_str(&crate::model_view::strip_from_model_text(&delta, cfg));
     body.push_str(&crate::qq_tools::wake_snapshot(context,cfg,key,epoch)?);
     let carried: Vec<i64> = held.iter().chain(&recalled).copied().collect();
-    let pending = json!({"rpcId":rpc_id,"generation":generation,"revision":revision,"sections":hashes,"full":full,"recalled":carried});
-    if !crate::session_map::update_context(context,key,sid,epoch,|r| {if r["generation"].as_u64().unwrap_or(0) == generation && (r["needsBriefing"]==true)==needs_briefing { r["pending"]=pending; }})? {
+    // Held as pending only while the generation and refresh state read above still hold; DSH reports the
+    // delivery (`session_context::observe`), which installs it.
+    if !crate::session_map::update_context(context,key,sid,epoch,|r| { crate::briefing_delivery::hold(r,&delivery,rpc_id,&revision,&hashes,&carried); })? {
         return Err(WAKE_BRIEFING_CHANGED.into());
     }
     let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);

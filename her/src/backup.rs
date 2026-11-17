@@ -858,6 +858,16 @@ fn online_snapshot(
     Ok(())
 }
 
+/// The stored `config.json` bytes the archive keeps, and the configuration the snapshot's settings come from: the
+/// same bytes parsed, with the settings overlay applied as for every configuration reader.
+pub(crate) fn snapshot_config(context: &RuntimeContext) -> Result<(Vec<u8>, serde_json::Value), String> {
+    let config = context.read_file(RuntimeArea::Config, "config.json")?;
+    let text = std::str::from_utf8(&config).map_err(|_| "backup config is not UTF-8")?;
+    let raw: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
+        .map_err(|_| "backup config is invalid")?;
+    Ok((config, context.overlay_config(raw)))
+}
+
 fn create_snapshot(
     context: &RuntimeContext,
     check: Check<'_>,
@@ -867,10 +877,7 @@ fn create_snapshot(
     let root = context
         .runtime_root()
         .ok_or("backup requires a selected runtime root")?;
-    let config = context.read_file(RuntimeArea::Config, "config.json")?;
-    let text = std::str::from_utf8(&config).map_err(|_| "backup config is not UTF-8")?;
-    let raw = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-        .map_err(|_| "backup config is invalid")?;
+    let (config, raw) = snapshot_config(context)?;
     let settings = Settings::from_config_resolved(root, &raw)?;
     let destination = settings.destination;
     ensure_destination(&destination)?;

@@ -87,6 +87,10 @@ _Avoid_: production folder, deploy dir
 HER's own part that runs a conversation turn: it sends the prompt to a model, runs the tool calls the model asks for, and keeps the conversation's history and summaries. It takes over the role DSH plays today.
 _Avoid_: DSH, conversation engine, agent host, backend
 
+**Turn engine (回合引擎, `turn_engine`)**:
+What runs the model work of one admitted turn for a conversation, DSH or the harness. HER keeps the turn's admission, its prompt and the delivery of its reply; the engine sends the prompt, follows the turn, stops it when it is cancelled and reports what happened.
+_Avoid_: backend (a CLI route), conversation engine
+
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.
 _Avoid_: dependency (a process the supervisor runs), fork, vendor

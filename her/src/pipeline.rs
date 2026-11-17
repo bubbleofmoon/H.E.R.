@@ -427,6 +427,9 @@ pub struct Pipeline {
     after_abandon_rotation: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     completion_observed_hook: Option<Box<dyn FnMut() + Send>>,
+    /// The scripted adapter the next admitted turn runs on, instead of its selected engine.
+    #[cfg(test)]
+    scripted: Option<crate::turn_engine::Script>,
     /// A queued chat job's epoch check, run again right before the turn begins (after media).
     before_turn: Option<Box<dyn FnOnce() -> Option<String> + Send>>,
     dispatch_wake: Option<(i64, serde_json::Value)>,
@@ -455,7 +458,8 @@ pub struct Pipeline {
 
 /// State of a chat turn while it runs.
 struct ChatRun {
-    engine: crate::harness::Engine,
+    /// The turn-engine adapter this turn runs on (captured before the turn begins).
+    adapter: crate::turn_engine::Adapter,
     reserved: Option<crate::reserved::Authority>,
     mode: String,
     silent: bool,
@@ -577,24 +581,51 @@ impl Pipeline {
         cfg: &serde_json::Value,
         live: bool,
     ) -> Result<Self, String> {
+        Self::build(context, cfg, live, true)
+    }
+
+    /// A pipeline for turns whose engine needs no DSH (`turn_engine::Engine::uses_dsh` is false;
+    /// selected runtime only). It reads no DSH credential and needs no DSH dependency; every DSH
+    /// call on it fails locally (`dsh_credential::UNBOUND`) without contacting DSH.
+    pub fn new_without_dsh(
+        context: &RuntimeContext,
+        cfg: &serde_json::Value,
+        live: bool,
+    ) -> Result<Self, String> {
+        Self::build(context, cfg, live, false)
+    }
+
+    fn build(
+        context: &RuntimeContext,
+        cfg: &serde_json::Value,
+        live: bool,
+        dsh: bool,
+    ) -> Result<Self, String> {
         // Validate selected-root session state before constructing any live dependencies or
         // creating the candidate workspace. A corrupt file must not silently start a new session
         // and later overwrite the evidence needed to repair it.
         let store = SessionStore::load_for_runtime(context)?;
-        let base = if context.is_isolated() {
-            context
-                .dependency_url("dsh")
-                .ok_or_else(|| "runtime DSH dependency is unavailable".to_string())?
-                .to_string()
+        let rpc = if !dsh {
+            if !context.is_isolated() {
+                return Err("a pipeline without DSH requires a selected runtime".to_string());
+            }
+            Rpc::unbound(context, context.dependency_url("dsh").unwrap_or_default())
         } else {
-            cfg
-            .get("dsh")
-            .and_then(|d| d.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080")
-            .to_string()
+            let base = if context.is_isolated() {
+                context
+                    .dependency_url("dsh")
+                    .ok_or_else(|| "runtime DSH dependency is unavailable".to_string())?
+                    .to_string()
+            } else {
+                cfg
+                .get("dsh")
+                .and_then(|d| d.get("baseUrl"))
+                .and_then(|b| b.as_str())
+                .unwrap_or("http://127.0.0.1:3080")
+                .to_string()
+            };
+            Rpc::connect_with_runtime(context, &base)?
         };
-        let rpc = Rpc::connect_with_runtime(context, &base)?;
 
         let http_url = if context.is_isolated() {
             context
@@ -689,6 +720,8 @@ impl Pipeline {
             after_abandon_rotation: None,
             #[cfg(test)]
             completion_observed_hook: None,
+            #[cfg(test)]
+            scripted: None,
             before_turn: None,
             dispatch_wake: None,
             dispatch_deadline: None,
@@ -1103,6 +1136,8 @@ impl Pipeline {
     pub fn expect_dispatch_wake(&mut self, at: i64, previous: serde_json::Value) { self.dispatch_wake = Some((at, previous)); }
     pub fn expect_dispatch_deadline(&mut self, at: i64) { self.dispatch_deadline = Some(at); }
     pub fn dispatch_definitely_unsubmitted(&self) -> bool { self.dispatch_unsubmitted }
+    /// It holds a DSH login (`new_with_runtime`); `new_without_dsh` pipelines do not.
+    pub fn has_dsh(&self) -> bool { self.rpc.credential().is_bound() }
 
     fn set_turn_token(&mut self, token: String) {
         self.turn_epoch = crate::send_outbox::token_epoch(&token);
@@ -1228,7 +1263,8 @@ impl Pipeline {
                 return Err("mode or permission changed".to_string());
             }
         }
-        if !self.chat.as_ref().is_some_and(|c| c.engine == crate::harness::Engine::Harness) {
+        // Only DSH turns are bound to a DSH session mapping (reserved2 runs on DSH).
+        if self.chat.as_ref().is_none_or(|c| c.adapter.uses_dsh()) {
             match crate::session_map::lookup(&self.context, key) {
                 Ok(Some(current)) if current == sid => {},
                 Ok(_) => return Err("会话映射已变化（重置或替换）".to_string()),
@@ -1496,6 +1532,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
+        if !self.has_dsh() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         self.failure_reported = false;
         self.refusals_recorded.clear();
         self.active_candidate = None;
@@ -2019,17 +2058,20 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     else if reply.as_ref().err().is_some_and(|e| e.starts_with("等回复超时")) { Some("collectorTimeout") }
                     else if reply.is_err() { Some("collectorFailure") }
                     else { None };
-                    Self::write_turn_timing(&self.context, serde_json::json!({
-                        "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64).unwrap_or(0), "key":key,
-                        "ok":reply.is_ok() && cancel_reason.is_none() && failover::classify_turn_end(&ended).is_none(),
-                        "endKind":end_kind,"cancelled":cancel_reason.is_some(),"cancelReason":cancel_reason,
-                        "turnId":self.cur_turn.as_ref().map(|turn| turn.id.as_str()),
-                        "attemptRpcId":rpc_id,
-                        "model":used_model,"attempts":attempts,"promptChars":prompt_chars,
-                        "cliMs":seg_cli,"sessMs":seg_sess,"modelMs":seg_model,"openMs":seg_open,
-                        "acceptMs":seg_accept,"turnMs":seg_turn,"totalMs":t0.elapsed().as_millis() as i64,
-                    }));
+                    // The DSH adapter's reported facts become the turn timing record.
+                    self.report_facts(key, &crate::turn_engine::Facts {
+                        ok: reply.is_ok() && cancel_reason.is_none() && failover::classify_turn_end(&ended).is_none(),
+                        end_kind: end_kind.map(str::to_string),
+                        cancel_reason,
+                        attempt: rpc_id.clone(),
+                        model: used_model.clone(),
+                        attempts,
+                        prompt_chars,
+                        segments: vec![("cliMs", seg_cli), ("sessMs", seg_sess), ("modelMs", seg_model),
+                            ("openMs", seg_open), ("acceptMs", seg_accept)],
+                        turn_ms: seg_turn,
+                        total_ms: t0.elapsed().as_millis() as i64,
+                    });
                     if let Some(reason) = retired {
                         return Err(format!("回合已取消：{reason}"));
                     }
@@ -2242,6 +2284,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     ///
     /// **先订阅再投递**：反过来的话回合可能在订阅建立前就结束，实时流不重放。
     pub async fn ask(&mut self, key: &str, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        if !self.has_dsh() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         let sid = self.ensure_session(key)?;
         self.prepare_title();
         let mut follow = FollowStream::open(&self.rpc.base, &self.rpc.cookie(), &sid).await?;
@@ -2458,10 +2503,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     /// Open the ledger entry of a turn (selected runtime). Refuses, recording the wake as `held`,
     /// while the conversation has a paused or unreconciled turn. Returns the agent token in force.
     fn begin_ledger_turn(&mut self, key: &str) -> Result<String, String> {
-        self.begin_ledger_turn_for_engine(key, crate::harness::Engine::Dsh)
+        self.begin_ledger_turn_as(key, crate::turn_engine::Engine::Dsh.id())
     }
 
-    fn begin_ledger_turn_for_engine(&mut self, key: &str, engine: crate::harness::Engine) -> Result<String, String> {
+    /// `begin_ledger_turn` for a turn whose adapter is `backend` (`turn_engine::Adapter::id`).
+    fn begin_ledger_turn_as(&mut self, key: &str, backend: &str) -> Result<String, String> {
         let inbound = std::mem::take(&mut self.next_inbound);
         self.refusals_recorded.clear();
         self.carried_messages = inbound.iter().filter_map(|key| key.rsplit_once("|message:")
@@ -2490,7 +2536,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let epoch = crate::send_outbox::token_epoch(&token);
         let ledger_offset = crate::turn_ledger::ledger_len(&self.context).ok();
         let recorder =
-            crate::turn_ledger::Recorder::begin(&self.context, key, engine.id(), &reason, &epoch, &inbound, None)?;
+            crate::turn_ledger::Recorder::begin(&self.context, key, backend, &reason, &epoch, &inbound, None)?;
         self.cur_turn = Some(recorder);
         self.turn_ledger_offset = ledger_offset;
         self.turn_final = false;
@@ -2696,13 +2742,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if !self.context.is_isolated() {
             return Err("chat 模式只在选定运行环境中运行".to_string());
         }
-        let engine = crate::harness::Engine::selected(cfg, key)?;
-        if engine == crate::harness::Engine::Harness && !matches!(mode, "chat" | "closed-agent") {
-            return Err("harness supports chat and owner-private closed-agent modes only".into());
+        let adapter = self.turn_adapter(cfg, key)?;
+        if !adapter.supports(mode) {
+            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
         }
         self.preset_chat = crate::chat::chat_preset(cfg);
         self.owner_qq = crate::chat::owner_qq(cfg);
-        if mode == "closed-agent" && engine == crate::harness::Engine::Dsh { self.preset_closed = self.closed_preset()?; }
+        if mode == "closed-agent" && adapter.uses_dsh() { self.preset_closed = self.closed_preset()?; }
         self.note_turn("chat", inbound);
         let context = self.context.clone();
         let media_cfg = cfg.clone();
@@ -2718,9 +2764,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Some(reason) = self.before_turn.take().and_then(|check| check()) {
             return Err(reason);
         }
-        self.begin_ledger_turn_for_engine(key, engine)?;
+        self.begin_ledger_turn_as(key, adapter.id())?;
         self.chat = Some(ChatRun {
-            engine,
+            adapter,
             reserved: None,
             mode: mode.to_string(),
             silent: false,
@@ -2746,8 +2792,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         silent: bool,
         authority: crate::reserved::Authority,
     ) -> Result<(), String> {
-        if crate::harness::Engine::selected(cfg, key)? != crate::harness::Engine::Dsh {
-            return Err("harness supports chat and owner-private closed-agent modes only".into());
+        let adapter = self.turn_adapter(cfg, key)?;
+        if !adapter.supports("reserved") {
+            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
         }
         authority.check(&self.context, key)?;
         self.expect_dispatch_token(authority.token.clone());
@@ -2770,14 +2817,14 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         .map_err(|_| "图片获取失败".to_string())?;
         let _update_turn = crate::release::turn_guard(&self.context).await?;
         authority.check(&self.context, key)?;
-        self.begin_ledger_turn(key)?;
+        self.begin_ledger_turn_as(key, adapter.id())?;
         let ack = if authority.social() || silent {
             None
         } else {
             crate::chat::ack_message(cfg)
         };
         self.chat = Some(ChatRun {
-            engine: crate::harness::Engine::Dsh,
+            adapter,
             reserved: Some(authority),
             mode: "reserved".to_string(),
             silent,
@@ -2799,44 +2846,160 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
         result
     }
-    async fn ask_harness(&mut self, key: &str, prompt: &str, cfg: &serde_json::Value) -> Result<String, String> {
+    // ── the turn-engine seam (`turn_engine`) ─────────────────────────────────────
+
+    /// The adapter this conversation's next turn runs on: its selected engine, or the scripted
+    /// adapter a test installed.
+    fn turn_adapter(&mut self, cfg: &serde_json::Value, key: &str) -> Result<crate::turn_engine::Adapter, String> {
+        #[cfg(test)]
+        if let Some(script) = self.scripted.take() {
+            return Ok(crate::turn_engine::Adapter::Scripted(script));
+        }
+        crate::turn_engine::Adapter::selected(cfg, key)
+    }
+
+    /// Run one admitted turn on `adapter`. The pipeline already holds the turn's ledger entry and
+    /// token; the adapter submits `prompt`, streams the turn, stops when it is cancelled and reports
+    /// its facts (`last_report` and the turn timing record). Returns the model's final text.
+    async fn run_admitted_turn(
+        &mut self,
+        adapter: &crate::turn_engine::Adapter,
+        key: &str,
+        prompt: &str,
+        timeout: std::time::Duration,
+        cfg: &serde_json::Value,
+    ) -> Result<String, String> {
+        match adapter {
+            crate::turn_engine::Adapter::Dsh => {
+                if !self.has_dsh() {
+                    return Err(crate::dsh_credential::UNBOUND.to_string());
+                }
+                // A pinned CLI backend was the caller's to run: the DSH adapter's configuration
+                // copy drops `backends.sessions`, so its failover never runs that CLI again.
+                let mut cfg_dsh = cfg.clone();
+                if let Some(b) = cfg_dsh.get_mut("backends").and_then(|v| v.as_object_mut()) {
+                    b.remove("sessions");
+                }
+                self.ask_with_failover_with_deadline(key, prompt, timeout, &cfg_dsh).await
+            }
+            crate::turn_engine::Adapter::Harness => self.ask_harness(key, prompt, timeout, cfg).await,
+            #[cfg(test)]
+            crate::turn_engine::Adapter::Scripted(script) => self.run_scripted(script, key, prompt),
+        }
+    }
+
+    /// Write the turn timing record (`logs/turn-timing.jsonl`) of an adapter's reported facts.
+    fn report_facts(&self, key: &str, facts: &crate::turn_engine::Facts) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let turn = self.cur_turn.as_ref().map(|turn| turn.id.as_str());
+        Self::write_turn_timing(&self.context, facts.timing_record(key, turn, ts));
+    }
+
+    /// The scripted test adapter: records the attempt, its acceptance and the thinking start like
+    /// a live engine, answers with the script and reports facts. It never contacts DSH or a model.
+    #[cfg(test)]
+    fn run_scripted(&mut self, script: &crate::turn_engine::Script, key: &str, prompt: &str) -> Result<String, String> {
+        let begun = std::time::Instant::now();
+        let recorder = self.cur_turn.as_ref().ok_or("the scripted adapter requires a durable bridge turn")?;
+        let attempt = format!("scripted:{}", recorder.id);
+        recorder.attempt(&attempt, "")?;
+        self.dispatch_unsubmitted = false;
+        recorder.accepted(&attempt)?;
+        recorder.started()?;
+        script.seen.lock().unwrap_or_else(|p| p.into_inner()).push((key.to_string(), prompt.to_string()));
+        if let Some(ack) = self.chat.as_mut().and_then(|c| c.ack.take()) {
+            self.send_chat_text(key, "", "ack", &ack);
+        }
+        let ok = script.reply.is_ok();
+        self.report_facts(key, &crate::turn_engine::Facts {
+            ok,
+            end_kind: Some(if ok { script.end_kind } else { "error" }.to_string()),
+            cancel_reason: None,
+            attempt,
+            model: Some("scripted/fixture".to_string()),
+            attempts: 1,
+            prompt_chars: prompt.chars().count(),
+            segments: Vec::new(),
+            turn_ms: 0,
+            total_ms: begun.elapsed().as_millis() as i64,
+        });
+        if ok {
+            self.last_report = Some(TurnReport {
+                end_kind: script.end_kind.to_string(),
+                send_tool_ok: script.send_tool_ok,
+                command: None,
+            });
+        }
+        script.reply.clone()
+    }
+
+    /// The harness adapter: admit the turn to HER's own harness, stream it, cancel it when the
+    /// conversation's mode, permission or token changes, and report its facts.
+    async fn ask_harness(
+        &mut self,
+        key: &str,
+        prompt: &str,
+        timeout: std::time::Duration,
+        cfg: &serde_json::Value,
+    ) -> Result<String, String> {
         use crate::harness::{Harness, ModelRoute, TurnRequest};
+        let begun = std::time::Instant::now();
         self.chat_guard(key, "")?;
         let route = ModelRoute::from_runtime(&self.context, cfg)?;
         let model = route.model_name().to_string();
         let harness = Harness::open(&self.context)?;
         let recorder = self.cur_turn.as_ref().ok_or("harness requires a durable bridge turn")?;
-        recorder.attempt(&format!("harness:{}", recorder.id), "")?;
+        let attempt = format!("harness:{}", recorder.id);
+        recorder.attempt(&attempt, "")?;
         let mut turn = harness.admit(TurnRequest {
             id: recorder.id.clone(), conversation: key.to_string(), generation: self.turn_epoch.clone(),
             prompt: prompt.to_string(),
             profile: if self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") { "closed-agent".into() } else { self.preset_chat.clone() }, route,
             limits: crate::harness::Limits::from_config(cfg),
             tools: crate::harness::Tools::capture(&self.context, cfg, key, &self.turn_epoch)?,
-            deadline: std::time::Duration::from_secs(turn_timeout_secs(cfg)),
+            deadline: timeout,
         })?;
         self.dispatch_unsubmitted = false;
-        recorder.accepted(&format!("harness:{}", recorder.id))?;
+        recorder.accepted(&attempt)?;
+        // The model starts on admission: this is the thinking start reserved2 typing delays read.
+        let _ = recorder.started();
+        let started = std::time::Instant::now();
         if let Some(ack) = self.chat.as_mut().and_then(|c| c.ack.take()) {
             self.send_chat_text(key, "", "ack", &ack);
         }
+        let mut invalidated = false;
         let result = loop {
             tokio::select! {
                 result = turn.wait() => break result,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                     if self.chat_guard(key, "").is_err() {
+                        invalidated = true;
                         turn.cancel();
                         break turn.wait().await;
                     }
                 }
             }
         };
+        let turn_ms = started.elapsed().as_millis() as i64;
         for reference in turn.message_refs() {
             if !self.carried_messages.contains(&reference) {
                 self.carried_messages.push(reference);
             }
         }
-        match turn.status() {
+        let status = turn.status();
+        self.report_facts(key, &crate::turn_engine::Facts::of_harness(
+            &status,
+            invalidated,
+            attempt,
+            format!("openai/{model}"),
+            prompt.chars().count(),
+            turn_ms,
+            begun.elapsed().as_millis() as i64,
+        ));
+        match status {
             crate::harness::Status::Paused { .. } => self.turn_final = true,
             crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
             _ => {}
@@ -2844,7 +3007,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let text = match result {
             Ok(text) => text,
             Err(error) => {
-                if error.starts_with("model/backend ") || error == "harness model deadline exceeded" {
+                if error.starts_with("model/backend ") || error == crate::harness::DEADLINE_EXCEEDED {
                     self.report_backend_failure(cfg, key, "harness", "openai", &model, "", &error);
                 }
                 return Err(error);
@@ -2856,17 +3019,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     }
 
     async fn run_chat_inner(&mut self, key: &str, prompt: &str, cfg: &serde_json::Value) -> Result<(), String> {
-        let mut cfg_dsh = cfg.clone();
-        if let Some(b) = cfg_dsh.get_mut("backends").and_then(|v| v.as_object_mut()) {
-            b.remove("sessions");
-        }
         let delivered =
             crate::prompt::wrap_for_delivery_with_runtime(&self.context, prompt, cfg, crate::parity_clock::now_ms());
-        let text = if self.chat.as_ref().is_some_and(|c| c.engine == crate::harness::Engine::Harness) {
-            self.ask_harness(key, &delivered, cfg).await?
-        } else {
-            self.ask_with_failover(key, &delivered, turn_timeout_secs(cfg), &cfg_dsh).await?
-        };
+        let adapter = self.chat.as_ref().map_or(crate::turn_engine::Adapter::Dsh, |c| c.adapter.clone());
+        let timeout = std::time::Duration::from_secs(turn_timeout_secs(cfg));
+        let text = self.run_admitted_turn(&adapter, key, &delivered, timeout, cfg).await?;
         let report = self.last_report.take().unwrap_or_default();
         if self.chat.as_ref().is_some_and(|c|c.silent) { return Ok(()); }
         let sid = crate::session_map::lookup(&self.context, key)?.unwrap_or_default();
@@ -3027,8 +3184,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     ) -> Result<usize, String> {
         let key = target.key();
         let key: &str = &key;
-        if crate::harness::Engine::selected(cfg, key)? != crate::harness::Engine::Dsh {
-            return Err("harness supports chat and owner-private closed-agent modes only".into());
+        let adapter = self.turn_adapter(cfg, key)?;
+        if !adapter.supports("reserved2") {
+            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
         }
 
         // ── 1) 纯文本后端（opencode 免费档）──
@@ -3049,14 +3207,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }).await? { return Ok(sent); }
         }
 
-        // ── 2) DSH：完整提示词，模型自己调工具发 ──
+        // ── 2) The turn engine: full prompt, the model sends through its own tools ──
         //
-        // 用一份**去掉 backends.sessions** 的配置副本，避免 ask_with_failover 里那段
-        // CLI 分支又跑一遍（那样会用 dsh_prompt 再试一次纯文本后端，纯属浪费）。
-        let mut cfg_dsh = cfg.clone();
-        if let Some(b) = cfg_dsh.get_mut("backends").and_then(|v| v.as_object_mut()) {
-            b.remove("sessions");
-        }
+        // The DSH adapter drops `backends.sessions` from its configuration copy, so the pinned
+        // CLI above never runs a second time inside its failover chain.
+        //
         // **不要代发模型输出**。
         //
         // 2026-10-23 20:2x 我在这里加过一条"安全网"：模型没调发送工具就把它输出的文本代发出去。
@@ -3078,7 +3233,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             cfg,
             crate::parity_clock::now_ms(),
         );
-        let reply = self.ask_with_failover_with_deadline(&key, &delivered, reserved2_turn_timeout(cfg), &cfg_dsh).await?;
+        let reply = self.run_admitted_turn(&adapter, key, &delivered, reserved2_turn_timeout(cfg), cfg).await?;
         let after = Self::last_ai_reply_at(&self.context, &key);
         let trimmed = reply.trim();
         let n = trimmed.chars().count();
@@ -3135,6 +3290,7 @@ impl AccessEpoch {
 mod tests {
     include!("pipeline_cli_relay_tests.rs");
     include!("pipeline_completion_tests.rs");
+    include!("pipeline_engine_tests.rs");
     use super::*;
     use serde_json::{json, Value};
 

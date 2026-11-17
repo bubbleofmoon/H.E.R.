@@ -575,6 +575,41 @@ pub(crate) fn assistant_texts(context: &RuntimeContext, conversation: &str, afte
     Ok(out)
 }
 
+/// The newest model attempt of `conversation`'s session in `generation` that returned a response, ordered by its
+/// `model_attempt_started` event (the append-only sequence, not the wall clock): the idle rotation rule's evidence
+/// (`harness::rotation`). An older attempt never stands in for a newest one without reported usage. No database,
+/// session or answered attempt means `None`. Never creates or migrates storage.
+// The idle check built with the history budget (#6) calls this; remove this line then.
+#[allow(dead_code)]
+pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation: &str) -> Result<Option<super::rotation::LastCall>, String> {
+    let path = context.resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORAGE_ERROR)?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT a.model, a.response FROM events e JOIN sessions s ON e.session_id = s.id JOIN model_attempts a ON e.attempt_id = a.id
+            WHERE s.conversation = ?1 AND s.generation = ?2 AND e.kind = 'model_attempt_started' AND a.response IS NOT NULL
+            ORDER BY e.seq DESC LIMIT 1",
+            params![conversation, generation],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|_| STORAGE_ERROR)?;
+    let Some((model, response)) = row else {
+        return Ok(None);
+    };
+    let response: Value = serde_json::from_str(&response).map_err(|_| STORAGE_ERROR)?;
+    let input = response
+        .pointer("/captured_usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .filter(|tokens| *tokens > 0);
+    Ok(Some(super::rotation::LastCall { model, input }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +664,51 @@ mod tests {
         assert_eq!(data.as_ref(), opaque, "canonical binary bytes must survive record masking");
         assert!(parts.iter().any(|p| matches!(p, ContentPart::ThoughtSignature(signature) if signature == &opaque)));
         assert!(parts.iter().any(|p| matches!(p, ContentPart::Text(text) if text == "ordinary ***")), "model text is still masked");
+    }
+
+    #[test]
+    fn harness_idle_rotation_last_call_reads_the_newest_answered_request_of_the_session() {
+        use crate::harness::rotation::LastCall;
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-last-call-165-{}", crate::turn_ledger::mint_id(""))));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(root.clone());
+        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-165","harness":{"model":"fake-chat"}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-165").unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
+        let generation = crate::send_outbox::token_epoch(&token);
+        assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), None, "no database: no request");
+        assert!(!root.join("data").join(DB).exists(), "reading never creates the database");
+        let mut request = TurnRequest {
+            id:"last-call-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), profile:"closed-agent".into(),
+            route:ModelRoute::from_runtime(&context, &cfg).unwrap(), deadline:std::time::Duration::from_secs(10),
+            tools:Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(), limits:Limits::from_config(&cfg),
+        };
+        let answer = |raw: Value| Event::Assistant { text: "answer".into(), raw, message: ChatMessage::assistant("answer".to_string()) };
+        let store = Store::open(&context).unwrap();
+        store.admit(&request).unwrap();
+        store.finish(&request.id, &Status::Completed("answer".into()), Some(&answer(json!({"captured_usage":{"prompt_tokens":600_000,"total_tokens":600_100}})))).unwrap();
+        let first = Some(LastCall { model: "fake-chat".into(), input: Some(600_000) });
+        assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), first, "the answered request's model and total input");
+        request.id = "last-call-cancelled".into();
+        store.admit(&request).unwrap();
+        store.finish(&request.id, &Status::Cancelled, None).unwrap();
+        assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), first, "a request that never answered is not evidence");
+        request.id = "last-call-unreported".into();
+        store.admit(&request).unwrap();
+        store.finish(&request.id, &Status::Completed("answer".into()), Some(&answer(json!({})))).unwrap();
+        assert_eq!(
+            last_call(&context, "private:8808", &generation).unwrap(),
+            Some(LastCall { model: "fake-chat".into(), input: None }),
+            "the newest answered request counts even without usage; an older one never stands in"
+        );
+        assert_eq!(last_call(&context, "private:8808", "other-generation").unwrap(), None, "another generation's session has its own evidence");
+        assert_eq!(last_call(&context, "private:9909", &generation).unwrap(), None, "another conversation too");
     }
 }

@@ -270,12 +270,10 @@ fn must_reply(text: &str, nick: &str, cfg: &Value) -> bool {
 }
 
 fn config_stamp(context: &RuntimeContext) -> Result<String, String> {
-    let path = context.resolve_path(RuntimeArea::Config, "config.json", crate::runtime::PathIntent::ReadFile)
-        .map_err(str::to_string)?;
-    let metadata = std::fs::metadata(path).map_err(|_| "reserved config metadata is unavailable".to_string())?;
-    let modified = metadata.modified().map_err(|_| "reserved config timestamp is unavailable".to_string())?
+    let stamp = context.config_stamp().map_err(str::to_string)?;
+    let modified = stamp.modified.ok_or("reserved config timestamp is unavailable")?
         .duration_since(std::time::UNIX_EPOCH).map_err(|_| "reserved config timestamp is invalid".to_string())?;
-    Ok(format!("{}:{}", modified.as_nanos(), metadata.len()))
+    Ok(format!("{}:{}", modified.as_nanos(), stamp.len))
 }
 
 /// Frozen JS starts with defaults, but HTTP hot reload replaces top-level social wholesale.
@@ -489,6 +487,26 @@ impl Authority {
         }
         Ok(())
     }
+}
+/// The current authority of `key` as the hub would capture it (tests outside this module).
+#[cfg(test)]
+pub(crate) fn authority_for_test(context: &RuntimeContext, key: &str) -> Result<Authority, String> {
+    let cfg = context.load_config().map_err(|e| e.to_string())?;
+    let token = console::ensure_or_rotate_agent_token(context, key, false)?;
+    let (owner, generation) = mutate(context, |s| {
+        if s.owner.is_empty() {
+            s.owner = crate::turn_ledger::mint_id("process-");
+        }
+        let generation = s.conversations.entry(key.to_string()).or_default().generation.clone();
+        Ok((s.owner.clone(), generation))
+    })?;
+    Ok(Authority {
+        owner,
+        generation,
+        mode: mode_stamp(context)?,
+        social: config(&cfg)["enabled"] != false,
+        token,
+    })
 }
 #[derive(Clone)]
 struct Job {

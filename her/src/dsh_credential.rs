@@ -32,6 +32,8 @@ between this host and DSH (DSH refuses an issuedAt in the future), a DSH version
 /// The administrator alert for the same streak.
 pub const REJECTED_TWICE_ALERT: &str = "DSH 连续两次拒绝了刚铸造的登录 Cookie，DSH 登录不可用。可能原因：本机与 DSH 的时钟偏差（clock skew，\
 DSH 不接受未来的 issuedAt），或 DSH 版本变更改了登录规则（DSH version change）；也请检查签名密钥是否被替换。";
+/// The refusal of every DSH call on a login that was never bound (`Credential::unbound`).
+pub const UNBOUND: &str = "DSH is not bound to this pipeline: its turns run without DSH";
 
 fn b64url(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
@@ -159,6 +161,8 @@ pub struct Credential {
     /// One refresh after a rejection (the frozen JS `_doFetchWithAuth`). The 401 drill (`--selftest-401`) turns it
     /// off to observe the raw refusal.
     refresh: AtomicBool,
+    /// False for a pipeline whose turns run without DSH: no secret was read and no cookie minted.
+    bound: bool,
 }
 
 impl Credential {
@@ -168,7 +172,25 @@ impl Credential {
             context,
             cookie: Mutex::new(cookie),
             refresh: AtomicBool::new(true),
+            bound: true,
         }
+    }
+
+    /// No login: reads no secret and mints no cookie. `Rpc` refuses every call on it with
+    /// `UNBOUND` before contacting DSH, and `relogin` never binds it.
+    pub fn unbound(context: &RuntimeContext, base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            context: context.clone(),
+            cookie: Mutex::new(String::new()),
+            refresh: AtomicBool::new(false),
+            bound: false,
+        }
+    }
+
+    /// A login was minted for this credential (`unbound` is the only constructor without one).
+    pub fn is_bound(&self) -> bool {
+        self.bound
     }
 
     /// Read the runtime's credentials and mint a fresh cookie for `base`.
@@ -246,6 +268,9 @@ impl Credential {
     /// 立刻全部 401。重读密钥并重铸即可恢复，无需重启。为什么不能只铸不验：实测有一次铸完仍然 401——DSH 换密钥时，
     /// 文件先变、进程内存后变（或反过来），中间那几百毫秒里刚铸的票也是 401。所以 4 次、递增间隔。
     pub fn relogin(&self, mut verify: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+        if !self.bound {
+            return Err(UNBOUND.to_string());
+        }
         let mut last = String::new();
         for attempt in 0..4 {
             let cookie =

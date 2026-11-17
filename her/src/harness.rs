@@ -1,4 +1,5 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
+pub(crate) mod rotation;
 pub(crate) mod store;
 mod tools;
 pub use tools::Tools;
@@ -24,36 +25,8 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
-/// Independent of a model route or the existing CLI backend pins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Engine {
-    Dsh,
-    Harness,
-}
-
-impl Engine {
-    pub fn selected(cfg: &Value, conversation: &str) -> Result<Self, String> {
-        let Some(selections) = cfg.get("conversationEngines") else {
-            return Ok(Self::Dsh);
-        };
-        let selections = selections
-            .as_object()
-            .ok_or("conversationEngines must be an object")?;
-        match selections.get(conversation) {
-            None => Ok(Self::Dsh),
-            Some(Value::String(value)) if value == "dsh" => Ok(Self::Dsh),
-            Some(Value::String(value)) if value == "harness" => Ok(Self::Harness),
-            _ => Err("unknown conversation engine selection".into()),
-        }
-    }
-
-    pub fn id(self) -> &'static str {
-        match self {
-            Self::Dsh => "dsh",
-            Self::Harness => "harness",
-        }
-    }
-}
+/// The failure of a turn whose wall deadline (`socialV2.turnTimeoutSecs`) ran out.
+pub(crate) const DEADLINE_EXCEEDED: &str = "harness model deadline exceeded";
 
 /// Credentials are opaque: never derive Debug or serialize this target.
 pub struct ModelRoute {
@@ -328,7 +301,7 @@ impl Harness {
             let outcome = tokio::select! { biased;
                 _ = cancelled.changed() => { interrupted = Some(Status::Cancelled); None },
                 _ = tokio::time::sleep(request.deadline) => {
-                    interrupted = Some(Status::Failed("harness model deadline exceeded".into())); None
+                    interrupted = Some(Status::Failed(DEADLINE_EXCEEDED.into())); None
                 },
                 result = &mut execution => Some(result),
             };
@@ -603,7 +576,7 @@ fn check_bound(
         return Err(Failure::Cancelled);
     }
     if tokio::time::Instant::now() >= deadline {
-        return Err("harness model deadline exceeded".into());
+        return Err(DEADLINE_EXCEEDED.into());
     }
     request.tools.check().map_err(|error| match error {
         tools::CheckError::Revoked(_) => Failure::Cancelled,
