@@ -150,7 +150,7 @@ fn ticket17_settings_get_reports_effective_send_delay_before_any_write() {
     let set_args = json!({"key":"private:7001","token":"owner-token","settingKey":"sendDelayMs","value":17});
     assert_eq!(
         crate::mcp::call_tool_with_context("settings_set", &set_args, &context).unwrap(),
-        "已改 sendDelayMs = 17。已立即生效"
+        "已改 sendDelayMs。已立即生效"
     );
     assert_eq!(
         crate::mcp::call_tool_with_context("settings_get", &args, &context).unwrap(),
