@@ -891,6 +891,38 @@ fn settings_reset_stores_the_default_over_the_file_and_is_audited() {
 }
 
 #[test]
+fn settings_reset_of_a_model_id_without_a_default_stores_not_configured_over_the_file() {
+    let model = &crate::settings::HARNESS_MODEL;
+    let next_use = |context: &RuntimeContext| model.text(&context.load_config_document().unwrap());
+    let (root, context) = settings_fixture("settings reset model");
+    write_config(&root, |config| config["harness"] = json!({"model": "file-model"}));
+    let (status, body) = post(&context, "/api/settings/set", json!({"setting": model.key, "value": "model-a"}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use(&context).as_deref(), Some("model-a"));
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": model.key}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"ok": true, "setting": model.key, "value": null, "revision": 2, "changed": true}));
+    assert_eq!(next_use(&context), None, "the missing default wins over the file's value");
+    let rows = audit_rows(&root);
+    assert_eq!(
+        (rows[1]["source"].clone(), rows[1]["old"].clone(), rows[1]["new"].clone()),
+        (json!("reset"), json!("\"model-a\""), json!("null"))
+    );
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": model.key}));
+    assert_eq!((status, body["changed"].clone()), (200, json!(false)), "a stored default is not a change");
+    let (status, body) = post(&context, "/api/settings/set", json!({"setting": model.key, "value": null}));
+    assert_eq!(status, 400, "a set still refuses null: {body}");
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use(&context).as_deref(), Some("model-a"), "undoing the reset restores the old value");
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "undoing the undo stores the missing default again: {body}");
+    assert_eq!(next_use(&context), None);
+}
+
+#[test]
 fn settings_undo_restores_the_old_value_and_is_refused_after_a_later_change() {
     let (root, context) = settings_fixture("settings undo");
     for value in [4500, 5000] {

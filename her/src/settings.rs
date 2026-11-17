@@ -91,6 +91,12 @@ impl Setting {
         }
     }
 
+    /// A value the store keeps for this setting: a valid value, or `Null` when that is the default (a model id
+    /// without one), which a reset stores so the read is "not configured" whatever `config.json` says.
+    fn storable(&self, value: &Value) -> Option<Value> {
+        self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
+    }
+
     /// The default; `Null` for a model id without one (not configured).
     pub(crate) fn default_value(&self) -> Value {
         match self.kind {
@@ -565,7 +571,7 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
         .filter_map(|(key, text)| {
             let setting = find(&key)?;
             let value = serde_json::from_str::<Value>(&text).ok()?;
-            Some((setting, setting.normalize(&value)?))
+            Some((setting, setting.storable(&value)?))
         })
         .collect())
 }
@@ -821,6 +827,17 @@ pub(crate) fn apply(
     }
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.requirement()))?;
+    store(context, setting, value, actor, source)
+}
+
+/// Writes one valid stored value (`storable`) with its audit row; the stored value again changes nothing.
+fn store(
+    context: &RuntimeContext,
+    setting: &'static Setting,
+    value: Value,
+    actor: &str,
+    source: &str,
+) -> Result<Applied, (u16, String)> {
     let text = value.to_string();
     write_store(context, false, |conn| {
         let old = stored_row(conn, setting.key)?;
@@ -835,13 +852,14 @@ pub(crate) fn apply(
 }
 
 /// Returns a global setting to its registry default: the default is stored, so it wins over `config.json`, with one
-/// audit row (source `reset`). A stored default already changes nothing.
+/// audit row (source `reset`). A model id without a default stores `null`, read as not configured. A stored default
+/// already changes nothing.
 pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
-    apply(context, setting.key, &setting.default_value(), actor, "reset")
+    store(context, setting, setting.default_value(), actor, "reset")
 }
 
 const UNKNOWN_ENTRY_ERROR: &str = "unknown history entry";
@@ -890,7 +908,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
             .map(|text| {
                 serde_json::from_str::<Value>(&text)
                     .ok()
-                    .and_then(|value| setting.normalize(&value))
+                    .and_then(|value| setting.storable(&value))
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
