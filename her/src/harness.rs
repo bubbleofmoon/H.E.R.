@@ -1,4 +1,5 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
+pub(crate) mod profile;
 pub(crate) mod rotation;
 pub(crate) mod store;
 mod tools;
@@ -494,6 +495,12 @@ async fn tool_loop(
         // #175: an oversized tool result reaches the model as a preview. The references above are
         // read from the whole filtered copy, so they still cover every ID the preview shows.
         let delivered = preview_tool_results(delivered, request.limits.tool_result_chars);
+        // #160: the menu is narrowed by the current authority and tool switches before every
+        // request, a retry included; revoked authority ends the turn here, as in `check_bound`.
+        let offered = request.tools.model_tools().map_err(|error| match error {
+            tools::CheckError::Revoked(_) => Failure::Cancelled,
+            tools::CheckError::Unavailable(reason) => Failure::Failed(reason),
+        })?;
         // #183: a capture the operator armed takes this request as `model_step` hands it to the
         // model client, which adds only the OpenAI wire framing.
         crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
@@ -501,7 +508,7 @@ async fn tool_loop(
                 delivered.clone(),
                 request.limits.image_input,
             ))
-            .with_tools(request.tools.model_tools());
+            .with_tools(offered.clone());
             serde_json::json!({
                 "model": request.route.model_name(),
                 "maxTokens": request.limits.max_tokens.saturating_sub(spent).min(4096),
@@ -512,7 +519,7 @@ async fn tool_loop(
             client,
             &request.route,
             delivered,
-            request.tools.model_tools(),
+            offered,
             request.limits.max_tokens.saturating_sub(spent),
             request.limits.image_input,
         );

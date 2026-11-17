@@ -2961,7 +2961,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             media: self.chat.as_ref().map(|c| c.media_parts.clone()).unwrap_or_default(),
             profile: if self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") { "closed-agent".into() } else { self.preset_chat.clone() }, route,
             limits: crate::harness::Limits::from_config(cfg),
-            tools: crate::harness::Tools::capture(&self.context, cfg, key, &self.turn_epoch)?,
+            tools: crate::harness::Tools::capture(&self.context, cfg, self.chat.as_ref().map_or("", |c| c.mode.as_str()), key, &self.turn_epoch)?,
             deadline: timeout,
         })?;
         self.dispatch_unsubmitted = false;

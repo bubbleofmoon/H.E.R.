@@ -1014,7 +1014,7 @@ mod tests {
             profile: "closed-agent".into(),
             route: crate::harness::ModelRoute::from_runtime(&context, &cfg).unwrap(),
             deadline: Duration::from_secs(10),
-            tools: crate::harness::Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(),
+            tools: crate::harness::Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation).unwrap(),
             limits: crate::harness::Limits::from_config(&cfg),
         };
         let store = crate::harness::store::Store::open(&context).unwrap();
@@ -1097,7 +1097,7 @@ mod tests {
                 profile: "closed-agent".into(),
                 route: crate::harness::ModelRoute::from_runtime(&context, &cfg).unwrap(),
                 deadline: Duration::from_secs(10),
-                tools: crate::harness::Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(),
+                tools: crate::harness::Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation).unwrap(),
                 limits: crate::harness::Limits::from_config(&cfg),
             })
             .unwrap();

@@ -91,6 +91,10 @@ _Avoid_: DSH, conversation engine, agent host, backend
 What runs the model work of one admitted turn for a conversation, DSH or the harness. HER keeps the turn's admission, its prompt and the delivery of its reply; the engine sends the prompt, follows the turn, stops it when it is cancelled and reports what happened.
 _Avoid_: backend (a CLI route), conversation engine
 
+**Mode profile (模式档案, `harness::profile`)**:
+What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it and who may use it. HER checks it when a turn is admitted and again before every tool call.
+_Avoid_: preset, tool whitelist, tool guard
+
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.
 _Avoid_: dependency (a process the supervisor runs), fork, vendor
