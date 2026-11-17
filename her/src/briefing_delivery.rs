@@ -21,20 +21,17 @@ pub(crate) const FORMAT: u64 = 1;
 
 /// The record a new session starts with: generation 0, nothing pending or installed.
 pub(crate) fn fresh(sid: &str, epoch: &str) -> Value {
-    todo!("#171 step 2");
     json!({"sid": sid, "epoch": epoch, "format": FORMAT, "generation": 0})
 }
 
 /// Whether `record` is the record of session `sid` in epoch `epoch`.
 pub(crate) fn belongs(record: &Value, sid: &str, epoch: &str) -> bool {
-    todo!("#171 step 2");
     record["sid"] == sid && record["epoch"] == epoch && record["format"] == FORMAT
 }
 
 /// Start the record of session (`sid`, `epoch`) unless `record` already is it. Every new session starts this way:
 /// its next wake carries a full briefing and no recall is held.
 pub(crate) fn begin(record: &mut Value, sid: &str, epoch: &str) {
-    todo!("#171 step 2");
     if !belongs(record, sid, epoch) {
         *record = fresh(sid, epoch);
     }
@@ -59,14 +56,12 @@ impl WakePlan {
     /// Whether section `name`, whose current hash is `hash` (`None`: the section is empty), differs from the
     /// installed briefing: a delta replaces or removes exactly these sections.
     pub fn changed(&self, name: &str, hash: Option<&str>) -> bool {
-        todo!("#171 step 2");
         self.installed.get(name).map(String::as_str) != hash
     }
 }
 
 /// Read the next wake's plan from the session's record.
 pub(crate) fn plan(record: &Value) -> WakePlan {
-    todo!("#171 step 2");
     let generation = record["generation"].as_u64().unwrap_or(0);
     let installed = &record["installed"];
     let current = installed["generation"].as_u64() == Some(generation);
@@ -103,7 +98,6 @@ pub(crate) fn hold(
     sections: &BTreeMap<&str, String>,
     recalled: &[i64],
 ) -> bool {
-    todo!("#171 step 2");
     if record["generation"].as_u64().unwrap_or(0) != plan.generation
         || (record["needsBriefing"] == true) != plan.needs_briefing
     {
@@ -124,7 +118,6 @@ pub(crate) fn hold(
 /// installed one when it is that prompt's and of the current generation, and "needs a full briefing again" clears; a
 /// foreign receipt, or a pending briefing of an earlier generation, changes nothing. Returns whether it installed.
 pub(crate) fn delivered(record: &mut Value, receipt: &str, seq: i64) -> bool {
-    todo!("#171 step 2");
     if record["pending"]["rpcId"].as_str() != Some(receipt) || record["pending"]["generation"] != record["generation"] {
         return false;
     }
@@ -139,7 +132,6 @@ pub(crate) fn delivered(record: &mut Value, receipt: &str, seq: i64) -> bool {
 /// dropped; a pending full briefing stays, because its delivery installs a full briefing anyway. A gap already
 /// reported through `through` or later changes nothing. Returns whether it asked for a full briefing.
 pub(crate) fn history_gap(record: &mut Value, through: i64) -> bool {
-    todo!("#171 step 2");
     if record["gapThrough"].as_i64().unwrap_or(0) >= through {
         return false;
     }
@@ -155,7 +147,6 @@ pub(crate) fn history_gap(record: &mut Value, through: i64) -> bool {
 /// for it, so the next wake carries a full briefing and holds no recall; a pending briefing of the old generation is
 /// dropped and can no longer be installed.
 pub(crate) fn next_generation(record: &mut Value) {
-    todo!("#171 step 2");
     record["generation"] = json!(record["generation"].as_u64().unwrap_or(0) + 1);
     record["pending"] = Value::Null;
     record["needsBriefing"] = json!(true);
