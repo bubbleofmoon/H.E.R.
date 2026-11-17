@@ -160,6 +160,14 @@ pub fn strip_chat_with_runtime(context: &crate::runtime::RuntimeContext, data: &
     strip_model_chat_data(data, &with_blacklist(context, cfg))
 }
 
+/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it would make a denied term
+/// (`settings::denied_in_text`) that `text` did not hold: then `None`, and the caller uses its accepted fallback.
+pub fn strip_checked(text: &str, delivery: &Value) -> Option<String> {
+    let stripped = strip_from_model_text(text, delivery);
+    let before = crate::settings::denied_in_text(text);
+    crate::settings::denied_in_text(&stripped).iter().all(|term| before.contains(term)).then_some(stripped)
+}
+
 /// Filter only the copy delivered to a model. Transport codes and media markers are atoms.
 pub fn strip_from_model_text(text: &str, cfg: &Value) -> String {
     let Some(items) = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array) else {

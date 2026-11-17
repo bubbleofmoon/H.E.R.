@@ -76,10 +76,7 @@ pub(crate) fn model_text(context: &crate::runtime::RuntimeContext, cfg: &Value, 
         return String::new();
     };
     let delivery = crate::model_view::with_blacklist(context, cfg);
-    let visible = |text: &str| {
-        let stripped = crate::model_view::strip_from_model_text(text, &delivery);
-        crate::settings::denied_in_text(&stripped).is_empty().then_some(stripped)
-    };
+    let visible = |text: &str| crate::model_view::strip_checked(text, &delivery);
     visible(&text(cfg, key))
         .or_else(|| {
             crate::settings::last_good_text(context, key, |candidate| visible(candidate).is_some())

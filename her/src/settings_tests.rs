@@ -2339,6 +2339,29 @@ fn prompt_text_rule_a_strip_turns_into_a_denied_term_falls_back_to_the_last_good
 }
 
 #[test]
+fn prompt_text_sticker_rules_a_strip_turns_into_a_denied_term_fall_back_to_the_default() {
+    let (root, context) = prompt_fixture("prompt text sticker strip denied");
+    let (status, body) = set_text(&context, "prompt.stickerStrategy", json!("【表情包策略】D鲸SH 140"));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = set_text(&context, "prompt.stickerSoften", json!("【用表情缓和语气】D鲸SH 140"));
+    assert_eq!(status, 200, "{body}");
+    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
+    // The strategy is printed without a sticker inventory; the strip's `DSH` never reaches the model, the default does.
+    let text = next_render(&context);
+    assert!(!text.contains("DSH") && text.contains(crate::prompt_text::STICKER_STRATEGY), "{text}");
+    // The softening rule is printed only with an inventory, so it is checked directly.
+    let config = context.load_config_document().unwrap();
+    assert_eq!(
+        crate::prompt_text::model_text(&context, &config, crate::prompt_text::STICKER_SOFTEN_KEY),
+        crate::prompt_text::STICKER_SOFTEN
+    );
+    assert_eq!(
+        crate::prompt_text::model_text(&context, &config, crate::prompt_text::STICKER_STRATEGY_KEY),
+        crate::prompt_text::STICKER_STRATEGY
+    );
+}
+
+#[test]
 fn prompt_text_works_on_a_store_written_before_it() {
     // A store as #146 wrote it: schema version 1 with integer rows only. No migration is needed.
     let (root, context) = prompt_fixture("prompt text old store");

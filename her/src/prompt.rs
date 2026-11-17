@@ -236,6 +236,14 @@ pub fn initial_prompt_line_with_runtime(
     }
     crate::initial_prompts::format_injection(context, cfg, key)
 }
+
+/// The nickname as the model may read it: the model-view strip applied, or empty (the unknown-nickname wording) when the
+/// strip would make it a denied term.
+fn checked_nickname(context: &RuntimeContext, cfg: &Value, name: &str) -> String {
+    let delivery = crate::model_view::with_blacklist(context, cfg);
+    crate::model_view::strip_checked(name, &delivery).unwrap_or_default()
+}
+
 /// 身份行（对应 JS 的 selfIdentityTextV2）。
 pub fn identity_line(name: &str, qq: &str) -> String {
     if name.is_empty() && qq.is_empty() {
@@ -285,16 +293,21 @@ pub fn sticker_line(cfg: &Value) -> String {
 }
 
 pub fn sticker_line_with_runtime(context: &RuntimeContext, cfg: &Value) -> String {
-    let (enabled, include, _total, sticker_context, strategy) =
+    let (enabled, include, _total, sticker_context, _strategy) =
         sticker_parts_with_runtime(context, cfg);
     if !enabled || !include {
         return String::new();
     }
+    // Each rule is checked after the model-view strip (`prompt_text::model_text`). The inventory holds stored notes and
+    // names; a strip that would make it a denied term leaves it out.
+    let delivery = crate::model_view::with_blacklist(context, cfg);
+    let sticker_context = crate::model_view::strip_checked(&sticker_context, &delivery).unwrap_or_default();
+    let strategy = crate::prompt_text::model_text(context, cfg, crate::prompt_text::STICKER_STRATEGY_KEY);
     // The softening rule points at the inventory, so it is only printed with one. An emptied text (#140) is left out.
     let soften = if sticker_context.is_empty() {
         String::new()
     } else {
-        crate::prompt_text::text(cfg, crate::prompt_text::STICKER_SOFTEN_KEY)
+        crate::prompt_text::model_text(context, cfg, crate::prompt_text::STICKER_SOFTEN_KEY)
     };
     let parts: Vec<&str> = [strategy.trim_end(), soften.trim_end(), sticker_context.as_str()]
         .into_iter()
@@ -1097,7 +1110,7 @@ pub fn build_reminder_with_runtime(
     // 角色行必须在最前（JS 的 roleLine）：有角色卡的会话，提醒里也得先报身份，
     // 否则模型可能在"没有角色"的语境下收尾。之前漏了这一段。
     out.push_str(&role_line_with_runtime(context, key));
-    out.push_str(&identity_line(self_name, self_qq));
+    out.push_str(&identity_line(&checked_nickname(context, &cfg, self_name), self_qq));
     out.push_str(&token_line(token));
     out.push_str(&format!(
         "【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。"
@@ -1240,7 +1253,7 @@ fn build_inner(
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
     out.push_str(&identity_core(context, &cfg, key));
-    out.push_str(&identity_line(self_name, self_qq));
+    out.push_str(&identity_line(&checked_nickname(context, &cfg, self_name), self_qq));
     out.push_str(&token_line(token));
     let initial = initial_prompt_line_with_runtime(context, &cfg, key, reason);
     if !initial.is_empty() {
@@ -2070,10 +2083,13 @@ pub(crate) fn prepare_dsh_wake_layered(
         Section::parts("wakeWords", None, vec![crate::wake_words::briefing_line(context,key,st)]),
     ], &crate::briefing::Budgets::from_cfg(cfg));
     let mut sections = assembly.sections.clone();
-    // The behaviour rules are stripped and checked one by one in `prompt_text::behaviour`; stripping them again could
-    // make a new match, so that section is skipped here.
+    // The behaviour rules and the sticker texts are stripped and checked one by one (`prompt_text::model_text`), and
+    // stripping them again could make a new match, so those sections are skipped here. Every other section is stripped
+    // once; one the strip would turn into a denied term is left empty.
     for (name, text) in sections.iter_mut() {
-        if *name != "behaviour" { *text = crate::model_view::strip_from_model_text(text,cfg); }
+        if *name != "behaviour" && *name != "stickers" {
+            *text = crate::model_view::strip_checked(text, cfg).unwrap_or_default();
+        }
     }
     after_sections();
     let hashes: BTreeMap<&str,String> = sections.iter().filter(|(_,v)| !v.is_empty())
