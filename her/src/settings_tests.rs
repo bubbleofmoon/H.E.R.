@@ -2602,6 +2602,43 @@ fn audit_undo_keeps_a_stored_value_and_its_write_back() {
 }
 
 #[test]
+fn audit_undo_survives_a_write_back_into_a_null_parent() {
+    // A null on a registry pointer's path reads as absent: the write-back turns it into an object, and that is no
+    // later change of the file the audit record describes.
+    let cases: [(&str, &str, Value); 4] = [
+        ("/webSearch", "webSearch.model", json!("model-x")),
+        ("/harness", "harness.model", json!("model-x")),
+        ("/memory", "memory.digest.model", json!("model-x")),
+        ("/socialV2/reply", QUIET_KEY, json!(4500)),
+    ];
+    for (null_at, key, value) in cases {
+        let (root, context) = settings_fixture("settings audit undo null parent");
+        write_config(&root, |config| {
+            let mut slot = config;
+            for name in null_at.split('/').skip(1) {
+                slot = &mut slot[name];
+            }
+            *slot = Value::Null;
+        });
+        let (status, reply) =
+            admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"autoReplyCheckMs": 4000})));
+        assert_eq!(status, 200, "{null_at}: {reply}");
+        assert_eq!(stored_config(&root).pointer(null_at), Some(&Value::Null), "{null_at}: the console write keeps the null");
+        let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+        assert_eq!(status, 200, "{recent}");
+        let entry = recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()
+            ["id"]
+            .clone();
+        let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&json!({"setting": key, "value": value})));
+        assert_eq!(status, 200, "{key}: {body}");
+        assert!(stored_config(&root).pointer(null_at).is_some_and(Value::is_object), "{null_at}: the write-back made an object");
+        let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry})));
+        assert_eq!(status, 200, "{null_at}: {reply}");
+        assert_ne!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 4000, "{null_at}: the console member is restored");
+    }
+}
+
+#[test]
 fn audit_undo_of_a_console_write_survives_a_later_settings_write_back() {
     // A settings write rewrites config.json with no audit record of its own; the audit undo of an earlier console
     // write must still apply, because registry members belong to the store and are never undone through the audit.
