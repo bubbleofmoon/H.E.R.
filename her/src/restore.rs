@@ -51,7 +51,7 @@ struct Prepared {
 fn location(name: &str) -> Result<(RuntimeArea, String), String> {
     let simple = |s: &str| !s.is_empty() && !s.contains(['/', '\\', ':']) && s != "." && s != "..";
     match name {
-        "memory.db" | "conversations.db" => Ok((RuntimeArea::Data, name.into())),
+        "memory.db" | "conversations.db" | "settings.db" => Ok((RuntimeArea::Data, name.into())),
         "config.json" => Ok((RuntimeArea::Config, "config.json".into())),
         "说明.md" => Ok((RuntimeArea::Resources, name.into())),
         _ if name.starts_with("state/") => {
@@ -87,6 +87,51 @@ fn label(area: RuntimeArea, relative: &str) -> String {
     )
 }
 
+/// How long a restore retries removing a file another process holds open. The supervisor keeps running through a
+/// restore and reads `settings.db` through the configuration loader, and Windows refuses to remove a file SQLite has
+/// open. The replacement retries the same violations for the same time (`guarded_file::Staged::commit`).
+const OPEN_FILE_WAIT: Duration = Duration::from_secs(1);
+
+/// Runs `operation` again while it fails with a Windows access, sharing or lock violation (OS errors 5, 32 and 33)
+/// and `deadline` has not passed. `windows` is `cfg!(windows)` outside the policy test, so other hosts try once.
+fn retry_open_file(
+    windows: bool,
+    deadline: Instant,
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    loop {
+        match operation() {
+            Err(error)
+                if windows
+                    && matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Removes a runtime file as `RuntimeContext::remove_file` does (the path resolved twice and compared), retrying
+/// while another process holds it open (`retry_open_file`). A file that is already gone counts as removed.
+fn remove_runtime_file(
+    context: &RuntimeContext,
+    area: RuntimeArea,
+    relative: &str,
+) -> Result<(), String> {
+    let path = context.resolve_path(area, relative, PathIntent::ReadOptionalFile)?;
+    if context.resolve_path(area, relative, PathIntent::ReadOptionalFile)? != path {
+        return Err("runtime path is unavailable".into());
+    }
+    match retry_open_file(cfg!(windows), Instant::now() + OPEN_FILE_WAIT, || {
+        fs::remove_file(&path)
+    }) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result.map_err(|e| format!("cannot remove runtime file: {e}")),
+    }
+}
+
 fn current_files(
     context: &RuntimeContext,
     memory_only: bool,
@@ -98,6 +143,12 @@ fn current_files(
     let conversations = crate::backup::conversation_db_path(context)?;
     if conversations.try_exists().map_err(|e| e.to_string())? {
         files.insert("conversations.db".into(), location("conversations.db")?);
+    }
+    if crate::settings::store_path(context)?
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        files.insert("settings.db".into(), location("settings.db")?);
     }
     files.insert("config.json".into(), location("config.json")?);
     let data = context.resolve_path(RuntimeArea::Data, "", PathIntent::ReadDirectory)?;
@@ -300,6 +351,8 @@ trait Control {
     }
     fn health(&mut self, context: &RuntimeContext, budget: Duration) -> Result<(), String>;
     fn alert(&mut self, context: &RuntimeContext, config: &Value, reason: &str);
+    /// Called after the settings files are replaced and removed, before conversation reconciliation.
+    fn store_replaced(&mut self, _context: &RuntimeContext) {}
     fn replace(
         &mut self,
         context: &RuntimeContext,
@@ -531,28 +584,74 @@ fn resume(context: &RuntimeContext, by: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why `stop_and_replace` ended. `Refused` is the settings store gate that could not be had: the owners were stopped,
+/// no file was touched, and there is nothing to roll back.
+enum Step {
+    Refused(String),
+    Failed(String),
+}
+impl From<String> for Step {
+    fn from(message: String) -> Self {
+        Step::Failed(message)
+    }
+}
+impl Step {
+    fn message(self) -> String {
+        match self {
+            Step::Refused(message) | Step::Failed(message) => message,
+        }
+    }
+}
+
+/// Stops the writers, replaces the files, then reconciles conversations while the stopped owners are still held. A
+/// full restore takes the settings store gate last: after the stop has taken the task gates and the owner gates, and
+/// right before the first file is touched. It holds that gate through the settings file cleanup, replacement and
+/// removal and releases it before reconciliation, which takes configuration gates. A task waits for a configuration
+/// gate while it holds its task gate, and a settings writer waits for the store gate while it holds a configuration
+/// gate, so the one order is task gate, then configuration gate, then store gate; nothing waits for another gate while it
+/// holds the store gate.
+fn stop_and_replace(
+    context: &RuntimeContext,
+    by: &str,
+    prepared: &Prepared,
+    memory_only: bool,
+    control: &mut dyn Control,
+) -> Result<(), Step> {
+    let stopped = quiesce(context, by, control)?;
+    let store = if memory_only {
+        None
+    } else {
+        Some(crate::settings::restore_gate(context).map_err(Step::Refused)?)
+    };
+    apply(context, prepared, memory_only, control)?;
+    drop(store);
+    control.store_replaced(context);
+    if !memory_only && prepared.files.contains_key("conversations.db") {
+        reconcile_conversations(context)?;
+    }
+    drop(stopped);
+    Ok(())
+}
+
 fn apply(
     context: &RuntimeContext,
     prepared: &Prepared,
     memory_only: bool,
     control: &mut dyn Control,
 ) -> Result<(), String> {
-    // A stopped writer must not leave an old WAL to replay against the replacement database.
+    // A stopped writer must not leave an old WAL to replay against the replacement database. A reader in a process
+    // the restore does not stop may hold a file open for a moment; removals retry that (`remove_runtime_file`).
     crate::memory::db_path_for_runtime(context)?;
     let databases: &[&str] = if memory_only {
         &["memory.db"]
     } else {
         crate::backup::conversation_db_path(context)?;
-        &["memory.db", "conversations.db"]
+        crate::settings::store_path(context)?;
+        &["memory.db", "conversations.db", "settings.db"]
     };
     for database in databases {
         for suffix in ["-wal", "-shm", "-journal"] {
-            let name = format!("{database}{suffix}");
-            let path =
-                context.resolve_path(RuntimeArea::Data, &name, PathIntent::ReadOptionalFile)?;
-            if path.exists() {
-                context.remove_file(RuntimeArea::Data, &name)?;
-            }
+            remove_runtime_file(context, RuntimeArea::Data, &format!("{database}{suffix}"))?;
         }
     }
     let current = current_files(context, memory_only)?;
@@ -574,11 +673,8 @@ fn apply(
             continue;
         }
         if !prepared.files.contains_key(&name) {
-            context.remove_file(area, &relative)?;
+            remove_runtime_file(context, area, &relative)?;
         }
-    }
-    if !memory_only && prepared.files.contains_key("conversations.db") {
-        reconcile_conversations(context)?;
     }
     Ok(())
 }
@@ -767,23 +863,32 @@ fn execute_with(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
         let rollback = Prepared::open(context, &previous, memory_only)?;
-        let attempt = (|| {
-            let stopped = quiesce(context, by, control)?;
-            apply(context, &prepared, memory_only, control)?;
-            drop(stopped);
+        let attempt = (|| -> Result<(), Step> {
+            stop_and_replace(context, by, &prepared, memory_only, control)?;
             resume(context, by)?;
             control.restart(context)?;
             control.health(context, Duration::from_secs(120))?;
-            crate::backup::protect_pre_restore(&previous, &|| Ok(()))
+            Ok(crate::backup::protect_pre_restore(&previous, &|| Ok(()))?)
         })();
         match attempt {
             Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
-            Err(reason) => {
+            Err(Step::Refused(reason)) => {
+                // The settings store gate was not had: the owners are stopped and nothing was replaced, so there is
+                // nothing to roll back; start them again.
+                let started = resume(context, by).and_then(|()| control.restart(context));
+                let detail = match started {
+                    Ok(()) => format!("Restore refused after stopping, nothing changed: {reason}"),
+                    Err(error) => format!(
+                        "Restore refused after stopping, nothing changed: {reason}; the bridge could not be started again: {error}"
+                    ),
+                };
+                control.alert(context, &config, &detail);
+                Err(detail)
+            }
+            Err(Step::Failed(reason)) => {
                 // Always re-quiesce; a failed health check may leave live writers running.
                 let undo = (|| {
-                    let stopped = quiesce(context, by, control)?;
-                    apply(context, &rollback, memory_only, control)?;
-                    drop(stopped);
+                    stop_and_replace(context, by, &rollback, memory_only, control).map_err(Step::message)?;
                     resume(context, by)?;
                     control.restart(context)?;
                     crate::backup::protect_pre_restore(&previous, &|| Ok(()))
@@ -1171,6 +1276,17 @@ mod tests {
         health_error: Option<String>,
         fail_rollback_stop: bool,
         leave_conversation_sidecars: bool,
+        leave_settings_sidecars: bool,
+        fail_relative: Option<&'static str>,
+        replaced: Vec<String>,
+        probe_settings_write: bool,
+        settings_probe: Option<Result<(), u16>>,
+        writer_takes_gate_during_stop: bool,
+        writer_hold: Option<fs::File>,
+        store_free_at_stop: Vec<bool>,
+        restarts: usize,
+        probe_store_replaced: bool,
+        settings_after_replace: Option<Result<(), u16>>,
     }
     impl Control for FakeControl {
         fn preflight(&mut self, _: &RuntimeContext) -> Result<(), String> {
@@ -1178,6 +1294,17 @@ mod tests {
         }
         fn stop(&mut self, context: &RuntimeContext, _: u64) -> Result<(), String> {
             self.stops += 1;
+            // The store gate is free while the restore waits for the owners and the task gates (a stop is the first
+            // of those waits); a writer that takes it now holds it until the restore gives up.
+            match context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock") {
+                Ok(gate) => {
+                    self.store_free_at_stop.push(true);
+                    if self.writer_takes_gate_during_stop {
+                        self.writer_hold = Some(gate);
+                    }
+                }
+                Err(_) => self.store_free_at_stop.push(false),
+            }
             if self.leave_conversation_sidecars && self.stops == 1 {
                 for suffix in ["-wal", "-shm", "-journal"] {
                     fs::write(
@@ -1186,6 +1313,18 @@ mod tests {
                             .unwrap()
                             .join(format!("data/conversations.db{suffix}")),
                         b"stale conversation sidecar",
+                    )
+                    .unwrap();
+                }
+            }
+            if self.leave_settings_sidecars && self.stops == 1 {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    fs::write(
+                        context
+                            .runtime_root()
+                            .unwrap()
+                            .join(format!("data/settings.db{suffix}")),
+                        b"stale settings sidecar",
                     )
                     .unwrap();
                 }
@@ -1207,6 +1346,19 @@ mod tests {
                 Ok(())
             }
         }
+        fn restart(&mut self, _: &RuntimeContext) -> Result<(), String> {
+            self.restarts += 1;
+            Ok(())
+        }
+        fn store_replaced(&mut self, context: &RuntimeContext) {
+            if self.probe_store_replaced {
+                self.settings_after_replace = Some(
+                    crate::settings::apply(context, "reply.wakeQuietMs", &json!(4321), "probe", "console")
+                        .map(|_| ())
+                        .map_err(|(status, _)| status),
+                );
+            }
+        }
         fn alert(&mut self, _: &RuntimeContext, _: &Value, reason: &str) {
             self.alerts.push(reason.into());
         }
@@ -1218,7 +1370,19 @@ mod tests {
             input: &mut dyn Read,
         ) -> Result<(), String> {
             self.writes += 1;
-            if self.fail_write == Some(self.writes) {
+            self.replaced.push(label(area, relative));
+            if self.probe_settings_write && self.settings_probe.is_none() {
+                self.settings_probe = Some(
+                    crate::settings::apply(context, "reply.wakeQuietMs", &json!(4321), "probe", "console")
+                        .map(|_| ())
+                        .map_err(|(status, _)| status),
+                );
+            }
+            let fail_relative = self.fail_relative.is_some_and(|name| name == relative);
+            if fail_relative {
+                self.fail_relative = None;
+            }
+            if self.fail_write == Some(self.writes) || fail_relative {
                 struct Interrupted<'a>(&'a mut dyn Read, bool);
                 impl Read for Interrupted<'_> {
                     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -2316,4 +2480,6 @@ mod tests {
         assert_eq!(ordinary_path(Path::new(r"\\?\UNC\srv\share\a.zip")), r"\\srv\share\a.zip");
         assert_eq!(ordinary_path(Path::new(r"\\?\GLOBALROOT\x")), r"\\?\GLOBALROOT\x");
     }
+
+    include!("restore_settings_tests.rs");
 }
