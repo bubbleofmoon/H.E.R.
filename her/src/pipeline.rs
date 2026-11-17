@@ -1532,6 +1532,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
+        if !self.has_dsh() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         self.failure_reported = false;
         self.refusals_recorded.clear();
         self.active_candidate = None;
@@ -2266,6 +2269,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     ///
     /// **先订阅再投递**：反过来的话回合可能在订阅建立前就结束，实时流不重放。
     pub async fn ask(&mut self, key: &str, prompt: &str, timeout_secs: u64) -> Result<String, String> {
+        if !self.has_dsh() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         let sid = self.ensure_session(key)?;
         self.prepare_title();
         let mut follow = FollowStream::open(&self.rpc.base, &self.rpc.cookie(), &sid).await?;

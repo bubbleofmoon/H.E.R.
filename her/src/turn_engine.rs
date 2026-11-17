@@ -178,6 +178,7 @@ impl Facts {
 }
 
 /// The scripted test adapter: every admitted turn answers `reply` and records what it was asked.
+/// Limit: it never observes cancellation or the turn deadline, so its facts never name a cancel reason.
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct Script {
