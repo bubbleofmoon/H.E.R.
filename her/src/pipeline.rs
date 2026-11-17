@@ -1542,7 +1542,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Err(error) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
                 && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
-                && !error.contains("preset") && !error.contains("预设") {
+                && !error.contains("preset") && !error.contains("预设")
+                // #179: a guard refusal (here a session creation it stopped) is the guard's own alert, not a model failure.
+                && !error.contains(crate::dsh_profile::REFUSAL_PREFIX) {
                 let candidate = self.active_candidate.clone().unwrap_or_else(|| failover::model_chain_for(cfg, key)[0].clone());
                 self.report_backend_failure(cfg, key, "dsh", &candidate.provider, &candidate.model, "", error);
             }
@@ -1719,6 +1721,12 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if crate::dsh_health::is_down(&self.context) {
             return Err("DSH 不可用，未提交到 DSH".to_string());
         }
+        // #179: while a guarded DSH profile row is missing the turn is refused before any DSH call; the guard alerts
+        // the owner itself, so no model-failure alert follows.
+        if let Err(error) = crate::dsh_profile::admit(&self.context) {
+            self.failure_reported = true;
+            return Err(error);
+        }
         // 按会话取候选链：这个群配了独立模型就用它的，否则回落全局。
         seg_cli = t0.elapsed().as_millis() as i64;
         let chain = failover::model_chain_for(cfg, key);
@@ -1851,6 +1859,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             let submitted: Result<(), Submit> = match sent {
                 Ok(v) if v.get("accepted").and_then(|a| a.as_bool()) == Some(true) => Ok(()),
                 Ok(v) => Err(Submit::Refused(format!("prompt 未被接受：{v}"))),
+                Err(e) if e.starts_with(crate::dsh_profile::REFUSAL_PREFIX) => {
+                    // #179: the guard refused the prompt before it left (a profile row went missing since the check
+                    // above); nothing was submitted, and no other candidate may try.
+                    follow.close().await;
+                    self.failure_reported = true;
+                    return Err(e);
+                }
                 Err(e) if !prompt_error_needs_probe(self.cur_turn.is_some(), &e) => {
                     Err(Submit::Refused(format!("prompt 调用失败：{e}")))
                 }
@@ -2942,6 +2957,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let mut turn = harness.admit(TurnRequest {
             id: recorder.id.clone(), conversation: key.to_string(), generation: self.turn_epoch.clone(),
             prompt: prompt.to_string(),
+            // The media parts `run_chat_turn` acquired for this turn: the ones DSH would get.
+            media: self.chat.as_ref().map(|c| c.media_parts.clone()).unwrap_or_default(),
             profile: if self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") { "closed-agent".into() } else { self.preset_chat.clone() }, route,
             limits: crate::harness::Limits::from_config(cfg),
             tools: crate::harness::Tools::capture(&self.context, cfg, self.chat.as_ref().map_or("", |c| c.mode.as_str()), key, &self.turn_epoch)?,
