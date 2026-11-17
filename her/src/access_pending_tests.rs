@@ -76,7 +76,7 @@ fn t192_a_crash_between_the_write_and_the_revocation_is_finished_at_console_star
     assert_eq!(recorded.len(), 1, "the revocation was recorded before the write: {recorded:?}");
     assert_eq!(recorded[0]["why"], "access-revoked");
     assert_eq!(recorded[0]["mode"], "reserved2");
-    assert_eq!(recorded[0]["before"]["allow"]["groups"], json!([420042]));
+    assert_eq!(recorded[0]["before"]["allow"]["groups"], json!(["420042"]));
     assert_eq!(recorded[0]["after"]["allow"]["groups"], json!([]));
     // Console start finishes it.
     let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
