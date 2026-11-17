@@ -73,6 +73,10 @@ A new release running beside the current one, before it is made current, so its 
 **Update policy (更新策略)**:
 The administrator's setting for bridge releases: off, notify (ask before installing) or auto. Dependencies always need approval.
 
+**Live setting (实时设置)**:
+An owner-tunable value kept in the settings store (`settings.db`), checked against its one registry definition and recorded with every change; the next use reads it without a restart.
+_Avoid_: config key (a member of `config.json`), preference
+
 **Health check (健康检查)**:
 The single definition of "running": desired state running, supervisor alive, and console, SnowLuma, the configured model relay and DSH all healthy, including a working DSH login. People, scripts and the updater share it.
 

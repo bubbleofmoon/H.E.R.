@@ -990,13 +990,14 @@ impl RuntimeContext {
         Ok(self.overlay_config(file))
     }
 
-    /// The one place stored settings are applied over the parsed `config.json`; the settings store plugs in here.
-    /// Without a settings store the file is the configuration.
+    /// The one place stored settings are applied over the parsed `config.json`: the values in `data/settings.db`
+    /// (`settings::overlay`). A legacy context and a runtime without a settings store read the file as it is.
     pub(crate) fn overlay_config(&self, file: Value) -> Value {
-        apply_settings_overlay(file)
+        apply_settings_overlay(crate::settings::overlay(self, file))
     }
 
-    /// The change stamp of the stored `config.json` (`ConfigStamp`); the path checks of the loader apply.
+    /// The change stamp of the stored `config.json` (`ConfigStamp`); the path checks of the loader apply. It does not
+    /// see the settings store: no value under a registry setting's pointer is cached on it (registry test).
     pub fn config_stamp(&self) -> Result<ConfigStamp, &'static str> {
         let path = self.resolve_path(RuntimeArea::Config, "config.json", PathIntent::ReadFile)?;
         let metadata = fs::metadata(path).map_err(|_| "runtime config metadata is unavailable")?;
@@ -1215,6 +1216,7 @@ impl RuntimeContext {
             || (method == "POST" && path == "/api/memory/archive")
             || (method == "GET" && path == "/personas")
             || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
+            || (matches!(method, "GET" | "POST") && crate::console_settings::is_route(path))
             || path.strip_prefix("/api/slang/").is_some_and(|tail| {
                 let parts: Vec<&str> = tail.split('/').collect();
                 match (method, parts.as_slice()) {
@@ -1270,13 +1272,13 @@ impl RuntimeContext {
     }
 }
 
-/// Without a settings store nothing is applied over the file.
+/// Outside unit tests the settings store's overlay is the whole overlay.
 #[cfg(not(test))]
 fn apply_settings_overlay(file: Value) -> Value {
     file
 }
 
-/// Applies this thread's `with_config_overlay` values over the file.
+/// Applies this thread's `with_config_overlay` values over the file and the stored settings.
 #[cfg(test)]
 fn apply_settings_overlay(mut file: Value) -> Value {
     CONFIG_OVERLAY_TEST_VALUES.with(|values| {
