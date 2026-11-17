@@ -7,8 +7,10 @@
 //!
 //! Adapters: DSH (`Adapter::Dsh`: DSH sessions, model failover and the follow-stream collector in
 //! `pipeline/dsh_adapter.rs`), the harness (`Adapter::Harness`, `harness.rs`) and, in tests, the
-//! scripted adapter (`Script`). Retiring DSH deletes `Engine::Dsh`, `Adapter::Dsh`, the
-//! `pipeline::dsh_adapter` module and its registration points in `pipeline.rs`.
+//! scripted adapter (`Script`). `pipeline.rs` still sets up the DSH client (`Rpc`) and the other
+//! DSH fields in `Pipeline::build` until #13 removes DSH. Retiring DSH deletes `Engine::Dsh`,
+//! `Adapter::Dsh`, the `pipeline::dsh_adapter` module, its registration points in `pipeline.rs`
+//! and that setup.
 
 use serde_json::Value;
 
