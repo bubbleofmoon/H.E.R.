@@ -298,6 +298,12 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
 /// The reply's reason when the running live owner serves another list than `rollout.rustGroups`.
 const LIVE_RESTART_REASON: &str = "the live process serves the --live-groups list it was started with; the supervisor's watchdog restarts it with rollout.rustGroups on its next run (every two minutes), or run the watchdog task now (Schedule page, POST /api/tasks/watchdog/run)";
 
+/// #186 test seam: runs inside `conversation_scope` between its fresh read of `config.json` and its write, with the
+/// conversation key (so a test can hold one change there while another starts).
+#[cfg(test)]
+pub(super) static SCOPE_AFTER_READ: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
 /// #186: admit (`"action":"admit"`) or remove (`"action":"remove"`) one conversation (`"conversation"`: `group:<id>`
 /// or `private:<id>`) in both keys that decide whether it is answered: its allow list (`allow.groups` or
 /// `allow.private`) and `rollout.rustGroups`. One read-modify-write of `config.json` under the gates of
@@ -322,11 +328,20 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
             .is_some_and(|listed| listed == key)
     };
     let served_same = |value: &Value| value.as_str().and_then(canonical_v2_key).is_some_and(|served| served == key);
-    let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
+    // #186 FR-1 temporary mutation: no closed-agent interaction gate (reverted in FR-2).
+    let interaction = std::fs::File::open(context.config_file()).map_err(|_| (503, "FR-1 mutation".to_string()))?;
     let (before, after, changed) = {
-        let _gate = acquire_social_state_gate(context)?;
+        // #186 FR-1 temporary mutation: no social gate (reverted in FR-2).
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         let mut file = read_config_object(context)?;
+        #[cfg(test)]
+        {
+            // Bound first, so the hook never runs while the seam's own lock is held.
+            let hook = SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            if let Some(hook) = hook {
+                hook(&key);
+            }
+        }
         let Some(mut served) = file.pointer("/rollout/rustGroups").and_then(Value::as_array).cloned() else {
             return Err((409, "rollout.rustGroups is not configured: the supervisor serves only that explicit list".to_string()));
         };

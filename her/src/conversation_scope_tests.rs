@@ -206,27 +206,54 @@ fn t186_cli_entry_waits_for_background_session_stops_within_its_limit() {
 
 #[test]
 fn t186_concurrent_admits_lose_no_update() {
+    use std::time::Duration;
     let (root, context) = scoped(
         "t186 concurrent",
         json!({"allow": {"groups": [], "private": []}, "rollout": {"enabled": true, "rustGroups": []}}),
     );
-    let keys = ["group:420051", "group:420052", "group:420053", "group:420054"];
-    std::thread::scope(|threads| {
-        for key in keys {
-            let context = context.clone();
-            threads.spawn(move || {
-                let reply = conversation_scope_change(&context, key, "admit").expect("each admit applies");
-                assert_eq!(reply["changed"], json!(["allow.groups", "rollout.rustGroups"]), "{reply}");
-            });
+    // The first admit stops between its read and its write until released; the second reports when it has read.
+    let (first_read_tx, first_read) = std::sync::mpsc::channel::<()>();
+    let (second_read_tx, second_read) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release) = std::sync::mpsc::channel::<()>();
+    let release = std::sync::Mutex::new(release);
+    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| match key {
+        "group:420051" => {
+            first_read_tx.send(()).unwrap();
+            let _ = release.lock().unwrap_or_else(|p| p.into_inner()).recv_timeout(Duration::from_secs(10));
         }
+        "group:420052" => {
+            let _ = second_read_tx.send(());
+        }
+        _ => {}
+    }));
+    let (first, second, second_read_early) = std::thread::scope(|threads| {
+        let first_context = context.clone();
+        let first = threads.spawn(move || conversation_scope_change(&first_context, "group:420051", "admit"));
+        first_read.recv_timeout(Duration::from_secs(10)).expect("the first admit reached the point between its read and its write");
+        let second_context = context.clone();
+        let mut second = Some(threads.spawn(move || conversation_scope_change(&second_context, "group:420052", "admit")));
+        // Serialized, the second admit waits on the gates and cannot read yet; unserialized it reads the old file now.
+        let second_read_early = second_read.recv_timeout(Duration::from_secs(2)).is_ok();
+        // Unserialized: let the second write land first, so the held first write is the stale one.
+        let early = if second_read_early { Some(second.take().unwrap().join().unwrap()) } else { None };
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second = match early {
+            Some(result) => result,
+            None => second.take().unwrap().join().unwrap(),
+        };
+        (first, second, second_read_early)
     });
+    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let config = file(&root);
-    assert_eq!(config["allow"]["groups"].as_array().unwrap().len(), 4, "{config}");
-    assert_eq!(config["rollout"]["rustGroups"].as_array().unwrap().len(), 4, "{config}");
-    let effective = context.load_config().unwrap();
-    for key in keys {
-        assert!(inbound_admitted(&effective, key), "{key}");
-        assert!(config["rollout"]["rustGroups"].as_array().unwrap().contains(&json!(key)), "{key}");
+    for key in ["group:420051", "group:420052"] {
+        assert!(config["rollout"]["rustGroups"].as_array().unwrap().contains(&json!(key)), "a concurrent admit lost an update: {key} {config}");
+        assert!(inbound_admitted(&context.load_config().unwrap(), key), "a concurrent admit lost an update: {key} {config}");
+    }
+    assert_eq!(config["allow"]["groups"], json!([420051, 420052]), "the second admit read after the first one wrote");
+    assert!(!second_read_early, "the second admit read the configuration while the first was between its read and its write");
+    for reply in [first, second] {
+        assert_eq!(reply.expect("each admit applies")["changed"], json!(["allow.groups", "rollout.rustGroups"]));
     }
 }
 

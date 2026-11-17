@@ -1978,6 +1978,61 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// #186: the administrator adds `deny` for one group and keeps it in `allow`.
+    fn t186_deny_keeping_allow(root: &std::path::Path, group: i64) {
+        let path = root.join("config/config.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        cfg["deny"] = json!({"groups": [group]});
+        std::fs::write(&path, cfg.to_string()).unwrap();
+    }
+
+    /// #186: a wake queued while the conversation was allowed never dispatches once it is denied (allow unchanged).
+    /// The allowed run is the control: the same queue dispatches.
+    #[tokio::test]
+    async fn t186_a_wake_queued_while_allowed_does_not_dispatch_once_denied() {
+        for denied in [false, true] {
+            let (root, mut hub) = queued_hub(if denied { "t186-tick-denied" } else { "t186-tick-allowed" }).await;
+            let key = "group:420042";
+            hub.ready = vec![(key.into(), "timeout".into())];
+            hub.awaiting.clear();
+            let mut state = hub.state().unwrap();
+            state["conversations"][key]["wakeConfig"]["infinite"] = json!(false);
+            state["conversations"][key]["wakeConfig"]["sleepUntil"] = json!("2000-01-01T00:00:00.000Z");
+            hub.context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+            if denied {
+                t186_deny_keeping_allow(&root, 420042);
+            }
+            hub.tick("bot", 9001).await.unwrap();
+            let dispatched = hub.active.contains_key(key);
+            for active in hub.active.values() {
+                active.task.abort();
+            }
+            drop(hub);
+            std::fs::remove_dir_all(root).unwrap();
+            assert_eq!(dispatched, !denied, "denied={denied}: a queued wake must dispatch only while the conversation is admitted");
+        }
+    }
+
+    /// #186: wake claims and wake snapshots refuse a denied conversation whose allow entry stays.
+    #[tokio::test]
+    async fn t186_wake_claims_and_wake_snapshots_refuse_a_denied_conversation() {
+        let (root, hub) = queued_hub("t186-deny-claim").await;
+        let key = "group:420042";
+        let snapshot = || {
+            console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot", Some(&json!({"key": key, "token": "test-token", "readOnly": true})))
+        };
+        let (status, reply) = snapshot();
+        assert_eq!(status, 200, "allowed: the wake snapshot answers: {reply}");
+        console::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None).expect("allowed: the wake claim succeeds");
+        t186_deny_keeping_allow(&root, 420042);
+        let (status, reply) = snapshot();
+        assert_eq!(status, 403, "a denied conversation's wake snapshot must be refused: {reply}");
+        let refused = console::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None);
+        assert_eq!(refused.unwrap_err(), "wake invalidated by current settings");
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     mod ticket24_base { include!("reserved2_ticket24_base_tests.rs"); }
     mod ticket24 { include!("reserved2_ticket24_tests.rs"); }
 
