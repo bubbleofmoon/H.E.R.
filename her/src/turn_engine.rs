@@ -6,9 +6,9 @@
 //! (`Facts`), from which the pipeline writes the turn timing record.
 //!
 //! Adapters: DSH (`Adapter::Dsh`: DSH sessions, model failover and the follow-stream collector in
-//! `pipeline.rs`), the harness (`Adapter::Harness`, `harness.rs`) and, in tests, the scripted
-//! adapter (`Script`). Retiring DSH deletes `Engine::Dsh`, `Adapter::Dsh` and the pipeline code
-//! only that adapter reaches.
+//! `pipeline/dsh_adapter.rs`), the harness (`Adapter::Harness`, `harness.rs`) and, in tests, the
+//! scripted adapter (`Script`). Retiring DSH deletes `Engine::Dsh`, `Adapter::Dsh`, the
+//! `pipeline::dsh_adapter` module and its registration points in `pipeline.rs`.
 
 use serde_json::Value;
 
