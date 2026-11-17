@@ -108,6 +108,10 @@ enum Step {
     AwaitMute(fn(&Value) -> bool),
     /// Wait until the fake OneBot has received at least `count` requests on `path`.
     AwaitRequests { path: &'static str, count: usize },
+    /// #192: make `config/config.json` unreadable (invalid JSON), keeping its bytes for `RestoreConfig`.
+    BreakConfig,
+    /// #192: put back the bytes `BreakConfig` kept.
+    RestoreConfig,
     Drop,
 }
 
@@ -187,6 +191,7 @@ fn group_frame(group: i64, user: i64, message_id: i64, text: &str) -> Value {
 }
 
 fn serve_ws(listener: TcpListener, scripts: Vec<Vec<Step>>, gateway: Arc<Mutex<FakeGateway>>, root: PathBuf) {
+    let mut kept_config: Option<Vec<u8>> = None;
     for script in scripts {
         let Ok((stream, _)) = listener.accept() else { return };
         let Ok(mut socket) = accept(stream) else { continue };
@@ -263,6 +268,15 @@ fn serve_ws(listener: TcpListener, scripts: Vec<Vec<Step>>, gateway: Arc<Mutex<F
                         gateway.lock().expect("gateway state").paths.iter().filter(|p| *p == path).count() >= count
                     });
                     assert!(reached, "the fake gateway did not see {count} {path} requests");
+                }
+                Step::BreakConfig => {
+                    let path = root.join("config/config.json");
+                    kept_config = Some(fs::read(&path).expect("read the config to break"));
+                    fs::write(&path, "{ unreadable for t192").expect("break the config");
+                }
+                Step::RestoreConfig => {
+                    let bytes = kept_config.take().expect("BreakConfig ran before RestoreConfig");
+                    fs::write(root.join("config/config.json"), bytes).expect("restore the config");
                 }
                 Step::Wait(ms) => thread::sleep(Duration::from_millis(ms)),
                 Step::Drop => break,
@@ -1124,5 +1138,57 @@ fn replayed_saved_event_is_logged_once() {
     );
     let logged: Vec<Value> = history_records(root.path()).into_iter().filter(|record| record["mid"] == "9201").collect();
     assert_eq!(logged.len(), 1, "a replayed event must not be logged again: {logged:?}");
+    drop(harness);
+}
+
+/// #192 (F3): a message that arrives while `config.json` cannot be read is saved and held, and handled once the
+/// configuration reads again on the same connection; it is never dropped.
+#[test]
+fn t192_an_event_held_while_the_configuration_is_unreadable_is_handled_once_it_reads_again() {
+    let root = TempRoot::new("t192-held");
+    let harness = start(
+        root.path(),
+        vec![vec![
+            Step::Wait(1500),
+            Step::BreakConfig,
+            Step::Mention { message_id: 7501, text: "held probe" },
+            Step::AwaitReceived { message_id: 7501 },
+            Step::Wait(1500),
+            Step::RestoreConfig,
+            Step::Wait(60_000),
+        ]],
+    );
+    let handled = wait_for(Duration::from_secs(30), || !decisions(root.path()).is_empty());
+    let log = fs::read_to_string(root.path().join("candidate-out.log")).unwrap_or_default();
+    assert!(handled, "the held event was not handled once the configuration read again; candidate log:\n{log}");
+    assert_eq!(decisions(root.path()).len(), 1, "exactly one decision for the one held message");
+    assert!(log.contains("held until it reads again"), "the hold is logged:\n{log}");
+    assert!(log.contains("replaying 1 held inbound events"), "the replay is logged:\n{log}");
+    drop(harness);
+}
+
+/// #192 (F3): an event held when the connection drops stays held across a reconnect that still cannot read the
+/// configuration, and is handled once it reads again.
+#[test]
+fn t192_held_events_survive_a_reconnect_with_an_unreadable_configuration() {
+    let root = TempRoot::new("t192-held-reconnect");
+    let harness = start(
+        root.path(),
+        vec![
+            vec![
+                Step::Wait(1500),
+                Step::BreakConfig,
+                Step::Mention { message_id: 7502, text: "held across a reconnect" },
+                Step::AwaitReceived { message_id: 7502 },
+                Step::Drop,
+            ],
+            vec![Step::Wait(3000), Step::RestoreConfig, Step::Wait(60_000)],
+        ],
+    );
+    let handled = wait_for(Duration::from_secs(40), || !decisions(root.path()).is_empty());
+    let log = fs::read_to_string(root.path().join("candidate-out.log")).unwrap_or_default();
+    assert!(handled, "the event held across the reconnect was not handled; candidate log:\n{log}");
+    assert_eq!(decisions(root.path()).len(), 1, "exactly one decision for the one held message");
+    assert!(log.contains("已保存的入站事件留待下次连接重放"), "the reconnect could not read the configuration:\n{log}");
     drop(harness);
 }
