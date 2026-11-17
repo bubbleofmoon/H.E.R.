@@ -460,3 +460,32 @@ fn t192_duplicate_pending_ids_refuse_access_changes() {
     assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN), "nothing is revoked");
     assert!(access::finish_pending_revocations(&context).is_err(), "console start reports it");
 }
+
+#[test]
+fn t192_a_noncanonical_target_refuses_access_changes() {
+    let (root, context) = admitted("t192 noncanonical target");
+    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let config = root.0.join("config/config.json");
+    // A hand-edited target with a trailing space names no conversation the token lookup finds.
+    let text = json!({"pending": [{
+        "id": "one", "mode": "closed-agent", "before": {"ownerQQ": 8808}, "after": {"ownerQQ": 8809},
+        "targets": ["group:420046 "]
+    }]})
+    .to_string();
+    std::fs::write(&record, &text).unwrap();
+    mutate_social_state_for(&context, |state| {
+        state["conversations"]["group:420046"] = json!({"agentToken": "old-noncanon-token-abcdefghij", "bootstrapSent": true});
+        Ok(())
+    })
+    .unwrap();
+    let before = std::fs::read(&config).unwrap();
+    let error = conversation_scope_change(&context, "group:420043", "admit").unwrap_err();
+    assert_eq!(error.0, 503, "{error:?}");
+    assert_eq!(std::fs::read(&config).unwrap(), before, "nothing is written");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "the record is kept for repair");
+    assert_eq!(
+        conversation_token(&context, "group:420046").unwrap().as_deref(),
+        Some("old-noncanon-token-abcdefghij"),
+        "nothing is revoked"
+    );
+}
