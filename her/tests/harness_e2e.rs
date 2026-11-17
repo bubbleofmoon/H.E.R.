@@ -3310,3 +3310,63 @@ fn menu_a_switch_turned_off_mid_turn_leaves_the_next_model_request() {
     );
     assert_eq!(next.len(), first.len() - 1, "{next:?}");
 }
+
+/// The owner's notices of a turn that failed over and then ended in the step limit (a non-model failure).
+fn owner_failover_notices(alerts: &[String]) {
+    assert_eq!(alerts.len(), 2, "one route alert and one turn failure notice: {alerts:?}");
+    assert!(
+        alerts.iter().any(|t| t.contains("backend=harness") && t.contains("model=model-a") && t.contains("class=backend")),
+        "the failed route is alerted by its model: {alerts:?}"
+    );
+    assert!(
+        alerts.iter().any(|t| t.contains("回合失败") && t.contains("harness step limit exceeded")),
+        "the turn failure notice is still sent: {alerts:?}"
+    );
+    assert!(alerts.iter().all(|t| !t.contains("CHAT_SECRET")), "{alerts:?}");
+}
+
+#[test]
+fn harness_routes_failover_then_step_limit_keeps_the_turn_failure_notice_across_turns() {
+    // Turn one fails over from route a to route b and completes; turn two starts on route b and loops to the step limit.
+    let loop_call = |id: &str| ModelReply::ToolCalls(vec![json!({"id":id,"name":"bash","arguments":{"command":"unoffered"}})]);
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 500, message: "CHAT_SECRET service".into() },
+        ModelReply::Text("from b".into()),
+        loop_call("loop-1"),
+        loop_call("loop-2"),
+    ]);
+    let mut rig = harness_rig("harness-routes-failover-then-step-limit", &model);
+    set_harness_config(&rig, json!({"maxSteps": 2, "routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "first turn");
+    assert!(wait_for(LONG, || rig.ledger().iter().filter(|r| r["k"] == "ended").count() >= 1));
+    says(&rig, GROUP_KEY, 1001, "tester", "second turn");
+    assert!(wait_for(LONG, || rig.ledger().iter().filter(|r| r["k"] == "ended").count() >= 2));
+    let names: Vec<String> = lock(&model.requests)
+        .iter()
+        .map(|r| r["model"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, ["model-a", "model-b", "model-b", "model-b"], "turn two starts on the degraded route");
+    rig.wait_texts(OWNER_KEY, 2);
+    owner_failover_notices(&rig.texts_to(OWNER_KEY));
+}
+
+#[test]
+fn harness_routes_failover_then_step_limit_in_one_turn_reports_both() {
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 500, message: "CHAT_SECRET service".into() },
+        ModelReply::ToolCalls(vec![json!({"id":"loop-1","name":"bash","arguments":{"command":"unoffered"}})]),
+    ]);
+    let mut rig = harness_rig("harness-routes-failover-then-step-limit-one-turn", &model);
+    set_harness_config(&rig, json!({"maxSteps": 2, "routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "one turn");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended")));
+    let names: Vec<String> = lock(&model.requests)
+        .iter()
+        .map(|r| r["model"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(names, ["model-a", "model-b"], "the failover is a step of the same turn");
+    rig.wait_texts(OWNER_KEY, 2);
+    owner_failover_notices(&rig.texts_to(OWNER_KEY));
+}

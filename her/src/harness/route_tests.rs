@@ -499,3 +499,32 @@ async fn harness_routes_a_config_without_routes_keeps_its_one_route() {
     assert!(request.get("reasoning_effort").is_none(), "no effort is sent: {request}");
     assert_eq!(rig.attempts(), [attempt("legacy-model", "legacy-model", "completed")]);
 }
+
+/// A stop on `length`: the answer ran out of output. It reports 15 tokens of usage, as the other answers do.
+fn length() -> String {
+    sse(&[stop("length")])
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_routes_an_unsafe_stop_is_charged_before_the_failover_asks_for_what_is_left() {
+    let chain = json!({"maxTokens":20,"routes":[{"id":"a","model":"model-a"},{"id":"b","model":"model-b"}]});
+    let rig = rig("unsafe-left", chain, None).await;
+    let server = serve(rig.model.clone(), vec![length(), length()]);
+    let mut turn = rig.admit("unsafe-left-1");
+    assert!(ended(&mut turn).await.is_err());
+    let requests = server.await.unwrap();
+    assert_eq!(models(&requests), ["model-a", "model-b"], "a stop on length fails over");
+    assert_eq!(requests[1]["max_tokens"], 5, "route a's 15 tokens are charged: route b asks for the 5 left");
+    rig.no_more_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_routes_an_unsafe_stop_that_spends_the_budget_does_not_fail_over() {
+    let chain = json!({"maxTokens":15,"routes":[{"id":"a","model":"model-a"},{"id":"b","model":"model-b"}]});
+    let rig = rig("unsafe-spent", chain, None).await;
+    let server = serve(rig.model.clone(), vec![length()]);
+    let result = ended(&mut rig.admit("unsafe-spent-1")).await;
+    assert!(result.as_ref().is_err_and(|reason| class(reason) == "backend"), "{result:?}");
+    assert_eq!(models(&server.await.unwrap()), ["model-a"], "the stop spent the whole budget: no route b request");
+    rig.no_more_requests().await;
+}
