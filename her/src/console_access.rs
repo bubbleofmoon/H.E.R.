@@ -710,7 +710,7 @@ fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
         .ok()
         .and_then(|value| value.get("pending").and_then(Value::as_array).cloned())
         .ok_or_else(|| format!("data/{PENDING_REVOCATIONS} is not a pending-revocation record; repair or remove it"))?;
-    if let Some(index) = pending.iter().position(|entry| false && !usable_entry(entry)) { // #192 TEMPORARY RED MUTATION
+    if let Some(index) = pending.iter().position(|entry| !usable_entry(entry)) {
         return Err(format!("data/{PENDING_REVOCATIONS} entry {index} has no usable before/after policy; repair or remove it"));
     }
     Ok(pending)
@@ -794,7 +794,7 @@ pub(super) fn settle_failed_write(context: &RuntimeContext, unchanged: &Value, p
     if pending.is_none() {
         return String::new();
     }
-    let published = false; // #192 TEMPORARY RED MUTATION
+    let published = read_config_object(context).map_or(true, |current| &current != unchanged);
     if published {
         return "; the configuration may have been written, so its revocation stays pending and is finished at the next console start or access change".to_string();
     }

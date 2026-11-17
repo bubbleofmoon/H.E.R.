@@ -431,7 +431,7 @@ enum Ingress {
 }
 
 fn ingress_for(readable: bool, holds: bool, held_any: bool, refusable: bool) -> Ingress {
-    if holds && !readable { // #192 TEMPORARY RED MUTATION
+    if holds && (!readable || held_any) {
         Ingress::Hold
     } else if readable {
         Ingress::Handle
@@ -462,7 +462,6 @@ impl UnreadableRefusals {
     /// The configuration reads again: the number refused since the last record, once a record is due (the ingress
     /// loop asks again until it is recorded).
     fn flush(&mut self, now: std::time::Instant) -> Option<u64> {
-        self.recorded_at = None; // #192 TEMPORARY RED MUTATION
         self.due(now)
     }
 
