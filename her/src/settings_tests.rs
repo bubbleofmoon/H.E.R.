@@ -800,7 +800,7 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert!(page.contains("s.kind.min") && page.contains("s.kind.max"), "the input takes the bounds");
     assert_eq!(view["kind"]["min"], 1);
     assert!(page.contains("s.kind.type==='integer'"), "the page picks the input by the kind");
-    assert!(page.contains("input.maxLength=s.kind.maxChars"), "a model id input takes its length bound");
+    assert!(!page.contains("maxLength"), "a model id input sets no UTF-16 length: the set route counts characters");
     assert!(page.contains("input.value=s.value==null?'':s.value"), "a model id that is not configured shows empty");
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
     assert_eq!(status, 200, "{body}");
@@ -1150,6 +1150,24 @@ fn stored_model_and_cost_rows_the_registry_refuses_are_not_applied() {
     assert_eq!(body["revision"], 2);
     assert_eq!(next_turn_model(&context), Ok("fixed-model".to_string()));
     assert_eq!(audit_rows(&root).last().unwrap()["old"], json!("bad\nid").to_string(), "the audit keeps what was stored");
+}
+
+#[test]
+fn model_id_length_counts_characters_not_utf16_units() {
+    // The limit is 200 characters (`settings.rs` `model_id`), not UTF-16 units: a character outside the BMP is two units.
+    let (_root, context) = model_fixture("settings model length");
+    let astral = |count: usize| "\u{1F600}".repeat(count);
+    let (status, body) = set_setting(&context, "harness.model", json!(astral(101)));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["value"], json!(astral(101)), "101 characters (202 UTF-16 units) are accepted");
+    assert_eq!(next_turn_model(&context), Ok(astral(101)));
+    let (status, body) = set_setting(&context, "harness.model", json!(astral(201)));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["error"],
+        "harness.model must be a model id of 1 to 200 characters without control characters"
+    );
+    assert_eq!(next_turn_model(&context), Ok(astral(101)), "a refused id keeps the old value");
 }
 
 #[test]
