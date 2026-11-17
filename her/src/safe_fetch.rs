@@ -135,21 +135,47 @@ pub fn fetch_bytes(raw_url: &str, max_bytes: usize) -> Result<Fetched, String> {
     fetch_bytes_with(raw_url, max_bytes, resolve_public, curl_once)
 }
 
-fn fetch_bytes_with<R, F>(raw_url: &str, max_bytes: usize, mut resolve: R, mut transfer: F) -> Result<Fetched, String>
+/// One GET of a fixed URL (#206 self avatar): the guards of `fetch_bytes` (public pinned addresses, size
+/// cap, image magic), but no redirect is followed (a 3xx is a failure) and all address attempts together
+/// end within `budget`. The host lookup has its own five-second limit (`resolve_public`).
+#[cfg_attr(test, allow(dead_code))]
+pub fn fetch_exact(raw_url: &str, max_bytes: usize, budget: std::time::Duration) -> Result<Fetched, String> {
+    fetch_with_hops(raw_url, max_bytes, 0, budget, resolve_public, curl_once)
+}
+
+fn fetch_bytes_with<R, F>(raw_url: &str, max_bytes: usize, resolve: R, transfer: F) -> Result<Fetched, String>
+where
+    R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
+    F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
+{
+    fetch_with_hops(raw_url, max_bytes, 5, std::time::Duration::from_secs(20), resolve, transfer)
+}
+
+/// `redirects` is how many redirects may be followed (each target revalidated); `budget` caps one hop's
+/// address attempts together, and one attempt to 8 seconds when there are several addresses.
+fn fetch_with_hops<R, F>(
+    raw_url: &str,
+    max_bytes: usize,
+    redirects: usize,
+    budget: std::time::Duration,
+    mut resolve: R,
+    mut transfer: F,
+) -> Result<Fetched, String>
 where
     R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
     F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
 {
     let mut current = raw_url.trim().to_string();
-    for _hop in 0..=5 {
+    for _hop in 0..=redirects {
         let parsed = parse_url(&current).ok_or_else(|| format!("URL 不合法：{current}"))?;
         let ips = resolve(&parsed.host, parsed.port)?;
         let started = std::time::Instant::now();
         let mut result = Err("图片抓取失败".to_string());
         for pin in ips.iter().take(4) {
-            let remaining = std::time::Duration::from_secs(20).saturating_sub(started.elapsed());
+            let remaining = budget.saturating_sub(started.elapsed());
             if remaining.is_zero() { break; }
-            let budget = remaining.min(std::time::Duration::from_secs(if ips.len() > 1 { 8 } else { 20 }));
+            let per_address = if ips.len() > 1 { budget.min(std::time::Duration::from_secs(8)) } else { budget };
+            let budget = remaining.min(per_address);
             result = transfer(&parsed, *pin, max_bytes, budget);
             if result.is_ok() { break; }
         }
@@ -174,23 +200,6 @@ where
         });
     }
     Err("重定向次数过多，已停止".to_string())
-}
-
-/// #206 run 1 stub, replaced in run 2: ignores `redirects` and `budget`.
-#[cfg(test)]
-fn fetch_with_hops<R, F>(
-    raw_url: &str,
-    max_bytes: usize,
-    _redirects: usize,
-    _budget: std::time::Duration,
-    resolve: R,
-    transfer: F,
-) -> Result<Fetched, String>
-where
-    R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
-    F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
-{
-    fetch_bytes_with(raw_url, max_bytes, resolve, transfer)
 }
 
 fn redirect_target(base: &ParsedUrl, location: &str) -> Result<String, String> {

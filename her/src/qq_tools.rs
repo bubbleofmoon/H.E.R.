@@ -1002,7 +1002,9 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
         }
         "qq_get_self_image" => {
             let q = query_string(&[("key", key.to_string())]);
-            match api.call(with_token(ApiCall::get(format!("/api/socialV2/self-image?{q}")))) {
+            // 45 s: the console may wait up to 15 s for another caller's avatar fetch, then fetch itself
+            // (5 s lookup + 8 s transfer) and normalize.
+            match api.call(with_token(ApiCall::get(format!("/api/socialV2/self-image?{q}")).timeout(45_000))) {
                 Ok(data) => self_image_outcome(&data),
                 Err(e) => fail("获取形象图片失败：", e),
             }
@@ -1081,14 +1083,16 @@ fn image_content(data: &Value) -> Vec<Value> {
     content
 }
 
-/// `qq_get_self_image`'s result (#206 run 1: the old lead line; run 2 replaces this function).
+/// `qq_get_self_image`'s result: a fixed lead line for the source and the image blocks. Nothing else
+/// from the console answer reaches the model (no file name, path or address).
 pub(crate) fn self_image_outcome(data: &Value) -> ToolOutcome {
     let image_content = image_content(data);
     if image_content.is_empty() {
         return ToolOutcome::error(format!("没有可返回的形象图片：{}", error_text(data.get("error"), "未知")));
     }
+    let lead = if data.get("source").and_then(Value::as_str) == Some("qqAvatar") { "这是你现在的 QQ 头像：" } else { "这是你的默认形象图：" };
     ToolOutcome {
-        content: std::iter::once(json!({"type": "text", "text": "这是你的默认 Q 版形象："})).chain(image_content).collect(),
+        content: std::iter::once(json!({"type": "text", "text": lead})).chain(image_content).collect(),
         is_error: false,
         delivery_unknown: false,
     }
