@@ -354,12 +354,14 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
     let (root, context) = settings_fixture("settings revoked");
     let body = json!({"setting": QUIET_KEY, "value": 4500}).to_string();
     let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
-    let (status, _, reply) = crate::console_settings::route(&context, "POST", "/api/settings/set", &body, false, &revoked);
+    let (status, _, reply) =
+        crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &revoked);
     assert_eq!(status, 401, "{reply}");
     assert!(!settings_db(&root).exists(), "a revoked credential never writes");
     assert_eq!(next_use_quiet(&context), Some(3000));
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, _, reply) = crate::console_settings::route(&context, "POST", "/api/settings/set", &body, false, &granted);
+    let (status, _, reply) =
+        crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &granted);
     assert_eq!(status, 200, "{reply}");
     assert_eq!(next_use_quiet(&context), Some(4500));
 }
@@ -381,7 +383,13 @@ fn settings_routes_refuse_agents_legacy_contexts_and_oversized_bodies() {
     let oversized = json!({"setting": QUIET_KEY, "value": "x".repeat(1_000_001)});
     let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&oversized));
     assert_eq!(status, 413, "{body}");
-    for (method, path) in [("POST", "/api/settings"), ("GET", "/api/settings/set"), ("POST", "/api/settings/reset")] {
+    for (method, path) in [
+        ("POST", "/api/settings"),
+        ("GET", "/api/settings/set"),
+        ("GET", "/api/settings/reset"),
+        ("GET", "/api/settings/undo"),
+        ("POST", "/api/settings/history"),
+    ] {
         let (status, body) = admin_request(&context, method, path, Some(&request));
         assert_eq!(status, 404, "{method} {path}: {body}");
     }
@@ -784,7 +792,8 @@ fn no_registry_setting_is_cached_on_the_config_stamp() {
 fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (root, context) = settings_fixture("settings page");
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, content_type, page) = crate::console_settings::route(&context, "GET", "/settings", "", false, &granted);
+    let (status, content_type, page) =
+        crate::console_settings::route(&context, "GET", "/settings", &HashMap::new(), "", false, &granted);
     assert_eq!(status, 200, "{page}");
     assert_eq!(content_type, "text/html; charset=utf-8");
     let (status, _) = admin_request(&context, "GET", "/settings", None);
@@ -811,6 +820,15 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
         page.contains("api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value})"),
         "the page sets through the route: a number for an integer setting, the text for a model id"
     );
+    assert!(page.contains("api('/api/settings/reset',{setting:s.key})"), "the page resets through the route");
+    assert!(page.contains("api('/api/settings/undo',{entry:e.entry})"), "the page undoes through the route");
+    assert!(
+        page.contains("'/api/settings/history'") && page.contains("'?before='+next"),
+        "the page lists the history one page at a time"
+    );
+    for field in ["entry", "atMs", "setting", "old", "new", "source", "actor"] {
+        assert!(page.contains(&format!("e.{field}")), "the history shows {field}");
+    }
     assert!(page.contains("'x-console-token'"), "the page sends the console credential");
     assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
     assert!(!settings_db(&root).exists(), "showing the page creates no store");
@@ -818,6 +836,485 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&request));
     assert_eq!(status, 200, "{body}");
     assert_eq!(quiet_view(&context)["value"], 4500, "the page's next list shows the new value");
+}
+
+fn post(context: &RuntimeContext, path: &str, body: Value) -> (u16, Value) {
+    admin_request(context, "POST", path, Some(&body))
+}
+
+/// One page of `GET /api/settings/history<query>`: its entries, newest first, and its `next`.
+fn history_page(context: &RuntimeContext, query: &str) -> (Vec<Value>, Value) {
+    let (status, body) = admin_request(context, "GET", &format!("/api/settings/history{query}"), None);
+    assert_eq!(status, 200, "{body}");
+    (body["entries"].as_array().unwrap().clone(), body["next"].clone())
+}
+
+/// One request straight to `console_settings::route`, past the console front.
+fn direct_route(
+    context: &RuntimeContext, method: &str, path: &str, body: &str, authority: crate::persona::Authority<'_>,
+) -> (u16, Value) {
+    let (status, _, reply) = crate::console_settings::route(context, method, path, &HashMap::new(), body, false, authority);
+    (status, serde_json::from_str(&reply).unwrap_or(Value::Null))
+}
+
+#[test]
+fn settings_reset_stores_the_default_over_the_file_and_is_audited() {
+    let (root, context) = settings_fixture("settings reset");
+    write_config(&root, |config| config["socialV2"] = json!({"reply": {"wakeQuietMs": 9000}}));
+    assert_eq!(next_use_quiet(&context), Some(9000), "the file's value applies before any change");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": QUIET_KEY}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"ok": true, "setting": QUIET_KEY, "value": 3000, "revision": 2, "changed": true}));
+    assert_eq!(next_use_quiet(&context), Some(3000), "the default wins over the file's value");
+    assert_eq!(quiet_view(&context)["stored"], 3000);
+    let rows = audit_rows(&root);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1]["actor"], "administrator");
+    assert_eq!(
+        (rows[1]["source"].clone(), rows[1]["old"].clone(), rows[1]["new"].clone()),
+        (json!("reset"), json!("4500"), json!("3000"))
+    );
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": QUIET_KEY}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["changed"], false, "a stored default is not a change");
+    assert_eq!(audit_rows(&root).len(), 2);
+    // Without a stored value a reset still stores the default, so the file's value stops applying.
+    let (fresh_root, fresh) = settings_fixture("settings reset fresh");
+    write_config(&fresh_root, |config| config["socialV2"] = json!({"reply": {"wakeQuietMs": 9000}}));
+    let (status, body) = post(&fresh, "/api/settings/reset", json!({"setting": QUIET_KEY}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((body["revision"].clone(), body["changed"].clone()), (json!(1), json!(true)));
+    assert_eq!(next_use_quiet(&fresh), Some(3000));
+    assert_eq!(audit_rows(&fresh_root)[0]["old"], Value::Null);
+}
+
+#[test]
+fn settings_reset_of_a_model_id_without_a_default_stores_not_configured_over_the_file() {
+    let model = &crate::settings::HARNESS_MODEL;
+    let next_use = |context: &RuntimeContext| model.text(&context.load_config_document().unwrap());
+    let (root, context) = settings_fixture("settings reset model");
+    write_config(&root, |config| config["harness"] = json!({"model": "file-model"}));
+    let (status, body) = post(&context, "/api/settings/set", json!({"setting": model.key, "value": "model-a"}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use(&context).as_deref(), Some("model-a"));
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": model.key}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"ok": true, "setting": model.key, "value": null, "revision": 2, "changed": true}));
+    assert_eq!(next_use(&context), None, "the missing default wins over the file's value");
+    let rows = audit_rows(&root);
+    assert_eq!(
+        (rows[1]["source"].clone(), rows[1]["old"].clone(), rows[1]["new"].clone()),
+        (json!("reset"), json!("\"model-a\""), json!("null"))
+    );
+    let (status, body) = post(&context, "/api/settings/reset", json!({"setting": model.key}));
+    assert_eq!((status, body["changed"].clone()), (200, json!(false)), "a stored default is not a change");
+    let (status, body) = post(&context, "/api/settings/set", json!({"setting": model.key, "value": null}));
+    assert_eq!(status, 400, "a set still refuses null: {body}");
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use(&context).as_deref(), Some("model-a"), "undoing the reset restores the old value");
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "undoing the undo stores the missing default again: {body}");
+    assert_eq!(next_use(&context), None);
+}
+
+#[test]
+fn settings_undo_restores_the_old_value_and_is_refused_after_a_later_change() {
+    let (root, context) = settings_fixture("settings undo");
+    for value in [4500, 5000] {
+        let (status, body) = set_quiet(&context, json!(value));
+        assert_eq!(status, 200, "{body}");
+    }
+    let (entries, _) = history_page(&context, "");
+    let (latest, first) = (entries[0]["entry"].clone(), entries[1]["entry"].clone());
+    // The first change has a later one: undoing it would overwrite 5000.
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": first}));
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "the setting changed after this entry; undo the later change first");
+    assert_eq!(next_use_quiet(&context), Some(5000));
+    assert_eq!(audit_rows(&root).len(), 2, "a refused undo writes no audit row");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": latest}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"ok": true, "entry": latest, "setting": QUIET_KEY, "stored": 4500}));
+    assert_eq!(next_use_quiet(&context), Some(4500), "the next use reads the restored value");
+    let rows = audit_rows(&root);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[2]["actor"], "administrator");
+    assert_eq!(
+        (rows[2]["source"].clone(), rows[2]["old"].clone(), rows[2]["new"].clone()),
+        (json!("undo"), json!("5000"), json!("4500"))
+    );
+    // The undone entry is no longer the latest change; undoing the undo redoes the change.
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": latest}));
+    assert_eq!(status, 409, "{body}");
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use_quiet(&context), Some(5000));
+    // A change back to the same value is still a later change: the value matches, the undo is refused.
+    for value in [6000, 5000] {
+        let (status, body) = set_quiet(&context, json!(value));
+        assert_eq!(status, 200, "{body}");
+    }
+    let (entries, _) = history_page(&context, "");
+    let redo = entries.iter().find(|entry| entry["source"] == "undo" && entry["new"] == 5000).unwrap()["entry"].clone();
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": redo}));
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(next_use_quiet(&context), Some(5000));
+    assert_eq!(audit_rows(&root).len(), 6);
+}
+
+#[test]
+fn settings_undo_of_a_first_change_removes_the_stored_value_and_never_reuses_a_revision() {
+    let (root, context) = settings_fixture("settings undo first");
+    write_config(&root, |config| config["socialV2"] = json!({"reply": {"wakeQuietMs": 9000}}));
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["stored"], Value::Null, "{body}");
+    assert_eq!(quiet_view(&context)["stored"], Value::Null);
+    assert_eq!(next_use_quiet(&context), Some(9000), "the file's value applies again");
+    let (entries, _) = history_page(&context, "");
+    assert_eq!((entries[0]["old"].clone(), entries[0]["new"].clone()), (json!(4500), Value::Null));
+    // The next change continues after both recorded changes.
+    let (status, body) = set_quiet(&context, json!(5000));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revision"], 3, "a revision is never reused for the same setting");
+}
+
+#[test]
+fn settings_history_lists_changes_newest_first_one_page_at_a_time() {
+    let (root, context) = settings_fixture("settings history");
+    let (entries, next) = history_page(&context, "");
+    assert!(entries.is_empty() && next.is_null(), "no store yet is an empty history");
+    assert!(!settings_db(&root).exists(), "reading the history never creates the store");
+    for ms in 1..=100 {
+        crate::settings::apply(&context, QUIET_KEY, &json!(ms), "administrator", "console").unwrap();
+    }
+    let (entries, next) = history_page(&context, "");
+    assert_eq!(entries.len(), 100);
+    assert_eq!((entries[0]["old"].clone(), entries[0]["new"].clone()), (json!(99), json!(100)), "newest first");
+    assert_eq!((entries[99]["old"].clone(), entries[99]["new"].clone()), (Value::Null, json!(1)));
+    for entry in &entries {
+        assert_eq!(
+            (entry["actor"].clone(), entry["source"].clone(), entry["scope"].clone(), entry["setting"].clone()),
+            (json!("administrator"), json!("console"), json!("global"), json!(QUIET_KEY))
+        );
+        assert!(entry["atMs"].as_i64().unwrap() > 0, "{entry}");
+    }
+    let ids: Vec<i64> = entries.iter().map(|entry| entry["entry"].as_i64().unwrap()).collect();
+    assert!(ids.windows(2).all(|pair| pair[0] > pair[1]), "{ids:?}");
+    // Exactly one full page: `next` points past it, and that page is empty and the last.
+    assert_eq!(next, entries[99]["entry"]);
+    let (older, last) = history_page(&context, &format!("?before={next}"));
+    assert!(older.is_empty() && last.is_null(), "{older:?}");
+    // One more change: the oldest moves to a second page.
+    crate::settings::apply(&context, QUIET_KEY, &json!(101), "administrator", "console").unwrap();
+    let (entries, next) = history_page(&context, "");
+    assert_eq!((entries.len(), entries[0]["new"].clone(), entries[99]["new"].clone()), (100, json!(101), json!(2)));
+    let (older, last) = history_page(&context, &format!("?before={next}"));
+    assert_eq!(older.len(), 1, "{older:?}");
+    assert_eq!(older[0]["new"], 1);
+    assert!(last.is_null());
+    // `setting` narrows the list to one registry key.
+    let (narrowed, _) = history_page(&context, &format!("?setting={QUIET_KEY}"));
+    assert_eq!(narrowed.len(), 100);
+}
+
+#[test]
+fn settings_writes_wait_for_the_store_gate_and_give_up_after_five_seconds() {
+    // Every write holds `locks/settings-store.lock` from its inspection until its connection closes, so no other
+    // writer can leave a journal between a writer's inspection and its read-write open.
+    let (root, context) = settings_fixture("settings gate every write");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    let gate = context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock").unwrap();
+    let (status, body) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| set_quiet(&context, json!(5000)));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!writer.is_finished(), "a write went ahead while another writer held the store gate");
+        // Readers never wait for the gate.
+        assert_eq!(quiet_view(&context)["stored"], 4500);
+        assert_eq!(next_use_quiet(&context), Some(4500));
+        let (entries, _) = history_page(&context, "");
+        assert_eq!(entries.len(), 1);
+        drop(gate);
+        writer.join().unwrap()
+    });
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use_quiet(&context), Some(5000));
+    // Held past the wait, the write gives up and writes nothing.
+    let gate = context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock").unwrap();
+    let started = std::time::Instant::now();
+    let (status, body) = set_quiet(&context, json!(6000));
+    let waited = started.elapsed();
+    drop(gate);
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "settings storage is unavailable");
+    assert!(waited >= std::time::Duration::from_secs(5), "{waited:?}");
+    assert_eq!(next_use_quiet(&context), Some(5000), "a write that gave up changed nothing");
+    assert_eq!(audit_rows(&root).len(), 2);
+}
+
+#[test]
+fn audit_undo_keeps_the_current_value_of_every_registry_setting() {
+    // A whole-file audit undo restores `config.json`, but registry settings change and undo through the store only.
+    let (root, context) = settings_fixture("settings audit undo");
+    let config_post = |body: Value| {
+        let (status, reply) = admin_request(&context, "POST", "/api/socialV2/config", Some(&body));
+        assert_eq!(status, 200, "{reply}");
+    };
+    let latest_config_entry = || {
+        let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+        assert_eq!(status, 200, "{recent}");
+        recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()["id"]
+            .clone()
+    };
+    let file = || -> Value { serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap() };
+    config_post(json!({"reply": {"wakeQuietMs": 7000}, "autoReplyCheckMs": 4000}));
+    config_post(json!({"reply": {"wakeQuietMs": 8000}, "autoReplyCheckMs": 5000}));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest_config_entry()})));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["settingsKept"], json!([QUIET_KEY]), "{reply}");
+    assert_eq!(file()["socialV2"]["autoReplyCheckMs"], 4000, "other members are restored");
+    assert_eq!(file()["socialV2"]["reply"]["wakeQuietMs"], 8000, "the registry setting keeps its current value");
+    // A registry value the current file lacks is removed from the restored file.
+    config_post(json!({"reply": {}}));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest_config_entry()})));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["settingsKept"], json!([QUIET_KEY]), "{reply}");
+    assert_eq!(file()["socialV2"]["reply"], json!({}));
+    // An undo whose backup holds the current registry values keeps nothing.
+    config_post(json!({"autoReplyCheckMs": 6000}));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest_config_entry()})));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["settingsKept"], json!([]), "{reply}");
+    assert_eq!(file()["socialV2"]["autoReplyCheckMs"], 4000);
+}
+
+#[test]
+fn settings_undo_never_overwrites_a_concurrent_change() {
+    let (root, context) = settings_fixture("settings undo concurrent");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "");
+    let entry = entries[0]["entry"].clone();
+    // Two undos of the same entry: exactly one restores.
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| post(&context, "/api/settings/undo", json!({"entry": entry})));
+        let second = scope.spawn(|| post(&context, "/api/settings/undo", json!({"entry": entry})));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 409], "{first:?} {second:?}");
+    assert_eq!(audit_rows(&root).len(), 2);
+    assert_eq!(quiet_view(&context)["stored"], Value::Null);
+    // An undo racing a change from another writer, which takes no console gate: the change always survives.
+    let (status, body) = set_quiet(&context, json!(5000));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "");
+    let entry = entries[0]["entry"].clone();
+    let (undo, set) = std::thread::scope(|scope| {
+        let undo = scope.spawn(|| post(&context, "/api/settings/undo", json!({"entry": entry})));
+        let set = scope.spawn(|| crate::settings::apply(&context, QUIET_KEY, &json!(6000), "administrator", "console"));
+        (undo.join().unwrap(), set.join().unwrap())
+    });
+    assert!(matches!(&set, Ok(applied) if applied.changed), "the change landed");
+    assert!(matches!(undo.0, 200 | 409), "{undo:?}");
+    assert_eq!(quiet_view(&context)["stored"], 6000, "the undo never overwrote the later change");
+    let rows = audit_rows(&root);
+    assert_eq!(rows.len(), if undo.0 == 200 { 5 } else { 4 }, "{rows:?}");
+    assert_eq!(rows.last().unwrap()["new"], "6000", "the change is the last row either way");
+}
+
+#[test]
+fn settings_undo_refuses_entries_it_cannot_restore() {
+    let (root, context) = settings_fixture("settings undo old rows");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    // Rows an older release or another writer left: a stored value out of range, a retired setting's entry and an
+    // entry of another scope.
+    let conn = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap();
+    conn.execute_batch(
+        "UPDATE settings SET value='50000' WHERE key='reply.wakeQuietMs';
+         INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+         VALUES(1, 'older release', 'console', 'global', 'reply.retired', 'not json', '1', 'retired-1');
+         INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+         VALUES(2, 'older release', 'console', 'conversation:group:1', 'reply.wakeQuietMs', NULL, '7', 'scoped-1');",
+    )
+    .unwrap();
+    drop(conn);
+    // The stored value changed without an audit row: the first entry's new value is no longer what is stored.
+    let (entries, _) = history_page(&context, "");
+    let first = entries.iter().find(|entry| entry["new"] == 4500).unwrap()["entry"].clone();
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": first}));
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "the setting changed after this entry; undo the later change first");
+    let (status, body) = set_quiet(&context, json!(4600));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "");
+    assert_eq!(entries.len(), 4, "{entries:?}");
+    assert_eq!((entries[0]["old"].clone(), entries[0]["new"].clone()), (json!(50000), json!(4600)), "the stored text");
+    assert_eq!(entries[1]["scope"], "conversation:group:1");
+    assert_eq!(entries[2]["setting"], "reply.retired", "the history keeps a retired setting's entries");
+    assert_eq!(entries[2]["old"], "not json", "stored text that is not JSON is shown as a string");
+    for (entry, error) in [
+        (&entries[0], "the old value of this entry is no longer accepted"),
+        (&entries[1], "this entry cannot be undone"),
+        (&entries[2], "this entry cannot be undone"),
+    ] {
+        let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entry["entry"]}));
+        assert_eq!(status, 409, "{entry}: {body}");
+        assert_eq!(body["error"], error, "{entry}");
+    }
+    assert_eq!(quiet_view(&context)["stored"], 4600);
+    assert_eq!(audit_rows(&root).len(), 4, "a refused undo writes nothing");
+}
+
+#[test]
+fn settings_undo_cut_off_before_its_audit_row_changes_nothing() {
+    let (root, context) = settings_fixture("settings undo rollback");
+    for value in [4500, 5000] {
+        let (status, body) = set_quiet(&context, json!(value));
+        assert_eq!(status, 200, "{body}");
+    }
+    let (entries, _) = history_page(&context, "");
+    crate::settings::FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    crate::settings::FAIL_BEFORE_AUDIT.with(|fail| fail.set(false));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(quiet_view(&context)["stored"], 5000, "the cut-off undo left no value");
+    assert_eq!(audit_rows(&root).len(), 2, "and no audit row");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use_quiet(&context), Some(4500));
+    assert_eq!(audit_rows(&root).len(), 3);
+}
+
+#[test]
+fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input() {
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+    let legacy = RuntimeContext::legacy();
+    for (method, path, body) in [
+        ("GET", "/api/settings/history", ""),
+        ("POST", "/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#),
+        ("POST", "/api/settings/undo", r#"{"entry":1}"#),
+    ] {
+        let (status, reply) = direct_route(&legacy, method, path, body, &granted);
+        assert_eq!((status, reply["error"].clone()), (503, json!("settings require a selected runtime")), "{path}");
+    }
+
+    let (root, context) = settings_fixture("settings undo bad input");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": 1}));
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["error"], "unknown history entry");
+    assert!(!settings_db(&root).exists(), "an undo without a store never creates one");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    // The authority re-checks the console credential under the configuration gate before anything is written.
+    for (path, body) in [("/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#), ("/api/settings/undo", r#"{"entry":1}"#)] {
+        let (status, reply) = direct_route(&context, "POST", path, body, &revoked);
+        assert_eq!(status, 401, "{path}: {reply}");
+    }
+    for (request, status, error) in [
+        (json!({"entry": 99999}), 404, "unknown history entry"),
+        (json!({"entry": 0}), 400, "entry must be a positive integer"),
+        (json!({"entry": -1}), 400, "entry must be a positive integer"),
+        (json!({"entry": 1.5}), 400, "entry must be a positive integer"),
+        (json!({"entry": "1"}), 400, "entry must be a positive integer"),
+        (json!({"entry": u64::MAX}), 400, "entry must be a positive integer"),
+        (json!({}), 400, "entry must be a positive integer"),
+        (json!({"entry": 1, "setting": QUIET_KEY}), 400, "unknown settings field"),
+        (json!([1]), 400, "body must be a JSON object"),
+    ] {
+        let (got, body) = post(&context, "/api/settings/undo", request.clone());
+        assert_eq!((got, body["error"].clone()), (status, json!(error)), "{request}");
+    }
+    for (request, error) in [
+        (json!({"setting": "reply.other"}), "unknown setting"),
+        (json!({}), "setting is required"),
+        (json!({"setting": QUIET_KEY, "value": 3000}), "unknown settings field"),
+    ] {
+        let (status, body) = post(&context, "/api/settings/reset", request.clone());
+        assert_eq!((status, body["error"].clone()), (400, json!(error)), "{request}");
+    }
+    for query in ["?before=0", "?before=-1", "?before=abc", "?before=1.5", "?setting=reply.other"] {
+        let (status, body) = admin_request(&context, "GET", &format!("/api/settings/history{query}"), None);
+        assert_eq!(status, 400, "{query}: {body}");
+    }
+    for (method, path, body) in [
+        ("GET", "/api/settings/history", None),
+        ("POST", "/api/settings/reset", Some(json!({"setting": QUIET_KEY}))),
+        ("POST", "/api/settings/undo", Some(json!({"entry": 1}))),
+    ] {
+        let (status, reply) = agent_request(&context, method, path, body.as_ref(), "fixture-agent-token");
+        assert_eq!(status, 403, "{path}: {reply}");
+    }
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": 1, "pad": "x".repeat(1_000_001)}));
+    assert_eq!(status, 413, "{body}");
+    assert_eq!(quiet_view(&context)["stored"], 4500, "no refusal changed the value");
+    assert_eq!(audit_rows(&root).len(), 1, "and none wrote an audit row");
+
+    // A store this release cannot read: every route answers 503 and the file keeps every byte.
+    let (garbage_root, garbage) = settings_fixture("settings history garbage");
+    let bytes = vec![b'x'; 4096];
+    std::fs::write(settings_db(&garbage_root), &bytes).unwrap();
+    for (method, path, body) in [
+        ("GET", "/api/settings/history", None),
+        ("POST", "/api/settings/undo", Some(json!({"entry": 1}))),
+        ("POST", "/api/settings/reset", Some(json!({"setting": QUIET_KEY}))),
+    ] {
+        let (status, reply) = admin_request(&garbage, method, path, body.as_ref());
+        assert_eq!((status, reply["error"].clone()), (503, json!("settings storage is unavailable")), "{path}");
+    }
+    assert_eq!(std::fs::read(settings_db(&garbage_root)).unwrap(), bytes);
+}
+
+#[test]
+fn settings_undo_takes_the_store_gate_before_it_inspects_the_store() {
+    // Every write holds the store gate before it inspects the store, even an undo that answers 404 when there is none.
+    let (root, context) = settings_fixture("settings undo gate first");
+    let gate = context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock").unwrap();
+    let (status, body) = std::thread::scope(|scope| {
+        let undo = scope.spawn(|| post(&context, "/api/settings/undo", json!({"entry": 1})));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!undo.is_finished(), "an undo answered before the store gate was free");
+        drop(gate);
+        undo.join().unwrap()
+    });
+    assert_eq!((status, body["error"].clone()), (404, json!("unknown history entry")), "{body}");
+    assert!(!settings_db(&root).exists(), "an undo without a store still creates none");
+}
+
+#[test]
+fn audit_undo_refuses_a_backup_that_cannot_hold_a_current_registry_value() {
+    // A backup whose `reply` is not an object cannot hold `reply.wakeQuietMs`: the undo refuses and writes nothing,
+    // instead of reporting a kept value that the restored file lacks.
+    let (root, context) = settings_fixture("settings audit undo scalar");
+    let config_post = |body: Value| {
+        let (status, reply) = admin_request(&context, "POST", "/api/socialV2/config", Some(&body));
+        assert_eq!(status, 200, "{reply}");
+    };
+    config_post(json!({"reply": false}));
+    config_post(json!({"reply": {"wakeQuietMs": 8000}}));
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+    assert_eq!(status, 200, "{recent}");
+    let latest = recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()
+        ["id"]
+        .clone();
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest})));
+    assert_eq!(status, 409, "{reply}");
+    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "a refused undo writes nothing");
 }
 
 // Model and cost settings (#150): each is read through the registry by its real reader.

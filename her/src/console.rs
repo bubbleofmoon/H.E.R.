@@ -12388,7 +12388,7 @@ fn route_with_context(
             }
             Ok(gate)
         };
-        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.body, agent_call, &authority);
+        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && crate::console_persona::is_route(&req.path) {
@@ -14348,6 +14348,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         // read-modify-write (stale check and restore) runs under the social-state gate.
         let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
         access::finish_pending_before_change(context, &interaction)?;
+        // Registry settings whose backup value differed from the current file's (`settings::keep_registry_values`).
+        let mut settings_kept: Vec<&'static str> = Vec::new();
         let (config_before, restored, planned) = {
             let _gate = acquire_social_state_gate(context)?;
             // Safe undo: only the state this record produced may be replaced. A later change of the
@@ -14385,6 +14387,11 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                         }
                         _ => {}
                     }
+                    // Registry settings change and undo through the settings store only: the restored
+                    // configuration keeps their current values.
+                    settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config).map_err(
+                        |key| (409, format!("the backup cannot keep the current value of {key}; nothing was undone")),
+                    )?;
                     let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
                     // If the restored configuration cannot be loaded, everything the old one allowed is revoked.
                     let (after, load_error) = match context.effective_config(&restored_config) {
@@ -14425,7 +14432,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         if !failures.is_empty() {
             return Err((500, format!("已恢复 {}，但立即撤销未完成：{}", restored.join("、"), failures.join("；"))));
         }
-        return Ok(json!({ "ok": true, "id": id, "restored": restored, "revoked": revoked }));
+        return Ok(json!({ "ok": true, "id": id, "restored": restored, "revoked": revoked, "settingsKept": settings_kept }));
     }
 
     let mut restored: Vec<String> = Vec::new();
