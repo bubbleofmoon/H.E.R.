@@ -1123,6 +1123,95 @@ try {
   Assert-True ($run.Text.IndexOf('an unexpected error', [StringComparison]::OrdinalIgnoreCase) -lt 0) 'S1v-release: a section failed with an unexpected error'
   Assert-OldUntouched 'S1v'
 
+  Step 'S1w a refused value is never used'
+  # A check that does not wait for an earlier one must still never use what that one refused (#182 fix round 1). The
+  # failures of this step are kept and reported together at its end, so one red run shows each of them.
+  $kept = [Collections.Generic.List[string]]::new()
+  # The profile DSH home's profiles folder is a junction to a folder outside it. The copy plan refuses it, and the
+  # profile check refuses it on its own, before it reads anything through it (no MCP preview is rendered). A separate
+  # fixture profile holds the links, so the running fixture's DSH home never changes.
+  $linkedProfile = Join-Path $F 'profile-linked'
+  $linkedHome = Join-Path $linkedProfile '.dsh'
+  $outsideProfiles = Join-Path $F 'outside-profiles'
+  [void][IO.Directory]::CreateDirectory($linkedHome)
+  Write-Fixture (Join-Path $outsideProfiles 'web\cordis.patch.yml') $originalCordis
+  $linkedArgs = @($inventoryArgs | ForEach-Object { if ($_ -ceq $profileFolder) { $linkedProfile } else { $_ } })
+  $profilesLink = Join-Path $linkedHome 'profiles'
+  [void](New-Item -ItemType Junction -Path $profilesLink -Target $outsideProfiles)
+  try { $run = Invoke-MoveScript $linkedArgs 'S1w-profile-link' } finally { [IO.Directory]::Delete($profilesLink) }
+  $runFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0].FullName
+  try { Assert-Run $run 1 'copy plan: REFUSED: a junction or link was found in dsh-home' 'S1w copy plan refuses the profiles junction' } catch { $kept.Add($_.Exception.Message) }
+  try { Assert-Run $run 1 'dsh profile: REFUSED: a junction or link lies on the path of the DSH profile' 'S1w profile check refuses the profiles junction' } catch { $kept.Add($_.Exception.Message) }
+  if (Test-Path -LiteralPath (Join-Path $runFolder 'mcp-preview')) { $kept.Add('FAIL S1w: the profile was read through the profiles junction (an MCP preview was rendered)') }
+  # The profile file itself is a file symbolic link to a file outside the DSH home (the copy plan looks at folder links
+  # only). A symbolic link needs a privilege (or developer mode): without one the web folder becomes a junction to the
+  # outside folder instead; the line says which.
+  $linkedWeb = Join-Path $linkedHome 'profiles\web'
+  [void][IO.Directory]::CreateDirectory($linkedWeb)
+  $fileLink = Join-Path $linkedWeb 'cordis.patch.yml'
+  $fileShape = 'junction above it'
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { [void](& cmd.exe /d /c mklink $fileLink (Join-Path $outsideProfiles 'web\cordis.patch.yml') 2>&1); $mklinkCode = $LASTEXITCODE } finally { $ErrorActionPreference = $previous }
+  if ($mklinkCode -eq 0 -and (Test-Path -LiteralPath $fileLink -PathType Leaf)) { $fileShape = 'symbolic link' }
+  else {
+    if ($null -ne (Get-Item -LiteralPath $fileLink -Force -ErrorAction SilentlyContinue)) { [IO.File]::Delete($fileLink) }
+    [IO.Directory]::Delete($linkedWeb)
+    [void](New-Item -ItemType Junction -Path $linkedWeb -Target (Join-Path $outsideProfiles 'web'))
+  }
+  Write-Host ('profile file link: ' + $fileShape)
+  try { $run = Invoke-MoveScript $linkedArgs 'S1w-profile-file' }
+  finally { if ($fileShape -eq 'symbolic link') { [IO.File]::Delete($fileLink) } else { [IO.Directory]::Delete($linkedWeb) } }
+  $runFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0].FullName
+  try { Assert-Run $run 1 'dsh profile: REFUSED: a junction or link lies on the path of the DSH profile' ('S1w profile check refuses the ' + $fileShape) } catch { $kept.Add($_.Exception.Message) }
+  if (Test-Path -LiteralPath (Join-Path $runFolder 'mcp-preview')) { $kept.Add('FAIL S1w: the profile was read through the ' + $fileShape + ' (an MCP preview was rendered)') }
+  if (-not (Remove-FixtureTree $linkedProfile)) { throw 'FAIL S1w: the linked fixture profile still holds a link' }
+  Remove-Item -LiteralPath $outsideProfiles -Recurse -Force
+  # Move still stops at the first link in the old DSH stub, before it enters any further folder: here a junction beside
+  # a folder whose file this harness holds exclusively. Listing the link and walking on (Inventory's way) would meet the
+  # held file and fail with an unexpected error instead.
+  $stubFolder = Join-Path $oldRuntime 'user\dsh'
+  $stubLink = Join-Path $stubFolder 'fixture-stub-link'
+  $heldFolder = Join-Path $stubFolder 'fixture-stub-held'
+  Write-Fixture (Join-Path $heldFolder 'held.txt') 'held'
+  [void](New-Item -ItemType Junction -Path $stubLink -Target (Join-Path $stubFolder '.agent-presets'))
+  $held = $null
+  try {
+    $held = [IO.File]::Open((Join-Path $heldFolder 'held.txt'), [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    $run = Invoke-MoveScript $moveArgs 'S1w-move-stub'
+  }
+  finally { if ($null -ne $held) { $held.Dispose() }; [IO.Directory]::Delete($stubLink); Remove-Item -LiteralPath $heldFolder -Recurse -Force }
+  try { Assert-Run $run 1 'STOPPED: REFUSED: a junction or link was found in dsh-stub' 'S1w Move stops at the first stub link' } catch { $kept.Add($_.Exception.Message) }
+  if ($run.Text.IndexOf('an unexpected error', [StringComparison]::OrdinalIgnoreCase) -ge 0) { $kept.Add('FAIL S1w: Move walked on past the stub link (an unexpected error)') }
+  # A rejected console port is never stored, so the checks that need it report they were skipped, and none renders or
+  # queries it; then a rejected OneBot WebSocket port, which keeps the OneBot port out too. The runs read a bare copy of
+  # the old runtime's two configuration files: the running fixture reads its own configuration, never this copy.
+  $portRuntime = Join-Path $F 'runtime-port'
+  $portConfig = Get-Content -LiteralPath (Join-Path $oldRuntime 'config\config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  $portConfig.consolePort = 3000
+  Write-FixtureJson (Join-Path $portRuntime 'config\config.json') $portConfig
+  Copy-Item -LiteralPath (Join-Path $oldRuntime 'dependencies.json') -Destination (Join-Path $portRuntime 'dependencies.json')
+  $portArgs = @($inventoryArgs | ForEach-Object { if ($_ -ceq $oldRuntime) { $portRuntime } else { $_ } })
+  try {
+    $run = Invoke-MoveScript $portArgs 'S1w-console-port'
+    $runFolder = @(Get-ChildItem -LiteralPath $evidence -Directory -Filter 'inventory-*' | Sort-Object -Property Name -Descending)[0].FullName
+    $portConfig.consolePort = $consolePort
+    Write-FixtureJson (Join-Path $portRuntime 'config\config.json') $portConfig
+    $portDependencies = Get-Content -LiteralPath (Join-Path $oldRuntime 'dependencies.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $portDependencies.onebot_ws = 'ws://127.0.0.1:3001'
+    Write-FixtureJson (Join-Path $portRuntime 'dependencies.json') $portDependencies
+    $wsRun = Invoke-MoveScript $portArgs 'S1w-onebot-ws-port'
+  }
+  finally { Remove-Item -LiteralPath $portRuntime -Recurse -Force }
+  try { Assert-Run $run 1 'configuration: REFUSED: a rehearsal never uses a production port' 'S1w console port refused' } catch { $kept.Add($_.Exception.Message) }
+  try { Assert-Run $run 1 'dsh profile: REFUSED: skipped: needs the configuration check' 'S1w console port: the profile check skipped' } catch { $kept.Add($_.Exception.Message) }
+  try { Assert-Run $run 1 'dependency processes: REFUSED: skipped: needs the configuration check' 'S1w console port: the dependency processes skipped' } catch { $kept.Add($_.Exception.Message) }
+  if (Test-Path -LiteralPath (Join-Path $runFolder 'mcp-preview')) { $kept.Add('FAIL S1w: a refused console port was used (an MCP preview was rendered)') }
+  try { Assert-Run $wsRun 1 'configuration: REFUSED: a rehearsal never uses a production port' 'S1w OneBot WebSocket port refused' } catch { $kept.Add($_.Exception.Message) }
+  try { Assert-Run $wsRun 1 'dependency processes: REFUSED: skipped: needs the configuration check' 'S1w OneBot WebSocket port: the dependency processes skipped' } catch { $kept.Add($_.Exception.Message) }
+  try { Assert-OldUntouched 'S1w' } catch { $kept.Add($_.Exception.Message) }
+  if ($kept.Count -gt 0) { throw ($kept -join "`r`n") }
+
   Step 'S2 health failure rolls back'
   Write-Fixture $failMarker 'fail'
   try { $run = Invoke-MoveScript ($rehearsalArgs + @('-Mode', 'Move') + $sourceArgs + @('-ReleaseName', 'fixture-new', '-HealthWaitSeconds', '45')) 'S2' }
