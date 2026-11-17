@@ -59,15 +59,15 @@ const OWNER_PRIVATE: &[&str] = &[
     "snowluma_status",
 ];
 
-/// The legacy reads and direct sends the console serves in `closed-agent`, the tokenless image
-/// lookup, memory, the owner-only tools and the auxiliary tools; never the reserved2 tools.
+/// The legacy reads the console serves in `closed-agent`, the direct private send (the console
+/// accepts the turn's bound token only for the owner's own chat), the tokenless image lookup,
+/// memory, the owner-only tools and the auxiliary tools. Never the group sends (the bound token
+/// never matches a group target there) or the reserved2 tools.
 const CLOSED_AGENT: &[&str] = &[
     "qq_status",
     "qq_list_groups",
     "qq_get_group_members",
     "qq_get_group_history",
-    "qq_send_group_message",
-    "qq_reply",
     "qq_send_private_message",
     "qq_get_message_images",
     "memory_write",

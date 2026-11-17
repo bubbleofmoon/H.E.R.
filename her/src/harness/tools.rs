@@ -120,8 +120,17 @@ impl Tools {
     /// model request, so a switch turned off mid-turn leaves the menu before the next request; a
     /// switch turned back on restores only a tool the turn captured.
     pub(super) fn model_tools(&self) -> Result<Vec<Tool>, CheckError> {
-        // Red stub (#160 run 3, model_tools): 3B replaces this line and the next.
-        let current: Option<Vec<Value>> = None;
+        let current = match &self.authority {
+            Some(authority) => {
+                authority.check()?;
+                let cfg = authority
+                    .context
+                    .load_config()
+                    .map_err(|reason| CheckError::Unavailable(reason.into()))?;
+                Some(definitions(&cfg, authority.profile))
+            }
+            None => None,
+        };
         Ok(self
             .definitions
             .iter()
@@ -257,7 +266,7 @@ impl Authority {
 }
 
 /// The definitions of `profile`'s menu that `cfg` registers, in registration order: a tool the
-/// configuration switches off (#153) drops out of every menu.
+/// configuration switches off (#153) drops out of every menu, the direct-send switches included.
 fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
     let menu = profile.menu();
     let mut tools = crate::mcp::tool_list(cfg)["tools"]
@@ -267,8 +276,30 @@ fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
     tools.extend(crate::aux_mcp::tool_list());
     tools
         .into_iter()
-        .filter(|d| d["name"].as_str().is_some_and(|name| menu.contains(&name)))
+        .filter(|d| {
+            d["name"].as_str().is_some_and(|name| {
+                menu.contains(&name)
+                    && direct_send_switch(name).is_none_or(|flag| {
+                        cfg.pointer(&format!("/socialV2/tools/{flag}"))
+                            .and_then(Value::as_bool)
+                            != Some(false)
+                    })
+            })
+        })
         .collect()
+}
+
+/// The `socialV2.tools` switch the console checks for a token-bound direct send
+/// (`console_agent::direct_inner`). The shared MCP registration (`qq_tools::registered`) does not
+/// gate these three tools, and the harness always binds the turn's token into them, so the menu
+/// applies the switch. As in the console, only an explicit `false` switches a send off.
+fn direct_send_switch(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "qq_send_private_message" => "sendPrivate",
+        "qq_send_group_message" => "sendGroup",
+        "qq_reply" => "reply",
+        _ => return None,
+    })
 }
 
 pub(super) fn error(reason: &str) -> Value {
