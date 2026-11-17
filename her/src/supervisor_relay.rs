@@ -933,6 +933,24 @@ mod native_tests {
     }
 
     #[test]
+    fn a_part_created_after_a_skip_inherits_only_the_her_ace_before_the_next_sweep() {
+        let fixture = Fixture::new();
+        let (logs, gone, _kept) = request_log_parts(&fixture);
+        let skipped = sweep(&fixture.0, &mut |seam, path| {
+            if seam == Seam::Listed && path == gone.as_path() {
+                std::fs::remove_file(path).unwrap();
+            }
+        });
+        assert_eq!(skipped, Ok(1));
+        assert_dacl(&logs, true, 3);
+        // A part the relay creates after the skip, with no further sweep: only the HER ACE,
+        // inherited from the protected logs folder (INHERITED_ACE = 16).
+        let created = logs.join("request-log-parts-request-body-3");
+        std::fs::write(&created, b"synthetic request body").unwrap();
+        assert_dacl(&created, false, 16);
+    }
+
+    #[test]
     fn relay_acl_verification_refuses_a_protected_foreign_sid_grant() {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
@@ -1395,6 +1413,25 @@ mod unix_tests {
                 libc::EACCES
             )
         );
+    }
+
+    #[test]
+    fn a_part_created_after_a_skip_sits_in_a_private_folder_before_the_next_sweep() {
+        let fixture = Fixture::new();
+        let (logs, gone, _kept) = request_log_parts(&fixture);
+        let skipped = sweep(&fixture.0, &mut |seam, path| {
+            if seam == Seam::Listed && path == gone.as_path() {
+                std::fs::remove_file(path).unwrap();
+            }
+        });
+        assert_eq!(skipped, Ok(1));
+        // A part the relay creates after the skip, with no further sweep: the 0700 version folder
+        // and the 0700 logs folder keep other accounts out of it.
+        let created = logs.join("request-log-parts-request-body-3");
+        std::fs::write(&created, b"synthetic request body").unwrap();
+        assert_eq!(mode(&fixture.0), 0o700);
+        assert_eq!(mode(&logs), 0o700);
+        assert!(created.is_file());
     }
 
     #[test]
