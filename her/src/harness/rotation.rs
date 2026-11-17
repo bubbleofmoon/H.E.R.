@@ -49,9 +49,16 @@ pub(crate) fn due_at(cfg: &Value, last: &LastCall, idle_from: i64) -> Option<i64
     if last.input? < cap(cfg, &last.model) {
         return None;
     }
-    let lead_ms = ((minutes - 1.0).max(0.0) * 60_000.0).ceil().min(i128::MAX as f64 / 2.0) as i128;
-    // The sum is exact in i128 and saturates only at the end, so a huge lead saturates the deadline from any start.
-    Some((i128::from(idle_from) + lead_ms).min(i128::from(i64::MAX)) as i64)
+    let lead_ms: i128 = if minutes <= 1.0 {
+        0
+    } else {
+        // Whole minutes are exact in i128; only the fraction goes through f64, so no millisecond is lost.
+        let whole = minutes.trunc();
+        let frac_ms = ((minutes - whole) * 60_000.0).ceil() as i128;
+        (whole as i128 - 1).saturating_mul(60_000).saturating_add(frac_ms)
+    };
+    // The sum saturates in i128 and then at the i64 range, so a huge lead saturates the deadline from any start.
+    Some(i128::from(idle_from).saturating_add(lead_ms).min(i128::from(i64::MAX)) as i64)
 }
 
 #[cfg(test)]
