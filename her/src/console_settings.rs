@@ -16,7 +16,8 @@ pub fn is_route(path: &str) -> bool {
 }
 
 /// `authority` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
-/// it commits.
+/// it commits and its write-back into `config.json` is done (the store gate is taken inside it,
+/// `settings::write_store`).
 pub fn route(
     context: &RuntimeContext, method: &str, path: &str, query: &HashMap<String, String>, body: &str, agent_call: bool,
     authority: crate::persona::Authority<'_>,
@@ -55,15 +56,20 @@ fn setting_field(fields: &Map<String, Value>) -> Result<&str, (u16, String)> {
     fields.get("setting").and_then(Value::as_str).ok_or((400, "setting is required".to_string()))
 }
 
-/// The reply of a set or reset: the setting, the stored value, its revision and whether it changed.
+/// The reply of a set or reset: the setting, the stored value, its revision and whether it changed, plus `mirrorError`
+/// when `config.json` could not be updated (the stored change stands).
 fn applied_reply(setting: &str, applied: crate::settings::Applied) -> Value {
-    json!({
+    let mut reply = json!({
         "ok": true,
         "setting": setting,
         "value": applied.value,
         "revision": applied.revision,
         "changed": applied.changed,
-    })
+    });
+    if let Some(error) = applied.mirror_error {
+        reply["mirrorError"] = json!(error);
+    }
+    reply
 }
 
 /// `{"setting": <registry key>, "value": <value>}`.
@@ -85,7 +91,8 @@ fn reset(context: &RuntimeContext, body: &str, authority: crate::persona::Author
     Ok(applied_reply(setting, applied))
 }
 
-/// `{"entry": <history entry id>}`; the reply names the entry, the setting and its stored value now (`null`: none).
+/// `{"entry": <history entry id>}`; the reply names the entry, the setting and its stored value now (`null`: none),
+/// plus `mirrorError` when `config.json` could not be updated (the undo stands).
 fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
     let fields = body_fields(body, &["entry"])?;
     let entry = fields
@@ -95,7 +102,11 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         .ok_or((400, "entry must be a positive integer".to_string()))?;
     let _gate = authority()?;
     let undone = crate::settings::undo(context, entry, "administrator")?;
-    Ok(json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored}))
+    let mut reply = json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored});
+    if let Some(error) = undone.mirror_error {
+        reply["mirrorError"] = json!(error);
+    }
+    Ok(reply)
 }
 
 /// `?setting=<registry key>&before=<entry id>`, both optional; other query members are ignored.

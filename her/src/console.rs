@@ -277,12 +277,17 @@ thread_local! {
     static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo).
+/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). Stored settings are
+/// put back at their registry pointers first (`settings::mirror_into`), so no writer puts back an older value of one.
 fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<(), String> {
     let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
         .map_err(|_| "runtime config is invalid".to_string())?;
-    let normalized = if doc.get("backup").is_some() {
+    let mirrored = crate::settings::mirror_into(context, &mut doc)?;
+    let backup = doc.get("backup").is_some();
+    if backup {
         doc["backup"] = crate::config::backup_config(&doc)?;
+    }
+    let normalized = if backup || mirrored {
         Some(serde_json::to_string_pretty(&doc).map_err(|error| error.to_string())?)
     } else { None };
     let text = normalized.as_deref().unwrap_or(text);
@@ -2709,6 +2714,11 @@ const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设�
 /// in the console (`/api/settings` `storeError`).
 const SETTINGS_STORE_UNAVAILABLE: &str = "设置存储暂时不可用，这次没有改动";
 
+/// The chat's note when a registry setting was stored but `config.json` was not updated (`settings::Applied`'s
+/// `mirror_error`). The write-back's own error names files, so it stays on the console's stderr; the next settings
+/// change or the console's start finishes the write-back.
+const SETTINGS_MIRROR_UNFINISHED: &str = "配置文件这次没有同步，下次改设置或控制台重启时会补上";
+
 /// When a chat change to a registry setting takes effect, as `settings_set` replies (`settings::Setting::applies`).
 fn settings_applies_note(applies: &str) -> &'static str {
     match applies {
@@ -2866,9 +2876,11 @@ pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &
 
 /// `settings-get` / `settings-set` for a caller that already proved owner-private authority. In a selected runtime a
 /// registry setting the chat may use (`settings::chat_setting`, named by its configuration path) reads as the next use
-/// reads it and is written through `settings::apply` (actor `owner`, source `chat`): validated by the registry and
-/// audited. A legacy context has no settings store, so it offers none. The other `SETTINGS_WRITABLE` paths keep their
-/// `config.json` write until their settings batch registers them.
+/// reads it and is written through `settings::apply` (actor `owner`, source `chat`): validated by the registry, audited
+/// and written back into `config.json`; a write-back that fails keeps the change, and the reply's `mirrorError` and
+/// note carry `SETTINGS_MIRROR_UNFINISHED`. The caller (`memory_actions::handle`) holds the configuration gate, which
+/// the settings store requires of every writer. A legacy context has no settings store, so it offers none. The other
+/// `SETTINGS_WRITABLE` paths keep their `config.json` write until their settings batch registers them.
 pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &RuntimeContext) -> Result<Value, (u16, String)> {
         if action == "settings-get" {
             let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2923,14 +2935,20 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     (503, SETTINGS_STORE_UNAVAILABLE.to_string())
                 }
             })?;
-            return Ok(json!({
+            let mut reply = json!({
                 "ok": true,
                 "key": path,
                 "value": applied.value,
                 "changed": applied.changed,
                 "hot": setting.applies != "restart",
                 "note": settings_applies_note(setting.applies),
-            }));
+            });
+            // The stored change stands; the write-back's own error names files, so the chat gets one fixed text.
+            if applied.mirror_error.is_some() {
+                reply["mirrorError"] = json!(SETTINGS_MIRROR_UNFINISHED);
+                reply["note"] = json!(format!("{}；{SETTINGS_MIRROR_UNFINISHED}", settings_applies_note(setting.applies)));
+            }
+            return Ok(reply);
         }
         if !is_setting_writable(&path) {
             return Err((
@@ -13927,6 +13945,13 @@ fn audit_snapshot(context: &RuntimeContext) -> Result<Vec<(String, String)>, Str
         .collect())
 }
 
+/// The digest of a configuration with every registry member removed (`settings::registry_free`); None when the text
+/// is not JSON.
+fn config_registry_free_sha(text: &str) -> Option<String> {
+    let document: Value = serde_json::from_str(text).ok()?;
+    Some(sha256_hex(&crate::settings::registry_free(&document).to_string()))
+}
+
 fn sha256_hex(s: &str) -> String {
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut h, s.as_bytes());
@@ -14360,7 +14385,13 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     .read_optional_text(area, relative)
                     .map_err(|_| (503, "selected runtime audit target is unavailable".to_string()))?
                     .unwrap_or_default();
-                if f.get("afterSha").and_then(Value::as_str) != Some(sha256_hex(&current).as_str()) {
+                // A configuration record that has `afterRegistryFreeSha` ignores registry members, which the settings
+                // store owns; any other record compares the raw file.
+                let unchanged = match f.get("afterRegistryFreeSha").and_then(Value::as_str) {
+                    Some(expected) if file == "config/config.json" => config_registry_free_sha(&current).as_deref() == Some(expected),
+                    _ => f.get("afterSha").and_then(Value::as_str) == Some(sha256_hex(&current).as_str()),
+                };
+                if !unchanged {
                     return Err((409, format!("{file} 在这条审计记录之后又被修改过，撤销会覆盖之后的变更；请先撤销更新的记录")));
                 }
             }
@@ -14540,12 +14571,18 @@ fn audit_write(
             let _ = std::fs::write(&backup, old);
             backup
         };
-        changed.push(json!({
+        let mut record = json!({
             "file": path,
             "backup": backup,
             "beforeSha": sha256_hex(old),
             "afterSha": sha256_hex(now),
-        }));
+        });
+        if path == "config/config.json" {
+            if let Some(sha) = config_registry_free_sha(now) {
+                record["afterRegistryFreeSha"] = json!(sha);
+            }
+        }
+        changed.push(record);
     }
     if changed.is_empty() && !administrator {
         return Ok(()); // 没改到文件（比如只读了状态），不留噪音
@@ -14593,6 +14630,28 @@ fn audit_write(
     Ok(())
 }
 
+/// #176: a settings change cut off between its store commit and its `config.json` write-back (a crash, a full disk),
+/// or a store an earlier build wrote without the write-back, is written back before the console answers any request.
+/// Without a stored value nothing is read or created beyond the store inspection, and no gate is taken. A busy gate
+/// (`SOCIAL_STATE_GATE_WAIT`) or a failed write is reported; the next settings change retries it.
+fn finish_settings_write_back(context: &RuntimeContext) {
+    if !crate::settings::has_stored_values(context) {
+        return;
+    }
+    let result = config_gate(context)
+        .and_then(|_gate| crate::settings::write_back(context).map_err(|error| (503, error)));
+    match result {
+        Ok(blocked) if blocked.is_empty() => {}
+        Ok(blocked) => crate::safe_println!(
+            "[console] ⚠️ config.json cannot hold the stored settings {} (a non-object is on the way)",
+            blocked.join(", ")
+        ),
+        Err((_, error)) => crate::safe_println!(
+            "[console] ⚠️ stored settings were not written back into config.json (the next settings change retries): {error}"
+        ),
+    }
+}
+
 /// 起服务。`port=0` 时用默认 3101。
 /// 当前控制台监听的端口（自重启要用它拉起新进程）。
 static CONSOLE_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
@@ -14633,6 +14692,8 @@ pub fn serve_with_context(
     let _ = CONSOLE_PORT.set(port);
     crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
     access::harden_selected_state_dir(&context);
+    // Before the start stamp of config.json is noted: the write-back may change the file.
+    finish_settings_write_back(&context);
     access::note_config_start(&context);
     // #192: an access change cut off between its configuration write and its revocation is finished before the
     // console answers any request.
