@@ -523,3 +523,91 @@ fn restore_settings_backup_while_the_console_writes_settings() {
         "{restored:?} was never written by the console"
     );
 }
+
+#[test]
+fn restore_settings_held_store_gate_refuses_the_restore_before_stopping() {
+    let f = Fixture::new();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    set_quiet(&f, 5000);
+    let plan = preview(&f.context(), &archive, false).unwrap();
+    // Another process holds the store gate, as a standalone MCP server does while it writes.
+    let gate = f.context().open_locked_file(RuntimeArea::Data, "locks/settings-store.lock").unwrap();
+    let mut control = FakeControl::default();
+    let error = execute_with(
+        &f.context(),
+        &archive,
+        false,
+        plan["confirmation"].as_str().unwrap(),
+        "fixture-admin",
+        &mut control,
+    )
+    .unwrap_err();
+    drop(gate);
+    assert!(error.contains("settings"), "{error}");
+    assert_eq!(control.stops, 0, "a gate the restore cannot take refuses it before anything stops");
+    assert_eq!(quiet(&f), Some(5000), "nothing changed");
+}
+
+#[test]
+fn restore_settings_console_write_is_refused_while_the_store_is_replaced() {
+    let f = Fixture::new();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    set_quiet(&f, 5000);
+    let plan = preview(&f.context(), &archive, false).unwrap();
+    // The probe runs at the first replacement, after the sidecar cleanup, where the restore holds the gate.
+    let mut control = FakeControl { probe_settings_write: true, ..Default::default() };
+    execute_with(
+        &f.context(),
+        &archive,
+        false,
+        plan["confirmation"].as_str().unwrap(),
+        "fixture-admin",
+        &mut control,
+    )
+    .unwrap();
+    assert_eq!(
+        control.settings_probe,
+        Some(Err(503)),
+        "a settings write between the sidecar cleanup and the replacement is refused"
+    );
+    assert_eq!(quiet(&f), Some(4000));
+}
+
+#[test]
+fn restore_settings_gate_that_is_not_a_plain_file_fails_the_backup_and_refuses_the_restore() {
+    for case in ["hard link", "directory", "hard link without the store"] {
+        let f = Fixture::new();
+        set_quiet(&f, 4000);
+        let archive = f.backup();
+        set_quiet(&f, 5000);
+        let plan = preview(&f.context(), &archive, false).unwrap();
+        let gate = f.0.join("locks/settings-store.lock");
+        if case == "directory" {
+            fs::remove_file(&gate).unwrap();
+            fs::create_dir(&gate).unwrap();
+        } else {
+            fs::hard_link(&gate, f.0.join("locks/settings-store-second-name.lock")).unwrap();
+        }
+        if case == "hard link without the store" {
+            for name in ["settings.db", "settings.db-wal", "settings.db-shm", "settings.db-journal"] {
+                let _ = fs::remove_file(f.0.join("data").join(name));
+            }
+        }
+        let error = crate::backup::create(&f.context(), &|| Ok(())).expect_err(case);
+        assert!(error.contains("settings"), "{case}: {error}");
+        let mut control = FakeControl::default();
+        let error = execute_with(
+            &f.context(),
+            &archive,
+            false,
+            plan["confirmation"].as_str().unwrap(),
+            "fixture-admin",
+            &mut control,
+        )
+        .expect_err(case);
+        assert!(error.contains("settings"), "{case}: {error}");
+        assert_eq!(control.stops, 0, "{case}: refused before anything stops");
+    }
+}

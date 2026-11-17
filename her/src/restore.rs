@@ -1222,6 +1222,8 @@ mod tests {
         leave_settings_sidecars: bool,
         fail_relative: Option<&'static str>,
         replaced: Vec<String>,
+        probe_settings_write: bool,
+        settings_probe: Option<Result<(), u16>>,
     }
     impl Control for FakeControl {
         fn preflight(&mut self, _: &RuntimeContext) -> Result<(), String> {
@@ -1282,6 +1284,13 @@ mod tests {
         ) -> Result<(), String> {
             self.writes += 1;
             self.replaced.push(label(area, relative));
+            if self.probe_settings_write && self.settings_probe.is_none() {
+                self.settings_probe = Some(
+                    crate::settings::apply(context, "reply.wakeQuietMs", &json!(4321), "probe", "console")
+                        .map(|_| ())
+                        .map_err(|(status, _)| status),
+                );
+            }
             let fail_relative = self.fail_relative.is_some_and(|name| name == relative);
             if fail_relative {
                 self.fail_relative = None;
