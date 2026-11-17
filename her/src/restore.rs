@@ -351,6 +351,10 @@ trait Control {
     }
     fn health(&mut self, context: &RuntimeContext, budget: Duration) -> Result<(), String>;
     fn alert(&mut self, context: &RuntimeContext, config: &Value, reason: &str);
+    /// Called once the restore has passed its admission check, before the pre-restore backup.
+    fn admitted(&mut self, _context: &RuntimeContext) {}
+    /// Called after the settings files are replaced and removed, before conversation reconciliation.
+    fn store_replaced(&mut self, _context: &RuntimeContext) {}
     fn replace(
         &mut self,
         context: &RuntimeContext,
@@ -642,6 +646,7 @@ fn apply(
             remove_runtime_file(context, area, &relative)?;
         }
     }
+    control.store_replaced(context);
     if !memory_only && prepared.files.contains_key("conversations.db") {
         reconcile_conversations(context)?;
     }
@@ -822,6 +827,7 @@ fn execute_with(
                 return Err(error);
             }
         }
+        control.admitted(context);
         audit(
             context,
             by,
@@ -1248,6 +1254,11 @@ mod tests {
         replaced: Vec<String>,
         probe_settings_write: bool,
         settings_probe: Option<Result<(), u16>>,
+        probe_writer_after_admission: bool,
+        writer_got_gate: Option<bool>,
+        writer_hold: Option<fs::File>,
+        probe_store_replaced: bool,
+        settings_after_replace: Option<Result<(), u16>>,
     }
     impl Control for FakeControl {
         fn preflight(&mut self, _: &RuntimeContext) -> Result<(), String> {
@@ -1294,6 +1305,26 @@ mod tests {
                     .unwrap_or_else(|| "fixture health deadline expired".into()))
             } else {
                 Ok(())
+            }
+        }
+        fn admitted(&mut self, context: &RuntimeContext) {
+            if self.probe_writer_after_admission {
+                match context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock") {
+                    Ok(gate) => {
+                        self.writer_got_gate = Some(true);
+                        self.writer_hold = Some(gate);
+                    }
+                    Err(_) => self.writer_got_gate = Some(false),
+                }
+            }
+        }
+        fn store_replaced(&mut self, context: &RuntimeContext) {
+            if self.probe_store_replaced {
+                self.settings_after_replace = Some(
+                    crate::settings::apply(context, "reply.wakeQuietMs", &json!(4321), "probe", "console")
+                        .map(|_| ())
+                        .map_err(|(status, _)| status),
+                );
             }
         }
         fn alert(&mut self, _: &RuntimeContext, _: &Value, reason: &str) {

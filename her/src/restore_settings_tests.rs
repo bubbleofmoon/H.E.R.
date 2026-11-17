@@ -617,3 +617,52 @@ fn restore_settings_gate_that_is_not_a_plain_file_fails_the_backup_and_refuses_t
         assert_eq!(control.stops, 0, "{case}: refused before anything stops");
     }
 }
+
+#[test]
+fn restore_settings_writer_cannot_take_the_store_gate_after_admission() {
+    let f = Fixture::new();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    set_quiet(&f, 5000);
+    let plan = preview(&f.context(), &archive, false).unwrap();
+    // A writer tries for the store gate as soon as the restore is admitted: the restore must already hold it, so a
+    // gate that is taken between admission and the mutation can never make a rollback run.
+    let mut control = FakeControl { probe_writer_after_admission: true, ..Default::default() };
+    let result = execute_with(
+        &f.context(),
+        &archive,
+        false,
+        plan["confirmation"].as_str().unwrap(),
+        "fixture-admin",
+        &mut control,
+    );
+    assert_eq!(control.writer_got_gate, Some(false), "a writer took the store gate after the restore was admitted");
+    result.unwrap();
+    assert_eq!(quiet(&f), Some(4000));
+}
+
+#[test]
+fn restore_settings_store_gate_is_released_before_conversation_reconciliation() {
+    let f = Fixture::new();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    set_quiet(&f, 5000);
+    let plan = preview(&f.context(), &archive, false).unwrap();
+    // Reconciliation takes configuration gates, which a settings writer takes before the store gate, so the store
+    // gate must be free by then.
+    let mut control = FakeControl { probe_store_replaced: true, ..Default::default() };
+    execute_with(
+        &f.context(),
+        &archive,
+        false,
+        plan["confirmation"].as_str().unwrap(),
+        "fixture-admin",
+        &mut control,
+    )
+    .unwrap();
+    assert_eq!(
+        control.settings_after_replace,
+        Some(Ok(())),
+        "a settings write after the replacement and before reconciliation is accepted"
+    );
+}
