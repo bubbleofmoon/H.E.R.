@@ -163,34 +163,40 @@ fn self_avatar_wrong_old_or_damaged_records_refetch() {
     let (root, context) = with_identity("206 avatar records", json!({"userId": "10001"}));
     let path = root.0.join("data").join(CACHE_FILE);
     let good = base64::engine::general_purpose::STANDARD.encode(png(3, 2));
-    let records = [
-        json!({"version": 1, "uin": "10002", "fetchedAt": T0, "data": good}).to_string(),
-        json!({"version": 1, "uin": "10001", "fetchedAt": T0, "data": "!!not base64"}).to_string(),
-        json!({"version": 1, "uin": "10001", "fetchedAt": T0 + 1, "data": good}).to_string(),
-        json!({"version": 1, "uin": "10001", "fetchedAt": i64::MIN, "data": good}).to_string(),
-        json!({"version": 2, "uin": "10001", "fetchedAt": T0, "data": good}).to_string(),
-        json!({"version": 1, "uin": "10001", "failedAt": i64::MIN}).to_string(),
-        "not json".to_string(),
-        " ".repeat(MAX_BYTES * 4 / 3 + 4097),
-    ];
-    for (index, text) in records.iter().enumerate() {
-        std::fs::write(&path, text).unwrap();
+    // Each record is tried one backoff after the previous one: every fetch needs a new attempt reservation.
+    let records = |now: i64| -> Vec<String> {
+        vec![
+            json!({"version": 1, "uin": "10002", "fetchedAt": now, "data": good}).to_string(),
+            json!({"version": 1, "uin": "10001", "fetchedAt": now, "data": "!!not base64"}).to_string(),
+            json!({"version": 1, "uin": "10001", "fetchedAt": now + 1, "data": good}).to_string(),
+            json!({"version": 1, "uin": "10001", "fetchedAt": i64::MIN, "data": good}).to_string(),
+            json!({"version": 2, "uin": "10001", "fetchedAt": now, "data": good}).to_string(),
+            json!({"version": 1, "uin": "10001", "failedAt": i64::MIN}).to_string(),
+            "not json".to_string(),
+            " ".repeat(MAX_BYTES * 4 / 3 + 4097),
+        ]
+    };
+    let count = records(T0).len();
+    for index in 0..count {
+        let now = T0 + index as i64 * FAILURE_BACKOFF_MS;
+        std::fs::write(&path, &records(now)[index]).unwrap();
         let calls = Cell::new(0);
         let mut fetch = |_: &str| -> Fetched {
             calls.set(calls.get() + 1);
             Ok(png(2, 2))
         };
-        let live = current_with(&context, T0, PIXELS, &mut fetch).unwrap_or_else(|| panic!("record {index} must refetch"));
+        let live = current_with(&context, now, PIXELS, &mut fetch).unwrap_or_else(|| panic!("record {index} must refetch"));
         assert_eq!(dimensions(&live.images[0].bytes), (2, 2), "record {index}");
         assert_eq!(calls.get(), 1, "record {index}");
-        assert_eq!(record(&root)["fetchedAt"], json!(T0), "record {index} is replaced");
+        assert_eq!(record(&root)["fetchedAt"], json!(now), "record {index} is replaced");
     }
     // A record of exactly the size cap is read (trailing JSON whitespace pads it); one byte more was refused above.
-    let mut exact = json!({"version": 1, "uin": "10001", "fetchedAt": T0, "data": good}).to_string();
+    let now = T0 + count as i64 * FAILURE_BACKOFF_MS;
+    let mut exact = json!({"version": 1, "uin": "10001", "fetchedAt": now, "data": good}).to_string();
     exact.push_str(&" ".repeat(MAX_BYTES * 4 / 3 + 4096 - exact.len()));
     std::fs::write(&path, &exact).unwrap();
     let mut refused = |_: &str| -> Fetched { panic!("a record at the cap is used, not refetched") };
-    let kept = current_with(&context, T0, PIXELS, &mut refused).expect("record at the cap");
+    let kept = current_with(&context, now, PIXELS, &mut refused).expect("record at the cap");
     assert_eq!(dimensions(&kept.images[0].bytes), (3, 2));
 }
 
@@ -221,6 +227,11 @@ fn self_avatar_needs_her_own_valid_uin_and_a_selected_runtime() {
     assert!(!root.0.join("data").join(CACHE_FILE).exists());
     assert!(current_with(&RuntimeContext::legacy(), T0, PIXELS, &mut fetch).is_none(), "the fixed-path mode keeps the portrait");
     assert_eq!(calls.get(), 0);
+    // Positive control: her own valid uin in a selected runtime fetches once and stores the avatar.
+    let (valid_root, valid) = with_identity("206 avatar identity valid", json!({"userId": "10001"}));
+    assert!(current_with(&valid, T0, PIXELS, &mut fetch).is_some(), "a valid uin serves her avatar");
+    assert_eq!(calls.get(), 1, "a valid uin fetches");
+    assert_eq!(record(&valid_root)["uin"], json!("10001"));
 }
 
 #[test]
@@ -270,7 +281,7 @@ fn self_avatar_taken_gate_serves_the_portrait_until_its_holder_exits() {
 }
 
 #[test]
-fn self_avatar_failed_store_serves_from_memory_for_fifteen_minutes_then_refetches() {
+fn self_avatar_failed_store_backs_off_on_disk_for_fifteen_minutes_then_refetches() {
     let (root, context) = with_identity("206 avatar store failure", json!({"userId": "10001"}));
     let path = root.0.join("data").join(CACHE_FILE);
     std::fs::create_dir(&path).unwrap();
@@ -279,17 +290,84 @@ fn self_avatar_failed_store_serves_from_memory_for_fifteen_minutes_then_refetche
         calls.set(calls.get() + 1);
         Ok(png(2, 2))
     };
-    assert!(current_with(&context, T0, PIXELS, &mut fetch).is_some(), "a failed store does not hide the avatar");
+    assert!(current_with(&context, T0, PIXELS, &mut fetch).is_some(), "a failed store does not hide the fetched avatar");
     assert!(path.is_dir(), "the blocked record is left alone");
-    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_some(), "served inside the fifteen minutes");
+    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_none(), "inside the fifteen minutes the portrait is served");
     assert_eq!(calls.get(), 1, "a failed store is not retried inside the fifteen minutes");
+    // A restarted console: a new runtime context on the same root, nothing kept in memory.
+    let restarted = RuntimeContext::from_root(&root.0).unwrap();
+    assert!(current_with(&restarted, T0 + 2, PIXELS, &mut fetch).is_none());
+    assert_eq!(calls.get(), 1, "the backoff survives a restart");
     std::fs::remove_dir(&path).unwrap();
-    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS - 1, PIXELS, &mut fetch).is_some());
+    assert!(current_with(&restarted, T0 + FAILURE_BACKOFF_MS - 1, PIXELS, &mut fetch).is_none());
     assert_eq!(calls.get(), 1, "still inside the backoff once the record can be written");
-    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS, PIXELS, &mut fetch).is_some());
+    assert!(current_with(&restarted, T0 + FAILURE_BACKOFF_MS, PIXELS, &mut fetch).is_some());
     assert_eq!(calls.get(), 2, "after fifteen minutes it fetches and stores again");
-    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS + 1, PIXELS, &mut fetch).is_some());
+    assert!(current_with(&restarted, T0 + FAILURE_BACKOFF_MS + 1, PIXELS, &mut fetch).is_some());
     assert_eq!(calls.get(), 2, "the stored record serves the next call");
+}
+
+#[test]
+fn self_avatar_unreadable_cache_counts_as_a_failure_under_the_backoff() {
+    let (root, context) = with_identity("206 avatar unreadable cache", json!({"userId": "10001"}));
+    let path = root.0.join("data").join(CACHE_FILE);
+    let calls = Cell::new(0);
+    let mut fetch = |_: &str| -> Fetched {
+        calls.set(calls.get() + 1);
+        Ok(png(2, 2))
+    };
+    assert!(current_with(&context, T0, PIXELS, &mut fetch).is_some());
+    assert_eq!(calls.get(), 1);
+    // The stored record exists but can no longer be read as a file.
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_none(), "an unreadable cache serves the portrait");
+    assert_eq!(calls.get(), 1, "an unreadable cache is not a plain miss");
+    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS - 1, PIXELS, &mut fetch).is_none());
+    assert_eq!(calls.get(), 1);
+    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS, PIXELS, &mut fetch).is_some(), "one fetch after the backoff");
+    assert_eq!(calls.get(), 2);
+    assert!(current_with(&context, T0 + FAILURE_BACKOFF_MS + 1, PIXELS, &mut fetch).is_none());
+    assert_eq!(calls.get(), 2, "still at most one fetch per fifteen minutes");
+}
+
+#[test]
+fn self_avatar_unwritable_reservation_serves_the_portrait_without_fetching() {
+    let (root, context) = with_identity("206 avatar reservation", json!({"userId": "10001"}));
+    let attempt = root.0.join("data").join(crate::self_avatar::ATTEMPT_FILE);
+    std::fs::create_dir(&attempt).unwrap();
+    let calls = Cell::new(0);
+    let mut fetch = |_: &str| -> Fetched {
+        calls.set(calls.get() + 1);
+        Ok(png(2, 2))
+    };
+    assert!(current_with(&context, T0, PIXELS, &mut fetch).is_none(), "no reservation, no fetch");
+    assert_eq!(calls.get(), 0);
+    assert!(!root.0.join("data").join(CACHE_FILE).exists());
+    std::fs::remove_dir(&attempt).unwrap();
+    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_some());
+    assert_eq!(calls.get(), 1);
+    let reservation: Value = serde_json::from_slice(&std::fs::read(&attempt).unwrap()).unwrap();
+    assert_eq!(reservation, json!({"version": 1, "uin": "10001", "attemptAt": T0 + 1}));
+}
+
+#[test]
+fn self_avatar_identity_change_during_the_fetch_discards_the_result() {
+    let (root, context) = with_identity("206 avatar identity during fetch", json!({"userId": "10001"}));
+    let urls = std::cell::RefCell::new(Vec::new());
+    let mut fetch = |url: &str| -> Fetched {
+        urls.borrow_mut().push(url.to_string());
+        if urls.borrow().len() == 1 {
+            // The bridge logs in as another account while the first fetch runs.
+            context.write_atomic(RuntimeArea::Data, "identity.json", json!({"userId": "10002"}).to_string().as_bytes()).unwrap();
+        }
+        Ok(png(2, 2))
+    };
+    assert!(current_with(&context, T0, PIXELS, &mut fetch).is_none(), "the old account's picture is not served");
+    assert!(!root.0.join("data").join(CACHE_FILE).exists(), "and not stored");
+    assert!(current_with(&context, T0 + 1, PIXELS, &mut fetch).is_some(), "the new account fetches at once");
+    assert_eq!(*urls.borrow(), vec![avatar_url("10001"), avatar_url("10002")]);
+    assert_eq!(record(&root)["uin"], json!("10002"));
 }
 
 #[test]
@@ -322,6 +400,11 @@ fn self_avatar_console_answer_and_tool_result_name_no_file_or_address() {
         clean(text);
         assert!(!text.contains('/') && !text.contains('\\'), "{text}");
     };
+    // Removing the record and the attempt reservation lets the next call fetch again at once.
+    let forget = || {
+        std::fs::remove_file(root.0.join("data").join(CACHE_FILE)).unwrap();
+        std::fs::remove_file(root.0.join("data").join(crate::self_avatar::ATTEMPT_FILE)).unwrap();
+    };
 
     let live = super::super::handle_self_image(&context, &params, &HashMap::new(), &cfg).unwrap();
     assert_eq!(live["source"], "qqAvatar");
@@ -339,9 +422,17 @@ fn self_avatar_console_answer_and_tool_result_name_no_file_or_address() {
     clean_result(&model_texts(&outcome.content));
 
     // A failed fetch serves the static portrait under a neutral lead line.
-    std::fs::remove_file(root.0.join("data").join(CACHE_FILE)).unwrap();
-    crate::self_avatar::FETCH_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(|_: &str| -> Fetched { Err("down".to_string()) })));
+    forget();
+    let failed = std::rc::Rc::new(Cell::new(0));
+    let counted = failed.clone();
+    crate::self_avatar::FETCH_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_: &str| -> Fetched {
+            counted.set(counted.get() + 1);
+            Err("down".to_string())
+        }));
+    });
     let portrait = super::super::handle_self_image(&context, &params, &HashMap::new(), &cfg).unwrap();
+    assert_eq!(failed.get(), 1, "the failing fetch ran");
     assert_eq!(portrait["source"], "portrait");
     let bytes = base64::engine::general_purpose::STANDARD.decode(portrait["image"]["data"].as_str().unwrap()).unwrap();
     assert_eq!(dimensions(&bytes), (3, 2));
@@ -350,10 +441,11 @@ fn self_avatar_console_answer_and_tool_result_name_no_file_or_address() {
     clean_result(&model_texts(&outcome.content));
 
     // With no hook the fetch fails: a unit test never reaches the network.
-    std::fs::remove_file(root.0.join("data").join(CACHE_FILE)).unwrap();
+    forget();
     crate::self_avatar::FETCH_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
     let unhooked = super::super::handle_self_image(&context, &params, &HashMap::new(), &cfg).unwrap();
     assert_eq!(unhooked["source"], "portrait");
+    assert!(root.0.join("data").join(crate::self_avatar::ATTEMPT_FILE).exists(), "the unhooked call reached the fetch");
 
     let missing = crate::qq_tools::self_image_outcome(&json!({"ok": false, "error": "未找到形象图片"}));
     assert!(missing.is_error);
@@ -401,22 +493,32 @@ fn self_avatar_clock_is_read_once_the_gate_is_held() {
 #[test]
 fn self_avatar_identity_is_read_once_the_gate_is_held() {
     let (_root, context) = with_identity("206 avatar identity switch", json!({"userId": "10001"}));
-    // Another caller holds the gate. This caller starts while her uin is 10001, waits for the gate, and her
-    // uin changes to 10002 before the gate frees.
+    // Another caller holds the gate. This caller starts while her uin is 10001 and, once it has found the
+    // gate taken, stops in the wait hook; her uin changes to 10002 and the gate frees before it goes on.
     let holder = context.open_locked_file(RuntimeArea::Data, crate::self_avatar::GATE_FILE).unwrap();
     let urls = std::sync::Mutex::new(Vec::new());
     let (context, urls) = (&context, &urls);
+    let (reached, waiting) = std::sync::mpsc::channel::<()>();
+    let (go, resume) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
         let caller = scope.spawn(move || {
+            crate::self_avatar::GATE_WAIT_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let _ = reached.send(());
+                    let _ = resume.recv();
+                }));
+            });
             let mut fetch = |url: &str| -> Fetched {
                 urls.lock().unwrap().push(url.to_string());
                 Ok(png(2, 2))
             };
             crate::self_avatar::current_with(context, T0, PIXELS, &mut fetch).is_some()
         });
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        waiting.recv_timeout(std::time::Duration::from_secs(30)).expect("the caller found the gate taken");
         context.write_atomic(RuntimeArea::Data, "identity.json", json!({"userId": "10002"}).to_string().as_bytes()).unwrap();
         drop(holder);
+        go.send(()).unwrap();
+        drop(go);
         assert!(caller.join().unwrap());
     });
     assert_eq!(*urls.lock().unwrap(), vec![avatar_url("10002")], "the caller fetches the uin it has once the gate is held");

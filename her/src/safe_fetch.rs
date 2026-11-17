@@ -645,6 +645,48 @@ mod tests {
     }
 
     #[test]
+    fn self_avatar_curl_reads_no_config_and_no_proxy_environment() {
+        let p = parse_url("https://q1.qlogo.cn/g?b=qq&nk=10001&s=640").unwrap();
+        let command = curl_command(&p, "1.1.1.1".parse().unwrap(), 1024, std::time::Duration::from_secs(5), std::path::Path::new("o.bin"), std::path::Path::new("h.hdr")).unwrap();
+        let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[0], "-q", "curl reads its config files unless -q comes first: {args:?}");
+        // Windows environment names are case-insensitive.
+        let key = |name: &str| if cfg!(windows) { name.to_ascii_uppercase() } else { name.to_string() };
+        let envs: std::collections::HashMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(name, value)| (key(&name.to_string_lossy()), value.map(|value| value.to_string_lossy().into_owned())))
+            .collect();
+        for name in ["CURL_HOME", "XDG_CONFIG_HOME", "HOME", "APPDATA", "USERPROFILE", "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            assert_eq!(envs.get(&key(name)), Some(&Some(String::new())), "{name} is empty for curl");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_avatar_curl_ignores_a_curlrc_in_its_home() {
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let (port, hits) = fake_media_server(vec![
+            ("/g?b=qq&nk=10001&s=640", 200, vec![], png.clone()),
+            ("/from-curlrc", 200, vec![], b"config".to_vec()),
+        ]);
+        let sequence = FETCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = crate::install_root::development_root(std::env::temp_dir().join(format!("her-curlrc-{}-{sequence}", std::process::id())));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".curlrc"), format!("url = \"http://127.0.0.1:{port}/from-curlrc\"\n")).unwrap();
+        let (out, hdr) = (home.join("out.bin"), home.join("out.hdr"));
+        let p = parse_url(&format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640")).unwrap();
+        let mut command = curl_command(&p, "127.0.0.1".parse().unwrap(), 1 << 20, std::time::Duration::from_secs(8), &out, &hdr).unwrap();
+        // The child's home holds a curlrc, as if the console ran with that home: only `-q` keeps it unread.
+        command.env("CURL_HOME", &home).env("HOME", &home);
+        let output = command.output().unwrap();
+        let body = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(body, png, "the avatar body, not the curlrc's URL");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "the curlrc's extra URL was never requested");
+    }
+
+    #[test]
     fn resolve_public_rejects_loopback_literal() {
         assert!(resolve_public("127.0.0.1", 80).is_err());
         assert!(resolve_public("localhost", 80).is_err());

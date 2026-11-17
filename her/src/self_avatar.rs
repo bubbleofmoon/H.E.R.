@@ -33,6 +33,10 @@ pub const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 pub const CACHE_FILE: &str = "self-avatar.cache";
 /// A cache record larger than this is ignored (base64 of `MAX_BYTES` plus the other fields).
 const CACHE_FILE_MAX: u64 = (MAX_BYTES as u64) * 4 / 3 + 4096;
+/// The attempt reservation (JSON) in the runtime data folder: her uin and the time of the last fetch
+/// attempt. It is written and read back before every fetch, so the backoff holds across restarts and
+/// processes even when the cache cannot be stored or read. Not `.json`, like `CACHE_FILE`.
+pub const ATTEMPT_FILE: &str = "self-avatar.attempt";
 /// One check-fetch-store at a time per runtime, across processes: a second caller waits here and then
 /// finds the stored avatar or failure. The OS releases the lock when its holder exits.
 pub const GATE_FILE: &str = "locks/self-avatar.lock";
@@ -45,6 +49,8 @@ thread_local! {
     /// Unit tests' replacement for the network fetch. With none set the fetch fails.
     pub(crate) static FETCH_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>>> =
         std::cell::RefCell::new(None);
+    /// Unit tests' signal, on this thread, that a caller found the gate taken and is about to wait.
+    pub(crate) static GATE_WAIT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
 }
 
 /// A QQ uin as qlogo takes it: 5 to 11 ASCII digits without a leading zero.
@@ -172,6 +178,12 @@ fn gate(context: &RuntimeContext) -> Option<std::fs::File> {
         match context.open_locked_file(RuntimeArea::Data, GATE_FILE) {
             Ok(file) => return Some(file),
             Err(error) if error == "runtime file is already locked" && std::time::Instant::now() < deadline => {
+                #[cfg(test)]
+                GATE_WAIT_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(_) => return None,
