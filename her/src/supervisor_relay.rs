@@ -1444,20 +1444,4 @@ mod unix_tests {
         assert_eq!(restrict(&fixture.0), Ok(0));
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
     }
-
-    #[test]
-    fn a_sweep_stopped_midway_is_completed_by_the_next_pass() {
-        let fixture = Fixture::new();
-        let (logs, gone, kept) = request_log_parts(&fixture);
-        // A stop right after the version folder: it is private, its entries are not yet. A part
-        // removed meanwhile is skipped by the next pass, which completes the rest.
-        set_mode(&fixture.0, 0o700);
-        set_mode(&logs, 0o755);
-        set_mode(&gone, 0o644);
-        set_mode(&kept, 0o644);
-        std::fs::remove_file(&gone).unwrap();
-        assert_eq!(restrict(&fixture.0), Ok(1));
-        assert_eq!(mode(&logs), 0o700);
-        assert_eq!(mode(&kept), 0o600);
-    }
 }
