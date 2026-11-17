@@ -379,6 +379,121 @@ fn gap_lists(read: Result<Value, &'static str>, last: &(Vec<String>, Vec<String>
     }
 }
 
+/// #192 (F3): how many held events (saved while the configuration could not be read) are kept in memory for replay
+/// once it reads again; a later one stays saved and replays at the next connection that reads the configuration.
+const HELD_LIMIT: usize = 10_000;
+
+/// #192 (F3): the conversation a message or poke belongs to, named as the reserved2 hub names it (`group:<id>` or
+/// `private:<id>`); `None` for every other frame and for a frame without that id.
+fn held_conversation(ev: &Event) -> Option<String> {
+    match (ev.post_type.as_str(), ev.message_type.as_str()) {
+        ("message", "group") => ev.group_id.map(|id| format!("group:{id}")),
+        ("message", "private") => ev.user_id.map(|id| format!("private:{id}")),
+        ("notice", _) if ev.sub_type == "poke" => ev.group_id.map(|id| format!("group:{id}")).or_else(|| {
+            ev.user_id
+                .or(ev.sender_id)
+                .or_else(|| ev.sender.as_ref().and_then(|s| s.user_id))
+                .map(|id| format!("private:{id}"))
+        }),
+        _ => None,
+    }
+}
+
+/// #192 (F3): remember a saved event (its journal key) for replay once the configuration reads again. False when
+/// `HELD_LIMIT` events are already held: that one stays saved for the next connection's replay.
+fn hold(held: &mut Vec<String>, event_key: String) -> bool {
+    if held.contains(&event_key) {
+        return true;
+    }
+    if held.len() >= HELD_LIMIT {
+        return false;
+    }
+    held.push(event_key);
+    true
+}
+
+/// #192 (F3): the held events among the saved ones, in saved order, split by the configuration that reads again:
+/// admitted conversations replay, the others are settled.
+fn take_held(cfg: &Value, held: &[String], saved: Vec<inbound::Replayable>) -> (Vec<inbound::Replayable>, Vec<String>) {
+    let held: std::collections::HashSet<&str> = held.iter().map(String::as_str).collect();
+    let items = saved.into_iter().filter(|item| held.contains(item.event_key.as_str())).collect();
+    split_replayable(Some(cfg), items)
+}
+
+/// #192 (F3): what the ingress loop does with one event. `readable`: the configuration read for it succeeded; `holds`:
+/// reserved2 serves its conversation here (`--live-groups`); `held_any`: events are held already; `refusable`: another
+/// mode would serve it. A served event is held while the configuration cannot be read, and also while earlier events
+/// are still held, so it never overtakes them once the configuration reads again.
+#[derive(Debug, PartialEq, Eq)]
+enum Ingress {
+    Handle,
+    Hold,
+    Refuse,
+    Skip,
+}
+
+fn ingress_for(readable: bool, holds: bool, held_any: bool, refusable: bool) -> Ingress {
+    if holds && (!readable || held_any) {
+        Ingress::Hold
+    } else if readable {
+        Ingress::Handle
+    } else if refusable {
+        Ingress::Refuse
+    } else {
+        Ingress::Skip
+    }
+}
+
+/// #192 (F3): whether this process's reserved2 hub serves `key`, by the rule of `Hub::taken` (reserved2.rs): every
+/// conversation with `--live-all` (the flag the hub is built with), otherwise those listed in `--live-groups`.
+fn reserved2_serves(live_all: bool, live_groups: &[String], key: &str) -> bool {
+    !key.is_empty() && (live_all || live_groups.iter().any(|g| g == key))
+}
+
+/// #192 (F3): events refused while the configuration cannot be read (outside reserved2, which holds them) go to the
+/// run record at most once a minute, also across a recovery, with the number refused since the previous record.
+#[derive(Default)]
+struct UnreadableRefusals {
+    count: u64,
+    recorded_at: Option<std::time::Instant>,
+}
+
+impl UnreadableRefusals {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// One more refused event; the number to record now, when a record is due.
+    fn note(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.count += 1;
+        self.due(now)
+    }
+
+    /// The configuration reads again: the number refused since the last record, once a record is due (the ingress
+    /// loop asks again until it is recorded).
+    fn flush(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.due(now)
+    }
+
+    fn due(&mut self, now: std::time::Instant) -> Option<u64> {
+        if self.count == 0 || self.recorded_at.is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY) {
+            return None;
+        }
+        self.recorded_at = Some(now);
+        Some(std::mem::take(&mut self.count))
+    }
+}
+
+/// #192 (F3): one run-record line for `count` events refused while the configuration could not be read.
+fn record_unreadable_refusals(context: &runtime::RuntimeContext, count: u64) {
+    recovery_log::record(
+        context,
+        run_record::Trigger::Turn,
+        run_record::Component::Queue,
+        "config-unreadable",
+        run_record::Outcome::Failed,
+        &format!("{count} inbound event(s) not processed: the configuration could not be read"),
+    );
+}
+
 /// Wake configurations written to the state file by a tool or the console (`confirmedAt` changed) reach the
 /// running state machine of the conversation. `synced` remembers the last `session::WakeSync` seen per conversation.
 fn sync_wake_configs(
@@ -1849,6 +1964,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let mut token = token;
     // #186: the gap lists of the last readable configuration, for a reconnect that cannot read it.
     let mut gap_admitted = (console::admitted_ids(&cfg_raw, "group"), console::admitted_ids(&cfg_raw, "private"));
+    // #192 (F3): saved events held while the configuration cannot be read (journal keys, arrival order), kept across
+    // reconnects, and the refusals not recorded yet.
+    let mut held: Vec<String> = Vec::new();
+    let mut refusals = UnreadableRefusals::default();
     'reconnect: loop {
         // Isolated startup validates all selected-root state before contacting its WebSocket.
         // Keep this inside the reconnect loop: a failed handshake drops this candidate pipeline,
@@ -2035,7 +2154,17 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if let Err(error) = &replay_cfg {
         println!("[her] ❌ 读取配置失败，已保存的入站事件留待下次连接重放：{error}");
     }
-    let (replay, settle) = split_replayable(replay_cfg.as_ref().ok(), journal.replayable().await?);
+    let saved = journal.replayable().await?;
+    // #192 (F3): with an unreadable configuration every saved event is held and replays once it reads again; with a
+    // readable one every saved event is decided below.
+    if replay_cfg.is_err() {
+        for item in &saved {
+            hold(&mut held, item.event_key.clone());
+        }
+    } else {
+        held.clear();
+    }
+    let (replay, settle) = split_replayable(replay_cfg.as_ref().ok(), saved);
     replay_queue.extend(replay);
     if !settle.is_empty() {
         journal.mark_handled(settle, now_ms() as i64).await?;
@@ -2045,7 +2174,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // 灰度：只接管列出来的会话（"group:123,private:456"）。空 = 不接管任何会话。
-    let (live_groups, _live_all, mut pipeline) = match isolated_live_startup {
+    let (live_groups, live_all, mut pipeline) = match isolated_live_startup {
         Some((live_groups, live_all, pipeline)) => {
             if !live_groups.is_empty() {
                 println!("[her] 灰度接管：{live_groups:?}");
@@ -2268,6 +2397,27 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
         // 回合恢复核对后明确未执行且仍有效的事件（ticket 10）排到重放队列末尾。
         replay_queue.extend(turn_recovery::take_resumable());
+        // #192 (F3): once the configuration reads again, the held events go to the front of the replay queue in
+        // arrival order (events of conversations it no longer admits are settled), and the refusals not recorded yet
+        // are recorded once a record is due (at most one a minute).
+        if !held.is_empty() || refusals.count > 0 {
+            if let Ok(now_cfg) = runtime_context.load_config() {
+                if let Some(count) = refusals.flush(std::time::Instant::now()) {
+                    record_unreadable_refusals(&runtime_context, count);
+                }
+                let keys = std::mem::take(&mut held);
+                if !keys.is_empty() {
+                    let (replay, settle) = take_held(&now_cfg, &keys, journal.replayable().await?);
+                    if !settle.is_empty() {
+                        journal.mark_handled(settle, now_ms() as i64).await?;
+                    }
+                    println!("[her] the configuration reads again: replaying {} held inbound events", replay.len());
+                    for item in replay.into_iter().rev() {
+                        replay_queue.push_front(item);
+                    }
+                }
+            }
+        }
         // 重放队列优先于新帧；重放事件已经由上一次连接保存过，不再写入。
         let (text, replayed) = if let Some(item) = replay_queue.pop_front() {
             (item.raw, true)
@@ -2491,6 +2641,51 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         }
 
+        // #192 (F3): the configuration this event is handled with, read once here. While it cannot be read, reserved2
+        // saves a message or poke of a conversation this process serves and holds it until it reads again (replayed
+        // above, in arrival order); while events are held, a newer served event is held behind them even when the
+        // configuration reads again, so it never overtakes them. Every other mode records the refusal. Nothing is
+        // dropped silently.
+        let event_cfg = if runtime_context.is_isolated() {
+            let read = runtime_context.load_config();
+            let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
+            let key = held_conversation(&ev).unwrap_or_default();
+            let served = reserved2_serves(live_all, &live_groups, &key);
+            let listed = !key.is_empty() && live_groups.iter().any(|g| g == &key);
+            let refusable = !key.is_empty() && !reserved2_now && live_mode && (live_groups.is_empty() || listed);
+            match ingress_for(read.is_ok(), reserved2_now && served, !held.is_empty(), refusable) {
+                Ingress::Handle => read.ok(),
+                Ingress::Hold => {
+                    let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
+                    let saved = replayed
+                        || journal.record_received(inbound_key.clone(), key.clone(), text.clone(), now_ms() as i64).await?
+                            == inbound::Receipt::New;
+                    // A duplicate (not saved again) was saved, and so held or replayed, before.
+                    if saved {
+                        if !hold(&mut held, inbound_key) {
+                            println!("[her] ⚠️ {key} event saved; {HELD_LIMIT} are held already, so it replays at the next connection");
+                        } else if let Err(error) = &read {
+                            println!("[her] ⚠️ configuration unreadable ({error}): {key} event saved and held until it reads again");
+                        } else {
+                            println!("[her] {key} event saved and held behind the events held earlier");
+                        }
+                    }
+                    continue;
+                }
+                Ingress::Refuse => {
+                    let error = read.err().unwrap_or_default();
+                    println!("[her] ❌ configuration unreadable ({error}): {key} event not processed");
+                    if let Some(count) = refusals.note(std::time::Instant::now()) {
+                        record_unreadable_refusals(&runtime_context, count);
+                    }
+                    continue;
+                }
+                Ingress::Skip => continue,
+            }
+        } else {
+            None
+        };
+
         // Administrative release approval and persona switching are independent of participation mode.
         if is_message && live_mode && pipeline.is_some() && runtime_context.is_isolated() {
             let (plain, _, _) = plain_text(&ev.message, self_id);
@@ -2626,7 +2821,13 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
         if let Some(hub) = reserved2_hub.as_mut() {
             if console::runtime_mode(&runtime_context) == "reserved2" {
-                if let Err(error) = hub.handle(&ev, &text, replayed, self_id, &self_nick, &self_cards).await { println!("[reserved2] ingress error: {error}"); }
+                // #192 (F3): the hub decides with the configuration read above, so a file that becomes unreadable in
+                // between cannot drop the event.
+                let handled = match event_cfg {
+                    Some(cfg) => hub.handle_with_config(cfg, &ev, &text, replayed, self_id, &self_nick, &self_cards).await,
+                    None => hub.handle(&ev, &text, replayed, self_id, &self_nick, &self_cards).await,
+                };
+                if let Err(error) = handled { println!("[reserved2] ingress error: {error}"); }
                 continue;
             }
         }
@@ -3326,6 +3527,108 @@ mod tests {
             "a group added mid-run gets its gaps recorded; a denied one does not"
         );
         assert_eq!(gap_lists(Err("runtime config is invalid"), &last), last, "an unreadable configuration keeps the last lists");
+    }
+
+    #[test]
+    fn t192_held_events_are_the_messages_and_pokes_of_a_conversation() {
+        let event = |frame: Value| serde_json::from_value::<Event>(frame).unwrap();
+        let cases = [
+            (json!({"post_type":"message","message_type":"group","group_id":420042,"user_id":1001}), Some("group:420042")),
+            (json!({"post_type":"message","message_type":"private","user_id":7001}), Some("private:7001")),
+            (json!({"post_type":"notice","notice_type":"notify","sub_type":"poke","group_id":420042,"user_id":1001}), Some("group:420042")),
+            (json!({"post_type":"notice","notice_type":"notify","sub_type":"poke","sender_id":7001}), Some("private:7001")),
+            (json!({"post_type":"notice","notice_type":"notify","sub_type":"poke","sender":{"user_id":7002}}), Some("private:7002")),
+            (json!({"post_type":"message","message_type":"group","user_id":1001}), None),
+            (json!({"post_type":"notice","notice_type":"group_increase","group_id":420042}), None),
+            (json!({"post_type":"meta_event","meta_event_type":"heartbeat"}), None),
+        ];
+        for (frame, expected) in cases {
+            assert_eq!(held_conversation(&event(frame.clone())).as_deref(), expected, "{frame}");
+        }
+    }
+
+    #[test]
+    fn t192_at_most_the_held_limit_stays_in_memory() {
+        let mut held: Vec<String> = (0..HELD_LIMIT - 1).map(|n| format!("group:420042|message:{n}")).collect();
+        assert!(hold(&mut held, "group:420042|message:last".to_string()), "the event that reaches the limit is held");
+        assert_eq!(held.len(), HELD_LIMIT);
+        assert!(hold(&mut held, "group:420042|message:0".to_string()), "an event held already stays held");
+        assert_eq!(held.len(), HELD_LIMIT, "and is not held twice");
+        assert!(!hold(&mut held, "group:420042|message:over".to_string()), "one past the limit waits for the next connection");
+        assert_eq!(held.len(), HELD_LIMIT);
+    }
+
+    #[test]
+    fn t192_held_events_replay_in_saved_order_once_the_configuration_reads() {
+        let item = |conversation: &str, id: &str| inbound::Replayable {
+            event_key: format!("{conversation}|message:{id}"),
+            conversation: conversation.to_string(),
+            raw: "{}".to_string(),
+        };
+        // Saved order; the event awaiting a wake (`:2`) is saved but was never held.
+        let saved = vec![item("group:420042", "1"), item("group:420042", "2"), item("group:420043", "3"), item("group:420042", "4")];
+        let held = vec!["group:420042|message:4".to_string(), "group:420043|message:3".to_string(), "group:420042|message:1".to_string()];
+        let cfg = json!({"allow": {"groups": [420042, 420043]}, "deny": {"groups": [420043]}});
+        let (replay, settle) = take_held(&cfg, &held, saved);
+        assert_eq!(
+            replay.iter().map(|r| r.event_key.as_str()).collect::<Vec<_>>(),
+            ["group:420042|message:1", "group:420042|message:4"],
+            "held events of admitted conversations replay in saved order"
+        );
+        assert_eq!(settle, ["group:420043|message:3"], "a held event of a conversation denied meanwhile is settled");
+    }
+
+    #[test]
+    fn t192_refusals_are_recorded_at_most_once_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        let mut refusals = UnreadableRefusals::default();
+        assert_eq!(refusals.note(at(0)), Some(1), "the first refusal is recorded at once");
+        assert_eq!(refusals.note(at(1_000)), None);
+        assert_eq!(refusals.flush(at(2_000)), None, "a recovery within the minute records nothing yet");
+        assert_eq!(refusals.note(at(3_000)), None, "nor does a refusal after that recovery");
+        assert_eq!(refusals.flush(at(59_999)), None, "just under a minute: not yet");
+        assert_eq!(refusals.flush(at(60_000)), Some(2), "a minute after the last record: the two since then");
+        assert_eq!(refusals.flush(at(60_001)), None, "nothing is recorded twice");
+        assert_eq!(refusals.note(at(61_000)), None, "the next record is a minute after this one");
+        assert_eq!(refusals.note(at(119_999)), None);
+        assert_eq!(refusals.note(at(120_000)), Some(3));
+    }
+
+    #[test]
+    fn t192_a_served_event_waits_behind_held_events_even_once_the_configuration_reads() {
+        // (readable, holds, held_any, refusable) and the action.
+        let cases = [
+            // The interleaving: the configuration reads again, but earlier events of the served conversations are
+            // still held: the newer event is held behind them.
+            ((true, true, true, false), Ingress::Hold),
+            ((true, true, false, false), Ingress::Handle),
+            ((false, true, false, false), Ingress::Hold),
+            ((false, true, true, false), Ingress::Hold),
+            // A conversation reserved2 does not serve here is never held behind them.
+            ((true, false, true, true), Ingress::Handle),
+            ((false, false, false, true), Ingress::Refuse),
+            ((false, false, true, false), Ingress::Skip),
+        ];
+        for ((readable, holds, held_any, refusable), expected) in cases {
+            assert_eq!(
+                ingress_for(readable, holds, held_any, refusable),
+                expected,
+                "readable={readable} holds={holds} held_any={held_any} refusable={refusable}"
+            );
+        }
+    }
+
+    #[test]
+    fn t192_live_all_is_served_and_held_like_the_reserved2_hub_serves_it() {
+        let listed = vec!["group:420042".to_string()];
+        assert!(reserved2_serves(false, &listed, "group:420042"));
+        assert!(!reserved2_serves(false, &listed, "group:420043"), "an unlisted conversation without --live-all");
+        assert!(reserved2_serves(true, &listed, "group:420043"), "--live-all serves an unlisted conversation, as Hub::taken does");
+        assert!(reserved2_serves(true, &[], "private:7001"), "--live-all with no explicit groups");
+        assert!(!reserved2_serves(true, &[], ""), "a frame without a conversation is never served");
+        // With --live-all and no explicit groups, an unreadable configuration holds the event instead of skipping it.
+        assert_eq!(ingress_for(false, reserved2_serves(true, &[], "group:420043"), false, false), Ingress::Hold);
     }
 
     fn ev(group: bool, text: &str) -> Event {
