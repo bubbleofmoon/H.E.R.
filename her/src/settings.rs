@@ -2,8 +2,9 @@
 //!
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
-//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
-//! A legacy (no-root) context has no store.
+//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply`, `reset` and `undo` change one value with one
+//! audit row each, under the store gate (`write_store`), and `history` lists the audit rows. A legacy (no-root)
+//! context has no store.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -22,7 +23,8 @@ const LEGACY_ERROR: &str = "settings require a selected runtime";
 
 #[cfg(test)]
 thread_local! {
-    /// Makes the next `apply` on this thread fail after it wrote the value and before the audit row.
+    /// Makes the next change (`apply`, `reset` or `undo`) on this thread fail after it wrote the value and before the
+    /// audit row.
     pub(crate) static FAIL_BEFORE_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -169,7 +171,8 @@ enum Inspection {
     Ready(Connection),
 }
 
-/// The store gate, a file under `data/`: it serializes the WAL switch of a new store.
+/// The store gate, a file under `data/`: every write holds it from its inspection until its connection closes
+/// (`write_store`).
 const STORE_GATE: &str = "locks/settings-store.lock";
 
 /// The refusal for a rollback journal beside the store. Nothing recovers it: our store has a journal only while its
@@ -397,16 +400,16 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
 const WAL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Puts the store in WAL mode. The switch asks for the write lock while it holds a read lock, and SQLite then answers
-/// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. So a
-/// store not yet in WAL is switched under `locks/settings-store.lock`, one writer at a time, and the switch is retried
-/// while another connection holds a lock, until `WAL_SWITCH_WAIT`. A store already in WAL is left as it is.
-fn enable_wal(context: &RuntimeContext, conn: &Connection) -> Result<(), String> {
+/// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. The
+/// caller holds `locks/settings-store.lock` (`write_store`), so a store not yet in WAL is switched one writer at a
+/// time, and the switch is retried while another connection holds a lock, until `WAL_SWITCH_WAIT`. A store already in
+/// WAL is left as it is.
+fn enable_wal(conn: &Connection) -> Result<(), String> {
     let mode = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, String>(0));
     if mode("PRAGMA journal_mode").is_ok_and(|mode| mode.eq_ignore_ascii_case("wal")) {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
-    let _gate = store_gate(context, deadline)?;
     loop {
         let busy = match mode("PRAGMA journal_mode=WAL") {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
@@ -500,7 +503,8 @@ fn has_settings_schema(conn: &Connection) -> bool {
 }
 
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
-/// schema is newer than this release's (checked before anything is written).
+/// schema is newer than this release's (checked before anything is written). The caller holds the store gate
+/// (`write_store`).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // Refuse what this release cannot use before any connection that can write opens the store.
     drop(inspect(context)?);
@@ -515,7 +519,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
     // The same checks again, for a store changed since the inspection.
     check_schema(&conn)?;
-    enable_wal(context, &conn)?;
+    enable_wal(&conn)?;
     conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
     match schema_version(&tx)? {
@@ -540,6 +544,89 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Runs one write under the store gate. The gate is taken (waiting up to `WAL_SWITCH_WAIT`, else 503) before the
+/// inspection and held until the connection closes, so no other writer of this store can stop between this writer's
+/// inspection and its read-write open and leave a journal that open would play back. `write` runs in one immediate
+/// transaction, committed when it returns `Ok` and rolled back otherwise.
+fn write_store<T>(
+    context: &RuntimeContext,
+    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+) -> Result<T, (u16, String)> {
+    let unavailable = |error: String| -> (u16, String) { (503, error) };
+    let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
+    let mut conn = open_for_write(context).map_err(unavailable)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    let result = write(&tx)?;
+    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    Ok(result)
+}
+
+/// The stored text and revision of a global setting, read in the caller's transaction.
+fn stored_row(conn: &Connection, key: &str) -> Result<Option<(String, i64)>, (u16, String)> {
+    conn.query_row("SELECT value, revision FROM settings WHERE key=?1", [key], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .map_err(|_| (503, STORAGE_ERROR.to_string()))
+}
+
+/// Writes one change of a global setting and its audit row in the caller's transaction: `new` is the text to store,
+/// `None` removes the stored value. Returns the stored revision (0 when removed). A revision continues from the stored
+/// row, or, without one (never set, or removed by an undo), after the setting's audit rows, so it is never reused.
+fn record_change(
+    conn: &Connection,
+    setting: &Setting,
+    old: Option<(String, i64)>,
+    new: Option<&str>,
+    actor: &str,
+    source: &str,
+) -> Result<i64, (u16, String)> {
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let at = now_ms();
+    let revision = match new {
+        Some(text) => {
+            let revision = match &old {
+                Some((_, revision)) => revision + 1,
+                None => {
+                    let changes: i64 = conn
+                        .query_row(
+                            "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1",
+                            [setting.key],
+                            |row| row.get(0),
+                        )
+                        .map_err(failed)?;
+                    changes + 1
+                }
+            };
+            conn.execute(
+                "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+                 updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                params![setting.key, text, revision, at, actor],
+            )
+            .map_err(failed)?;
+            revision
+        }
+        None => {
+            conn.execute("DELETE FROM settings WHERE key=?1", [setting.key]).map_err(failed)?;
+            0
+        }
+    };
+    #[cfg(test)]
+    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
+        return Err((503, STORAGE_ERROR.to_string()));
+    }
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let request = format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    conn.execute(
+        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+         VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
+        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), new, request],
+    )
+    .map_err(failed)?;
+    Ok(revision)
+}
+
 /// Sets one global setting: validated against the registry, then written with one audit row in one transaction.
 /// The same value again changes nothing and writes no audit row. A refused value leaves the stored value as it was.
 pub(crate) fn apply(
@@ -554,46 +641,141 @@ pub(crate) fn apply(
     }
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.requirement()))?;
-    let unavailable = |error: String| -> (u16, String) { (503, error) };
-    let mut conn = open_for_write(context).map_err(unavailable)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    let old: Option<(String, i64)> = tx
-        .query_row("SELECT value, revision FROM settings WHERE key=?1", [setting.key], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .optional()
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let text = value.to_string();
-    if let Some((old_text, revision)) = &old {
-        if *old_text == text {
-            return Ok(Applied { value, revision: *revision, changed: false });
+    write_store(context, |conn| {
+        let old = stored_row(conn, setting.key)?;
+        if let Some((old_text, revision)) = &old {
+            if *old_text == text {
+                return Ok(Applied { value, revision: *revision, changed: false });
+            }
         }
+        let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
+        Ok(Applied { value, revision, changed: true })
+    })
+}
+
+/// Returns a global setting to its registry default: the default is stored, so it wins over `config.json`, with one
+/// audit row (source `reset`). A stored default already changes nothing.
+pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
     }
-    let revision = old.as_ref().map_or(0, |(_, revision)| *revision) + 1;
-    let at = now_ms();
-    tx.execute(
-        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
-         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
-        params![setting.key, text, revision, at, actor],
-    )
-    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    #[cfg(test)]
-    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
-        return Err(unavailable(STORAGE_ERROR.to_string()));
+    let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+    apply(context, setting.key, &setting.default_value(), actor, "reset")
+}
+
+const UNKNOWN_ENTRY_ERROR: &str = "unknown history entry";
+const CHANGED_SINCE_ERROR: &str = "the setting changed after this entry; undo the later change first";
+const NOT_UNDOABLE_ERROR: &str = "this entry cannot be undone";
+const OLD_VALUE_REFUSED_ERROR: &str = "the old value of this entry is no longer accepted";
+
+/// What `undo` restored.
+pub(crate) struct Undone {
+    pub key: &'static str,
+    /// The stored value now; `None` when the undo removed it.
+    pub stored: Option<Value>,
+}
+
+/// Undoes one history entry (`settings_audit.id`): restores its old value (none removes the stored value) with one
+/// audit row (source `undo`), so undoing that row redoes the change. In the same transaction it refuses with 409 and
+/// writes nothing unless the entry names a global setting the registry still has, no later audit row names that
+/// setting, the stored value is still the entry's new value and the registry still accepts the entry's old value. An
+/// entry that does not exist, and any entry while there is no store yet, is 404 (and creates no store).
+pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<Undone, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
     }
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let request = format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    tx.execute(
-        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
-         VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
-        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), text, request],
-    )
-    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    Ok(Applied { value, revision, changed: true })
+    if matches!(inspect(context).map_err(|error| (503, error))?, Inspection::Missing | Inspection::Fresh) {
+        return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));
+    }
+    write_store(context, |conn| {
+        let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+        let row: Option<(String, String, Option<String>, Option<String>)> = conn
+            .query_row("SELECT scope, key, old_value, new_value FROM settings_audit WHERE id=?1", [entry], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()
+            .map_err(failed)?;
+        let (scope, key, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
+        let setting = find(&key).filter(|_| scope == "global").ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+        let later: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1 AND id>?2",
+                params![setting.key, entry],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        let current = stored_row(conn, setting.key)?;
+        if later > 0 || current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
+            return Err((409, CHANGED_SINCE_ERROR.to_string()));
+        }
+        let restored = old_text
+            .map(|text| {
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|value| setting.normalize(&value))
+                    .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
+            })
+            .transpose()?;
+        let restored_text = restored.as_ref().map(Value::to_string);
+        record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
+        Ok(Undone { key: setting.key, stored: restored })
+    })
+}
+
+/// The most entries one history page lists.
+pub(crate) const HISTORY_PAGE: usize = 100;
+
+/// The change history (`settings_audit`), newest first: at most `HISTORY_PAGE` entries with an id below `before` (from
+/// the newest when `None`), only `setting`'s when given (an unknown setting is 400). Each entry has its id (`entry`,
+/// what undo takes), `atMs`, `actor`, `source`, `scope`, `setting` and `old` and `new` (`null`: no stored value; text
+/// that is not JSON is shown as a string). `next` is the `before` of the next page, `null` on the last. Read through
+/// the inspection's read-only connection: no store yet is an empty history, a store this release cannot read is 503.
+pub(crate) fn history(
+    context: &RuntimeContext,
+    setting: Option<&str>,
+    before: Option<i64>,
+) -> Result<Value, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let key = setting
+        .map(|key| find(key).map(|found| found.key).ok_or((400, "unknown setting".to_string())))
+        .transpose()?;
+    let conn = match inspect(context).map_err(|error| (503, error))? {
+        Inspection::Missing | Inspection::Fresh => return Ok(json!({"ok": true, "entries": [], "next": null})),
+        Inspection::Ready(conn) => conn,
+    };
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let shown = |text: Option<String>| {
+        text.map_or(Value::Null, |text| serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)))
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT id, at_ms, actor, source, scope, key, old_value, new_value FROM settings_audit
+             WHERE id < ?1 AND (?2 IS NULL OR key = ?2) ORDER BY id DESC LIMIT ?3",
+        )
+        .map_err(failed)?;
+    let entries = statement
+        .query_map(params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let at: i64 = row.get(1)?;
+            let actor: String = row.get(2)?;
+            let source: String = row.get(3)?;
+            let scope: String = row.get(4)?;
+            let key: String = row.get(5)?;
+            let old: Option<String> = row.get(6)?;
+            let new: Option<String> = row.get(7)?;
+            Ok(json!({
+                "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope, "setting": key,
+                "old": shown(old), "new": shown(new),
+            }))
+        })
+        .map_err(failed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(failed)?;
+    let next = if entries.len() == HISTORY_PAGE { entries.last().map(|entry| entry["entry"].clone()) } else { None };
+    Ok(json!({"ok": true, "entries": entries, "next": next}))
 }
 
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value

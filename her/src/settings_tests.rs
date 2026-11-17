@@ -354,12 +354,14 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
     let (root, context) = settings_fixture("settings revoked");
     let body = json!({"setting": QUIET_KEY, "value": 4500}).to_string();
     let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
-    let (status, _, reply) = crate::console_settings::route(&context, "POST", "/api/settings/set", &body, false, &revoked);
+    let (status, _, reply) =
+        crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &revoked);
     assert_eq!(status, 401, "{reply}");
     assert!(!settings_db(&root).exists(), "a revoked credential never writes");
     assert_eq!(next_use_quiet(&context), Some(3000));
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, _, reply) = crate::console_settings::route(&context, "POST", "/api/settings/set", &body, false, &granted);
+    let (status, _, reply) =
+        crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &granted);
     assert_eq!(status, 200, "{reply}");
     assert_eq!(next_use_quiet(&context), Some(4500));
 }
@@ -774,7 +776,8 @@ fn no_registry_setting_is_cached_on_the_config_stamp() {
 fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (root, context) = settings_fixture("settings page");
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, content_type, page) = crate::console_settings::route(&context, "GET", "/settings", "", false, &granted);
+    let (status, content_type, page) =
+        crate::console_settings::route(&context, "GET", "/settings", &HashMap::new(), "", false, &granted);
     assert_eq!(status, 200, "{page}");
     assert_eq!(content_type, "text/html; charset=utf-8");
     let (status, _) = admin_request(&context, "GET", "/settings", None);
@@ -827,7 +830,7 @@ fn history_page(context: &RuntimeContext, query: &str) -> (Vec<Value>, Value) {
 fn direct_route(
     context: &RuntimeContext, method: &str, path: &str, body: &str, authority: crate::persona::Authority<'_>,
 ) -> (u16, Value) {
-    let (status, _, reply) = crate::console_settings::route(context, method, path, body, false, authority);
+    let (status, _, reply) = crate::console_settings::route(context, method, path, &HashMap::new(), body, false, authority);
     (status, serde_json::from_str(&reply).unwrap_or(Value::Null))
 }
 

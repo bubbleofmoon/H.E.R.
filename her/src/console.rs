@@ -12336,7 +12336,7 @@ fn route_with_context(
             }
             Ok(gate)
         };
-        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.body, agent_call, &authority);
+        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && crate::console_persona::is_route(&req.path) {
