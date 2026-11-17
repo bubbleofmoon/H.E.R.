@@ -2,7 +2,8 @@
 //!
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
-//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
+//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change,
+//! for the console set route and for the owner's chat settings tools (`chat_setting`, `console::settings_action`).
 //! A legacy (no-root) context has no store. The registry owns each setting's default and bounds: a reader reads its
 //! setting through `Setting::read` (or `integer`, `text`) on the loader's document, never with a default of its own.
 
@@ -74,6 +75,9 @@ pub(crate) struct Setting {
     pub group: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
+    /// Whether the owner's private chat may read and change it through `settings_get` / `settings_set`, under
+    /// `chat_name`. Never set for a secret (registry test).
+    pub chat: bool,
 }
 
 impl Setting {
@@ -133,6 +137,26 @@ impl Setting {
             Kind::ModelId { .. } => json!({"type": "model id", "maxChars": MODEL_ID_MAX_CHARS}),
         }
     }
+
+    /// What the next use reads from `document`, the loaded configuration: the value at the pointer when this setting
+    /// accepts it, otherwise the default.
+    pub(crate) fn effective_value(&self, document: &Value) -> Value {
+        self.read(document)
+    }
+
+    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
+    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    pub(crate) fn chat_name(&self) -> String {
+        self.pointer.trim_start_matches('/').replace('/', ".")
+    }
+
+    /// Why a chat value was refused, under the chat's name.
+    pub(crate) fn chat_requirement(&self) -> String {
+        match self.kind {
+            Kind::Integer { min, max, .. } => format!("{} 必须是 {min} 到 {max} 的整数", self.chat_name()),
+            Kind::ModelId { .. } => format!("{} 必须是 1 到 200 个字符、不含控制字符的模型名", self.chat_name()),
+        }
+    }
 }
 
 pub(crate) const WAKE_QUIET: Setting = Setting {
@@ -143,6 +167,7 @@ pub(crate) const WAKE_QUIET: Setting = Setting {
     group: "reply rhythm",
     label: "Quiet time before a message wake",
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
+    chat: true,
 };
 
 /// Read by `harness::ModelRoute::from_runtime` and, as the digest's fallback, by `digest::model`.
@@ -154,6 +179,7 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
     group: "model and cost",
     label: "Conversation model",
     hint: "The relay model id harness turns use, read when each turn starts. Not set: harness turns fail as not configured.",
+    chat: false,
 };
 
 /// Read by `harness::Limits::from_config`.
@@ -165,6 +191,7 @@ pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
     group: "model and cost",
     label: "Model requests per turn",
     hint: "The most model requests one harness turn makes (each tool round is one more); read when each turn starts.",
+    chat: false,
 };
 
 /// Read by `harness::Limits::from_config`.
@@ -176,6 +203,7 @@ pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     group: "model and cost",
     label: "Token budget per turn",
     hint: "The tokens one harness turn may use across all its model requests; read when each turn starts.",
+    chat: false,
 };
 
 /// Read by `digest::model`.
@@ -187,6 +215,7 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
     group: "model and cost",
     label: "Digest model",
     hint: "The relay model id the memory digest uses; not set uses the conversation model. Read at each digest run.",
+    chat: false,
 };
 
 /// Read by `digest::model`.
@@ -198,6 +227,7 @@ pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     group: "model and cost",
     label: "Digest request timeout",
     hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.",
+    chat: false,
 };
 
 /// Read by `aux_search::load_search_config`.
@@ -209,6 +239,7 @@ pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
     group: "model and cost",
     label: "Web search model",
     hint: "The model id the primary web search asks, read at each search.",
+    chat: false,
 };
 
 /// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
@@ -224,6 +255,11 @@ pub(crate) const REGISTRY: &[Setting] = &[
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
+}
+
+/// The registry setting the owner's chat names `name` (`Setting::chat_name`), when the chat may use it.
+pub(crate) fn chat_setting(name: &str) -> Option<&'static Setting> {
+    REGISTRY.iter().find(|setting| setting.chat && setting.chat_name() == name)
 }
 
 /// The result of one `apply`.

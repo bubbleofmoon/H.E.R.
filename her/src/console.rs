@@ -2702,8 +2702,21 @@ const SETTINGS_READONLY_HINT: &str =
 /// What `settings-get` shows in place of a secret.
 const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
 
-/// The refusal for a settings read outside `SETTINGS_WRITABLE`. It never repeats the requested key.
+/// The refusal for a settings read outside the chat-writable settings. It never repeats the requested key.
 const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
+
+/// The chat's answer when the settings store cannot take a write. The store's own error names its files, so it stays
+/// in the console (`/api/settings` `storeError`).
+const SETTINGS_STORE_UNAVAILABLE: &str = "设置存储暂时不可用，这次没有改动";
+
+/// When a chat change to a registry setting takes effect, as `settings_set` replies (`settings::Setting::applies`).
+fn settings_applies_note(applies: &str) -> &'static str {
+    match applies {
+        "live" => "已立即生效",
+        "next wake" => "下次唤醒时生效",
+        _ => "重启后生效",
+    }
+}
 
 /// A secret config path: everything under `security.*`, and every path with a segment (lower case,
 /// `-` and `_` removed) that ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
@@ -2851,7 +2864,11 @@ pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &
     })
 }
 
-/// `settings-get` / `settings-set` for a caller that already proved owner-private authority.
+/// `settings-get` / `settings-set` for a caller that already proved owner-private authority. In a selected runtime a
+/// registry setting the chat may use (`settings::chat_setting`, named by its configuration path) reads as the next use
+/// reads it and is written through `settings::apply` (actor `owner`, source `chat`): validated by the registry and
+/// audited. A legacy context has no settings store, so it offers none. The other `SETTINGS_WRITABLE` paths keep their
+/// `config.json` write until their settings batch registers them.
 pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &RuntimeContext) -> Result<Value, (u16, String)> {
         if action == "settings-get" {
             let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2862,12 +2879,22 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                         all.insert(p.to_string(), redact_setting(p, v));
                     }
                 }
+                let mut writable: Vec<String> = SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
+                for setting in crate::settings::REGISTRY.iter().filter(|setting| setting.chat && context.is_isolated()) {
+                    let name = setting.chat_name();
+                    all.insert(name.clone(), redact_setting(&name, setting.effective_value(cfg)));
+                    writable.push(name);
+                }
                 return Ok(json!({
                     "ok": true,
                     "settings": all,
-                    "writable": SETTINGS_WRITABLE,
+                    "writable": writable,
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
+            }
+            if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
+                let value = redact_setting(&path, setting.effective_value(cfg));
+                return Ok(json!({"ok": true, "key": path, "writable": true, "value": value}));
             }
             // Only the settings the model may also change are readable. Any other key (a console token,
             // a gateway, backend, relay or model setting, an unknown path) is refused without naming it.
@@ -2886,6 +2913,25 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         }
         // settings-set
         let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
+            let value = b.get("value").cloned().unwrap_or(Value::Null);
+            // A refused value answers under the chat's name; the store's own errors stay out of the chat.
+            let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat").map_err(|(status, _)| {
+                if status == 400 {
+                    (400, setting.chat_requirement())
+                } else {
+                    (503, SETTINGS_STORE_UNAVAILABLE.to_string())
+                }
+            })?;
+            return Ok(json!({
+                "ok": true,
+                "key": path,
+                "value": applied.value,
+                "changed": applied.changed,
+                "hot": setting.applies != "restart",
+                "note": settings_applies_note(setting.applies),
+            }));
+        }
         if !is_setting_writable(&path) {
             return Err((
                 403,
