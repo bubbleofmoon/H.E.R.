@@ -99,6 +99,10 @@ _Avoid_: backend (a CLI route), conversation engine
 What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it, who may use it and the mode prompt its turns start with. HER checks it when a turn is admitted and again before every tool call.
 _Avoid_: preset, tool whitelist, tool guard
 
+**Model route (模型路由, `harness::routes`)**:
+One way the harness reaches a model: a route id, the relay model it asks, its reasoning effort and its output limit. A conversation's candidate chain lists routes in order; when one fails, the next takes over.
+_Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
+
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.
 _Avoid_: dependency (a process the supervisor runs), fork, vendor

@@ -1027,7 +1027,7 @@ mod tests {
         let mut result = genai::chat::ChatMessage::tool(genai::chat::ToolResponse::from_tool_call(&seed_call, r#"{"content":[{"type":"text","text":"seed tool text 183"}]}"#));
         result.content.extend(vec![genai::chat::ContentPart::Binary(genai::chat::Binary::from_base64("image/png", "iVBORw0KGgo=", None))]);
         store.tool_result("seed-183", &run, &result, &json!({"content": [{"type": "text", "text": "seed tool text 183"}]})).unwrap();
-        store.next_attempt(&seed).unwrap();
+        store.next_attempt(&seed, 0).unwrap();
         let reply = genai::chat::ChatMessage::assistant("seed reply 183");
         store
             .finish("seed-183", &crate::harness::Status::Completed("seed reply 183".into()), Some(&crate::harness::Event::Assistant { text: "seed reply 183".into(), raw: json!({}), message: reply }))

@@ -887,12 +887,18 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
 
     fn report_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, code: &str, message: &str) {
         let failure = crate::model_failure::Failure::classify(code, message);
+        note_model_error(&self.context, key, &failure.summary());
+        self.alert_backend_failure(cfg, key, backend, provider, model, &failure);
+    }
+
+    /// The owner's alert and refusal record of one failed backend request, without a model error note: a request that
+    /// only failed over is no turn failure (`report_backend_failure` adds the note for the failure that ended the turn).
+    fn alert_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, failure: &crate::model_failure::Failure) {
         self.failure_reported = true;
         if failure.class == "refusal" && self.refusals_recorded.insert((backend.into(), provider.into(), model.into())) {
-            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, &failure, &self.carried_messages);
+            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, &self.carried_messages);
         }
-        note_model_error(&self.context, key, &failure.summary());
-        crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, &failure);
+        crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, failure);
     }
 
     /// JS `auditAndSend`: a reply stopped by the outbound sentinel is announced to the administrator (unless
@@ -1416,10 +1422,12 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
         use crate::harness::{Harness, ModelRoute, TurnRequest};
+        // A model error noted by an earlier turn belongs to that turn: this turn's own outcome decides what its caller
+        // is told (the DSH path clears it the same way).
+        take_model_error(&self.context, key);
         let begun = std::time::Instant::now();
         self.chat_guard(key, "")?;
         let route = ModelRoute::from_runtime(&self.context, cfg)?;
-        let model = route.model_name().to_string();
         let harness = Harness::open(&self.context)?;
         let recorder = self.cur_turn.as_ref().ok_or("harness requires a durable bridge turn")?;
         let attempt = format!("harness:{}", recorder.id);
@@ -1462,6 +1470,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
         }
         let status = turn.status();
+        // The route the turn's last request went to, after any failover.
+        let model = turn.model();
         self.report_facts(key, &crate::turn_engine::Facts::of_harness(
             &status,
             invalidated,
@@ -1476,10 +1486,24 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
             _ => {}
         }
+        // Each route request that failed over or ended the turn is an owner alert, as the DSH chain reports each failed
+        // candidate. Only the one that ended a model turn is that turn's model error.
+        let model_end = matches!(&result, Err(error) if error.starts_with("model/backend "));
+        let failures = turn.route_failures();
+        let count = failures.len();
+        for (index, failure) in failures.iter().enumerate() {
+            println!("[failover] {key} harness route {} failed ({})", failure.route, failure.summary);
+            if model_end && index + 1 == count {
+                self.report_backend_failure(cfg, key, "harness", "openai", &failure.model, "", &failure.summary);
+            } else {
+                let classified = crate::model_failure::Failure::classify("", &failure.summary);
+                self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified);
+            }
+        }
         let text = match result {
             Ok(text) => text,
             Err(error) => {
-                if error.starts_with("model/backend ") || error == crate::harness::DEADLINE_EXCEEDED {
+                if error == crate::harness::DEADLINE_EXCEEDED {
                     self.report_backend_failure(cfg, key, "harness", "openai", &model, "", &error);
                 }
                 return Err(error);
