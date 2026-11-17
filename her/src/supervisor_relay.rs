@@ -217,8 +217,18 @@ impl From<Unprotected> for String {
 
 /// Whether an I/O error reports the entry itself missing: Win32 ERROR_FILE_NOT_FOUND (2) or
 /// ERROR_PATH_NOT_FOUND (3), Unix ENOENT. Every other error is a refusal.
-fn vanished(_error: &std::io::Error) -> bool {
-    false // #227 red switch: run 2 restores the classification.
+fn vanished(error: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok())
+            .is_some_and(win32_vanished)
+    }
+    #[cfg(not(windows))]
+    {
+        error.kind() == std::io::ErrorKind::NotFound
+    }
 }
 
 /// Whether `path` itself is now reported missing.
@@ -241,8 +251,8 @@ fn shown(path: &Path) -> String {
 }
 
 /// A sweep diagnostic naming the path that failed, as the ACL diagnostics do.
-fn named(text: &str, _failed: &Path) -> String {
-    text.to_string() // #227 red switch: run 2 names the path.
+fn named(text: &str, failed: &Path) -> String {
+    format!("{text}: {}", shown(failed))
 }
 
 /// Checks one entry before its permissions change: outside any protected root, no redirected
@@ -490,8 +500,9 @@ fn windows_acl_error(path: &Path, step: &str, code: u32) -> String {
 
 /// Win32 ERROR_FILE_NOT_FOUND (2) and ERROR_PATH_NOT_FOUND (3).
 #[cfg(windows)]
-fn win32_vanished(_code: u32) -> bool {
-    false // #227 red switch: run 2 restores the classification.
+fn win32_vanished(code: u32) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
 }
 
 /// A failed native step on `path`: `Missing` when Windows reports the entry missing.
