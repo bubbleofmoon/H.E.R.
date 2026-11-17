@@ -26601,4 +26601,5 @@ mod tests {
     mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
     mod config_overlay_tests { include!("config_overlay_tests.rs"); }
+    mod self_avatar_tests { include!("self_avatar_tests.rs"); }
 }

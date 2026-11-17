@@ -52,6 +52,7 @@ mod slang_learn;
 mod wait_util;
 mod backend;
 mod safe_fetch;
+mod self_avatar;
 mod media_normalize;
 mod media;
 mod subprocess;

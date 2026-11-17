@@ -1003,17 +1003,7 @@ fn call_tool_inner(name: &str, args: &Value, context: &RuntimeContext, filter_re
         "qq_get_self_image" => {
             let q = query_string(&[("key", key.to_string())]);
             match api.call(with_token(ApiCall::get(format!("/api/socialV2/self-image?{q}")))) {
-                Ok(data) => {
-                    let image_content = image_content(&data);
-                    if image_content.is_empty() {
-                        return ToolOutcome::error(format!("没有可返回的形象图片：{}", error_text(data.get("error"), "未知")));
-                    };
-                    ToolOutcome {
-                        content: std::iter::once(json!({"type": "text", "text": "这是你的默认 Q 版形象："})).chain(image_content).collect(),
-                        is_error: false,
-                        delivery_unknown: false,
-                    }
-                }
+                Ok(data) => self_image_outcome(&data),
                 Err(e) => fail("获取形象图片失败：", e),
             }
         }
@@ -1089,6 +1079,19 @@ fn image_content(data: &Value) -> Vec<Value> {
         }
     }
     content
+}
+
+/// `qq_get_self_image`'s result (#206 run 1: the old lead line; run 2 replaces this function).
+pub(crate) fn self_image_outcome(data: &Value) -> ToolOutcome {
+    let image_content = image_content(data);
+    if image_content.is_empty() {
+        return ToolOutcome::error(format!("没有可返回的形象图片：{}", error_text(data.get("error"), "未知")));
+    }
+    ToolOutcome {
+        content: std::iter::once(json!({"type": "text", "text": "这是你的默认 Q 版形象："})).chain(image_content).collect(),
+        is_error: false,
+        delivery_unknown: false,
+    }
 }
 
 fn images_message_outcome(message_id: &str, data: &Value) -> ToolOutcome {

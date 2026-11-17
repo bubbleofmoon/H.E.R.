@@ -176,6 +176,23 @@ where
     Err("重定向次数过多，已停止".to_string())
 }
 
+/// #206 run 1 stub, replaced in run 2: ignores `redirects` and `budget`.
+#[cfg(test)]
+fn fetch_with_hops<R, F>(
+    raw_url: &str,
+    max_bytes: usize,
+    _redirects: usize,
+    _budget: std::time::Duration,
+    resolve: R,
+    transfer: F,
+) -> Result<Fetched, String>
+where
+    R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
+    F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
+{
+    fetch_bytes_with(raw_url, max_bytes, resolve, transfer)
+}
+
 fn redirect_target(base: &ParsedUrl, location: &str) -> Result<String, String> {
     let loc = location.trim().split('#').next().unwrap_or("");
     if loc.contains("://") { return Ok(loc.to_string()); }
@@ -563,6 +580,59 @@ mod tests {
         assert_eq!(redirected.url, format!("http://fake.test:{port}/a.png"));
         assert!(fetch_bytes_with(&format!("http://fake.test:{port}/big.png"), png.len() - 1, resolve, curl_once).is_err(), "size cap");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn self_avatar_exact_fetch_follows_no_redirect_and_keeps_its_budget() {
+        let bytes = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let budget = std::time::Duration::from_secs(8);
+        let (mut lookups, mut transfers) = (Vec::new(), 0);
+        let refused = fetch_with_hops("https://public.test/g?x=1", 1024, 0, budget, |host, _| {
+            lookups.push(host.to_string());
+            Ok(vec!["1.1.1.1".parse().unwrap()])
+        }, |_, _, _, given| {
+            transfers += 1;
+            assert!(given > std::time::Duration::ZERO && given <= budget, "{given:?}");
+            Ok((302, Some("https://public.test/elsewhere.png".into()), Vec::new()))
+        });
+        assert!(refused.is_err(), "a redirect is never followed");
+        assert_eq!((lookups, transfers), (vec!["public.test".to_string()], 1));
+        let ips: Vec<IpAddr> = ["1.1.1.1", "8.8.8.8"].iter().map(|s| s.parse().unwrap()).collect();
+        let mut given_budgets = Vec::new();
+        let fetched = fetch_with_hops("https://public.test/g?x=1", 1024, 0, budget, |_, _| Ok(ips.clone()), |_, _, _, given| {
+            given_budgets.push(given);
+            if given_budgets.len() == 1 { Err("first address down".into()) } else { Ok((200, None, bytes.clone())) }
+        }).unwrap();
+        assert_eq!(fetched.bytes, bytes);
+        assert_eq!(given_budgets.len(), 2);
+        assert!(given_budgets.iter().all(|given| *given <= budget), "{given_budgets:?}");
+        let resolve = |_: &str, _| Ok(vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+        assert!(fetch_with_hops("https://public.test/g", bytes.len() - 1, 0, budget, resolve, |_, _, _, _| Ok((200, None, bytes.clone()))).is_err(), "one byte over the cap");
+        assert!(fetch_with_hops("https://public.test/g", bytes.len(), 0, budget, resolve, |_, _, _, _| Ok((200, None, bytes.clone()))).is_ok(), "exactly the cap");
+        assert!(fetch_with_hops("https://public.test/g", 1024, 0, budget, resolve, |_, _, _, _| Ok((200, None, b"<html>no</html>".to_vec()))).is_err(), "not an image");
+        assert!(fetch_with_hops("https://public.test/g", 1024, 0, budget, resolve, |_, _, _, _| Ok((404, None, bytes.clone()))).is_err(), "not 2xx");
+        let mut late = 0;
+        assert!(fetch_with_hops("https://public.test/g", 1024, 0, std::time::Duration::ZERO, resolve, |_, _, _, _| {
+            late += 1;
+            Ok((200, None, bytes.clone()))
+        }).is_err(), "a spent budget starts no transfer");
+        assert_eq!(late, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_avatar_exact_fetch_through_system_curl_stops_at_a_redirect() {
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let (port, hits) = fake_media_server(vec![
+            ("/g?b=qq&nk=10001&s=640", 200, vec![], png.clone()),
+            ("/go", 302, vec![("Location".into(), "/g?b=qq&nk=10001&s=640".into())], Vec::new()),
+        ]);
+        let resolve = |_: &str, _| Ok(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        let budget = std::time::Duration::from_secs(8);
+        let direct = fetch_with_hops(&format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640"), 1 << 20, 0, budget, resolve, curl_once).expect("direct avatar");
+        assert_eq!(direct.bytes, png);
+        assert!(fetch_with_hops(&format!("http://fake.test:{port}/go"), 1 << 20, 0, budget, resolve, curl_once).is_err(), "the redirect is not followed");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2, "the redirect target was never requested");
     }
 
     #[test]
