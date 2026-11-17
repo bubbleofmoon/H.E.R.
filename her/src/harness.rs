@@ -247,6 +247,12 @@ enum ModelFailure {
         reason: String,
         wait: Option<Duration>,
     },
+    /// A response that ended on a stop no answer may use (a content filter, or a stop other than completion or a
+    /// tool call). Its usage is charged before the miss is decided, so a failover asks the next route for what is left.
+    Stopped {
+        reason: String,
+        end: Box<StreamEnd>,
+    },
     Terminal(String),
 }
 
@@ -262,7 +268,7 @@ impl ModelFailure {
         match self {
             Self::Dropped(reason) => (routes::Miss::Dropped, reason),
             Self::RateLimited { reason, wait } => (routes::Miss::RateLimited { wait }, reason),
-            Self::Terminal(reason) => {
+            Self::Terminal(reason) | Self::Stopped { reason, .. } => {
                 let class = crate::model_failure::Failure::classify("", &reason).class;
                 let miss = if class == "empty-response" {
                     routes::Miss::Empty
@@ -656,6 +662,15 @@ async fn tool_loop(
         };
         let end = match end {
             Ok(end) => end,
+            Err(ModelFailure::Stopped { reason, end }) => {
+                // The stop's usage is charged before the miss is decided, as an answer's is.
+                spent = spent.saturating_add(charge_of(&end)?);
+                let at = MissAt { spent, ..at };
+                chain
+                    .missed(context, store, request, progress, sent, at, ModelFailure::Stopped { reason, end }, &mut cancelled)
+                    .await?;
+                continue;
+            }
             Err(failure) => {
                 chain
                     .missed(context, store, request, progress, sent, at, failure, &mut cancelled)
@@ -664,23 +679,9 @@ async fn tool_loop(
             }
         };
         check_bound(request, &cancelled, deadline)?;
-        let usage = end
-            .captured_usage
-            .as_ref()
-            .and_then(|u| {
-                u.total_tokens.or_else(|| {
-                    u.prompt_tokens
-                        .zip(u.completion_tokens)
-                        .map(|(a, b)| a.max(0).saturating_add(b.max(0)))
-                })
-            })
-            .filter(|v| *v > 0)
-            .map(|v| v as u32);
+        spent = spent.saturating_add(charge_of(&end)?);
         let mut raw = serde_json::to_value(end)
             .map_err(|_| "harness model response could not be recorded")?;
-        // Providers without usage are charged conservatively for their generated UTF-8 payload.
-        let charge = usage.unwrap_or_else(|| raw.to_string().len().min(u32::MAX as usize) as u32);
-        spent = spent.saturating_add(charge);
         redact(&mut raw, &request.route.key);
         let end: StreamEnd = serde_json::from_value(raw.clone())
             .map_err(|_| "harness model response could not be recorded")?;
@@ -944,6 +945,30 @@ fn check_bound(
     })
 }
 
+/// The tokens a model response is charged: its reported usage (total, else prompt plus completion), else its
+/// serialized size, since a provider without usage is charged conservatively for its generated payload.
+fn charge_of(end: &StreamEnd) -> Result<u32, &'static str> {
+    let usage = end
+        .captured_usage
+        .as_ref()
+        .and_then(|u| {
+            u.total_tokens.or_else(|| {
+                u.prompt_tokens
+                    .zip(u.completion_tokens)
+                    .map(|(a, b)| a.max(0).saturating_add(b.max(0)))
+            })
+        })
+        .filter(|v| *v > 0)
+        .map(|v| v as u32);
+    match usage {
+        Some(tokens) => Ok(tokens),
+        None => {
+            let raw = serde_json::to_value(end).map_err(|_| "harness model response could not be recorded")?;
+            Ok(raw.to_string().len().min(u32::MAX as usize) as u32)
+        }
+    }
+}
+
 /// One model request on `route`; `max_tokens` is already capped by the route's limit.
 async fn model_step(
     client: &Client,
@@ -1021,21 +1046,19 @@ async fn model_step(
         )
     })?;
     if matches!(end.captured_stop_reason, Some(StopReason::ContentFilter(_))) {
-        return Err(
-            crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL")
-                .summary()
-                .into(),
-        );
+        return Err(ModelFailure::Stopped {
+            reason: crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL").summary(),
+            end: Box::new(end),
+        });
     }
     if !matches!(
         end.captured_stop_reason,
         Some(StopReason::Completed(_) | StopReason::ToolCall(_))
     ) {
-        return Err(
-            crate::model_failure::Failure::new("backend", "UNSAFE_FINISH_REASON")
-                .summary()
-                .into(),
-        );
+        return Err(ModelFailure::Stopped {
+            reason: crate::model_failure::Failure::new("backend", "UNSAFE_FINISH_REASON").summary(),
+            end: Box::new(end),
+        });
     }
     Ok(end)
 }
