@@ -10,6 +10,9 @@ pub(crate) use model::{model_for, DigestModel, ModelError};
 use conversation::Hold;
 #[cfg(test)]
 pub(crate) use model::install_test_model;
+/// What the digest's model port reads from the configuration (`settings_tests`).
+#[cfg(test)]
+pub(crate) use model::{model_id as digest_model_id, timeout as digest_timeout};
 /// The digest's model prompt, for the model-visible text guard (`console::tests::model_text_guard_tests`).
 #[cfg(test)]
 pub(crate) use conversation::PROMPT as DIGEST_PROMPT;

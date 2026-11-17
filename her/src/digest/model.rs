@@ -42,12 +42,20 @@ pub(crate) struct RelayModel {
 
 impl RelayModel {
     pub(crate) fn from_runtime(context: &RuntimeContext, cfg: &Value) -> Result<Self, ModelError> {
-        let configured = |path: &str| cfg.pointer(path).and_then(Value::as_str).filter(|v| !v.trim().is_empty());
-        let model = configured("/memory/digest/model").or_else(|| configured("/harness/model")).ok_or(ModelError("unconfigured"))?;
-        let route = crate::harness::ModelRoute::for_model(context, model).map_err(|_| ModelError("unconfigured"))?;
-        let secs = cfg.pointer("/memory/digest/timeoutSecs").and_then(Value::as_u64).unwrap_or(120).clamp(1, 600);
-        Ok(Self { route, timeout: Duration::from_secs(secs) })
+        let model = model_id(cfg).ok_or(ModelError("unconfigured"))?;
+        let route = crate::harness::ModelRoute::for_model(context, &model).map_err(|_| ModelError("unconfigured"))?;
+        Ok(Self { route, timeout: timeout(cfg) })
     }
+}
+
+/// The digest's model id: `memory.digest.model`, else `harness.model`; `None` when neither is configured.
+pub(crate) fn model_id(cfg: &Value) -> Option<String> {
+    crate::settings::DIGEST_MODEL.text(cfg).or_else(|| crate::settings::HARNESS_MODEL.text(cfg))
+}
+
+/// The bound on one digest model request: `memory.digest.timeoutSecs`.
+pub(crate) fn timeout(cfg: &Value) -> Duration {
+    Duration::from_secs(crate::settings::DIGEST_TIMEOUT_SECS.integer(cfg).unsigned_abs())
 }
 
 impl DigestModel for RelayModel {

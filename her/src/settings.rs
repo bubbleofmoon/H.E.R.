@@ -3,8 +3,10 @@
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply`, `reset` and `undo` change one value with one
-//! audit row each, under the store gate (`write_store`), and `history` lists the audit rows. A legacy (no-root)
-//! context has no store.
+//! audit row each, under the store gate (`write_store`), for the console routes and for the owner's chat settings tools
+//! (`chat_setting`, `console::settings_action`); `history` lists the audit rows. A legacy (no-root) context has no store.
+//! The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
+//! `integer`, `text`) on the loader's document, never with a default of its own.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -32,10 +34,35 @@ thread_local! {
 #[cfg(test)]
 pub(crate) static WAL_SWITCH_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The longest model id the store accepts, in characters.
+pub(crate) const MODEL_ID_MAX_CHARS: usize = 200;
+
 /// The value type and bounds of a setting.
 pub(crate) enum Kind {
-    /// A JSON integer from `min` to `max`, both included.
-    Integer { min: i64, max: i64, default: i64 },
+    /// A JSON integer from `min` to `max`, both included. `file` is how the next use reads a value the store would
+    /// refuse.
+    Integer { min: i64, max: i64, default: i64, file: FileRule },
+    /// A model id: a JSON string that, trimmed as JavaScript trims, has 1 to `MODEL_ID_MAX_CHARS` characters and no
+    /// control character; it is stored and read trimmed. `default` is what a missing or refused value reads as, and
+    /// `None` reads as not configured.
+    ModelId { default: Option<&'static str> },
+}
+
+/// How the next use reads an integer the store would refuse, found in `config.json` (each reader's rule before the
+/// registry owned it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FileRule {
+    /// It reads as the default.
+    Default,
+    /// A non-negative integer is clamped into the bounds; any other value reads as the default.
+    Clamp,
+}
+
+/// A model id as the store keeps it (`Kind::ModelId`), or `None` when `value` is not one.
+fn model_id(value: &Value) -> Option<&str> {
+    let id = crate::aux_text::js_trim(value.as_str()?);
+    let length = id.chars().count();
+    ((1..=MODEL_ID_MAX_CHARS).contains(&length) && !id.chars().any(char::is_control)).then_some(id)
 }
 
 /// One registry entry.
@@ -50,6 +77,9 @@ pub(crate) struct Setting {
     pub group: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
+    /// Whether the owner's private chat may read and change it through `settings_get` / `settings_set`, under
+    /// `chat_name`. Never set for a secret (registry test).
+    pub chat: bool,
 }
 
 impl Setting {
@@ -57,42 +87,181 @@ impl Setting {
     pub(crate) fn normalize(&self, value: &Value) -> Option<Value> {
         match self.kind {
             Kind::Integer { min, max, .. } => value.as_i64().filter(|n| (min..=max).contains(n)).map(|n| json!(n)),
+            Kind::ModelId { .. } => model_id(value).map(|id| json!(id)),
         }
     }
 
+    /// The default; `Null` for a model id without one (not configured).
     pub(crate) fn default_value(&self) -> Value {
         match self.kind {
             Kind::Integer { default, .. } => json!(default),
+            Kind::ModelId { default } => default.map_or(Value::Null, |id| json!(id)),
         }
+    }
+
+    /// What the next use reads from `document` (the loader's document with stored values applied, or any
+    /// configuration value): the value at the pointer as the setting reads it, else the default.
+    pub(crate) fn read(&self, document: &Value) -> Value {
+        let found = document.pointer(self.pointer);
+        let read = match self.kind {
+            Kind::Integer { min, max, file: FileRule::Clamp, .. } => found
+                .and_then(Value::as_u64)
+                .map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
+            _ => found.and_then(|value| self.normalize(value)),
+        };
+        read.unwrap_or_else(|| self.default_value())
+    }
+
+    /// `read` of an integer setting; readers ask it only of integer settings (registry test).
+    pub(crate) fn integer(&self, document: &Value) -> i64 {
+        self.read(document).as_i64().unwrap_or_default()
+    }
+
+    /// `read` of a model id: `None` when it is not configured.
+    pub(crate) fn text(&self, document: &Value) -> Option<String> {
+        self.read(document).as_str().map(str::to_string)
     }
 
     /// Why a refused value was refused.
     fn requirement(&self) -> String {
         match self.kind {
             Kind::Integer { min, max, .. } => format!("{} must be an integer from {min} to {max}", self.key),
+            Kind::ModelId { .. } => format!(
+                "{} must be a model id of 1 to {MODEL_ID_MAX_CHARS} characters without control characters",
+                self.key
+            ),
         }
     }
 
     fn kind_view(&self) -> Value {
         match self.kind {
             Kind::Integer { min, max, .. } => json!({"type": "integer", "min": min, "max": max}),
+            Kind::ModelId { .. } => json!({"type": "model id", "maxChars": MODEL_ID_MAX_CHARS}),
+        }
+    }
+
+    /// What the next use reads from `document`, the loaded configuration: the value at the pointer when this setting
+    /// accepts it, otherwise the default.
+    pub(crate) fn effective_value(&self, document: &Value) -> Value {
+        self.read(document)
+    }
+
+    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
+    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    pub(crate) fn chat_name(&self) -> String {
+        self.pointer.trim_start_matches('/').replace('/', ".")
+    }
+
+    /// Why a chat value was refused, under the chat's name.
+    pub(crate) fn chat_requirement(&self) -> String {
+        match self.kind {
+            Kind::Integer { min, max, .. } => format!("{} 必须是 {min} 到 {max} 的整数", self.chat_name()),
+            Kind::ModelId { .. } => format!("{} 必须是 1 到 200 个字符、不含控制字符的模型名", self.chat_name()),
         }
     }
 }
 
-/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
-pub(crate) const REGISTRY: &[Setting] = &[Setting {
+pub(crate) const WAKE_QUIET: Setting = Setting {
     key: "reply.wakeQuietMs",
     pointer: "/socialV2/reply/wakeQuietMs",
-    kind: Kind::Integer { min: 1, max: 30_000, default: 3_000 },
+    kind: Kind::Integer { min: 1, max: 30_000, default: 3_000, file: FileRule::Default },
     applies: "next wake",
     group: "reply rhythm",
     label: "Quiet time before a message wake",
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
-}];
+    chat: true,
+};
+
+/// Read by `harness::ModelRoute::from_runtime` and, as the digest's fallback, by `digest::model`.
+pub(crate) const HARNESS_MODEL: Setting = Setting {
+    key: "harness.model",
+    pointer: "/harness/model",
+    kind: Kind::ModelId { default: None },
+    applies: "live",
+    group: "model and cost",
+    label: "Conversation model",
+    hint: "The relay model id harness turns use, read when each turn starts. Not set: harness turns fail as not configured.",
+    chat: false,
+};
+
+/// Read by `harness::Limits::from_config`.
+pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
+    key: "harness.maxSteps",
+    pointer: "/harness/maxSteps",
+    kind: Kind::Integer { min: 1, max: 64, default: 8, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Model requests per turn",
+    hint: "The most model requests one harness turn makes (each tool round is one more); read when each turn starts.",
+    chat: false,
+};
+
+/// Read by `harness::Limits::from_config`.
+pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
+    key: "harness.maxTokens",
+    pointer: "/harness/maxTokens",
+    kind: Kind::Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Token budget per turn",
+    hint: "The tokens one harness turn may use across all its model requests; read when each turn starts.",
+    chat: false,
+};
+
+/// Read by `digest::model`.
+pub(crate) const DIGEST_MODEL: Setting = Setting {
+    key: "memory.digest.model",
+    pointer: "/memory/digest/model",
+    kind: Kind::ModelId { default: None },
+    applies: "live",
+    group: "model and cost",
+    label: "Digest model",
+    hint: "The relay model id the memory digest uses; not set uses the conversation model. Read at each digest run.",
+    chat: false,
+};
+
+/// Read by `digest::model`.
+pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
+    key: "memory.digest.timeoutSecs",
+    pointer: "/memory/digest/timeoutSecs",
+    kind: Kind::Integer { min: 1, max: 600, default: 120, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Digest request timeout",
+    hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.",
+    chat: false,
+};
+
+/// Read by `aux_search::load_search_config`.
+pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
+    key: "webSearch.model",
+    pointer: "/webSearch/model",
+    kind: Kind::ModelId { default: Some("deepseek-v4-flash") },
+    applies: "live",
+    group: "model and cost",
+    label: "Web search model",
+    hint: "The model id the primary web search asks, read at each search.",
+    chat: false,
+};
+
+/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
+pub(crate) const REGISTRY: &[Setting] = &[
+    WAKE_QUIET,
+    HARNESS_MODEL,
+    HARNESS_MAX_STEPS,
+    HARNESS_MAX_TOKENS,
+    DIGEST_MODEL,
+    DIGEST_TIMEOUT_SECS,
+    WEB_SEARCH_MODEL,
+];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
+}
+
+/// The registry setting the owner's chat names `name` (`Setting::chat_name`), when the chat may use it.
+pub(crate) fn chat_setting(name: &str) -> Option<&'static Setting> {
+    REGISTRY.iter().find(|setting| setting.chat && setting.chat_name() == name)
 }
 
 /// The result of one `apply`.
@@ -821,7 +990,8 @@ fn remove_at(document: &mut Value, pointer: &str) {
 }
 
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
-/// (`null` when none) and `value`, what the next use reads. `storeError` says why stored values are not applied.
+/// (`null` when none) and `value`, what the next use reads (`Setting::read`; `null` for a model id that is not
+/// configured). `storeError` says why stored values are not applied.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
@@ -835,10 +1005,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         .iter()
         .map(|setting| {
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = document
-                .pointer(setting.pointer)
-                .and_then(|value| setting.normalize(value))
-                .unwrap_or_else(|| setting.default_value());
+            let value = setting.read(&document);
             json!({
                 "key": setting.key,
                 "group": setting.group,

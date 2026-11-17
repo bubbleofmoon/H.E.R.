@@ -48,12 +48,8 @@ impl ModelRoute {
         if !context.is_isolated() {
             return Err("harness requires a selected runtime".into());
         }
-        let model = cfg
-            .pointer("/harness/model")
-            .and_then(Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-            .ok_or("harness model is not configured")?;
-        Self::for_model(context, model)
+        let model = crate::settings::HARNESS_MODEL.text(cfg).ok_or("harness model is not configured")?;
+        Self::for_model(context, &model)
     }
 
     /// The selected runtime's relay route for `model`, authenticated with the harness credential.
@@ -103,16 +99,8 @@ pub struct Limits {
 impl Limits {
     pub fn from_config(cfg: &Value) -> Self {
         Self {
-            max_steps: cfg
-                .pointer("/harness/maxSteps")
-                .and_then(Value::as_u64)
-                .unwrap_or(8)
-                .clamp(1, 64) as usize,
-            max_tokens: cfg
-                .pointer("/harness/maxTokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(32_768)
-                .clamp(1, 1_000_000) as u32,
+            max_steps: crate::settings::HARNESS_MAX_STEPS.integer(cfg) as usize,
+            max_tokens: crate::settings::HARNESS_MAX_TOKENS.integer(cfg) as u32,
             image_input: cfg
                 .pointer("/harness/imageInput")
                 .and_then(Value::as_bool)
@@ -123,6 +111,12 @@ impl Limits {
                 .map(|chars| chars.clamp(1_000.0, 100_000.0) as usize)
                 .unwrap_or(TOOL_RESULT_CHARS as usize),
         }
+    }
+
+    /// The step and token budgets (tests).
+    #[cfg(test)]
+    pub(crate) fn budgets(&self) -> (usize, u32) {
+        (self.max_steps, self.max_tokens)
     }
 }
 

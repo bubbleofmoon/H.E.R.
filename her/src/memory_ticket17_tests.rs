@@ -58,7 +58,8 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
         "socialV2.context.wakeMaxChars":6000,
         "socialV2.context.wakeRecentLimit":4,
         "memory.inject.relatedTopK":3,
-        "role.maxInjectChars":6000
+        "role.maxInjectChars":6000,
+        "socialV2.reply.wakeQuietMs":3000
     });
     let bytes = serde_json::to_vec(&cfg).unwrap();
     context
@@ -103,7 +104,7 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"],
-        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null}),
+        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
         "preserve explicit values and JS shallow replacement"
     );
 }
@@ -149,7 +150,7 @@ fn ticket17_settings_get_reports_effective_send_delay_before_any_write() {
     let set_args = json!({"key":"private:7001","token":"owner-token","settingKey":"sendDelayMs","value":17});
     assert_eq!(
         crate::mcp::call_tool_with_context("settings_set", &set_args, &context).unwrap(),
-        "已改 sendDelayMs = 17。已立即生效"
+        "已改 sendDelayMs。已立即生效"
     );
     assert_eq!(
         crate::mcp::call_tool_with_context("settings_get", &args, &context).unwrap(),
