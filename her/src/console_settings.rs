@@ -34,7 +34,7 @@ pub fn route(
 }
 
 /// `{"setting": <registry key>, "value": <value>}`; the reply names the setting, the stored value, its revision and
-/// whether it changed.
+/// whether it changed, plus `mirrorError` when `config.json` could not be updated (the stored change stands).
 fn set(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
     let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(body) else {
         return Err((400, "body must be a JSON object".to_string()));
@@ -46,13 +46,17 @@ fn set(context: &RuntimeContext, body: &str, authority: crate::persona::Authorit
     let value = fields.get("value").ok_or((400, "value is required".to_string()))?;
     let _gate = authority()?;
     let applied = crate::settings::apply(context, setting, value, "administrator", "console")?;
-    Ok(json!({
+    let mut reply = json!({
         "ok": true,
         "setting": setting,
         "value": applied.value,
         "revision": applied.revision,
         "changed": applied.changed,
-    }))
+    });
+    if let Some(error) = applied.mirror_error {
+        reply["mirrorError"] = json!(error);
+    }
+    Ok(reply)
 }
 
 fn failure(status: u16, message: &str) -> (u16, &'static str, String) {

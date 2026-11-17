@@ -277,12 +277,17 @@ thread_local! {
     static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo).
+/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). Stored settings are
+/// put back at their registry pointers first (`settings::mirror_into`), so no writer puts back an older value of one.
 fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<(), String> {
     let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
         .map_err(|_| "runtime config is invalid".to_string())?;
-    let normalized = if doc.get("backup").is_some() {
+    let mirrored = crate::settings::mirror_into(context, &mut doc);
+    let backup = doc.get("backup").is_some();
+    if backup {
         doc["backup"] = crate::config::backup_config(&doc)?;
+    }
+    let normalized = if backup || mirrored {
         Some(serde_json::to_string_pretty(&doc).map_err(|error| error.to_string())?)
     } else { None };
     let text = normalized.as_deref().unwrap_or(text);
@@ -14534,9 +14539,27 @@ fn audit_write(
     Ok(())
 }
 
-/// #176 run 1 stub: the console start's settings write-back (run 2 replaces it).
-#[cfg(test)]
-fn finish_settings_write_back(_context: &RuntimeContext) {}
+/// #176: a settings change cut off between its store commit and its `config.json` write-back (a crash, a full disk),
+/// or a store an earlier build wrote without the write-back, is written back before the console answers any request.
+/// Without a stored value nothing is read or created beyond the store inspection, and no gate is taken. A busy gate
+/// (`SOCIAL_STATE_GATE_WAIT`) or a failed write is reported; the next settings change retries it.
+fn finish_settings_write_back(context: &RuntimeContext) {
+    if !crate::settings::has_stored_values(context) {
+        return;
+    }
+    let result = config_gate(context)
+        .and_then(|_gate| crate::settings::write_back(context).map_err(|error| (503, error)));
+    match result {
+        Ok(blocked) if blocked.is_empty() => {}
+        Ok(blocked) => crate::safe_println!(
+            "[console] ⚠️ config.json cannot hold the stored settings {} (a non-object is on the way)",
+            blocked.join(", ")
+        ),
+        Err((_, error)) => crate::safe_println!(
+            "[console] ⚠️ stored settings were not written back into config.json (the next settings change retries): {error}"
+        ),
+    }
+}
 
 /// 起服务。`port=0` 时用默认 3101。
 /// 当前控制台监听的端口（自重启要用它拉起新进程）。
@@ -14578,6 +14601,8 @@ pub fn serve_with_context(
     let _ = CONSOLE_PORT.set(port);
     crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
     access::harden_selected_state_dir(&context);
+    // Before the start stamp of config.json is noted: the write-back may change the file.
+    finish_settings_write_back(&context);
     access::note_config_start(&context);
     // #192: an access change cut off between its configuration write and its revocation is finished before the
     // console answers any request.

@@ -3,7 +3,10 @@
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
-//! A legacy (no-root) context has no store.
+//! Each write first seeds the store from `config.json` (`seed`: every registry setting never in the store, with one
+//! `migration` audit row each) and keeps `config/config.json.pre-settings`; after it, `write_back` mirrors every stored
+//! value into `config.json`, so a release without the store reads the current values. A legacy (no-root) context has
+//! no store.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -19,6 +22,14 @@ const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
 const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
 const LEGACY_ERROR: &str = "settings require a selected runtime";
+/// The configuration file the store seeds from and writes back into (`RuntimeArea::Config`).
+const CONFIG: &str = "config.json";
+/// The copy of `config.json` from before settings first wrote anything, beside it.
+const PRE_SETTINGS_COPY: &str = "config.json.pre-settings";
+const CONFIG_ERROR: &str = "runtime config is unavailable";
+const COPY_ERROR: &str = "config.json.pre-settings cannot be written";
+/// Who a seeded value is recorded as (`updated_by` and the audit actor); the audit source is `migration`.
+const SEED_ACTOR: &str = "system";
 
 #[cfg(test)]
 thread_local! {
@@ -101,6 +112,8 @@ pub(crate) struct Applied {
     pub value: Value,
     pub revision: i64,
     pub changed: bool,
+    /// Why `config.json` does not hold every stored value after this write; the stored change stands either way.
+    pub mirror_error: Option<String>,
 }
 
 /// Applies the stored settings over `document`, the parsed `config.json`. A stored value goes to its registry pointer;
@@ -127,21 +140,44 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
-fn set_at(document: &mut Value, pointer: &str, value: Value) {
+/// Puts `value` at `pointer`; returns false, leaving that member alone, when a non-object is on the way.
+fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
     let names: Vec<&str> = pointer.split('/').skip(1).collect();
-    let Some((last, parents)) = names.split_last() else { return };
+    let Some((last, parents)) = names.split_last() else { return false };
     let mut slot = document;
     for name in parents {
-        let Some(object) = slot.as_object_mut() else { return };
+        let Some(object) = slot.as_object_mut() else { return false };
         let next = object.entry(name.to_string()).or_insert(Value::Null);
         if next.is_null() {
             *next = json!({});
         }
         slot = next;
     }
-    if let Some(object) = slot.as_object_mut() {
-        object.insert(last.to_string(), value);
+    match slot.as_object_mut() {
+        Some(object) => {
+            object.insert(last.to_string(), value);
+            true
+        }
+        None => false,
     }
+}
+
+/// Puts each stored value at its registry pointer in `document`. Returns whether `document` changed and the keys
+/// whose pointer passes through a non-object (left in place).
+fn place(document: &mut Value, stored: Vec<(&'static Setting, Value)>) -> (bool, Vec<&'static str>) {
+    let mut changed = false;
+    let mut blocked = Vec::new();
+    for (setting, value) in stored {
+        if document.pointer(setting.pointer) == Some(&value) {
+            continue;
+        }
+        if set_at(document, setting.pointer, value) {
+            changed = true;
+        } else {
+            blocked.push(setting.key);
+        }
+    }
+    (changed, blocked)
 }
 
 /// Validates the store and its sidecars through the runtime's containment checks.
@@ -543,14 +579,134 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A request id for audit rows: the time, the process and a per-process sequence.
+fn request_id(at: i64) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The stored `config.json` as a JSON object (a leading UTF-8 BOM accepted), never the overlaid view.
+fn raw_config(context: &RuntimeContext) -> Result<Value, String> {
+    let text = context.read_text(RuntimeArea::Config, CONFIG).map_err(|_| CONFIG_ERROR.to_string())?;
+    serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .ok()
+        .filter(Value::is_object)
+        .ok_or_else(|| CONFIG_ERROR.to_string())
+}
+
+/// Keeps `config/config.json.pre-settings`, a byte-for-byte copy of `config.json` from before settings first wrote
+/// anything: made when missing, never replaced. Anything there but a plain file is refused and left alone. The caller
+/// holds the configuration gate, so no other writer changes `config.json` between the check and the copy.
+fn keep_pre_settings_copy(context: &RuntimeContext) -> Result<(), String> {
+    let path = context
+        .resolve_path(RuntimeArea::Config, PRE_SETTINGS_COPY, PathIntent::ReadOptionalFile)
+        .map_err(|_| COPY_ERROR.to_string())?;
+    if file_len(&path).map_err(|_| COPY_ERROR.to_string())?.is_some() {
+        return Ok(());
+    }
+    let bytes = context.read_file(RuntimeArea::Config, CONFIG).map_err(|_| CONFIG_ERROR.to_string())?;
+    context.write_atomic(RuntimeArea::Config, PRE_SETTINGS_COPY, &bytes).map_err(|_| COPY_ERROR.to_string())
+}
+
+/// Copies into the store, inside the writer's transaction, every registry setting that has never been in it (no row
+/// and no audit row) and whose value in `document`, the stored `config.json`, the registry accepts: revision 1 and one
+/// audit row each (actor `system`, source `migration`, one request id for the batch). A value the registry refuses is
+/// not copied, and a later write checks it again. So the first write seeds the store, a setting a later release adds
+/// is seeded by the first write after the upgrade, and nothing is seeded twice.
+fn seed(conn: &Connection, document: &Value, at: i64) -> Result<(), String> {
+    let request = request_id(at);
+    for setting in REGISTRY {
+        let Some(value) = document.pointer(setting.pointer).and_then(|value| setting.normalize(value)) else {
+            continue;
+        };
+        let known: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1) OR EXISTS(SELECT 1 FROM settings_audit WHERE key=?1)",
+                [setting.key],
+                |row| row.get(0),
+            )
+            .map_err(|_| STORAGE_ERROR.to_string())?;
+        if known {
+            continue;
+        }
+        let text = value.to_string();
+        conn.execute(
+            "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, 1, ?3, ?4)",
+            params![setting.key, text, at, SEED_ACTOR],
+        )
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+        conn.execute(
+            "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+             VALUES(?1, ?2, 'migration', 'global', ?3, NULL, ?4, ?5)",
+            params![at, SEED_ACTOR, setting.key, text, request],
+        )
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    }
+    Ok(())
+}
+
+/// Writes every stored value into `config.json` at its registry pointer, through one atomic write and only when the
+/// file differs, so a release without the store reads the current values. The caller holds the configuration gate.
+/// Before the first change to the file, `config.json.pre-settings` is kept. Returns the keys whose pointer passes
+/// through a non-object in the file (left in place); a file `canonical_config` refuses is not written. No store, no
+/// schema yet and no stored value write nothing; a store that cannot be read is an error.
+pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, String> {
+    if !context.is_isolated() {
+        return Ok(Vec::new());
+    }
+    let stored = stored_values(context)?;
+    if stored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut document = raw_config(context)?;
+    if crate::config::canonical_config(&document).is_err() {
+        return Err(CONFIG_ERROR.to_string());
+    }
+    let (changed, blocked) = place(&mut document, stored);
+    if changed {
+        #[cfg(test)]
+        if FAIL_WRITE_BACK.with(|fail| fail.replace(false)) {
+            return Err(CONFIG_ERROR.to_string());
+        }
+        keep_pre_settings_copy(context)?;
+        let text = serde_json::to_string_pretty(&document).map_err(|_| CONFIG_ERROR.to_string())?;
+        context.write_atomic(RuntimeArea::Config, CONFIG, text.as_bytes()).map_err(|_| CONFIG_ERROR.to_string())?;
+    }
+    Ok(blocked)
+}
+
+/// Puts every stored value into `document`, a `config.json` a console writer is about to write, so the writer never
+/// puts back an older value of a stored setting. Returns whether `document` changed. A legacy context, a document that
+/// is not an object and a store that cannot be read (the overlay reports it) change nothing.
+pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> bool {
+    if !context.is_isolated() || !document.is_object() {
+        return false;
+    }
+    match stored_values(context) {
+        Ok(stored) => place(document, stored).0,
+        Err(_) => false,
+    }
+}
+
+/// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
+/// cannot be read. Reads only: nothing is created.
+pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
+    context.is_isolated() && stored_values(context).is_ok_and(|stored| !stored.is_empty())
+}
+
 /// Creates the store with its schema and no value, as a crash after the schema commit leaves it (test seam).
 #[cfg(test)]
 pub(crate) fn create_store(context: &RuntimeContext) -> Result<(), String> {
     open_for_write(context).map(drop)
 }
 
-/// Sets one global setting: validated against the registry, then written with one audit row in one transaction.
-/// The same value again changes nothing and writes no audit row. A refused value leaves the stored value as it was.
+/// Sets one global setting: validated against the registry, then, in one transaction, the store is seeded from
+/// `config.json` (`seed`) and the value written with one audit row. The same value again writes no value and no audit
+/// row (a seed still commits). A refused value leaves the stored value as it was. A `config.json` that cannot be read
+/// as a JSON object, or a `config.json.pre-settings` that cannot be kept, refuses the write before anything is stored.
+/// After the commit, `write_back` mirrors the store into `config.json`; a failure there keeps the stored change and is
+/// reported in `mirror_error`. The caller holds the configuration gate (`console::config_gate`), as the console's set
+/// route does, so writers of the store and of `config.json` never interleave.
 pub(crate) fn apply(
     context: &RuntimeContext,
     key: &str,
@@ -564,10 +720,14 @@ pub(crate) fn apply(
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.requirement()))?;
     let unavailable = |error: String| -> (u16, String) { (503, error) };
+    let document = raw_config(context).map_err(unavailable)?;
     let mut conn = open_for_write(context).map_err(unavailable)?;
+    keep_pre_settings_copy(context).map_err(unavailable)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    let at = now_ms();
+    seed(&tx, &document, at).map_err(unavailable)?;
     let old: Option<(String, i64)> = tx
         .query_row("SELECT value, revision FROM settings WHERE key=?1", [setting.key], |row| {
             Ok((row.get(0)?, row.get(1)?))
@@ -575,34 +735,42 @@ pub(crate) fn apply(
         .optional()
         .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let text = value.to_string();
-    if let Some((old_text, revision)) = &old {
-        if *old_text == text {
-            return Ok(Applied { value, revision: *revision, changed: false });
+    let (revision, changed) = match &old {
+        Some((old_text, revision)) if *old_text == text => (*revision, false),
+        _ => {
+            let revision = old.as_ref().map_or(0, |(_, revision)| *revision) + 1;
+            tx.execute(
+                "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+                 updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                params![setting.key, text, revision, at, actor],
+            )
+            .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+            #[cfg(test)]
+            if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
+                return Err(unavailable(STORAGE_ERROR.to_string()));
+            }
+            let old_text = old.as_ref().map(|(old_text, _)| old_text.as_str());
+            tx.execute(
+                "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+                 VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
+                params![at, actor, source, setting.key, old_text, text, request_id(at)],
+            )
+            .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+            (revision, true)
         }
-    }
-    let revision = old.as_ref().map_or(0, |(_, revision)| *revision) + 1;
-    let at = now_ms();
-    tx.execute(
-        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
-         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
-        params![setting.key, text, revision, at, actor],
-    )
-    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    #[cfg(test)]
-    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
-        return Err(unavailable(STORAGE_ERROR.to_string()));
-    }
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let request = format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    tx.execute(
-        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
-         VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
-        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), text, request],
-    )
-    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    };
     tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    Ok(Applied { value, revision, changed: true })
+    drop(conn);
+    let mirror_error = match write_back(context) {
+        Ok(blocked) if blocked.is_empty() => None,
+        Ok(blocked) => Some(format!("config.json cannot hold {}", blocked.join(", "))),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = &mirror_error {
+        crate::safe_eprintln!("[settings] config.json does not hold the stored settings: {error}");
+    }
+    Ok(Applied { value, revision, changed, mirror_error })
 }
 
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
