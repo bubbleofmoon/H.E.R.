@@ -1118,7 +1118,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
             .map_err(failed)?;
         let (scope, key, source, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
         let setting = find(&key)
-            .filter(|_| scope == "global" && source != "migration")
+            .filter(|_| scope == "global" && source != "never")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
         let later: i64 = conn
             .query_row(
@@ -1141,7 +1141,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
             .transpose()?;
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
-        if restored.is_none() {
+        if restored.is_none() && actor == "never" {
             remove_from_config(context, setting).map_err(|error| (503, error))?;
         }
         Ok(Undone { key: setting.key, stored: restored, mirror_error: None })
