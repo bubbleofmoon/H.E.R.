@@ -230,11 +230,24 @@ fn host_port(p: &ParsedUrl) -> String {
     }
 }
 
+/// Environment that would point curl at a config file (curlrc lookup) or a proxy; the curl child gets
+/// each of these set to empty.
+const CURL_ENV_CLEARED: [&str; 11] = [
+    "CURL_HOME", "XDG_CONFIG_HOME", "HOME", "APPDATA", "USERPROFILE",
+    "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+];
+
 /// The curl invocation for one pinned hop (`curl.exe` on Windows, `curl` elsewhere; no console window).
+/// `-q` must be the very first argument: otherwise curl reads a curlrc, which could add a URL or a
+/// `connect-to` that bypasses the pinned address.
 fn curl_command(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration, out_path: &std::path::Path, hdr_path: &std::path::Path) -> Result<std::process::Command, String> {
     let url = format!("{}://{}{}", p.scheme, host_port(p), p.rest);
     let mut command = crate::subprocess::command_without_console(crate::aux_fetch::curl_program());
+    for name in CURL_ENV_CLEARED {
+        command.env(name, "");
+    }
     command.args([
+            "-q",
             "-sS",
             "--globoff",
             "--max-redirs",

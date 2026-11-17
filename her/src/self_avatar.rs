@@ -1,13 +1,11 @@
 //! Her own QQ avatar for `qq_get_self_image` (#206). Selected runtimes fetch it from the one qlogo
 //! address for her own uin (`<data>/identity.json`), keep it in `<data>/self-avatar.cache` for 30 days
-//! and remember a failed fetch for 15 minutes. `None` from `current` means: serve the static portrait.
+//! and fetch at most once per 15 minutes per runtime: every fetch first writes and reads back an attempt
+//! reservation (`<data>/self-avatar.attempt`). `None` from `current` means: serve the static portrait.
 //!
 //! The fetch goes through `safe_fetch::fetch_exact` (public pinned address, no redirect followed, size
 //! cap, image magic, time budget). Unit tests replace it with `FETCH_TEST_HOOK`; with no hook set the
 //! fetch fails, so no test contacts qlogo.
-
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -23,7 +21,7 @@ pub const SIZE: &str = "640";
 pub const MAX_BYTES: usize = 2 * 1024 * 1024;
 /// A stored avatar is fresh for 30 days (the gateway's own web console caches qlogo for as long).
 pub const TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-/// After a failed fetch for the same uin, no new fetch for 15 minutes.
+/// After a fetch attempt for the same uin, no new attempt for 15 minutes.
 pub const FAILURE_BACKOFF_MS: i64 = 15 * 60 * 1000;
 /// Transfer budget for one fetch, all address attempts together.
 #[cfg_attr(test, allow(dead_code))]
@@ -37,6 +35,8 @@ const CACHE_FILE_MAX: u64 = (MAX_BYTES as u64) * 4 / 3 + 4096;
 /// attempt. It is written and read back before every fetch, so the backoff holds across restarts and
 /// processes even when the cache cannot be stored or read. Not `.json`, like `CACHE_FILE`.
 pub const ATTEMPT_FILE: &str = "self-avatar.attempt";
+/// A reservation larger than this is ignored (the next reservation replaces it).
+const ATTEMPT_FILE_MAX: u64 = 1024;
 /// One check-fetch-store at a time per runtime, across processes: a second caller waits here and then
 /// finds the stored avatar or failure. The OS releases the lock when its holder exits.
 pub const GATE_FILE: &str = "locks/self-avatar.lock";
@@ -85,9 +85,9 @@ pub fn url_allowed(url: &str) -> bool {
 }
 
 /// Her current avatar, normalized for the model, or `None` for the static portrait: a fresh stored
-/// avatar for her uin, else one fetch unless a failure for that uin is younger than
-/// `FAILURE_BACKOFF_MS`. The fetch's outcome is stored; when the store fails, the outcome is kept in this
-/// process for the same backoff instead.
+/// avatar for her uin, else one fetch when no attempt for that uin is younger than `FAILURE_BACKOFF_MS`
+/// and a new attempt reservation is written and reads back. The fetch's outcome is stored (a failed
+/// store is ignored: the reservation keeps the backoff); a fetch during which her uin changed is dropped.
 pub fn current(context: &RuntimeContext, now_ms: &dyn Fn() -> i64, max_pixels: u64) -> Option<Normalized> {
     current_with_clock(context, now_ms, max_pixels, &mut fetch_live)
 }
@@ -125,49 +125,53 @@ pub(crate) fn current_with_clock(
             return None;
         }
     }
-    if let Some(bytes) = unstored(context.data_dir(), &uin, now_ms) {
-        return bytes.as_deref().and_then(|bytes| decode(bytes, max_pixels));
+    // Every fetch needs a new reservation on disk: a cache that is missing, damaged, unreadable or cannot
+    // be stored still allows at most one fetch per `FAILURE_BACKOFF_MS`, across restarts and processes.
+    if attempt_recent(context, &uin, now_ms) || !reserve(context, &uin, now_ms) {
+        return None;
     }
     let fetched = fetch(&avatar_url(&uin)).ok();
+    // Her account changed while the fetch ran: the bytes are the old account's picture.
+    if own_uin(context).as_deref() != Some(uin.as_str()) {
+        return None;
+    }
     let normalized = fetched.as_deref().and_then(|bytes| decode(bytes, max_pixels));
     let record = match (&fetched, &normalized) {
         (Some(bytes), Some(_)) => json!({"version": 1, "uin": uin, "fetchedAt": now_ms, "data": STANDARD.encode(bytes)}),
         _ => json!({"version": 1, "uin": uin, "failedAt": now_ms}),
     };
-    if context.write_atomic(RuntimeArea::Data, CACHE_FILE, record.to_string().as_bytes()).is_err() {
-        let kept = if normalized.is_some() { fetched.clone() } else { None };
-        remember_unstored(context.data_dir(), &uin, now_ms, kept);
-    }
+    let _ = context.write_atomic(RuntimeArea::Data, CACHE_FILE, record.to_string().as_bytes());
     normalized
 }
 
-/// A fetch whose cache store failed, kept in this process: the runtime data folder, her uin, the time of
-/// the fetch and the avatar bytes when they normalized (`None` serves the portrait).
-struct UnstoredFetch {
-    data_dir: PathBuf,
-    uin: String,
-    at: i64,
-    bytes: Option<Vec<u8>>,
-}
-
-/// The fetches whose store failed, one entry per runtime folder and uin. A broken disk must not turn every
-/// call into a fetch, so such an entry serves for `FAILURE_BACKOFF_MS` (see `unstored`).
-static UNSTORED: Mutex<Vec<UnstoredFetch>> = Mutex::new(Vec::new());
-
-/// The kept outcome while it is younger than `FAILURE_BACKOFF_MS`: `Some(bytes)` serves (`None` is the
-/// portrait), `None` means no kept outcome applies.
-fn unstored(data_dir: &Path, uin: &str, now_ms: i64) -> Option<Option<Vec<u8>>> {
-    let list = UNSTORED.lock().ok()?;
-    let entry = list.iter().find(|entry| entry.data_dir == data_dir && entry.uin == uin)?;
-    let age = now_ms.checked_sub(entry.at)?;
-    (0..FAILURE_BACKOFF_MS).contains(&age).then(|| entry.bytes.clone())
-}
-
-fn remember_unstored(data_dir: &Path, uin: &str, at: i64, bytes: Option<Vec<u8>>) {
-    if let Ok(mut list) = UNSTORED.lock() {
-        list.retain(|entry| !(entry.data_dir == data_dir && entry.uin == uin));
-        list.push(UnstoredFetch { data_dir: data_dir.to_path_buf(), uin: uin.to_string(), at, bytes });
+/// Whether the stored reservation is for `uin` and at most `now_ms` and younger than `FAILURE_BACKOFF_MS`.
+/// A missing, oversized, unreadable or damaged reservation is not recent (`reserve` then replaces it).
+fn attempt_recent(context: &RuntimeContext, uin: &str, now_ms: i64) -> bool {
+    if !context.optional_file_len(RuntimeArea::Data, ATTEMPT_FILE).is_ok_and(|len| len <= ATTEMPT_FILE_MAX) {
+        return false;
     }
+    let Some(value) = context
+        .read_optional_text(RuntimeArea::Data, ATTEMPT_FILE)
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return false;
+    };
+    value.get("version").and_then(Value::as_i64) == Some(1)
+        && value.get("uin").and_then(Value::as_str) == Some(uin)
+        && value
+            .get("attemptAt")
+            .and_then(Value::as_i64)
+            .and_then(|at| now_ms.checked_sub(at))
+            .is_some_and(|age| (0..FAILURE_BACKOFF_MS).contains(&age))
+}
+
+/// Writes the reservation for `uin` at `now_ms` and reads it back; `false` (no fetch) unless both work.
+fn reserve(context: &RuntimeContext, uin: &str, now_ms: i64) -> bool {
+    let reservation = json!({"version": 1, "uin": uin, "attemptAt": now_ms}).to_string();
+    context.write_atomic(RuntimeArea::Data, ATTEMPT_FILE, reservation.as_bytes()).is_ok()
+        && context.read_optional_text(RuntimeArea::Data, ATTEMPT_FILE).ok().flatten().as_deref() == Some(reservation.as_str())
 }
 
 /// The exclusive gate file, held until the returned handle drops; `None` when it stays taken for
@@ -242,7 +246,8 @@ impl CacheRecord {
     }
 }
 
-/// The stored record; missing, oversized, unreadable or not version 1 is `None`.
+/// The stored record; missing, oversized, unreadable or not version 1 is `None`. Such a cache never
+/// fetches on its own: the attempt reservation still limits the fetches.
 fn read_cache(context: &RuntimeContext) -> Option<CacheRecord> {
     let len = context.optional_file_len(RuntimeArea::Data, CACHE_FILE).ok()?;
     if len == 0 || len > CACHE_FILE_MAX {
