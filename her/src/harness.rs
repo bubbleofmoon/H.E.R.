@@ -27,6 +27,9 @@ use tokio::sync::{broadcast, watch};
 /// The failure of a turn whose wall deadline (`socialV2.turnTimeoutSecs`) ran out.
 pub(crate) const DEADLINE_EXCEEDED: &str = "harness model deadline exceeded";
 
+/// Default cap, in characters, on the model copy of one tool result (`harness.toolResultChars`).
+const TOOL_RESULT_CHARS: u64 = 8_000;
+
 /// Credentials are opaque: never derive Debug or serialize this target.
 pub struct ModelRoute {
     key: String,
@@ -105,7 +108,11 @@ impl Limits {
                 .and_then(Value::as_u64)
                 .unwrap_or(32_768)
                 .clamp(1, 1_000_000) as u32,
-            tool_result_chars: usize::MAX, // #175 red stub
+            tool_result_chars: cfg
+                .pointer("/harness/toolResultChars")
+                .and_then(Value::as_u64)
+                .unwrap_or(TOOL_RESULT_CHARS)
+                .clamp(1_000, 100_000) as usize,
         }
     }
 }
@@ -868,8 +875,54 @@ fn preview_tool_results(messages: Vec<ChatMessage>, cap: usize) -> Vec<ChatMessa
 /// The model copy of one tool result. A result longer than `cap` characters becomes one MCP result:
 /// the longest leading part of its text that keeps the whole copy within `cap`, a note that the rest
 /// was omitted, and the original error flag. Canonical facts keep the whole result.
-fn preview_tool_text(text: &str, _cap: usize) -> String {
-    text.to_string() // #175 red stub
+fn preview_tool_text(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let data = serde_json::from_str::<Value>(text).ok();
+    let body = data
+        .as_ref()
+        .and_then(|data| data["content"].as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| text.to_string());
+    let is_error = data.as_ref().is_some_and(|data| data["isError"] == true);
+    // Byte offsets of every character boundary, so a prefix never splits a character.
+    let ends: Vec<usize> = body
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(body.len()))
+        .collect();
+    let total = ends.len() - 1;
+    let build = |shown: usize| {
+        let leading = &body[..ends[shown]];
+        let note = format!("[Tool result too long: showing the first {shown} of {total} characters of its text; the rest of the result was omitted.]");
+        let mut copy = serde_json::json!({"content":[
+            {"type":"text","text":leading},
+            {"type":"text","text":note}
+        ]});
+        if is_error {
+            copy["isError"] = Value::Bool(true);
+        }
+        copy.to_string()
+    };
+    // The serialized copy never shrinks as the prefix grows: bisect for the longest one that fits.
+    let (mut low, mut high) = (0, total);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if build(mid).chars().count() <= cap {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    build(low)
 }
 
 /// Keep binary image parts in the canonical tool fact; never embed their base64 in model text.
