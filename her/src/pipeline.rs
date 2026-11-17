@@ -1224,7 +1224,7 @@ impl Pipeline {
         }
         if self.chat.is_none() {
             let cfg = self.context.load_config().map_err(|e|e.to_string())?;
-            if crate::console::runtime_mode(&self.context) != "reserved2" || !crate::console::key_allowed(&cfg,key) {
+            if crate::console::runtime_mode(&self.context) != "reserved2" || !crate::console::inbound_admitted(&cfg,key) {
                 return Err("mode or permission changed".to_string());
             }
         }

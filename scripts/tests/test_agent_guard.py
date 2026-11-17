@@ -105,6 +105,8 @@ READS = [
     'gh api rate_limit',
     'gh api rate_limit --jq .resources.core.remaining',
 ]
+# #185: the dispatch a worker on the ticket branch her/67-dsh-decisions runs, as the guard's own message names it
+QUICK_DSH = 'gh workflow run quick.yml --ref her/67-dsh-decisions -f target=install_root -f os=windows'
 IMPLEMENTER_ALLOWED = [
     ('wt', 'git push origin her/1-x'),
     ('wt', 'git push -u origin her/1-x'),
@@ -117,6 +119,10 @@ IMPLEMENTER_ALLOWED = [
     ('repo', 'cd {wt} && git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit -f filter=lifecycle::tests::a -f os=windows'),
     ('wt', 'gh workflow run quick.yml -R bubbleofmoon/H.E.R. --ref her/1-x -f target=harness_e2e'),
+    ('dsh', QUICK_DSH),                                  # #185: the exact form from its own worktree
+    ('repo', 'cd {dsh} && ' + QUICK_DSH),                # the same from a session that starts elsewhere, after the cd
+    ('detached', 'cd {dsh} && ' + QUICK_DSH),
+    ('wt', 'cd {dsh} && ' + QUICK_DSH),                  # KNOWN GAP (T1/T2, #85): no ticket binding, so a cd into another worktree with its own ref passes
     ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
     ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6-astra high read-only 120'),
     ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
@@ -214,6 +220,24 @@ DENIED_EVERY_ROLE = [
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit -f target=x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x'),
     ('repo', 'gh workflow run quick.yml --ref main -f target=unit'),
+    # #185: the dispatch runs only as one plain command in the worktree whose branch is its --ref
+    ('repo', QUICK_DSH),                                 # the session's folder is on main and the cd is missing
+    ('detached', QUICK_DSH),
+    ('wt', QUICK_DSH),                                   # another ticket's ref from this worktree
+    ('repo', 'cd {wt} && ' + QUICK_DSH),                 # cd into another ticket's worktree
+    ('repo', 'cd {repo} && ' + QUICK_DSH),
+    ('dsh', QUICK_DSH + ' 2>&1'),
+    ('dsh', QUICK_DSH + ' | cat'),
+    ('dsh', QUICK_DSH + '; ls'),
+    ('dsh', 'cd {dsh} && ' + QUICK_DSH + ' && git push origin main'),
+    ('dsh', 'cd {dsh} && ' + QUICK_DSH + ' && gh run watch 1'),
+    ('dsh', QUICK_DSH + ' -f os=linux'),
+    ('dsh', QUICK_DSH + ' --ref main'),
+    ('dsh', 'gh workflow run quick.yml --ref her/67-dsh-decisions-x -f target=install_root -f os=windows'),
+    ('dsh', 'gh workflow run quick.yml --ref her/67-dsh-decisions -f target=install_root -f os=windows-latest'),
+    ('dsh', 'gh workflow run quick.yml --ref her/67-dsh-decisions -f target=../install_root -f os=windows'),
+    ('dsh', 'gh workflow run quick.yml --ref her/67-dsh-decisions -f target=install_root$x -f os=windows'),
+    ('dsh', 'gh workflow run quick.yml --ref her/67-dsh-decisions -f os=windows'),
     # fail closed: unparseable commands, ANSI-C quoting and backslash-newline continuations
     ('wt', 'echo "unterminated'),
     ('wt', "git $'pu\\x73h' origin HEAD:refs/heads/main"),
@@ -300,6 +324,7 @@ DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
     ('wt', 'git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit'),
+    ('dsh', QUICK_DSH),                                  # #185: allowed for an implementer only
     ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
 ]
 DENIED_REVIEWER = [
@@ -638,7 +663,7 @@ class AgentGuard(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp = tempfile.TemporaryDirectory()
         base = Path(cls._tmp.name)
-        cls.places = {'repo': base / 'repo', 'wt': base / 'wt', 'detached': base / 'detached'}
+        cls.places = {'repo': base / 'repo', 'wt': base / 'wt', 'detached': base / 'detached', 'dsh': base / 'dsh'}
         git = ['git', '-c', 'user.name=guard-test', '-c', 'user.email=guard-test@example.invalid',
                '-c', 'init.defaultBranch=main']
         repo = str(cls.places['repo'])
@@ -649,6 +674,8 @@ class AgentGuard(unittest.TestCase):
                        env=env)
         subprocess.run([*git, '-C', repo, 'worktree', 'add', '-q', '--detach', str(cls.places['detached'])], check=True,
                        env=env)
+        subprocess.run([*git, '-C', repo, 'worktree', 'add', '-q', '-b', 'her/67-dsh-decisions', str(cls.places['dsh'])],
+                       check=True, env=env)
 
     @classmethod
     def tearDownClass(cls):
@@ -857,6 +884,18 @@ class AgentGuard(unittest.TestCase):
                 with self.subTest(role=role, command=command):                 # the wrapper rule refuses it, not another rule
                     code, err = self.guard(role, where, command)
                     self.assertIn(message, err)
+
+    # --- #185: the quick.yml dispatch is pinned to the branch checked out where it runs --------------------
+    def test_a_refused_dispatch_names_the_cd_form_and_the_branch_pin(self):          # first red
+        wrong_folder = [('repo', QUICK_DSH), ('detached', QUICK_DSH), ('wt', QUICK_DSH),
+                        ('repo', 'cd {wt} && ' + QUICK_DSH), ('repo', 'cd {repo} && ' + QUICK_DSH)]
+        for role in ('implementer', 'gate'):
+            for where, command in wrong_folder:
+                with self.subTest(role=role, where=where, command=command):
+                    code, err = self.guard(role, where, command)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn('[cd <worktree> &&] gh workflow run quick.yml --ref', err)
+                    self.assertIn('not the branch checked out where the command runs', err)
 
 
 if __name__ == '__main__':

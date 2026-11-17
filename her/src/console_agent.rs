@@ -92,7 +92,7 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
     let token = body_text(&input, "token");
     let state = load_social_state_for(context)?;
     if current_mode_for(context)? != "reserved2" || state["paused"] == true
-        || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !key_allowed(cfg, &key)
+        || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(cfg, &key)
         || token.is_empty() || !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "wake snapshot invalidated".into()));
     }

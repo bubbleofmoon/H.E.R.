@@ -67,6 +67,68 @@ pub fn live_target_from_config(cfg: &Value) -> Result<LiveTarget, String> {
     Ok(LiveTarget { groups: list, console, console_port: port })
 }
 
+/// #186: where `rollout.rustGroups` (the conversations a live owner is started to serve, `--live-groups`) and the
+/// inbound gate (`console::inbound_admitted`: listed in an allow list and not denied) disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeGaps {
+    /// Served but refused by the inbound gate: their events are dropped before the journal.
+    pub not_allowed: Vec<String>,
+    /// Admitted but not served, while the rollout is on (`rollout.enabled` is not `false`): nobody answers them.
+    pub not_served: Vec<String>,
+}
+
+impl ScopeGaps {
+    /// One operator-facing line per kind of gap; empty when both lists agree.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if !self.not_allowed.is_empty() {
+            lines.push(format!(
+                "rollout.rustGroups serves {} but the allow/deny lists refuse them: their messages are dropped",
+                self.not_allowed.join(",")
+            ));
+        }
+        if !self.not_served.is_empty() {
+            lines.push(format!(
+                "the allow lists admit {} but rollout.rustGroups does not serve them: nobody answers them",
+                self.not_served.join(",")
+            ));
+        }
+        lines
+    }
+}
+
+/// #186: compare `rollout.rustGroups` with the allow/deny lists of `cfg`. No `rollout.rustGroups` array means no
+/// rollout to compare (the watchdog refuses that configuration on its own).
+pub fn rollout_scope_gaps(cfg: &Value) -> ScopeGaps {
+    let Some(entries) = cfg.pointer("/rollout/rustGroups").and_then(Value::as_array) else {
+        return ScopeGaps::default();
+    };
+    let served: Vec<String> = entries
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let mut not_allowed: Vec<String> = Vec::new();
+    for key in &served {
+        if !crate::console::inbound_admitted(cfg, key) && !not_allowed.contains(key) {
+            not_allowed.push(key.clone());
+        }
+    }
+    let mut not_served: Vec<String> = Vec::new();
+    if cfg.pointer("/rollout/enabled").and_then(Value::as_bool) != Some(false) {
+        for kind in ["group", "private"] {
+            for id in crate::console::admitted_ids(cfg, kind) {
+                let key = format!("{kind}:{id}");
+                if !served.contains(&key) && !not_served.contains(&key) {
+                    not_served.push(key);
+                }
+            }
+        }
+    }
+    ScopeGaps { not_allowed, not_served }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsoleProbe {
     Absent,
@@ -469,6 +531,40 @@ mod tests {
         ] {
             assert!(live_target_from_config(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn t186_scope_gaps_flag_both_directions_and_only_while_the_rollout_is_on() {
+        let cfg = json!({
+            "allow": {"groups": [420042, "420043"], "private": ["7001"]},
+            "deny": {"groups": [420043]},
+            "rollout": {"rustGroups": ["group:420042", "group:420043", "group:420044", "group:420044"]}
+        });
+        let gaps = rollout_scope_gaps(&cfg);
+        assert_eq!(gaps.not_allowed, groups(&["group:420043", "group:420044"]), "denied and unlisted served keys, once each");
+        assert_eq!(gaps.not_served, groups(&["private:7001"]), "an admitted private chat nobody serves");
+        let lines = gaps.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("group:420043,group:420044") && lines[1].contains("private:7001"), "{lines:?}");
+
+        // Explicitly off: admitted but unserved conversations are not a gap; served but refused ones still are.
+        let mut off = cfg.clone();
+        off["rollout"]["enabled"] = json!(false);
+        let gaps = rollout_scope_gaps(&off);
+        assert_eq!(gaps.not_allowed, groups(&["group:420043", "group:420044"]));
+        assert!(gaps.not_served.is_empty(), "{gaps:?}");
+
+        // Both lists agree: no gap, no line.
+        let agreed = json!({"allow": {"groups": [420042], "private": []}, "rollout": {"enabled": true, "rustGroups": ["group:420042"]}});
+        assert_eq!(rollout_scope_gaps(&agreed), ScopeGaps::default());
+        assert!(rollout_scope_gaps(&agreed).lines().is_empty());
+
+        // No rollout array: nothing to compare.
+        assert_eq!(rollout_scope_gaps(&json!({"allow": {"groups": [420042]}})), ScopeGaps::default());
+        assert_eq!(
+            rollout_scope_gaps(&json!({"allow": {"groups": [420042]}, "rollout": {"rustGroups": "group:420042"}})),
+            ScopeGaps::default()
+        );
     }
 
     #[test]

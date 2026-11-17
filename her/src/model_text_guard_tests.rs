@@ -6,50 +6,8 @@ use super::*;
 // the MCP tool lists with their descriptions and schemas, the generated MCP server names and serve
 // arguments, the digest and slang learner prompts, and representative tool errors.
 
-/// Latin terms, matched case-insensitively as whole words (an ASCII letter or digit on either side
-/// is not a match, so `dshReady` or `qq_send_message` pass while `user/dsh` and `deepseek娘` fail).
-const DENIED_WORDS: [&str; 13] = [
-    "deepseek", "dsh", "harness", "opencode", "codex", "claude", "anthropic", "astrbot", "cliproxy",
-    "antigravity", "openai", "chatgpt", "gpt",
-];
-
-/// Phrases matched case-insensitively anywhere.
-const DENIED_PHRASES: [&str; 9] = ["cli-proxy", "人工智能", "机器人", "语言模型", "大模型", "模型", "智能体", "助手", "深度求索"];
-
-/// The denied terms `text` contains. "AI" is matched in upper case with no ASCII letter on either side,
-/// so 反AI味 fails while `lastAiReplyAt`, `API` and `EMAIL` pass.
-fn denied_terms(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let lower = text.to_lowercase();
-    let word_edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
-    for word in DENIED_WORDS {
-        let mut from = 0;
-        while let Some(at) = lower[from..].find(word) {
-            let (start, end) = (from + at, from + at + word.len());
-            if word_edge(lower[..start].chars().next_back()) && word_edge(lower[end..].chars().next()) {
-                found.push(word.to_string());
-                break;
-            }
-            from = end;
-        }
-    }
-    let letter = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphabetic());
-    let mut from = 0;
-    while let Some(at) = text[from..].find("AI") {
-        let (start, end) = (from + at, from + at + 2);
-        if !letter(text[..start].chars().next_back()) && !letter(text[end..].chars().next()) {
-            found.push("AI".to_string());
-            break;
-        }
-        from = end;
-    }
-    for phrase in DENIED_PHRASES {
-        if lower.contains(phrase) {
-            found.push(phrase.to_string());
-        }
-    }
-    found
-}
+// The #142 denylist matcher lives with `her-cli upstream-capture sweep`, which uses it too (#183).
+use crate::upstream_capture::denied_terms;
 
 /// The string literals passed to `error(` in a source file: the harness's tool results, which are
 /// private to `harness::tools` and so are checked in the source.

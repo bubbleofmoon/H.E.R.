@@ -34,6 +34,10 @@ pub struct Verdict {
     parts: BTreeMap<&'static str, Part>,
     #[serde(rename = "dependencyNotices", skip_serializing_if = "Vec::is_empty")]
     dependency_notices: Vec<serde_json::Value>,
+    /// #186: where `rollout.rustGroups` and the allow/deny lists disagree. Reported beside the parts, never a failed
+    /// part: a configuration choice does not make a release unhealthy.
+    #[serde(rename = "scopeNotices", skip_serializing_if = "Vec::is_empty")]
+    scope_notices: Vec<String>,
 }
 
 fn owner(data: &Path, role: &str, lock: &str) -> Part {
@@ -85,6 +89,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 ok: false,
                 parts,
                 dependency_notices: Vec::new(),
+                scope_notices: Vec::new(),
             };
         }
     };
@@ -120,6 +125,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 ok: false,
                 parts,
                 dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
+                scope_notices: Vec::new(),
             };
         }
     };
@@ -180,6 +186,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         ok: parts.values().all(|part| part.verdict == "pass"),
         parts,
         dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
+        scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
     }
 }
 
@@ -306,5 +313,44 @@ pub fn assert_running(root: &Path, wait: Option<&str>) -> i32 {
         if Instant::now() >= end {
             return output(&verdict);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn t186_health_reports_rollout_scope_notices_beside_the_parts() {
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("her-t186-health-{}", crate::turn_ledger::mint_id(""))),
+        );
+        for dir in ["config", "data/logs", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config = json!({
+            "consoleToken": "synthetic-health-scope-token",
+            "consolePort": 1,
+            "allow": {"groups": [420042]},
+            "rollout": {"enabled": false, "rustGroups": ["group:420042", "group:420044"]}
+        });
+        std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+        )
+        .unwrap();
+        // A complete selected-runtime layout needs `data/social-v2.json`; without it no configuration can be read
+        // and so no scope can be compared.
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        RuntimeContext::from_root(&root).expect("the fixture is a complete runtime layout");
+        let verdict = serde_json::to_value(check(&root, Instant::now() + Duration::from_secs(5))).unwrap();
+        let notices = verdict["scopeNotices"].as_array().cloned().unwrap_or_default();
+        assert_eq!(notices.len(), 1, "one served conversation the allow list refuses: {verdict}");
+        assert!(notices[0].as_str().unwrap().contains("group:420044"), "{verdict}");
+        let parts: Vec<&str> = verdict["parts"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(parts, ["console", "desired", "dsh", "dshLogin", "snowluma", "supervisor"], "a scope gap is never a part");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

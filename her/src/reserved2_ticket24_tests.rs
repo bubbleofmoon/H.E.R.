@@ -20,7 +20,7 @@ async fn a_revoked_then_regranted_conversation_never_runs_its_queued_wake() {
     let id = recent["entries"][0]["id"].clone();
     let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/audit/undo", Some(&json!({"id": id})));
     assert_eq!(status, 200, "{reply}");
-    assert!(crate::console::key_allowed(&hub.context.load_config().unwrap(), revoked), "undo restored access");
+    assert!(crate::console::inbound_admitted(&hub.context.load_config().unwrap(), revoked), "undo restored access");
     hub.tick("bot", 9001).await.unwrap();
     let ran = abort_all(&mut hub);
     let event = format!("{revoked}|message:1");

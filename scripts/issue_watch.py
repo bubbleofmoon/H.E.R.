@@ -10,14 +10,18 @@ update was under a minute old), with `since=` the last read's `updated_at` minus
 comment whose id it has not reported (a bounded set of ids per issue), never by position or count, so a deleted
 comment never hides one. A comment posted after the listing may wake it one poll early.
 Run it hidden in the background; its exit is the wake-up signal, so start it again after acting on the baton.
+--follow keeps it running instead, for a streaming reader such as the Monitor tool: it prints each event as its own
+line, flushed at once and before the state is written (a stop between the two repeats the event, never loses it), then
+waits one interval (a comment read's rate-limit wait when that is longer). Polling, ETag, rate-limit and state rules are
+the same, and a poll GitHub did not answer is retried at the next interval. It ends only with exit 2 or on a signal.
 
 usage: python -I scripts/issue_watch.py --machine windows|linux|owner [--repo bubbleofmoon/H.E.R.]
-                                        [--state <file>] [--interval 180] [--once]
+                                        [--state <file>] [--interval 180] [--once | --follow]
 The default state file is ~/.her-baton-watch-<machine>-<owner>-<repo>.json (each part %XX-encoded except letters, digits, '.' and '_'), one per repository, replaced atomically, so watching
 another repository never makes this one's held issues look new.
---once polls a single time and prints the newly held issues ("no batons" when none are new).
+--once polls a single time and prints the newly held issues ("no batons" when none are new). It excludes --follow.
 --interval is at least 180 seconds, and every wait, a short rate-limit wait included, lasts at least one interval.
-A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time; a 403 naming a secondary rate limit without either header waits 180 s. Exit 0 after printing; 2 on an API failure, a --once poll or comment read GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
+A rate limit (403/429 with Retry-After or X-RateLimit-Reset) is waited out, at most an hour at a time; a 403 naming a secondary rate limit without either header waits 180 s. Exit 0 after printing (never with --follow); 2 on an API failure, a --once poll or comment read GitHub did not answer, 100 or more batons, or a malformed --repo. Auth: GH_TOKEN or `gh auth token`.
 """
 import argparse, calendar, datetime, http.client, json, os, re, subprocess, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
 
@@ -252,7 +256,9 @@ def main(argv=None):
     p.add_argument("--repo", default="bubbleofmoon/H.E.R.")
     p.add_argument("--state", default=None)
     p.add_argument("--interval", type=interval_arg, default=MIN_INTERVAL)
-    p.add_argument("--once", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true")
+    mode.add_argument("--follow", action="store_true")
     a = p.parse_args(argv)
     try:
         state_path = a.state or default_state_path(a.machine, a.repo)
@@ -304,6 +310,8 @@ def main(argv=None):
                     wait = comment_wait
             else:
                 state["retry_after"] = 0
+        if a.follow and events:
+            print("\n".join(events), flush=True)      # before the state write: a stop in between repeats an event, never loses one
         write_state(state_path, state)
         if wait == 0 and a.once:
             print("GitHub did not answer; no baton state was read", file=sys.stderr)
@@ -313,6 +321,9 @@ def main(argv=None):
             return 2
         if wait is not None:
             time.sleep(max(wait, a.interval))
+            continue
+        if a.follow:
+            time.sleep(max(comment_wait, a.interval))      # a comment read's rate-limit wait outlasts the interval
             continue
         if events or a.once:
             print("\n".join(events) if events else "no batons")
