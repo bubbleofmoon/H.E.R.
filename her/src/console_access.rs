@@ -786,6 +786,15 @@ fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     if let Some(index) = pending.iter().position(|entry| !usable_entry(entry)) {
         return Err(format!("data/{PENDING_REVOCATIONS} entry {index} has no usable before/after policy; repair or remove it"));
     }
+    // #192: entries are told apart by `id` (the stop and target bookkeeping names them); two entries with one id
+    // would let one entry's removal drop the other, so the record is refused instead.
+    let mut ids: Vec<String> = Vec::new();
+    for id in pending.iter().filter_map(|entry| entry["id"].as_str()) {
+        if ids.iter().any(|seen| seen == id) {
+            return Err(format!("data/{PENDING_REVOCATIONS} has the pending id {id} twice; repair or remove it"));
+        }
+        ids.push(id.to_string());
+    }
     Ok(pending)
 }
 
