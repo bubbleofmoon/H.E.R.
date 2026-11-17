@@ -46,7 +46,7 @@ pub(crate) fn call_tool(name: &str, args: &Value, context: &RuntimeContext) -> V
 }
 
 /// The selected config (`{}` when a legacy context has none, as JS `loadConfig`); an invalid file is `{}` too.
-fn read_config(context: &RuntimeContext) -> Value {
+pub(crate) fn read_config(context: &RuntimeContext) -> Value {
     context
         .read_text(RuntimeArea::Config, "config.json")
         .ok()

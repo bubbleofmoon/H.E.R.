@@ -316,7 +316,7 @@ fn onebot_base(context: &RuntimeContext, cfg: &Value) -> Result<(String, String)
 }
 
 /// Selected-runtime config; legacy contexts tolerate a missing/invalid file (JS `loadConfig` returns `{}`).
-fn config(context: &RuntimeContext) -> Result<Value, String> {
+pub(crate) fn config(context: &RuntimeContext) -> Result<Value, String> {
     let text = match context.read_text(RuntimeArea::Config, "config.json") {
         Ok(text) => text,
         Err(_) if !context.is_isolated() => return Ok(json!({})),

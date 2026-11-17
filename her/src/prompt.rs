@@ -11,7 +11,7 @@ fn social_state_for_runtime(context: &RuntimeContext) -> Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
-fn config_for_runtime(context: &RuntimeContext) -> Value {
+pub(crate) fn config_for_runtime(context: &RuntimeContext) -> Value {
     let cfg = context
         .read_text(RuntimeArea::Config, "config.json")
         .ok()

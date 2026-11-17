@@ -26598,4 +26598,5 @@ mod tests {
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
     mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
+    mod config_overlay_tests { include!("config_overlay_tests.rs"); }
 }
