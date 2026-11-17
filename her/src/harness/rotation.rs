@@ -152,6 +152,11 @@ mod tests {
             Some(8_999_999_999_999_940_000),
             "a huge cache life keeps every millisecond of its lead"
         );
+        assert_eq!(
+            due_at(&cfg(json!(1.015_116_666_666_666_7)), &call("m", Some(500_000)), 0),
+            Some(908),
+            "a fractional cache life rounds its lead up exactly, not through f64"
+        );
     }
 
     #[test]
