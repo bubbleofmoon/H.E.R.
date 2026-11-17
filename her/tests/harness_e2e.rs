@@ -2716,6 +2716,146 @@ fn harness_refusal_records_message_ids_from_recalled_history_and_read_results() 
     assert!(!refs.iter().any(|r| r["messageId"] == "forged"));
 }
 
+/// The model copy of `call`'s result in `request`, after checking it is a preview within 1000 characters.
+fn tool_preview_wire(request: &Value, call: &str) -> String {
+    let wire = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == call)
+        .unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        wire.chars().count() <= 1000,
+        "{call}: preview exceeds the cap: {}",
+        wire.chars().count()
+    );
+    let outcome: Value = serde_json::from_str(&wire).unwrap();
+    assert!(
+        outcome["content"][1]["text"]
+            .as_str()
+            .is_some_and(|note| note.contains("the rest of the result was omitted")),
+        "{call}: no preview note: {wire}"
+    );
+    wire
+}
+
+#[test]
+fn tool_preview_oversized_memory_search_reaches_the_model_as_a_preview_and_stays_whole_in_the_record() {
+    let content = format!("HEAD175 {} TAIL175", "filler ".repeat(200));
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            json!({"id":"preview-write","name":"memory_write","arguments":{"key":OWNER_KEY,"token":"","content":content}}),
+            json!({"id":"preview-search","name":"memory_search","arguments":{"key":OWNER_KEY,"token":"","query":"head175"}}),
+        ]),
+        ModelReply::Text("preview checked".into()),
+        ModelReply::Text("preview replayed".into()),
+    ]);
+    let mut rig = owner_harness_rig("harness-tool-preview", &model);
+    set_harness_config(&rig, json!({"toolResultChars":1000}), 30);
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "store and find a long note");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 2)[1], "preview checked");
+    assert!(wait_for(LONG, || rig
+        .ledger()
+        .iter()
+        .any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    {
+        let requests = lock(&model.requests);
+        assert_eq!(requests.len(), 2);
+        let wire = tool_preview_wire(&requests[1], "preview-search");
+        let outcome: Value = serde_json::from_str(&wire).unwrap();
+        let shown = outcome["content"][0]["text"].as_str().unwrap();
+        assert!(shown.starts_with("1. [#1 fact] HEAD175 filler"), "{shown}");
+        assert!(!wire.contains("TAIL175"), "omitted text reached the model");
+        let written = tool_wire_result(&requests[1], "preview-write");
+        assert_eq!(
+            written["content"].as_array().unwrap().len(),
+            1,
+            "a short result gets no note: {written}"
+        );
+        assert!(written["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("已记住"));
+    }
+    let facts = conversation_facts(&rig);
+    let run = facts["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["call"] == "preview-search")
+        .unwrap();
+    assert_eq!(run["state"], "completed");
+    assert!(
+        run["result"].to_string().contains("TAIL175"),
+        "the tool run lost the full result"
+    );
+    let events = facts["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|e| e["kind"] == "tool_result"
+            && e["payload"]["message"].to_string().contains("TAIL175")),
+        "the canonical tool fact lost the full result"
+    );
+    assert!(
+        events.iter().any(|e| e["kind"] == "turn_admitted"
+            && e["payload"]["limits"]["toolResultChars"] == 1000),
+        "the cap is not recorded with the turn budgets"
+    );
+    // History replay previews again from the whole fact.
+    says(&rig, OWNER_KEY, OWNER, "owner", "look at that note again");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 4)[3], "preview replayed");
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 3);
+    let replayed = tool_preview_wire(&requests[2], "preview-search");
+    assert!(replayed.contains("HEAD175") && !replayed.contains("TAIL175"), "{replayed}");
+}
+
+#[test]
+fn tool_preview_of_a_long_qq_read_keeps_its_refusal_references() {
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            json!({"id":"long-read","name":"qq_get_group_history","arguments":{"groupId":GROUP_ID}}),
+        ]),
+        ModelReply::Refusal,
+    ]);
+    let mut rig = owner_harness_rig("harness-preview-refusal-refs", &model);
+    set_harness_config(&rig, json!({"toolResultChars":1000}), 30);
+    lock(&rig.gateway).intercept = Some(Arc::new(|action, _| {
+        (action == "get_group_msg_history").then(|| {
+            let messages: Vec<Value> = (0..40)
+                .map(|n| json!({"message_id":format!("preview-ref-{n}"),"raw_message":"a long history line ".repeat(4)}))
+                .collect();
+            json!({"status":"ok","retcode":0,"data":{"messages":messages}})
+        })
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "read a long history then refuse");
+    rig.wait_texts(OWNER_KEY, 2); // ack and private failure notice
+    assert!(wait_for(LONG, || !rig
+        .data_lines("logs/model-refusals.jsonl")
+        .is_empty()));
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 2);
+    let wire = tool_preview_wire(&requests[1], "long-read");
+    assert!(
+        wire.contains("preview-ref-0") && !wire.contains("preview-ref-39"),
+        "{wire}"
+    );
+    // References come from the whole filtered result: the IDs the preview shows and those it omits.
+    let records = rig.data_lines("logs/model-refusals.jsonl");
+    assert_eq!(records.len(), 1);
+    let refs = records[0]["messages"].as_array().unwrap();
+    for id in ["preview-ref-0", "preview-ref-39"] {
+        assert!(
+            refs.iter().any(|r| r["messageId"] == id),
+            "{id}: {records:?}"
+        );
+    }
+}
+
 // Isolated CLI containment is Windows-only; the portable exit-code test covers its decoder here.
 #[cfg(windows)]
 #[test]

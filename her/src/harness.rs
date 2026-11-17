@@ -28,6 +28,9 @@ use tokio::sync::{broadcast, watch};
 /// The failure of a turn whose wall deadline (`socialV2.turnTimeoutSecs`) ran out.
 pub(crate) const DEADLINE_EXCEEDED: &str = "harness model deadline exceeded";
 
+/// Default cap, in characters, on the model copy of one tool result (`harness.toolResultChars`).
+const TOOL_RESULT_CHARS: u64 = 8_000;
+
 /// Credentials are opaque: never derive Debug or serialize this target.
 pub struct ModelRoute {
     key: String,
@@ -93,6 +96,7 @@ pub struct Limits {
     /// `harness.imageInput` (default true): the route accepts image parts. When false, every image
     /// part of a delivered request becomes `NO_IMAGE_INPUT` text (`model_messages`).
     image_input: bool,
+    tool_result_chars: usize,
 }
 
 impl Limits {
@@ -112,6 +116,11 @@ impl Limits {
                 .pointer("/harness/imageInput")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            tool_result_chars: cfg
+                .pointer("/harness/toolResultChars")
+                .and_then(Value::as_f64)
+                .map(|chars| chars.clamp(1_000.0, 100_000.0) as usize)
+                .unwrap_or(TOOL_RESULT_CHARS as usize),
         }
     }
 }
@@ -482,6 +491,9 @@ async fn tool_loop(
         // Capture only structured references from the request being issued. Later read
         // results and recalled tool facts may add sources absent from the inbound wake.
         *request_refs.lock().unwrap_or_else(|p| p.into_inner()) = model_request_refs(&delivered);
+        // #175: an oversized tool result reaches the model as a preview. The references above are
+        // read from the whole filtered copy, so they still cover every ID the preview shows.
+        let delivered = preview_tool_results(delivered, request.limits.tool_result_chars);
         // #183: a capture the operator armed takes this request as `model_step` hands it to the
         // model client, which adds only the OpenAI wire framing.
         crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
@@ -907,6 +919,79 @@ fn filter_tool_text(text: &str, cfg: &Value, tool: Option<&str>) -> Result<Strin
     Ok(crate::model_view::strip_model_chat_data(&data, cfg).to_string())
 }
 
+/// Preview every oversized tool response of a delivery copy; other parts, images included, pass unchanged.
+fn preview_tool_results(messages: Vec<ChatMessage>, cap: usize) -> Vec<ChatMessage> {
+    let mut result = Vec::new();
+    for mut message in messages {
+        let mut parts = Vec::new();
+        for part in message.content {
+            parts.push(match part {
+                ContentPart::ToolResponse(mut response) => {
+                    response.content = preview_tool_text(&response.content, cap);
+                    ContentPart::ToolResponse(response)
+                }
+                other => other,
+            });
+        }
+        message.content = parts.into();
+        result.push(message);
+    }
+    result
+}
+
+/// The model copy of one tool result. A result longer than `cap` characters becomes one MCP result:
+/// the longest leading part of its text that keeps the whole copy within `cap`, a note that the rest
+/// was omitted, and the original error flag. Canonical facts keep the whole result.
+fn preview_tool_text(text: &str, cap: usize) -> String {
+    if text.chars().count() <= cap {
+        return text.to_string();
+    }
+    let data = serde_json::from_str::<Value>(text).ok();
+    let body = data
+        .as_ref()
+        .and_then(|data| data["content"].as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_else(|| text.to_string());
+    let error_flag = data.as_ref().and_then(|data| data.get("isError")).cloned();
+    // Byte offsets of every character boundary, so a prefix never splits a character.
+    let ends: Vec<usize> = body
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(body.len()))
+        .collect();
+    let total = ends.len() - 1;
+    let build = |shown: usize| {
+        let leading = &body[..ends[shown]];
+        let note = format!("[Tool result too long: showing the first {shown} of {total} characters of its text; the rest of the result was omitted.]");
+        let mut copy = serde_json::json!({"content":[
+            {"type":"text","text":leading},
+            {"type":"text","text":note}
+        ]});
+        if let Some(flag) = &error_flag {
+            copy["isError"] = flag.clone();
+        }
+        copy.to_string()
+    };
+    // The serialized copy never shrinks as the prefix grows: bisect for the longest one that fits.
+    let (mut low, mut high) = (0, total);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if build(mid).chars().count() <= cap {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    build(low)
+}
+
 /// Keep binary image parts in the canonical tool fact; never embed their base64 in model text.
 fn tool_message(call: &ToolCall, outcome: &Value) -> ChatMessage {
     let mut text = outcome.clone();
@@ -1128,6 +1213,197 @@ mod tests {
             db.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    /// A one-text-block MCP result whose serialized form is exactly `chars` characters.
+    fn tool_preview_result(chars: usize) -> String {
+        let empty = json!({"content":[{"type":"text","text":""}]}).to_string();
+        json!({"content":[{"type":"text","text":"a".repeat(chars - empty.chars().count())}]})
+            .to_string()
+    }
+
+    /// The shown text, the note and the parsed copy of a preview, after checking it fits the cap.
+    fn tool_preview_parts(copy: &str, cap: usize) -> (String, String, Value) {
+        assert!(
+            copy.chars().count() <= cap,
+            "preview exceeds the cap: {} > {cap}",
+            copy.chars().count()
+        );
+        let data: Value = serde_json::from_str(copy).unwrap();
+        let blocks = data["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "a preview holds its text and one note: {copy}");
+        (
+            blocks[0]["text"].as_str().unwrap().to_string(),
+            blocks[1]["text"].as_str().unwrap().to_string(),
+            data,
+        )
+    }
+
+    #[test]
+    fn tool_preview_keeps_a_result_at_the_cap_and_previews_one_character_over() {
+        let at_cap = tool_preview_result(1_000);
+        assert_eq!(at_cap.chars().count(), 1_000);
+        assert_eq!(
+            preview_tool_text(&at_cap, 1_000),
+            at_cap,
+            "a result at the cap is delivered whole"
+        );
+        let over = tool_preview_result(1_001);
+        let (shown, note, data) = tool_preview_parts(&preview_tool_text(&over, 1_000), 1_000);
+        assert!(
+            !shown.is_empty() && shown.chars().all(|c| c == 'a'),
+            "{shown}"
+        );
+        let total = 1_001
+            - json!({"content":[{"type":"text","text":""}]})
+                .to_string()
+                .chars()
+                .count();
+        assert_eq!(
+            note,
+            format!(
+                "[Tool result too long: showing the first {} of {total} characters of its text; the rest of the result was omitted.]",
+                shown.chars().count()
+            )
+        );
+        assert!(
+            data.get("isError").is_none(),
+            "a successful result stays successful: {data}"
+        );
+    }
+
+    #[test]
+    fn tool_preview_of_a_web_fetch_result_keeps_its_leading_text_and_error_flag_within_the_cap() {
+        // The web_fetch outcome shape: the page as pretty JSON in one text block. Its quotes and
+        // newlines are escaped again on the wire, so the copy is longer than the text it shows.
+        let page = serde_json::to_string_pretty(&json!({
+            "url": "https://example.invalid/long-page",
+            "text": format!("HEAD175 {} TAIL175", "a \"quoted\" line\n".repeat(4_000)),
+        }))
+        .unwrap();
+        for is_error in [false, true] {
+            let mut outcome = json!({"content":[{"type":"text","text":page}]});
+            outcome["isError"] = json!(is_error);
+            let (shown, note, data) =
+                tool_preview_parts(&preview_tool_text(&outcome.to_string(), 8_000), 8_000);
+            assert!(page.starts_with(&shown), "the preview is the leading text");
+            assert!(shown.contains("HEAD175") && !shown.contains("TAIL175"));
+            assert!(
+                note.contains(&format!("of {} characters", page.chars().count())),
+                "{note}"
+            );
+            assert_eq!(data["isError"], json!(is_error), "{data}");
+        }
+    }
+
+    #[test]
+    fn tool_preview_counts_characters_not_bytes_and_accepts_plain_text() {
+        let wide = json!({"content":[{"type":"text","text":"你".repeat(3_000)}]}).to_string();
+        let (shown, note, _) = tool_preview_parts(&preview_tool_text(&wide, 1_000), 1_000);
+        // The envelope and the note take under 200 characters; a byte count would show about 270.
+        assert!(
+            shown.chars().count() >= 800,
+            "the preview was cut by bytes: {}",
+            shown.chars().count()
+        );
+        assert!(
+            note.contains(&format!(
+                "the first {} of 3000 characters",
+                shown.chars().count()
+            )),
+            "{note}"
+        );
+        let plain = "x".repeat(1_500);
+        let (shown, _, _) = tool_preview_parts(&preview_tool_text(&plain, 1_000), 1_000);
+        assert!(!shown.is_empty() && plain.starts_with(&shown), "{shown}");
+    }
+
+    #[test]
+    fn tool_preview_of_a_memory_search_result_previews_the_rendered_model_copy() {
+        let content = format!("HEAD175 {} TAIL175", "filler ".repeat(300));
+        let hit = json!({"id":7,"owner_id":"private:8808","scope":"session","kind":"fact",
+            "subject":null,"content":content,"score":1.0,"tags":null,"source":"agent",
+            "importance":0.5,"pinned":0,"hits":0,"created_at":1,"last_used_at":null,
+            "owner_type":"session","archived":0,"expires_at":null});
+        let original = json!({"content":[{"type":"text","text":"canonical rendering"}],
+            "_meta":{"herMemoryResult":{"v":1,"name":"memory_search","args":{},
+            "data":{"ok":true,"count":1,"memories":[hit]}}}})
+        .to_string();
+        let filtered = filter_tool_text(&original, &json!({}), Some("memory_search")).unwrap();
+        let (shown, _, data) = tool_preview_parts(&preview_tool_text(&filtered, 1_000), 1_000);
+        assert!(shown.starts_with("1. [#7 fact] HEAD175 filler"), "{shown}");
+        assert!(!shown.contains("TAIL175"), "{shown}");
+        assert!(
+            data.get("_meta").is_none(),
+            "the internal source never reaches the model: {data}"
+        );
+    }
+
+    #[test]
+    fn tool_preview_cap_defaults_to_8000_characters_and_is_clamped() {
+        for (harness, expected) in [
+            (json!({}), 8_000_usize),
+            (json!({"toolResultChars":2_500}), 2_500),
+            (json!({"toolResultChars":1}), 1_000),
+            (json!({"toolResultChars":-1}), 1_000),
+            (json!({"toolResultChars":2500.0}), 2_500),
+            (json!({"toolResultChars":5_000_000}), 100_000),
+            (json!({"toolResultChars":"large"}), 8_000),
+        ] {
+            assert_eq!(
+                Limits::from_config(&json!({ "harness": harness })).tool_result_chars,
+                expected,
+                "{harness}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_preview_shortens_each_long_tool_response_and_keeps_other_parts() {
+        let call = |id: &str| ToolCall {
+            call_id: id.into(),
+            fn_name: "web_fetch".into(),
+            fn_arguments: json!({}),
+            thought_signatures: None,
+        };
+        let long = json!({"content":[{"type":"text","text":"b".repeat(2_000)},
+            {"type":"image","mimeType":"image/png","data":"iVBORw0KGgo="}]});
+        let short = json!({"content":[{"type":"text","text":"short result"}]});
+        let prompt = "c".repeat(2_000);
+        let delivered = preview_tool_results(
+            vec![
+                ChatMessage::user(prompt.clone()),
+                tool_message(&call("long-call"), &long),
+                tool_message(&call("short-call"), &short),
+            ],
+            1_000,
+        );
+        let responses: Vec<(String, String)> = delivered
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|part| match part {
+                ContentPart::ToolResponse(r) => Some((r.call_id.clone(), r.content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].0, "long-call");
+        tool_preview_parts(&responses[0].1, 1_000);
+        assert_eq!(responses[1], ("short-call".to_string(), short.to_string()));
+        assert!(
+            delivered
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|p| matches!(p, ContentPart::Text(text) if *text == prompt)),
+            "user text is not a tool result"
+        );
+        assert!(
+            delivered
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|p| matches!(p, ContentPart::Binary(_))),
+            "tool images are separate parts and stay"
         );
     }
 }
