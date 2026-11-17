@@ -310,12 +310,17 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                 lines
             }
         }
-        "settings_set" => format!(
-            "已改 {} = {}。{}",
-            result["key"].as_str().unwrap_or(""),
-            result["value"],
-            result["note"].as_str().unwrap_or("")
-        ),
+        "settings_set" => {
+            let key = result["key"].as_str().unwrap_or("");
+            let note = result["note"].as_str().unwrap_or("");
+            // Only a registry setting's reply names its value. A config.json setting's reply names the key alone, so the
+            // owner's raw value never reaches the model.
+            if crate::settings::chat_setting(key).is_some() {
+                format!("已改 {key} = {}。{note}", result["value"])
+            } else {
+                format!("已改 {key}。{note}")
+            }
+        }
         _ => return Err("unknown memory/settings result".into()),
     })
 }

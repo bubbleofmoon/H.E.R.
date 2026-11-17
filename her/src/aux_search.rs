@@ -16,7 +16,6 @@ use crate::aux_text::{clamped_int, collapse_js_space, js_string, js_trim, js_tru
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/anthropic/v1";
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
 const DEFAULT_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -60,7 +59,8 @@ pub fn load_search_config(config: &Value) -> SearchConfig {
         api_key: trimmed("apiKey").unwrap_or_default(),
         api_key_env: trimmed("apiKeyEnv").filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
         base_url: trimmed("baseURL").map(|s| s.trim_end_matches('/').to_string()).unwrap_or_default(),
-        model: trimmed("model").filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        // `webSearch.model` is a registry setting: its default and rules live in `settings.rs`.
+        model: crate::settings::WEB_SEARCH_MODEL.text(config).unwrap_or_default(),
         max_uses: clamped_int(raw.get("maxUses"), 5, 1, 5),
         max_tokens: clamped_int(raw.get("maxTokens"), 4096, 256, 8192),
         max_results: clamped_int(raw.get("maxResults"), 8, 1, 20),
@@ -502,6 +502,12 @@ fn bing_search(query: &str, config: &SearchConfig, net: &Network) -> Result<Vec<
 type CacheEntry = (Instant, Value);
 static CACHE: OnceLock<Mutex<(Vec<String>, HashMap<String, CacheEntry>)>> = OnceLock::new();
 
+/// The answer cache key: provider choice, query, result count and model (a JSON array, so no two of them run
+/// together), so a changed `webSearch.model` is asked afresh rather than answered from the cache.
+fn answer_key(wanted: &str, query: &str, config: &SearchConfig) -> String {
+    json!([wanted, query, config.max_results, config.model]).to_string()
+}
+
 /// JS `webSearch(query)`: provider choice, DeepSeek -> Bing fallback, empty-result note, five-minute cache.
 pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, net: &Network) -> Result<Value, String> {
     let q = js_trim(query);
@@ -510,7 +516,7 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
     }
     let config = load_search_config(config_value);
     let wanted = config.provider.clone();
-    let cache_key = format!("{wanted}|{q}|{}", config.max_results);
+    let cache_key = answer_key(&wanted, q, &config);
     let cache = CACHE.get_or_init(|| Mutex::new((Vec::new(), HashMap::new())));
     if let Some((at, value)) = cache.lock().ok().and_then(|c| c.1.get(&cache_key).cloned()) {
         if at.elapsed() < CACHE_TTL {
@@ -610,6 +616,23 @@ mod tests {
             });
             assert_eq!(&got, want, "config text: {:?}", case["text"]);
         }
+    }
+
+    #[test]
+    fn a_changed_search_model_is_asked_afresh() {
+        let config = |model: &str| load_search_config(&json!({"webSearch": {"model": model}}));
+        assert_ne!(
+            answer_key("auto", "q", &config("m1")),
+            answer_key("auto", "q", &config("m2")),
+            "a changed web search model is never answered from the cache"
+        );
+        assert_eq!(answer_key("auto", "q", &config("m1")), answer_key("auto", "q", &config("m1")));
+        assert_ne!(answer_key("auto", "q", &config("m1")), answer_key("bing", "q", &config("m1")));
+        assert_ne!(
+            answer_key("auto", "q|8|a", &config("b")),
+            answer_key("auto", "q", &config("a|8|b")),
+            "query and model never run together"
+        );
     }
 
     #[test]

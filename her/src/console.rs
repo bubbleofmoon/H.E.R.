@@ -2702,8 +2702,21 @@ const SETTINGS_READONLY_HINT: &str =
 /// What `settings-get` shows in place of a secret.
 const SETTINGS_SECRET_MARKER: &str = "(已隐藏)";
 
-/// The refusal for a settings read outside `SETTINGS_WRITABLE`. It never repeats the requested key.
+/// The refusal for a settings read outside the chat-writable settings. It never repeats the requested key.
 const SETTINGS_READ_REFUSED: &str = "只能读取可以通过对话修改的设置；不带 settingKey 调用 settings_get 可以看到这些设置";
+
+/// The chat's answer when the settings store cannot take a write. The store's own error names its files, so it stays
+/// in the console (`/api/settings` `storeError`).
+const SETTINGS_STORE_UNAVAILABLE: &str = "设置存储暂时不可用，这次没有改动";
+
+/// When a chat change to a registry setting takes effect, as `settings_set` replies (`settings::Setting::applies`).
+fn settings_applies_note(applies: &str) -> &'static str {
+    match applies {
+        "live" => "已立即生效",
+        "next wake" => "下次唤醒时生效",
+        _ => "重启后生效",
+    }
+}
 
 /// A secret config path: everything under `security.*`, and every path with a segment (lower case,
 /// `-` and `_` removed) that ends in token(s), secret(s), password, passwd, apikey(s), key(s) or
@@ -2851,7 +2864,11 @@ pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &
     })
 }
 
-/// `settings-get` / `settings-set` for a caller that already proved owner-private authority.
+/// `settings-get` / `settings-set` for a caller that already proved owner-private authority. In a selected runtime a
+/// registry setting the chat may use (`settings::chat_setting`, named by its configuration path) reads as the next use
+/// reads it and is written through `settings::apply` (actor `owner`, source `chat`): validated by the registry and
+/// audited. A legacy context has no settings store, so it offers none. The other `SETTINGS_WRITABLE` paths keep their
+/// `config.json` write until their settings batch registers them.
 pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &RuntimeContext) -> Result<Value, (u16, String)> {
         if action == "settings-get" {
             let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
@@ -2862,12 +2879,22 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                         all.insert(p.to_string(), redact_setting(p, v));
                     }
                 }
+                let mut writable: Vec<String> = SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
+                for setting in crate::settings::REGISTRY.iter().filter(|setting| setting.chat && context.is_isolated()) {
+                    let name = setting.chat_name();
+                    all.insert(name.clone(), redact_setting(&name, setting.effective_value(cfg)));
+                    writable.push(name);
+                }
                 return Ok(json!({
                     "ok": true,
                     "settings": all,
-                    "writable": SETTINGS_WRITABLE,
+                    "writable": writable,
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
+            }
+            if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
+                let value = redact_setting(&path, setting.effective_value(cfg));
+                return Ok(json!({"ok": true, "key": path, "writable": true, "value": value}));
             }
             // Only the settings the model may also change are readable. Any other key (a console token,
             // a gateway, backend, relay or model setting, an unknown path) is refused without naming it.
@@ -2886,6 +2913,25 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         }
         // settings-set
         let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
+            let value = b.get("value").cloned().unwrap_or(Value::Null);
+            // A refused value answers under the chat's name; the store's own errors stay out of the chat.
+            let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat").map_err(|(status, _)| {
+                if status == 400 {
+                    (400, setting.chat_requirement())
+                } else {
+                    (503, SETTINGS_STORE_UNAVAILABLE.to_string())
+                }
+            })?;
+            return Ok(json!({
+                "ok": true,
+                "key": path,
+                "value": applied.value,
+                "changed": applied.changed,
+                "hot": setting.applies != "restart",
+                "note": settings_applies_note(setting.applies),
+            }));
+        }
         if !is_setting_writable(&path) {
             return Err((
                 403,
@@ -8406,10 +8452,11 @@ fn handle_sticker_image(
         "images": images,
     }))
 }
-/// `GET /api/socialV2/self-image`：AI 自己的形象图（base64 内联）。
+/// `GET /api/socialV2/self-image`：她自己的形象图（base64 内联）。
 ///
 /// 返回 JSON 而不是二进制：MCP 那层要把它当图片内容塞回给模型，
-/// 走 JSON 省掉一次 content-type 协商。
+/// 走 JSON 省掉一次 content-type 协商。Selected runtimes answer with her live QQ avatar
+/// (`self_avatar`, `"source": "qqAvatar"`) and fall back to the static portrait (`"source": "portrait"`).
 fn handle_self_image(
     context: &RuntimeContext,
     params: &HashMap<String, String>,
@@ -8453,6 +8500,11 @@ fn handle_self_image(
     let path = crate::legacy_path!("qq-bridge/assets/deepseek娘.png");
     let _source = crate::media::admit_source()
         .ok_or_else(|| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
+    let max_pixels = crate::media::Limits::from_config(cfg).pixels;
+    if let Some(live) = crate::self_avatar::current(context, &now_ms, max_pixels) {
+        let images = crate::media::image_values(&live);
+        return Ok(json!({ "ok": true, "key": key, "source": "qqAvatar", "image": images[0], "images": images }));
+    }
     let bytes = if context.is_isolated() {
         let (area, relative) = runtime_location(path)
             .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
@@ -8479,10 +8531,10 @@ fn handle_self_image(
         crate::media::read_image_path(std::path::Path::new(path), crate::media_normalize::MAX_INPUT_BYTES)
             .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?
     };
-    let normalized = crate::media_normalize::normalize(&bytes, crate::media::Limits::from_config(cfg).pixels)
+    let normalized = crate::media_normalize::normalize(&bytes, max_pixels)
         .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let images = crate::media::image_values(&normalized);
-    Ok(json!({ "ok": true, "key": key, "image": images[0], "images": images }))
+    Ok(json!({ "ok": true, "key": key, "source": "portrait", "image": images[0], "images": images }))
 }
 
 
@@ -12336,7 +12388,7 @@ fn route_with_context(
             }
             Ok(gate)
         };
-        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.body, agent_call, &authority);
+        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && crate::console_persona::is_route(&req.path) {
@@ -14296,6 +14348,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         // read-modify-write (stale check and restore) runs under the social-state gate.
         let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
         access::finish_pending_before_change(context, &interaction)?;
+        // Registry settings whose backup value differed from the current file's (`settings::keep_registry_values`).
+        let mut settings_kept: Vec<&'static str> = Vec::new();
         let (config_before, restored, planned) = {
             let _gate = acquire_social_state_gate(context)?;
             // Safe undo: only the state this record produced may be replaced. A later change of the
@@ -14333,6 +14387,11 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                         }
                         _ => {}
                     }
+                    // Registry settings change and undo through the settings store only: the restored
+                    // configuration keeps their current values.
+                    settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config).map_err(
+                        |key| (409, format!("the backup cannot keep the current value of {key}; nothing was undone")),
+                    )?;
                     let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
                     // If the restored configuration cannot be loaded, everything the old one allowed is revoked.
                     let (after, load_error) = match context.effective_config(&restored_config) {
@@ -14373,7 +14432,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         if !failures.is_empty() {
             return Err((500, format!("已恢复 {}，但立即撤销未完成：{}", restored.join("、"), failures.join("；"))));
         }
-        return Ok(json!({ "ok": true, "id": id, "restored": restored, "revoked": revoked }));
+        return Ok(json!({ "ok": true, "id": id, "restored": restored, "revoked": revoked, "settingsKept": settings_kept }));
     }
 
     let mut restored: Vec<String> = Vec::new();
@@ -26658,5 +26717,6 @@ mod tests {
     mod access_pending_tests { include!("access_pending_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
     mod config_overlay_tests { include!("config_overlay_tests.rs"); }
+    mod self_avatar_tests { include!("self_avatar_tests.rs"); }
     mod settings_tests { include!("settings_tests.rs"); }
 }

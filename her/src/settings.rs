@@ -2,8 +2,11 @@
 //!
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
-//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
-//! A legacy (no-root) context has no store.
+//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply`, `reset` and `undo` change one value with one
+//! audit row each, under the store gate (`write_store`), for the console routes and for the owner's chat settings tools
+//! (`chat_setting`, `console::settings_action`); `history` lists the audit rows. A legacy (no-root) context has no store.
+//! The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
+//! `integer`, `text`) on the loader's document, never with a default of its own.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -22,7 +25,8 @@ const LEGACY_ERROR: &str = "settings require a selected runtime";
 
 #[cfg(test)]
 thread_local! {
-    /// Makes the next `apply` on this thread fail after it wrote the value and before the audit row.
+    /// Makes the next change (`apply`, `reset` or `undo`) on this thread fail after it wrote the value and before the
+    /// audit row.
     pub(crate) static FAIL_BEFORE_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -30,15 +34,41 @@ thread_local! {
 #[cfg(test)]
 pub(crate) static WAL_SWITCH_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The longest model id the store accepts, in characters.
+pub(crate) const MODEL_ID_MAX_CHARS: usize = 200;
+
 /// The value type and bounds of a setting.
 pub(crate) enum Kind {
-    /// A JSON integer from `min` to `max`, both included.
-    Integer { min: i64, max: i64, default: i64 },
+    /// A JSON integer from `min` to `max`, both included. `file` is how the next use reads a value the store would
+    /// refuse.
+    Integer { min: i64, max: i64, default: i64, file: FileRule },
+    /// A model id: a JSON string that, trimmed as JavaScript trims, has 1 to `MODEL_ID_MAX_CHARS` characters and no
+    /// control character; it is stored and read trimmed. `default` is what a missing or refused value reads as, and
+    /// `None` reads as not configured.
+    ModelId { default: Option<&'static str> },
     /// Model-visible text (#140, `prompt_text`): a JSON string of at most `max_chars` Unicode scalar values with no
     /// control character but line feed and tab, and no #142 denied term (`denied_in_text`). An empty string is accepted
     /// and renders nothing. A carriage return is refused, never converted, so the stored text is the text that renders.
-    /// Not for other strings: a model id, for one, may hold a denied word.
+    /// `default` passes the same check (registry test) and is what a missing or refused value reads as. Not for model
+    /// ids (`ModelId`), which may hold a denied word.
     Text { max_chars: usize, default: &'static str },
+}
+
+/// How the next use reads an integer the store would refuse, found in `config.json` (each reader's rule before the
+/// registry owned it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FileRule {
+    /// It reads as the default.
+    Default,
+    /// A non-negative integer is clamped into the bounds; any other value reads as the default.
+    Clamp,
+}
+
+/// A model id as the store keeps it (`Kind::ModelId`), or `None` when `value` is not one.
+fn model_id(value: &Value) -> Option<&str> {
+    let id = crate::aux_text::js_trim(value.as_str()?);
+    let length = id.chars().count();
+    ((1..=MODEL_ID_MAX_CHARS).contains(&length) && !id.chars().any(char::is_control)).then_some(id)
 }
 
 /// Whether `text` has the shape a text setting accepts: at most `max_chars` Unicode scalar values and no control
@@ -104,6 +134,9 @@ pub(crate) struct Setting {
     pub group: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
+    /// Whether the owner's private chat may read and change it through `settings_get` / `settings_set`, under
+    /// `chat_name`. Never set for a secret or a text setting (registry tests).
+    pub chat: bool,
 }
 
 impl Setting {
@@ -111,6 +144,7 @@ impl Setting {
     pub(crate) fn normalize(&self, value: &Value) -> Option<Value> {
         match self.kind {
             Kind::Integer { min, max, .. } => value.as_i64().filter(|n| (min..=max).contains(n)).map(|n| json!(n)),
+            Kind::ModelId { .. } => model_id(value).map(|id| json!(id)),
             Kind::Text { max_chars, .. } => value
                 .as_str()
                 .filter(|text| text_shape_ok(text, max_chars) && denied_in_text(text).is_empty())
@@ -118,17 +152,57 @@ impl Setting {
         }
     }
 
+    /// A value the store keeps for this setting: a valid value, or `Null` when that is the default (a model id
+    /// without one), which a reset stores so the read is "not configured" whatever `config.json` says. A text default
+    /// is a valid value, the empty text included.
+    fn storable(&self, value: &Value) -> Option<Value> {
+        self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
+    }
+
+    /// The default; `Null` for a model id without one (not configured).
     pub(crate) fn default_value(&self) -> Value {
         match self.kind {
             Kind::Integer { default, .. } => json!(default),
+            Kind::ModelId { default } => default.map_or(Value::Null, |id| json!(id)),
             Kind::Text { default, .. } => json!(default),
         }
+    }
+
+    /// What the next use reads from `document` (the loader's document with stored values applied, or any
+    /// configuration value): the value at the pointer as the setting reads it, else the default.
+    pub(crate) fn read(&self, document: &Value) -> Value {
+        let found = document.pointer(self.pointer);
+        let read = match self.kind {
+            Kind::Integer { min, max, file: FileRule::Clamp, .. } => found
+                .and_then(Value::as_u64)
+                .map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
+            // A value the store would refuse reads as the default; for a text, one with a denied term included.
+            Kind::Integer { file: FileRule::Default, .. } | Kind::ModelId { .. } | Kind::Text { .. } => {
+                found.and_then(|value| self.normalize(value))
+            }
+        };
+        read.unwrap_or_else(|| self.default_value())
+    }
+
+    /// `read` of an integer setting; readers ask it only of integer settings (registry test).
+    pub(crate) fn integer(&self, document: &Value) -> i64 {
+        self.read(document).as_i64().unwrap_or_default()
+    }
+
+    /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
+    /// one.
+    pub(crate) fn text(&self, document: &Value) -> Option<String> {
+        self.read(document).as_str().map(str::to_string)
     }
 
     /// Why `value`, which this setting refused, was refused. A text of the right shape names its denied terms.
     fn refusal(&self, value: &Value) -> String {
         match self.kind {
             Kind::Integer { min, max, .. } => format!("{} must be an integer from {min} to {max}", self.key),
+            Kind::ModelId { .. } => format!(
+                "{} must be a model id of 1 to {MODEL_ID_MAX_CHARS} characters without control characters",
+                self.key
+            ),
             Kind::Text { max_chars, .. } => {
                 let denied = value
                     .as_str()
@@ -150,22 +224,131 @@ impl Setting {
     fn kind_view(&self) -> Value {
         match self.kind {
             Kind::Integer { min, max, .. } => json!({"type": "integer", "min": min, "max": max}),
+            Kind::ModelId { .. } => json!({"type": "model id", "maxChars": MODEL_ID_MAX_CHARS}),
             Kind::Text { max_chars, .. } => json!({"type": "text", "maxChars": max_chars}),
+        }
+    }
+
+    /// What the next use reads from `document`, the loaded configuration: the value at the pointer when this setting
+    /// accepts it, otherwise the default.
+    pub(crate) fn effective_value(&self, document: &Value) -> Value {
+        self.read(document)
+    }
+
+    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
+    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    pub(crate) fn chat_name(&self) -> String {
+        self.pointer.trim_start_matches('/').replace('/', ".")
+    }
+
+    /// Why a chat value was refused, under the chat's name. No text setting is chat-writable (registry test); its arm
+    /// keeps the match whole.
+    pub(crate) fn chat_requirement(&self) -> String {
+        match self.kind {
+            Kind::Integer { min, max, .. } => format!("{} 必须是 {min} 到 {max} 的整数", self.chat_name()),
+            Kind::ModelId { .. } => format!("{} 必须是 1 到 200 个字符、不含控制字符的模型名", self.chat_name()),
+            Kind::Text { max_chars, .. } => format!(
+                "{} 必须是不超过 {max_chars} 个字符的文字，除换行和制表符外不含控制字符，也不含禁用词",
+                self.chat_name()
+            ),
         }
     }
 }
 
-/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
+pub(crate) const WAKE_QUIET: Setting = Setting {
+    key: "reply.wakeQuietMs",
+    pointer: "/socialV2/reply/wakeQuietMs",
+    kind: Kind::Integer { min: 1, max: 30_000, default: 3_000, file: FileRule::Default },
+    applies: "next wake",
+    group: "reply rhythm",
+    label: "Quiet time before a message wake",
+    hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
+    chat: true,
+};
+
+/// Read by `harness::ModelRoute::from_runtime` and, as the digest's fallback, by `digest::model`.
+pub(crate) const HARNESS_MODEL: Setting = Setting {
+    key: "harness.model",
+    pointer: "/harness/model",
+    kind: Kind::ModelId { default: None },
+    applies: "live",
+    group: "model and cost",
+    label: "Conversation model",
+    hint: "The relay model id harness turns use, read when each turn starts. Not set: harness turns fail as not configured.",
+    chat: false,
+};
+
+/// Read by `harness::Limits::from_config`.
+pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
+    key: "harness.maxSteps",
+    pointer: "/harness/maxSteps",
+    kind: Kind::Integer { min: 1, max: 64, default: 8, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Model requests per turn",
+    hint: "The most model requests one harness turn makes (each tool round is one more); read when each turn starts.",
+    chat: false,
+};
+
+/// Read by `harness::Limits::from_config`.
+pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
+    key: "harness.maxTokens",
+    pointer: "/harness/maxTokens",
+    kind: Kind::Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Token budget per turn",
+    hint: "The tokens one harness turn may use across all its model requests; read when each turn starts.",
+    chat: false,
+};
+
+/// Read by `digest::model`.
+pub(crate) const DIGEST_MODEL: Setting = Setting {
+    key: "memory.digest.model",
+    pointer: "/memory/digest/model",
+    kind: Kind::ModelId { default: None },
+    applies: "live",
+    group: "model and cost",
+    label: "Digest model",
+    hint: "The relay model id the memory digest uses; not set uses the conversation model. Read at each digest run.",
+    chat: false,
+};
+
+/// Read by `digest::model`.
+pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
+    key: "memory.digest.timeoutSecs",
+    pointer: "/memory/digest/timeoutSecs",
+    kind: Kind::Integer { min: 1, max: 600, default: 120, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Digest request timeout",
+    hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.",
+    chat: false,
+};
+
+/// Read by `aux_search::load_search_config`.
+pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
+    key: "webSearch.model",
+    pointer: "/webSearch/model",
+    kind: Kind::ModelId { default: Some("deepseek-v4-flash") },
+    applies: "live",
+    group: "model and cost",
+    label: "Web search model",
+    hint: "The model id the primary web search asks, read at each search.",
+    chat: false,
+};
+
+/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`. The prompt
+/// text settings (#140) are read by `prompt_text::text` and are never chat-writable, so the model cannot rewrite its
+/// own prompt.
 pub(crate) const REGISTRY: &[Setting] = &[
-    Setting {
-        key: "reply.wakeQuietMs",
-        pointer: "/socialV2/reply/wakeQuietMs",
-        kind: Kind::Integer { min: 1, max: 30_000, default: 3_000 },
-        applies: "next wake",
-        group: "reply rhythm",
-        label: "Quiet time before a message wake",
-        hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
-    },
+    WAKE_QUIET,
+    HARNESS_MODEL,
+    HARNESS_MAX_STEPS,
+    HARNESS_MAX_TOKENS,
+    DIGEST_MODEL,
+    DIGEST_TIMEOUT_SECS,
+    WEB_SEARCH_MODEL,
     Setting {
         key: crate::prompt_text::NOT_A_CLERK_KEY,
         pointer: "/prompts/behaviour/notAClerk",
@@ -174,6 +357,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Rule: not a clerk",
         hint: "First rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::PROACTIVE_KEY,
@@ -183,6 +367,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Rule: initiative",
         hint: "Second rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::GROUP_CONDUCT_KEY,
@@ -192,6 +377,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Rule: group conduct",
         hint: "Third rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::REPEAT_KEY,
@@ -201,6 +387,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Rule: no repeated bits",
         hint: "Last rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::STICKER_STRATEGY_KEY,
@@ -210,6 +397,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Sticker strategy",
         hint: "Opens the briefing's sticker section while stickers are on. Saved text is checked for denied names.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::STICKER_SOFTEN_KEY,
@@ -219,6 +407,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Softening a reply with a sticker",
         hint: "Follows the sticker strategy when a sticker list is shown. Saved text is checked for denied names.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::MODE_CHAT_KEY,
@@ -228,6 +417,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Mode prompt: chat",
         hint: "Opens the system message of each chat-mode turn on HER's own engine, in groups and other people's private chats. Checked for denied names; empty sends none.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::MODE_OWNER_PRIVATE_KEY,
@@ -237,6 +427,7 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Mode prompt: owner's private chat",
         hint: "Opens the system message of each chat-mode turn on HER's own engine in the owner's private chat. Checked for denied names; empty sends none.",
+        chat: false,
     },
     Setting {
         key: crate::prompt_text::MODE_CLOSED_AGENT_KEY,
@@ -246,11 +437,17 @@ pub(crate) const REGISTRY: &[Setting] = &[
         group: "prompt text",
         label: "Mode prompt: admin agent",
         hint: "Opens the system message of each admin-agent turn on HER's own engine. Checked for denied names; empty sends none.",
+        chat: false,
     },
 ];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
+}
+
+/// The registry setting the owner's chat names `name` (`Setting::chat_name`), when the chat may use it.
+pub(crate) fn chat_setting(name: &str) -> Option<&'static Setting> {
+    REGISTRY.iter().find(|setting| setting.chat && setting.chat_name() == name)
 }
 
 /// The result of one `apply`.
@@ -284,20 +481,26 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
-fn set_at(document: &mut Value, pointer: &str, value: Value) {
+/// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
+/// below the first non-object, when a member on the way is not an object.
+fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
     let names: Vec<&str> = pointer.split('/').skip(1).collect();
-    let Some((last, parents)) = names.split_last() else { return };
+    let Some((last, parents)) = names.split_last() else { return false };
     let mut slot = document;
     for name in parents {
-        let Some(object) = slot.as_object_mut() else { return };
+        let Some(object) = slot.as_object_mut() else { return false };
         let next = object.entry(name.to_string()).or_insert(Value::Null);
         if next.is_null() {
             *next = json!({});
         }
         slot = next;
     }
-    if let Some(object) = slot.as_object_mut() {
-        object.insert(last.to_string(), value);
+    match slot.as_object_mut() {
+        Some(object) => {
+            object.insert(last.to_string(), value);
+            true
+        }
+        None => false,
     }
 }
 
@@ -329,7 +532,8 @@ enum Inspection {
     Ready(Connection),
 }
 
-/// The store gate, a file under `data/`: it serializes the WAL switch of a new store.
+/// The store gate, a file under `data/`: every write holds it from its inspection until its connection closes
+/// (`write_store`).
 const STORE_GATE: &str = "locks/settings-store.lock";
 
 /// The refusal for a rollback journal beside the store. Nothing recovers it: our store has a journal only while its
@@ -530,8 +734,8 @@ fn header_version(path: &std::path::Path) -> Result<i64, String> {
 
 /// The stored values of registry settings, read through the inspection's read-only connection. No store or no schema
 /// yet is an empty list; a store with a journal is unreadable. Rows with a key the registry does not have are skipped,
-/// and so are rows with a value their setting does not accept, except for a text setting: its last good version
-/// (`last_good`) stands in, and the refusal is reported once per key and process on stderr.
+/// and so are rows with a value their setting does not keep (`storable`), except for a text setting: its last good
+/// version (`last_good`) stands in, and the refusal is reported once per key and process on stderr.
 fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
     let conn = match inspect(context)? {
         Inspection::Missing | Inspection::Fresh => return Ok(Vec::new()),
@@ -546,7 +750,7 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
     let mut values = Vec::new();
     for (key, text) in rows {
         let Some(setting) = find(&key) else { continue };
-        match serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.normalize(&value)) {
+        match serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.storable(&value)) {
             Some(value) => values.push((setting, value)),
             None if matches!(setting.kind, Kind::Text { .. }) => {
                 report_refused_text(setting.key);
@@ -561,8 +765,9 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
 }
 
 /// The last good version of a text setting whose stored value is refused (a row changed outside `apply`, or a denied
-/// term a later release added): the newest audited value the setting accepts. A reset (an audit row without a new
-/// value) ends the search, and so does the oldest row; `None` then, and the file's value or the default applies.
+/// term a later release added): the newest audited value the setting accepts, such as the default a reset stored. An
+/// audit row without a new value (an undo that removed the stored value) ends the search, and so does the oldest row;
+/// `None` then, and the file's value or the default applies.
 fn last_good(conn: &Connection, setting: &Setting) -> Option<Value> {
     let mut statement =
         conn.prepare("SELECT new_value FROM settings_audit WHERE key=?1 ORDER BY id DESC").ok()?;
@@ -592,16 +797,16 @@ fn report_refused_text(key: &'static str) {
 const WAL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Puts the store in WAL mode. The switch asks for the write lock while it holds a read lock, and SQLite then answers
-/// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. So a
-/// store not yet in WAL is switched under `locks/settings-store.lock`, one writer at a time, and the switch is retried
-/// while another connection holds a lock, until `WAL_SWITCH_WAIT`. A store already in WAL is left as it is.
-fn enable_wal(context: &RuntimeContext, conn: &Connection) -> Result<(), String> {
+/// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. The
+/// caller holds `locks/settings-store.lock` (`write_store`), so a store not yet in WAL is switched one writer at a
+/// time, and the switch is retried while another connection holds a lock, until `WAL_SWITCH_WAIT`. A store already in
+/// WAL is left as it is.
+fn enable_wal(conn: &Connection) -> Result<(), String> {
     let mode = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, String>(0));
     if mode("PRAGMA journal_mode").is_ok_and(|mode| mode.eq_ignore_ascii_case("wal")) {
         return Ok(());
     }
     let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
-    let _gate = store_gate(context, deadline)?;
     loop {
         let busy = match mode("PRAGMA journal_mode=WAL") {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
@@ -695,7 +900,8 @@ fn has_settings_schema(conn: &Connection) -> bool {
 }
 
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
-/// schema is newer than this release's (checked before anything is written).
+/// schema is newer than this release's (checked before anything is written). The caller holds the store gate
+/// (`write_store`).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // Refuse what this release cannot use before any connection that can write opens the store.
     drop(inspect(context)?);
@@ -710,7 +916,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
     // The same checks again, for a store changed since the inspection.
     check_schema(&conn)?;
-    enable_wal(context, &conn)?;
+    enable_wal(&conn)?;
     conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
     match schema_version(&tx)? {
@@ -735,6 +941,94 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Runs one write under the store gate. The gate is taken (waiting up to `WAL_SWITCH_WAIT`, else 503) before the
+/// inspection and held until the connection closes, so no other writer of this store can stop between this writer's
+/// inspection and its read-write open and leave a journal that open would play back. With `existing_only`, a store
+/// that is missing or fresh is 404 under the gate and none is created. `write` runs in one immediate transaction,
+/// committed when it returns `Ok` and rolled back otherwise.
+fn write_store<T>(
+    context: &RuntimeContext,
+    existing_only: bool,
+    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+) -> Result<T, (u16, String)> {
+    let unavailable = |error: String| -> (u16, String) { (503, error) };
+    let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
+    if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
+        return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));
+    }
+    let mut conn = open_for_write(context).map_err(unavailable)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    let result = write(&tx)?;
+    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    Ok(result)
+}
+
+/// The stored text and revision of a global setting, read in the caller's transaction.
+fn stored_row(conn: &Connection, key: &str) -> Result<Option<(String, i64)>, (u16, String)> {
+    conn.query_row("SELECT value, revision FROM settings WHERE key=?1", [key], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .map_err(|_| (503, STORAGE_ERROR.to_string()))
+}
+
+/// Writes one change of a global setting and its audit row in the caller's transaction: `new` is the text to store,
+/// `None` removes the stored value. Returns the stored revision (0 when removed). A revision continues from the stored
+/// row, or, without one (never set, or removed by an undo), after the setting's audit rows, so it is never reused.
+fn record_change(
+    conn: &Connection,
+    setting: &Setting,
+    old: Option<(String, i64)>,
+    new: Option<&str>,
+    actor: &str,
+    source: &str,
+) -> Result<i64, (u16, String)> {
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let at = now_ms();
+    let revision = match new {
+        Some(text) => {
+            let revision = match &old {
+                Some((_, revision)) => revision + 1,
+                None => {
+                    let changes: i64 = conn
+                        .query_row(
+                            "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1",
+                            [setting.key],
+                            |row| row.get(0),
+                        )
+                        .map_err(failed)?;
+                    changes + 1
+                }
+            };
+            conn.execute(
+                "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+                 updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+                params![setting.key, text, revision, at, actor],
+            )
+            .map_err(failed)?;
+            revision
+        }
+        None => {
+            conn.execute("DELETE FROM settings WHERE key=?1", [setting.key]).map_err(failed)?;
+            0
+        }
+    };
+    #[cfg(test)]
+    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
+        return Err((503, STORAGE_ERROR.to_string()));
+    }
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let request = format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    conn.execute(
+        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+         VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
+        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), new, request],
+    )
+    .map_err(failed)?;
+    Ok(revision)
+}
+
 /// Sets one global setting: validated against the registry, then written with one audit row in one transaction.
 /// The same value again changes nothing and writes no audit row. A refused value leaves the stored value as it was.
 pub(crate) fn apply(
@@ -749,50 +1043,189 @@ pub(crate) fn apply(
     }
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
-    let unavailable = |error: String| -> (u16, String) { (503, error) };
-    let mut conn = open_for_write(context).map_err(unavailable)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    let old: Option<(String, i64)> = tx
-        .query_row("SELECT value, revision FROM settings WHERE key=?1", [setting.key], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .optional()
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    store(context, setting, value, actor, source)
+}
+
+/// Writes one valid stored value (`storable`) with its audit row; the stored value again changes nothing.
+fn store(
+    context: &RuntimeContext,
+    setting: &'static Setting,
+    value: Value,
+    actor: &str,
+    source: &str,
+) -> Result<Applied, (u16, String)> {
     let text = value.to_string();
-    if let Some((old_text, revision)) = &old {
-        if *old_text == text {
-            return Ok(Applied { value, revision: *revision, changed: false });
+    write_store(context, false, |conn| {
+        let old = stored_row(conn, setting.key)?;
+        if let Some((old_text, revision)) = &old {
+            if *old_text == text {
+                return Ok(Applied { value, revision: *revision, changed: false });
+            }
+        }
+        let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
+        Ok(Applied { value, revision, changed: true })
+    })
+}
+
+/// Returns a global setting to its registry default: the default is stored, so it wins over `config.json`, with one
+/// audit row (source `reset`). A model id without a default stores `null`, read as not configured; a text setting
+/// stores its compiled text, an empty one included. A stored default already changes nothing.
+pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+    store(context, setting, setting.default_value(), actor, "reset")
+}
+
+const UNKNOWN_ENTRY_ERROR: &str = "unknown history entry";
+const CHANGED_SINCE_ERROR: &str = "the setting changed after this entry; undo the later change first";
+const NOT_UNDOABLE_ERROR: &str = "this entry cannot be undone";
+const OLD_VALUE_REFUSED_ERROR: &str = "the old value of this entry is no longer accepted";
+
+/// What `undo` restored.
+pub(crate) struct Undone {
+    pub key: &'static str,
+    /// The stored value now; `None` when the undo removed it.
+    pub stored: Option<Value>,
+}
+
+/// Undoes one history entry (`settings_audit.id`): restores its old value (none removes the stored value) with one
+/// audit row (source `undo`), so undoing that row redoes the change. In the same transaction it refuses with 409 and
+/// writes nothing unless the entry names a global setting the registry still has, no later audit row names that
+/// setting, the stored value is still the entry's new value and the registry still accepts the entry's old value. An
+/// entry that does not exist, and any entry while there is no store yet, is 404 (and creates no store).
+pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<Undone, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    write_store(context, true, |conn| {
+        let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+        let row: Option<(String, String, Option<String>, Option<String>)> = conn
+            .query_row("SELECT scope, key, old_value, new_value FROM settings_audit WHERE id=?1", [entry], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .optional()
+            .map_err(failed)?;
+        let (scope, key, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
+        let setting = find(&key).filter(|_| scope == "global").ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+        let later: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1 AND id>?2",
+                params![setting.key, entry],
+                |row| row.get(0),
+            )
+            .map_err(failed)?;
+        let current = stored_row(conn, setting.key)?;
+        if later > 0 || current.as_ref().map(|(text, _)| text.as_str()) != new_text.as_deref() {
+            return Err((409, CHANGED_SINCE_ERROR.to_string()));
+        }
+        let restored = old_text
+            .map(|text| {
+                serde_json::from_str::<Value>(&text)
+                    .ok()
+                    .and_then(|value| setting.storable(&value))
+                    .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
+            })
+            .transpose()?;
+        let restored_text = restored.as_ref().map(Value::to_string);
+        record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
+        Ok(Undone { key: setting.key, stored: restored })
+    })
+}
+
+/// The most entries one history page lists.
+pub(crate) const HISTORY_PAGE: usize = 100;
+
+/// The change history (`settings_audit`), newest first: at most `HISTORY_PAGE` entries with an id below `before` (from
+/// the newest when `None`), only `setting`'s when given (an unknown setting is 400). Each entry has its id (`entry`,
+/// what undo takes), `atMs`, `actor`, `source`, `scope`, `setting` and `old` and `new` (`null`: no stored value; text
+/// that is not JSON is shown as a string). `next` is the `before` of the next page, `null` on the last. Read through
+/// the inspection's read-only connection: no store yet is an empty history, a store this release cannot read is 503.
+pub(crate) fn history(
+    context: &RuntimeContext,
+    setting: Option<&str>,
+    before: Option<i64>,
+) -> Result<Value, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let key = setting
+        .map(|key| find(key).map(|found| found.key).ok_or((400, "unknown setting".to_string())))
+        .transpose()?;
+    let conn = match inspect(context).map_err(|error| (503, error))? {
+        Inspection::Missing | Inspection::Fresh => return Ok(json!({"ok": true, "entries": [], "next": null})),
+        Inspection::Ready(conn) => conn,
+    };
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
+    let shown = |text: Option<String>| {
+        text.map_or(Value::Null, |text| serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)))
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT id, at_ms, actor, source, scope, key, old_value, new_value FROM settings_audit
+             WHERE id < ?1 AND (?2 IS NULL OR key = ?2) ORDER BY id DESC LIMIT ?3",
+        )
+        .map_err(failed)?;
+    let entries = statement
+        .query_map(params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64], |row| {
+            let id: i64 = row.get(0)?;
+            let at: i64 = row.get(1)?;
+            let actor: String = row.get(2)?;
+            let source: String = row.get(3)?;
+            let scope: String = row.get(4)?;
+            let key: String = row.get(5)?;
+            let old: Option<String> = row.get(6)?;
+            let new: Option<String> = row.get(7)?;
+            Ok(json!({
+                "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope, "setting": key,
+                "old": shown(old), "new": shown(new),
+            }))
+        })
+        .map_err(failed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(failed)?;
+    let next = if entries.len() == HISTORY_PAGE { entries.last().map(|entry| entry["entry"].clone()) } else { None };
+    Ok(json!({"ok": true, "entries": entries, "next": next}))
+}
+
+/// For a whole `config.json` an audit undo restores: keeps `current`'s value at every registry pointer in `restored`,
+/// and removes it where `current` has none, because registry settings change and undo through the store only. A
+/// value in `restored` differed from `current`'s. Err with the key when a non-object on the way in `restored` cannot
+/// hold `current`'s value: the undo must refuse, because the restored file would lose that value.
+pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Result<Vec<&'static str>, &'static str> {
+    let mut kept = Vec::new();
+    for setting in REGISTRY {
+        let now = current.pointer(setting.pointer).cloned();
+        if restored.pointer(setting.pointer) == now.as_ref() {
+            continue;
+        }
+        kept.push(setting.key);
+        let placed = match now {
+            Some(value) => set_at(restored, setting.pointer, value),
+            None => {
+                remove_at(restored, setting.pointer);
+                true
+            }
+        };
+        if !placed {
+            return Err(setting.key);
         }
     }
-    let revision = old.as_ref().map_or(0, |(_, revision)| *revision) + 1;
-    let at = now_ms();
-    tx.execute(
-        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
-         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
-        params![setting.key, text, revision, at, actor],
-    )
-    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    #[cfg(test)]
-    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
-        return Err(unavailable(STORAGE_ERROR.to_string()));
+    Ok(kept)
+}
+
+/// Removes the member a pointer of plain member names ends at, if its parent is an object.
+fn remove_at(document: &mut Value, pointer: &str) {
+    let Some((parent, last)) = pointer.rsplit_once('/') else { return };
+    if let Some(object) = document.pointer_mut(parent).and_then(Value::as_object_mut) {
+        object.remove(last);
     }
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let request = format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    tx.execute(
-        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
-         VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
-        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), text, request],
-    )
-    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    Ok(Applied { value, revision, changed: true })
 }
 
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
-/// (`null` when none) and `value`, what the next use reads. `storeError` says why stored values are not applied.
+/// (`null` when none) and `value`, what the next use reads (`Setting::read`; `null` for a model id that is not
+/// configured). `storeError` says why stored values are not applied.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
@@ -806,10 +1239,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         .iter()
         .map(|setting| {
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = document
-                .pointer(setting.pointer)
-                .and_then(|value| setting.normalize(value))
-                .unwrap_or_else(|| setting.default_value());
+            let value = setting.read(&document);
             json!({
                 "key": setting.key,
                 "group": setting.group,
