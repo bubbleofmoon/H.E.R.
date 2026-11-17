@@ -382,3 +382,32 @@ async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
         "an unbound pipeline refuses its ask locally"
     );
 }
+
+/// #197: `pipeline.rs` keeps the turn code every engine shares; the DSH adapter's own code (DSH
+/// sessions and RPCs, model selection, the follow-stream collector, DSH cancellation and usage
+/// rows) lives in `pipeline/dsh_adapter.rs`, reached only through its registration points.
+#[test]
+fn dsh197_pipeline_rs_names_no_dsh_turn_code() {
+    let source = include_str!("pipeline.rs");
+    let production = &source[..source.find("\nmod tests {").expect("pipeline.rs has its test module")];
+    for token in [
+        "FollowStream", "TurnUsage", "\"session/prompt\"", "\"session/create\"", "\"session/selectModel\"",
+        "\"session/cancel\"", "\"session/rename\"", "\"workspace/create\"", "\"workspace/rename\"",
+        "\"agentPresets/list\"", "\"settings/describe\"", "stop_session_work", "archive_session",
+        "probe_prompt", "dsh_profile::", "dsh_health::", ".relogin(", "rpc.call", "fn ensure_session",
+        "fn apply_model", "fn cancel_with_reason",
+        "fn turn_records(", "fn prompt_error_needs_probe(", "fn definite_refusal(", "fn preset_for(",
+        "fn ensure_workspace(", "fn ensure_session(", "fn access_epoch(", "fn discard_created_session(",
+        "fn require_preset(", "fn closed_preset(", "fn prepare_title(", "fn flush_title(",
+        "fn cancel_session(", "fn cancel(", "fn cancel_with_reason(", "fn cancel_reserved_epoch(",
+        "fn note_session(", "fn has_dsh(", "fn abandon_attempt(", "fn abandon_attempt_for_test(",
+        "fn session_policy(", "fn stale_policy(", "fn replace_session(", "fn failover_state(",
+        "fn apply_model(", "fn ask_with_failover(", "fn ask_with_failover_with_deadline(",
+        "fn cli_fallback(", "fn should_audit_key(", "fn hide_if_sensitive(", "fn report_turn_error(",
+        "fn ask_with_failover_inner(", "fn exhausted_chain(", "fn ask(", "fn record_turn_usage(",
+        "fn reply(", "fn handle(", "fn handle_with_failover(", "fn run_dsh_turn(",
+        "enum Submit", "struct AccessEpoch",
+    ] {
+        assert!(!production.contains(token), "pipeline.rs still names DSH turn code: {token}");
+    }
+}
