@@ -199,8 +199,8 @@ pub(crate) fn startup(context: &RuntimeContext) {
     let _ = admit(context);
 }
 
-/// Before DSH starts (and at live start): write HER's rows back in the install root's runtime; a failure is recorded
-/// and prompts stay refused by `admit`.
+/// Before DSH starts (and at live start): write HER's rows back in the install root's runtime; a failure is recorded,
+/// the owner is alerted, and prompts stay refused by `admit` while the rows are missing.
 pub(crate) fn restore_for_start(context: &RuntimeContext) {
     if !applies(context) {
         return;
@@ -208,7 +208,10 @@ pub(crate) fn restore_for_start(context: &RuntimeContext) {
     match restore(context) {
         Ok(true) => record(context, Trigger::Startup, "profile-restore", Outcome::Ok, "the guarded profile rows were written back"),
         Ok(false) => {}
-        Err(error) => record(context, Trigger::Startup, "profile-restore", Outcome::Failed, &error),
+        Err(error) => {
+            record(context, Trigger::Startup, "profile-restore", Outcome::Failed, &error);
+            let _ = alert(context, "profile-restore");
+        }
     }
 }
 
@@ -257,30 +260,40 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
     let dir = context
         .resolve_path(RuntimeArea::DshUser, PROFILE_DIR, PathIntent::ReadDirectory)
         .map_err(str::to_string)?;
+    let own = || -> Result<Vec<String>, String> {
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .map_err(|_| "the profile folder cannot be listed".to_string())?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| is_own_backup(name))
+            .collect();
+        names.sort();
+        Ok(names)
+    };
     let stamp = crate::dsh_mcp_config::utc_stamp();
-    let present: Vec<String> = std::fs::read_dir(&dir) // STUB179-3C
-        .map_err(|_| "the profile folder cannot be listed".to_string())? // STUB179-3C
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok()) // STUB179-3C
-        .collect(); // STUB179-3C
-    let name = backup_name(&stamp, &present) // STUB179-3C
-        .ok_or("no free backup name in this millisecond; nothing was written")?; // STUB179-3C
+    let name = backup_name(&stamp, &own()?)
+        .ok_or("no backup name sorts after the newest backup; nothing was written")?;
     context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes())?;
-    let mut names: Vec<String> = std::fs::read_dir(&dir)
-        .map_err(|_| "the profile folder cannot be listed".to_string())?
-        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| is_own_backup(name))
-        .collect();
-    names.sort();
+    let names = own()?;
     for stale in &names[..names.len().saturating_sub(BACKUPS_KEPT)] {
         let _ = context.remove_file(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{stale}"));
     }
     Ok(())
 }
 
-/// The first free backup name for `stamp`: the prefix, the stamp, `-` and two digits, so two backups in one
-/// millisecond never share a name.
+/// The next backup name: the prefix, a stamp, `-` and a two-digit counter, sorting after every existing own backup,
+/// so names never repeat and pruning (oldest names first) never removes the newest. `stamp` when it sorts after the
+/// newest; otherwise the newest name's stamp with its counter plus one; `None` once that counter would pass 99.
 fn backup_name(stamp: &str, existing: &[String]) -> Option<String> {
-    (0..100).map(|n| format!("{BACKUP_PREFIX}{stamp}-{n:02}")).find(|name| !existing.contains(name)) // STUB179-3C
+    let fresh = format!("{BACKUP_PREFIX}{stamp}-00");
+    match existing.iter().filter(|name| is_own_backup(name)).max() {
+        None => Some(fresh),
+        Some(newest) if fresh.as_str() > newest.as_str() => Some(fresh),
+        Some(newest) => {
+            let (base, counter) = newest.split_at(newest.len() - 2);
+            let next = counter.parse::<u8>().ok()? + 1;
+            (next < 100).then(|| format!("{base}{next:02}"))
+        }
+    }
 }
 
 /// Exactly the names `backup_name` gives a `utc_stamp`; pruning never touches any other file.
@@ -424,16 +437,16 @@ fn scan(text: &str, label: &str, owned: Option<(usize, usize)>, problems: &mut B
     // Every preset (a preset row, or a profile patch that replaces a preset's plugin list) keeps every guarded row;
     // a preset file without any preset row refuses too.
     let presets: Vec<&Item> =
-        found.iter().filter(|item| is_package(&item.name, PRESET_PACKAGE) || item.plugins).collect();
+        found.iter().filter(|item| is_package(&item.name, PRESET_PACKAGE) || item.plugins.is_some()).collect();
     if owned.is_none() && presets.is_empty() {
         problems.insert(format!("missing-rows:{label}"));
     }
     for preset in presets {
-        let rows: Vec<&Item> = found
-            .iter()
-            .skip_while(|item| item.line <= preset.line)
-            .take_while(|item| item.col > preset.col)
-            .collect();
+        // Only the items of the preset's own `plugins` list count, not lists nested under a plugin's config.
+        let (start, end) = preset.plugins.unwrap_or((preset.line, preset.line));
+        let window: Vec<&Item> = found.iter().filter(|item| item.line > start && item.line < end).collect();
+        let level = window.iter().map(|item| item.col).min();
+        let rows: Vec<&Item> = window.into_iter().filter(|item| Some(item.col) == level).collect();
         if REQUIRED_PRESET_ROWS.iter().any(|id| !rows.iter().any(|row| row.id == *id)) {
             problems.insert(format!("missing-rows:{label}"));
         }
@@ -497,8 +510,9 @@ struct Item {
     max_bytes: Option<String>,
     /// The persona text of a `persona` row (`config.prefix`, `config.suffix`).
     text: String,
-    /// The row's `config` carries a `plugins` list (a preset, or a profile patch replacing one).
-    plugins: bool,
+    /// The lines strictly between which the row's `config.plugins` list lies (a preset, or a profile patch replacing
+    /// one); `None` without such a key.
+    plugins: Option<(usize, usize)>,
 }
 
 fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
@@ -563,7 +577,7 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
             }
             return Err("flow collection");
         }
-        let Some((key, mut value)) = split_key(body) else {
+        let Some((key, mut value)) = split_key(body)? else {
             // A scalar list item, or the next line of a multi-line plain scalar.
             if item {
                 out.push(Entry { line: index, col, item, value: body.to_string(), ..Entry::default() });
@@ -607,21 +621,30 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
     Ok(out)
 }
 
-/// `key: value` or `key:` (the key plain or quoted); `None` for a line that is no mapping entry.
-fn split_key(content: &str) -> Option<(String, String)> {
+/// `key: value` or `key:` (the key plain or quoted, `''` in a single-quoted key read as `'`); `Ok(None)` for a line
+/// that is no mapping entry. A double-quoted line holding a backslash is refused: its escapes are not decoded, so its
+/// key could not be read exactly.
+fn split_key(content: &str) -> Result<Option<(String, String)>, &'static str> {
     if let Some(quote) = content.chars().next().filter(|c| *c == '\'' || *c == '"') {
-        let close = content[1..].find(quote)? + 1;
-        let rest = content[close + 1..].strip_prefix(':')?;
-        if !rest.is_empty() && !rest.starts_with(' ') {
-            return None;
+        if quote == '"' && content.contains('\\') {
+            return Err("escape in a double-quoted scalar");
         }
-        return Some((content[1..close].to_string(), rest.trim().to_string()));
+        let Some(close) = quote_end(content, quote) else { return Ok(None) };
+        let Some(rest) = content[close + 1..].strip_prefix(':') else { return Ok(None) };
+        if !rest.is_empty() && !rest.starts_with(' ') {
+            return Ok(None);
+        }
+        let key = &content[1..close];
+        let key = if quote == '\'' { key.replace("''", "'") } else { key.to_string() };
+        return Ok(Some((key, rest.trim().to_string())));
     }
-    let at = content.match_indices(':').map(|(at, _)| at).find(|at| {
+    let Some(at) = content.match_indices(':').map(|(at, _)| at).find(|at| {
         let after = &content[*at + 1..];
         after.is_empty() || after.starts_with(' ')
-    })?;
-    Some((content[..at].trim_end().to_string(), content[at + 1..].trim().to_string()))
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some((content[..at].trim_end().to_string(), content[at + 1..].trim().to_string())))
 }
 
 /// The byte index of the quote that closes the scalar the first character of `value` opens, when it closes on this
@@ -671,10 +694,19 @@ fn items(entries: &[Entry]) -> Vec<Item> {
                     let children: Vec<&Entry> =
                         entries[index + 1..].iter().take_while(|child| child.col > col).collect();
                     if let Some(depth) = children.first().map(|child| child.col) {
-                        for child in children.iter().filter(|child| child.col == depth && !child.item) {
+                        for (offset, child) in
+                            children.iter().enumerate().filter(|(_, child)| child.col == depth && !child.item)
+                        {
                             match child.key.as_str() {
                                 "maxBytes" => item.max_bytes = Some(unquote(&child.value)),
-                                "plugins" => item.plugins = true,
+                                "plugins" => {
+                                    // The list ends at the first later entry no deeper than the `plugins` key.
+                                    let end = entries[index + 2 + offset..]
+                                        .iter()
+                                        .find(|next| next.col <= child.col)
+                                        .map_or(usize::MAX, |next| next.line);
+                                    item.plugins = Some((child.line, end));
+                                }
                                 "prefix" | "suffix" => {
                                     if !child.value.starts_with('|') && !child.value.starts_with('>') {
                                         item.text.push_str(&unquote(&child.value));
