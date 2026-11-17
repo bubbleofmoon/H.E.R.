@@ -51,6 +51,8 @@ thread_local! {
         std::cell::RefCell::new(None);
     /// Unit tests' signal, on this thread, that a caller found the gate taken and is about to wait.
     pub(crate) static GATE_WAIT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
+    /// Unit tests' signal, on this thread, that a picture is about to be normalized: the account may change there.
+    pub(crate) static NORMALIZE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
 }
 
 /// A QQ uin as qlogo takes it: 5 to 11 ASCII digits without a leading zero.
