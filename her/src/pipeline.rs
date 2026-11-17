@@ -1503,7 +1503,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Err(error) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
                 && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
-                && !error.contains("preset") && !error.contains("预设") {
+                && !error.contains("preset") && !error.contains("预设")
+                // #179: a guard refusal (here a session creation it stopped) is the guard's own alert, not a model failure.
+                && !error.contains(crate::dsh_profile::REFUSAL_PREFIX) {
                 let candidate = self.active_candidate.clone().unwrap_or_else(|| failover::model_chain_for(cfg, key)[0].clone());
                 self.report_backend_failure(cfg, key, "dsh", &candidate.provider, &candidate.model, "", error);
             }

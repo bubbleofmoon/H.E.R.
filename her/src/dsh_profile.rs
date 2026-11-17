@@ -6,9 +6,11 @@
 //! alerts the owner once per distinct gap. The guard applies to the install root's runtime (production); development
 //! roots outside it and the fixed-path legacy mode (retired by #78) are not guarded.
 //!
-//! The YAML reader here is a small line reader for the block style DSH profiles and presets use. A form it does not
-//! read (flow collections other than `{}`/`[]`, anchors, aliases, tabs, nested sequences, document markers) is itself
-//! a refusal, and every guarded plugin package named on a non-comment line must be a row it read.
+//! The YAML reader here is a small line reader for the block style DSH profiles and presets use, on an allowlist:
+//! keys are plain identifiers; values are plain, single-quoted, double-quoted without a backslash, block scalars, `{}`
+//! or `[]`. Any other form (quoted or explicit keys, tags, anchors, aliases, flow collections, escapes, tabs, nested
+//! sequences, document markers) is itself a refusal, and every guarded plugin package named on a non-comment line
+//! must be a row it read.
 
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
@@ -266,13 +268,13 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
             .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
             .filter(|name| is_own_backup(name))
             .collect();
-        names.sort();
+        names.sort_by_key(|name| backup_key(name));
         Ok(names)
     };
     let stamp = crate::dsh_mcp_config::utc_stamp();
     let name = backup_name(&stamp, &own()?)
         .ok_or("no backup name sorts after the newest backup; nothing was written")?;
-    context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes())?;
+    write_backup(context, &name, old)?;
     let names = own()?;
     for stale in &names[..names.len().saturating_sub(BACKUPS_KEPT)] {
         let _ = context.remove_file(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{stale}"));
@@ -280,34 +282,51 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Step 4-red stand-in with today's behaviour (Step 4-fix replaces it).
+/// Write a backup under a new name only: an existing file of that name (on a case-insensitive file system, of any
+/// spelling of it) is never replaced; the restore then refuses.
 fn write_backup(context: &RuntimeContext, name: &str, old: &str) -> Result<(), String> {
-    context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes()) // STUB179-4
+    context.create_new_file(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes())
 }
 
 /// The next backup name: the prefix, a stamp, `-` and a two-digit counter, sorting after every existing own backup,
 /// so names never repeat and pruning (oldest names first) never removes the newest. `stamp` when it sorts after the
 /// newest; otherwise the newest name's stamp with its counter plus one; `None` once that counter would pass 99.
 fn backup_name(stamp: &str, existing: &[String]) -> Option<String> {
-    let fresh = format!("{BACKUP_PREFIX}{stamp}-00");
-    match existing.iter().filter(|name| is_own_backup(name)).max() {
-        None => Some(fresh),
-        Some(newest) if fresh.as_str() > newest.as_str() => Some(fresh),
+    let fresh = format!("{stamp}-00");
+    let next = match existing.iter().filter_map(|name| backup_key(name)).max() {
+        None => fresh,
+        Some(newest) if fresh > newest => fresh,
         Some(newest) => {
             let (base, counter) = newest.split_at(newest.len() - 2);
             let next = counter.parse::<u8>().ok()? + 1;
-            (next < 100).then(|| format!("{base}{next:02}"))
+            if next >= 100 {
+                return None;
+            }
+            format!("{base}{next:02}")
         }
-    }
+    };
+    Some(format!("{BACKUP_PREFIX}{next}"))
+}
+
+/// The ordering key of one of HER's backups: the stamp and counter after the prefix. On Windows the name is compared
+/// ignoring case, as its file system does, so another spelling of a name counts too; `None` for any other form.
+fn backup_key(name: &str) -> Option<String> {
+    const SHAPE: &str = "dddd-dd-ddTdd-dd-dd-dddZ-dd";
+    let head = name.get(..BACKUP_PREFIX.len())?;
+    let (same, rest) = if cfg!(windows) {
+        (head.eq_ignore_ascii_case(BACKUP_PREFIX), name[BACKUP_PREFIX.len()..].to_ascii_uppercase())
+    } else {
+        (head == BACKUP_PREFIX, name[BACKUP_PREFIX.len()..].to_string())
+    };
+    let fits = same
+        && rest.len() == SHAPE.len()
+        && rest.chars().zip(SHAPE.chars()).all(|(c, shape)| if shape == 'd' { c.is_ascii_digit() } else { c == shape });
+    fits.then_some(rest)
 }
 
 /// Exactly the names `backup_name` gives a `utc_stamp`; pruning never touches any other file.
 fn is_own_backup(name: &str) -> bool {
-    const SHAPE: &str = "dddd-dd-ddTdd-dd-dd-dddZ-dd";
-    name.strip_prefix(BACKUP_PREFIX).is_some_and(|rest| {
-        rest.len() == SHAPE.len()
-            && rest.chars().zip(SHAPE.chars()).all(|(c, shape)| if shape == 'd' { c.is_ascii_digit() } else { c == shape })
-    })
+    backup_key(name).is_some()
 }
 
 fn read_capped(context: &RuntimeContext, relative: &str) -> Result<Option<String>, String> {
@@ -582,43 +601,20 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
             }
             return Err("flow collection");
         }
-        let Some((key, mut value)) = split_key(body)? else {
-            // A scalar list item, or the next line of a multi-line plain scalar.
-            if item {
-                out.push(Entry { line: index, col, item, value: body.to_string(), ..Entry::default() });
-            } else if let Some(last) = out.last_mut() {
-                last.body.push(body.to_string());
-            }
-            continue;
+        // A key is only a plain identifier followed by `:` and a space or the end of the line. A line without one is
+        // a scalar list item (on an item line) or refused: quoted, tagged, anchored and explicit keys, a space before
+        // the colon and multi-line plain scalars are not read.
+        let (key, raw_value) = match plain_key(body) {
+            Some((key, rest)) => (key, rest),
+            None if item => (String::new(), body),
+            None => return Err("not a plain key"),
         };
-        if value.starts_with('#') {
-            value.clear();
-        } else if !value.starts_with(['\'', '"']) {
-            if let Some(at) = value.find(" #") {
-                value = value[..at].trim_end().to_string();
-            }
-        }
-        if key == "<<" || value.starts_with('&') || value.starts_with('*') {
-            return Err("anchor or alias");
-        }
-        if (value.starts_with('{') && value != "{}") || (value.starts_with('[') && value != "[]") {
-            return Err("flow collection");
-        }
-        // Escapes are not decoded here, so a scalar holding one is not read: refuse it.
-        if value.starts_with('"') && value.contains('\\') {
-            return Err("escape in a double-quoted scalar");
-        }
+        let value = plain_or_quoted(raw_value)?;
         if value.starts_with('|') || value.starts_with('>') {
             block = Some(col);
         } else if let Some(quote) = value.chars().next().filter(|c| *c == '\'' || *c == '"') {
-            match quote_end(&value, quote) {
-                Some(end) => {
-                    let rest = value[end + 1..].trim_start();
-                    if !rest.is_empty() && !rest.starts_with('#') {
-                        return Err("text after a quoted scalar");
-                    }
-                }
-                None => quoted = Some(quote),
+            if quote_end(&value, quote).is_none() {
+                quoted = Some(quote);
             }
         }
         out.push(Entry { line: index, col, item, key, value, body: Vec::new() });
@@ -626,30 +622,59 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
     Ok(out)
 }
 
-/// `key: value` or `key:` (the key plain or quoted, `''` in a single-quoted key read as `'`); `Ok(None)` for a line
-/// that is no mapping entry. A double-quoted line holding a backslash is refused: its escapes are not decoded, so its
-/// key could not be read exactly.
-fn split_key(content: &str) -> Result<Option<(String, String)>, &'static str> {
-    if let Some(quote) = content.chars().next().filter(|c| *c == '\'' || *c == '"') {
-        if quote == '"' && content.contains('\\') {
-            return Err("escape in a double-quoted scalar");
-        }
-        let Some(close) = quote_end(content, quote) else { return Ok(None) };
-        let Some(rest) = content[close + 1..].strip_prefix(':') else { return Ok(None) };
-        if !rest.is_empty() && !rest.starts_with(' ') {
-            return Ok(None);
-        }
-        let key = &content[1..close];
-        let key = if quote == '\'' { key.replace("''", "'") } else { key.to_string() };
-        return Ok(Some((key, rest.trim().to_string())));
+/// A plain key: `[A-Za-z0-9_.-]+` directly followed by `:` and a space or the end of the line, and the rest of the
+/// line. `None` for every other form.
+fn plain_key(content: &str) -> Option<(String, &str)> {
+    let end = content.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))?;
+    let rest = content[end..].strip_prefix(':')?;
+    if end == 0 || !(rest.is_empty() || rest.starts_with(' ')) {
+        return None;
     }
-    let Some(at) = content.match_indices(':').map(|(at, _)| at).find(|at| {
-        let after = &content[*at + 1..];
-        after.is_empty() || after.starts_with(' ')
-    }) else {
-        return Ok(None);
-    };
-    Ok(Some((content[..at].trim_end().to_string(), content[at + 1..].trim().to_string())))
+    Some((content[..end].to_string(), rest))
+}
+
+/// The value forms the reader reads: empty, a block scalar header, `{}` or `[]`, a single-quoted scalar (`''` is the
+/// only escape), a double-quoted scalar without a backslash (a quoted scalar may only be followed by a comment), or a
+/// plain scalar that starts with no indicator and holds no `: ` (its trailing comment is dropped). Every other form
+/// (tags, anchors, aliases, flow collections, escapes) is refused.
+fn plain_or_quoted(raw: &str) -> Result<String, &'static str> {
+    let value = raw.trim();
+    let Some(first) = value.chars().next() else { return Ok(String::new()) };
+    match first {
+        '#' => Ok(String::new()),
+        '|' | '>' => {
+            let header = value.split(" #").next().unwrap_or("").trim_end();
+            if header[1..].chars().all(|c| c == '-' || c == '+' || c.is_ascii_digit()) {
+                Ok(value.to_string())
+            } else {
+                Err("block scalar header")
+            }
+        }
+        '\'' | '"' => {
+            if first == '"' && value.contains('\\') {
+                return Err("escape in a double-quoted scalar");
+            }
+            if let Some(end) = quote_end(value, first) {
+                let rest = value[end + 1..].trim_start();
+                if !rest.is_empty() && !rest.starts_with('#') {
+                    return Err("text after a quoted scalar");
+                }
+            }
+            Ok(value.to_string())
+        }
+        _ if value == "{}" || value == "[]" => Ok(value.to_string()),
+        _ => {
+            let plain = value.find(" #").map_or(value, |at| value[..at].trim_end());
+            if "!&*?|>%@`{}[],:".contains(first)
+                || (first == '-' && (plain == "-" || plain.starts_with("- ")))
+                || plain.contains(": ")
+                || plain.ends_with(':')
+            {
+                return Err("not a plain scalar");
+            }
+            Ok(plain.to_string())
+        }
+    }
 }
 
 /// The byte index of the quote that closes the scalar the first character of `value` opens, when it closes on this
