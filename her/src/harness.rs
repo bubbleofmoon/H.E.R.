@@ -1,4 +1,5 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
+pub(crate) mod profile;
 pub(crate) mod rotation;
 pub(crate) mod store;
 mod tools;
@@ -93,6 +94,9 @@ impl ModelRoute {
 pub struct Limits {
     max_steps: usize,
     max_tokens: u32,
+    /// `harness.imageInput` (default true): the route accepts image parts. When false, every image
+    /// part of a delivered request becomes `NO_IMAGE_INPUT` text (`model_messages`).
+    image_input: bool,
     tool_result_chars: usize,
 }
 
@@ -109,6 +113,10 @@ impl Limits {
                 .and_then(Value::as_u64)
                 .unwrap_or(32_768)
                 .clamp(1, 1_000_000) as u32,
+            image_input: cfg
+                .pointer("/harness/imageInput")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             tool_result_chars: cfg
                 .pointer("/harness/toolResultChars")
                 .and_then(Value::as_f64)
@@ -123,11 +131,56 @@ pub struct TurnRequest {
     pub conversation: String,
     pub generation: String,
     pub prompt: String,
+    /// Inbound media parts of the turn as `media::model_parts` renders them for DSH (`text` labels
+    /// and normalized `image` parts, in order); empty for a text-only turn.
+    pub media: Vec<Value>,
     pub profile: String,
     pub route: ModelRoute,
     pub deadline: Duration,
     pub tools: Tools,
     pub limits: Limits,
+}
+
+/// What a route without image input sees in place of each image part (`harness.imageInput: false`).
+/// Model-visible: it names no model or maker (#142, `model_text_guard_tests`).
+pub(crate) const NO_IMAGE_INPUT: &str = "（这张图片现在看不到）";
+
+impl TurnRequest {
+    /// The turn's canonical user message (`user_message`): stored at admission and sent live.
+    pub(crate) fn user_message(&self) -> ChatMessage {
+        user_message(&self.prompt, &self.media)
+    }
+}
+
+/// The prompt, then each inbound media part in order: a `text` label as text, an `image` part as a
+/// binary image. A text-only turn keeps the single-text user message. Parts of another shape, and
+/// image parts without an image MIME type or data, are dropped.
+pub(crate) fn user_message(prompt: &str, media: &[Value]) -> ChatMessage {
+    if media.is_empty() {
+        return ChatMessage::user(prompt.to_string());
+    }
+    let mut parts = vec![ContentPart::Text(prompt.to_string())];
+    for part in media {
+        match part["type"].as_str() {
+            Some("text") => {
+                if let Some(text) = part["text"].as_str() {
+                    parts.push(ContentPart::Text(text.to_string()));
+                }
+            }
+            Some("image") => {
+                let mime = part["mediaType"]
+                    .as_str()
+                    .filter(|mime| mime.starts_with("image/"));
+                let data = part["data"].as_str().filter(|data| !data.is_empty());
+                if let (Some(mime), Some(data)) = (mime, data) {
+                    let name = part["name"].as_str().map(str::to_string);
+                    parts.push(ContentPart::Binary(Binary::from_base64(mime, data, name)));
+                }
+            }
+            _ => {}
+        }
+    }
+    ChatMessage::user(parts)
 }
 
 #[derive(Clone, Debug)]
@@ -271,12 +324,21 @@ impl Harness {
         let key = request.route.key.clone();
         request.prompt = request.prompt.replace(&key, "[REDACTED]");
         request.profile = request.profile.replace(&key, "[REDACTED]");
+        // Media labels are text too; image data stays the bytes the pipeline normalized.
+        for part in request.media.iter_mut() {
+            let redacted = part["text"]
+                .as_str()
+                .map(|text| text.replace(&key, "[REDACTED]"));
+            if let Some(text) = redacted {
+                part["text"] = Value::String(text);
+            }
+        }
         let mut messages = self.store.admit(&request)?;
         let instruction = request.tools.instruction();
         if !instruction.is_empty() {
             messages.insert(0, ChatMessage::system(instruction));
         }
-        messages.push(ChatMessage::user(request.prompt.clone()));
+        messages.push(request.user_message());
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
         let (cancel, mut cancelled) = watch::channel(false);
@@ -433,11 +495,20 @@ async fn tool_loop(
         // #175: an oversized tool result reaches the model as a preview. The references above are
         // read from the whole filtered copy, so they still cover every ID the preview shows.
         let delivered = preview_tool_results(delivered, request.limits.tool_result_chars);
+        // #160: the menu is narrowed by the current authority and tool switches before every
+        // request, a retry included; revoked authority ends the turn here, as in `check_bound`.
+        let offered = request.tools.model_tools().map_err(|error| match error {
+            tools::CheckError::Revoked(_) => Failure::Cancelled,
+            tools::CheckError::Unavailable(reason) => Failure::Failed(reason),
+        })?;
         // #183: a capture the operator armed takes this request as `model_step` hands it to the
         // model client, which adds only the OpenAI wire framing.
         crate::upstream_capture::offer(context, crate::upstream_capture::Route::Harness, || {
-            let chat = ChatRequest::new(model_messages(delivered.clone()))
-                .with_tools(request.tools.model_tools());
+            let chat = ChatRequest::new(model_messages(
+                delivered.clone(),
+                request.limits.image_input,
+            ))
+            .with_tools(offered.clone());
             serde_json::json!({
                 "model": request.route.model_name(),
                 "maxTokens": request.limits.max_tokens.saturating_sub(spent).min(4096),
@@ -448,8 +519,9 @@ async fn tool_loop(
             client,
             &request.route,
             delivered,
-            request.tools.model_tools(),
+            offered,
             request.limits.max_tokens.saturating_sub(spent),
+            request.limits.image_input,
         );
         let end = tokio::select! { biased;
             _ = cancelled.changed() => return Err(Failure::Cancelled),
@@ -602,6 +674,7 @@ async fn model_step(
     messages: Vec<ChatMessage>,
     tools: Vec<genai::chat::Tool>,
     max_tokens: u32,
+    image_input: bool,
 ) -> Result<StreamEnd, ModelFailure> {
     // The pinned adapter drops delta.refusal. Preserve only its presence at the wire
     // boundary; never retain the provider's refusal text in diagnostics or history.
@@ -636,7 +709,7 @@ async fn model_step(
     let mut response = client
         .exec_chat_stream(
             ModelSpec::Target(route.target.clone()),
-            ChatRequest::new(model_messages(messages)).with_tools(tools),
+            ChatRequest::new(model_messages(messages, image_input)).with_tools(tools),
             Some(&options),
         )
         .await
@@ -948,7 +1021,9 @@ fn tool_message(call: &ToolCall, outcome: &Value) -> ChatMessage {
 
 /// Chat Completions accepts vision on user messages. Complete every tool response in a round
 /// before attaching its images, preserving provider call/result adjacency on live use and replay.
-fn model_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+/// A route without image input (`image_input` false) gets `NO_IMAGE_INPUT` text in place of every
+/// image part, inbound or from a tool, live and on replay; canonical facts keep the image.
+fn model_messages(messages: Vec<ChatMessage>, image_input: bool) -> Vec<ChatMessage> {
     let mut result = Vec::new();
     let mut images = Vec::new();
     for mut message in messages {
@@ -979,6 +1054,18 @@ fn model_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
     if images.iter().any(|p| matches!(p, ContentPart::Binary(_))) {
         result.push(ChatMessage::user(images));
+    }
+    if !image_input {
+        for message in result
+            .iter_mut()
+            .filter(|message| message.role == ChatRole::User)
+        {
+            for part in message.content.iter_mut() {
+                if matches!(part, ContentPart::Binary(binary) if binary.is_image()) {
+                    *part = ContentPart::Text(NO_IMAGE_INPUT.to_string());
+                }
+            }
+        }
     }
     result
 }
@@ -1090,6 +1177,7 @@ mod tests {
                             conversation: format!("group:{n}"),
                             generation: "first".into(),
                             prompt: "simultaneous first input".into(),
+                            media: Vec::new(),
                             profile: "plain".into(),
                             route: ModelRoute::from_runtime(&context, &cfg)?,
                             deadline: Duration::from_secs(3),
@@ -1330,3 +1418,7 @@ mod tests {
 #[cfg(test)]
 #[path = "harness/cancellation_tests.rs"]
 mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "harness/media_tests.rs"]
+mod media_tests;

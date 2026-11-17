@@ -3087,3 +3087,221 @@ fn hf123_harness_qq_tools_share_face_normalization_and_repeat_admission() {
         .find(|m|m["role"] == "tool" && m["tool_call_id"] == "face-3").unwrap();
     assert!(refused["content"].as_str().unwrap().contains("重复"), "{refused}");
 }
+
+/// The tool names a model request offered, in order.
+fn offered_tools(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The chat mode profile's menu: groups and private chats other than the owner's (#160).
+const CHAT_MENU: [&str; 8] = [
+    "qq_status",
+    "memory_write",
+    "memory_search",
+    "memory_index",
+    "memory_forget",
+    "web_search",
+    "web_fetch",
+    "snowluma_status",
+];
+
+/// The owner's private chat in chat mode (#160).
+const OWNER_CHAT_MENU: [&str; 11] = [
+    "qq_status",
+    "memory_write",
+    "memory_search",
+    "memory_index",
+    "memory_forget",
+    "memory_acl",
+    "settings_get",
+    "settings_set",
+    "web_search",
+    "web_fetch",
+    "snowluma_status",
+];
+
+/// The owner's private chat in closed-agent mode (#160).
+const CLOSED_AGENT_MENU: [&str; 16] = [
+    "qq_status",
+    "qq_list_groups",
+    "qq_get_group_members",
+    "qq_get_group_history",
+    "qq_send_private_message",
+    "qq_get_message_images",
+    "memory_write",
+    "memory_search",
+    "memory_index",
+    "memory_forget",
+    "memory_acl",
+    "settings_get",
+    "settings_set",
+    "web_search",
+    "web_fetch",
+    "snowluma_status",
+];
+
+#[test]
+fn menu_chat_group_turns_offer_the_chat_menu_and_refuse_other_her_tools_without_effects() {
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            json!({"id":"off-menu-send","name":"qq_send_group_message","arguments":{"groupId":GROUP_ID,"message":"off-menu send must never reach the group"}}),
+            json!({"id":"off-menu-history","name":"qq_get_group_history","arguments":{"groupId":GROUP_ID}}),
+            json!({"id":"off-menu-v2-send","name":"qq_send_message","arguments":{"key":GROUP_KEY,"token":"","messages":["off-menu v2 send must never reach the group"]}}),
+            json!({"id":"dsh-namespaced","name":"mcp__snowluma__qq_status","arguments":{}}),
+        ]),
+        ModelReply::Text("off-menu calls refused".into()),
+        ModelReply::Text("next turn replays the refusals".into()),
+    ]);
+    let mut rig = harness_rig("harness-160-chat-menu", &model);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "try tools outside the chat menu");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2)[1], "off-menu calls refused");
+    assert!(wait_for(LONG, || rig
+        .ledger()
+        .iter()
+        .any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert_eq!(offered_tools(&lock(&model.requests)[0]), CHAT_MENU);
+    let facts = conversation_facts(&rig);
+    let tools = facts["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 4, "{facts}");
+    for tool in tools {
+        assert_eq!(tool["state"], "refused", "{facts}");
+        assert!(tool["result"].to_string().contains("not found"), "{facts}");
+    }
+    assert_eq!(
+        rig.gateway_calls("get_group_msg_history"),
+        0,
+        "an off-menu read reached the gateway"
+    );
+    assert!(
+        !rig.sends().iter().any(|(_, text)| text.contains("must never reach")),
+        "an off-menu send reached QQ"
+    );
+    // The next turn replays the refused calls as history and still offers only the chat menu.
+    says(&rig, GROUP_KEY, 1001, "tester", "and again");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "next turn replays the refusals");
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 3);
+    assert_eq!(offered_tools(&requests[2]), CHAT_MENU);
+    assert!(
+        requests[2]["messages"].to_string().contains("off-menu-send"),
+        "the refused call was not replayed"
+    );
+}
+
+#[test]
+fn menu_a_model_looping_on_an_off_menu_tool_stops_at_the_step_budget_without_effects() {
+    let replies = (0..10)
+        .map(|step| {
+            ModelReply::ToolCalls(vec![json!({"id":format!("off-menu-loop-{step}"),"name":"qq_send_group_message","arguments":{"groupId":GROUP_ID,"message":"looped off-menu send"}})])
+        })
+        .collect();
+    let model = FakeModel::script(replies);
+    let mut rig = harness_rig("harness-160-off-menu-budget", &model);
+    set_harness_config(&rig, json!({"maxSteps":2}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "loop on an off-menu tool");
+    assert!(wait_for(LONG, || rig
+        .ledger()
+        .iter()
+        .any(|r| r["k"] == "ended")));
+    assert_eq!(
+        lock(&model.requests).len(),
+        2,
+        "the step budget did not bound the loop"
+    );
+    let facts = conversation_facts(&rig);
+    assert_eq!(facts["turns"][0]["state"], "failed");
+    let tools = facts["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2, "{facts}");
+    for tool in tools {
+        assert_eq!(tool["state"], "refused", "{facts}");
+        assert!(tool["result"].to_string().contains("not found"), "{facts}");
+    }
+    assert_eq!(rig.texts_to(GROUP_KEY), vec![ACK.to_string()]);
+}
+
+#[test]
+fn menu_a_mode_transition_changes_the_owner_menu_on_the_next_turn_without_carrying_history() {
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            json!({"id":"closed-agent-groups","name":"qq_list_groups","arguments":{}}),
+        ]),
+        ModelReply::Text("closed-agent answer".into()),
+        ModelReply::Text("chat answer".into()),
+    ]);
+    let mut rig = owner_harness_rig("harness-160-mode-transition", &model);
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "list the groups");
+    assert!(wait_for(LONG, || rig
+        .ledger()
+        .iter()
+        .any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert_eq!(offered_tools(&lock(&model.requests)[0]), CLOSED_AGENT_MENU);
+    assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "completed");
+    assert_eq!(
+        rig.console("POST", "/api/mode", Some(&json!({"mode":"chat"})))
+            .0,
+        200
+    );
+    says(&rig, OWNER_KEY, OWNER, "owner", "now just chat");
+    assert!(
+        wait_for(LONG, || lock(&model.requests).len() == 3),
+        "the chat-mode turn never reached the model"
+    );
+    let next = lock(&model.requests)[2].clone();
+    assert_eq!(offered_tools(&next), OWNER_CHAT_MENU);
+    assert!(
+        !next.to_string().contains("qq_list_groups"),
+        "the chat-mode turn carried the closed-agent menu or history: {next}"
+    );
+}
+
+#[test]
+fn menu_a_switch_turned_off_mid_turn_leaves_the_next_model_request() {
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            json!({"id":"status-then-switch","name":"qq_status","arguments":{}}),
+        ]),
+        ModelReply::Text("menu narrowed".into()),
+    ]);
+    let mut rig = owner_harness_rig("harness-160-mid-turn-switch", &model);
+    // The status tool's OneBot read turns the image switch off once the turn has asked the model.
+    let (config, asked) = (rig.root.join("config/config.json"), model.requests.clone());
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, _| {
+        if action == "get_login_info" && !lock(&asked).is_empty() {
+            let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+            cfg["socialV2"]["tools"]["getImages"] = json!(false);
+            let staged = config.with_extension("json.160");
+            fs::write(&staged, cfg.to_string()).unwrap();
+            fs::rename(&staged, &config).unwrap();
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "check the status");
+    assert!(
+        wait_for(LONG, || lock(&model.requests).len() == 2),
+        "the turn never asked the model again"
+    );
+    let requests = lock(&model.requests);
+    let first = offered_tools(&requests[0]);
+    assert!(
+        first.iter().any(|name| name == "qq_get_message_images"),
+        "{first:?}"
+    );
+    let next = offered_tools(&requests[1]);
+    assert!(
+        !next.iter().any(|name| name == "qq_get_message_images"),
+        "a switch turned off mid-turn stayed on the next request's menu: {next:?}"
+    );
+    assert_eq!(next.len(), first.len() - 1, "{next:?}");
+}

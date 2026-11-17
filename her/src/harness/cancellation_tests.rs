@@ -95,10 +95,11 @@ async fn config_read_error_during_an_admitted_turn_preserves_the_failure_reason(
             conversation: "private:8808".into(),
             generation: generation.clone(),
             prompt: "reply".into(),
+            media: Vec::new(),
             profile: "closed-agent".into(),
             route: ModelRoute::from_runtime(&context, &cfg).unwrap(),
             deadline: Duration::from_secs(10),
-            tools: Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(),
+            tools: Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation).unwrap(),
             limits: Limits::from_config(&cfg),
         })
         .unwrap();
@@ -184,10 +185,11 @@ async fn revoked_authority_settles_a_submitted_send_without_starting_the_next_ca
             conversation: "private:8808".into(),
             generation: generation.clone(),
             prompt: "submit two sends".into(),
+            media: Vec::new(),
             profile: "closed-agent".into(),
             route: ModelRoute::from_runtime(&context, &cfg).unwrap(),
             deadline: Duration::from_secs(10),
-            tools: Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(),
+            tools: Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation).unwrap(),
             limits: Limits::from_config(&cfg),
         })
         .unwrap();
