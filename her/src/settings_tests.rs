@@ -176,13 +176,31 @@ fn settings_store_never_opens_memory_db() {
 
 #[test]
 fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
+    // A newer release's WAL store, closed cleanly: everything is in the file and no sidecar is left.
     let (root, context) = settings_fixture("settings newer schema");
     let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0)).unwrap();
+    assert_eq!(mode, "wal");
     conn.execute_batch("CREATE TABLE later (x INTEGER); PRAGMA user_version=2;").unwrap();
     drop(conn);
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "the fixture left settings.db{suffix}");
+    }
+    let before = std::fs::read(settings_db(&root)).unwrap();
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 503, "{body}");
     assert_eq!(body["error"], crate::settings::NEWER_SCHEMA_ERROR);
+    assert!(context.load_config_document().unwrap().get("socialV2").is_none(), "the loader reads the file");
+    assert_eq!(next_use_quiet(&context), Some(3000));
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["storeError"], crate::settings::NEWER_SCHEMA_ERROR);
+    assert_eq!(body["settings"][0]["value"], 3000);
+    // Checked before any verification connection opens the file.
+    assert_eq!(std::fs::read(settings_db(&root)).unwrap(), before, "a newer store keeps every byte");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "the refusal created settings.db{suffix}");
+    }
     let conn = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
         .unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
@@ -190,13 +208,6 @@ fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
     let tables: i64 =
         conn.query_row("SELECT count(*) FROM sqlite_master WHERE name='settings'", [], |row| row.get(0)).unwrap();
     assert_eq!(tables, 0, "a newer store is never written");
-    drop(conn);
-    assert!(context.load_config_document().unwrap().get("socialV2").is_none(), "the loader reads the file");
-    assert_eq!(next_use_quiet(&context), Some(3000));
-    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["storeError"], crate::settings::NEWER_SCHEMA_ERROR);
-    assert_eq!(body["settings"][0]["value"], 3000);
 }
 
 #[test]
@@ -308,6 +319,9 @@ fn settings_store_finishes_a_store_cut_off_before_its_schema() {
     let (root, context) = settings_fixture("settings empty store");
     std::fs::write(settings_db(&root), b"").unwrap();
     assert_eq!(next_use_quiet(&context), Some(3000));
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("storeError").is_none(), "a store cut off before its schema is not an error: {body}");
     assert_eq!(quiet_view(&context)["stored"], Value::Null);
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 200, "{body}");
@@ -382,9 +396,16 @@ fn settings_store_waits_for_another_writer_while_it_switches_a_new_store_to_wal(
     let holder = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
         .unwrap();
     holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let busy = || crate::settings::WAL_SWITCH_BUSY.load(std::sync::atomic::Ordering::SeqCst);
+    let busy_before = busy();
     let applied = std::thread::scope(|scope| {
         let writer = scope.spawn(|| crate::settings::apply(&context, QUIET_KEY, &json!(4500), "administrator", "console"));
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Release the lock only once the writer is known to have met it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while busy() == busy_before {
+            assert!(std::time::Instant::now() < deadline, "the writer never met the held lock");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         holder.execute_batch("COMMIT;").unwrap();
         writer.join().unwrap()
     });
@@ -412,6 +433,142 @@ fn settings_store_refuses_a_version_one_store_without_its_tables_and_leaves_it_u
     assert_eq!(body["error"], "settings storage is unavailable");
     assert_eq!(std::fs::read(settings_db(&root)).unwrap(), before, "a refused store is never touched");
     assert!(!root.0.join("data/settings.db-wal").exists(), "no sidecar was created");
+}
+
+/// A version-2 database with one row, standing in for `memory.db`.
+fn other_database(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT); INSERT INTO notes(body) VALUES ('kept');
+         PRAGMA user_version=2;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn settings_store_refuses_a_hard_linked_database_and_never_touches_the_other_file() {
+    // The containment checks see paths: a second name for another database must be refused before SQLite opens it.
+    let (root, context) = settings_fixture("settings hard link");
+    let memory = root.0.join("data/memory.db");
+    other_database(&memory);
+    std::fs::hard_link(&memory, settings_db(&root)).unwrap();
+    let before = std::fs::read(&memory).unwrap();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "settings storage is unavailable");
+    assert_eq!(next_use_quiet(&context), Some(3000));
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["storeError"], "settings storage is unavailable");
+    assert_eq!(std::fs::read(&memory).unwrap(), before, "the other database keeps every byte");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!root.0.join(format!("data/memory.db{suffix}")).exists(), "memory.db{suffix} was created");
+        assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "settings.db{suffix} was created");
+    }
+}
+
+#[test]
+fn settings_store_refuses_a_hard_linked_sidecar() {
+    let (root, context) = settings_fixture("settings hard linked sidecar");
+    let memory = root.0.join("data/memory.db");
+    other_database(&memory);
+    std::fs::write(settings_db(&root), b"").unwrap();
+    let journal = root.0.join("data/settings.db-journal");
+    std::fs::hard_link(&memory, &journal).unwrap();
+    let before = std::fs::read(&memory).unwrap();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "settings storage is unavailable");
+    assert!(journal.is_file(), "the linked sidecar is left in place");
+    assert_eq!(std::fs::read(&memory).unwrap(), before, "the other database keeps every byte");
+    assert_eq!(std::fs::read(settings_db(&root)).unwrap(), b"", "the store is left as it was");
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["storeError"], "settings storage is unavailable");
+}
+
+#[test]
+fn settings_store_refuses_a_version_one_store_with_other_columns_and_leaves_it_unchanged() {
+    let (root, context) = settings_fixture("settings other columns");
+    let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
+    conn.execute_batch("CREATE TABLE settings (x); CREATE TABLE settings_audit (x); PRAGMA user_version=1;").unwrap();
+    drop(conn);
+    let before = std::fs::read(settings_db(&root)).unwrap();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], "settings storage is unavailable");
+    assert_eq!(std::fs::read(settings_db(&root)).unwrap(), before, "a refused store is never touched");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "settings.db{suffix} was created");
+    }
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["storeError"], "settings storage is unavailable");
+}
+
+#[test]
+fn settings_store_refusal_leaves_uncheckpointed_frames_alone() {
+    // A newer release's store whose process ended with committed frames still in the WAL.
+    let (root, context) = settings_fixture("settings newer frames");
+    let wal = root.0.join("data/settings.db-wal");
+    let shm = root.0.join("data/settings.db-shm");
+    let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0)).unwrap();
+    assert_eq!(mode, "wal");
+    conn.execute_batch("CREATE TABLE later (x INTEGER); INSERT INTO later VALUES (1); PRAGMA user_version=2;").unwrap();
+    drop(conn);
+    let db_before = std::fs::read(settings_db(&root)).unwrap();
+    let wal_before = std::fs::read(&wal).unwrap();
+    assert!(!wal_before.is_empty() && shm.is_file(), "the fixture leaves frames in the WAL");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], crate::settings::NEWER_SCHEMA_ERROR);
+    assert_eq!(next_use_quiet(&context), Some(3000));
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["storeError"], crate::settings::NEWER_SCHEMA_ERROR);
+    assert_eq!(std::fs::read(settings_db(&root)).ok(), Some(db_before), "the database keeps every byte");
+    assert_eq!(std::fs::read(&wal).ok(), Some(wal_before), "the WAL keeps every frame");
+    assert!(shm.is_file(), "the index is not removed");
+    assert!(!root.0.join("data/settings.db-journal").exists(), "no journal was created");
+}
+
+#[test]
+fn settings_store_refuses_a_newer_store_with_a_journal_and_leaves_both() {
+    let (root, context) = settings_fixture("settings newer journal");
+    let journal = root.0.join("data/settings.db-journal");
+    let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
+    conn.execute_batch("CREATE TABLE later (x INTEGER); PRAGMA user_version=2;").unwrap();
+    drop(conn);
+    std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
+    let db_before = std::fs::read(settings_db(&root)).unwrap();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"], crate::settings::NEWER_SCHEMA_ERROR);
+    assert_eq!(next_use_quiet(&context), Some(3000));
+    assert_eq!(std::fs::read(&journal).ok(), Some(vec![0xff_u8; 512]), "the journal is never rolled back or removed");
+    assert_eq!(std::fs::read(settings_db(&root)).ok(), Some(db_before), "the database keeps every byte");
+}
+
+#[test]
+fn settings_store_recovers_its_own_store_left_with_a_journal() {
+    // Our store cut off in the rollback-journal phase of its creation: readers see no values and no error, and the next
+    // write lets SQLite recover the journal.
+    let (root, context) = settings_fixture("settings own journal");
+    let journal = root.0.join("data/settings.db-journal");
+    let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
+    conn.execute_batch("CREATE TABLE scratch (x INTEGER); DROP TABLE scratch;").unwrap();
+    drop(conn);
+    std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
+    assert_eq!(next_use_quiet(&context), Some(3000));
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.get("storeError").is_none(), "a store at version 0 with a journal is not an error: {body}");
+    assert!(journal.is_file(), "readers leave the journal to a writer");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(next_use_quiet(&context), Some(4500));
 }
 
 #[test]

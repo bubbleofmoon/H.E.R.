@@ -25,6 +25,10 @@ thread_local! {
     pub(crate) static FAIL_BEFORE_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
+#[cfg(test)]
+pub(crate) static WAL_SWITCH_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The value type and bounds of a setting.
 pub(crate) enum Kind {
     /// A JSON integer from `min` to `max`, both included.
