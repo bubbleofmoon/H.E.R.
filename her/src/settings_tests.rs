@@ -913,6 +913,8 @@ fn prompt_text_save_is_checked_and_a_refusal_keeps_the_last_good_version() {
         (json!("别提 DeepSeek 和 机器人"), "prompt.proactive names a denied term: deepseek, 机器人"),
         (json!("ＤＳＨ 里的规则"), "prompt.proactive names a denied term: dsh"),
         (json!("D\u{200b}SH 里的规则"), "prompt.proactive names a denied term: dsh"),
+        (json!("D\u{61c}SH 里的规则"), "prompt.proactive names a denied term: dsh"),
+        (json!("D\u{180e}SH 里的规则"), "prompt.proactive names a denied term: dsh"),
         (json!("x".repeat(2001)), shape),
         (json!("一行\r\n两行"), shape),
         (json!("响铃\u{7}"), shape),

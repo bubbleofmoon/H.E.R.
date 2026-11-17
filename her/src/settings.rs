@@ -48,16 +48,20 @@ fn text_shape_ok(text: &str, max_chars: usize) -> bool {
 }
 
 /// The #142 denied terms (`upstream_capture::denied_terms`) in model-visible text, each once. The check reads the text
-/// with invisible format characters removed, full-width ASCII folded and letters in upper case, so a split, full-width
-/// or lower-case spelling (`D` and `SH` around a zero-width space, `ＤＳＨ`, `ai`) is found too.
+/// with invisible format characters (every Unicode format character, general category Cf) removed, full-width ASCII
+/// folded and letters in upper case, so a split, full-width or lower-case spelling (`D` and `SH` around a zero-width
+/// space, `ＤＳＨ`, `ai`) is found too.
 pub(crate) fn denied_in_text(text: &str) -> Vec<String> {
     let folded: String = text
         .chars()
         .filter(|c| {
             !matches!(
                 *c,
-                '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-                    | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+                '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
+                    | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+                    | '\u{13430}'..='\u{13455}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+                    | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
             )
         })
         .map(|c| match c {
