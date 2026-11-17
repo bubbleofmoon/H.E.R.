@@ -1160,10 +1160,9 @@ impl FollowStream {
         let first = self.snapshot.events.iter().filter_map(|e|e["seq"].as_i64()).min().unwrap_or(0);
         if !self.snapshot.covers_whole_log() && seen > 0 && first > seen.saturating_add(1) {
             crate::session_map::update_context(context,key,sid,epoch,|r| {
-                if r["observedSeq"].as_i64()==Some(seen) && r["gapThrough"].as_i64().unwrap_or(0)<first-1 {
-                    r["gapThrough"]=serde_json::json!(first-1);
-                    r["needsBriefing"]=serde_json::json!(true);
-                    if r["pending"]["full"]!=true {r["pending"]=serde_json::Value::Null;}
+                // The DSH adapter reports only the gap; `briefing_delivery` decides what the next wake carries.
+                if r["observedSeq"].as_i64()==Some(seen) {
+                    crate::briefing_delivery::history_gap(r,first-1);
                 }
             })?;
         }

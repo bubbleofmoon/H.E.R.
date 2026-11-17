@@ -316,10 +316,43 @@ mod tests {
         assert_eq!(std::fs::read(root.join("data/sessions.json")).unwrap(), b"{not json");
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn briefing_delivery_store_starts_a_new_session_record_and_refuses_the_old_session() {
+        let root = root("briefing-start");
+        let token = |epoch: &str| {
+            let state = json!({"conversations": {"group:1": {"agentToken": epoch}}});
+            std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
+        };
+        token("epoch-1");
+        let context = RuntimeContext::from_root(&root).unwrap();
+        bind(&context, "group:1", "sid-1", None).unwrap();
+        assert!(update_context(&context, "group:1", "sid-1", "epoch-1", crate::briefing_delivery::next_generation).unwrap());
+        assert_eq!(context_record(&context, "group:1", "sid-1", "epoch-1").unwrap()["generation"], 1);
+        // Rotation or reset: the mapping moves to a new session and the epoch is replaced.
+        bind(&context, "group:1", "sid-2", None).unwrap();
+        token("epoch-2");
+        assert_eq!(context_record(&context, "group:1", "sid-2", "epoch-2").unwrap(), json!({"generation": 0}));
+        assert!(
+            !update_context(&context, "group:1", "sid-1", "epoch-1", crate::briefing_delivery::next_generation).unwrap(),
+            "a late writer of the old session changes nothing"
+        );
+        assert!(update_context(&context, "group:1", "sid-2", "epoch-2", |r| {
+            crate::briefing_delivery::history_gap(r, 3);
+        })
+        .unwrap());
+        let doc = read(&context).unwrap();
+        let record = &doc["briefings"]["group:1"];
+        assert_eq!((record["sid"].clone(), record["epoch"].clone(), record["generation"].clone()), (json!("sid-2"), json!("epoch-2"), json!(0)));
+        assert_eq!(record["gapThrough"], 3, "the new session's record started fresh, then took the reported gap: {record}");
+        assert!(record["installed"].is_null(), "{record}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
-/// Briefing evidence shares the mapping gate. The social gate pins the epoch while writing;
-/// a late collector cannot acknowledge a replacement session or a rotated token.
+/// The DSH route's briefing-delivery store (`briefing_delivery.rs`). Briefing evidence shares the mapping
+/// gate. The social gate pins the epoch while writing; a late collector cannot acknowledge a replacement
+/// session or a rotated token. A new session's record starts with `briefing_delivery::begin`.
 pub fn update_context(
     context: &RuntimeContext, key: &str, sid: &str, epoch: &str,
     change: impl FnOnce(&mut Value),
@@ -333,9 +366,7 @@ pub fn update_context(
             return false;
         }
         let record = object(doc, "briefings").entry(key.to_string()).or_insert_with(|| json!({}));
-        if record["sid"] != sid || record["epoch"] != epoch || record["format"] != 1 {
-            *record = json!({"sid":sid,"epoch":epoch,"format":1,"generation":0});
-        }
+        crate::briefing_delivery::begin(record, sid, epoch);
         let before = record.clone();
         change(record);
         *record != before
@@ -345,7 +376,7 @@ pub fn update_context(
 pub fn context_record(context: &RuntimeContext, key: &str, sid: &str, epoch: &str) -> Result<Value, String> {
     let doc = read(context)?;
     let record = doc.get("briefings").and_then(|r| r.get(key)).cloned().unwrap_or(Value::Null);
-    Ok(if record["sid"] == sid && record["epoch"] == epoch && record["format"] == 1 {
+    Ok(if crate::briefing_delivery::belongs(&record, sid, epoch) {
         record
     } else { json!({"generation":0}) })
 }
