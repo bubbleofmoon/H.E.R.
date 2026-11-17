@@ -10,8 +10,10 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
+use std::path::{Path, PathBuf};
+
 use crate::media_normalize::Normalized;
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 
 /// The only host the avatar fetch contacts.
 pub const HOST: &str = "q1.qlogo.cn";
@@ -39,6 +41,8 @@ pub const ATTEMPT_FILE: &str = "self-avatar.attempt";
 /// A reservation file larger than this is unusable (no fetch). Only the accounts that fetched in the last
 /// 15 minutes are kept, so the file stays far below this.
 const ATTEMPT_FILE_MAX: u64 = 16 * 1024;
+/// The folder under the runtime data folder where the avatar fetch's curl writes its body and header files.
+const TRANSFER_FOLDER: &str = "self-avatar-transfer";
 /// One check-fetch-store at a time per runtime, across processes: a second caller waits here and then
 /// finds the stored avatar or failure. The OS releases the lock when its holder exits.
 pub const GATE_FILE: &str = "locks/self-avatar.lock";
@@ -95,7 +99,7 @@ pub fn url_allowed(url: &str) -> bool {
 /// and a new attempt reservation is written and reads back. The fetch's outcome is stored (a failed
 /// store is ignored: the reservation keeps the backoff); a fetch during which her uin changed is dropped.
 pub fn current(context: &RuntimeContext, now_ms: &dyn Fn() -> i64, max_pixels: u64) -> Option<Normalized> {
-    current_with_clock(context, now_ms, max_pixels, &mut fetch_live)
+    current_with_clock(context, now_ms, max_pixels, &mut |url: &str| fetch_live(context, url))
 }
 
 /// `current_with_clock` with a fixed time, for the unit tests.
@@ -129,6 +133,11 @@ pub(crate) fn current_with_clock(
             return identity_still(context, &uin).then_some(normalized);
         }
         if record.failure_recent(now_ms) {
+            // A failure dated ahead of the clock (the clock moved back) is restamped now and stays in force.
+            if record.failed_at.is_some_and(|at| at > now_ms) {
+                let restamped = json!({"version": 1, "uin": uin, "failedAt": now_ms});
+                let _ = context.write_atomic(RuntimeArea::Data, CACHE_FILE, restamped.to_string().as_bytes());
+            }
             return None;
         }
     }
@@ -151,7 +160,17 @@ pub(crate) fn current_with_clock(
         (Some(bytes), Some(_)) => json!({"version": 1, "uin": uin, "fetchedAt": now_ms, "data": STANDARD.encode(bytes)}),
         _ => json!({"version": 1, "uin": uin, "failedAt": now_ms}),
     };
+    #[cfg(test)]
+    STORE_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
     let _ = context.write_atomic(RuntimeArea::Data, CACHE_FILE, record.to_string().as_bytes());
+    // The cache replacement may have retried while her account changed: the picture is not served then.
+    if !identity_still(context, &uin) {
+        return None;
+    }
     normalized
 }
 
@@ -185,25 +204,35 @@ fn read_attempts(context: &RuntimeContext) -> Option<Vec<(String, i64)>> {
 }
 
 /// Writes her reservation for `uin` at `now_ms` and reads it back; `false` (no fetch) when the file is
-/// unusable, when `uin` has a reservation younger than `FAILURE_BACKOFF_MS`, or when the write or the
-/// read-back fails. Other accounts' reservations younger than `FAILURE_BACKOFF_MS` are kept; older ones go.
+/// unusable, when `uin` has a reservation in force (younger than `FAILURE_BACKOFF_MS`), or when the write or
+/// the read-back fails. A reservation of `uin` dated ahead of the clock (the clock moved back) is restamped at
+/// now and counts as in force, so it allows no fetch now. Other accounts' reservations in force are kept,
+/// those dated ahead of the clock included; older ones are dropped.
 fn reserve(context: &RuntimeContext, uin: &str, now_ms: i64) -> bool {
     let Some(attempts) = read_attempts(context) else {
         return false;
     };
-    let recent = |at: i64| now_ms.checked_sub(at).is_some_and(|age| (0..FAILURE_BACKOFF_MS).contains(&age));
-    if attempts.iter().any(|(owner, at)| owner == uin && recent(*at)) {
+    // The age of a reservation: negative when it is dated ahead of the clock.
+    let age = |at: i64| now_ms.checked_sub(at);
+    let in_force = |at: i64| age(at).is_some_and(|age| age < FAILURE_BACKOFF_MS);
+    let own_recent = attempts
+        .iter()
+        .any(|(owner, at)| owner == uin && age(*at).is_some_and(|age| (0..FAILURE_BACKOFF_MS).contains(&age)));
+    if own_recent {
         return false;
     }
+    let own_ahead = attempts.iter().any(|(owner, at)| owner == uin && age(*at).is_some_and(|age| age < 0));
     let mut kept: Vec<Value> = attempts
         .iter()
-        .filter(|(owner, at)| owner != uin && recent(*at))
+        .filter(|(owner, at)| owner != uin && in_force(*at))
         .map(|(owner, at)| json!({"uin": owner, "attemptAt": at}))
         .collect();
     kept.push(json!({"uin": uin, "attemptAt": now_ms}));
     let reservation = json!({"version": 1, "attempts": kept}).to_string();
-    context.write_atomic(RuntimeArea::Data, ATTEMPT_FILE, reservation.as_bytes()).is_ok()
-        && context.read_optional_text(RuntimeArea::Data, ATTEMPT_FILE).ok().flatten().as_deref() == Some(reservation.as_str())
+    let written = context.write_atomic(RuntimeArea::Data, ATTEMPT_FILE, reservation.as_bytes()).is_ok()
+        && context.read_optional_text(RuntimeArea::Data, ATTEMPT_FILE).ok().flatten().as_deref() == Some(reservation.as_str());
+    // A reservation dated ahead of the clock was just restamped now: it is in force, so this call does not fetch.
+    written && !own_ahead
 }
 
 /// The exclusive gate file, held until the returned handle drops; `None` when it stays taken for
@@ -227,21 +256,39 @@ fn gate(context: &RuntimeContext) -> Option<std::fs::File> {
     }
 }
 
-/// The production fetch: an allowed address only, through `safe_fetch::fetch_exact`.
-fn fetch_live(url: &str) -> Result<Vec<u8>, String> {
+/// The production fetch: an allowed address only, through `safe_fetch::fetch_exact`, with its files in the
+/// transfer folder.
+fn fetch_live(context: &RuntimeContext, url: &str) -> Result<Vec<u8>, String> {
     if !url_allowed(url) {
         return Err("avatar address refused".to_string());
     }
-    transfer(url)
+    let folder = transfer_folder(context)?;
+    transfer(url, &folder)
+}
+
+/// The folder for the avatar fetch's body and header files: `<data>/self-avatar-transfer`, created when missing
+/// through the runtime's path rules (links refused). Leftovers of earlier transfers (`her-fetch-*`) are removed
+/// before each fetch, so no transfer file is left in the system temporary folder or beside the data.
+fn transfer_folder(context: &RuntimeContext) -> Result<PathBuf, String> {
+    let folder = context
+        .resolve_path(RuntimeArea::Data, TRANSFER_FOLDER, PathIntent::CreateDirectory)
+        .map_err(str::to_string)?;
+    let entries = std::fs::read_dir(&folder).map_err(|_| "transfer folder is unavailable".to_string())?;
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("her-fetch-") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(folder)
 }
 
 #[cfg(not(test))]
-fn transfer(url: &str) -> Result<Vec<u8>, String> {
-    crate::safe_fetch::fetch_exact(url, MAX_BYTES, FETCH_BUDGET).map(|fetched| fetched.bytes)
+fn transfer(url: &str, folder: &Path) -> Result<Vec<u8>, String> {
+    crate::safe_fetch::fetch_exact(url, MAX_BYTES, FETCH_BUDGET, folder).map(|fetched| fetched.bytes)
 }
 
 #[cfg(test)]
-fn transfer(url: &str) -> Result<Vec<u8>, String> {
+fn transfer(url: &str, _folder: &Path) -> Result<Vec<u8>, String> {
     FETCH_TEST_HOOK.with(|hook| match hook.borrow_mut().as_mut() {
         Some(hook) => hook(url),
         None => Err("no test fetch".to_string()),
@@ -276,11 +323,11 @@ impl CacheRecord {
         if (0..TTL_MS).contains(&age) { self.data.as_deref() } else { None }
     }
 
-    /// A failure recorded at most `now_ms` and younger than `FAILURE_BACKOFF_MS`.
+    /// A failure younger than `FAILURE_BACKOFF_MS`; one dated ahead of the clock counts as in force.
     fn failure_recent(&self, now_ms: i64) -> bool {
         self.failed_at
             .and_then(|at| now_ms.checked_sub(at))
-            .is_some_and(|age| (0..FAILURE_BACKOFF_MS).contains(&age))
+            .is_some_and(|age| age < FAILURE_BACKOFF_MS)
     }
 }
 

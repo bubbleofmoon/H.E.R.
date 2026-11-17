@@ -138,9 +138,11 @@ pub fn fetch_bytes(raw_url: &str, max_bytes: usize) -> Result<Fetched, String> {
 /// One GET of a fixed URL (#206 self avatar): the guards of `fetch_bytes` (public pinned addresses, size
 /// cap, image magic), but no redirect is followed (a 3xx is a failure) and all address attempts together
 /// end within `budget`. The host lookup has its own five-second limit (`resolve_public`).
+/// The body and header files are written into `transfer_dir` (the caller's folder, not the system temporary
+/// folder).
 #[cfg_attr(test, allow(dead_code))]
-pub fn fetch_exact(raw_url: &str, max_bytes: usize, budget: std::time::Duration) -> Result<Fetched, String> {
-    fetch_with_hops(raw_url, max_bytes, 0, budget, resolve_public, curl_once)
+pub fn fetch_exact(raw_url: &str, max_bytes: usize, budget: std::time::Duration, transfer_dir: &std::path::Path) -> Result<Fetched, String> {
+    fetch_with_hops(raw_url, max_bytes, 0, budget, resolve_public, |p, pin, max, given| curl_once_in(p, pin, max, given, transfer_dir))
 }
 
 fn fetch_bytes_with<R, F>(raw_url: &str, max_bytes: usize, resolve: R, transfer: F) -> Result<Fetched, String>
@@ -279,14 +281,13 @@ thread_local! {
     pub(crate) static CURL_PATHS_TEST_HOOK: std::cell::RefCell<Vec<std::path::PathBuf>> = std::cell::RefCell::new(Vec::new());
 }
 
-/// Red stub (gate round 3): ignores the transfer folder and uses the system temporary folder.
-#[cfg(test)]
-fn curl_once_in(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration, _transfer_dir: &std::path::Path) -> Result<(u16, Option<String>, Vec<u8>), String> {
-    curl_once(p, pin, max_bytes, budget)
-}
-
 /// 调一次 curl：把连接钉死在 `pin` 上，返回 (状态码, Location 头, 正文)。
 fn curl_once(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    curl_once_in(p, pin, max_bytes, budget, &std::env::temp_dir())
+}
+
+/// `curl_once` with its body and header files written into `dir`.
+fn curl_once_in(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration, dir: &std::path::Path) -> Result<(u16, Option<String>, Vec<u8>), String> {
     // 临时名必须带**唯一后缀**：控制台是每连接一线程，并发抓两张图时如果只用 pid，
     // 两个线程会写同一个文件，结果是一张图的内容混进另一张（A2 审计的 M5）。
     let uniq = std::time::SystemTime::now()
@@ -294,8 +295,8 @@ fn curl_once(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Du
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let sequence = FETCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let out_path = std::env::temp_dir().join(format!("her-fetch-{}-{uniq}-{sequence}.bin", std::process::id()));
-    let hdr_path = std::env::temp_dir().join(format!("her-fetch-{}-{uniq}-{sequence}.hdr", std::process::id()));
+    let out_path = dir.join(format!("her-fetch-{}-{uniq}-{sequence}.bin", std::process::id()));
+    let hdr_path = dir.join(format!("her-fetch-{}-{uniq}-{sequence}.hdr", std::process::id()));
     #[cfg(test)]
     CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow_mut().extend([out_path.clone(), hdr_path.clone()]));
     let status = curl_command(p, pin, max_bytes, budget, &out_path, &hdr_path)?
