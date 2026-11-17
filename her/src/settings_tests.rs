@@ -1034,6 +1034,16 @@ fn chat_settings_and_the_console_write_one_setting_at_once() {
 }
 
 #[test]
+fn chat_settings_legacy_set_replies_without_the_value() {
+    let (_root, context) = chat_fixture("chat settings legacy reply");
+    // A config.json setting the owner writes: the model's reply names the key, never the value the owner sent.
+    let text = chat_text(&context, "settings_set", json!({"settingKey": "sendDelayMs", "value": "OpenAI"}));
+    assert_eq!(text, "已改 sendDelayMs。已立即生效", "{text}");
+    assert!(!text.contains("OpenAI"), "{text}");
+    assert!(crate::upstream_capture::denied_terms(&text).is_empty(), "{text}");
+}
+
+#[test]
 fn chat_settings_come_from_the_registry_and_are_never_secret() {
     let (_root, context) = chat_fixture("chat settings registry");
     let all = chat(&context, "settings-get", json!({})).unwrap();
