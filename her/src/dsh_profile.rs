@@ -128,7 +128,6 @@ fn record(context: &RuntimeContext, trigger: Trigger, event: &str, outcome: Outc
 /// Refuse a DSH prompt while a guarded row is missing. The owner is alerted once per distinct set of problems; the
 /// set is kept in the data area, so a restart with the same gap does not alert again.
 pub(crate) fn admit(context: &RuntimeContext) -> Result<(), String> {
-    return Err(format!("{REFUSAL_PREFIX}stub179")); // STUB179
     if !applies(context) {
         return Ok(());
     }
@@ -172,7 +171,6 @@ fn alert(context: &RuntimeContext, codes: &str) {
 
 /// At live start: write HER's rows back, then check the whole profile once, so a gap is reported now.
 pub(crate) fn startup(context: &RuntimeContext) {
-    return; // STUB179
     restore_for_start(context);
     let _ = admit(context);
 }
@@ -180,7 +178,6 @@ pub(crate) fn startup(context: &RuntimeContext) {
 /// Before DSH starts (and at live start): write HER's rows back in the install root's runtime; a failure is recorded
 /// and prompts stay refused by `admit`.
 pub(crate) fn restore_for_start(context: &RuntimeContext) {
-    return; // STUB179
     if !applies(context) {
         return;
     }
@@ -194,7 +191,6 @@ pub(crate) fn restore_for_start(context: &RuntimeContext) {
 /// Write HER's block into the profile's patch layer. `Ok(false)`: already current, nothing written. A changed file is
 /// first saved as `cordis.patch.yml.bak-her-<UTC>` (newest five of those kept; other backups are never touched).
 pub(crate) fn restore(context: &RuntimeContext) -> Result<bool, String> {
-    return Err("stub179".to_string()); // STUB179
     let _lock = profile_lock(context)?;
     // The DSH home itself may not exist yet on a fresh install (the supervisor creates it before DSH starts too).
     context.resolve_path(RuntimeArea::DshUser, "", PathIntent::CreateDirectory).map_err(str::to_string)?;
@@ -261,7 +257,6 @@ fn read_capped(context: &RuntimeContext, relative: &str) -> Result<Option<String
 
 /// Every problem of the profile and the preset bundle, as sorted codes (`<row>:<file>`); `Ok` when there is none.
 pub(crate) fn check(context: &RuntimeContext) -> Result<(), Vec<String>> {
-    return Err(vec!["stub179".to_string()]); // STUB179
     let mut problems = BTreeSet::new();
     check_profile(context, &mut problems);
     check_presets(context, &mut problems);
@@ -643,7 +638,6 @@ fn items(entries: &[Entry]) -> Vec<Item> {
 /// Exit 0 and `ok` when every guarded row is in place, 1 and one problem code per line otherwise, 2 on usage or
 /// runtime errors.
 pub(crate) fn run_cli(args: &[String]) -> i32 {
-    return 2; // STUB179
     let [command, flag, root] = args else {
         eprintln!("{USAGE}");
         return 2;
