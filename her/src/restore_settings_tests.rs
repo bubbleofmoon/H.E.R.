@@ -472,25 +472,37 @@ fn restore_settings_archive_with_a_damaged_store_is_refused() {
 
 #[test]
 fn restore_settings_backup_while_the_console_writes_settings() {
-    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::sync::Mutex;
     let f = Fixture::new();
     set_quiet(&f, 1000);
     let stop = AtomicBool::new(false);
-    let archive = std::thread::scope(|scope| {
+    // Every value a console write stored, the initial 1000 included; the restored value must be one of them.
+    let stored = Mutex::new(vec![1000_i64]);
+    let completed = AtomicUsize::new(0);
+    let (archive, before, after) = std::thread::scope(|scope| {
         scope.spawn(|| {
             let context = f.context();
             let mut value = 1000;
             while !stop.load(SeqCst) {
                 value = if value >= 30_000 { 1000 } else { value + 1 };
-                let _ = crate::settings::apply(&context, "reply.wakeQuietMs", &json!(value), "administrator", "console");
+                if crate::settings::apply(&context, "reply.wakeQuietMs", &json!(value), "administrator", "console")
+                    .is_ok()
+                {
+                    stored.lock().unwrap().push(value);
+                    completed.fetch_add(1, SeqCst);
+                }
                 std::thread::sleep(Duration::from_millis(2));
             }
         });
+        let before = completed.load(SeqCst);
         let archive = crate::backup::create(&f.context(), &|| Ok(()));
+        let after = completed.load(SeqCst);
         stop.store(true, SeqCst);
-        archive
-    })
-    .unwrap();
+        (archive, before, after)
+    });
+    let archive = archive.unwrap();
+    assert!(after > before, "no console write completed during the backup ({before} before, {after} after)");
     assert!(
         crate::backup::verify_archive(&archive, &|| Ok(())).unwrap().files.contains_key("settings.db"),
         "the archive holds a consistent copy of settings.db"
@@ -505,5 +517,9 @@ fn restore_settings_backup_while_the_console_writes_settings() {
         &mut FakeControl::default(),
     )
     .unwrap();
-    assert!(quiet(&f).is_some_and(|value| (1000..=30_000).contains(&value)), "{:?}", quiet(&f));
+    let restored = quiet(&f);
+    assert!(
+        restored.is_some_and(|value| stored.lock().unwrap().contains(&value)),
+        "{restored:?} was never written by the console"
+    );
 }
