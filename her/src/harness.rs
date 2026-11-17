@@ -145,9 +145,31 @@ impl TurnRequest {
 /// binary image. A text-only turn keeps the single-text user message. Parts of another shape, and
 /// image parts without an image MIME type or data, are dropped.
 pub(crate) fn user_message(prompt: &str, media: &[Value]) -> ChatMessage {
-    // #164 run 1 stub: run 2 builds the media parts.
-    let _ = media;
-    ChatMessage::user(prompt.to_string())
+    if media.is_empty() {
+        return ChatMessage::user(prompt.to_string());
+    }
+    let mut parts = vec![ContentPart::Text(prompt.to_string())];
+    for part in media {
+        match part["type"].as_str() {
+            Some("text") => {
+                if let Some(text) = part["text"].as_str() {
+                    parts.push(ContentPart::Text(text.to_string()));
+                }
+            }
+            Some("image") => {
+                let mime = part["mediaType"]
+                    .as_str()
+                    .filter(|mime| mime.starts_with("image/"));
+                let data = part["data"].as_str().filter(|data| !data.is_empty());
+                if let (Some(mime), Some(data)) = (mime, data) {
+                    let name = part["name"].as_str().map(str::to_string);
+                    parts.push(ContentPart::Binary(Binary::from_base64(mime, data, name)));
+                }
+            }
+            _ => {}
+        }
+    }
+    ChatMessage::user(parts)
 }
 
 #[derive(Clone, Debug)]
@@ -940,8 +962,18 @@ fn model_messages(messages: Vec<ChatMessage>, image_input: bool) -> Vec<ChatMess
     if images.iter().any(|p| matches!(p, ContentPart::Binary(_))) {
         result.push(ChatMessage::user(images));
     }
-    // #164 run 1 stub: run 2 applies the image-input rule.
-    let _ = (image_input, NO_IMAGE_INPUT);
+    if !image_input {
+        for message in result
+            .iter_mut()
+            .filter(|message| message.role == ChatRole::User)
+        {
+            for part in message.content.iter_mut() {
+                if matches!(part, ContentPart::Binary(binary) if binary.is_image()) {
+                    *part = ContentPart::Text(NO_IMAGE_INPUT.to_string());
+                }
+            }
+        }
+    }
     result
 }
 
