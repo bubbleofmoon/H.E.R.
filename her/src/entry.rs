@@ -89,6 +89,8 @@ mod backup;
 mod restore;
 mod console_tasks;
 mod console_persona;
+mod console_settings;
+mod settings;
 mod supervisor;
 mod supervisor_dependencies;
 mod dependency;

@@ -493,6 +493,7 @@ fn is_bounded_json_post(method: &str, path: &str) -> bool {
         || (method == "POST" && path.starts_with("/api/releases/"))
         || (method == "POST" && path.starts_with("/api/dependencies/"))
         || (method == "POST" && path == "/api/restart")
+        || (method == "POST" && path.starts_with("/api/settings/"))
 }
 
 fn bounded_post_body_too_large(req: &Request) -> bool {
@@ -12318,6 +12319,23 @@ fn route_with_context(
             Ok(value) => (if value["queued"] == true {202} else {200}, "application/json; charset=utf-8".to_string(), value.to_string()),
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
+    }
+    if crate::console_settings::is_route(&req.path) {
+        if !context.is_isolated() {
+            return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"settings require a selected runtime"}).to_string());
+        }
+        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
+        // A set commits under the configuration gate after a fresh credential check, like persona writes.
+        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+            let gate = config_gate(context)?;
+            let latest = selected_config_for_handler(context)?;
+            if !authorized_in(context, req, &latest) {
+                return Err((401, "console credential was revoked".into()));
+            }
+            Ok(gate)
+        };
+        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.body, agent_call, &authority);
+        return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && crate::console_persona::is_route(&req.path) {
         let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
@@ -26599,4 +26617,5 @@ mod tests {
     mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
     mod config_overlay_tests { include!("config_overlay_tests.rs"); }
+    mod settings_tests { include!("settings_tests.rs"); }
 }
