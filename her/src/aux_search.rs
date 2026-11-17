@@ -502,6 +502,12 @@ fn bing_search(query: &str, config: &SearchConfig, net: &Network) -> Result<Vec<
 type CacheEntry = (Instant, Value);
 static CACHE: OnceLock<Mutex<(Vec<String>, HashMap<String, CacheEntry>)>> = OnceLock::new();
 
+/// The answer cache key: provider choice, query, result count and model (a JSON array, so no two of them run
+/// together), so a changed `webSearch.model` is asked afresh rather than answered from the cache.
+fn answer_key(wanted: &str, query: &str, config: &SearchConfig) -> String {
+    json!([wanted, query, config.max_results]).to_string()
+}
+
 /// JS `webSearch(query)`: provider choice, DeepSeek -> Bing fallback, empty-result note, five-minute cache.
 pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, net: &Network) -> Result<Value, String> {
     let q = js_trim(query);
@@ -510,7 +516,7 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
     }
     let config = load_search_config(config_value);
     let wanted = config.provider.clone();
-    let cache_key = format!("{wanted}|{q}|{}", config.max_results);
+    let cache_key = answer_key(&wanted, q, &config);
     let cache = CACHE.get_or_init(|| Mutex::new((Vec::new(), HashMap::new())));
     if let Some((at, value)) = cache.lock().ok().and_then(|c| c.1.get(&cache_key).cloned()) {
         if at.elapsed() < CACHE_TTL {
@@ -610,6 +616,23 @@ mod tests {
             });
             assert_eq!(&got, want, "config text: {:?}", case["text"]);
         }
+    }
+
+    #[test]
+    fn a_changed_search_model_is_asked_afresh() {
+        let config = |model: &str| load_search_config(&json!({"webSearch": {"model": model}}));
+        assert_ne!(
+            answer_key("auto", "q", &config("m1")),
+            answer_key("auto", "q", &config("m2")),
+            "a changed web search model is never answered from the cache"
+        );
+        assert_eq!(answer_key("auto", "q", &config("m1")), answer_key("auto", "q", &config("m1")));
+        assert_ne!(answer_key("auto", "q", &config("m1")), answer_key("bing", "q", &config("m1")));
+        assert_ne!(
+            answer_key("auto", "q|8|a", &config("b")),
+            answer_key("auto", "q", &config("a|8|b")),
+            "query and model never run together"
+        );
     }
 
     #[test]

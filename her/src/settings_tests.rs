@@ -728,17 +728,33 @@ fn settings_registry_is_complete_and_agrees_with_its_reader() {
         assert!(matches!(setting.applies, "live" | "next wake" | "restart"), "{}", setting.key);
         assert!(setting.pointer.starts_with('/') && !setting.pointer.contains('~'), "{}", setting.pointer);
         assert!(setting.pointer.split('/').skip(1).all(|name| !name.is_empty()), "{}", setting.pointer);
-        let crate::settings::Kind::Integer { min, max, default } = setting.kind;
-        assert!(min <= default && default <= max, "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
-        assert_eq!(setting.default_value(), json!(default));
+        match setting.kind {
+            crate::settings::Kind::Integer { min, max, default, file } => {
+                assert!(min <= default && default <= max, "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
+                assert_eq!(setting.default_value(), json!(default));
+                assert_eq!(setting.integer(&json!({})), default, "{}: a missing value reads as the default", setting.key);
+                if file == crate::settings::FileRule::Clamp {
+                    assert!(min >= 0, "{}: a clamped setting has non-negative bounds", setting.key);
+                }
+            }
+            crate::settings::Kind::ModelId { default } => {
+                if let Some(id) = default {
+                    assert_eq!(setting.normalize(&json!(id)), Some(json!(id)), "{}: the default is a model id", setting.key);
+                }
+                assert_eq!(setting.default_value(), default.map_or(Value::Null, |id| json!(id)), "{}", setting.key);
+                assert_eq!(setting.text(&json!({})), default.map(str::to_string), "{}", setting.key);
+            }
+        }
     }
     // The registry owns the default and bounds the reader applies to the file (`wake_cfg_of`).
     let quiet = crate::settings::find(QUIET_KEY).expect("reply.wakeQuietMs is registered");
-    let crate::settings::Kind::Integer { min, max, default } = quiet.kind;
+    let crate::settings::Kind::Integer { min, max, default, .. } = quiet.kind else {
+        panic!("reply.wakeQuietMs is an integer setting");
+    };
     for ms in [min - 1, min, default, max, max + 1] {
         let config = json!({"socialV2": {"reply": {"wakeQuietMs": ms}}});
         let expected = quiet.normalize(&json!(ms)).and_then(|value| value.as_i64()).unwrap_or(default);
@@ -783,10 +799,17 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     }
     assert!(page.contains("s.kind.min") && page.contains("s.kind.max"), "the input takes the bounds");
     assert_eq!(view["kind"]["min"], 1);
+    assert!(page.contains("s.kind.type==='integer'"), "the page picks the input by the kind");
+    assert!(page.contains("input.maxLength=s.kind.maxChars"), "a model id input takes its length bound");
+    assert!(page.contains("input.value=s.value==null?'':s.value"), "a model id that is not configured shows empty");
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    let model = body["settings"].as_array().unwrap().iter().find(|entry| entry["key"] == "harness.model").unwrap();
+    assert_eq!(model["kind"], json!({"type": "model id", "maxChars": 200}));
     assert!(page.contains("api('/api/settings')"), "the page lists through the route");
     assert!(
-        page.contains("api('/api/settings/set',{setting:s.key,value:Number(input.value)})"),
-        "the page sets through the route"
+        page.contains("api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value})"),
+        "the page sets through the route: a number for an integer setting, the text for a model id"
     );
     assert!(page.contains("'x-console-token'"), "the page sends the console credential");
     assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
@@ -795,4 +818,420 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&request));
     assert_eq!(status, 200, "{body}");
     assert_eq!(quiet_view(&context)["value"], 4500, "the page's next list shows the new value");
+}
+
+// Model and cost settings (#150): each is read through the registry by its real reader.
+
+const MODEL_KEYS: [&str; 6] = [
+    "harness.model",
+    "harness.maxSteps",
+    "harness.maxTokens",
+    "memory.digest.model",
+    "memory.digest.timeoutSecs",
+    "webSearch.model",
+];
+
+fn set_setting(context: &RuntimeContext, key: &str, value: Value) -> (u16, Value) {
+    admin_request(context, "POST", "/api/settings/set", Some(&json!({"setting": key, "value": value})))
+}
+
+/// The `key` entry of `GET /api/settings`.
+fn setting_view(context: &RuntimeContext, key: &str) -> Value {
+    let (status, body) = admin_request(context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    body["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["key"] == key)
+        .unwrap_or_else(|| panic!("{key} is listed"))
+        .clone()
+}
+
+/// A fixture runtime whose relay route can be built: the fixture has the `model` dependency, this adds the credential.
+fn model_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {
+    let (root, context) = settings_fixture(label);
+    std::fs::write(root.0.join("config/harness-api-key"), "fixture-harness-credential-150").unwrap();
+    (root, context)
+}
+
+/// The model id the next harness turn uses (`ModelRoute::from_runtime` on the loader's configuration), or its error.
+fn next_turn_model(context: &RuntimeContext) -> Result<String, String> {
+    crate::harness::ModelRoute::from_runtime(context, &context.load_config().unwrap())
+        .map(|route| route.model_name().to_string())
+}
+
+/// The step and token budgets the next harness turn captures.
+fn next_turn_budgets(context: &RuntimeContext) -> (usize, u32) {
+    crate::harness::Limits::from_config(&context.load_config().unwrap()).budgets()
+}
+
+/// The model id and the request timeout, in seconds, of the next digest run.
+fn next_digest(context: &RuntimeContext) -> (Option<String>, u64) {
+    let cfg = context.load_config().unwrap();
+    (crate::digest::digest_model_id(&cfg), crate::digest::digest_timeout(&cfg).as_secs())
+}
+
+/// The model the next web search asks (`aux_mcp` reads the loader's document).
+fn next_search_model(context: &RuntimeContext) -> String {
+    crate::aux_search::load_search_config(&context.load_config_document().unwrap()).model
+}
+
+#[test]
+fn model_and_cost_settings_are_live_on_the_next_use() {
+    let (root, context) = model_fixture("settings model live");
+    // Nothing in the file or the store: the registry's defaults.
+    assert_eq!(next_turn_model(&context), Err("harness model is not configured".to_string()));
+    assert_eq!(next_turn_budgets(&context), (8, 32_768));
+    assert_eq!(next_digest(&context), (None, 120));
+    assert_eq!(next_search_model(&context), "deepseek-v4-flash");
+    // The file's values while the store holds none.
+    write_config(&root, |config| {
+        config["harness"] = json!({"model": "file-model", "maxSteps": 3, "maxTokens": 5000});
+        config["memory"] = json!({"digest": {"timeoutSecs": 30}});
+        config["webSearch"] = json!({"model": "file-search"});
+    });
+    let config_path = root.0.join("config/config.json");
+    let stored_file = std::fs::read(&config_path).unwrap();
+    assert_eq!(next_turn_model(&context), Ok("file-model".to_string()));
+    assert_eq!(next_turn_budgets(&context), (3, 5000));
+    assert_eq!(next_digest(&context), (Some("file-model".to_string()), 30), "the digest falls back to the conversation model");
+    assert_eq!(next_search_model(&context), "file-search");
+
+    let changes = [
+        ("harness.model", json!("store-model")),
+        ("harness.maxSteps", json!(12)),
+        ("harness.maxTokens", json!(64_000)),
+        ("memory.digest.model", json!("store-digest")),
+        ("memory.digest.timeoutSecs", json!(45)),
+        ("webSearch.model", json!("store-search")),
+    ];
+    for (key, value) in &changes {
+        let (status, body) = set_setting(&context, key, value.clone());
+        assert_eq!(status, 200, "{key}: {body}");
+        assert_eq!(body, json!({"ok": true, "setting": key, "value": value, "revision": 1, "changed": true}), "{key}");
+    }
+    assert_eq!(next_turn_model(&context), Ok("store-model".to_string()));
+    assert_eq!(next_turn_budgets(&context), (12, 64_000));
+    assert_eq!(next_digest(&context), (Some("store-digest".to_string()), 45));
+    assert_eq!(next_search_model(&context), "store-search");
+    assert_eq!(std::fs::read(&config_path).unwrap(), stored_file, "the store never writes config.json");
+    let rows = audit_rows(&root);
+    assert_eq!(rows.len(), changes.len(), "{rows:?}");
+    for (row, (key, value)) in rows.iter().zip(&changes) {
+        assert_eq!(
+            (row["key"].as_str(), row["source"].as_str(), row["scope"].as_str()),
+            (Some(*key), Some("console"), Some("global"))
+        );
+        assert_eq!(row["new"], json!(value.to_string()), "{key}");
+    }
+    for key in MODEL_KEYS {
+        let view = setting_view(&context, key);
+        assert_eq!((view["group"].as_str(), view["applies"].as_str()), (Some("model and cost"), Some("live")), "{key}");
+        assert_eq!(view["stored"], view["value"], "{key}: the next use reads the stored value");
+    }
+    assert_eq!(setting_view(&context, "harness.model")["kind"], json!({"type": "model id", "maxChars": 200}));
+    assert_eq!(setting_view(&context, "harness.model")["default"], Value::Null);
+    assert_eq!(setting_view(&context, "webSearch.model")["default"], "deepseek-v4-flash");
+    assert_eq!(setting_view(&context, "harness.maxSteps")["kind"], json!({"type": "integer", "min": 1, "max": 64}));
+    assert_eq!(setting_view(&context, "harness.maxTokens")["default"], 32_768);
+    let request = json!({"setting": "harness.maxTokens", "value": 1_000_000});
+    let (status, body) = agent_request(&context, "POST", "/api/settings/set", Some(&request), "fixture-agent-token");
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(next_turn_budgets(&context), (12, 64_000), "an agent never changes its own budget");
+}
+
+#[test]
+fn model_and_cost_settings_refuse_invalid_values_and_keep_the_old_value() {
+    let (root, context) = model_fixture("settings model refused");
+    let accepted = [
+        ("harness.model", json!("x".repeat(200)), json!("x".repeat(200))),
+        ("harness.model", json!("  padded-model  "), json!("padded-model")),
+        ("harness.model", json!("模型".repeat(100)), json!("模型".repeat(100))),
+        ("harness.maxSteps", json!(1), json!(1)),
+        ("harness.maxSteps", json!(64), json!(64)),
+        ("harness.maxTokens", json!(1), json!(1)),
+        ("harness.maxTokens", json!(1_000_000), json!(1_000_000)),
+        ("memory.digest.timeoutSecs", json!(1), json!(1)),
+        ("memory.digest.timeoutSecs", json!(600), json!(600)),
+    ];
+    for (key, value, stored) in &accepted {
+        let (status, body) = set_setting(&context, key, value.clone());
+        assert_eq!(status, 200, "{key} {value}: {body}");
+        assert_eq!(&body["value"], stored, "{key} {value}: stored trimmed");
+    }
+    let model = "harness.model must be a model id of 1 to 200 characters without control characters";
+    let tokens = format!("harness.maxTokens must be an integer from 1 to {}", 1_000_000);
+    let refused = [
+        ("harness.model", json!(""), model),
+        ("harness.model", json!("   "), model),
+        ("harness.model", json!("x".repeat(201)), model),
+        ("harness.model", json!("模".repeat(201)), model),
+        ("harness.model", json!("line\nbreak"), model),
+        ("harness.model", json!("bell\u{7}"), model),
+        ("harness.model", json!(7), model),
+        ("harness.model", Value::Null, model),
+        ("harness.model", json!(true), model),
+        ("harness.model", json!(["m"]), model),
+        ("harness.model", json!({"id": "m"}), model),
+        ("webSearch.model", json!(""), "webSearch.model must be a model id of 1 to 200 characters without control characters"),
+        (
+            "memory.digest.model",
+            json!("tab\tinside"),
+            "memory.digest.model must be a model id of 1 to 200 characters without control characters",
+        ),
+        ("harness.maxSteps", json!(0), "harness.maxSteps must be an integer from 1 to 64"),
+        ("harness.maxSteps", json!(65), "harness.maxSteps must be an integer from 1 to 64"),
+        ("harness.maxSteps", json!(8.5), "harness.maxSteps must be an integer from 1 to 64"),
+        ("harness.maxSteps", json!("8"), "harness.maxSteps must be an integer from 1 to 64"),
+        ("harness.maxTokens", json!(0), tokens.as_str()),
+        ("harness.maxTokens", json!(1_000_001), tokens.as_str()),
+        ("memory.digest.timeoutSecs", json!(0), "memory.digest.timeoutSecs must be an integer from 1 to 600"),
+        ("memory.digest.timeoutSecs", json!(601), "memory.digest.timeoutSecs must be an integer from 1 to 600"),
+    ];
+    for (key, value, error) in &refused {
+        let (status, body) = set_setting(&context, key, value.clone());
+        assert_eq!(status, 400, "{key} {value}: {body}");
+        assert_eq!(body["error"], *error, "{key} {value}");
+    }
+    assert_eq!(next_turn_model(&context), Ok("模型".repeat(100)), "every refusal keeps the old value");
+    assert_eq!(next_turn_budgets(&context), (64, 1_000_000));
+    assert_eq!(next_digest(&context), (Some("模型".repeat(100)), 600));
+    assert_eq!(next_search_model(&context), "deepseek-v4-flash");
+    assert_eq!(audit_rows(&root).len(), accepted.len(), "a refusal writes no audit row");
+}
+
+#[test]
+fn model_and_cost_readers_take_defaults_and_bounds_from_the_registry() {
+    let registered = |key: &str| crate::settings::find(key).unwrap_or_else(|| panic!("{key} is registered"));
+    let steps = registered("harness.maxSteps");
+    let tokens = registered("harness.maxTokens");
+    let timeout = registered("memory.digest.timeoutSecs");
+    let harness_model = registered("harness.model");
+    registered("memory.digest.model");
+    registered("webSearch.model");
+    // A `config.json` integer outside the bounds is clamped and any other value reads as the default: each reader's
+    // rule before the registry owned it.
+    for (value, expected) in [
+        (json!(0), 1),
+        (json!(1), 1),
+        (json!(8), 8),
+        (json!(64), 64),
+        (json!(65), 64),
+        (json!(u64::MAX), 64),
+        (json!(-1), 8),
+        (json!(5.5), 8),
+        (json!("8"), 8),
+        (Value::Null, 8),
+    ] {
+        let cfg = json!({"harness": {"maxSteps": value}});
+        assert_eq!(crate::harness::Limits::from_config(&cfg).budgets().0, expected, "maxSteps {value}");
+        assert_eq!(steps.integer(&cfg), expected as i64, "maxSteps {value}");
+    }
+    for (value, expected) in [
+        (json!(0), 1),
+        (json!(1), 1),
+        (json!(32_768), 32_768),
+        (json!(1_000_000), 1_000_000),
+        (json!(1_000_001), 1_000_000),
+        (json!(-5), 32_768),
+        (json!("x"), 32_768),
+    ] {
+        let cfg = json!({"harness": {"maxTokens": value}});
+        assert_eq!(crate::harness::Limits::from_config(&cfg).budgets().1, expected, "maxTokens {value}");
+        assert_eq!(tokens.integer(&cfg), i64::from(expected), "maxTokens {value}");
+    }
+    for (value, expected) in
+        [(json!(0), 1), (json!(1), 1), (json!(600), 600), (json!(601), 600), (json!(-1), 120), (json!(2.5), 120)]
+    {
+        let cfg = json!({"memory": {"digest": {"timeoutSecs": value}}});
+        assert_eq!(crate::digest::digest_timeout(&cfg).as_secs(), expected, "timeoutSecs {value}");
+        assert_eq!(timeout.integer(&cfg), expected as i64, "timeoutSecs {value}");
+    }
+    assert_eq!(crate::harness::Limits::from_config(&json!({})).budgets(), (8, 32_768));
+    assert_eq!(crate::harness::Limits::from_config(&json!({"harness": "x"})).budgets(), (8, 32_768));
+    assert_eq!(crate::digest::digest_timeout(&json!({})).as_secs(), 120);
+    // A model id is trimmed; empty, not text, too long or with a control character reads as not configured.
+    for (value, expected) in [
+        (json!(" m1 "), Some("m1")),
+        (json!(""), None),
+        (json!("  "), None),
+        (json!(5), None),
+        (json!("a\nb"), None),
+        (json!("x".repeat(201)), None),
+    ] {
+        let cfg = json!({"harness": {"model": value}});
+        assert_eq!(harness_model.text(&cfg).as_deref(), expected, "harness.model {value}");
+        assert_eq!(crate::digest::digest_model_id(&cfg).as_deref(), expected, "digest fallback {value}");
+    }
+    let digest = |model: Value| {
+        crate::digest::digest_model_id(&json!({"memory": {"digest": {"model": model}}, "harness": {"model": "h"}}))
+    };
+    assert_eq!(digest(json!(" d ")).as_deref(), Some("d"));
+    assert_eq!(digest(json!("")).as_deref(), Some("h"), "an empty digest model uses the conversation model");
+    assert_eq!(digest(json!("a\u{1}b")).as_deref(), Some("h"));
+    assert_eq!(crate::digest::digest_model_id(&json!({})), None);
+    let search = |config: Value| crate::aux_search::load_search_config(&config).model;
+    assert_eq!(search(json!({})), "deepseek-v4-flash");
+    assert_eq!(search(json!({"webSearch": {"model": " m "}})), "m");
+    assert_eq!(search(json!({"webSearch": []})), "deepseek-v4-flash");
+    assert_eq!(search(json!({"webSearch": {"model": "a\u{1}b"}})), "deepseek-v4-flash");
+    assert_eq!(search(json!({"webSearch": {"model": "x".repeat(201)}})), "deepseek-v4-flash");
+    // The route a turn builds carries the trimmed id; a blank id is not configured.
+    let (_root, context) = model_fixture("settings model reader");
+    let turn_model = |model: &str| {
+        crate::harness::ModelRoute::from_runtime(&context, &json!({"harness": {"model": model}}))
+            .map(|built| built.model_name().to_string())
+    };
+    assert_eq!(turn_model(" padded "), Ok("padded".to_string()));
+    assert_eq!(turn_model("  "), Err("harness model is not configured".to_string()));
+}
+
+#[test]
+fn model_and_cost_settings_have_no_reader_default() {
+    // Each reader reads its setting through the registry (`settings.rs`), never by its own pointer or default.
+    let readers = [
+        ("harness.rs", include_str!("harness.rs")),
+        ("digest/model.rs", include_str!("digest/model.rs")),
+        ("aux_search.rs", include_str!("aux_search.rs")),
+    ];
+    let owned = [
+        "/harness/model",
+        "/harness/maxSteps",
+        "/harness/maxTokens",
+        "/memory/digest/model",
+        "/memory/digest/timeoutSecs",
+        "/webSearch/model",
+        "deepseek-v4-flash",
+    ];
+    for (file, source) in readers {
+        for needle in owned {
+            assert!(!source.contains(needle), "{file} reads {needle} itself; read it through settings::REGISTRY");
+        }
+    }
+    let registry = include_str!("settings.rs");
+    for needle in owned {
+        assert!(registry.contains(needle), "settings.rs owns {needle}");
+    }
+}
+
+#[test]
+fn stored_model_and_cost_rows_the_registry_refuses_are_not_applied() {
+    // Rows written by another release or by hand are checked again when overlaid, and never clamped.
+    let (root, context) = model_fixture("settings model old rows");
+    for (key, value) in [("harness.model", json!("store-model")), ("harness.maxSteps", json!(12)), ("memory.digest.timeoutSecs", json!(45))] {
+        let (status, body) = set_setting(&context, key, value);
+        assert_eq!(status, 200, "{key}: {body}");
+    }
+    assert_eq!(next_turn_model(&context), Ok("store-model".to_string()));
+    let conn = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap();
+    conn.execute("UPDATE settings SET value=?1 WHERE key='harness.model'", [json!("bad\nid").to_string()]).unwrap();
+    conn.execute_batch(
+        "UPDATE settings SET value='65' WHERE key='harness.maxSteps';
+         UPDATE settings SET value='not json' WHERE key='memory.digest.timeoutSecs';
+         INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('harness.maxTokens', '\"4096\"', 1, 0, 'test');",
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        next_turn_model(&context),
+        Err("harness model is not configured".to_string()),
+        "a stored model id with a control character is not applied"
+    );
+    assert_eq!(next_turn_budgets(&context), (8, 32_768), "an out-of-range or mistyped stored value is not applied, not clamped");
+    assert_eq!(next_digest(&context), (None, 120));
+    for key in ["harness.model", "harness.maxSteps", "harness.maxTokens", "memory.digest.timeoutSecs"] {
+        assert_eq!(setting_view(&context, key)["stored"], Value::Null, "{key}");
+    }
+    assert_eq!(setting_view(&context, "harness.model")["value"], Value::Null, "not configured");
+    let (status, body) = set_setting(&context, "harness.model", json!("fixed-model"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revision"], 2);
+    assert_eq!(next_turn_model(&context), Ok("fixed-model".to_string()));
+    assert_eq!(audit_rows(&root).last().unwrap()["old"], json!("bad\nid").to_string(), "the audit keeps what was stored");
+}
+
+#[test]
+fn model_and_cost_settings_written_at_once_all_commit() {
+    let (root, context) = model_fixture("settings model concurrent");
+    let apply = |key: &str, value: Value| crate::settings::apply(&context, key, &value, "administrator", "console");
+    let applied = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            for _ in 0..20 {
+                let (steps, tokens) = next_turn_budgets(&context);
+                assert!(steps == 8 && matches!(tokens, 32_768 | 4096), "{steps} {tokens}");
+            }
+        });
+        let writers = [
+            scope.spawn(|| apply("harness.model", json!("m-a"))),
+            scope.spawn(|| apply("harness.maxTokens", json!(4096))),
+            scope.spawn(|| apply("webSearch.model", json!("s-a"))),
+        ];
+        reader.join().unwrap();
+        writers.map(|writer| writer.join().unwrap().unwrap())
+    });
+    for (index, applied) in applied.iter().enumerate() {
+        assert!(applied.changed && applied.revision == 1, "writer {index}");
+    }
+    assert_eq!(next_turn_model(&context), Ok("m-a".to_string()));
+    assert_eq!(next_turn_budgets(&context), (8, 4096));
+    assert_eq!(next_search_model(&context), "s-a");
+    let mut keys: Vec<String> = audit_rows(&root).iter().map(|row| row["key"].as_str().unwrap().to_string()).collect();
+    keys.sort();
+    assert_eq!(keys, ["harness.maxTokens", "harness.model", "webSearch.model"]);
+}
+
+#[test]
+fn model_setting_cut_off_before_its_audit_row_leaves_the_old_model() {
+    let (root, context) = model_fixture("settings model rollback");
+    let (status, body) = set_setting(&context, "harness.model", json!("first-model"));
+    assert_eq!(status, 200, "{body}");
+    crate::settings::FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
+    let (status, body) = set_setting(&context, "harness.model", json!("second-model"));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(next_turn_model(&context), Ok("first-model".to_string()), "the next turn uses the last committed model");
+    assert_eq!(audit_rows(&root).len(), 1, "and no audit row");
+    let (status, body) = set_setting(&context, "harness.model", json!("second-model"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revision"], 2);
+}
+
+#[test]
+fn a_store_from_before_the_model_settings_is_read_and_extended() {
+    // A store an earlier release wrote holds older keys only; a full restore brings such a store back byte for byte.
+    let (root, context) = model_fixture("settings model older store");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "settings.db{suffix} was left");
+    }
+    let older = std::fs::read(settings_db(&root)).unwrap();
+    // This release reads it: the older key applies, the new keys read the file or their defaults.
+    assert_eq!(next_use_quiet(&context), Some(4500));
+    assert_eq!(next_turn_budgets(&context), (8, 32_768));
+    assert_eq!(next_turn_model(&context), Err("harness model is not configured".to_string()));
+    // And extends it: the same schema version, the older row untouched.
+    let (status, body) = set_setting(&context, "harness.maxSteps", json!(12));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revision"], 1);
+    assert_eq!(next_turn_budgets(&context), (12, 32_768));
+    assert_eq!(next_use_quiet(&context), Some(4500));
+    let conn = rusqlite::Connection::open_with_flags(settings_db(&root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, 1, "these settings need no new schema");
+    drop(conn);
+    // Restoring the older store over it brings back exactly what it held.
+    for suffix in ["-wal", "-shm", "-journal"] {
+        assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "settings.db{suffix} was left");
+    }
+    std::fs::write(settings_db(&root), &older).unwrap();
+    assert_eq!(next_use_quiet(&context), Some(4500));
+    assert_eq!(next_turn_budgets(&context), (8, 32_768), "the restored store has no model settings");
+    let (status, body) = set_setting(&context, "harness.model", json!("after-restore"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revision"], 1);
+    assert_eq!(next_turn_model(&context), Ok("after-restore".to_string()));
+    assert_eq!(audit_rows(&root).len(), 2, "the restored audit rows and the new one");
 }

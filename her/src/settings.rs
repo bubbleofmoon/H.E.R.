@@ -30,10 +30,35 @@ thread_local! {
 #[cfg(test)]
 pub(crate) static WAL_SWITCH_BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The longest model id the store accepts, in characters.
+pub(crate) const MODEL_ID_MAX_CHARS: usize = 200;
+
 /// The value type and bounds of a setting.
 pub(crate) enum Kind {
-    /// A JSON integer from `min` to `max`, both included.
-    Integer { min: i64, max: i64, default: i64 },
+    /// A JSON integer from `min` to `max`, both included. `file` is how the next use reads a value the store would
+    /// refuse.
+    Integer { min: i64, max: i64, default: i64, file: FileRule },
+    /// A model id: a JSON string that, trimmed as JavaScript trims, has 1 to `MODEL_ID_MAX_CHARS` characters and no
+    /// control character; it is stored and read trimmed. `default` is what a missing or refused value reads as, and
+    /// `None` reads as not configured.
+    ModelId { default: Option<&'static str> },
+}
+
+/// How the next use reads an integer the store would refuse, found in `config.json` (each reader's rule before the
+/// registry owned it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FileRule {
+    /// It reads as the default.
+    Default,
+    /// A non-negative integer is clamped into the bounds; any other value reads as the default.
+    Clamp,
+}
+
+/// A model id as the store keeps it (`Kind::ModelId`), or `None` when `value` is not one.
+fn model_id(value: &Value) -> Option<&str> {
+    let id = crate::aux_text::js_trim(value.as_str()?);
+    let length = id.chars().count();
+    ((1..=MODEL_ID_MAX_CHARS).contains(&length) && !id.chars().any(char::is_control)).then_some(id)
 }
 
 /// One registry entry.
@@ -55,39 +80,72 @@ impl Setting {
     pub(crate) fn normalize(&self, value: &Value) -> Option<Value> {
         match self.kind {
             Kind::Integer { min, max, .. } => value.as_i64().filter(|n| (min..=max).contains(n)).map(|n| json!(n)),
+            Kind::ModelId { .. } => model_id(value).map(|id| json!(id)),
         }
     }
 
+    /// The default; `Null` for a model id without one (not configured).
     pub(crate) fn default_value(&self) -> Value {
         match self.kind {
             Kind::Integer { default, .. } => json!(default),
+            Kind::ModelId { default } => default.map_or(Value::Null, |id| json!(id)),
         }
+    }
+
+    /// What the next use reads from `document` (the loader's document with stored values applied, or any
+    /// configuration value): the value at the pointer as the setting reads it, else the default.
+    pub(crate) fn read(&self, document: &Value) -> Value {
+        let found = document.pointer(self.pointer);
+        let read = match self.kind {
+            Kind::Integer { min, max, file: FileRule::Clamp, .. } => found
+                .and_then(Value::as_u64)
+                .map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
+            _ => found.and_then(|value| self.normalize(value)),
+        };
+        read.unwrap_or_else(|| self.default_value())
+    }
+
+    /// `read` of an integer setting; readers ask it only of integer settings (registry test).
+    pub(crate) fn integer(&self, document: &Value) -> i64 {
+        self.read(document).as_i64().unwrap_or_default()
+    }
+
+    /// `read` of a model id: `None` when it is not configured.
+    pub(crate) fn text(&self, document: &Value) -> Option<String> {
+        self.read(document).as_str().map(str::to_string)
     }
 
     /// Why a refused value was refused.
     fn requirement(&self) -> String {
         match self.kind {
             Kind::Integer { min, max, .. } => format!("{} must be an integer from {min} to {max}", self.key),
+            Kind::ModelId { .. } => format!(
+                "{} must be a model id of 1 to {MODEL_ID_MAX_CHARS} characters without control characters",
+                self.key
+            ),
         }
     }
 
     fn kind_view(&self) -> Value {
         match self.kind {
             Kind::Integer { min, max, .. } => json!({"type": "integer", "min": min, "max": max}),
+            Kind::ModelId { .. } => json!({"type": "model id", "maxChars": MODEL_ID_MAX_CHARS}),
         }
     }
 }
 
-/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
-pub(crate) const REGISTRY: &[Setting] = &[Setting {
+pub(crate) const WAKE_QUIET: Setting = Setting {
     key: "reply.wakeQuietMs",
     pointer: "/socialV2/reply/wakeQuietMs",
-    kind: Kind::Integer { min: 1, max: 30_000, default: 3_000 },
+    kind: Kind::Integer { min: 1, max: 30_000, default: 3_000, file: FileRule::Default },
     applies: "next wake",
     group: "reply rhythm",
     label: "Quiet time before a message wake",
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
-}];
+};
+
+/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
+pub(crate) const REGISTRY: &[Setting] = &[WAKE_QUIET];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
@@ -597,7 +655,8 @@ pub(crate) fn apply(
 }
 
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
-/// (`null` when none) and `value`, what the next use reads. `storeError` says why stored values are not applied.
+/// (`null` when none) and `value`, what the next use reads (`Setting::read`; `null` for a model id that is not
+/// configured). `storeError` says why stored values are not applied.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
@@ -611,10 +670,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         .iter()
         .map(|setting| {
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = document
-                .pointer(setting.pointer)
-                .and_then(|value| setting.normalize(value))
-                .unwrap_or_else(|| setting.default_value());
+            let value = setting.read(&document);
             json!({
                 "key": setting.key,
                 "group": setting.group,

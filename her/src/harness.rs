@@ -124,6 +124,12 @@ impl Limits {
                 .unwrap_or(TOOL_RESULT_CHARS as usize),
         }
     }
+
+    /// The step and token budgets (tests).
+    #[cfg(test)]
+    pub(crate) fn budgets(&self) -> (usize, u32) {
+        (self.max_steps, self.max_tokens)
+    }
 }
 
 pub struct TurnRequest {
