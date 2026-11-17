@@ -6,6 +6,9 @@
 //! cap, image magic, time budget). Unit tests replace it with `FETCH_TEST_HOOK`; with no hook set the
 //! fetch fails, so no test contacts qlogo.
 
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
@@ -77,7 +80,8 @@ pub fn url_allowed(url: &str) -> bool {
 
 /// Her current avatar, normalized for the model, or `None` for the static portrait: a fresh stored
 /// avatar for her uin, else one fetch unless a failure for that uin is younger than
-/// `FAILURE_BACKOFF_MS`. The fetch's outcome is stored; a failed store is ignored.
+/// `FAILURE_BACKOFF_MS`. The fetch's outcome is stored; when the store fails, the outcome is kept in this
+/// process for the same backoff instead.
 pub fn current(context: &RuntimeContext, now_ms: &dyn Fn() -> i64, max_pixels: u64) -> Option<Normalized> {
     current_with_clock(context, now_ms, max_pixels, &mut fetch_live)
 }
@@ -115,14 +119,49 @@ pub(crate) fn current_with_clock(
             return None;
         }
     }
+    if let Some(bytes) = unstored(context.data_dir(), &uin, now_ms) {
+        return bytes.as_deref().and_then(|bytes| decode(bytes, max_pixels));
+    }
     let fetched = fetch(&avatar_url(&uin)).ok();
     let normalized = fetched.as_deref().and_then(|bytes| decode(bytes, max_pixels));
     let record = match (&fetched, &normalized) {
         (Some(bytes), Some(_)) => json!({"version": 1, "uin": uin, "fetchedAt": now_ms, "data": STANDARD.encode(bytes)}),
         _ => json!({"version": 1, "uin": uin, "failedAt": now_ms}),
     };
-    let _ = context.write_atomic(RuntimeArea::Data, CACHE_FILE, record.to_string().as_bytes());
+    if context.write_atomic(RuntimeArea::Data, CACHE_FILE, record.to_string().as_bytes()).is_err() {
+        let kept = if normalized.is_some() { fetched.clone() } else { None };
+        remember_unstored(context.data_dir(), &uin, now_ms, kept);
+    }
     normalized
+}
+
+/// A fetch whose cache store failed, kept in this process: the runtime data folder, her uin, the time of
+/// the fetch and the avatar bytes when they normalized (`None` serves the portrait).
+struct UnstoredFetch {
+    data_dir: PathBuf,
+    uin: String,
+    at: i64,
+    bytes: Option<Vec<u8>>,
+}
+
+/// The fetches whose store failed, one entry per runtime folder and uin. A broken disk must not turn every
+/// call into a fetch, so such an entry serves for `FAILURE_BACKOFF_MS` (see `unstored`).
+static UNSTORED: Mutex<Vec<UnstoredFetch>> = Mutex::new(Vec::new());
+
+/// The kept outcome while it is younger than `FAILURE_BACKOFF_MS`: `Some(bytes)` serves (`None` is the
+/// portrait), `None` means no kept outcome applies.
+fn unstored(data_dir: &Path, uin: &str, now_ms: i64) -> Option<Option<Vec<u8>>> {
+    let list = UNSTORED.lock().ok()?;
+    let entry = list.iter().find(|entry| entry.data_dir == data_dir && entry.uin == uin)?;
+    let age = now_ms.checked_sub(entry.at)?;
+    (0..FAILURE_BACKOFF_MS).contains(&age).then(|| entry.bytes.clone())
+}
+
+fn remember_unstored(data_dir: &Path, uin: &str, at: i64, bytes: Option<Vec<u8>>) {
+    if let Ok(mut list) = UNSTORED.lock() {
+        list.retain(|entry| !(entry.data_dir == data_dir && entry.uin == uin));
+        list.push(UnstoredFetch { data_dir: data_dir.to_path_buf(), uin: uin.to_string(), at, bytes });
+    }
 }
 
 /// The exclusive gate file, held until the returned handle drops; `None` when it stays taken for
