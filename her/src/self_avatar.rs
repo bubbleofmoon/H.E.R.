@@ -104,8 +104,8 @@ pub(crate) fn current_with_clock(
     if !context.is_isolated() {
         return None;
     }
-    let uin = own_uin(context)?;
     let _gate = gate(context)?;
+    let uin = own_uin(context)?;
     let now_ms = now_ms();
     if let Some(record) = read_cache(context).filter(|record| record.uin == uin) {
         if let Some(normalized) = record.fresh(now_ms).and_then(|bytes| decode(bytes, max_pixels)) {
