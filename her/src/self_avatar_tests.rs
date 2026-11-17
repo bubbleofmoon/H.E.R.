@@ -361,3 +361,36 @@ fn self_avatar_console_answer_and_tool_result_name_no_file_or_address() {
     assert!(description.contains("QQ 头像") && !description.contains("小鲸鱼"), "{description}");
     clean(&description);
 }
+
+#[test]
+fn self_avatar_animated_avatar_sends_only_the_lead_line_and_images() {
+    let _guard = HookGuard;
+    let (_root, context) = with_identity("206 avatar animated", json!({"userId": "10001"}));
+    let cfg = context.load_config().unwrap();
+    let params = HashMap::from([("key".to_string(), "private:7001".to_string())]);
+    let animated = crate::media_normalize::fixtures::gif(3, 12, 9);
+    crate::self_avatar::FETCH_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_: &str| -> Fetched { Ok(animated.clone()) }));
+    });
+    let live = super::super::handle_self_image(&context, &params, &HashMap::new(), &cfg).unwrap();
+    assert_eq!(live["source"], "qqAvatar");
+    assert!(live["images"].as_array().unwrap().len() > 1, "several frames");
+    let outcome = crate::qq_tools::self_image_outcome(&live);
+    assert!(!outcome.is_error);
+    assert_eq!(outcome.content[0], json!({"type": "text", "text": "这是你现在的 QQ 头像："}));
+    assert!(outcome.content[1..].iter().all(|block| block["type"] == "image"), "{:?}", outcome.content);
+}
+
+#[test]
+fn self_avatar_clock_is_read_once_the_gate_is_held() {
+    let (_root, context) = with_identity("206 avatar clock", json!({"userId": "10001"}));
+    let mut fetch = |_: &str| -> Fetched { Ok(png(2, 2)) };
+    let gate_held_at_clock = Cell::new(None);
+    let clock = || -> i64 {
+        let taken = context.open_locked_file(RuntimeArea::Data, crate::self_avatar::GATE_FILE).is_err();
+        gate_held_at_clock.set(Some(taken));
+        T0
+    };
+    assert!(crate::self_avatar::current_with_clock(&context, &clock, PIXELS, &mut fetch).is_some());
+    assert_eq!(gate_held_at_clock.get(), Some(true), "the clock is read while the gate is held");
+}

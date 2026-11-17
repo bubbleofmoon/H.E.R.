@@ -177,6 +177,17 @@ impl CacheRecord {
     }
 }
 
+/// #206 review round 1 red stub: reads the clock before the gate (the green run reads it once the gate is held).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn current_with_clock(
+    context: &RuntimeContext,
+    now_ms: &dyn Fn() -> i64,
+    max_pixels: u64,
+    fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Option<Normalized> {
+    current_with(context, now_ms(), max_pixels, fetch)
+}
+
 /// The stored record; missing, oversized, unreadable or not version 1 is `None`.
 fn read_cache(context: &RuntimeContext) -> Option<CacheRecord> {
     let len = context.optional_file_len(RuntimeArea::Data, CACHE_FILE).ok()?;
