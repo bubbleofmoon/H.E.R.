@@ -110,9 +110,9 @@ impl Limits {
                 .clamp(1, 1_000_000) as u32,
             tool_result_chars: cfg
                 .pointer("/harness/toolResultChars")
-                .and_then(Value::as_u64)
-                .unwrap_or(TOOL_RESULT_CHARS)
-                .clamp(1_000, 100_000) as usize,
+                .and_then(Value::as_f64)
+                .map(|chars| chars.clamp(1_000.0, 100_000.0) as usize)
+                .unwrap_or(TOOL_RESULT_CHARS as usize),
         }
     }
 }
@@ -892,7 +892,7 @@ fn preview_tool_text(text: &str, cap: usize) -> String {
                 .join("\n")
         })
         .unwrap_or_else(|| text.to_string());
-    let is_error = data.as_ref().is_some_and(|data| data["isError"] == true);
+    let error_flag = data.as_ref().and_then(|data| data.get("isError")).cloned();
     // Byte offsets of every character boundary, so a prefix never splits a character.
     let ends: Vec<usize> = body
         .char_indices()
@@ -907,8 +907,8 @@ fn preview_tool_text(text: &str, cap: usize) -> String {
             {"type":"text","text":leading},
             {"type":"text","text":note}
         ]});
-        if is_error {
-            copy["isError"] = Value::Bool(true);
+        if let Some(flag) = &error_flag {
+            copy["isError"] = flag.clone();
         }
         copy.to_string()
     };
@@ -1202,9 +1202,7 @@ mod tests {
         .unwrap();
         for is_error in [false, true] {
             let mut outcome = json!({"content":[{"type":"text","text":page}]});
-            if is_error {
-                outcome["isError"] = json!(true);
-            }
+            outcome["isError"] = json!(is_error);
             let (shown, note, data) =
                 tool_preview_parts(&preview_tool_text(&outcome.to_string(), 8_000), 8_000);
             assert!(page.starts_with(&shown), "the preview is the leading text");
@@ -1213,7 +1211,7 @@ mod tests {
                 note.contains(&format!("of {} characters", page.chars().count())),
                 "{note}"
             );
-            assert_eq!(data["isError"] == true, is_error, "{data}");
+            assert_eq!(data["isError"], json!(is_error), "{data}");
         }
     }
 
@@ -1266,6 +1264,8 @@ mod tests {
             (json!({}), 8_000_usize),
             (json!({"toolResultChars":2_500}), 2_500),
             (json!({"toolResultChars":1}), 1_000),
+            (json!({"toolResultChars":-1}), 1_000),
+            (json!({"toolResultChars":2500.0}), 2_500),
             (json!({"toolResultChars":5_000_000}), 100_000),
             (json!({"toolResultChars":"large"}), 8_000),
         ] {
