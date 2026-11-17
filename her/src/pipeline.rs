@@ -427,6 +427,9 @@ pub struct Pipeline {
     after_abandon_rotation: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     completion_observed_hook: Option<Box<dyn FnMut() + Send>>,
+    /// The scripted adapter the next admitted turn runs on, instead of its selected engine.
+    #[cfg(test)]
+    scripted: Option<crate::turn_engine::Script>,
     /// A queued chat job's epoch check, run again right before the turn begins (after media).
     before_turn: Option<Box<dyn FnOnce() -> Option<String> + Send>>,
     dispatch_wake: Option<(i64, serde_json::Value)>,
@@ -689,6 +692,8 @@ impl Pipeline {
             after_abandon_rotation: None,
             #[cfg(test)]
             completion_observed_hook: None,
+            #[cfg(test)]
+            scripted: None,
             before_turn: None,
             dispatch_wake: None,
             dispatch_deadline: None,
@@ -705,6 +710,15 @@ impl Pipeline {
             pending_title: None,
             title_for: None,
         })
+    }
+
+    /// red scaffold (#62 run 1): Run 3 builds this pipeline without a DSH login.
+    pub fn new_without_dsh(
+        context: &RuntimeContext,
+        cfg: &serde_json::Value,
+        live: bool,
+    ) -> Result<Self, String> {
+        Self::new_with_runtime(context, cfg, live)
     }
 
     fn preset_for(&self, key: &str) -> String {
@@ -1103,6 +1117,8 @@ impl Pipeline {
     pub fn expect_dispatch_wake(&mut self, at: i64, previous: serde_json::Value) { self.dispatch_wake = Some((at, previous)); }
     pub fn expect_dispatch_deadline(&mut self, at: i64) { self.dispatch_deadline = Some(at); }
     pub fn dispatch_definitely_unsubmitted(&self) -> bool { self.dispatch_unsubmitted }
+    /// It holds a DSH login (`new_with_runtime`); `new_without_dsh` pipelines do not.
+    pub fn has_dsh(&self) -> bool { self.rpc.credential().is_bound() }
 
     fn set_turn_token(&mut self, token: String) {
         self.turn_epoch = crate::send_outbox::token_epoch(&token);
@@ -3120,6 +3136,7 @@ impl AccessEpoch {
 mod tests {
     include!("pipeline_cli_relay_tests.rs");
     include!("pipeline_completion_tests.rs");
+    include!("pipeline_engine_tests.rs");
     use super::*;
     use serde_json::{json, Value};
 

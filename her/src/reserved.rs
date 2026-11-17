@@ -490,6 +490,26 @@ impl Authority {
         Ok(())
     }
 }
+/// The current authority of `key` as the hub would capture it (tests outside this module).
+#[cfg(test)]
+pub(crate) fn authority_for_test(context: &RuntimeContext, key: &str) -> Result<Authority, String> {
+    let cfg = context.load_config().map_err(|e| e.to_string())?;
+    let token = console::ensure_or_rotate_agent_token(context, key, false)?;
+    let (owner, generation) = mutate(context, |s| {
+        if s.owner.is_empty() {
+            s.owner = crate::turn_ledger::mint_id("process-");
+        }
+        let generation = s.conversations.entry(key.to_string()).or_default().generation.clone();
+        Ok((s.owner.clone(), generation))
+    })?;
+    Ok(Authority {
+        owner,
+        generation,
+        mode: mode_stamp(context)?,
+        social: config(&cfg)["enabled"] != false,
+        token,
+    })
+}
 #[derive(Clone)]
 struct Job {
     key: String,

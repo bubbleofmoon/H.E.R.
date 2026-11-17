@@ -18,6 +18,7 @@ mod conversation_authority;
 mod memory_actions;
 mod pipeline;
 mod harness;
+mod turn_engine;
 mod prompt;
 mod briefing;
 mod initial_prompts;

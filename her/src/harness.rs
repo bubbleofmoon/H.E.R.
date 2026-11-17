@@ -24,6 +24,9 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
+/// The failure of a turn whose wall deadline (`socialV2.turnTimeoutSecs`) ran out.
+pub(crate) const DEADLINE_EXCEEDED: &str = "harness model deadline exceeded";
+
 /// Independent of a model route or the existing CLI backend pins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
