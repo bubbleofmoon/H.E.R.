@@ -213,7 +213,7 @@ impl Store {
             &request.id,
             None,
             "turn_admitted",
-            json!({"generation":request.generation,"profile":request.profile,"tools":request.tools.definitions(),"limits":{"maxSteps":request.limits.max_steps,"maxTokens":request.limits.max_tokens}}),
+            json!({"generation":request.generation,"profile":request.profile,"tools":request.tools.definitions(),"limits":{"maxSteps":request.limits.max_steps,"maxTokens":request.limits.max_tokens,"imageInput":request.limits.image_input}}),
         )?;
         append(
             &self.context,
@@ -222,7 +222,7 @@ impl Store {
             &request.id,
             None,
             "user",
-            json!({"text":request.prompt,"message":ChatMessage::user(request.prompt.clone())}),
+            json!({"text":request.prompt,"message":request.user_message()}),
         )?;
         append(
             &self.context,
@@ -598,7 +598,7 @@ mod tests {
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let mut request = TurnRequest {
-            id:"opaque-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), profile:"closed-agent".into(),
+            id:"opaque-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), media:Vec::new(), profile:"closed-agent".into(),
             route:ModelRoute::from_runtime(&context, &cfg).unwrap(), deadline:std::time::Duration::from_secs(10),
             tools:Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(), limits:Limits::from_config(&cfg),
         };
