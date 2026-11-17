@@ -583,12 +583,18 @@ fn restore_settings_gate_that_is_not_a_plain_file_fails_the_backup_and_refuses_t
         let archive = f.backup();
         set_quiet(&f, 5000);
         let plan = preview(&f.context(), &archive, false).unwrap();
-        let gate = f.0.join("locks/settings-store.lock");
+        // The gate lives in the data area (`data/locks/`). Create the plain file first when it is absent, so the case
+        // below builds its bad gate deliberately rather than depending on the writes that ran before.
+        let gate = f.0.join("data/locks/settings-store.lock");
+        fs::create_dir_all(gate.parent().unwrap()).unwrap();
+        if !gate.exists() {
+            fs::write(&gate, b"").unwrap();
+        }
         if case == "directory" {
             fs::remove_file(&gate).unwrap();
             fs::create_dir(&gate).unwrap();
         } else {
-            fs::hard_link(&gate, f.0.join("locks/settings-store-second-name.lock")).unwrap();
+            fs::hard_link(&gate, f.0.join("data/locks/settings-store-second-name.lock")).unwrap();
         }
         if case == "hard link without the store" {
             for name in ["settings.db", "settings.db-wal", "settings.db-shm", "settings.db-journal"] {
