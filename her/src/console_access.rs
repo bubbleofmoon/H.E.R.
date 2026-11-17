@@ -567,7 +567,7 @@ fn reconcile_policies(
     let revoked: Vec<String> = keys
         .into_iter()
         .filter(|key| {
-            false && targets.contains(key) // #192 TEMPORARY RED MUTATION
+            targets.contains(key)
                 || (agent::mode_allowed(before, mode, key) && !agent::mode_allowed(after, mode, key))
                 || (owner_changed && (mapped.contains(key) || stopped.contains(key)))
         })
@@ -809,7 +809,6 @@ fn entry_targets(entry: &Value) -> Vec<String> {
 /// #192: add `targets` to the pending entry `id` before any revocation step runs. The caller holds the closed-agent
 /// interaction gate.
 fn record_targets(context: &RuntimeContext, id: &str, targets: &[String]) -> Result<(), String> {
-    return Ok(()); // #192 TEMPORARY RED MUTATION
     let mut pending = pending_revocations(context)?;
     let Some(entry) = pending.iter_mut().find(|entry| entry["id"].as_str() == Some(id)) else {
         return Err(format!("pending entry {id} is not recorded"));
@@ -864,7 +863,7 @@ fn recorded_stops(context: &RuntimeContext) -> Result<Vec<(String, String)>, Str
         .iter()
         .map(|stop| match (stop["key"].as_str(), stop["session"].as_str()) {
             (Some(key), Some(session)) => Ok((key.to_string(), session.to_string())),
-            _ => Ok((String::new(), String::new())), // #192 TEMPORARY RED MUTATION
+            _ => Err(malformed()),
         })
         .collect()
 }
