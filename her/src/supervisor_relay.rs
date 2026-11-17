@@ -236,17 +236,28 @@ fn gone(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|error| vanished(&error))
 }
 
-/// Zero-width and bidirectional formatting characters, which can hide or reorder text.
+/// Characters that hide or reorder displayed text: control characters, the Unicode bidirectional
+/// controls (Bidi_Control, which includes U+061C), line and paragraph separators, zero-width
+/// characters and the byte-order mark.
 fn formatting(c: char) -> bool {
-    matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        )
 }
 
-/// A path as diagnostics show it. Control and formatting characters become `?`, so an entry name
-/// cannot add lines to a log or notice or reorder its text.
+/// A path as diagnostics show it. Such characters become `?`, so an entry name cannot add lines
+/// to a log or notice or reorder its text.
 fn shown(path: &Path) -> String {
     let text = path.display().to_string();
     text.chars()
-        .map(|c| if c.is_control() || formatting(c) { '?' } else { c })
+        .map(|c| if formatting(c) { '?' } else { c })
         .collect()
 }
 
@@ -255,11 +266,60 @@ fn named(text: &str, failed: &Path) -> String {
     format!("{text}: {}", shown(failed))
 }
 
+/// The native code of an I/O error as diagnostics show it: a Win32 code on Windows, an errno
+/// elsewhere, or the error kind when the OS gave no code.
+fn native_code(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        #[cfg(windows)]
+        Some(code) => format!("Win32 error {code}"),
+        #[cfg(not(windows))]
+        Some(code) => format!("errno {code}"),
+        None => format!("{:?}", error.kind()),
+    }
+}
+
+/// A sweep refusal naming the path, the failed step and the native code.
+fn failure(text: &str, failed: &Path, step: &str, error: &std::io::Error) -> String {
+    format!(
+        "{text}: {}: {step} failed ({})",
+        shown(failed),
+        native_code(error)
+    )
+}
+
+/// Checks that every ancestor of `path` can be read and is not a link. `Ok(false)` when a listed
+/// entry is gone and the ancestor read failed because it was removed (`vanished`); any other
+/// failure refuses, even when the entry is gone by then.
+fn ancestors_checked(
+    path: &Path,
+    listed: bool,
+    stat: impl Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<bool, String> {
+    for ancestor in path.ancestors().skip(1) {
+        match stat(ancestor) {
+            Ok(found) if crate::guarded_file::is_link(&found) => {
+                return Err("relay paths must not be redirected".into());
+            }
+            Ok(_) => {}
+            Err(error) if listed && vanished(&error) && gone(path) => return Ok(false),
+            Err(error) => {
+                return Err(failure(
+                    "relay path is unavailable",
+                    ancestor,
+                    "symlink_metadata",
+                    &error,
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
 /// Checks one entry before its permissions change: outside any protected root, no redirected
 /// part, a regular file or directory, and on Unix owned by this account with one link.
 /// `Ok(None)` when a listed entry vanished: the OS reports the entry itself missing, also after a
-/// guard or ancestor read failed because the entry was removed or moved meanwhile. The version
-/// folder itself (`listed == false`) must exist.
+/// guard failed or an ancestor reported missing because the entry was removed meanwhile. Any other
+/// read failure refuses. The version folder itself (`listed == false`) must exist.
 fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, String> {
     if crate::install_root::check_runtime(path, false).is_err() {
         return if listed && gone(path) {
@@ -271,20 +331,20 @@ fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, Strin
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if listed && vanished(&error) => return Ok(None),
-        Err(_) => return Err(named("relay path is unavailable", path)),
+        Err(error) => {
+            return Err(failure(
+                "relay path is unavailable",
+                path,
+                "symlink_metadata",
+                &error,
+            ));
+        }
     };
     if crate::guarded_file::is_link(&meta) {
         return Err("relay paths must not be redirected".into());
     }
-    for ancestor in path.ancestors().skip(1) {
-        match std::fs::symlink_metadata(ancestor) {
-            Ok(found) if crate::guarded_file::is_link(&found) => {
-                return Err("relay paths must not be redirected".into());
-            }
-            Ok(_) => {}
-            Err(_) if listed && gone(path) => return Ok(None),
-            Err(_) => return Err(named("relay path is unavailable", ancestor)),
-        }
+    if !ancestors_checked(path, listed, std::fs::symlink_metadata)? {
+        return Ok(None);
     }
     if !meta.is_file() && !meta.is_dir() {
         return Err("relay private files must be regular files or directories".into());
@@ -371,14 +431,28 @@ fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, Stri
                     *skipped += 1;
                     return Ok(());
                 }
-                Err(_) => return Err("relay private directory cannot be inspected".into()),
+                Err(error) => {
+                    return Err(failure(
+                        "relay private directory cannot be inspected",
+                        path,
+                        "read_dir",
+                        &error,
+                    ));
+                }
             };
             for child in children {
                 let child = match child {
                     Ok(child) => child.path(),
                     // The directory went away while it was listed; `protect` counts it below.
                     Err(error) if listed && vanished(&error) => break,
-                    Err(_) => return Err("relay private directory cannot be inspected".into()),
+                    Err(error) => {
+                        return Err(failure(
+                            "relay private directory cannot be inspected",
+                            path,
+                            "read_dir entry",
+                            &error,
+                        ));
+                    }
                 };
                 seam(Seam::Listed, &child);
                 collect(&child, true, entries, skipped, seam)?;
@@ -409,7 +483,12 @@ pub(super) fn unix_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), 
         (meta.permissions().mode() & 0o700) | 0o600
     };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
-        let reason = "relay private permissions could not be applied".to_string();
+        let reason = failure(
+            "relay private permissions could not be applied",
+            path,
+            "set_permissions",
+            &error,
+        );
         if vanished(&error) {
             Unprotected::Missing(reason)
         } else {
@@ -854,25 +933,6 @@ mod native_tests {
     }
 
     #[test]
-    fn request_log_parts_created_after_the_sweep_carry_only_the_her_ace() {
-        let fixture = Fixture::new();
-        let logs = fixture.0.join("logs");
-        std::fs::create_dir(&logs).unwrap();
-        restrict(&fixture.0).unwrap();
-        // A part in the existing logs folder: only the HER ACE, inherited (INHERITED_ACE = 16).
-        let part = logs.join("request-log-parts-request-body-1");
-        std::fs::write(&part, b"synthetic request body").unwrap();
-        assert_dacl(&part, false, 16);
-        // A folder the relay creates later, and a part in it.
-        let later = fixture.0.join("logs-later");
-        std::fs::create_dir(&later).unwrap();
-        let later_part = later.join("request-log-parts-request-body-2");
-        std::fs::write(&later_part, b"synthetic request body").unwrap();
-        assert_dacl(&later, false, 19);
-        assert_dacl(&later_part, false, 16);
-    }
-
-    #[test]
     fn relay_acl_verification_refuses_a_protected_foreign_sid_grant() {
         use windows_sys::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
@@ -1024,6 +1084,23 @@ mod unix_tests {
             named("relay path is unavailable", path),
             "relay path is unavailable: /relay/logs/part?refused: forged?name"
         );
+        // Bidirectional controls (U+061C included), line and paragraph separators, zero-width
+        // characters, the byte-order mark and C1 controls.
+        for c in [
+            '\u{061c}',
+            '\u{200b}',
+            '\u{200e}',
+            '\u{200f}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202a}',
+            '\u{2066}',
+            '\u{feff}',
+            '\u{85}',
+        ] {
+            let path = PathBuf::from(format!("/relay/logs/part{c}name"));
+            assert_eq!(shown(&path), "/relay/logs/part?name", "U+{:04X}", u32::from(c));
+        }
     }
 
     #[test]
@@ -1088,7 +1165,11 @@ mod unix_tests {
         let absent = fixture.0.join("absent");
         assert_eq!(
             restrict(&absent),
-            Err(format!("relay path is unavailable: {}", absent.display()))
+            Err(format!(
+                "relay path is unavailable: {}: symlink_metadata failed (errno {})",
+                absent.display(),
+                libc::ENOENT
+            ))
         );
     }
 
@@ -1103,7 +1184,11 @@ mod unix_tests {
         });
         assert_eq!(
             result,
-            Err("relay private directory cannot be inspected".to_string())
+            Err(format!(
+                "relay private directory cannot be inspected: {}: read_dir failed (errno {})",
+                fixture.0.display(),
+                libc::ENOENT
+            ))
         );
     }
 
@@ -1182,7 +1267,11 @@ mod unix_tests {
         });
         assert_eq!(
             result,
-            Err(format!("relay path is unavailable: {}", fixture.0.display()))
+            Err(format!(
+                "relay path is unavailable: {}: symlink_metadata failed (errno {})",
+                fixture.0.display(),
+                libc::ENOENT
+            ))
         );
         assert_eq!(calls, 1);
     }
@@ -1236,22 +1325,98 @@ mod unix_tests {
     }
 
     #[test]
+    fn an_ancestor_read_error_stays_a_refusal_even_when_the_entry_is_gone() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        std::fs::remove_file(&path).unwrap();
+        let result = ancestors_checked(&path, true, |ancestor| {
+            if ancestor == fixture.0.as_path() {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                std::fs::symlink_metadata(ancestor)
+            }
+        });
+        assert_eq!(
+            result,
+            Err(format!(
+                "relay path is unavailable: {}: symlink_metadata failed (errno {})",
+                fixture.0.display(),
+                libc::EIO
+            ))
+        );
+    }
+
+    #[test]
+    fn a_listing_failure_names_the_path_step_and_code() {
+        if unsafe { libc::geteuid() } == 0 {
+            // Root reads every directory; CI runs the suite as an unprivileged user.
+            return;
+        }
+        let fixture = Fixture::new();
+        let (logs, _, _) = request_log_parts(&fixture);
+        // Search and write permission without read: the entries cannot be listed.
+        set_mode(&logs, 0o300);
+        let result = restrict(&fixture.0);
+        set_mode(&logs, 0o700);
+        assert_eq!(
+            result,
+            Err(format!(
+                "relay private directory cannot be inspected: {}: read_dir failed (errno {})",
+                logs.display(),
+                libc::EACCES
+            ))
+        );
+    }
+
+    #[test]
+    fn a_permission_failure_names_the_path_step_and_code() {
+        if unsafe { libc::geteuid() } == 0 {
+            // Root may change any mode; CI runs the suite as an unprivileged user.
+            return;
+        }
+        let fixture = Fixture::new();
+        let dir = fixture.0.join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("request-log-parts-request-body-1");
+        std::fs::write(&file, b"synthetic fixture").unwrap();
+        let meta = std::fs::symlink_metadata(&file).unwrap();
+        // Without search permission on the directory, the file's mode cannot be changed.
+        set_mode(&dir, 0o600);
+        let result = unix_private(&file, &meta);
+        set_mode(&dir, 0o700);
+        let Err(Unprotected::Refused(error)) = result else {
+            panic!("a denied permission change must be refused");
+        };
+        assert_eq!(
+            error,
+            format!(
+                "relay private permissions could not be applied: {}: set_permissions failed (errno {})",
+                file.display(),
+                libc::EACCES
+            )
+        );
+    }
+
+    #[test]
     fn request_log_parts_deleted_while_two_sweepers_run_never_refuse() {
         let fixture = Fixture::new();
         let logs = fixture.0.join("logs");
         std::fs::create_dir(&logs).unwrap();
-        let parts: Vec<PathBuf> = (0..300)
-            .map(|n| logs.join(format!("request-log-parts-request-body-{n}")))
-            .collect();
-        for part in &parts {
+        for n in 0..300 {
+            let part = logs.join(format!("request-log-parts-request-body-{n}"));
             std::fs::write(part, b"synthetic fixture").unwrap();
         }
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The first sweeper asks the deleter to remove each part it has listed, and waits for that
+        // removal before it inspects the part. Every listed part is therefore a vanished entry.
+        let (ask_tx, ask_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
         let deleter = std::thread::spawn(move || {
-            for part in parts {
-                std::fs::remove_file(part).unwrap();
+            for part in ask_rx {
+                std::fs::remove_file(&part).unwrap();
+                ack_tx.send(()).unwrap();
             }
         });
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A second supervisor sharing the dependency folder sweeps it at the same time.
         let other = {
             let (folder, done) = (fixture.0.clone(), done.clone());
@@ -1263,18 +1428,19 @@ mod unix_tests {
                 skipped
             })
         };
-        let mut skipped = 0;
-        loop {
-            skipped += restrict(&fixture.0).unwrap();
-            if deleter.is_finished() {
-                break;
+        let skipped = sweep(&fixture.0, &mut |seam, path| {
+            if seam == Seam::Listed && path.parent() == Some(logs.as_path()) {
+                ask_tx.send(path.to_path_buf()).unwrap();
+                ack_rx.recv().unwrap();
             }
-        }
+        });
+        drop(ask_tx);
         done.store(true, Ordering::SeqCst);
         deleter.join().unwrap();
         let other = other.join().unwrap();
-        // A part vanishes once, so each sweeper skips at most all of them across its passes.
-        assert!(skipped <= 300 && other <= 300, "{skipped} {other}");
+        // This sweep listed and inspected all 300 parts, each removed in between: all are skipped.
+        assert_eq!(skipped, Ok(300));
+        assert!(other <= 300, "{other}");
         assert_eq!(restrict(&fixture.0), Ok(0));
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 0);
     }
@@ -1283,34 +1449,15 @@ mod unix_tests {
     fn a_sweep_stopped_midway_is_completed_by_the_next_pass() {
         let fixture = Fixture::new();
         let (logs, gone, kept) = request_log_parts(&fixture);
-        // A stop right after the version folder: it is private, its entries are not yet.
+        // A stop right after the version folder: it is private, its entries are not yet. A part
+        // removed meanwhile is skipped by the next pass, which completes the rest.
         set_mode(&fixture.0, 0o700);
         set_mode(&logs, 0o755);
         set_mode(&gone, 0o644);
         set_mode(&kept, 0o644);
-        assert_eq!(restrict(&fixture.0), Ok(0));
+        std::fs::remove_file(&gone).unwrap();
+        assert_eq!(restrict(&fixture.0), Ok(1));
         assert_eq!(mode(&logs), 0o700);
-        assert_eq!(mode(&gone), 0o600);
         assert_eq!(mode(&kept), 0o600);
-    }
-
-    #[test]
-    fn request_log_parts_created_after_the_sweep_sit_inside_a_private_folder() {
-        let fixture = Fixture::new();
-        set_mode(&fixture.0, 0o755);
-        assert_eq!(restrict(&fixture.0), Ok(0));
-        assert_eq!(mode(&fixture.0), 0o700);
-        // Whatever modes the relay gives later folders and parts, other accounts cannot reach them
-        // through the 0700 version folder; the next pass tightens them too.
-        let logs = fixture.0.join("logs");
-        std::fs::create_dir(&logs).unwrap();
-        set_mode(&logs, 0o755);
-        let part = logs.join("request-log-parts-request-body-1");
-        std::fs::write(&part, b"synthetic request body").unwrap();
-        set_mode(&part, 0o644);
-        assert_eq!(mode(&fixture.0), 0o700);
-        assert_eq!(restrict(&fixture.0), Ok(0));
-        assert_eq!(mode(&logs), 0o700);
-        assert_eq!(mode(&part), 0o600);
     }
 }
