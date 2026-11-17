@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 pub struct Tools {
     definitions: Vec<Value>,
     authority: Option<Authority>,
+    /// The profile's mode prompt (#140) as the configuration read at capture holds it, model-view
+    /// stripped; empty when none is set.
+    mode_prompt: String,
 }
 
 #[derive(Clone)]
@@ -64,9 +67,20 @@ impl Tools {
             profile,
         };
         authority.check().map_err(String::from)?;
+        // #140: read from the settings store with this turn's configuration, so an edit is in
+        // effect from the next turn; the model-view strip applies as it does to briefing sections.
+        let mode_prompt = profile
+            .prompt_key()
+            .map(|key| {
+                let delivery = crate::model_view::with_blacklist(context, cfg);
+                let text = crate::prompt_text::mode_prompt(cfg, key);
+                crate::model_view::strip_from_model_text(&text, &delivery).trim().to_string()
+            })
+            .unwrap_or_default();
         Ok(Self {
             definitions: definitions(cfg, profile),
             authority: Some(authority),
+            mode_prompt,
         })
     }
 
@@ -75,6 +89,7 @@ impl Tools {
         Self {
             definitions: Vec::new(),
             authority: None,
+            mode_prompt: String::new(),
         }
     }
 
@@ -111,8 +126,18 @@ impl Tools {
             .is_none_or(|a| a.conversation == conversation && a.generation == generation)
     }
 
+    /// The turn's system message: the profile's mode prompt, a blank line and the tool session
+    /// line; the session line alone while no mode prompt is set.
     pub(super) fn instruction(&self) -> String {
-        self.authority.as_ref().map(|a| session_instruction(&a.conversation)).unwrap_or_default()
+        let Some(authority) = &self.authority else {
+            return String::new();
+        };
+        let session = session_instruction(&authority.conversation);
+        if self.mode_prompt.is_empty() {
+            session
+        } else {
+            format!("{}\n\n{session}", self.mode_prompt)
+        }
     }
 
     /// The tools offered to the next model request: the captured menu, narrowed by the current
@@ -977,5 +1002,9 @@ mod tests {
         // An emptied prompt sends the session line alone again.
         save("prompt.mode.closedAgent", "").unwrap();
         assert_eq!(instruction("closed-agent", OWNER_KEY), session_instruction(OWNER_KEY));
+        // The profiles no harness turn admits name no mode prompt.
+        for profile in [Profile::Reserved2, Profile::Reserved2Owner, Profile::Digest, Profile::SlangLearner] {
+            assert_eq!(profile.prompt_key(), None, "{profile:?}");
+        }
     }
 }
