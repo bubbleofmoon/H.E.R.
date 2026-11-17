@@ -2260,25 +2260,82 @@ fn prompt_text_readers_see_one_whole_version_while_writers_save() {
     let (root, context) = prompt_fixture("prompt text concurrent");
     let first = format!("【别像客服】{}", "甲".repeat(1990));
     let second = format!("【别像客服】{}", "乙".repeat(1990));
-    let (a, b) = std::thread::scope(|scope| {
+    // The reader starts once a commit has returned, then reads until both writers have; every such read must show a
+    // whole committed version, never the compiled default.
+    let committed = std::sync::atomic::AtomicUsize::new(0);
+    let (a, b, reads_after_commit) = std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
-            for _ in 0..20 {
+            while committed.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            let mut reads_after_commit = 0;
+            loop {
+                let done = committed.load(std::sync::atomic::Ordering::SeqCst);
                 let text = next_render(&context);
+                let default = text.contains("【别像客服】你不是客服：");
                 let seen = [
-                    text.contains("【别像客服】你不是客服："),
+                    default,
                     text.contains(&format!("{first}\n\n【积极性】")),
                     text.contains(&format!("{second}\n\n【积极性】")),
                 ];
                 assert_eq!(seen.iter().filter(|seen| **seen).count(), 1, "one whole version: {text}");
+                assert!(!default, "a read after a commit shows the default, not the committed text: {text}");
+                reads_after_commit += 1;
+                if done == 2 {
+                    break;
+                }
             }
+            reads_after_commit
         });
-        let a = scope.spawn(|| crate::settings::apply(&context, "prompt.notAClerk", &json!(first.as_str()), "administrator", "console"));
-        let b = scope.spawn(|| crate::settings::apply(&context, "prompt.notAClerk", &json!(second.as_str()), "administrator", "console"));
-        reader.join().unwrap();
-        (a.join().unwrap().err(), b.join().unwrap().err())
+        let a = scope.spawn(|| {
+            let saved = crate::settings::apply(&context, "prompt.notAClerk", &json!(first.as_str()), "administrator", "console");
+            committed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            saved.err()
+        });
+        let b = scope.spawn(|| {
+            let saved = crate::settings::apply(&context, "prompt.notAClerk", &json!(second.as_str()), "administrator", "console");
+            committed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            saved.err()
+        });
+        let reads = reader.join().unwrap();
+        (a.join().unwrap(), b.join().unwrap(), reads)
     });
     assert_eq!((a, b), (None, None));
+    assert!(reads_after_commit > 0, "no read ran after a commit");
+    let settled = next_render(&context);
+    assert!(settled.contains(&format!("{first}\n\n【积极性】")) || settled.contains(&format!("{second}\n\n【积极性】")), "{settled}");
     assert_eq!(audit_rows(&root).len(), 2);
+}
+
+#[test]
+fn denied_term_split_by_format_characters_is_refused_on_save_and_load() {
+    // Invisible format characters read as joiners and as word boundaries at once: each spelling reads as `DSH`.
+    let rule = crate::settings::find("prompt.notAClerk").unwrap();
+    for split in ["x\u{200b}D\u{200b}SH", "x\u{200b}DS\u{200b}H", "x\u{200b}D\u{200b}S\u{200b}H"] {
+        assert!(crate::settings::denied_in_text(split).contains(&"dsh".to_string()), "{split:?}");
+        assert!(rule.normalize(&json!(split)).is_none(), "{split:?} is accepted on load");
+        let (_root, context) = prompt_fixture("prompt text split denied");
+        let (status, body) = set_text(&context, "prompt.notAClerk", json!(split));
+        assert_eq!(status, 400, "{split:?}: {body}");
+    }
+    // A split that a letter or digit touches is one word, not the term.
+    for clean in ["x\u{200b}DSHy", "XDSHX", "x\u{200b}DSH1"] {
+        assert!(!crate::settings::denied_in_text(clean).contains(&"dsh".to_string()), "{clean:?}");
+    }
+}
+
+#[test]
+fn prompt_text_rule_a_strip_turns_into_a_denied_term_falls_back_to_the_last_good_text() {
+    let (root, context) = prompt_fixture("prompt text strip denied");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】新版 140"));
+    assert_eq!(status, 200, "{body}");
+    // Accepted on save, when the strip has no term to remove; the strip then makes `DSH` of it.
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D鲸SH"));
+    assert_eq!(status, 200, "{body}");
+    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
+    let text = next_render(&context);
+    assert!(text.contains("【别像客服】新版 140\n\n"), "the last good version renders: {text}");
+    assert!(!text.contains("DSH") && !text.contains("鲸"), "a denied term reached the model: {text}");
 }
 
 #[test]

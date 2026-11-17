@@ -941,6 +941,21 @@ mod tests {
     }
 
     #[test]
+    fn mode_prompt_strip_that_makes_a_denied_term_falls_back_to_the_last_good_text() {
+        let fixture = Fixture::new("mode-prompt-strip", "closed-agent");
+        let save = |text: &str| {
+            crate::settings::apply(&fixture.context, "prompt.mode.closedAgent", &json!(text), "administrator", "console")
+        };
+        save("封闭模式说明 140").unwrap();
+        // Accepted on save, when the strip has no term to remove; the strip below makes `DSH` of it.
+        save("D鲸SH").unwrap();
+        fixture.edit_config(|cfg| cfg["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
+        let instruction = fixture.capture("closed-agent", OWNER_KEY).unwrap().instruction();
+        assert_eq!(instruction, format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY)));
+        assert!(!instruction.contains("DSH"), "a denied term reached the model: {instruction}");
+    }
+
+    #[test]
     fn mode_prompt_comes_from_the_store_per_profile_and_opens_the_system_message() {
         let fixture = Fixture::new("mode-prompt", "chat");
         let instruction = |mode: &str, conversation: &str| {
