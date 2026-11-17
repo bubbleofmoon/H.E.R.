@@ -140,6 +140,11 @@ mod tests {
                 "a huge cache life saturates the deadline from idle start {idle}"
             );
         }
+        assert_eq!(
+            due_at(&cfg(json!(1.5e14)), &call("m", Some(500_000)), 0),
+            Some(8_999_999_999_999_940_000),
+            "a huge cache life keeps every millisecond of its lead"
+        );
     }
 
     #[test]
