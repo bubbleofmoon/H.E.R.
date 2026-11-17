@@ -1252,6 +1252,7 @@ fn a_store_from_before_the_model_settings_is_read_and_extended() {
     assert_eq!(body["revision"], 1);
     assert_eq!(next_turn_model(&context), Ok("after-restore".to_string()));
     assert_eq!(audit_rows(&root).len(), 2, "the restored audit rows and the new one");
+}
 
 /// The chat's name for `reply.wakeQuietMs`: its configuration path.
 const CHAT_NAME: &str = "socialV2.reply.wakeQuietMs";
