@@ -2602,40 +2602,55 @@ fn audit_undo_keeps_a_stored_value_and_its_write_back() {
 }
 
 #[test]
-fn audit_undo_survives_a_write_back_into_a_null_parent() {
-    // A null on a registry pointer's path reads as absent: the write-back turns it into an object, and that is no
-    // later change of the file the audit record describes.
-    let cases: [(&str, &str, Value); 4] = [
-        ("/webSearch", "webSearch.model", json!("model-x")),
-        ("/harness", "harness.model", json!("model-x")),
-        ("/memory", "memory.digest.model", json!("model-x")),
-        ("/socialV2/reply", QUIET_KEY, json!(4500)),
+fn audit_undo_survives_a_write_back_into_a_null_or_empty_parent() {
+    // A null or an empty object on a registry pointer's path reads as absent: the write-back fills it, and that is no
+    // later change of the file the audit record describes. Each case runs on its own and fails the test at the end.
+    const SOCIAL: usize = 0;
+    const SLANG: usize = 1;
+    // The console route, its body and the member its write adds, which the undo removes again.
+    let consoles: [(&str, Value, &str, Value); 2] = [
+        ("/api/socialV2/config", json!({"autoReplyCheckMs": 4000}), "/socialV2/autoReplyCheckMs", json!(4000)),
+        ("/api/slang/config", json!({"injectMax": 5}), "/slang/injectMax", json!(5)),
     ];
-    for (null_at, key, value) in cases {
+    // Where the file starts with a null or an empty object, the setting written afterwards and the console route.
+    let cases: [(&str, Value, &str, Value, usize); 7] = [
+        ("/webSearch", Value::Null, "webSearch.model", json!("model-x"), SOCIAL),
+        ("/harness", Value::Null, "harness.model", json!("model-x"), SOCIAL),
+        ("/memory", Value::Null, "memory.digest.model", json!("model-x"), SOCIAL),
+        ("/socialV2/reply", Value::Null, QUIET_KEY, json!(4500), SOCIAL),
+        ("/memory/digest", Value::Null, "memory.digest.model", json!("model-x"), SLANG),
+        ("/memory", json!({}), "memory.digest.model", json!("model-x"), SLANG),
+        ("/socialV2/reply", Value::Null, QUIET_KEY, json!(4500), SLANG),
+    ];
+    let mut failures = Vec::new();
+    for (at, initial, key, value, console) in cases {
+        let (route, body, marker, marker_value) = &consoles[console];
+        let label = format!("{at} {initial} then {key} through {route}");
         let (root, context) = settings_fixture("settings audit undo null parent");
         write_config(&root, |config| {
             let mut slot = config;
-            for name in null_at.split('/').skip(1) {
+            for name in at.split('/').skip(1) {
                 slot = &mut slot[name];
             }
-            *slot = Value::Null;
+            *slot = initial.clone();
         });
-        let (status, reply) =
-            admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"autoReplyCheckMs": 4000})));
-        assert_eq!(status, 200, "{null_at}: {reply}");
-        assert_eq!(stored_config(&root).pointer(null_at), Some(&Value::Null), "{null_at}: the console write keeps the null");
+        let (status, reply) = admin_request(&context, "POST", route, Some(body));
+        assert_eq!(status, 200, "{label}: {reply}");
+        assert_eq!(stored_config(&root).pointer(at), Some(&initial), "{label}: the console write keeps it");
         let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
         assert_eq!(status, 200, "{recent}");
-        let entry = recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()
-            ["id"]
-            .clone();
-        let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&json!({"setting": key, "value": value})));
-        assert_eq!(status, 200, "{key}: {body}");
-        assert!(stored_config(&root).pointer(null_at).is_some_and(Value::is_object), "{null_at}: the write-back made an object");
+        let entry = recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == *route).unwrap()["id"].clone();
+        let (status, reply) = admin_request(&context, "POST", "/api/settings/set", Some(&json!({"setting": key, "value": value})));
+        assert_eq!(status, 200, "{label}: {reply}");
+        assert!(stored_config(&root).pointer(at).is_some_and(Value::is_object), "{label}: the write-back made an object");
         let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry})));
-        assert_eq!(status, 200, "{null_at}: {reply}");
-        assert_ne!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 4000, "{null_at}: the console member is restored");
+        if status != 200 {
+            failures.push(format!("{label}: undo answered {status}: {reply}"));
+        } else if stored_config(&root).pointer(marker) == Some(marker_value) {
+            failures.push(format!("{label}: the console member was not restored"));
+        }
     }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
