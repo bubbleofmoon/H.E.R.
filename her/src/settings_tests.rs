@@ -446,3 +446,36 @@ fn no_registry_setting_is_cached_on_the_config_stamp() {
         }
     }
 }
+
+#[test]
+fn settings_page_lists_the_registry_and_sets_through_the_route() {
+    let (root, context) = settings_fixture("settings page");
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let (status, content_type, page) = crate::console_settings::route(&context, "GET", "/settings", "", false, &granted);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(content_type, "text/html; charset=utf-8");
+    let (status, _) = admin_request(&context, "GET", "/settings", None);
+    assert_eq!(status, 200, "the page is served behind the console front");
+    let (status, body) = agent_request(&context, "GET", "/settings", None, "fixture-agent-token");
+    assert_eq!(status, 403, "{body}");
+    // The page renders what the list route returns and sends what the set route reads.
+    let view = quiet_view(&context);
+    for field in ["key", "label", "hint", "value", "default", "applies"] {
+        assert!(page.contains(&format!("s.{field}")), "the page shows {field}");
+        assert!(!view[field].is_null(), "the list route returns {field}");
+    }
+    assert!(page.contains("s.kind.min") && page.contains("s.kind.max"), "the input takes the bounds");
+    assert_eq!(view["kind"]["min"], 1);
+    assert!(page.contains("api('/api/settings')"), "the page lists through the route");
+    assert!(
+        page.contains("api('/api/settings/set',{setting:s.key,value:Number(input.value)})"),
+        "the page sets through the route"
+    );
+    assert!(page.contains("'x-console-token'"), "the page sends the console credential");
+    assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
+    assert!(!settings_db(&root).exists(), "showing the page creates no store");
+    let request = json!({"setting": QUIET_KEY, "value": 4500});
+    let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&request));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(quiet_view(&context)["value"], 4500, "the page's next list shows the new value");
+}
