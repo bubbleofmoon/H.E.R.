@@ -795,3 +795,20 @@ fn guard179_bare_line_breaks_are_refused() {
     edit_preset(&context, |text| text.replacen(persona, "              # note\u{2028}              prefix: AI\n", 1));
     assert_eq!(problems(&context), codes(&["yaml:preset1"]), "U+2028 in a preset");
 }
+
+#[test]
+fn guard179_only_yaml_separation_whitespace_is_trimmed() {
+    let (_root, context) = fixture("separation-whitespace");
+    write_compliant(&context);
+    let persona = "              prefix: |-\n                你是群里的普通成员。\n                - 不用列表回答。\n                说话简短。\n";
+    // DSH keeps U+00A0 and U+3000 as scalar content: the `#` after them is part of the scalar, and `AI` is persona text.
+    let cases = [
+        "              prefix: \u{a0}# AI\n",
+        "              prefix: \u{3000}# AI\n",
+    ];
+    for replace in cases {
+        edit_preset(&context, |text| text.replacen(persona, replace, 1));
+        assert_eq!(problems(&context), codes(&["persona-text:preset1"]), "{replace:?}");
+        write(&context, PRESET_FILE, PRESET);
+    }
+}
