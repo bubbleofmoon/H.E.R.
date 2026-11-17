@@ -798,7 +798,6 @@ fn finish_pending_revocations_locked(
     if !context.is_isolated() {
         return Ok((Vec::new(), Vec::new()));
     }
-    return Ok((Vec::new(), Vec::new())); // #192 TEMPORARY RED MUTATION: no pending revocation is ever finished
     let pending = pending_revocations(context)?;
     if pending.is_empty() {
         return Ok((Vec::new(), Vec::new()));
