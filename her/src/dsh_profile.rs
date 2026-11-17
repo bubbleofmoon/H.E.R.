@@ -258,8 +258,12 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
         .resolve_path(RuntimeArea::DshUser, PROFILE_DIR, PathIntent::ReadDirectory)
         .map_err(str::to_string)?;
     let stamp = crate::dsh_mcp_config::utc_stamp();
-    let name = backup_name(&stamp, |name| std::fs::symlink_metadata(dir.join(name)).is_ok())
-        .ok_or("no free backup name in this millisecond; nothing was written")?;
+    let present: Vec<String> = std::fs::read_dir(&dir) // STUB179-3C
+        .map_err(|_| "the profile folder cannot be listed".to_string())? // STUB179-3C
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok()) // STUB179-3C
+        .collect(); // STUB179-3C
+    let name = backup_name(&stamp, &present) // STUB179-3C
+        .ok_or("no free backup name in this millisecond; nothing was written")?; // STUB179-3C
     context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes())?;
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map_err(|_| "the profile folder cannot be listed".to_string())?
@@ -275,8 +279,8 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
 
 /// The first free backup name for `stamp`: the prefix, the stamp, `-` and two digits, so two backups in one
 /// millisecond never share a name.
-fn backup_name(stamp: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
-    (0..100).map(|n| format!("{BACKUP_PREFIX}{stamp}-{n:02}")).find(|name| !taken(name))
+fn backup_name(stamp: &str, existing: &[String]) -> Option<String> {
+    (0..100).map(|n| format!("{BACKUP_PREFIX}{stamp}-{n:02}")).find(|name| !existing.contains(name)) // STUB179-3C
 }
 
 /// Exactly the names `backup_name` gives a `utc_stamp`; pruning never touches any other file.

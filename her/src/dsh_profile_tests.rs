@@ -112,14 +112,29 @@ fn guard179_restore_keeps_five_own_backups_and_never_touches_other_backups() {
 #[test]
 fn guard179_backup_names_are_unique_and_only_own_names_are_pruned() {
     let stamp = "2026-01-02T03-04-05-006Z";
-    assert_eq!(backup_name(stamp, |_| false), Some(format!("{BACKUP_PREFIX}{stamp}-00")));
-    let taken = |name: &str| name.ends_with("-00") || name.ends_with("-01");
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| format!("{BACKUP_PREFIX}{name}")).collect()
+    }
+    assert_eq!(backup_name(stamp, &[]), Some(format!("{BACKUP_PREFIX}{stamp}-00")));
     assert_eq!(
-        backup_name(stamp, taken),
+        backup_name(stamp, &names(&[format!("{stamp}-00").as_str(), format!("{stamp}-01").as_str()])),
         Some(format!("{BACKUP_PREFIX}{stamp}-02")),
         "a third backup in the same millisecond"
     );
-    assert_eq!(backup_name(stamp, |_| true), None);
+    // The seventh backup in one millisecond, after pruning removed -00 and -01: never -00 again.
+    let pruned: Vec<String> = (2..7).map(|n| format!("{BACKUP_PREFIX}{stamp}-{n:02}")).collect();
+    assert_eq!(backup_name(stamp, &pruned), Some(format!("{BACKUP_PREFIX}{stamp}-07")));
+    // A clock that went back: the name still sorts after the newest backup.
+    assert_eq!(
+        backup_name(stamp, &names(&["2026-01-02T03-04-05-007Z-04"])),
+        Some(format!("{BACKUP_PREFIX}2026-01-02T03-04-05-007Z-05"))
+    );
+    assert_eq!(backup_name(stamp, &names(&[format!("{stamp}-99").as_str()])), None, "no name is left after -99");
+    assert_eq!(
+        backup_name(stamp, &names(&["0-manual", "9999"])),
+        Some(format!("{BACKUP_PREFIX}{stamp}-00")),
+        "names of another form do not count"
+    );
     assert!(is_own_backup(&format!("{BACKUP_PREFIX}{stamp}-07")));
     let others = [
         format!("{BACKUP_PREFIX}{stamp}"),
@@ -131,6 +146,28 @@ fn guard179_backup_names_are_unique_and_only_own_names_are_pruned() {
     for other in others {
         assert!(!is_own_backup(&other), "{other}");
     }
+}
+
+#[test]
+fn guard179_a_new_backup_sorts_after_the_newest_and_none_is_written_when_no_name_is_left() {
+    let (_root, context) = fixture("backup-order");
+    // Five backups stamped later than now (a clock that went back): the new one must still be the newest kept.
+    for counter in 0..5 {
+        write(&context, &format!("{PROFILE_DIR}/{BACKUP_PREFIX}2999-12-31T23-59-59-999Z-{counter:02}"), "old\n");
+    }
+    write(&context, PROFILE_FILE, PROFILE_HAND);
+    assert_eq!(restore(&context), Ok(true));
+    let backups = own_backups(&context);
+    assert_eq!(backups.len(), 5, "{backups:?}");
+    assert_eq!(backups[4], format!("{BACKUP_PREFIX}2999-12-31T23-59-59-999Z-05"), "{backups:?}");
+    assert_eq!(read(&context, &format!("{PROFILE_DIR}/{}", backups[4])), PROFILE_HAND);
+    // No name sorts after -99: the restore refuses and writes nothing.
+    write(&context, &format!("{PROFILE_DIR}/{BACKUP_PREFIX}2999-12-31T23-59-59-999Z-99"), "old\n");
+    write(&context, PROFILE_FILE, PROFILE_HAND);
+    let before = own_backups(&context);
+    assert!(restore(&context).is_err());
+    assert_eq!(read(&context, PROFILE_FILE), PROFILE_HAND);
+    assert_eq!(own_backups(&context), before);
 }
 
 #[test]
@@ -326,6 +363,49 @@ fn guard179_a_preset_missing_a_guarded_row_refuses() {
     let full = without_pwsh.replace("      - id: tool-fs\n", "      - id: tool-pwsh\n        disabled: true\n      - id: tool-fs\n");
     write(&context, PROFILE_FILE, &format!("{full}{good}"));
     assert_eq!(check(&context), Ok(()));
+}
+
+#[test]
+fn guard179_only_the_presets_own_plugin_rows_count() {
+    let (_root, context) = fixture("plugin-level");
+    write_compliant(&context);
+    let pwsh_row = "          - id: tool-pwsh\n            name: '@deepseek-ai/dsh-tool-pwsh'\n            disabled: true\n";
+    let cases = [
+        // A `tool-pwsh` item nested in another plugin's config list.
+        (
+            "              fetch: false\n",
+            "              fetch: false\n              examples:\n                - id: tool-pwsh\n                  disabled: true\n",
+        ),
+        // A `tool-pwsh` item in a list beside `plugins` in the preset's config, at the plugin items' column.
+        (
+            "            config: {}\n",
+            "            config: {}\n        examples:\n          - id: tool-pwsh\n            disabled: true\n",
+        ),
+    ];
+    for (find, replace) in cases {
+        edit_preset(&context, |text| text.replacen(pwsh_row, "", 1).replacen(find, replace, 1));
+        assert_eq!(problems(&context), vec!["missing-rows:preset1".to_string()], "{replace}");
+        write(&context, PRESET_FILE, PRESET);
+    }
+    assert_eq!(check(&context), Ok(()));
+}
+
+#[test]
+fn guard179_a_quoted_key_is_read_exactly_or_refused() {
+    let (_root, context) = fixture("quoted-keys");
+    write_compliant(&context);
+    let persona = "              prefix: |-\n                你是群里的普通成员。\n                - 不用列表回答。\n                说话简短。\n";
+    let cases = [
+        ("              \"pre\\u0066ix\": 像 AI 一样回答\n", "yaml:preset1"),
+        ("              \"pre\\x66ix\": 像 AI 一样回答\n", "yaml:preset1"),
+        ("              'prefix': 像 AI 一样回答\n", "persona-text:preset1"),
+        ("              \"prefix\": 像 AI 一样回答\n", "persona-text:preset1"),
+    ];
+    for (replace, expected) in cases {
+        edit_preset(&context, |text| text.replacen(persona, replace, 1));
+        assert_eq!(problems(&context), vec![expected.to_string()], "{replace}");
+        write(&context, PRESET_FILE, PRESET);
+    }
 }
 
 #[test]
@@ -593,7 +673,10 @@ fn guard179_a_failed_restore_is_recorded_and_prompts_stay_refused() {
     startup(&context);
     assert_eq!(read(&context, PROFILE_DIR), "not a folder\n");
     assert_eq!(admit(&context), Err(format!("{REFUSAL_PREFIX}profile-file")));
-    assert_eq!(alerts(&context).len(), 1);
+    let raised = alerts(&context);
+    assert_eq!(raised.len(), 2, "{raised:?}");
+    assert!(raised[0].contains("profile-restore"), "the failed restore alerts the owner: {raised:?}");
+    assert!(raised[1].contains("profile-file"), "{raised:?}");
 }
 
 #[cfg(unix)]
