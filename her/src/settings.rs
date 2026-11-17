@@ -161,11 +161,38 @@ pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf,
 /// file with one link or missing), and the connection never checkpoints on close, so a backup never changes the
 /// store. The schema is not checked: a store from a newer release is copied as it is. A store SQLite cannot read (a
 /// leftover journal, a file that is not a database) fails the snapshot.
+///
+/// A writer's last connection removes the WAL and its index when it closes, and the next writer creates them again,
+/// so a sidecar check can meet one halfway (on Windows a removed file refuses every open until its last handle
+/// closes). The sidecar checks are tried again until `WAL_SWITCH_WAIT`; the database's own checks are not, so a
+/// redirected or hard-linked store fails at once. Once this connection is open no writer is the last connection, so
+/// the sidecars stay for the snapshot.
 pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connection>, String> {
     if !context.is_isolated() {
         return Ok(None);
     }
-    let path = store_path(context)?;
+    let path = context
+        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    if file_len(&path)?.is_none() {
+        return Ok(None);
+    }
+    refuse_hard_links(&path)?;
+    let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+    while let Err(error) = check_sidecars(context) {
+        if std::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
+    Ok(Some(conn))
+}
+
+/// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or missing.
+fn check_sidecars(context: &RuntimeContext) -> Result<(), String> {
     for name in SIDECARS {
         let sidecar = context
             .resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)
@@ -173,14 +200,7 @@ pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connectio
         file_len(&sidecar)?;
         refuse_hard_links(&sidecar)?;
     }
-    if file_len(&path)?.is_none() {
-        return Ok(None);
-    }
-    refuse_hard_links(&path)?;
-    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
-    Ok(Some(conn))
+    Ok(())
 }
 
 fn schema_version(conn: &Connection) -> Result<i64, String> {
