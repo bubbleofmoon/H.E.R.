@@ -914,4 +914,68 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn mode_prompt_comes_from_the_store_per_profile_and_opens_the_system_message() {
+        let fixture = Fixture::new("mode-prompt", "chat");
+        let instruction = |mode: &str, conversation: &str| {
+            fixture.capture(mode, conversation).unwrap().instruction()
+        };
+        let save = |key: &str, text: &str| {
+            crate::settings::apply(&fixture.context, key, &json!(text), "administrator", "console")
+        };
+        assert_eq!(
+            instruction("chat", GROUP_KEY),
+            session_instruction(GROUP_KEY),
+            "no saved mode prompt: the session line alone, as before"
+        );
+        save("prompt.mode.chat", "群聊模式说明 140").unwrap();
+        save("prompt.mode.ownerPrivate", "这是你和管理员的私聊。140").unwrap();
+        save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
+        assert_eq!(
+            instruction("chat", GROUP_KEY),
+            format!("群聊模式说明 140\n\n{}", session_instruction(GROUP_KEY))
+        );
+        assert_eq!(
+            instruction("chat", OWNER_KEY),
+            format!("这是你和管理员的私聊。140\n\n{}", session_instruction(OWNER_KEY))
+        );
+        fixture.set_mode("closed-agent");
+        assert_eq!(
+            instruction("closed-agent", OWNER_KEY),
+            format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+        );
+        // Guarded at save: a denied term is refused and the saved prompt stays in effect.
+        assert_eq!(
+            save("prompt.mode.closedAgent", "你是一个助手").err(),
+            Some((400, "prompt.mode.closedAgent names a denied term: 助手".to_string()))
+        );
+        assert_eq!(
+            save("prompt.mode.closedAgent", &"鲸".repeat(8001)).err(),
+            Some((
+                400,
+                "prompt.mode.closedAgent must be text of at most 8000 characters, with no control character but line feed and tab"
+                    .to_string()
+            ))
+        );
+        assert!(instruction("closed-agent", OWNER_KEY).starts_with("封闭模式说明 140\n\n"));
+        // The longest accepted prompt is sent whole.
+        save("prompt.mode.closedAgent", &"鲸".repeat(8000)).unwrap();
+        assert_eq!(
+            instruction("closed-agent", OWNER_KEY),
+            format!("{}\n\n{}", "鲸".repeat(8000), session_instruction(OWNER_KEY))
+        );
+        // The model-view strip applies to the mode prompt.
+        save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
+        fixture.edit_config(|cfg| {
+            cfg["socialV2"] = json!({"context": {"stripFromModelText": ["封闭"]}})
+        });
+        assert_eq!(
+            instruction("closed-agent", OWNER_KEY),
+            format!("模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+        );
+        // An emptied prompt sends the session line alone again.
+        save("prompt.mode.closedAgent", "").unwrap();
+        assert_eq!(instruction("closed-agent", OWNER_KEY), session_instruction(OWNER_KEY));
+    }
 }

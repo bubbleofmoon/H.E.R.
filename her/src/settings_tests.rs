@@ -796,3 +796,273 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(quiet_view(&context)["value"], 4500, "the page's next list shows the new value");
 }
+
+// #140: prompt text as live data.
+
+/// A settings fixture whose memory database exists, so a prompt render can recall.
+fn prompt_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {
+    let (root, context) = settings_fixture(label);
+    drop(initialize_fixture_memory_database(&context));
+    (root, context)
+}
+
+fn set_text(context: &RuntimeContext, key: &str, value: Value) -> (u16, Value) {
+    admin_request(context, "POST", "/api/settings/set", Some(&json!({"setting": key, "value": value})))
+}
+
+/// What the next compatibility render of a group conversation sends; it carries the behaviour and sticker rules.
+fn next_render(context: &RuntimeContext) -> String {
+    crate::prompt::build_with_runtime(context, "group:101", "atMention", "小鲸鱼", "9001")
+}
+
+fn open_store(root: &FixtureRoot) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(settings_db(root), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap()
+}
+
+#[test]
+fn prompt_text_edit_is_live_on_the_next_wake_as_a_section_replacement() {
+    let (_root, context) = prompt_fixture("prompt text next wake");
+    let key = "group:101";
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", json!({"conversations":{
+        key:{"agentToken":"epoch-140","bootstrapSent":true,"lastUnreadSeq":1,"lastReadThroughSeq":0,"lastIncomingAt":1_000,
+            "unread":[{"seq":1,"sender":"甲","userId":"1001","text":"今天天气不错","time":1_000,"isSelf":false}],
+            "recentMessages":[],"wakeConfig":{"mode":"diving","infinite":true,"confirmedAt":1,"triggers":{"atMention":true}}}}})
+        .to_string().as_bytes()).unwrap();
+    crate::session_map::bind(&context, key, "sid-140", None).unwrap();
+    let mut allowed = context.load_config().unwrap();
+    allowed["allow"]["groups"] = json!([101]);
+    context.write_atomic(RuntimeArea::Config, "config.json", allowed.to_string().as_bytes()).unwrap();
+    context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved2"}"#).unwrap();
+    let open: crate::persona::Authority<'static> = &crate::persona::open_authority;
+    let id = crate::persona::create(&context, &json!({"name": "小鲸鱼", "core": "你是一只住在群里的小鲸鱼，爱聊天。"}), open)
+        .unwrap()["id"].as_str().unwrap().to_string();
+    crate::persona::approve(&context, &json!({"id": id, "version": 1}), open).unwrap();
+    crate::persona::assign(&context, &json!({"default": id}), open).unwrap();
+    // Each wake's message packet comes from the console route, served here twice.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let context = context.with_console_port(listener.local_addr().unwrap().port());
+    let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
+    let server = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            handle_conn(stream, served_cfg.clone(), served.clone());
+        }
+    });
+    let (briefing, _) = crate::prompt::prepare_dsh_wake(&context, &context.load_config().unwrap(), key, "sid-140", "epoch-140",
+        "atMention", "rpc-140-1", "").unwrap();
+    assert!(briefing.contains("【简报节 behaviour】\n【别像客服】你不是客服："), "{briefing}");
+    crate::session_context::observe(&context, key, "sid-140", "epoch-140", &json!({
+        "type": "user/message", "seq": 1, "data": {"source": {"rpcId": "rpc-140-1"}},
+    })).unwrap();
+    let edited = "【别像客服】改过的规则 140";
+    crate::settings::apply(&context, "prompt.notAClerk", &json!(edited), "administrator", "console").unwrap();
+    let (delta, _) = crate::prompt::prepare_dsh_wake(&context, &context.load_config().unwrap(), key, "sid-140", "epoch-140",
+        "atMention", "rpc-140-2", "").unwrap();
+    server.join().unwrap();
+    assert!(delta.contains("【唤醒增量】"), "{delta}");
+    assert!(delta.contains(&format!("【替换简报节 behaviour】完整替换旧节：\n{edited}\n\n【积极性】")), "{delta}");
+    assert!(!delta.contains("你不是客服"), "the old rule is gone: {delta}");
+    assert!(!delta.contains("【替换简报节 stickers】"), "only the edited section is replaced: {delta}");
+}
+
+#[test]
+fn prompt_text_save_is_checked_and_a_refusal_keeps_the_last_good_version() {
+    let (root, context) = prompt_fixture("prompt text refused");
+    assert!(next_render(&context).contains("【积极性】不要习惯性潜水"), "the compiled default renders");
+    let (status, body) = set_text(&context, "prompt.proactive", json!("【积极性】看心情接话 140"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"ok": true, "setting": "prompt.proactive", "value": "【积极性】看心情接话 140", "revision": 1, "changed": true}));
+    assert!(next_render(&context).contains("【积极性】看心情接话 140\n\n【在群里怎么说话】"), "the next render reads it");
+    let shape = "prompt.proactive must be text of at most 2000 characters, with no control character but line feed and tab";
+    for (value, error) in [
+        (json!("你是一个AI，要积极"), "prompt.proactive names a denied term: AI"),
+        (json!("我是ai"), "prompt.proactive names a denied term: AI"),
+        (json!("别提 DeepSeek 和 机器人"), "prompt.proactive names a denied term: deepseek, 机器人"),
+        (json!("ＤＳＨ 里的规则"), "prompt.proactive names a denied term: dsh"),
+        (json!("D\u{200b}SH 里的规则"), "prompt.proactive names a denied term: dsh"),
+        (json!("x".repeat(2001)), shape),
+        (json!("一行\r\n两行"), shape),
+        (json!("响铃\u{7}"), shape),
+        (json!(5), shape),
+        (Value::Null, shape),
+        (json!(["【积极性】"]), shape),
+    ] {
+        let (status, body) = set_text(&context, "prompt.proactive", value.clone());
+        assert_eq!(status, 400, "{value}: {body}");
+        assert_eq!(body["error"], error, "{value}");
+    }
+    assert!(next_render(&context).contains("【积极性】看心情接话 140\n\n"), "every refusal keeps the last good version");
+    assert_eq!(audit_rows(&root).len(), 1, "a refusal writes no audit row");
+    // The boundaries: 2000 characters (a Han character counts once) render whole, since a rule section is never cut;
+    // line feed and tab pass.
+    let longest = "鲸".repeat(2000);
+    let (status, body) = set_text(&context, "prompt.proactive", json!(longest));
+    assert_eq!(status, 200, "{body}");
+    assert!(next_render(&context).contains(&format!("{longest}\n\n【在群里怎么说话】")), "the longest text renders whole");
+    let (status, body) = set_text(&context, "prompt.proactive", json!("第一行\n\t第二行"));
+    assert_eq!(status, 200, "{body}");
+    assert!(next_render(&context).contains("第一行\n\t第二行\n\n【在群里怎么说话】"));
+    // An emptied text renders nothing; the other rules stay.
+    let (status, body) = set_text(&context, "prompt.proactive", json!(""));
+    assert_eq!(status, 200, "{body}");
+    let text = next_render(&context);
+    assert!(!text.contains("【积极性】") && text.contains("【别像客服】你不是客服") && text.contains("【在群里怎么说话】"), "{text}");
+}
+
+#[test]
+fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
+    let (root, context) = prompt_fixture("prompt text load guard");
+    for text in ["【别像客服】第一版 140", "【别像客服】第二版 140"] {
+        let (status, body) = set_text(&context, "prompt.notAClerk", json!(text));
+        assert_eq!(status, 200, "{body}");
+    }
+    let conn = open_store(&root);
+    // A row changed outside `apply`, or one holding a term a later release denies, is refused at load.
+    conn.execute("UPDATE settings SET value=?1 WHERE key='prompt.notAClerk'", [json!("【别像客服】我是 AI 140").to_string()])
+        .unwrap();
+    // Newer audit rows holding refused text too (old data: many of them) are passed over.
+    conn.execute_batch("BEGIN").unwrap();
+    for n in 0..500 {
+        conn.execute(
+            "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+             VALUES(0, 'test', 'test', 'global', 'prompt.notAClerk', NULL, ?1, ?2)",
+            rusqlite::params![json!(format!("【别像客服】AI {n}")).to_string(), format!("refused-{n}")],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    let text = next_render(&context);
+    assert!(text.contains("【别像客服】第二版 140\n\n") && !text.contains("我是 AI"), "the newest accepted audited value: {text}");
+    let (status, view) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{view}");
+    let entry = view["settings"].as_array().unwrap().iter().find(|entry| entry["key"] == "prompt.notAClerk").unwrap().clone();
+    assert_eq!(entry["stored"], "【别像客服】第二版 140", "{entry}");
+    assert_eq!(entry["value"], "【别像客服】第二版 140", "{entry}");
+    // A reset (an audit row without a new value) ends the search: the default applies.
+    conn.execute(
+        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+         VALUES(0, 'test', 'test', 'global', 'prompt.notAClerk', NULL, NULL, 'reset')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the default after a reset");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】第三版 140"));
+    assert_eq!(status, 200, "{body}");
+    assert!(next_render(&context).contains("【别像客服】第三版 140\n\n"), "a later save is in effect");
+
+    // Without an accepted stored or audited value, the file's value applies when accepted, else the default.
+    let (other_root, other) = prompt_fixture("prompt text file guard");
+    write_config(&other_root, |config| config["prompts"] = json!({"behaviour": {"notAClerk": "【别像客服】文件里的 AI 140"}}));
+    assert!(next_render(&other).contains("【别像客服】你不是客服："), "a refused file value renders the default");
+    write_config(&other_root, |config| config["prompts"] = json!({"behaviour": {"notAClerk": "【别像客服】文件里的版本 140"}}));
+    assert!(next_render(&other).contains("【别像客服】文件里的版本 140\n\n"), "an accepted file value renders");
+    let (status, body) = set_quiet(&other, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    let conn = open_store(&other_root);
+    conn.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('prompt.notAClerk', ?1, 1, 0, 'test')",
+        [json!("【别像客服】库里的 AI 140").to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(next_render(&other).contains("【别像客服】文件里的版本 140\n\n"), "a refused row with no audited value leaves the file's");
+}
+
+#[test]
+fn prompt_text_save_cut_off_before_its_audit_row_keeps_the_old_text() {
+    let (root, context) = prompt_fixture("prompt text cut off");
+    crate::settings::apply(&context, "prompt.groupConduct", &json!("【在群里怎么说话】旧版 140"), "administrator", "console")
+        .unwrap();
+    crate::settings::FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
+    let cut = crate::settings::apply(&context, "prompt.groupConduct", &json!("【在群里怎么说话】新版 140"), "administrator", "console");
+    assert_eq!(cut.err(), Some((503, "settings storage is unavailable".to_string())));
+    let text = next_render(&context);
+    assert!(text.contains("【在群里怎么说话】旧版 140\n\n") && !text.contains("新版 140"), "{text}");
+    assert_eq!(audit_rows(&root).len(), 1, "the cut-off save left no audit row");
+}
+
+#[test]
+fn prompt_text_readers_see_one_whole_version_while_writers_save() {
+    let (root, context) = prompt_fixture("prompt text concurrent");
+    let first = format!("【别像客服】{}", "甲".repeat(1990));
+    let second = format!("【别像客服】{}", "乙".repeat(1990));
+    let (a, b) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            for _ in 0..20 {
+                let text = next_render(&context);
+                let seen = [
+                    text.contains("【别像客服】你不是客服："),
+                    text.contains(&format!("{first}\n\n【积极性】")),
+                    text.contains(&format!("{second}\n\n【积极性】")),
+                ];
+                assert_eq!(seen.iter().filter(|seen| **seen).count(), 1, "one whole version: {text}");
+            }
+        });
+        let a = scope.spawn(|| crate::settings::apply(&context, "prompt.notAClerk", &json!(first.as_str()), "administrator", "console"));
+        let b = scope.spawn(|| crate::settings::apply(&context, "prompt.notAClerk", &json!(second.as_str()), "administrator", "console"));
+        reader.join().unwrap();
+        (a.join().unwrap().err(), b.join().unwrap().err())
+    });
+    assert_eq!((a, b), (None, None));
+    assert_eq!(audit_rows(&root).len(), 2);
+}
+
+#[test]
+fn prompt_text_works_on_a_store_written_before_it() {
+    // A store as #146 wrote it: schema version 1 with integer rows only. No migration is needed.
+    let (root, context) = prompt_fixture("prompt text old store");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the compiled defaults render");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】新版 140"));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revision"], 1);
+    assert!(next_render(&context).contains("【别像客服】新版 140\n\n"));
+    assert_eq!(next_use_quiet(&context), Some(4500), "the integer setting is untouched");
+    let version: i64 = open_store(&root).query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+    assert_eq!(version, 1, "the schema version is unchanged");
+}
+
+#[test]
+fn prompt_text_settings_page_edits_text_in_a_text_area() {
+    let (root, context) = settings_fixture("prompt text page");
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let (status, _, page) = crate::console_settings::route(&context, "GET", "/settings", "", false, &granted);
+    assert_eq!(status, 200, "{page}");
+    let (status, body) = admin_request(&context, "GET", "/api/settings", None);
+    assert_eq!(status, 200, "{body}");
+    let entry = |key: &str| body["settings"].as_array().unwrap().iter().find(|entry| entry["key"] == key).cloned();
+    let mode = entry("prompt.mode.chat").unwrap_or_else(|| panic!("prompt.mode.chat is listed: {body}"));
+    assert_eq!(mode["kind"], json!({"type": "text", "maxChars": 8000}));
+    assert_eq!((mode["default"].clone(), mode["stored"].clone(), mode["value"].clone()), (json!(""), Value::Null, json!("")));
+    assert_eq!(mode["group"], "prompt text");
+    let rule = entry("prompt.notAClerk").unwrap_or_else(|| panic!("prompt.notAClerk is listed: {body}"));
+    assert_eq!(rule["kind"], json!({"type": "text", "maxChars": 2000}));
+    assert!(rule["default"].as_str().unwrap().starts_with("【别像客服】你不是客服："), "{rule}");
+    assert!(
+        page.contains("s.kind.type==='text'") && page.contains("createElement(text?'textarea':'input')"),
+        "a text setting is edited in a text area"
+    );
+    assert!(
+        page.contains("value:text?input.value:Number(input.value)"),
+        "a text setting is sent as typed, an integer as a number"
+    );
+    assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
+    assert!(!settings_db(&root).exists(), "showing the page creates no store");
+}
+
+#[test]
+fn prompt_text_is_never_writable_from_chat() {
+    // The model must not rewrite its own prompt: the chat settings tool refuses every prompt pointer (#149 keeps it so).
+    let (root, context) = settings_fixture("prompt text chat");
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", br#"{"conversations":{"private:7001":{"agentToken":"owner-token-140"}}}"#)
+        .unwrap();
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    for pointer in ["prompts.behaviour.notAClerk", "prompts.mode.chat", "prompts.mode.closedAgent", "prompts", "prompts.mode"] {
+        let reply = crate::mcp::call_prepared("settings_set",
+            &json!({"key": "private:7001", "token": "owner-token-140", "settingKey": pointer, "value": "x"}), &context).to_string();
+        assert!(reply.contains("该项不可通过对话修改"), "{pointer}: {reply}");
+    }
+    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "nothing was written");
+}
