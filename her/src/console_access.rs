@@ -522,15 +522,21 @@ pub(super) fn reconcile_access_change(
     before: &Value,
     after: &Value,
     why: &str,
+    entry: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     if !context.is_isolated() {
         return (Vec::new(), Vec::new());
     }
-    reconcile_policies(context, before, after, &runtime_mode(context), why, after)
+    reconcile_policies(context, before, after, &runtime_mode(context), why, after, entry, &[])
 }
 
 /// `reconcile_access_change` for the policies `before` and `after` in `mode`; retired DSH sessions are stopped with
 /// the DSH settings of `dsh_cfg`. #192: a pending revocation is finished by this with its recorded policies and mode.
+/// The conversations it selects are recorded in its pending entry `entry` (`targets`) before any step runs, and
+/// `targets` (recorded by an earlier attempt) are selected again, so a retry revokes them whatever an interrupted
+/// attempt already changed (a retired mapping, a finished stop); the entry, and with it the targets, is removed only
+/// once every step succeeded.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_policies(
     context: &RuntimeContext,
     before: &Value,
@@ -538,9 +544,14 @@ fn reconcile_policies(
     mode: &str,
     why: &str,
     dsh_cfg: &Value,
+    entry: Option<&str>,
+    targets: &[String],
 ) -> (Vec<String>, Vec<String>) {
     let owner_changed = mode == "closed-agent" && owner_of(before) != owner_of(after);
-    let (keys, mut failures) = candidate_keys(context, before, after);
+    let (mut keys, mut failures) = candidate_keys(context, before, after);
+    keys.extend(targets.iter().cloned());
+    keys.sort();
+    keys.dedup();
     // Under `allowAllWhenEmpty` a conversation can be allowed without any record (a first contact
     // whose job is still queued): no key list can name it. A policy record ends the epoch of every
     // conversation the new policy does not admit (`turn_ledger::reset_count`).
@@ -556,10 +567,17 @@ fn reconcile_policies(
     let revoked: Vec<String> = keys
         .into_iter()
         .filter(|key| {
-            (agent::mode_allowed(before, mode, key) && !agent::mode_allowed(after, mode, key))
+            false && targets.contains(key) // #192 TEMPORARY RED MUTATION
+                || (agent::mode_allowed(before, mode, key) && !agent::mode_allowed(after, mode, key))
                 || (owner_changed && (mapped.contains(key) || stopped.contains(key)))
         })
         .collect();
+    if let Some(id) = entry {
+        if let Err(error) = record_targets(context, id, &revoked) {
+            failures.push(format!("the revocation targets were not recorded, nothing was revoked: {error}"));
+            return (Vec::new(), failures);
+        }
+    }
     for key in &revoked {
         if let Err(error) = revoke_key(context, dsh_cfg, key, why) {
             crate::safe_println!("[console] ⚠️ 撤销 {key} 失败：{error}");
@@ -772,15 +790,38 @@ fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
 }
 
 /// An entry carries both policies (`before`, `after`) as objects whose `allow` and `deny`, when present, are objects,
-/// as `begin_access_change` writes them. `mode` and `why` may be missing: the current mode and `access-revoked` are
-/// used.
+/// as `begin_access_change` writes them, and `targets`, when present, as an array of strings. `mode` and `why` may be
+/// missing: the current mode and `access-revoked` are used.
 fn usable_entry(entry: &Value) -> bool {
     ["before", "after"].iter().all(|side| {
         entry
             .get(*side)
             .and_then(Value::as_object)
             .is_some_and(|policy| ["allow", "deny"].iter().all(|list| policy.get(*list).is_none_or(Value::is_object)))
-    })
+    }) && entry.get("targets").is_none_or(|targets| targets.as_array().is_some_and(|keys| keys.iter().all(Value::is_string)))
+}
+
+/// #192: the conversations an earlier attempt selected for `entry` (`targets`).
+fn entry_targets(entry: &Value) -> Vec<String> {
+    entry["targets"].as_array().map(|keys| keys.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// #192: add `targets` to the pending entry `id` before any revocation step runs. The caller holds the closed-agent
+/// interaction gate.
+fn record_targets(context: &RuntimeContext, id: &str, targets: &[String]) -> Result<(), String> {
+    return Ok(()); // #192 TEMPORARY RED MUTATION
+    let mut pending = pending_revocations(context)?;
+    let Some(entry) = pending.iter_mut().find(|entry| entry["id"].as_str() == Some(id)) else {
+        return Err(format!("pending entry {id} is not recorded"));
+    };
+    let mut recorded = entry_targets(entry);
+    for key in targets {
+        if !recorded.contains(key) {
+            recorded.push(key.clone());
+        }
+    }
+    entry["targets"] = json!(recorded);
+    write_pending_revocations(context, &pending)
 }
 
 /// The whole record (`pending` and, #192 run 6, `stops`); an empty one when the file does not exist. A file that is not
@@ -810,24 +851,28 @@ fn write_pending_revocations(context: &RuntimeContext, pending: &[Value]) -> Res
     write_record_field(context, "pending", Value::Array(pending.to_vec()))
 }
 
-/// #192: the DSH session stops (`stops`: `{"key", "session"}`) recorded by `record_stop` that have not finished;
-/// malformed items are skipped (and kept in the file).
+/// #192: the DSH session stops (`stops`: `{"key", "session"}`) recorded by `record_stop` that have not finished. An
+/// absent field is no stop; a field that is not an array, or an item without a string `key` and `session`, is an
+/// error (so access changes are refused, as for an unusable pending entry).
 fn recorded_stops(context: &RuntimeContext) -> Result<Vec<(String, String)>, String> {
     let record = read_record(context)?;
-    Ok(record["stops"]
+    let Some(stops) = record.get("stops") else { return Ok(Vec::new()) };
+    let malformed = || format!("data/{PENDING_REVOCATIONS} has a malformed stop record; repair or remove it");
+    stops
         .as_array()
-        .map(|stops| {
-            stops
-                .iter()
-                .filter_map(|stop| Some((stop["key"].as_str()?.to_string(), stop["session"].as_str()?.to_string())))
-                .collect()
+        .ok_or_else(malformed)?
+        .iter()
+        .map(|stop| match (stop["key"].as_str(), stop["session"].as_str()) {
+            (Some(key), Some(session)) => Ok((key.to_string(), session.to_string())),
+            _ => Ok((String::new(), String::new())), // #192 TEMPORARY RED MUTATION
         })
-        .unwrap_or_default())
+        .collect()
 }
 
 /// #192: record a retired DSH session's stop as its own pending step, before its mapping is retired. The caller holds
 /// the closed-agent interaction gate.
 fn record_stop(context: &RuntimeContext, key: &str, session: &str) -> Result<(), String> {
+    recorded_stops(context)?;
     let mut stops = read_record(context)?["stops"].as_array().cloned().unwrap_or_default();
     let stop = json!({"key": key, "session": session});
     if !stops.contains(&stop) {
@@ -838,6 +883,7 @@ fn record_stop(context: &RuntimeContext, key: &str, session: &str) -> Result<(),
 
 /// #192: remove a finished stop from the record. The caller holds the closed-agent interaction gate.
 fn forget_stop(context: &RuntimeContext, key: &str, session: &str) -> Result<(), String> {
+    recorded_stops(context)?;
     let mut stops = read_record(context)?["stops"].as_array().cloned().unwrap_or_default();
     let stop = json!({"key": key, "session": session});
     stops.retain(|recorded| recorded != &stop);
@@ -933,7 +979,7 @@ pub(super) fn finish_access_change(
             hook(context.config_file());
         }
     }
-    let (revoked, mut failures) = reconcile_access_change(context, interaction_gate, before, after, why);
+    let (revoked, mut failures) = reconcile_access_change(context, interaction_gate, before, after, why, pending.as_deref());
     if failures.is_empty() {
         if let Err(error) = forget_access_change(context, &pending) {
             failures.push(format!("the finished revocation is still recorded as pending: {error}"));
@@ -954,31 +1000,44 @@ fn finish_pending_revocations_locked(
     if !context.is_isolated() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let pending = pending_revocations(context)?;
+    let mut pending = pending_revocations(context)?;
     if pending.is_empty() && recorded_stops(context)?.is_empty() {
         return Ok((Vec::new(), Vec::new()));
+    }
+    // #192: every entry carries an id (a hand-written one may not), so its targets can be recorded against it.
+    if pending.iter().any(|entry| !entry["id"].is_string()) {
+        for entry in pending.iter_mut().filter(|entry| !entry["id"].is_string()) {
+            entry["id"] = json!(crate::turn_ledger::mint_id("revoke-"));
+        }
+        write_pending_revocations(context, &pending)?;
     }
     // Retired DSH sessions are stopped with the DSH settings in force now.
     let current = context.load_config().unwrap_or_else(|_| json!({}));
     let mut revoked = Vec::new();
     let mut failures = Vec::new();
-    let mut left = Vec::new();
-    let had_pending = !pending.is_empty();
-    for entry in pending {
+    let mut finished: Vec<String> = Vec::new();
+    for entry in &pending {
+        let id = entry["id"].as_str().unwrap_or_default();
         let why = entry["why"].as_str().unwrap_or("access-revoked").to_string();
         let mode = entry["mode"].as_str().map(str::to_string).unwrap_or_else(|| runtime_mode(context));
-        let (keys, entry_failures) = reconcile_policies(context, &entry["before"], &entry["after"], &mode, &why, &current);
+        let targets = entry_targets(entry);
+        let (keys, entry_failures) =
+            reconcile_policies(context, &entry["before"], &entry["after"], &mode, &why, &current, Some(id), &targets);
         for key in keys {
             if !revoked.contains(&key) {
                 revoked.push(key);
             }
         }
-        if !entry_failures.is_empty() {
+        if entry_failures.is_empty() {
+            finished.push(id.to_string());
+        } else {
             failures.extend(entry_failures);
-            left.push(entry);
         }
     }
-    if had_pending {
+    // The record is read again: the attempts above recorded their targets (and stops) in it.
+    if !finished.is_empty() {
+        let mut left = pending_revocations(context)?;
+        left.retain(|entry| !entry["id"].as_str().is_some_and(|id| finished.iter().any(|done| done == id)));
         write_pending_revocations(context, &left).map_err(|e| format!("the finished revocations are still recorded as pending: {e}"))?;
     }
     // #192: every recorded DSH stop that has not finished runs again in the background (one already running in this

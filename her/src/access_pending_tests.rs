@@ -367,3 +367,74 @@ fn t192_an_owner_change_retried_after_a_crash_still_selects_a_retired_mapping() 
     );
     assert!(pending(&root).is_empty());
 }
+
+#[test]
+fn t192_revocation_targets_are_recorded_before_the_steps_and_kept_until_all_succeed() {
+    let (root, context) = admitted("t192 targets kept");
+    assert!(crash_after_write(&context, || conversation_scope_change(&context, GROUP, "remove")));
+    assert!(pending(&root)[0].get("targets").is_none(), "no revocation attempt ran yet");
+    // A damaged session map makes the attempt fail after its selection.
+    let sessions = root.0.join("data/sessions.json");
+    let mapping = std::fs::read(&sessions).unwrap();
+    std::fs::write(&sessions, "{ damaged").unwrap();
+    let (_, failures) = access::finish_pending_revocations(&context).unwrap();
+    assert!(!failures.is_empty(), "the attempt failed");
+    assert_eq!(pending(&root)[0]["targets"], json!([GROUP]), "its targets were recorded before its steps and stay after the failure");
+    std::fs::write(&sessions, &mapping).unwrap();
+    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    assert_eq!((revoked, failures), (vec![GROUP.to_string()], Vec::<String>::new()));
+    assert!(pending(&root).is_empty(), "every step succeeded: the entry and its targets are gone");
+}
+
+#[test]
+fn t192_a_retried_owner_change_selects_its_recorded_targets_after_the_stop_cleared() {
+    let (root, context) = admitted("t192 owner targets");
+    // What the gate review describes: an attempt recorded `group:420046` as a target, retired its mapping, failed to
+    // rotate its token, and its DSH stop then finished, so neither a mapping nor a stop names it any more.
+    std::fs::write(
+        root.0.join("data").join(access::PENDING_REVOCATIONS),
+        json!({"pending": [{"id": "revoke-t192-targets", "why": "access-revoked", "mode": "closed-agent",
+                            "before": {"ownerQQ": 8808}, "after": {"ownerQQ": 8809}, "targets": ["group:420046"]}]})
+        .to_string(),
+    )
+    .unwrap();
+    mutate_social_state_for(&context, |state| {
+        state["conversations"]["group:420046"] = json!({"agentToken": "old-target-token-abcdefghij", "bootstrapSent": true});
+        Ok(())
+    })
+    .unwrap();
+    let (revoked, failures) = access::finish_pending_revocations(&context).unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(revoked.contains(&"group:420046".to_string()), "the recorded target is selected again: {revoked:?}");
+    assert_ne!(
+        conversation_token(&context, "group:420046").unwrap().as_deref(),
+        Some("old-target-token-abcdefghij"),
+        "its token is rotated before the entry clears"
+    );
+    assert!(pending(&root).is_empty());
+}
+
+#[test]
+fn t192_a_malformed_stop_record_refuses_access_changes() {
+    let (root, context) = admitted("t192 malformed stops");
+    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let config = root.0.join("config/config.json");
+    for stops in [
+        json!([{"key": "group:420046"}]),
+        json!({"key": "group:420046", "session": "dsh-t192-malformed"}),
+        json!([{"key": 420046, "session": "dsh-t192-malformed"}]),
+    ] {
+        let text = json!({"pending": [], "stops": stops.clone()}).to_string();
+        std::fs::write(&record, &text).unwrap();
+        let before = std::fs::read(&config).unwrap();
+        let error = conversation_scope_change(&context, "group:420043", "admit").unwrap_err();
+        assert_eq!(error.0, 503, "{stops}: {error:?}");
+        assert!(error.1.contains("malformed stop record"), "{stops}: {error:?}");
+        assert_eq!(std::fs::read(&config).unwrap(), before, "{stops}: nothing is written");
+        assert!(access::finish_pending_revocations(&context).is_err(), "{stops}: console start reports it");
+        assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "{stops}: the record is kept for repair");
+    }
+    // A record without the field (every record written before run 6) stays accepted.
+    std::fs::write(&record, json!({"pending": []}).to_string()).unwrap();
+    conversation_scope_change(&context, "group:420043", "admit").expect("a record without stops accepts changes");
+}
