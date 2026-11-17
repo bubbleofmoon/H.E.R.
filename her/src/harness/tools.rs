@@ -115,15 +115,27 @@ impl Tools {
         self.authority.as_ref().map(|a| session_instruction(&a.conversation)).unwrap_or_default()
     }
 
-    pub(super) fn model_tools(&self) -> Vec<Tool> {
-        self.definitions
+    /// The tools offered to the next model request: the captured menu, narrowed by the current
+    /// authority (mode, allow-list, owner, token) and tool switches. The harness asks before every
+    /// model request, so a switch turned off mid-turn leaves the menu before the next request; a
+    /// switch turned back on restores only a tool the turn captured.
+    pub(super) fn model_tools(&self) -> Result<Vec<Tool>, CheckError> {
+        // Red stub (#160 run 3, model_tools): 3B replaces this line and the next.
+        let current: Option<Vec<Value>> = None;
+        Ok(self
+            .definitions
             .iter()
+            .filter(|d| {
+                current
+                    .as_ref()
+                    .is_none_or(|current| current.iter().any(|c| c["name"] == d["name"]))
+            })
             .map(|d| {
                 Tool::new(d["name"].as_str().unwrap_or_default())
                     .with_description(d["description"].as_str().unwrap_or_default())
                     .with_schema(d["inputSchema"].clone())
             })
-            .collect()
+            .collect())
     }
 
     /// Validate the captured schema and authority before recording the start intent.
@@ -420,8 +432,6 @@ mod tests {
                 "qq_list_groups",
                 "qq_get_group_members",
                 "qq_get_group_history",
-                "qq_send_group_message",
-                "qq_reply",
                 "qq_send_private_message",
                 "qq_get_message_images",
                 "memory_write",
@@ -808,5 +818,69 @@ mod tests {
         let settings = |key: &str| call("settings_get", json!({"key": key, "token": ""}));
         assert!(refusal_text(&group.prepare(&settings(GROUP_KEY)).unwrap_err()).contains("not found"));
         assert!(owner.prepare(&settings(OWNER_KEY)).is_ok());
+    }
+
+    /// The names the next model request would offer; panics when authority refuses the menu.
+    fn offered(tools: &Tools) -> Vec<String> {
+        match tools.model_tools() {
+            Ok(offered) => offered.iter().map(|t| t.name.as_str().to_string()).collect(),
+            Err(_) => panic!("authority refused the menu"),
+        }
+    }
+
+    #[test]
+    fn menu_model_tools_narrow_before_each_request_and_refuse_after_a_mode_change() {
+        let fixture = Fixture::new("model-tools", "closed-agent");
+        let admin = fixture.capture("closed-agent", OWNER_KEY).unwrap();
+        assert_eq!(offered(&admin), Profile::ClosedAgent.menu());
+        fixture.edit_config(|cfg| cfg["socialV2"] = json!({"tools": {"getImages": false}}));
+        let narrowed = offered(&admin);
+        assert!(
+            !narrowed.iter().any(|name| name == "qq_get_message_images"),
+            "a switch turned off mid-turn stayed on the menu: {narrowed:?}"
+        );
+        assert_eq!(narrowed.len(), Profile::ClosedAgent.menu().len() - 1);
+        assert_eq!(
+            names(admin.definitions()),
+            Profile::ClosedAgent.menu(),
+            "the admission record keeps the captured menu"
+        );
+        fixture.edit_config(|cfg| cfg["socialV2"] = json!({"tools": {"getImages": true}}));
+        assert_eq!(
+            offered(&admin),
+            Profile::ClosedAgent.menu(),
+            "a switch turned back on restores a captured tool"
+        );
+        fixture.set_mode("chat");
+        assert!(matches!(admin.model_tools(), Err(CheckError::Revoked(_))));
+    }
+
+    #[test]
+    fn menu_direct_send_switches_narrow_every_menu_like_the_console() {
+        let fixture = Fixture::new("send-switches", "closed-agent");
+        fixture.edit_config(|cfg| cfg["socialV2"] = json!({"tools": {"sendPrivate": false}}));
+        let admin = fixture.capture("closed-agent", OWNER_KEY).unwrap();
+        assert!(!names(admin.definitions()).contains(&"qq_send_private_message"));
+        let send = call(
+            "qq_send_private_message",
+            json!({"userId": 8808, "message": "hello"}),
+        );
+        assert!(refusal_text(&admin.prepare(&send).unwrap_err()).contains("not found"));
+        for (flag, tool) in [
+            ("sendPrivate", "qq_send_private_message"),
+            ("sendGroup", "qq_send_group_message"),
+            ("reply", "qq_reply"),
+        ] {
+            let listed = |value: Value| {
+                let cfg = json!({"socialV2": {"tools": {flag: value}}});
+                names(&definitions(&cfg, Profile::Reserved2)).contains(&tool)
+            };
+            assert!(!listed(json!(false)), "{flag} false");
+            assert!(listed(json!(true)), "{flag} true");
+            assert!(
+                listed(json!("false")),
+                "only an explicit false switches {flag} off, as the console reads it"
+            );
+        }
     }
 }

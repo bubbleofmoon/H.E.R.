@@ -3129,13 +3129,11 @@ const OWNER_CHAT_MENU: [&str; 11] = [
 ];
 
 /// The owner's private chat in closed-agent mode (#160).
-const CLOSED_AGENT_MENU: [&str; 18] = [
+const CLOSED_AGENT_MENU: [&str; 16] = [
     "qq_status",
     "qq_list_groups",
     "qq_get_group_members",
     "qq_get_group_history",
-    "qq_send_group_message",
-    "qq_reply",
     "qq_send_private_message",
     "qq_get_message_images",
     "memory_write",
@@ -3265,4 +3263,45 @@ fn menu_a_mode_transition_changes_the_owner_menu_on_the_next_turn_without_carryi
         !next.to_string().contains("qq_list_groups"),
         "the chat-mode turn carried the closed-agent menu or history: {next}"
     );
+}
+
+#[test]
+fn menu_a_switch_turned_off_mid_turn_leaves_the_next_model_request() {
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            json!({"id":"status-then-switch","name":"qq_status","arguments":{}}),
+        ]),
+        ModelReply::Text("menu narrowed".into()),
+    ]);
+    let mut rig = owner_harness_rig("harness-160-mid-turn-switch", &model);
+    // The status tool's OneBot read turns the image switch off once the turn has asked the model.
+    let (config, asked) = (rig.root.join("config/config.json"), model.requests.clone());
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, _| {
+        if action == "get_login_info" && !lock(&asked).is_empty() {
+            let mut cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+            cfg["socialV2"]["tools"]["getImages"] = json!(false);
+            let staged = config.with_extension("json.160");
+            fs::write(&staged, cfg.to_string()).unwrap();
+            fs::rename(&staged, &config).unwrap();
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "check the status");
+    assert!(
+        wait_for(LONG, || lock(&model.requests).len() == 2),
+        "the turn never asked the model again"
+    );
+    let requests = lock(&model.requests);
+    let first = offered_tools(&requests[0]);
+    assert!(
+        first.iter().any(|name| name == "qq_get_message_images"),
+        "{first:?}"
+    );
+    let next = offered_tools(&requests[1]);
+    assert!(
+        !next.iter().any(|name| name == "qq_get_message_images"),
+        "a switch turned off mid-turn stayed on the next request's menu: {next:?}"
+    );
+    assert_eq!(next.len(), first.len() - 1, "{next:?}");
 }
