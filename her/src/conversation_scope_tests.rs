@@ -206,55 +206,65 @@ fn t186_cli_entry_waits_for_background_session_stops_within_its_limit() {
 
 #[test]
 fn t186_concurrent_admits_lose_no_update() {
-    use std::time::Duration;
+    enum Signal {
+        Reached,
+        Finished,
+    }
+    /// Sends `Finished` when the first admit's thread ends, also while unwinding.
+    struct FinishGuard(std::sync::mpsc::Sender<Signal>);
+    impl Drop for FinishGuard {
+        fn drop(&mut self) {
+            let _ = self.0.send(Signal::Finished);
+        }
+    }
     let (root, context) = scoped(
         "t186 concurrent",
         json!({"allow": {"groups": [], "private": []}, "rollout": {"enabled": true, "rustGroups": []}}),
     );
-    // The first admit stops between its read and its write until released; the second reports when it has read.
-    let (first_read_tx, first_read) = std::sync::mpsc::channel::<()>();
-    let (second_read_tx, second_read) = std::sync::mpsc::channel::<()>();
+    // The first admit stops between its read and its write, holding both gates, until released.
+    let (signal_tx, signal) = std::sync::mpsc::channel::<Signal>();
     let (release_tx, release) = std::sync::mpsc::channel::<()>();
     let release = std::sync::Mutex::new(release);
-    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| match key {
-        "group:420051" => {
-            first_read_tx.send(()).unwrap();
-            let _ = release.lock().unwrap_or_else(|p| p.into_inner()).recv_timeout(Duration::from_secs(10));
+    let reached = signal_tx.clone();
+    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| {
+        if key == "group:420051" {
+            let _ = reached.send(Signal::Reached);
+            // Returns when released, or when the test drops the sender while unwinding.
+            let _ = release.lock().unwrap_or_else(|p| p.into_inner()).recv();
         }
-        "group:420052" => {
-            let _ = second_read_tx.send(());
-        }
-        _ => {}
     }));
-    let (first, second, second_read_early) = std::thread::scope(|threads| {
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    let (first, second, during) = std::thread::scope(|threads| {
+        // Owned by this closure, so a panic here drops it and frees the held admit.
+        let release_tx = release_tx;
+        let finished = FinishGuard(signal_tx);
         let first_context = context.clone();
-        let first = threads.spawn(move || conversation_scope_change(&first_context, "group:420051", "admit"));
-        first_read.recv_timeout(Duration::from_secs(10)).expect("the first admit reached the point between its read and its write");
-        let second_context = context.clone();
-        let mut second = Some(threads.spawn(move || conversation_scope_change(&second_context, "group:420052", "admit")));
-        // Serialized, the second admit waits on the gates and cannot read yet; unserialized it reads the old file now.
-        let second_read_early = second_read.recv_timeout(Duration::from_secs(2)).is_ok();
-        // Unserialized: let the second write land first, so the held first write is the stale one.
-        let early = if second_read_early { Some(second.take().unwrap().join().unwrap()) } else { None };
-        release_tx.send(()).unwrap();
-        let first = first.join().unwrap();
-        let second = match early {
-            Some(result) => result,
-            None => second.take().unwrap().join().unwrap(),
-        };
-        (first, second, second_read_early)
+        let first = threads.spawn(move || {
+            let _finished = finished;
+            conversation_scope_change(&first_context, "group:420051", "admit")
+        });
+        let held = matches!(signal.recv(), Ok(Signal::Reached));
+        // While the first admit holds the gates, the second runs synchronously on this thread.
+        let second = if held { Some(conversation_scope_change(&context, "group:420052", "admit")) } else { None };
+        let during = std::fs::read(root.0.join("config/config.json")).unwrap();
+        let _ = release_tx.send(());
+        (first.join().unwrap(), second, during)
     });
     *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    let second = second.expect("the first admit ended before it reached the point between its read and its write");
+    assert!(second.is_err(), "the second admit must be refused while the first holds the gates: {second:?}");
+    assert_eq!(second.unwrap_err().0, 503, "a busy gate refuses with 503");
+    assert_eq!(during, before, "the refused second admit wrote nothing");
+    assert_eq!(first.expect("the first admit applies")["changed"], json!(["allow.groups", "rollout.rustGroups"]));
     let config = file(&root);
-    for key in ["group:420051", "group:420052"] {
-        assert!(config["rollout"]["rustGroups"].as_array().unwrap().contains(&json!(key)), "a concurrent admit lost an update: {key} {config}");
-        assert!(inbound_admitted(&context.load_config().unwrap(), key), "a concurrent admit lost an update: {key} {config}");
-    }
-    assert_eq!(config["allow"]["groups"], json!([420051, 420052]), "the second admit read after the first one wrote");
-    assert!(!second_read_early, "the second admit read the configuration while the first was between its read and its write");
-    for reply in [first, second] {
-        assert_eq!(reply.expect("each admit applies")["changed"], json!(["allow.groups", "rollout.rustGroups"]));
-    }
+    assert_eq!(config["allow"]["groups"], json!([420051]), "only the first admit was written");
+    assert_eq!(config["rollout"]["rustGroups"], json!(["group:420051"]));
+    let retry = conversation_scope_change(&context, "group:420052", "admit").expect("the retried second admit applies");
+    assert_eq!(retry["changed"], json!(["allow.groups", "rollout.rustGroups"]));
+    let config = file(&root);
+    assert_eq!(config["allow"]["groups"], json!([420051, 420052]), "no update was lost");
+    assert_eq!(config["rollout"]["rustGroups"], json!(["group:420051", "group:420052"]));
+    assert!(inbound_admitted(&context.load_config().unwrap(), "group:420052"));
 }
 
 #[test]

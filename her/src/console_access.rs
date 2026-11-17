@@ -328,9 +328,10 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
             .is_some_and(|listed| listed == key)
     };
     let served_same = |value: &Value| value.as_str().and_then(canonical_v2_key).is_some_and(|served| served == key);
-    let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
+    // #186 FR2-1 temporary mutation: no closed-agent interaction gate (reverted in FR2-2).
+    let interaction = std::fs::File::open(context.config_file()).map_err(|_| (503, "FR2-1 mutation".to_string()))?;
     let (before, after, changed) = {
-        let _gate = acquire_social_state_gate(context)?;
+        // #186 FR2-1 temporary mutation: no social gate (reverted in FR2-2).
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         let mut file = read_config_object(context)?;
         #[cfg(test)]
