@@ -1978,6 +1978,48 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// #192 (F3): the hub handles an event with the configuration its caller read, even when `config.json` cannot be
+    /// read any more by the time the event reaches it; `handle`, which reads the file itself, refuses then.
+    #[tokio::test]
+    async fn t192_handle_with_config_uses_the_callers_read_while_the_file_is_unreadable() {
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-t192-callers-read-{}", crate::turn_ledger::mint_id(""))));
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config = json!({"consoleToken":"synthetic-hold-token","allow":{"groups":[420042]},"slang":{"enabled":false}});
+        std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1","onebot_ws":"ws://127.0.0.1:1"}"#).unwrap();
+        let state = json!({"conversations":{"group:420042":{"agentToken":"test-token","bootstrapSent":true,"unread":[],"recentMessages":[],"wakeConfig":{"confirmedAt":1,"mode":"diving","infinite":true,"triggers":{"atMention":true}}}}});
+        std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
+        let mut hub = Hub::new(&context, journal, vec!["group:420042".into()], false);
+        hub.tick("bot", 9001).await.unwrap();
+        let read = context.load_config().unwrap();
+        std::fs::write(root.join("config/config.json"), "{ not json").unwrap();
+        let frame = |message_id: i64| json!({"post_type":"message","message_type":"group","group_id":420042,"user_id":1001,"message_id":message_id,"message":[{"type":"text","data":{"text":"held probe"}}]});
+        let first = frame(19201);
+        let ev: crate::Event = serde_json::from_value(first.clone()).unwrap();
+        assert!(
+            hub.handle(&ev, &first.to_string(), false, 9001, "bot", &HashMap::new()).await.is_err(),
+            "a hub that reads the unreadable file itself cannot decide"
+        );
+        let second = frame(19202);
+        let ev: crate::Event = serde_json::from_value(second.clone()).unwrap();
+        hub.handle_with_config(read, &ev, &second.to_string(), false, 9001, "bot", &HashMap::new())
+            .await
+            .expect("the caller's read decides the event");
+        let event = inbound::event_key("group:420042", "message", Some("19202"), &second.to_string());
+        assert_eq!(
+            hub.journal.record_received(event, "group:420042".into(), second.to_string(), 2).await.unwrap(),
+            inbound::Receipt::Duplicate,
+            "the event was recorded with the caller's read"
+        );
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// #186: the administrator adds `deny` for one group and keeps it in `allow`.
     fn t186_deny_keeping_allow(root: &std::path::Path, group: i64) {
         let path = root.join("config/config.json");
@@ -2547,6 +2589,22 @@ impl Hub {
         cards: &HashMap<i64, String>,
     ) -> Result<(), String> {
         let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+        self.handle_with_config(cfg, ev, raw, replayed, self_id, nick, cards).await
+    }
+
+    /// #192 (F3): `handle` with the configuration the caller read for this event: the main loop reads it once, holds
+    /// the event while it cannot, and hands the same read here, so the gate and the handling never see two reads.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handle_with_config(
+        &mut self,
+        cfg: Value,
+        ev: &crate::Event,
+        raw: &str,
+        replayed: bool,
+        self_id: i64,
+        nick: &str,
+        cards: &HashMap<i64, String>,
+    ) -> Result<(), String> {
         self.adopt_mode(&cfg, crate::now_ms() as i64).await?;
         self.refresh_recovered(&cfg, crate::now_ms() as i64).await?;
         let key = match (ev.post_type.as_str(), ev.message_type.as_str()) {

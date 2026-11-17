@@ -1324,6 +1324,8 @@ fn ensure(
         // Upstream output may contain keys or login data. Only HER lifecycle metadata is retained.
         command.stdout(Stdio::null()).stderr(Stdio::null());
     } else if dependency.name == "dsh" {
+        // #179: DSH boots with HER's guarded profile rows in an installed runtime (a failure is recorded).
+        crate::dsh_profile::restore_for_start(context);
         let home = context
             .resolve_path(RuntimeArea::DshUser, "", PathIntent::CreateDirectory)
             .map_err(str::to_string)?;

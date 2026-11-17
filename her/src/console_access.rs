@@ -232,9 +232,10 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
     // Access changes are serialized with closed-agent receipts, mode changes and resets: the gate
     // is taken before anything is written, so its failure leaves the configuration unchanged.
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
+    finish_pending_before_change(context, &interaction)?;
     // The revocation compares the policy the runtime authorizes with (canonical lists and the
     // closed-agent owner overlay), read under the same gate as the write.
-    let (before, after, file) = {
+    let (before, after, file, pending) = {
         let _gate = acquire_social_state_gate(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         let mut file = read_config_object(context)?;
@@ -269,12 +270,13 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         object.insert("allow".into(), allow);
         object.insert("deny".into(), deny);
         object.insert("ownerQQ".into(), owner);
-        write_config_object(context, &file)?;
         // A written configuration the runtime cannot load revokes everything the old one allowed.
-        let effective_after = context.load_config().unwrap_or_else(|_| json!({}));
-        (effective_before, effective_after, file)
+        let effective_after = context.effective_config(&file).unwrap_or_else(|_| json!({}));
+        let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
+        write_config_or_forget(context, &file, &before, &pending)?;
+        (effective_before, effective_after, file, pending)
     };
-    let (retired, failures) = reconcile_access_change(context, &interaction, &before, &after, "access-revoked");
+    let (retired, failures) = finish_access_change(context, &interaction, &before, &after, "access-revoked", pending);
     drop(interaction);
     if !failures.is_empty() {
         return Err((500, format!("白名单已保存，但立即撤销未完成：{}", failures.join("；"))));
@@ -328,10 +330,13 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
     };
     let served_same = |value: &Value| value.as_str().and_then(canonical_v2_key).is_some_and(|served| served == key);
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-    let (before, after, changed) = {
+    finish_pending_before_change(context, &interaction)?;
+    let (before, after, changed, pending) = {
         let _gate = acquire_social_state_gate(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         let mut file = read_config_object(context)?;
+        // #192: the file as read, to tell a write that failed before publication from one that published.
+        let unchanged = file.clone();
         #[cfg(test)]
         {
             // Bound first, so the hook never runs while the seam's own lock is held.
@@ -377,17 +382,20 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
             file["rollout"]["rustGroups"] = Value::Array(served);
             changed.push("rollout.rustGroups".to_string());
         }
-        if !changed.is_empty() {
-            write_config_object(context, &file)?;
+        if changed.is_empty() {
+            (effective_before.clone(), effective_before, changed, None)
+        } else {
+            // A written configuration the runtime cannot load revokes everything the old one allowed.
+            let effective_after = context.effective_config(&file).unwrap_or_else(|_| json!({}));
+            let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
+            write_config_or_forget(context, &file, &unchanged, &pending)?;
+            (effective_before, effective_after, changed, pending)
         }
-        // A written configuration the runtime cannot load revokes everything the old one allowed.
-        let effective_after = context.load_config().unwrap_or_else(|_| json!({}));
-        (effective_before, effective_after, changed)
     };
     let (retired, failures) = if changed.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        reconcile_access_change(context, &interaction, &before, &after, "access-revoked")
+        finish_access_change(context, &interaction, &before, &after, "access-revoked", pending)
     };
     drop(interaction);
     if !failures.is_empty() {
@@ -493,6 +501,11 @@ fn candidate_keys(context: &RuntimeContext, before: &Value, after: &Value) -> (V
     if let Some(owner) = owner_of(before).as_i64() {
         keys.push(format!("private:{owner}"));
     }
+    // #192: a retired session's recorded stop still names its conversation after the mapping is gone.
+    match recorded_stops(context) {
+        Ok(stops) => keys.extend(stops.into_iter().map(|(key, _)| key)),
+        Err(error) => failures.push(error),
+    }
     keys.sort();
     keys.dedup();
     (keys, failures)
@@ -509,31 +522,64 @@ pub(super) fn reconcile_access_change(
     before: &Value,
     after: &Value,
     why: &str,
+    entry: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
     if !context.is_isolated() {
         return (Vec::new(), Vec::new());
     }
-    let mode = runtime_mode(context);
+    reconcile_policies(context, before, after, &runtime_mode(context), why, after, entry, &[])
+}
+
+/// `reconcile_access_change` for the policies `before` and `after` in `mode`; retired DSH sessions are stopped with
+/// the DSH settings of `dsh_cfg`. #192: a pending revocation is finished by this with its recorded policies and mode.
+/// The conversations it selects are recorded in its pending entry `entry` (`targets`) before any step runs, and
+/// `targets` (recorded by an earlier attempt) are selected again, so a retry revokes them whatever an interrupted
+/// attempt already changed (a retired mapping, a finished stop); the entry, and with it the targets, is removed only
+/// once every step succeeded.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_policies(
+    context: &RuntimeContext,
+    before: &Value,
+    after: &Value,
+    mode: &str,
+    why: &str,
+    dsh_cfg: &Value,
+    entry: Option<&str>,
+    targets: &[String],
+) -> (Vec<String>, Vec<String>) {
     let owner_changed = mode == "closed-agent" && owner_of(before) != owner_of(after);
-    let (keys, mut failures) = candidate_keys(context, before, after);
+    let (mut keys, mut failures) = candidate_keys(context, before, after);
+    keys.extend(targets.iter().cloned());
+    keys.sort();
+    keys.dedup();
     // Under `allowAllWhenEmpty` a conversation can be allowed without any record (a first contact
     // whose job is still queued): no key list can name it. A policy record ends the epoch of every
     // conversation the new policy does not admit (`turn_ledger::reset_count`).
-    if admits_unlisted(before, &mode) && access_policy(before) != access_policy(after) {
-        if let Err(error) = crate::turn_ledger::record_policy_reset(context, &access_policy(after), &mode, why) {
+    if admits_unlisted(before, mode) && access_policy(before) != access_policy(after) {
+        if let Err(error) = crate::turn_ledger::record_policy_reset(context, &access_policy(after), mode, why) {
             failures.push(format!("策略重置记录写入失败：{error}"));
         }
     }
     let mapped: Vec<String> = crate::session_map::all(context).unwrap_or_default().into_iter().map(|(k, _)| k).collect();
+    // #192: a retry after a crash between a mapping's retirement and its token rotation finds the conversation through
+    // the retired session's recorded stop (`record_stop` runs before `retire_if`), not only through current mappings.
+    let stopped: Vec<String> = recorded_stops(context).unwrap_or_default().into_iter().map(|(key, _)| key).collect();
     let revoked: Vec<String> = keys
         .into_iter()
         .filter(|key| {
-            (agent::mode_allowed(before, &mode, key) && !agent::mode_allowed(after, &mode, key))
-                || (owner_changed && mapped.contains(key))
+            targets.contains(key)
+                || (agent::mode_allowed(before, mode, key) && !agent::mode_allowed(after, mode, key))
+                || (owner_changed && (mapped.contains(key) || stopped.contains(key)))
         })
         .collect();
+    if let Some(id) = entry {
+        if let Err(error) = record_targets(context, id, &revoked) {
+            failures.push(format!("the revocation targets were not recorded, nothing was revoked: {error}"));
+            return (Vec::new(), failures);
+        }
+    }
     for key in &revoked {
-        if let Err(error) = revoke_key(context, after, key, why) {
+        if let Err(error) = revoke_key(context, dsh_cfg, key, why) {
             crate::safe_println!("[console] ⚠️ 撤销 {key} 失败：{error}");
             failures.push(format!("{key}：{error}"));
         }
@@ -576,9 +622,17 @@ fn revoke_key(context: &RuntimeContext, cfg: &Value, key: &str, why: &str) -> Re
             None
         }
     };
+    // #192: the session's stop is recorded before its mapping is retired, so a crash before the stop finished leaves it
+    // (and the conversation it belongs to) for the next console start or access change.
+    let mut stop = None;
     if let Some(session) = &session {
-        if let Err(error) = crate::session_map::retire_if(context, key, session) {
-            failures.push(format!("退役会话映射失败：{error}"));
+        if let Err(error) = record_stop(context, key, session) {
+            failures.push(format!("the DSH session stop was not recorded: {error}"));
+        } else {
+            if let Err(error) = crate::session_map::retire_if(context, key, session) {
+                failures.push(format!("退役会话映射失败：{error}"));
+            }
+            stop = Some(session.clone());
         }
     }
     if let Err((_, error)) = mutate_social_state_for(context, |state| {
@@ -597,8 +651,8 @@ fn revoke_key(context: &RuntimeContext, cfg: &Value, key: &str, why: &str) -> Re
     if let Err(error) = cancel_ledger_turns(context, key, why) {
         failures.push(error);
     }
-    if let Some(session) = session {
-        stop_retired_session_work(context, cfg, key, &session);
+    if let Some(session) = stop {
+        stop_recorded_session(context, cfg, key, &session);
     }
     if failures.is_empty() { Ok(()) } else { Err(failures.join("；")) }
 }
@@ -625,6 +679,55 @@ fn stop_retired_session_work(context: &RuntimeContext, cfg: &Value, key: &str, s
     BACKGROUND_STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
         let _ = stop_and_archive_session(&context, &cfg, &key, &session);
+        BACKGROUND_STOPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
+}
+
+/// #192: the DSH sessions whose recorded stop runs in this process now.
+static RUNNING_STOPS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// #192 test seam: given a session id, `Some(result)` replaces that session's DSH stop.
+#[cfg(test)]
+pub(super) static STOP_SEAM: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&str) -> Option<Result<(), String>> + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+fn run_recorded_stop(context: &RuntimeContext, cfg: &Value, key: &str, session: &str) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let seam = STOP_SEAM.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(result) = seam.and_then(|seam| seam(session)) {
+            return result;
+        }
+    }
+    stop_and_archive_session(context, cfg, key, session)
+}
+
+/// #192: `stop_retired_session_work` for a stop recorded in the pending-revocation record (`record_stop`). The record
+/// is removed, under the closed-agent interaction gate, only once the stop succeeded; a failure or a crash leaves it
+/// for the next console start or access change. A session whose stop already runs in this process is not started
+/// again.
+fn stop_recorded_session(context: &RuntimeContext, cfg: &Value, key: &str, session: &str) {
+    {
+        let mut running = RUNNING_STOPS.lock().unwrap_or_else(|p| p.into_inner());
+        if running.iter().any(|running| running == session) {
+            return;
+        }
+        running.push(session.to_string());
+    }
+    let (context, cfg, key, session) = (context.clone(), cfg.clone(), key.to_string(), session.to_string());
+    BACKGROUND_STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        if run_recorded_stop(&context, &cfg, &key, &session).is_ok() {
+            match crate::closed_agent::lock(&context) {
+                Ok(_gate) => {
+                    if let Err(error) = forget_stop(&context, &key, &session) {
+                        crate::safe_println!("[console] ⚠️ the finished DSH stop of {key} stays recorded: {error}");
+                    }
+                }
+                Err(error) => crate::safe_println!("[console] ⚠️ the finished DSH stop of {key} stays recorded: {error}"),
+            }
+        }
+        RUNNING_STOPS.lock().unwrap_or_else(|p| p.into_inner()).retain(|running| running != &session);
         BACKGROUND_STOPS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
 }
@@ -659,6 +762,328 @@ pub(super) fn wait_background_stops(limit: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     true
+}
+
+// ── #192: access changes whose revocation has not finished ───────────────────────────────────────
+
+/// Data-area record (`{"pending": [...]}`) of the access changes whose revocation has not finished. An access change
+/// adds its entry before it writes `config.json` and removes it once its revocation fully succeeded, so a crash in
+/// between leaves the entry for `finish_pending_revocations`. Read and written only under the closed-agent
+/// interaction gate.
+pub(super) const PENDING_REVOCATIONS: &str = "access-revocations-pending.json";
+
+/// #192 test seam: runs in every access change after its configuration write and before its revocation, with the
+/// runtime's `config.json` path (so a test can stop only its own runtime there, as a crash would).
+#[cfg(test)]
+pub(super) static AFTER_ACCESS_WRITE: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(&std::path::Path) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// The pending entries; none when the file does not exist (a runtime that never recorded one). An unreadable or
+/// malformed file, or an entry without usable policies, is an error: its entries cannot be finished, and nothing may
+/// be added to it.
+fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
+    let pending = read_record(context)?["pending"].as_array().cloned().unwrap_or_default();
+    if let Some(index) = pending.iter().position(|entry| !usable_entry(entry)) {
+        return Err(format!("data/{PENDING_REVOCATIONS} entry {index} has no usable before/after policy; repair or remove it"));
+    }
+    // #192: entries are told apart by `id` (the stop and target bookkeeping names them); two entries with one id
+    // would let one entry's removal drop the other, so the record is refused instead.
+    let mut ids: Vec<String> = Vec::new();
+    for id in pending.iter().filter_map(|entry| entry["id"].as_str()) {
+        if ids.iter().any(|seen| seen == id) {
+            return Err(format!("data/{PENDING_REVOCATIONS} has the pending id {id} twice; repair or remove it"));
+        }
+        ids.push(id.to_string());
+    }
+    Ok(pending)
+}
+
+/// An entry carries both policies (`before`, `after`) as objects whose `allow` and `deny`, when present, are objects,
+/// as `begin_access_change` writes them, and `targets`, when present, as an array of canonical conversation keys (the
+/// keys `canonical_v2_key` returns unchanged). `mode` and `why` may be
+/// missing: the current mode and `access-revoked` are used.
+fn usable_entry(entry: &Value) -> bool {
+    ["before", "after"].iter().all(|side| {
+        entry
+            .get(*side)
+            .and_then(Value::as_object)
+            .is_some_and(|policy| ["allow", "deny"].iter().all(|list| policy.get(*list).is_none_or(Value::is_object)))
+    }) && entry.get("targets").is_none_or(|targets| {
+        targets.as_array().is_some_and(|keys| {
+            keys.iter().all(|key| key.as_str().is_some_and(|key| canonical_v2_key(key).as_deref() == Some(key)))
+        })
+    })
+}
+
+/// #192: the conversations an earlier attempt selected for `entry` (`targets`).
+fn entry_targets(entry: &Value) -> Vec<String> {
+    entry["targets"].as_array().map(|keys| keys.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default()
+}
+
+/// #192: add `targets` to the pending entry `id` before any revocation step runs. The caller holds the closed-agent
+/// interaction gate.
+fn record_targets(context: &RuntimeContext, id: &str, targets: &[String]) -> Result<(), String> {
+    let mut pending = pending_revocations(context)?;
+    let Some(entry) = pending.iter_mut().find(|entry| entry["id"].as_str() == Some(id)) else {
+        return Err(format!("pending entry {id} is not recorded"));
+    };
+    let mut recorded = entry_targets(entry);
+    for key in targets {
+        if !recorded.contains(key) {
+            recorded.push(key.clone());
+        }
+    }
+    entry["targets"] = json!(recorded);
+    write_pending_revocations(context, &pending)
+}
+
+/// The whole record (`pending` and, #192 run 6, `stops`); an empty one when the file does not exist. A file that is not
+/// JSON with a `pending` array is an error.
+fn read_record(context: &RuntimeContext) -> Result<Value, String> {
+    let Some(text) = context
+        .read_optional_text(RuntimeArea::Data, PENDING_REVOCATIONS)
+        .map_err(|e| format!("data/{PENDING_REVOCATIONS} is unreadable: {e}"))?
+    else {
+        return Ok(json!({"pending": []}));
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .filter(|record| record.get("pending").is_some_and(Value::is_array))
+        .ok_or_else(|| format!("data/{PENDING_REVOCATIONS} is not a pending-revocation record; repair or remove it"))
+}
+
+/// Replace one field of the record, keeping the others.
+fn write_record_field(context: &RuntimeContext, field: &str, value: Value) -> Result<(), String> {
+    let mut record = read_record(context)?;
+    record[field] = value;
+    let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+    context.write_atomic(RuntimeArea::Data, PENDING_REVOCATIONS, text.as_bytes())
+}
+
+fn write_pending_revocations(context: &RuntimeContext, pending: &[Value]) -> Result<(), String> {
+    write_record_field(context, "pending", Value::Array(pending.to_vec()))
+}
+
+/// #192: the DSH session stops (`stops`: `{"key", "session"}`) recorded by `record_stop` that have not finished. An
+/// absent field is no stop; a field that is not an array, or an item without a string `key` and `session`, is an
+/// error (so access changes are refused, as for an unusable pending entry).
+fn recorded_stops(context: &RuntimeContext) -> Result<Vec<(String, String)>, String> {
+    let record = read_record(context)?;
+    let Some(stops) = record.get("stops") else { return Ok(Vec::new()) };
+    let malformed = || format!("data/{PENDING_REVOCATIONS} has a malformed stop record; repair or remove it");
+    stops
+        .as_array()
+        .ok_or_else(malformed)?
+        .iter()
+        .map(|stop| match (stop["key"].as_str(), stop["session"].as_str()) {
+            (Some(key), Some(session)) => Ok((key.to_string(), session.to_string())),
+            _ => Err(malformed()),
+        })
+        .collect()
+}
+
+/// #192: record a retired DSH session's stop as its own pending step, before its mapping is retired. The caller holds
+/// the closed-agent interaction gate.
+fn record_stop(context: &RuntimeContext, key: &str, session: &str) -> Result<(), String> {
+    recorded_stops(context)?;
+    let mut stops = read_record(context)?["stops"].as_array().cloned().unwrap_or_default();
+    let stop = json!({"key": key, "session": session});
+    if !stops.contains(&stop) {
+        stops.push(stop);
+    }
+    write_record_field(context, "stops", Value::Array(stops))
+}
+
+/// #192: remove a finished stop from the record. The caller holds the closed-agent interaction gate.
+fn forget_stop(context: &RuntimeContext, key: &str, session: &str) -> Result<(), String> {
+    recorded_stops(context)?;
+    let mut stops = read_record(context)?["stops"].as_array().cloned().unwrap_or_default();
+    let stop = json!({"key": key, "session": session});
+    stops.retain(|recorded| recorded != &stop);
+    write_record_field(context, "stops", Value::Array(stops))
+}
+
+/// Record the access change from `before` to `after` (effective configurations, the policies only) as pending, before
+/// its configuration write. Returns the entry id (none in a legacy runtime, which revokes nothing). Refused with 503,
+/// and so nothing written, when the record cannot be kept.
+pub(super) fn begin_access_change(
+    context: &RuntimeContext,
+    before: &Value,
+    after: &Value,
+    why: &str,
+) -> Result<Option<String>, (u16, String)> {
+    if !context.is_isolated() {
+        return Ok(None);
+    }
+    let mut pending = pending_revocations(context).map_err(|e| (503, e))?;
+    let id = crate::turn_ledger::mint_id("revoke-");
+    pending.push(json!({
+        "id": id,
+        "why": why,
+        "mode": runtime_mode(context),
+        "before": access_policy(before),
+        "after": access_policy(after),
+        "at": now_ms(),
+    }));
+    write_pending_revocations(context, &pending)
+        .map_err(|e| (503, format!("the access change was not recorded, nothing was written: {e}")))?;
+    Ok(Some(id))
+}
+
+/// Remove the pending entry `id` (its revocation finished, or its configuration write failed).
+pub(super) fn forget_access_change(context: &RuntimeContext, id: &Option<String>) -> Result<(), String> {
+    let Some(id) = id else { return Ok(()) };
+    let mut pending = pending_revocations(context)?;
+    pending.retain(|entry| entry["id"].as_str() != Some(id.as_str()));
+    write_pending_revocations(context, &pending)
+}
+
+/// Write `config.json` for an access change recorded as `pending`; `unchanged` is the file as the change read it. A
+/// failed write is settled by `settle_failed_write`.
+fn write_config_or_forget(
+    context: &RuntimeContext,
+    file: &Value,
+    unchanged: &Value,
+    pending: &Option<String>,
+) -> Result<(), (u16, String)> {
+    let Err((status, error)) = write_config_object(context, file) else { return Ok(()) };
+    Err((status, format!("{error}{}", settle_failed_write(context, unchanged, pending))))
+}
+
+/// The raw `config.json` as an access change finds it before its write, for `settle_failed_write` (`Null` when it
+/// cannot be read: a failed write then always keeps its entry).
+pub(super) fn config_snapshot(context: &RuntimeContext) -> Value {
+    read_config_object(context).unwrap_or(Value::Null)
+}
+
+/// After a failed configuration write: the pending entry is removed only when `config.json` still holds `unchanged`
+/// (the failure came before the atomic replace published anything). A file that changed, or cannot be read, may hold
+/// the new policy (a failure after publication, such as the folder sync): the entry stays, and the next console start
+/// or access change finishes its revocation. Returns the note added to the write error.
+pub(super) fn settle_failed_write(context: &RuntimeContext, unchanged: &Value, pending: &Option<String>) -> String {
+    if pending.is_none() {
+        return String::new();
+    }
+    let published = read_config_object(context).map_or(true, |current| &current != unchanged);
+    if published {
+        return "; the configuration may have been written, so its revocation stays pending and is finished at the next console start or access change".to_string();
+    }
+    match forget_access_change(context, pending) {
+        Ok(()) => String::new(),
+        Err(cleanup) => format!("; the recorded revocation stays pending: {cleanup}"),
+    }
+}
+
+/// The revocation that follows an access change's configuration write. Its pending entry is removed only when every
+/// step succeeded; otherwise it stays for the next console start or access change.
+pub(super) fn finish_access_change(
+    context: &RuntimeContext,
+    interaction_gate: &std::fs::File,
+    before: &Value,
+    after: &Value,
+    why: &str,
+    pending: Option<String>,
+) -> (Vec<String>, Vec<String>) {
+    #[cfg(test)]
+    {
+        // Bound first, so the hook never runs while the seam's own lock is held.
+        let hook = AFTER_ACCESS_WRITE.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(context.config_file());
+        }
+    }
+    let (revoked, mut failures) = reconcile_access_change(context, interaction_gate, before, after, why, pending.as_deref());
+    if failures.is_empty() {
+        if let Err(error) = forget_access_change(context, &pending) {
+            failures.push(format!("the finished revocation is still recorded as pending: {error}"));
+        }
+    }
+    (revoked, failures)
+}
+
+/// #192: finish every recorded access change whose revocation did not complete: a crash between its configuration
+/// write and its revocation, or a step that failed. Each entry revokes by its own recorded policies and mode, so a
+/// later re-grant cannot hide the conversations it removed: they get a fresh epoch even when admitted again. An entry
+/// is removed only when its revocation fully succeeded. Returns the revoked keys and the failures. The caller holds
+/// the closed-agent interaction gate.
+fn finish_pending_revocations_locked(
+    context: &RuntimeContext,
+    _interaction_gate: &std::fs::File,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    if !context.is_isolated() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let mut pending = pending_revocations(context)?;
+    if pending.is_empty() && recorded_stops(context)?.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    // #192: every entry carries an id (a hand-written one may not), so its targets can be recorded against it.
+    if pending.iter().any(|entry| !entry["id"].is_string()) {
+        for entry in pending.iter_mut().filter(|entry| !entry["id"].is_string()) {
+            entry["id"] = json!(crate::turn_ledger::mint_id("revoke-"));
+        }
+        write_pending_revocations(context, &pending)?;
+    }
+    // Retired DSH sessions are stopped with the DSH settings in force now.
+    let current = context.load_config().unwrap_or_else(|_| json!({}));
+    let mut revoked = Vec::new();
+    let mut failures = Vec::new();
+    let mut finished: Vec<String> = Vec::new();
+    for entry in &pending {
+        let id = entry["id"].as_str().unwrap_or_default();
+        let why = entry["why"].as_str().unwrap_or("access-revoked").to_string();
+        let mode = entry["mode"].as_str().map(str::to_string).unwrap_or_else(|| runtime_mode(context));
+        let targets = entry_targets(entry);
+        let (keys, entry_failures) =
+            reconcile_policies(context, &entry["before"], &entry["after"], &mode, &why, &current, Some(id), &targets);
+        for key in keys {
+            if !revoked.contains(&key) {
+                revoked.push(key);
+            }
+        }
+        if entry_failures.is_empty() {
+            finished.push(id.to_string());
+        } else {
+            failures.extend(entry_failures);
+        }
+    }
+    // The record is read again: the attempts above recorded their targets (and stops) in it.
+    if !finished.is_empty() {
+        let mut left = pending_revocations(context)?;
+        left.retain(|entry| !entry["id"].as_str().is_some_and(|id| finished.iter().any(|done| done == id)));
+        write_pending_revocations(context, &left).map_err(|e| format!("the finished revocations are still recorded as pending: {e}"))?;
+    }
+    // #192: every recorded DSH stop that has not finished runs again in the background (one already running in this
+    // process, such as those the loop above just started, is skipped).
+    for (key, session) in recorded_stops(context)? {
+        stop_recorded_session(context, &current, &key, &session);
+    }
+    Ok((revoked, failures))
+}
+
+/// Before an access change, under its gate: finish the earlier changes' revocations. The change is refused with 503,
+/// and nothing written, while one of them cannot finish, so a re-grant never revives an epoch that was due to end.
+pub(super) fn finish_pending_before_change(context: &RuntimeContext, interaction_gate: &std::fs::File) -> Result<(), (u16, String)> {
+    let (_, failures) = finish_pending_revocations_locked(context, interaction_gate).map_err(|e| (503, e))?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err((503, format!("an earlier access change's revocation did not finish, nothing was written: {}", failures.join("; "))))
+    }
+}
+
+/// #192: console start finishes what an access change cut off between its configuration write and its revocation
+/// left (also one made by `her-cli conversation`). Takes the closed-agent interaction gate (five seconds at most) only
+/// when an entry is recorded: an entry written meanwhile belongs to a change that holds the gate and finishes it itself.
+pub(super) fn finish_pending_revocations(context: &RuntimeContext) -> Result<(Vec<String>, Vec<String>), String> {
+    if !context.is_isolated()
+        || (pending_revocations(context).is_ok_and(|pending| pending.is_empty())
+            && recorded_stops(context).is_ok_and(|stops| stops.is_empty()))
+    {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let interaction = crate::closed_agent::lock(context)?;
+    finish_pending_revocations_locked(context, &interaction)
 }
 
 // ── GET/POST /api/security ───────────────────────────────────────────────────────────────────────

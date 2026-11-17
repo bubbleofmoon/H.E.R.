@@ -235,6 +235,117 @@ async fn seam_harness_turn_builds_and_runs_without_a_dsh_credential() {
     );
 }
 
+/// #164: a harness chat turn carries the inbound image the pipeline acquired (the same media parts
+/// DSH gets) after the prompt, and the voice note stays the prompt's `[语音]` label.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticket164_harness_chat_turn_sends_the_acquired_image_with_the_voice_label() {
+    use base64::Engine as _;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let model = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    model.set_nonblocking(true).unwrap();
+    let onebot = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    onebot.set_nonblocking(true).unwrap();
+    let mut runtime = SeamRuntime::new(
+        "harness-media-164",
+        "closed-agent",
+        false,
+        json!({"consoleToken":"fixture-token","ownerQQ":8808,
+            "conversationEngines":{"private:8808":"harness"},"harness":{"model":"fake-chat"}}),
+    );
+    std::fs::write(runtime.root.join("config/harness-api-key"), "synthetic-model-key-164").unwrap();
+    std::fs::write(
+        runtime.root.join("dependencies.json"),
+        json!({
+            "dsh": "http://127.0.0.1:43201",
+            "model": format!("http://{}", model.local_addr().unwrap()),
+            "onebot": format!("http://{}", onebot.local_addr().unwrap()),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    runtime.reload();
+    let cfg = runtime.cfg();
+    // A 1x1 PNG is small enough to pass media normalization unchanged.
+    let mut png = Vec::new();
+    image::DynamicImage::new_rgba8(1, 1)
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let png = base64::engine::general_purpose::STANDARD.encode(png);
+    // The gateway answers `get_image` with the picture and refuses every other call. It stops when
+    // `StopGateway` drops, on success and on a failed assertion alike.
+    struct StopGateway(std::sync::Arc<AtomicBool>);
+    impl Drop for StopGateway {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let stop = StopGateway(std::sync::Arc::new(AtomicBool::new(false)));
+    let (stopped, gateway_png) = (stop.0.clone(), png.clone());
+    let gateway = std::thread::spawn(move || {
+        let mut paths = Vec::new();
+        while !stopped.load(Ordering::SeqCst) {
+            let Some((mut stream, request)) = fake_dsh_accept(&onebot, std::time::Duration::from_millis(200)) else {
+                continue;
+            };
+            if request.path == "/get_image" {
+                let body = json!({"status":"ok","retcode":0,"data":{"base64":gateway_png}}).to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            } else {
+                write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+            paths.push(request.path);
+        }
+        paths
+    });
+    let server = std::thread::spawn(move || {
+        let (mut stream, request) = fake_dsh_accept(&model, std::time::Duration::from_secs(10))
+            .expect("the harness turn reached the model");
+        let chunk = json!({"id":"media-164","object":"chat.completion.chunk","model":"fake-chat",
+            "choices":[{"index":0,"delta":{"role":"assistant","content":"[SILENT]"},"finish_reason":null}]});
+        let end = json!({"id":"media-164","object":"chat.completion.chunk","model":"fake-chat",
+            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        serde_json::from_str::<Value>(&request.body).unwrap()
+    });
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg, true).unwrap();
+    let media = [json!({"kind":"image","file":"fixture-164.png"})];
+    let result = pipe
+        .run_chat_turn("private:8808", "hello harness media [语音]", None, &cfg, &[], &media, "closed-agent", true)
+        .await;
+    let request = server.join().unwrap();
+    drop(stop);
+    let paths = gateway.join().unwrap();
+    assert!(result.is_ok(), "the harness turn must run: {result:?}");
+    assert!(paths.iter().any(|path| path == "/get_image"), "the image came from the gateway: {paths:?}");
+    let sent = request["messages"].as_array().unwrap().last().unwrap().clone();
+    let content = sent["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the user message must carry parts: {sent}"));
+    assert_eq!(content.len(), 3, "{sent}");
+    let prompt = content[0]["text"].as_str().unwrap();
+    assert!(prompt.contains("hello harness media [语音]"), "the voice label stays in the prompt: {prompt}");
+    // `[图片1]（图片获取失败）` here means the acquisition failed: the gateway reply, or the
+    // process-wide four-permit media source gate (`media::admit_source`) was busy.
+    assert_eq!(content[1], json!({"type":"text","text":"[图片1]"}), "{sent}");
+    assert_eq!(
+        content[2],
+        json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{png}")}}),
+        "the normalized image reaches the model as the DSH path sends it"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
     // A session mapping makes `ensure_session` return without an RPC, so the stream open is the
@@ -270,4 +381,33 @@ async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
         Ok(Err(crate::dsh_credential::UNBOUND.to_string())),
         "an unbound pipeline refuses its ask locally"
     );
+}
+
+/// #197: `pipeline.rs` keeps the turn code every engine shares; the DSH adapter's own code (DSH
+/// sessions and RPCs, model selection, the follow-stream collector, DSH cancellation and usage
+/// rows) lives in `pipeline/dsh_adapter.rs`, reached only through its registration points.
+#[test]
+fn dsh197_pipeline_rs_names_no_dsh_turn_code() {
+    let source = include_str!("pipeline.rs");
+    let production = &source[..source.find("\nmod tests {").expect("pipeline.rs has its test module")];
+    for token in [
+        "FollowStream", "TurnUsage", "\"session/prompt\"", "\"session/create\"", "\"session/selectModel\"",
+        "\"session/cancel\"", "\"session/rename\"", "\"workspace/create\"", "\"workspace/rename\"",
+        "\"agentPresets/list\"", "\"settings/describe\"", "stop_session_work", "archive_session",
+        "probe_prompt", "dsh_profile::", "dsh_health::", ".relogin(", "rpc.call", "fn ensure_session",
+        "fn apply_model", "fn cancel_with_reason",
+        "fn turn_records(", "fn prompt_error_needs_probe(", "fn definite_refusal(", "fn preset_for(",
+        "fn ensure_workspace(", "fn ensure_session(", "fn access_epoch(", "fn discard_created_session(",
+        "fn require_preset(", "fn closed_preset(", "fn prepare_title(", "fn flush_title(",
+        "fn cancel_session(", "fn cancel(", "fn cancel_with_reason(", "fn cancel_reserved_epoch(",
+        "fn note_session(", "fn has_dsh(", "fn abandon_attempt(", "fn abandon_attempt_for_test(",
+        "fn session_policy(", "fn stale_policy(", "fn replace_session(", "fn failover_state(",
+        "fn apply_model(", "fn ask_with_failover(", "fn ask_with_failover_with_deadline(",
+        "fn cli_fallback(", "fn should_audit_key(", "fn hide_if_sensitive(", "fn report_turn_error(",
+        "fn ask_with_failover_inner(", "fn exhausted_chain(", "fn ask(", "fn record_turn_usage(",
+        "fn reply(", "fn handle(", "fn handle_with_failover(", "fn run_dsh_turn(",
+        "enum Submit", "struct AccessEpoch",
+    ] {
+        assert!(!production.contains(token), "pipeline.rs still names DSH turn code: {token}");
+    }
 }

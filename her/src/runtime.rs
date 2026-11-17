@@ -990,13 +990,14 @@ impl RuntimeContext {
         Ok(self.overlay_config(file))
     }
 
-    /// The one place stored settings are applied over the parsed `config.json`; the settings store plugs in here.
-    /// Without a settings store the file is the configuration.
+    /// The one place stored settings are applied over the parsed `config.json`: the values in `data/settings.db`
+    /// (`settings::overlay`). A legacy context and a runtime without a settings store read the file as it is.
     pub(crate) fn overlay_config(&self, file: Value) -> Value {
-        apply_settings_overlay(file)
+        apply_settings_overlay(crate::settings::overlay(self, file))
     }
 
-    /// The change stamp of the stored `config.json` (`ConfigStamp`); the path checks of the loader apply.
+    /// The change stamp of the stored `config.json` (`ConfigStamp`); the path checks of the loader apply. It does not
+    /// see the settings store: no value under a registry setting's pointer is cached on it (registry test).
     pub fn config_stamp(&self) -> Result<ConfigStamp, &'static str> {
         let path = self.resolve_path(RuntimeArea::Config, "config.json", PathIntent::ReadFile)?;
         let metadata = fs::metadata(path).map_err(|_| "runtime config metadata is unavailable")?;
@@ -1006,31 +1007,50 @@ impl RuntimeContext {
     pub fn load_config(&self) -> Result<Value, &'static str> {
         if self.is_isolated() {
             let raw = match self.load_config_document() {
-                Ok(raw) if raw.is_object() => raw,
-                Ok(_) | Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
+                Ok(raw) => raw,
+                Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
                 Err(ConfigReadError::Unavailable(message)) => return Err(message),
             };
-            // `consoleToken` stays as configured ("" for a generated token, JS): readers that
-            // authenticate use `effective_console_token`.
-            let (mut config, _) = crate::config::canonical_config(&raw)
-                .map_err(|_| "runtime config is invalid")?;
-            crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
-                .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
-            // The live closed-agent process mirrors DSH's qq-mode owner override here so the
-            // console and the turn worker enforce the same current administrator policy.
-            let closed = self.read_optional_text(RuntimeArea::Data, "mode.json")?.and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .is_some_and(|v| v["mode"] == "closed-agent");
-            if closed {
-                if let Some(owner) = self.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json")?
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("ownerQQ").cloned()) {
-                    let (overlay, _) = crate::config::canonical_config(&json!({"ownerQQ":owner})).map_err(|_| "runtime owner policy is invalid")?;
-                    if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
-                }
-            }
-            return Ok(config);
+            return self.normalized_config(&raw);
         }
 
         Ok(self.load_config_document().unwrap_or_else(|_| json!({})))
+    }
+
+    /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading
+    /// that file (an access change records the policy it writes before the write). The settings overlay is applied
+    /// first, as `load_config_document` does; a legacy context then uses the document as it is.
+    pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
+        let document = self.overlay_config(raw.clone());
+        if !self.is_isolated() {
+            return Ok(document);
+        }
+        self.normalized_config(&document)
+    }
+
+    /// The normalization `load_config` applies to the overlaid configuration document of a selected runtime.
+    fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
+        if !raw.is_object() {
+            return Err("runtime config is invalid");
+        }
+        // `consoleToken` stays as configured ("" for a generated token, JS): readers that
+        // authenticate use `effective_console_token`.
+        let (mut config, _) = crate::config::canonical_config(raw)
+            .map_err(|_| "runtime config is invalid")?;
+        crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
+            .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
+        // The live closed-agent process mirrors DSH's qq-mode owner override here so the
+        // console and the turn worker enforce the same current administrator policy.
+        let closed = self.read_optional_text(RuntimeArea::Data, "mode.json")?.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .is_some_and(|v| v["mode"] == "closed-agent");
+        if closed {
+            if let Some(owner) = self.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json")?
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("ownerQQ").cloned()) {
+                let (overlay, _) = crate::config::canonical_config(&json!({"ownerQQ":owner})).map_err(|_| "runtime owner policy is invalid")?;
+                if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
+            }
+        }
+        Ok(config)
     }
 
     pub fn read_social_state(&self) -> Result<Value, String> {
@@ -1196,6 +1216,7 @@ impl RuntimeContext {
             || (method == "POST" && path == "/api/memory/archive")
             || (method == "GET" && path == "/personas")
             || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
+            || (matches!(method, "GET" | "POST") && crate::console_settings::is_route(path))
             || path.strip_prefix("/api/slang/").is_some_and(|tail| {
                 let parts: Vec<&str> = tail.split('/').collect();
                 match (method, parts.as_slice()) {
@@ -1251,13 +1272,13 @@ impl RuntimeContext {
     }
 }
 
-/// Without a settings store nothing is applied over the file.
+/// Outside unit tests the settings store's overlay is the whole overlay.
 #[cfg(not(test))]
 fn apply_settings_overlay(file: Value) -> Value {
     file
 }
 
-/// Applies this thread's `with_config_overlay` values over the file.
+/// Applies this thread's `with_config_overlay` values over the file and the stored settings.
 #[cfg(test)]
 fn apply_settings_overlay(mut file: Value) -> Value {
     CONFIG_OVERLAY_TEST_VALUES.with(|values| {

@@ -73,6 +73,10 @@ A new release running beside the current one, before it is made current, so its 
 **Update policy (更新策略)**:
 The administrator's setting for bridge releases: off, notify (ask before installing) or auto. Dependencies always need approval.
 
+**Live setting (实时设置)**:
+An owner-tunable value kept in the settings store (`settings.db`), checked against its one registry definition and recorded with every change; the next use reads it without a restart.
+_Avoid_: config key (a member of `config.json`), preference
+
 **Health check (健康检查)**:
 The single definition of "running": desired state running, supervisor alive, and console, SnowLuma, the configured model relay and DSH all healthy, including a working DSH login. People, scripts and the updater share it.
 
@@ -90,6 +94,10 @@ _Avoid_: DSH, conversation engine, agent host, backend
 **Turn engine (回合引擎, `turn_engine`)**:
 What runs the model work of one admitted turn for a conversation, DSH or the harness. HER keeps the turn's admission, its prompt and the delivery of its reply; the engine sends the prompt, follows the turn, stops it when it is cancelled and reports what happened.
 _Avoid_: backend (a CLI route), conversation engine
+
+**Mode profile (模式档案, `harness::profile`)**:
+What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it and who may use it. HER checks it when a turn is admitted and again before every tool call.
+_Avoid_: preset, tool whitelist, tool guard
 
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.

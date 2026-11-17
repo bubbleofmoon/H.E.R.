@@ -213,3 +213,80 @@ fn hf136_fix2_failover_releases_rejected_completion_for_the_next_attempt_cap() {
     rejected_completion_cap_case(true, false);
     rejected_completion_cap_case(true, true);
 }
+
+/// #179: with one guarded profile row missing, the turn is refused before any DSH call and the owner is alerted.
+#[test]
+fn guard179_a_missing_profile_row_refuses_the_turn_before_any_dsh_call() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let root = fake_runtime_root("guard179-refused");
+    write_selected_secret(&root, [0x79; 32]);
+    let (context, mut pipe) = pipeline_for_fake_dsh(&root, listener.local_addr().unwrap().port());
+    crate::dsh_profile::test_support::force(&context);
+    crate::dsh_profile::test_support::write_compliant(&context);
+    let (find, replace) = crate::dsh_profile::test_support::PWSH_ON;
+    crate::dsh_profile::test_support::edit_preset(&context, |text| text.replacen(find, replace, 1));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(pipe.ask_with_failover("group:42", "synthetic guard test", 10, &json!({})));
+    let error = result.unwrap_err();
+    assert_eq!(error, format!("{}local-tools:preset1", crate::dsh_profile::REFUSAL_PREFIX));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no DSH call may be made"
+    );
+    assert_eq!(crate::dsh_profile::test_support::alerts(&context).len(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// #179: with every guarded row in place, the turn reaches DSH; in the same fixture, once a row is gone, the next
+/// turn does not (this half fails if the pipeline and RPC admission calls are removed).
+#[test]
+fn guard179_with_every_guarded_row_in_place_the_turn_reaches_dsh() {
+    let fake = CompletionDsh::start(false);
+    let root = fake_runtime_root("guard179-runs");
+    write_selected_secret(&root, [0x79; 32]);
+    std::fs::write(root.join("data/mode.json"), r#"{"mode":"chat"}"#).unwrap();
+    let (context, mut pipe) = pipeline_for_fake_dsh(&root, fake.port);
+    crate::dsh_profile::test_support::force(&context);
+    crate::dsh_profile::test_support::write_compliant(&context);
+    let key = "group:42";
+    crate::session_map::bind(&context, key, "sid-179", None).unwrap();
+    pipe.chat = Some(ChatRun {
+        adapter: crate::turn_engine::Adapter::Dsh,
+        reserved: None,
+        mode: "chat".into(),
+        silent: true,
+        media_parts: vec![],
+        ack: None,
+        delay_ms: 0,
+        owner_started: false,
+    });
+    pipe.begin_ledger_turn(key).unwrap();
+    // One candidate: the fake answers one prompt on the follow stream the pipeline opens first.
+    let cfg = json!({"dsh":{"provider":"first","model":"first"}});
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(pipe.ask_with_failover(key, "synthetic guard test", 10, &cfg));
+    pipe.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
+    let submitted = fake.prompts.load(std::sync::atomic::Ordering::SeqCst);
+    let quiet = crate::dsh_profile::test_support::alerts(&context).is_empty();
+    // The same fixture with the preset's `pwsh` row turned back on: the next turn is refused before any DSH call.
+    let (find, replace) = crate::dsh_profile::test_support::PWSH_ON;
+    crate::dsh_profile::test_support::edit_preset(&context, |text| text.replacen(find, replace, 1));
+    pipe.begin_ledger_turn(key).unwrap();
+    let refused = rt.block_on(pipe.ask_with_failover(key, "synthetic guard test", 10, &cfg));
+    pipe.end_ledger_turn(refused.as_ref().map(|_| ()).map_err(String::as_str));
+    let after = fake.prompts.load(std::sync::atomic::Ordering::SeqCst);
+    drop(fake);
+    assert!(submitted >= 1, "the turn must reach DSH: {result:?}");
+    assert!(quiet, "a compliant profile raises no alert");
+    assert_eq!(after, submitted, "the turn after a row went missing reached DSH: {refused:?}");
+    assert_eq!(refused, Err(format!("{}local-tools:preset1", crate::dsh_profile::REFUSAL_PREFIX)));
+    assert_eq!(crate::dsh_profile::test_support::alerts(&context).len(), 1);
+    std::fs::remove_dir_all(root).unwrap();
+}

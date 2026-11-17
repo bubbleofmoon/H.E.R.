@@ -267,6 +267,11 @@ fn arg_wrapper(endpoint: &str) -> Option<&'static str> {
     }
 }
 
+/// #179: the sends the DSH profile guard admits first: a session a prompt would run on, and every prompt.
+fn guarded_send(endpoint: &str) -> bool {
+    matches!(endpoint, "session/create" | "session/prompt")
+}
+
 /// 不需要参数的端点（JS 里映射成 null 的那些）。
 fn takes_no_args(endpoint: &str) -> bool {
     matches!(endpoint, "agentPresets/list" | "settings/describe")
@@ -401,6 +406,11 @@ impl Rpc {
             "method": endpoint,
             "payload": { "args": args },
         });
+        if guarded_send(&endpoint) {
+            // #179: no session is created and no prompt leaves while a guarded DSH profile row is missing (the
+            // install root's runtime only).
+            crate::dsh_profile::admit(self.credential.context())?;
+        }
         if endpoint == "session/prompt" {
             // #183: a capture the operator armed takes this prompt exactly as it is posted.
             crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
@@ -427,6 +437,10 @@ impl Rpc {
                     crate::run_record::Outcome::Ok,
                     &format!("{endpoint} refused with 401; credentials re-read, request repeated once"),
                 );
+                if guarded_send(&endpoint) {
+                    // #179: the repeat is another send; the guard is asked again.
+                    crate::dsh_profile::admit(self.credential.context())?;
+                }
                 (status, text) = http_post(&host_port, &path, Some(&fresh), &body_text)
                     .ok_or_else(|| format!("HTTP 连接失败：{endpoint}"))?;
             }
@@ -538,6 +552,11 @@ impl Rpc {
             "payload": { "args": args },
         });
         let (host_port, address) = bounded_loopback_endpoint(&self.base)?;
+        if guarded_send(&endpoint) {
+            // #179: no session is created and no prompt leaves while a guarded DSH profile row is missing (the
+            // install root's runtime only).
+            crate::dsh_profile::admit(self.credential.context())?;
+        }
         if endpoint == "session/prompt" {
             // #183: a capture the operator armed takes this prompt exactly as it is posted.
             crate::upstream_capture::offer(self.credential.context(), crate::upstream_capture::Route::Dsh, || envelope.clone());
@@ -557,6 +576,10 @@ impl Rpc {
             io_remaining(deadline, "reauthentication", cancelled)?;
             if let Some(fresh) = self.credential.refresh_after_rejection() {
                 io_remaining(deadline, "reauthentication", cancelled)?;
+                if guarded_send(&endpoint) {
+                    // #179: the repeat is another send; the guard is asked again.
+                    crate::dsh_profile::admit(self.credential.context())?;
+                }
                 (status, text) = http_post_with_deadline(
                     &host_port,
                     address,
