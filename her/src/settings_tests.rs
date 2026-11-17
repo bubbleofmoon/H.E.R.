@@ -2339,6 +2339,42 @@ fn prompt_text_rule_a_strip_turns_into_a_denied_term_falls_back_to_the_last_good
 }
 
 #[test]
+fn prompt_text_render_stripped_again_on_delivery_never_makes_a_denied_term() {
+    let (root, context) = prompt_fixture("prompt text double strip");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】新版 140"));
+    assert_eq!(status, 200, "{body}");
+    // Accepted on save; one strip pass reads `D鲸鱼SH` and a second one `DSH`.
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D鲸鲸鱼鱼SH"));
+    assert_eq!(status, 200, "{body}");
+    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["鲸鱼"]}));
+    let render = next_render(&context);
+    let config = context.load_config_document().unwrap();
+    // The delivery strips the render again, as the DSH and CLI paths and the harness do.
+    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
+    for text in [&render, &delivered] {
+        assert!(!crate::settings::denied_in_text(text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
+        assert!(text.contains("【别像客服】新版 140\n\n"), "the last good version renders: {text}");
+        assert!(!text.contains("D鲸"), "{text}");
+    }
+}
+
+#[test]
+fn prompt_text_strip_joining_rules_across_their_boundary_never_makes_a_denied_term() {
+    let (root, context) = prompt_fixture("prompt text boundary strip");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D"));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = set_text(&context, "prompt.proactive", json!("SH【积极性】"));
+    assert_eq!(status, 200, "{body}");
+    // The rules are joined by a blank line; stripping it from the whole render would make `DSH` of the two.
+    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["\n\n"]}));
+    let render = next_render(&context);
+    assert!(!crate::settings::denied_in_text(&render).contains(&"dsh".to_string()), "{render}");
+    let config = context.load_config_document().unwrap();
+    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
+    assert!(!crate::settings::denied_in_text(&delivered).contains(&"dsh".to_string()), "a denied term reached the model: {delivered}");
+}
+
+#[test]
 fn prompt_text_sticker_rules_a_strip_turns_into_a_denied_term_fall_back_to_the_default() {
     let (root, context) = prompt_fixture("prompt text sticker strip denied");
     let (status, body) = set_text(&context, "prompt.stickerStrategy", json!("【表情包策略】D鲸SH 140"));

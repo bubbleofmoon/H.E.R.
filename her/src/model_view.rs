@@ -466,6 +466,87 @@ mod tests {
         assert_eq!(strip_from_model_text(text, &cfg), "  ");
     }
 
+    fn strip_cfg(items: &[&str]) -> Value {
+        json!({"socialV2":{"context":{"stripFromModelText":items}}})
+    }
+
+    #[test]
+    fn prompt_text_model_strip_repeats_until_nothing_more_goes() {
+        // One pass over `x鲸鲸鱼鱼y` takes the inner `鲸鱼` and leaves a new one behind.
+        assert_eq!(strip_from_model_text("x鲸鲸鱼鱼y", &strip_cfg(&["鲸鱼"])), "xy");
+        assert_eq!(strip_from_model_text("a鲸鲸鲸鱼鱼鱼b", &strip_cfg(&["鲸鱼"])), "ab");
+        // The first literal's removal makes a match for the second one.
+        assert_eq!(strip_from_model_text("甲乙X丙丁", &strip_cfg(&["乙丙", "X"])), "甲丁");
+    }
+
+    #[test]
+    fn prompt_text_model_strip_never_adds_a_denied_term() {
+        let strip = |text: &str, items: &[&str]| strip_from_model_text(text, &strip_cfg(items));
+        // The strip would make `DSH` of a text that held none: the literal is not applied.
+        assert_eq!(strip("D鲸SH", &["鲸"]), "D鲸SH");
+        // The first pass is harmless and kept; the second would make `DSH`.
+        assert_eq!(strip("D鲸鲸鱼鱼SH", &["鲸鱼"]), "D鲸鱼SH");
+        // A literal that is harmless still applies.
+        assert_eq!(strip("D鲸SH 坏", &["鲸", "坏"]), "D鲸SH ");
+        // A strip that joins text across a line break makes the term too.
+        assert_eq!(strip("D\n\nSH", &["\n\n"]), "D\n\nSH");
+        assert_eq!(strip("甲\n\n乙", &["\n\n"]), "甲乙");
+        // A term the text already held is not protected, and is not a reason to keep other strips out.
+        assert_eq!(strip("DSH 鲸x", &["鲸"]), "DSH x");
+        // Applying the strip again changes nothing, so a delivery strip after a checked one adds no term.
+        for (text, items) in [
+            ("D鲸鲸鱼鱼SH", &["鲸鱼"][..]),
+            ("D鲸SH 坏", &["鲸", "坏"][..]),
+            ("D\n\nSH", &["\n\n"][..]),
+            ("x鲸鲸鱼鱼y", &["鲸鱼"][..]),
+        ] {
+            let once = strip(text, items);
+            assert_eq!(strip(&once, items), once, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn prompt_text_checked_strip_refuses_a_text_the_strip_would_turn_into_a_denied_term() {
+        let delivery = strip_cfg(&["鲸鱼"]);
+        // The second pass would make `DSH`, so the text is refused whole, not delivered half stripped.
+        assert_eq!(strip_checked("D鲸鲸鱼鱼SH", &delivery), None);
+        assert_eq!(strip_checked("D鲸鱼SH", &delivery), None);
+        assert_eq!(strip_checked("D鲸SH", &strip_cfg(&["鲸"])), None);
+        assert_eq!(strip_checked("a鲸鱼b", &delivery), Some("ab".to_string()));
+        assert_eq!(strip_checked("a鲸鲸鱼鱼b", &delivery), Some("ab".to_string()));
+        // A term the text already held is not the strip's doing.
+        assert_eq!(strip_checked("DSH 鲸鱼x", &delivery), Some("DSH x".to_string()));
+    }
+
+    fn delivery_fixture(name: &str, strip: &[&str]) -> (std::path::PathBuf, crate::runtime::RuntimeContext, Value) {
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-{name}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        )));
+        for dir in ["config", "data", "resources", "user/dsh"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        let mut cfg = strip_cfg(strip);
+        cfg["consoleToken"] = json!("delivery-fixture");
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
+        let context = crate::runtime::RuntimeContext::from_root(&root).unwrap();
+        (root, context, cfg)
+    }
+
+    #[test]
+    fn prompt_text_dsh_delivery_strip_never_adds_a_denied_term() {
+        // The compatibility render passed its check as `D鲸鱼SH`; the DSH delivery strips the prompt again.
+        let (root, context, cfg) = delivery_fixture("prompt-text-dsh", &["鲸鱼"]);
+        let delivered = strip_text_with_runtime(&context, "【别像客服】D鲸鱼SH\n\n后文", &cfg);
+        assert!(!crate::settings::denied_in_text(&delivered).contains(&"dsh".to_string()), "{delivered}");
+        assert_eq!(delivered, "【别像客服】D鲸鱼SH\n\n后文");
+        // The snapshot packet form strips its chat fields and the text around it the same way.
+        let packet = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D鲸鱼SH 鲸鱼好\"}]}后D鲸鱼SH";
+        let delivered = strip_text_with_runtime(&context, packet, &cfg);
+        assert!(!crate::settings::denied_in_text(&delivered).contains(&"dsh".to_string()), "{delivered}");
+        assert_eq!(delivered, packet, "the literal that would make the term is not applied anywhere in the text");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn strip_model_text_keeps_cq_media_and_json_transport_fields_intact() {
         let cfg = json!({"socialV2":{"context":{"stripFromModelText":["奸","bad","[","图","text","\"","\\"]}}});

@@ -1454,6 +1454,18 @@ mod tests {
     }
 
     #[test]
+    fn prompt_text_cli_nickname_a_strip_turns_into_a_denied_term_reads_as_unknown() {
+        let (root, context) = runtime_fixture("cli-nickname-strip");
+        std::fs::write(root.join("config/config.json"), serde_json::json!({
+            "consoleToken":"fixture-token","socialV2":{"context":{"stripFromModelText":["鲸"]}}
+        }).to_string()).unwrap();
+        let text = build_text_only_with_runtime(&context, "group:1", &[], "D鲸SH", "9001");
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!crate::settings::denied_in_text(&text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
+        assert!(text.contains("（昵称未取到）"), "{text}");
+    }
+
+    #[test]
     fn local_datetime_matches_zh_cn_shape() {
         // 2026-01-05 01:03:02 UTC → 北京时间 09:03:02
         // zh-CN 的 toLocaleString **月日不补零**、时分秒补零
