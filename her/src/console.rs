@@ -282,7 +282,7 @@ thread_local! {
 fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<(), String> {
     let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
         .map_err(|_| "runtime config is invalid".to_string())?;
-    let mirrored = crate::settings::mirror_into(context, &mut doc);
+    let mirrored = crate::settings::mirror_into(context, &mut doc)?;
     let backup = doc.get("backup").is_some();
     if backup {
         doc["backup"] = crate::config::backup_config(&doc)?;

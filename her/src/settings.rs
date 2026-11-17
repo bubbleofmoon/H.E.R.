@@ -148,6 +148,7 @@ fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
     for name in parents {
         let Some(object) = slot.as_object_mut() else { return false };
         let next = object.entry(name.to_string()).or_insert(Value::Null);
+        // An explicit null on the way reads as absent, so it is replaced by an object.
         if next.is_null() {
             *next = json!({});
         }
@@ -676,16 +677,19 @@ pub(crate) fn write_back(context: &RuntimeContext) -> Result<Vec<&'static str>, 
 }
 
 /// Puts every stored value into `document`, a `config.json` a console writer is about to write, so the writer never
-/// puts back an older value of a stored setting. Returns whether `document` changed. A legacy context, a document that
-/// is not an object and a store that cannot be read (the overlay reports it) change nothing.
-pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> bool {
+/// puts back an older value of a stored setting. Returns whether `document` changed; a change keeps
+/// `config.json.pre-settings` first, and a copy that cannot be kept is an error. A legacy context, a document that is
+/// not an object and a store that cannot be read (the overlay reports it) change nothing.
+pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Result<bool, String> {
     if !context.is_isolated() || !document.is_object() {
-        return false;
+        return Ok(false);
     }
-    match stored_values(context) {
-        Ok(stored) => place(document, stored).0,
-        Err(_) => false,
+    let Ok(stored) = stored_values(context) else { return Ok(false) };
+    let (changed, _) = place(document, stored);
+    if changed {
+        keep_pre_settings_copy(context)?;
     }
+    Ok(changed)
 }
 
 /// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
