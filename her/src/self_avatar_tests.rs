@@ -394,3 +394,27 @@ fn self_avatar_clock_is_read_once_the_gate_is_held() {
     assert!(crate::self_avatar::current_with_clock(&context, &clock, PIXELS, &mut fetch).is_some());
     assert_eq!(gate_held_at_clock.get(), Some(true), "the clock is read while the gate is held");
 }
+
+#[test]
+fn self_avatar_identity_is_read_once_the_gate_is_held() {
+    let (_root, context) = with_identity("206 avatar identity switch", json!({"userId": "10001"}));
+    // Another caller holds the gate. This caller starts while her uin is 10001, waits for the gate, and her
+    // uin changes to 10002 before the gate frees.
+    let holder = context.open_locked_file(RuntimeArea::Data, crate::self_avatar::GATE_FILE).unwrap();
+    let urls = std::sync::Mutex::new(Vec::new());
+    let (context, urls) = (&context, &urls);
+    std::thread::scope(|scope| {
+        let caller = scope.spawn(move || {
+            let mut fetch = |url: &str| -> Fetched {
+                urls.lock().unwrap().push(url.to_string());
+                Ok(png(2, 2))
+            };
+            crate::self_avatar::current_with(context, T0, PIXELS, &mut fetch).is_some()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        context.write_atomic(RuntimeArea::Data, "identity.json", json!({"userId": "10002"}).to_string().as_bytes()).unwrap();
+        drop(holder);
+        assert!(caller.join().unwrap());
+    });
+    assert_eq!(*urls.lock().unwrap(), vec![avatar_url("10002")], "the caller fetches the uin it has once the gate is held");
+}
