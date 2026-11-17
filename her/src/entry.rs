@@ -445,7 +445,7 @@ fn ingress_for(readable: bool, holds: bool, held_any: bool, refusable: bool) -> 
 /// #192 (F3): whether this process's reserved2 hub serves `key`, by the rule of `Hub::taken` (reserved2.rs): every
 /// conversation with `--live-all` (the flag the hub is built with), otherwise those listed in `--live-groups`.
 fn reserved2_serves(live_all: bool, live_groups: &[String], key: &str) -> bool {
-    !key.is_empty() && live_groups.iter().any(|g| g == key) // #192 TEMPORARY RED MUTATION
+    !key.is_empty() && (live_all || live_groups.iter().any(|g| g == key))
 }
 
 /// #192 (F3): events refused while the configuration cannot be read (outside reserved2, which holds them) go to the

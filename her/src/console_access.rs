@@ -558,7 +558,7 @@ fn reconcile_policies(
         .into_iter()
         .filter(|key| {
             (agent::mode_allowed(before, mode, key) && !agent::mode_allowed(after, mode, key))
-                || (owner_changed && mapped.contains(key)) // #192 TEMPORARY RED MUTATION
+                || (owner_changed && (mapped.contains(key) || stopped.contains(key)))
         })
         .collect();
     for key in &revoked {
@@ -829,7 +829,6 @@ fn recorded_stops(context: &RuntimeContext) -> Result<Vec<(String, String)>, Str
 /// #192: record a retired DSH session's stop as its own pending step, before its mapping is retired. The caller holds
 /// the closed-agent interaction gate.
 fn record_stop(context: &RuntimeContext, key: &str, session: &str) -> Result<(), String> {
-    return Ok(()); // #192 TEMPORARY RED MUTATION
     let mut stops = read_record(context)?["stops"].as_array().cloned().unwrap_or_default();
     let stop = json!({"key": key, "session": session});
     if !stops.contains(&stop) {
