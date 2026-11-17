@@ -483,18 +483,14 @@ pub fn assign(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
         "rebriefed": rebriefed, "rebriefFailed": failed}))
 }
 
-/// A switch starts a new briefing generation in the conversation's current session (as a
-/// compaction does): its next wake carries a full briefing; memory and history stay. Without a
-/// mapped session the next wake starts a fresh one anyway.
+/// A switch starts a new briefing generation in the conversation's current session the way a
+/// compaction does (`briefing_delivery::next_generation`): its next wake carries a full briefing;
+/// memory and history stay. Without a mapped session the next wake starts a fresh one anyway.
 pub(crate) fn rebrief(context: &RuntimeContext, key: &str) -> Result<bool, String> {
     let Some(sid) = crate::session_map::lookup(context, key)? else { return Ok(false) };
     let state = context.read_social_state()?;
     let Some(epoch) = state["conversations"][key]["agentToken"].as_str().map(str::to_string) else { return Ok(false) };
-    crate::session_map::update_context(context, key, &sid, &epoch, |record| {
-        record["generation"] = json!(record["generation"].as_u64().unwrap_or(0) + 1);
-        record["pending"] = Value::Null;
-        record["needsBriefing"] = json!(true);
-    })
+    crate::session_map::update_context(context, key, &sid, &epoch, |record| crate::briefing_delivery::next_generation(record))
 }
 
 /// `{default: id|null}` or `{conversation: key, persona: id|null}`.

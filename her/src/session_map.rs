@@ -350,8 +350,9 @@ mod tests {
     }
 }
 
-/// Briefing evidence shares the mapping gate. The social gate pins the epoch while writing;
-/// a late collector cannot acknowledge a replacement session or a rotated token.
+/// The DSH route's briefing-delivery store (`briefing_delivery.rs`). Briefing evidence shares the mapping
+/// gate. The social gate pins the epoch while writing; a late collector cannot acknowledge a replacement
+/// session or a rotated token. A new session's record starts with `briefing_delivery::begin`.
 pub fn update_context(
     context: &RuntimeContext, key: &str, sid: &str, epoch: &str,
     change: impl FnOnce(&mut Value),
@@ -365,9 +366,7 @@ pub fn update_context(
             return false;
         }
         let record = object(doc, "briefings").entry(key.to_string()).or_insert_with(|| json!({}));
-        if record["sid"] != sid || record["epoch"] != epoch || record["format"] != 1 {
-            *record = json!({"sid":sid,"epoch":epoch,"format":1,"generation":0});
-        }
+        crate::briefing_delivery::begin(record, sid, epoch);
         let before = record.clone();
         change(record);
         *record != before
@@ -377,7 +376,7 @@ pub fn update_context(
 pub fn context_record(context: &RuntimeContext, key: &str, sid: &str, epoch: &str) -> Result<Value, String> {
     let doc = read(context)?;
     let record = doc.get("briefings").and_then(|r| r.get(key)).cloned().unwrap_or(Value::Null);
-    Ok(if record["sid"] == sid && record["epoch"] == epoch && record["format"] == 1 {
+    Ok(if crate::briefing_delivery::belongs(&record, sid, epoch) {
         record
     } else { json!({"generation":0}) })
 }
