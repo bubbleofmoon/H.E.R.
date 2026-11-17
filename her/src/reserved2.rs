@@ -2462,7 +2462,7 @@ impl Hub {
             .filter(|(key, d)| {
                 let key = key.as_str();
                 self.taken(key)
-                    && console::key_allowed(cfg, key)
+                    && console::inbound_admitted(cfg, key)
                     && (!dsh_down || pipeline::pinned_cli_backend(cfg, key).is_some())
                     && !self.active.contains_key(key)
                     && !self.recovered.contains_key(key)
@@ -2783,7 +2783,7 @@ impl Hub {
         if console::runtime_mode(&self.context) == "reserved2" && state["paused"] != true {
             for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
                 let token = state["conversations"][&turn.key]["agentToken"].as_str().unwrap_or("");
-                if !token.is_empty() && console::key_allowed(cfg, &turn.key)
+                if !token.is_empty() && console::inbound_admitted(cfg, &turn.key)
                     && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
                     && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
                     running.insert(turn.key.clone(), (turn.id.clone(), token.to_string()));
@@ -2847,7 +2847,7 @@ impl Hub {
         use std::sync::atomic::Ordering;
         for (key,m) in &self.maintenance {
             let current=self.rotation_state(cfg,"guard-read",now)?["conversations"][key].clone();
-            if suspended || !self.taken(key) || !console::key_allowed(cfg,key)
+            if suspended || !self.taken(key) || !console::inbound_admitted(cfg,key)
                 || m.plan.policy != json!({"rotation":cfg.pointer("/dsh/rotation"),"cacheTtlMinutes":cfg.pointer("/dsh/cacheTtlMinutes")})
                 || ["lastIncomingAt","lastUnreadSeq","adminWakes"].iter().any(|field|current[*field]!=m.plan.guard[*field])
                 || self.ready.iter().any(|(k,_)|k==key) {
@@ -2926,7 +2926,7 @@ impl Hub {
         let dsh_down=crate::dsh_health::is_down(&self.context);
         if now < self.maintenance_scan_at {return Ok(());}
         let state=self.rotation_state(cfg,"scan-state",now)?;
-        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && console::key_allowed(cfg,key)).cloned().collect()).unwrap_or_default();
+        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && console::inbound_admitted(cfg,key)).cloned().collect()).unwrap_or_default();
         for key in keys {
             if self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key) {continue;}
             if crate::session_rotation::read_retry_at(&self.context,&key,"recovery-scan") > now {
@@ -2979,7 +2979,7 @@ impl Hub {
             (state, _) = self.observe_turn_epoch(&key)?;
             let predicate = if suspended || state["paused"] == true { "suspended" }
                 else if !self.taken(&key) { "notTaken" }
-                else if !console::key_allowed(&cfg, &key) { "notAllowed" }
+                else if !console::inbound_admitted(&cfg, &key) { "notAllowed" }
                 else if state["conversations"].get(key.as_str()).is_none() { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
                     old.as_str() != state["conversations"][&key]["agentToken"].as_str().unwrap_or("")
@@ -3000,7 +3000,7 @@ impl Hub {
         {
             if let Some(conversations) = state["conversations"].as_object() {
                 for (key, conv) in conversations {
-                    if self.taken(key) && console::key_allowed(&cfg, key) {
+                    if self.taken(key) && console::inbound_admitted(&cfg, key) {
                         self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
                         self.drivers.entry(key.clone()).or_insert_with(|| {
                             session::Driver::new(
@@ -3086,7 +3086,7 @@ impl Hub {
             let model_error = pipeline::take_model_error(&self.context, &key);
             let current_token = console::conversation_token(&self.context, &key).ok().flatten().unwrap_or_default();
             let still_valid = console::runtime_mode(&self.context) == "reserved2"
-                && console::key_allowed(&cfg, &key)
+                && console::inbound_admitted(&cfg, &key)
                 && current_token == active.token
                 && self.mode_stamp == active.mode_stamp;
             let owned_token = current_token == active.token
@@ -3101,7 +3101,7 @@ impl Hub {
             }
             if result.is_ok() && owned_token && !active.text_only
                 && console::runtime_mode(&self.context) == "reserved2"
-                && console::key_allowed(&cfg, &key) && self.mode_stamp == active.mode_stamp {
+                && console::inbound_admitted(&cfg, &key) && self.mode_stamp == active.mode_stamp {
                 if let Ok(records) = crate::turn_ledger::read_records(&self.context) {
                     let (turns, _) = crate::turn_ledger::fold(&records);
                     let epoch = crate::send_outbox::token_epoch(&active.token);
@@ -3259,7 +3259,7 @@ impl Hub {
                 println!("[reserved2] {key} 手动唤醒已失效（令牌代际已变），丢弃");
                 continue;
             };
-            if suspended || !console::key_allowed(&cfg, &key) || !self.drivers.contains_key(&key) {
+            if suspended || !console::inbound_admitted(&cfg, &key) || !self.drivers.contains_key(&key) {
                 println!("[reserved2] {key} 手动唤醒未执行：当前不允许唤醒（{reason}）");
                 continue;
             }
@@ -3290,7 +3290,7 @@ impl Hub {
                 }
                 continue;
             }
-            if suspended || !self.taken(&key) || !console::key_allowed(&cfg, &key) {
+            if suspended || !self.taken(&key) || !console::inbound_admitted(&cfg, &key) {
                 continue;
             }
             if crate::group_mute::active(&self.context, &key).is_some() {

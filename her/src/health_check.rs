@@ -341,6 +341,10 @@ mod tests {
             r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
         )
         .unwrap();
+        // A complete selected-runtime layout needs `data/social-v2.json`; without it no configuration can be read
+        // and so no scope can be compared.
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        RuntimeContext::from_root(&root).expect("the fixture is a complete runtime layout");
         let verdict = serde_json::to_value(check(&root, Instant::now() + Duration::from_secs(5))).unwrap();
         let notices = verdict["scopeNotices"].as_array().cloned().unwrap_or_default();
         assert_eq!(notices.len(), 1, "one served conversation the allow list refuses: {verdict}");

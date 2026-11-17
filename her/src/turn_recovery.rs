@@ -524,7 +524,7 @@ fn wait_secs(cfg: &Value) -> u64 {
 
 /// Same session mapping, same token epoch, conversation still allowed.
 fn validity(context: &RuntimeContext, cfg: &Value, turn: &Turn) -> Result<(), String> {
-    if !crate::console::key_allowed(cfg, &turn.key) {
+    if !crate::console::inbound_admitted(cfg, &turn.key) {
         return Err("会话已不在允许范围内".to_string());
     }
     if !turn.session_id.is_empty() {
@@ -598,7 +598,7 @@ fn hand_back(journal: &Journal, keys: &[String]) {
 }
 
 fn allowed(cfg: &Value, event: &Replayable) -> bool {
-    crate::console::key_allowed(cfg, &event.conversation)
+    crate::console::inbound_admitted(cfg, &event.conversation)
 }
 
 /// Apply one verdict. The ledger record comes first and is the commit point: if it cannot be

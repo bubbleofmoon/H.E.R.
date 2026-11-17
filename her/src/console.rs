@@ -9396,7 +9396,7 @@ pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, k
 pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: &str, now: i64, expected: Option<&str>) -> Result<(Value,String), String> {
     mutate_social_state_for(context, |state| {
         let cfg = context.load_config().map_err(|e|(503,e.to_string()))?;
-        if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !key_allowed(&cfg,key) {
+        if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(&cfg,key) {
             return Err((403,"wake invalidated by current settings".to_string()));
         }
         let conv = &mut state["conversations"][key];
@@ -9575,12 +9575,10 @@ pub(crate) fn access_allowed(cfg: &Value, mode: &str, key: &str) -> bool {
     agent::mode_allowed(cfg, mode, key)
 }
 
-pub(crate) fn key_allowed(cfg: &Value, key: &str) -> bool {
-    key_in_allowlist(cfg, key)
-}
-
 /// #186: the inbound gate. `key` is admitted when its id is listed in its allow list and is not in its deny list,
 /// both read from the configuration the caller loaded for this event (`allowAllWhenEmpty` admits nothing here).
+/// Reserved2 ingress, tick invalidation and dispatch, wake claims, turn validity, turn recovery and wake snapshots
+/// all decide by this rule; there is no allow-only check.
 pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
     key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
 }
@@ -9644,7 +9642,7 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
         let previous = &state["conversations"][key];
         if let Some(expected) = guard {
             let cfg=context.load_config().map_err(|e|(503,e.to_string()))?;
-            if runtime_mode(context)!="reserved2" || state["paused"]==true || !key_allowed(&cfg,key)
+            if runtime_mode(context)!="reserved2" || state["paused"]==true || !inbound_admitted(&cfg,key)
                 || cfg.pointer("/socialV2/enabled")==Some(&json!(false))
                 || ["agentToken","lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
                 return Ok(None);

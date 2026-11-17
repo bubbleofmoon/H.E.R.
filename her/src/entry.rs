@@ -401,7 +401,7 @@ fn sync_wake_configs(
                     wc.get("infinite").and_then(Value::as_bool) == Some(false)
                         && wc.get("sleepUntil").and_then(Value::as_str).and_then(wake::parse_iso_ms).is_some()
                 });
-                if finite && console::key_allowed(cfg, key) {
+                if finite && console::inbound_admitted(cfg, key) {
                     drivers.entry(key.clone()).or_insert_with(|| {
                         session::Driver::new(session::scheduler_from_state(wake_cfg_of(cfg), conversation), text_seed(key, None))
                     });
