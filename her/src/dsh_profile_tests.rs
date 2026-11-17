@@ -776,3 +776,22 @@ fn guard179_the_check_command_reports_ok_or_the_problems() {
     assert_eq!(run_cli(&args("write")), 2);
     assert_eq!(run_cli(&["check".to_string()]), 2);
 }
+
+#[test]
+fn guard179_bare_line_breaks_are_refused() {
+    let (_root, context) = fixture("bare-breaks");
+    write_compliant(&context);
+    let persona = "              prefix: |-\n                你是群里的普通成员。\n                - 不用列表回答。\n                说话简短。\n";
+    // A bare carriage return is a line break for DSH's YAML loader: `prefix: AI` is a row here, not a comment.
+    edit_preset(&context, |text| text.replacen(persona, "              # comment\r              prefix: AI\n", 1));
+    assert_eq!(problems(&context), codes(&["yaml:preset1"]), "a bare CR in a preset");
+    write(&context, PRESET_FILE, PRESET);
+    // A bare carriage return after the managed block hides an enabled tool row from the check.
+    let profile = format!("{}# comment\r- id: tool-pwsh\r  disabled: false\n", read(&context, PROFILE_FILE));
+    write(&context, PROFILE_FILE, &profile);
+    assert_eq!(problems(&context), codes(&["yaml:profile"]), "a bare CR in the profile");
+    write_compliant(&context);
+    // U+2028 is a line break for the YAML loader too.
+    edit_preset(&context, |text| text.replacen(persona, "              # note\u{2028}              prefix: AI\n", 1));
+    assert_eq!(problems(&context), codes(&["yaml:preset1"]), "U+2028 in a preset");
+}
