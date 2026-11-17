@@ -396,6 +396,17 @@ fn dsh197_pipeline_rs_names_no_dsh_turn_code() {
         "\"agentPresets/list\"", "\"settings/describe\"", "stop_session_work", "archive_session",
         "probe_prompt", "dsh_profile::", "dsh_health::", ".relogin(", "rpc.call", "fn ensure_session",
         "fn apply_model", "fn cancel_with_reason",
+        "fn turn_records(", "fn prompt_error_needs_probe(", "fn definite_refusal(", "fn preset_for(",
+        "fn ensure_workspace(", "fn ensure_session(", "fn access_epoch(", "fn discard_created_session(",
+        "fn require_preset(", "fn closed_preset(", "fn prepare_title(", "fn flush_title(",
+        "fn cancel_session(", "fn cancel(", "fn cancel_with_reason(", "fn cancel_reserved_epoch(",
+        "fn note_session(", "fn has_dsh(", "fn abandon_attempt(", "fn abandon_attempt_for_test(",
+        "fn session_policy(", "fn stale_policy(", "fn replace_session(", "fn failover_state(",
+        "fn apply_model(", "fn ask_with_failover(", "fn ask_with_failover_with_deadline(",
+        "fn cli_fallback(", "fn should_audit_key(", "fn hide_if_sensitive(", "fn report_turn_error(",
+        "fn ask_with_failover_inner(", "fn exhausted_chain(", "fn ask(", "fn record_turn_usage(",
+        "fn reply(", "fn handle(", "fn handle_with_failover(", "fn run_dsh_turn(",
+        "enum Submit", "struct AccessEpoch",
     ] {
         assert!(!production.contains(token), "pipeline.rs still names DSH turn code: {token}");
     }
