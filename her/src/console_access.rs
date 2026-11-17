@@ -799,7 +799,8 @@ fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
 }
 
 /// An entry carries both policies (`before`, `after`) as objects whose `allow` and `deny`, when present, are objects,
-/// as `begin_access_change` writes them, and `targets`, when present, as an array of strings. `mode` and `why` may be
+/// as `begin_access_change` writes them, and `targets`, when present, as an array of canonical conversation keys (the
+/// keys `canonical_v2_key` returns unchanged). `mode` and `why` may be
 /// missing: the current mode and `access-revoked` are used.
 fn usable_entry(entry: &Value) -> bool {
     ["before", "after"].iter().all(|side| {
@@ -807,7 +808,11 @@ fn usable_entry(entry: &Value) -> bool {
             .get(*side)
             .and_then(Value::as_object)
             .is_some_and(|policy| ["allow", "deny"].iter().all(|list| policy.get(*list).is_none_or(Value::is_object)))
-    }) && entry.get("targets").is_none_or(|targets| targets.as_array().is_some_and(|keys| keys.iter().all(Value::is_string)))
+    }) && entry.get("targets").is_none_or(|targets| {
+        targets.as_array().is_some_and(|keys| {
+            keys.iter().all(|key| key.as_str().is_some_and(|key| canonical_v2_key(key).as_deref() == Some(key)))
+        })
+    })
 }
 
 /// #192: the conversations an earlier attempt selected for `entry` (`targets`).
