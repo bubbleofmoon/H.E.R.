@@ -351,8 +351,6 @@ trait Control {
     }
     fn health(&mut self, context: &RuntimeContext, budget: Duration) -> Result<(), String>;
     fn alert(&mut self, context: &RuntimeContext, config: &Value, reason: &str);
-    /// Called once the restore has passed its admission check, before the pre-restore backup.
-    fn admitted(&mut self, _context: &RuntimeContext) {}
     /// Called after the settings files are replaced and removed, before conversation reconciliation.
     fn store_replaced(&mut self, _context: &RuntimeContext) {}
     fn replace(
@@ -586,19 +584,45 @@ fn resume(context: &RuntimeContext, by: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Stops the writers, replaces the files, then reconciles conversations while the stopped owners are still held. The
-/// settings store gate (`store`, taken at admission) is held through the settings file cleanup, replacement and removal
-/// and released before reconciliation, which takes configuration gates; the configuration gate always comes before the
-/// store gate.
+/// Why `stop_and_replace` ended. `Refused` is the settings store gate that could not be had: the owners were stopped,
+/// no file was touched, and there is nothing to roll back.
+enum Step {
+    Refused(String),
+    Failed(String),
+}
+impl From<String> for Step {
+    fn from(message: String) -> Self {
+        Step::Failed(message)
+    }
+}
+impl Step {
+    fn message(self) -> String {
+        match self {
+            Step::Refused(message) | Step::Failed(message) => message,
+        }
+    }
+}
+
+/// Stops the writers, replaces the files, then reconciles conversations while the stopped owners are still held. A
+/// full restore takes the settings store gate last: after the stop has taken the task gates and the owner gates, and
+/// right before the first file is touched. It holds that gate through the settings file cleanup, replacement and
+/// removal and releases it before reconciliation, which takes configuration gates. A task waits for a configuration
+/// gate while it holds its task gate, and a settings writer waits for the store gate while it holds a configuration
+/// gate, so the one order is task gate, then configuration gate, then store gate; nothing waits for another gate while it
+/// holds the store gate.
 fn stop_and_replace(
     context: &RuntimeContext,
     by: &str,
     prepared: &Prepared,
     memory_only: bool,
     control: &mut dyn Control,
-    store: Option<std::fs::File>,
-) -> Result<(), String> {
+) -> Result<(), Step> {
     let stopped = quiesce(context, by, control)?;
+    let store = if memory_only {
+        None
+    } else {
+        Some(crate::settings::restore_gate(context).map_err(Step::Refused)?)
+    };
     apply(context, prepared, memory_only, control)?;
     drop(store);
     control.store_replaced(context);
@@ -818,24 +842,6 @@ fn execute_with(
         }
         control.preflight(context)?;
         let config = context.load_config().map_err(str::to_owned)?;
-        // A full restore takes the settings store gate at admission and holds it into the replacement, so a writer that
-        // holds the gate refuses the restore with nothing changed, and a gate taken in between can never make a rollback run.
-        let store = if memory_only {
-            None
-        } else {
-            match crate::settings::restore_gate(context) {
-                Ok(gate) => Some(gate),
-                Err(error) => {
-                    control.alert(
-                        context,
-                        &config,
-                        &format!("Restore refused before stopping: {error}"),
-                    );
-                    return Err(error);
-                }
-            }
-        };
-        control.admitted(context);
         audit(
             context,
             by,
@@ -857,24 +863,32 @@ fn execute_with(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
         let rollback = Prepared::open(context, &previous, memory_only)?;
-        let attempt = (|| {
-            stop_and_replace(context, by, &prepared, memory_only, control, store)?;
+        let attempt = (|| -> Result<(), Step> {
+            stop_and_replace(context, by, &prepared, memory_only, control)?;
             resume(context, by)?;
             control.restart(context)?;
             control.health(context, Duration::from_secs(120))?;
-            crate::backup::protect_pre_restore(&previous, &|| Ok(()))
+            Ok(crate::backup::protect_pre_restore(&previous, &|| Ok(()))?)
         })();
         match attempt {
             Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
-            Err(reason) => {
+            Err(Step::Refused(reason)) => {
+                // The settings store gate was not had: the owners are stopped and nothing was replaced, so there is
+                // nothing to roll back; start them again.
+                let started = resume(context, by).and_then(|()| control.restart(context));
+                let detail = match started {
+                    Ok(()) => format!("Restore refused after stopping, nothing changed: {reason}"),
+                    Err(error) => format!(
+                        "Restore refused after stopping, nothing changed: {reason}; the bridge could not be started again: {error}"
+                    ),
+                };
+                control.alert(context, &config, &detail);
+                Err(detail)
+            }
+            Err(Step::Failed(reason)) => {
                 // Always re-quiesce; a failed health check may leave live writers running.
                 let undo = (|| {
-                    let rollback_store = if memory_only {
-                        None
-                    } else {
-                        Some(crate::settings::restore_gate(context)?)
-                    };
-                    stop_and_replace(context, by, &rollback, memory_only, control, rollback_store)?;
+                    stop_and_replace(context, by, &rollback, memory_only, control).map_err(Step::message)?;
                     resume(context, by)?;
                     control.restart(context)?;
                     crate::backup::protect_pre_restore(&previous, &|| Ok(()))
