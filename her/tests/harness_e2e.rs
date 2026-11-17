@@ -2467,18 +2467,22 @@ fn hotfix82_harness_filters_current_and_replayed_chat_only_in_model_copies() {
 
 #[test]
 fn hotfix81_harness_failures_are_failed_turns_with_content_free_owner_alerts() {
-    for (name, reply, class, refusal) in [
-        ("policy",ModelReply::Refusal,"refusal",true),
-        ("error-event",ModelReply::ErrorEvent,"refusal",true),
-        ("policy-http",ModelReply::Error{status:403,message:"safety block CHAT_SECRET".into()},"refusal",true),
-        ("timeout",ModelReply::Delayed{text:"late reply".into(),release:Arc::new(std::sync::atomic::AtomicBool::new(false))},"timeout",false),
-        ("prose",ModelReply::Text("The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET".into()),"refusal",true),
-        ("quota",ModelReply::Error{status:429,message:"CHAT_SECRET quota".into()},"quota",false),
-        ("upstream",ModelReply::Error{status:503,message:"CHAT_SECRET service".into()},"backend",false),
-        ("empty",ModelReply::Text(String::new()),"empty-response",false),
-        ("exit-zero-shape",ModelReply::Text("Error: failed CHAT_SECRET".into()),"backend",false),
+    let quota = || ModelReply::Error{status:429,message:"CHAT_SECRET quota".into()};
+    for (name, replies, class, refusal) in [
+        ("policy",vec![ModelReply::Refusal],"refusal",true),
+        ("error-event",vec![ModelReply::ErrorEvent],"refusal",true),
+        ("policy-http",vec![ModelReply::Error{status:403,message:"safety block CHAT_SECRET".into()}],"refusal",true),
+        ("timeout",vec![ModelReply::Delayed{text:"late reply".into(),release:Arc::new(std::sync::atomic::AtomicBool::new(false))}],"timeout",false),
+        ("prose",vec![ModelReply::Text("The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET".into())],"refusal",true),
+        // #7: a plain 429 is retried once on the one route; the repeat on the unchanged request ends the turn.
+        ("quota",vec![quota(),quota()],"quota",false),
+        ("upstream",vec![ModelReply::Error{status:503,message:"CHAT_SECRET service".into()}],"backend",false),
+        // #7: an empty answer is retried three times (after 1, 2 and 4 s) before the turn fails.
+        ("empty",(0..4).map(|_| ModelReply::Text(String::new())).collect::<Vec<_>>(),"empty-response",false),
+        ("exit-zero-shape",vec![ModelReply::Text("Error: failed CHAT_SECRET".into())],"backend",false),
     ] {
-        let model=FakeModel::script(vec![reply]);
+        let requests=replies.len();
+        let model=FakeModel::script(replies);
         let mut rig=harness_rig(&format!("hotfix81-harness-{name}"),&model);
         if name == "timeout" {
             let path=rig.root.join("config/config.json");
@@ -2489,6 +2493,7 @@ fn hotfix81_harness_failures_are_failed_turns_with_content_free_owner_alerts() {
         rig.start();
         rig.push(group_event(81801,1001,"tester","",vec![text_seg("CHAT_SECRET incoming")]));
         assert!(wait_for(LONG,||rig.ledger().iter().any(|r|r["k"]=="ended"&&r["outcome"]=="failed")),"{name}: {:?}",rig.ledger());
+        assert_eq!(lock(&model.requests).len(),requests,"{name}: model requests");
         rig.wait_texts(OWNER_KEY,1);
         let alerts=rig.texts_to(OWNER_KEY);
         assert_eq!(alerts.len(),1,"{name}: {alerts:?}");

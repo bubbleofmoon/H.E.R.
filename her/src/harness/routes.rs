@@ -4,8 +4,6 @@
 //! conversation's sticky degraded route and spent failovers (`RouteMemory`, `with_memory`). `harness.rs` runs every
 //! harness turn on it and the digest reads the chain's first route (`digest::model`). Usage facts (#173) and route
 //! health (#174) build on it.
-#![allow(dead_code)]
-// #7 step 2 wires the rest of this module into harness.rs; remove both lines then.
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -49,7 +47,7 @@ impl RouteSpec {
     /// before routes existed (`harness/rotation.rs`) keep naming it.
     pub(crate) fn implicit(model: String) -> Self {
         Self {
-            id: model.clone(),
+            id: format!("{model}-route"),
             model,
             effort: None,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,

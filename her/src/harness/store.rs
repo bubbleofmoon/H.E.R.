@@ -203,9 +203,11 @@ impl Store {
         let now = crate::parity_clock::now_ms();
         tx.execute("INSERT INTO turns(id,session_id,conversation,profile,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
             params![request.id, session, request.conversation, request.profile, now]).map_err(|_| STORAGE_ERROR)?;
+        // The first attempt goes to the turn's start route (`ModelRoute::start`).
+        let route = request.route.routes.get(request.route.start).ok_or(STORAGE_ERROR)?;
         let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
-            params![attempt, request.id, safe_text(&self.context, &request.route.model), safe_text(&self.context, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
+            params![attempt, request.id, safe_text(&self.context, &route.model), safe_text(&self.context, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
         append(
             &self.context,
             &tx,
@@ -231,7 +233,7 @@ impl Store {
             &request.id,
             Some(&attempt),
             "model_attempt_started",
-            json!({"model":request.route.model,"endpoint":request.route.endpoint}),
+            json!({"model":route.model,"endpoint":request.route.endpoint,"route":route.id}),
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(history)
@@ -262,7 +264,9 @@ impl Store {
         Ok(())
     }
 
-    pub fn next_attempt(&self, request: &TurnRequest) -> Result<(), String> {
+    /// A new attempt of the running turn on route `route` of its chain (a step, a retry or a failover).
+    pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<(), String> {
+        let route = request.route.routes.get(route).ok_or(STORAGE_ERROR)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -270,7 +274,7 @@ impl Store {
         let session = running_session(&tx, &request.id)?;
         let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
-            params![attempt, request.id, safe_text(&self.context, &request.route.model), safe_text(&self.context, &request.route.endpoint), crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
+            params![attempt, request.id, safe_text(&self.context, &route.model), safe_text(&self.context, &request.route.endpoint), crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
         append(
             &self.context,
             &tx,
@@ -278,7 +282,7 @@ impl Store {
             &request.id,
             Some(&attempt),
             "model_attempt_started",
-            json!({"model":request.route.model,"endpoint":request.route.endpoint}),
+            json!({"model":route.model,"endpoint":request.route.endpoint,"route":route.id}),
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())

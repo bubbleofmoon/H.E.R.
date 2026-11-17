@@ -1419,7 +1419,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let begun = std::time::Instant::now();
         self.chat_guard(key, "")?;
         let route = ModelRoute::from_runtime(&self.context, cfg)?;
-        let model = route.model_name().to_string();
         let harness = Harness::open(&self.context)?;
         let recorder = self.cur_turn.as_ref().ok_or("harness requires a durable bridge turn")?;
         let attempt = format!("harness:{}", recorder.id);
@@ -1462,6 +1461,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
         }
         let status = turn.status();
+        // The route the turn's last request went to, after any failover.
+        let model = turn.model();
         self.report_facts(key, &crate::turn_engine::Facts::of_harness(
             &status,
             invalidated,
@@ -1476,10 +1477,15 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
             _ => {}
         }
+        // Each route request that failed over or ended the turn, as the DSH chain reports each failed candidate.
+        for failure in turn.route_failures() {
+            println!("[failover] {key} harness route {} failed ({})", failure.route, failure.summary);
+            self.report_backend_failure(cfg, key, "harness", "openai", &failure.model, "", &failure.summary);
+        }
         let text = match result {
             Ok(text) => text,
             Err(error) => {
-                if error.starts_with("model/backend ") || error == crate::harness::DEADLINE_EXCEEDED {
+                if error == crate::harness::DEADLINE_EXCEEDED {
                     self.report_backend_failure(cfg, key, "harness", "openai", &model, "", &error);
                 }
                 return Err(error);
