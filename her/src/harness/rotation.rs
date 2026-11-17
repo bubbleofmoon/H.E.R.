@@ -52,13 +52,31 @@ pub(crate) fn due_at(cfg: &Value, last: &LastCall, idle_from: i64) -> Option<i64
     let lead_ms: i128 = if minutes <= 1.0 {
         0
     } else {
-        // Whole minutes are exact in i128; only the fraction goes through f64, so no millisecond is lost.
+        // Whole minutes are exact in i128, and the fraction's milliseconds are computed from its bits, so no millisecond is lost.
         let whole = minutes.trunc();
-        let frac_ms = ((minutes - whole) * 60_000.0).ceil() as i128;
+        let frac_ms = ceil_fraction_ms(minutes - whole);
         (whole as i128 - 1).saturating_mul(60_000).saturating_add(frac_ms)
     };
     // The sum saturates in i128 and then at the i64 range, so a huge lead saturates the deadline from any start.
     Some(i128::from(idle_from).saturating_add(lead_ms).min(i128::from(i64::MAX)) as i64)
+}
+
+/// The exact ceiling of `frac` × 60000 for 0 <= frac < 1: the f64 is mant × 2^-shift, so the product is a ratio of
+/// integers and no rounding happens before the ceiling.
+fn ceil_fraction_ms(frac: f64) -> i128 {
+    if frac <= 0.0 {
+        return 0;
+    }
+    let bits = frac.to_bits();
+    let exp = ((bits >> 52) & 0x7ff) as u32;
+    let frac_bits = (bits & ((1u64 << 52) - 1)) as u128;
+    let (mant, shift) = if exp == 0 { (frac_bits, 1074u32) } else { (frac_bits | (1u128 << 52), 1075 - exp) };
+    let num = mant * 60_000;
+    if shift >= 127 {
+        return 1; // num < 2^70, so the value is above 0 and below 1
+    }
+    let den = 1u128 << shift;
+    ((num + den - 1) / den) as i128
 }
 
 #[cfg(test)]
