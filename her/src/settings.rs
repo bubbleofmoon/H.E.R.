@@ -1261,6 +1261,38 @@ fn remove_at(document: &mut Value, pointer: &str) {
     }
 }
 
+/// `document` as the console audit compares a configuration: every registry pointer removed (with the objects that
+/// are empty after it, so a written-back `reply` object and an absent one agree) and the members of every object in
+/// sorted order, so its serialization is canonical. Registry members belong to the store and are never undone through
+/// the audit, so a settings write-back is no change of the audited file.
+pub(crate) fn registry_free(document: &Value) -> Value {
+    let mut stripped = document.clone();
+    for setting in REGISTRY {
+        remove_at(&mut stripped, setting.pointer);
+        let mut parent = setting.pointer;
+        while let Some((above, _)) = parent.rsplit_once('/') {
+            if above.is_empty() || !stripped.pointer(above).and_then(Value::as_object).is_some_and(|object| object.is_empty()) {
+                break;
+            }
+            remove_at(&mut stripped, above);
+            parent = above;
+        }
+    }
+    sorted(stripped)
+}
+
+fn sorted(value: Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut members: Vec<(String, Value)> = object.into_iter().collect();
+            members.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(members.into_iter().map(|(name, member)| (name, sorted(member))).collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sorted).collect()),
+        other => other,
+    }
+}
+
 /// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
 /// (`null` when none) and `value`, what the next use reads (`Setting::read`; `null` for a model id that is not
 /// configured). `storeError` says why stored values are not applied.

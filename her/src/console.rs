@@ -13945,6 +13945,13 @@ fn audit_snapshot(context: &RuntimeContext) -> Result<Vec<(String, String)>, Str
         .collect())
 }
 
+/// The digest of a configuration with every registry member removed (`settings::registry_free`); None when the text
+/// is not JSON.
+fn config_registry_free_sha(text: &str) -> Option<String> {
+    let document: Value = serde_json::from_str(text).ok()?;
+    Some(sha256_hex(&crate::settings::registry_free(&document).to_string()))
+}
+
 fn sha256_hex(s: &str) -> String {
     let mut h = <sha2::Sha256 as sha2::Digest>::new();
     sha2::Digest::update(&mut h, s.as_bytes());
@@ -14378,7 +14385,13 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     .read_optional_text(area, relative)
                     .map_err(|_| (503, "selected runtime audit target is unavailable".to_string()))?
                     .unwrap_or_default();
-                if f.get("afterSha").and_then(Value::as_str) != Some(sha256_hex(&current).as_str()) {
+                // A configuration record that has `afterRegistryFreeSha` ignores registry members, which the settings
+                // store owns; any other record compares the raw file.
+                let unchanged = match f.get("afterRegistryFreeSha").and_then(Value::as_str) {
+                    Some(expected) if file == "config/config.json" => config_registry_free_sha(&current).as_deref() == Some(expected),
+                    _ => f.get("afterSha").and_then(Value::as_str) == Some(sha256_hex(&current).as_str()),
+                };
+                if !unchanged {
                     return Err((409, format!("{file} 在这条审计记录之后又被修改过，撤销会覆盖之后的变更；请先撤销更新的记录")));
                 }
             }
@@ -14558,12 +14571,18 @@ fn audit_write(
             let _ = std::fs::write(&backup, old);
             backup
         };
-        changed.push(json!({
+        let mut record = json!({
             "file": path,
             "backup": backup,
             "beforeSha": sha256_hex(old),
             "afterSha": sha256_hex(now),
-        }));
+        });
+        if path == "config/config.json" {
+            if let Some(sha) = config_registry_free_sha(now) {
+                record["afterRegistryFreeSha"] = json!(sha);
+            }
+        }
+        changed.push(record);
     }
     if changed.is_empty() && !administrator {
         return Ok(()); // 没改到文件（比如只读了状态），不留噪音
