@@ -1006,31 +1006,50 @@ impl RuntimeContext {
     pub fn load_config(&self) -> Result<Value, &'static str> {
         if self.is_isolated() {
             let raw = match self.load_config_document() {
-                Ok(raw) if raw.is_object() => raw,
-                Ok(_) | Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
+                Ok(raw) => raw,
+                Err(ConfigReadError::Invalid) => return Err("runtime config is invalid"),
                 Err(ConfigReadError::Unavailable(message)) => return Err(message),
             };
-            // `consoleToken` stays as configured ("" for a generated token, JS): readers that
-            // authenticate use `effective_console_token`.
-            let (mut config, _) = crate::config::canonical_config(&raw)
-                .map_err(|_| "runtime config is invalid")?;
-            crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
-                .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
-            // The live closed-agent process mirrors DSH's qq-mode owner override here so the
-            // console and the turn worker enforce the same current administrator policy.
-            let closed = self.read_optional_text(RuntimeArea::Data, "mode.json")?.and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .is_some_and(|v| v["mode"] == "closed-agent");
-            if closed {
-                if let Some(owner) = self.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json")?
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("ownerQQ").cloned()) {
-                    let (overlay, _) = crate::config::canonical_config(&json!({"ownerQQ":owner})).map_err(|_| "runtime owner policy is invalid")?;
-                    if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
-                }
-            }
-            return Ok(config);
+            return self.normalized_config(&raw);
         }
 
         Ok(self.load_config_document().unwrap_or_else(|_| json!({})))
+    }
+
+    /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading
+    /// that file (an access change records the policy it writes before the write). The settings overlay is applied
+    /// first, as `load_config_document` does; a legacy context then uses the document as it is.
+    pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
+        let document = self.overlay_config(raw.clone());
+        if !self.is_isolated() {
+            return Ok(document);
+        }
+        self.normalized_config(&document)
+    }
+
+    /// The normalization `load_config` applies to the overlaid configuration document of a selected runtime.
+    fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
+        if !raw.is_object() {
+            return Err("runtime config is invalid");
+        }
+        // `consoleToken` stays as configured ("" for a generated token, JS): readers that
+        // authenticate use `effective_console_token`.
+        let (mut config, _) = crate::config::canonical_config(raw)
+            .map_err(|_| "runtime config is invalid")?;
+        crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
+            .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
+        // The live closed-agent process mirrors DSH's qq-mode owner override here so the
+        // console and the turn worker enforce the same current administrator policy.
+        let closed = self.read_optional_text(RuntimeArea::Data, "mode.json")?.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .is_some_and(|v| v["mode"] == "closed-agent");
+        if closed {
+            if let Some(owner) = self.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json")?
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("ownerQQ").cloned()) {
+                let (overlay, _) = crate::config::canonical_config(&json!({"ownerQQ":owner})).map_err(|_| "runtime owner policy is invalid")?;
+                if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
+            }
+        }
+        Ok(config)
     }
 
     pub fn read_social_state(&self) -> Result<Value, String> {
