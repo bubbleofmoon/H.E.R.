@@ -37,7 +37,8 @@ public issue, comment or commit names those vault paths and nothing else.
   file list, window semantics and format details are in the vault document.
 - The move into the install root (#67) is `scripts/production-move.ps1` with `-Production`,
   from an administrator PowerShell under the owner's account: `-Mode Inventory` (read-only
-  checks) first, then `-Mode Move` (`-DigestModel <id>` also points the memory digest at the
+  checks that report every blocker at once; a check that needs a failed one reports
+  `skipped: needs <check>`) first, then `-Mode Move` (`-DigestModel <id>` also points the memory digest at the
   relay), and `-Mode Rollback -Production -StateFile <evidence>\state.json` returns to the
   untouched originals. `-Mode OperatorFolders` copies the ops scripts into `C:\qqbot\ops`
   afterwards. For this move only, the Windows coordinator runs the script for the owner:

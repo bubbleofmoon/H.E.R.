@@ -306,7 +306,7 @@ function Add-Failure($ErrorRecord, [string]$Section) {
 # section reports a fixed "skipped" finding instead of running on empty values and hiding its own result.
 function Assert-PlanHas($plan, [string[]]$Keys, [string]$Prerequisite) {
   foreach ($key in $Keys) {
-    # A port is an int; 0 means its section refused it (the configuration sets ConsolePort to 0 before refusing).
+    # A port is an int, and 0 counts as missing: the configuration stores a port only after its checks passed.
     if (-not $plan.Contains($key) -or $null -eq $plan[$key] -or ([string]$plan[$key]) -eq '' -or ($plan[$key] -is [int] -and $plan[$key] -eq 0)) { Stop-Refused ('skipped: needs ' + $Prerequisite) }
   }
 }
@@ -1114,7 +1114,10 @@ function Test-ManifestSkip([string]$Child, [string[]]$Exclude) {
   foreach ($relative in @($Exclude)) { if ($relative) { $skip[$relative.ToLowerInvariant()] = $true } }
   return $skip.ContainsKey($Child.ToLowerInvariant())
 }
-function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [string]$Label, [switch]$NoHash) {
+# -Links (a list) collects each junction or link below the start folder as its relative path and leaves it out, never
+# entering it, instead of refusing. Only Inventory's DSH stub comparison passes it, so a stub link does not hide the
+# stub's differing files; every other walk, Move's stub walk included, still refuses at the first junction or link.
+function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [string]$Label, [switch]$NoHash, $Links = $null) {
   $base = Get-Normal $Root
   $target = Get-Normal $TargetRoot
   # The start folder too: a source that is itself a junction or link would be copied from somewhere else.
@@ -1134,7 +1137,7 @@ function Get-Manifest([string]$Root, [string]$TargetRoot, [string[]]$Exclude, [s
       if ($relative) { $child = $relative + '\' + $item.Name }
       if (Test-ManifestSkip $child $Exclude) { continue }
       if ($base.Length + 1 + $child.Length -gt 259 -or $target.Length + 1 + $child.Length -gt 259) { Stop-Refused ('a path is longer than 259 characters in ' + $Label) }
-      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Stop-Refused ('a junction or link was found in ' + $Label) }
+      if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { if ($null -ne $Links) { $Links.Add($child); continue }; Stop-Refused ('a junction or link was found in ' + $Label) }
       if ($item -is [IO.DirectoryInfo]) {
         $entries.Add([pscustomobject]@{ Path = $child; Length = -1; Sha256 = '' })
         $pending.Push($child)
@@ -1285,17 +1288,23 @@ function Protect-Folder([string]$Path, [string]$What = 'the install root') {
   if ($foreign.Count -gt 0) { Stop-Failed ($What + ' grants access to another account') }
   Write-Step ($What + ' is restricted to the owner, SYSTEM and Administrators')
 }
-function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude) {
-  $differences = [Collections.Generic.List[string]]::new()
-  if (-not (Test-Present $Stub)) { return ,$differences }
+# The old runtime's DSH stub against the profile DSH home, as paths relative to the stub: Differences holds the stub
+# files the home lacks or holds with other content. With -ListLinks (Inventory only), Links holds the stub's junctions
+# and links (listed, never followed) and the walk goes on; without it the walk refuses at the first one, before it
+# enters any further folder, so Move stops at the first stub blocker.
+function Compare-DshStub([string]$Stub, [string]$DshHome, [string[]]$Exclude, [switch]$ListLinks) {
+  $result = [pscustomobject]@{ Differences = [Collections.Generic.List[string]]::new(); Links = [Collections.Generic.List[string]]::new() }
+  if (-not (Test-Present $Stub)) { return $result }
   $homeIndex = @{}
   foreach ($entry in (Get-Manifest $DshHome $DshHome $Exclude 'dsh-home')) { $homeIndex[$entry.Path.ToLowerInvariant()] = $entry.Sha256 }
-  foreach ($entry in (Get-Manifest $Stub $Stub $script:DshStubExclude 'dsh-stub')) {
+  $links = $null
+  if ($ListLinks) { $links = $result.Links }
+  foreach ($entry in (Get-Manifest $Stub $Stub $script:DshStubExclude 'dsh-stub' -Links $links)) {
     if ($entry.Length -lt 0) { continue }
     $key = $entry.Path.ToLowerInvariant()
-    if (-not $homeIndex.ContainsKey($key) -or $homeIndex[$key] -ne $entry.Sha256) { $differences.Add($entry.Path) }
+    if (-not $homeIndex.ContainsKey($key) -or $homeIndex[$key] -ne $entry.Sha256) { $result.Differences.Add($entry.Path) }
   }
-  return ,$differences
+  return $result
 }
 function New-McpProfile([string]$Cli, [string]$Source, [string]$Folder, [int]$ConsolePort) {
   [void][IO.Directory]::CreateDirectory($Folder)
@@ -1673,6 +1682,13 @@ function Get-ConfigPath($Value, [string]$Name) {
   if ($Value -isnot [string] -or $Value -notmatch '^[A-Za-z]:[\\/]') { Stop-Refused ($Name + ' is not an absolute path') }
   return (Get-Normal $Value)
 }
+# Inventory runs every check and reports every blocker: each independent check has its own try block, and a check that
+# needs a failed one reports "skipped: needs <check>" (Assert-PlanHas). A value enters the plan only after its own
+# checks passed, and a check that reads a place another check guards validates that place itself, so a check that
+# does not wait for an earlier one never uses what that one refused. Only the run's own inputs stop the Inventory
+# before the checks: the required parameters and the four old folders (no link above them, inside the temporary
+# folder in a rehearsal, outside the install root), because every check reads through them. Move refuses at the first
+# blocker: Add-Blocker and Add-Failure throw outside Inventory, and Move's DSH stub walk refuses at its first link.
 function Get-MovePlan {
   if (-not $OldRuntime -or -not $OldRelayFolder -or -not $ReleaseSource) { Stop-Refused '-OldRuntime, -OldRelayFolder and -ReleaseSource are required' }
   if (-not (Test-ReleaseName $ReleaseName)) { Stop-Refused '-ReleaseName must be 3 to 41 lower-case letters, digits and dashes, starting with a letter, and not a vX.Y.Z tag' }
@@ -1710,14 +1726,18 @@ function Get-MovePlan {
     # Release images: exactly the three images the hash list names. A release folder not built yet is a fixed finding.
     if (-not (Test-Path -LiteralPath (Join-Path $plan.ReleaseSource 'SHA256SUMS') -PathType Leaf)) { Stop-Refused 'the release folder or its SHA256SUMS is not there yet' }
     $plan.Sums = ConvertFrom-Sums (Read-Lines (Join-Path $plan.ReleaseSource 'SHA256SUMS'))
+    # Every image is checked, so one missing or changed image does not hide another.
+    $imagesChecked = $true
     foreach ($name in @('her.exe', 'her-cli.exe', 'herupdate.exe')) {
-      if (-not (Test-Path -LiteralPath (Join-Path $plan.ReleaseSource $name) -PathType Leaf)) { Stop-Refused ('the release folder has no ' + $name) }
-      if ((Get-FileSha (Join-Path $plan.ReleaseSource $name)) -ne $plan.Sums[$name]) { Stop-Refused ('the release source ' + $name + ' differs from SHA256SUMS') }
+      if (-not (Test-Path -LiteralPath (Join-Path $plan.ReleaseSource $name) -PathType Leaf)) { Add-Blocker ('the release folder has no ' + $name); $imagesChecked = $false; continue }
+      if ((Get-FileSha (Join-Path $plan.ReleaseSource $name)) -ne $plan.Sums[$name]) { Add-Blocker ('the release source ' + $name + ' differs from SHA256SUMS'); $imagesChecked = $false }
     }
-    $plan.SourceCli = Join-Path $plan.ReleaseSource 'her-cli.exe'
-    $plan.Cli = Join-Path $script:Root 'current\her-cli.exe'
-    # Set only when the whole release check passed: later sections need the check, not just some of its values.
-    $plan.ReleaseChecked = 'yes'
+    if ($imagesChecked) {
+      $plan.SourceCli = Join-Path $plan.ReleaseSource 'her-cli.exe'
+      $plan.Cli = Join-Path $script:Root 'current\her-cli.exe'
+      # Set only when the whole release check passed: later sections need the check, not just some of its values.
+      $plan.ReleaseChecked = 'yes'
+    }
   } catch { Add-Failure $_ 'release' }
 
   try {
@@ -1731,22 +1751,64 @@ function Get-MovePlan {
     $tasks = Get-Prop $config 'tasks'
     $startAll = Get-Prop $tasks 'start-all'
     if ((Get-Prop (Get-Prop $tasks 'upstream-check') 'enabled') -eq $true) { Add-Blocker 'tasks.upstream-check is enabled; it needs the old release folder' }
-    $plan.NodePath = Get-ConfigPath (Get-Prop $tasks 'nodePath') 'tasks.nodePath'
-    Assert-NoLinkAbove $plan.NodePath 'the configured Node'
-    $plan.OldRelease = Get-ConfigPath (Get-Prop $tasks 'installRoot') 'tasks.installRoot'
-    $plan.SnowLuma = Get-ConfigPath (Get-Prop $startAll 'snowLumaDirectory') 'tasks.start-all.snowLumaDirectory'
-    $plan.DshScript = Get-ConfigPath (Get-Prop $startAll 'dshScript') 'tasks.start-all.dshScript'
-    foreach ($folder in @($plan.OldRelease, $plan.SnowLuma, $plan.DshScript)) { Assert-NoLinkAbove $folder 'an old production folder'; Assert-RehearsalPath $folder }
-    $plan.ConsolePort = [int](Get-Prop $config 'consolePort')
-    if ($plan.ConsolePort -le 0) { Stop-Refused 'the old configuration has no consolePort' }
-    Assert-RehearsalPort $plan.ConsolePort
-    $plan.OneBotPort = Get-Port (Get-Prop $dependencies 'onebot') 'onebot'
-    $plan.OneBotWsPort = 0
-    if ($null -ne (Get-Prop $dependencies 'onebot_ws')) { $plan.OneBotWsPort = Get-Port (Get-Prop $dependencies 'onebot_ws') 'onebot_ws' }
-    $plan.DshPort = Get-Port (Get-Prop $dependencies 'dsh') 'dsh'
     $plan.RuntimeExclude = @('user\dsh', 'import-manifest.json', 'data\lifecycle\session-handover.json', 'data\lifecycle\session-handover-required.json')
-    $plan.BackupDestination = Get-BackupDestination $config
-    if ($plan.BackupDestination) { Assert-NoLinkAbove $plan.BackupDestination 'the backup folder'; Assert-RehearsalPath $plan.BackupDestination }
+    $plan.ConfigRead = 'yes'
+  } catch { Add-Failure $_ 'configuration' }
+
+  # Each configured path, port and the backup folder is checked on its own, so one bad value does not hide another. A
+  # path is stored only after its own checks passed; a section that needs a missing value reports it was skipped.
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    $configured = Get-ConfigPath (Get-Prop $tasks 'nodePath') 'tasks.nodePath'
+    Assert-NoLinkAbove $configured 'the configured Node'
+    $plan.NodePath = $configured
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    $configured = Get-ConfigPath (Get-Prop $tasks 'installRoot') 'tasks.installRoot'
+    Assert-NoLinkAbove $configured 'an old production folder'; Assert-RehearsalPath $configured
+    $plan.OldRelease = $configured
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    $configured = Get-ConfigPath (Get-Prop $startAll 'snowLumaDirectory') 'tasks.start-all.snowLumaDirectory'
+    Assert-NoLinkAbove $configured 'an old production folder'; Assert-RehearsalPath $configured
+    $plan.SnowLuma = $configured
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    $configured = Get-ConfigPath (Get-Prop $startAll 'dshScript') 'tasks.start-all.dshScript'
+    Assert-NoLinkAbove $configured 'an old production folder'; Assert-RehearsalPath $configured
+    $plan.DshScript = $configured
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    # Like a path, a port is stored only after its own checks passed, so no later check uses a refused port.
+    $port = [int](Get-Prop $config 'consolePort')
+    if ($port -le 0) { Stop-Refused 'the old configuration has no consolePort' }
+    Assert-RehearsalPort $port
+    $plan.ConsolePort = $port
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    # Both OneBot ports or neither: the dependency processes check needs the pair.
+    $port = Get-Port (Get-Prop $dependencies 'onebot') 'onebot'
+    $wsPort = 0
+    if ($null -ne (Get-Prop $dependencies 'onebot_ws')) { $wsPort = Get-Port (Get-Prop $dependencies 'onebot_ws') 'onebot_ws' }
+    $plan.OneBotPort = $port
+    $plan.OneBotWsPort = $wsPort
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    $plan.DshPort = Get-Port (Get-Prop $dependencies 'dsh') 'dsh'
+  } catch { Add-Failure $_ 'configuration' }
+  try {
+    Assert-PlanHas $plan @('ConfigRead') 'the configuration check'
+    $configured = Get-BackupDestination $config
+    if ($configured) { Assert-NoLinkAbove $configured 'the backup folder'; Assert-RehearsalPath $configured }
+    $plan.BackupDestination = $configured
+    # The backups section needs this check, not only its value: an empty destination means no backup folder.
+    $plan.BackupChecked = 'yes'
   } catch { Add-Failure $_ 'configuration' }
 
   try {
@@ -1999,46 +2061,93 @@ function Get-MovePlan {
   } catch { Add-Failure $_ 'copy plan' }
 
   try {
-    # Old scheduled tasks, other enabled tasks that would still start old production, and the HER task.
-    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
+    # Old scheduled tasks, each read on its own so a missing one does not hide the other; the plan keeps them only when
+    # both were read.
+    $records = @()
+    $readBoth = $true
+    foreach ($name in @($OldSupervisorTask, $OldRelayTask)) {
+      try { $records += Get-TaskRecord $name } catch { Add-Failure $_ 'scheduled tasks'; $readBoth = $false }
+    }
+    if ($readBoth) { $plan.OldTasks = $records }
+    foreach ($task in $records) { if (-not $task.Enabled) { Add-Blocker ('the scheduled task ' + $task.Name + ' is not enabled') } }
+  } catch { Add-Failure $_ 'scheduled tasks' }
+
+  try {
+    # Other enabled tasks that would still start old production.
     Assert-PlanHas $plan @('Roots') 'the copy plan'
-    $plan.OldTasks = @((Get-TaskRecord $OldSupervisorTask), (Get-TaskRecord $OldRelayTask))
-    foreach ($task in $plan.OldTasks) { if (-not $task.Enabled) { Add-Blocker ('the scheduled task ' + $task.Name + ' is not enabled') } }
     foreach ($task in @(Get-ScheduledTask -ErrorAction Stop)) {
       if ([string]$task.State -eq 'Disabled' -or @($OldSupervisorTask, $OldRelayTask, 'HER') -contains $task.TaskName) { continue }
       $text = (@($task.Actions | ForEach-Object { [string]$_.Execute + ' ' + [string]$_.Arguments + ' ' + [string]$_.WorkingDirectory }) -join ' ').Replace('/', '\').ToLowerInvariant()
       if (Test-NamesRoot $text $plan.Roots) { Add-Blocker ('the enabled scheduled task ' + $task.TaskName + ' names an old production folder') }
     }
+  } catch { Add-Failure $_ 'scheduled tasks' }
+
+  try {
+    # The HER task, read through the release's console twin.
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     $herTask = (Invoke-Cli $plan.SourceCli @('scheduled-task', 'read') 'her-task-read').Output | ConvertFrom-Json
     if ($null -ne $herTask.xml) { Add-Blocker 'a scheduled task named HER already exists' }
   } catch { Add-Failure $_ 'scheduled tasks' }
 
+  # DSH home, in four checks that do not hide each other: the old runtime's DSH stub, the profile's MCP block, the
+  # profile, plugin and bundle texts, and the bundles' dependencies (then the other files that name a bundle).
   try {
-    # DSH home: the runtime's own DSH files must equal the profile copies the move installs.
-    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
-    Assert-PlanHas $plan @('ConsolePort') 'the configuration check'
+    # The runtime's own DSH files must equal the profile copies the move installs, and the stub holds no junction or
+    # link. Inventory lists its links without following them, so they do not hide its differing files; Move refuses at
+    # the first one.
     Assert-PlanHas $plan @('Roots') 'the copy plan'
     if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
+    $stub = Compare-DshStub (Join-Path $plan.OldRuntime 'user\dsh') $plan.DshHome (Get-DshLinkPaths $plan) -ListLinks:($Mode -eq 'Inventory')
+    Write-Utf8 (Join-Path $script:Evidence 'dsh-stub-links.txt') ((@($stub.Links) -join "`r`n") + "`r`n")
+    Write-Utf8 (Join-Path $script:Evidence 'dsh-stub-differences.txt') ((@($stub.Differences) -join "`r`n") + "`r`n")
+    if ($stub.Links.Count -gt 0) { Add-Blocker 'a junction or link was found in dsh-stub (list in the evidence folder)' }
+    if ($stub.Differences.Count -gt 0 -and -not $AcceptDshProfileFiles) { Add-Blocker ('' + $stub.Differences.Count + ' runtime DSH files differ from the profile DSH home (list in the evidence folder); pass -AcceptDshProfileFiles to take the profile copies') }
+  } catch { Add-Failure $_ 'dsh stub' }
+
+  $rendered = ''
+  try {
+    # The profile's MCP block, rendered by the release's console twin on a private copy in the evidence folder.
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
+    Assert-PlanHas $plan @('ConsolePort') 'the configuration check'
+    if (-not (Test-Path -LiteralPath $plan.DshHome -PathType Container)) { Stop-Refused 'the profile DSH home is missing' }
     $profileFile = Join-Path $plan.DshHome 'profiles\web\cordis.patch.yml'
+    # The copy plan refuses a folder link in the DSH home, but this check does not wait for it: each step below the DSH
+    # home, the file included, is checked from the top down before anything is read through it.
+    $profileStep = $plan.DshHome
+    foreach ($part in @('profiles', 'web', 'cordis.patch.yml')) {
+      $profileStep = Join-Path $profileStep $part
+      $item = Get-Item -LiteralPath $profileStep -Force -ErrorAction SilentlyContinue
+      if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Stop-Refused 'a junction or link lies on the path of the DSH profile' }
+    }
     if (-not (Test-Path -LiteralPath $profileFile -PathType Leaf)) { Stop-Refused 'the profile DSH home has no profiles\web\cordis.patch.yml' }
-    $differences = Compare-DshStub (Join-Path $plan.OldRuntime 'user\dsh') $plan.DshHome (Get-DshLinkPaths $plan)
-    Write-Utf8 (Join-Path $script:Evidence 'dsh-stub-differences.txt') ((@($differences) -join "`r`n") + "`r`n")
-    if ($differences.Count -gt 0 -and -not $AcceptDshProfileFiles) { Add-Blocker ('' + $differences.Count + ' runtime DSH files differ from the profile DSH home (list in the evidence folder); pass -AcceptDshProfileFiles to take the profile copies') }
     $rendered = New-McpProfile $plan.SourceCli $profileFile (Join-Path $script:Evidence 'mcp-preview') $plan.ConsolePort
+  } catch { Add-Failure $_ 'dsh profile' }
+
+  try {
     # The same bundle rewrite the move applies, in memory: what is left must name no old folder and climb nowhere.
+    Assert-PlanHas $plan @('Roots') 'the copy plan'
+    if (-not $rendered) { Stop-Refused 'skipped: needs the DSH profile check' }
     $references = Find-OldProfileReferences $plan.DshHome $rendered (Get-ScanRoots $plan) $plan.Bundles (Get-DshTextMap $plan)
     Write-Utf8 (Join-Path $script:Evidence 'dsh-profile-references.txt') ((@($references) -join "`r`n") + "`r`n")
     if ($references.Count -gt 0) { Add-Blocker ('' + $references.Count + ' DSH profile, plugin or bundle files name old production paths or climb out with a link (list in the evidence folder)') }
+  } catch { Add-Failure $_ 'dsh profile references' }
+
+  try {
+    Assert-PlanHas $plan @('Roots') 'the copy plan'
     $carried = @()
     if ($plan.ToolModules) { $carried += [pscustomobject]@{ From = $plan.ToolModules; To = (Join-Path $plan.ToolRoot 'node_modules') } }
     $outside = Find-BundleOutsideDependencies $plan.Bundles $carried
     Write-Utf8 (Join-Path $script:Evidence 'dsh-bundle-dependencies.txt') ((@($outside) -join "`r`n") + "`r`n")
     if ($outside.Count -gt 0) { Add-Blocker 'a linked DSH bundle depends on a package outside its own folder (list in the evidence folder)' }
+  } catch { Add-Failure $_ 'dsh bundle dependencies' }
+
+  try {
     # Not a blocker: other DSH-home files naming a bundle's old folder keep naming it; F3 settles them before deleting qq-bridge.
+    Assert-PlanHas $plan @('Roots') 'the copy plan'
     $others = Find-OtherBundleReferences $plan.DshHome $plan.Bundles
     Write-Utf8 (Join-Path $script:Evidence 'dsh-other-bundle-references.txt') ((@($others) -join "`r`n") + "`r`n")
     $plan.OtherBundleReferences = $others.Count
-  } catch { Add-Failure $_ 'dsh home' }
+  } catch { Add-Failure $_ 'dsh other references' }
 
   try {
     # Configuration dry run on separate copies; only JSON pointers are written, never values.
@@ -2065,6 +2174,7 @@ function Get-MovePlan {
 
   try {
     # Backups (owner decision a): no archive the new retention would prune.
+    Assert-PlanHas $plan @('BackupChecked') 'the configuration check'
     $destination = [string]$plan.BackupDestination
     if ($destination -and (Test-Path -LiteralPath $destination -PathType Container)) {
       $archives = @(Get-ChildItem -LiteralPath $destination -File -Force | Where-Object { $_.Name -match $ArchivePattern })
@@ -2075,14 +2185,20 @@ function Get-MovePlan {
   try {
     # Sizes, path lengths and junctions of every copy; free disk space.
     Assert-PlanHas $plan @('Copies') 'the copy plan'
-    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     $bytes = 0.0
+    $listedAll = $true
     foreach ($copy in $plan.Copies) {
-      $listing = Get-Manifest $copy.From $copy.To $copy.Exclude $copy.Label -NoHash
-      foreach ($item in $listing) { if ($item.Length -gt 0) { $bytes += $item.Length } }
-      $fileCount = @($listing | Where-Object { $_.Length -ge 0 }).Count
-      Test-RobocopyView $copy.From $copy.To $copy.Exclude $copy.Label $fileCount
+      # Each copy is listed on its own, so a link or a long path in one copy does not hide another; the free space is
+      # judged only once every copy was listed.
+      try {
+        $listing = Get-Manifest $copy.From $copy.To $copy.Exclude $copy.Label -NoHash
+        foreach ($item in $listing) { if ($item.Length -gt 0) { $bytes += $item.Length } }
+        $fileCount = @($listing | Where-Object { $_.Length -ge 0 }).Count
+        Test-RobocopyView $copy.From $copy.To $copy.Exclude $copy.Label $fileCount
+      } catch { Add-Failure $_ ('sizes of ' + $copy.Label); $listedAll = $false }
     }
+    if (-not $listedAll) { Stop-Refused 'skipped: needs the size of every copy' }
+    Assert-PlanHas $plan @('ReleaseChecked') 'the release check'
     foreach ($name in @('her.exe', 'her-cli.exe', 'herupdate.exe')) { $image = Get-Item -LiteralPath (Join-Path $plan.ReleaseSource $name); $bytes += 2 * $image.Length }
     $plan.CopyBytes = $bytes
     $drive = [IO.DriveInfo]::new($script:Root.Substring(0, 1))
