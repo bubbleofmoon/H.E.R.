@@ -48,8 +48,11 @@ impl Tools {
         conversation: &str,
         generation: &str,
     ) -> Result<Self, String> {
-        // Red stub (#160 step 1, capture): step 2 replaces this block.
-        let profile = Profile::of_conversation(cfg, mode, conversation).unwrap_or(Profile::Chat);
+        if !crate::turn_engine::Adapter::Harness.supports(mode) {
+            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
+        }
+        let profile = Profile::of_conversation(cfg, mode, conversation)
+            .ok_or("harness has no tool menu for this conversation in this mode")?;
         let token = crate::conversation_authority::token(context, conversation)?
             .ok_or("harness tool authority is unavailable")?;
         let authority = Authority {
@@ -57,7 +60,7 @@ impl Tools {
             conversation: conversation.into(),
             generation: generation.into(),
             token,
-            mode: crate::conversation_authority::mode(context),
+            mode: mode.into(),
             profile,
         };
         authority.check().map_err(String::from)?;
@@ -220,7 +223,10 @@ impl Authority {
             .load_config()
             .map_err(|reason| CheckError::Unavailable(reason.into()))?;
         let mode = crate::conversation_authority::mode(&self.context);
-        if mode != self.mode || !crate::chat::allowed_in_mode(&cfg, &mode, &self.conversation) {
+        if mode != self.mode
+            || !crate::chat::allowed_in_mode(&cfg, &mode, &self.conversation)
+            || Profile::of_conversation(&cfg, &mode, &self.conversation) != Some(self.profile)
+        {
             return Err(CheckError::Revoked(
                 "harness conversation authority changed",
             ));
@@ -241,11 +247,7 @@ impl Authority {
 /// The definitions of `profile`'s menu that `cfg` registers, in registration order: a tool the
 /// configuration switches off (#153) drops out of every menu.
 fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
-    // Red stub (#160 step 1, definitions): step 2 replaces this block.
-    let owner = matches!(
-        profile,
-        Profile::OwnerPrivate | Profile::ClosedAgent | Profile::Reserved2Owner
-    );
+    let menu = profile.menu();
     let mut tools = crate::mcp::tool_list(cfg)["tools"]
         .as_array()
         .cloned()
@@ -253,13 +255,7 @@ fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
     tools.extend(crate::aux_mcp::tool_list());
     tools
         .into_iter()
-        .filter(|d| {
-            owner
-                || !matches!(
-                    d["name"].as_str(),
-                    Some("memory_acl" | "settings_get" | "settings_set")
-                )
-        })
+        .filter(|d| d["name"].as_str().is_some_and(|name| menu.contains(&name)))
         .collect()
 }
 
