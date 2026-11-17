@@ -63,11 +63,11 @@ std::thread_local! {
     static TEST_WARNINGS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Test hook: a new process starts with no in-process record.
+/// Test hook: this runtime's in-process record is forgotten, as a new process would have none.
 #[cfg(test)]
-fn forget_process_states() {
+fn forget_process_states(context: &crate::runtime::RuntimeContext) {
     if let Some(states) = PROCESS_STATES.get() {
-        states.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        states.lock().unwrap_or_else(|p| p.into_inner()).remove(context.runtime_root().unwrap());
     }
 }
 
@@ -105,7 +105,8 @@ fn shared_state_transition(context: &crate::runtime::RuntimeContext, state: &'st
     Some(state != "ready")
 }
 
-/// The fallback record: the last state this process reported for the runtime. Returns whether to warn.
+/// Records `state` as this process's last seen state for the runtime, on every read. Returns whether to warn by the
+/// process record alone, which is the fallback when the shared record cannot be used.
 fn process_state_transition(context: &crate::runtime::RuntimeContext, state: &'static str) -> bool {
     let mut states = PROCESS_STATES
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -120,10 +121,9 @@ pub fn with_blacklist(context: &crate::runtime::RuntimeContext, cfg: &Value) -> 
     // The retired legacy layout has no selected config directory.
     if !context.is_isolated() { return cfg.clone(); }
     let (state, file_items) = read_blacklist(context);
-    let warn = match shared_state_transition(context, state) {
-        Some(warn) => warn,
-        None => process_state_transition(context, state),
-    };
+    // The process record is updated on every read, so a fallback never compares against a stale state.
+    let process_warn = process_state_transition(context, state);
+    let warn = shared_state_transition(context, state).unwrap_or(process_warn);
     if warn { warn_blacklist_state(state); }
     let configured = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut seen = HashSet::new();
@@ -394,27 +394,27 @@ mod tests {
         let view = || with_blacklist(&context, &cfg);
 
         // First process: the missing state is reported once.
-        forget_process_states();
+        forget_process_states(&context);
         view();
         assert_eq!(take_warnings(), vec!["missing"]);
         // Same process, same state: silent.
         view();
         assert!(take_warnings().is_empty());
         // A second process reading the same runtime, same state: silent.
-        forget_process_states();
+        forget_process_states(&context);
         view();
         assert!(take_warnings().is_empty(), "a second process repeated the missing-state warning");
         // A state change reports again: missing -> invalid -> ready (silent) -> missing.
         std::fs::write(&file, "invalid JSON").unwrap();
-        forget_process_states();
+        forget_process_states(&context);
         view();
         assert_eq!(take_warnings(), vec!["invalid"]);
         std::fs::write(&file, r#"{"strip":["WORD"]}"#).unwrap();
-        forget_process_states();
+        forget_process_states(&context);
         view();
         assert!(take_warnings().is_empty());
         std::fs::remove_file(&file).unwrap();
-        forget_process_states();
+        forget_process_states(&context);
         view();
         assert_eq!(take_warnings(), vec!["missing"]);
         std::fs::remove_dir_all(root).unwrap();
@@ -436,13 +436,13 @@ mod tests {
         let context = RuntimeContext::from_root(&root).unwrap();
         let view = || with_blacklist(&context, &cfg);
 
-        forget_process_states();
+        forget_process_states(&context);
         let filtered = view();
         assert_eq!(take_warnings(), vec!["missing"]);
         assert_eq!(filtered["socialV2"]["context"]["stripFromModelText"], json!(["CFG"]), "delivery must continue");
         view();
         assert!(take_warnings().is_empty(), "the process record must stop a repeat");
-        forget_process_states();
+        forget_process_states(&context);
         view();
         assert_eq!(take_warnings(), vec!["missing"], "each process warns once when the shared record is unusable");
         std::fs::remove_dir_all(root).unwrap();
