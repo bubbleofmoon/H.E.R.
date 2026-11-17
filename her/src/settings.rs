@@ -191,6 +191,45 @@ fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Valu
         .collect())
 }
 
+/// How long a writer waits for the store gate and for other connections to let go while it switches a new store to
+/// WAL (the same as `busy_timeout`).
+const WAL_SWITCH_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Puts the store in WAL mode. The switch asks for the write lock while it holds a read lock, and SQLite then answers
+/// SQLITE_BUSY at once, without `busy_timeout`, when another connection in any process holds the write lock. So a
+/// store not yet in WAL is switched under `locks/settings-store.lock`, one writer at a time, and the switch is retried
+/// while another connection holds a lock, until `WAL_SWITCH_WAIT`. A store already in WAL is left as it is.
+fn enable_wal(context: &RuntimeContext, conn: &Connection) -> Result<(), String> {
+    let mode = |sql: &str| conn.query_row(sql, [], |row| row.get::<_, String>(0));
+    if mode("PRAGMA journal_mode").is_ok_and(|mode| mode.eq_ignore_ascii_case("wal")) {
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+    let _gate = loop {
+        match context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock") {
+            Ok(gate) => break gate,
+            Err(error) if error == "runtime file is already locked" && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return Err(STORAGE_ERROR.to_string()),
+        }
+    };
+    loop {
+        let busy = match mode("PRAGMA journal_mode=WAL") {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => return Ok(()),
+            Ok(_) => true,
+            Err(rusqlite::Error::SqliteFailure(error, _)) => {
+                matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+            }
+            Err(_) => false,
+        };
+        if !busy || std::time::Instant::now() >= deadline {
+            return Err(STORAGE_ERROR.to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
 /// schema is newer than this release's (checked before anything is written).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
@@ -205,7 +244,8 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     if version != 0 && version != SCHEMA_VERSION {
         return Err(refuse_version(version));
     }
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
+    enable_wal(context, &conn)?;
+    conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
     match schema_version(&tx)? {
         0 => tx
