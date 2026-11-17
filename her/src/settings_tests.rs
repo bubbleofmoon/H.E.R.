@@ -728,17 +728,50 @@ fn settings_registry_is_complete_and_agrees_with_its_reader() {
         assert!(matches!(setting.applies, "live" | "next wake" | "restart"), "{}", setting.key);
         assert!(setting.pointer.starts_with('/') && !setting.pointer.contains('~'), "{}", setting.pointer);
         assert!(setting.pointer.split('/').skip(1).all(|name| !name.is_empty()), "{}", setting.pointer);
-        let crate::settings::Kind::Integer { min, max, default } = setting.kind;
-        assert!(min <= default && default <= max, "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
-        assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
-        assert_eq!(setting.default_value(), json!(default));
+        match setting.kind {
+            crate::settings::Kind::Integer { min, max, default } => {
+                assert!(min <= default && default <= max, "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
+                assert_eq!(setting.default_value(), json!(default));
+            }
+            crate::settings::Kind::Text { max_chars, default } => {
+                // The compiled default passes its own check, so the fallback is never a refused text.
+                assert_eq!(setting.normalize(&json!(default)), Some(json!(default)), "{}", setting.key);
+                assert_eq!(setting.default_value(), json!(default));
+                let longest = "鲸".repeat(max_chars);
+                assert_eq!(setting.normalize(&json!(longest)), Some(json!(longest)), "{}", setting.key);
+                assert_eq!(setting.normalize(&json!(format!("{longest}鲸"))), None, "{}", setting.key);
+                assert_eq!(setting.normalize(&json!("")), Some(json!("")), "{}", setting.key);
+                for refused in [json!("AI"), json!("ai"), json!("ＤＳＨ"), json!("a\rb"), json!(1), Value::Null] {
+                    assert_eq!(setting.normalize(&refused), None, "{}: {refused}", setting.key);
+                }
+                // The reader (`prompt_text::text`) agrees: the default without a value, the configured text when
+                // accepted, the default when refused.
+                let configured = |text: &str| {
+                    let mut document = json!(text);
+                    for name in setting.pointer.split('/').skip(1).collect::<Vec<_>>().into_iter().rev() {
+                        let mut object = serde_json::Map::new();
+                        object.insert(name.to_string(), document);
+                        document = Value::Object(object);
+                    }
+                    document
+                };
+                assert_eq!(crate::prompt_text::text(&json!({}), setting.key), default, "{}", setting.key);
+                assert_eq!(crate::prompt_text::text(&configured("鲸 140"), setting.key), "鲸 140", "{}", setting.key);
+                assert_eq!(crate::prompt_text::text(&configured("AI 140"), setting.key), default, "{}", setting.key);
+                // Prompt text is never chat-writable: the chat tool's list names no prompt pointer (#149 keeps it so).
+                assert!(setting.pointer.starts_with("/prompts/"), "{}", setting.key);
+            }
+        }
     }
     // The registry owns the default and bounds the reader applies to the file (`wake_cfg_of`).
     let quiet = crate::settings::find(QUIET_KEY).expect("reply.wakeQuietMs is registered");
-    let crate::settings::Kind::Integer { min, max, default } = quiet.kind;
+    let crate::settings::Kind::Integer { min, max, default } = quiet.kind else {
+        panic!("reply.wakeQuietMs is an integer setting");
+    };
     for ms in [min - 1, min, default, max, max + 1] {
         let config = json!({"socialV2": {"reply": {"wakeQuietMs": ms}}});
         let expected = quiet.normalize(&json!(ms)).and_then(|value| value.as_i64()).unwrap_or(default);
@@ -785,7 +818,7 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(view["kind"]["min"], 1);
     assert!(page.contains("api('/api/settings')"), "the page lists through the route");
     assert!(
-        page.contains("api('/api/settings/set',{setting:s.key,value:Number(input.value)})"),
+        page.contains("api('/api/settings/set',{setting:s.key,value:text?input.value:Number(input.value)})"),
         "the page sets through the route"
     );
     assert!(page.contains("'x-console-token'"), "the page sends the console credential");
