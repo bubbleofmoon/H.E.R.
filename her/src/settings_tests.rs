@@ -1110,3 +1110,21 @@ fn settings_write_back_keeps_a_large_config_json_whole() {
     assert_eq!(file_quiet(&root), Some(4500));
     assert_eq!(std::fs::read(pre_settings_copy(&root)).unwrap(), original);
 }
+
+#[test]
+fn settings_console_writer_keeps_the_copy_before_it_mirrors() {
+    let (root, context) = settings_fixture("settings console copy");
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    let _ = std::fs::remove_file(pre_settings_copy(&root));
+    std::fs::create_dir(pre_settings_copy(&root)).unwrap();
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    let text = json!({"socialV2": {"reply": {"wakeQuietMs": 9000}}}).to_string();
+    assert_eq!(
+        write_selected_config_text(&context, &text),
+        Err("config.json.pre-settings cannot be written".to_string()),
+        "a console write that would mirror a stored value is refused without its copy"
+    );
+    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "config.json is untouched");
+    assert!(pre_settings_copy(&root).is_dir(), "what is there is left alone");
+}
