@@ -213,7 +213,7 @@ impl Store {
             &request.id,
             None,
             "turn_admitted",
-            json!({"generation":request.generation,"profile":request.profile,"tools":request.tools.definitions(),"limits":{"maxSteps":request.limits.max_steps,"maxTokens":request.limits.max_tokens}}),
+            json!({"generation":request.generation,"profile":request.profile,"tools":request.tools.definitions(),"limits":{"maxSteps":request.limits.max_steps,"maxTokens":request.limits.max_tokens,"toolResultChars":request.limits.tool_result_chars}}),
         )?;
         append(
             &self.context,
