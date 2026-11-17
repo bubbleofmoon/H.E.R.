@@ -8406,10 +8406,11 @@ fn handle_sticker_image(
         "images": images,
     }))
 }
-/// `GET /api/socialV2/self-image`：AI 自己的形象图（base64 内联）。
+/// `GET /api/socialV2/self-image`：她自己的形象图（base64 内联）。
 ///
 /// 返回 JSON 而不是二进制：MCP 那层要把它当图片内容塞回给模型，
-/// 走 JSON 省掉一次 content-type 协商。
+/// 走 JSON 省掉一次 content-type 协商。Selected runtimes answer with her live QQ avatar
+/// (`self_avatar`, `"source": "qqAvatar"`) and fall back to the static portrait (`"source": "portrait"`).
 fn handle_self_image(
     context: &RuntimeContext,
     params: &HashMap<String, String>,
@@ -8453,6 +8454,11 @@ fn handle_self_image(
     let path = crate::legacy_path!("qq-bridge/assets/deepseek娘.png");
     let _source = crate::media::admit_source()
         .ok_or_else(|| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
+    let max_pixels = crate::media::Limits::from_config(cfg).pixels;
+    if let Some(live) = crate::self_avatar::current(context, &now_ms, max_pixels) {
+        let images = crate::media::image_values(&live);
+        return Ok(json!({ "ok": true, "key": key, "source": "qqAvatar", "image": images[0], "images": images }));
+    }
     let bytes = if context.is_isolated() {
         let (area, relative) = runtime_location(path)
             .map_err(|_| (503, "selected self image is unavailable".to_string()))?;
@@ -8479,10 +8485,10 @@ fn handle_self_image(
         crate::media::read_image_path(std::path::Path::new(path), crate::media_normalize::MAX_INPUT_BYTES)
             .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?
     };
-    let normalized = crate::media_normalize::normalize(&bytes, crate::media::Limits::from_config(cfg).pixels)
+    let normalized = crate::media_normalize::normalize(&bytes, max_pixels)
         .map_err(|_| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let images = crate::media::image_values(&normalized);
-    Ok(json!({ "ok": true, "key": key, "image": images[0], "images": images }))
+    Ok(json!({ "ok": true, "key": key, "source": "portrait", "image": images[0], "images": images }))
 }
 
 
@@ -26658,5 +26664,6 @@ mod tests {
     mod access_pending_tests { include!("access_pending_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
     mod config_overlay_tests { include!("config_overlay_tests.rs"); }
+    mod self_avatar_tests { include!("self_avatar_tests.rs"); }
     mod settings_tests { include!("settings_tests.rs"); }
 }

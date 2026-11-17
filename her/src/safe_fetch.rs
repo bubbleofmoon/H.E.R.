@@ -135,21 +135,49 @@ pub fn fetch_bytes(raw_url: &str, max_bytes: usize) -> Result<Fetched, String> {
     fetch_bytes_with(raw_url, max_bytes, resolve_public, curl_once)
 }
 
-fn fetch_bytes_with<R, F>(raw_url: &str, max_bytes: usize, mut resolve: R, mut transfer: F) -> Result<Fetched, String>
+/// One GET of a fixed URL (#206 self avatar): the guards of `fetch_bytes` (public pinned addresses, size
+/// cap, image magic), but no redirect is followed (a 3xx is a failure) and all address attempts together
+/// end within `budget`. The host lookup has its own five-second limit (`resolve_public`).
+/// The body and header files are written into `transfer_dir` (the caller's folder, not the system temporary
+/// folder).
+#[cfg_attr(test, allow(dead_code))]
+pub fn fetch_exact(raw_url: &str, max_bytes: usize, budget: std::time::Duration, transfer_dir: &std::path::Path) -> Result<Fetched, String> {
+    fetch_with_hops(raw_url, max_bytes, 0, budget, resolve_public, |p, pin, max, given| curl_once_in(p, pin, max, given, transfer_dir))
+}
+
+fn fetch_bytes_with<R, F>(raw_url: &str, max_bytes: usize, resolve: R, transfer: F) -> Result<Fetched, String>
+where
+    R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
+    F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
+{
+    fetch_with_hops(raw_url, max_bytes, 5, std::time::Duration::from_secs(20), resolve, transfer)
+}
+
+/// `redirects` is how many redirects may be followed (each target revalidated); `budget` caps one hop's
+/// address attempts together, and one attempt to 8 seconds when there are several addresses.
+fn fetch_with_hops<R, F>(
+    raw_url: &str,
+    max_bytes: usize,
+    redirects: usize,
+    budget: std::time::Duration,
+    mut resolve: R,
+    mut transfer: F,
+) -> Result<Fetched, String>
 where
     R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
     F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
 {
     let mut current = raw_url.trim().to_string();
-    for _hop in 0..=5 {
+    for _hop in 0..=redirects {
         let parsed = parse_url(&current).ok_or_else(|| format!("URL 不合法：{current}"))?;
         let ips = resolve(&parsed.host, parsed.port)?;
         let started = std::time::Instant::now();
         let mut result = Err("图片抓取失败".to_string());
         for pin in ips.iter().take(4) {
-            let remaining = std::time::Duration::from_secs(20).saturating_sub(started.elapsed());
+            let remaining = budget.saturating_sub(started.elapsed());
             if remaining.is_zero() { break; }
-            let budget = remaining.min(std::time::Duration::from_secs(if ips.len() > 1 { 8 } else { 20 }));
+            let per_address = if ips.len() > 1 { budget.min(std::time::Duration::from_secs(8)) } else { budget };
+            let budget = remaining.min(per_address);
             result = transfer(&parsed, *pin, max_bytes, budget);
             if result.is_ok() { break; }
         }
@@ -204,11 +232,24 @@ fn host_port(p: &ParsedUrl) -> String {
     }
 }
 
+/// Environment that would point curl at a config file (curlrc lookup) or a proxy; the curl child gets
+/// each of these set to empty.
+const CURL_ENV_CLEARED: [&str; 11] = [
+    "CURL_HOME", "XDG_CONFIG_HOME", "HOME", "APPDATA", "USERPROFILE",
+    "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+];
+
 /// The curl invocation for one pinned hop (`curl.exe` on Windows, `curl` elsewhere; no console window).
+/// `-q` must be the very first argument: otherwise curl reads a curlrc, which could add a URL or a
+/// `connect-to` that bypasses the pinned address.
 fn curl_command(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration, out_path: &std::path::Path, hdr_path: &std::path::Path) -> Result<std::process::Command, String> {
     let url = format!("{}://{}{}", p.scheme, host_port(p), p.rest);
     let mut command = crate::subprocess::command_without_console(crate::aux_fetch::curl_program());
+    for name in CURL_ENV_CLEARED {
+        command.env(name, "");
+    }
     command.args([
+            "-q",
             "-sS",
             "--globoff",
             "--max-redirs",
@@ -234,8 +275,19 @@ fn curl_command(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time:
     Ok(command)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Unit tests' record, on this thread, of the body and header file paths each curl transfer was given.
+    pub(crate) static CURL_PATHS_TEST_HOOK: std::cell::RefCell<Vec<std::path::PathBuf>> = std::cell::RefCell::new(Vec::new());
+}
+
 /// 调一次 curl：把连接钉死在 `pin` 上，返回 (状态码, Location 头, 正文)。
 fn curl_once(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String> {
+    curl_once_in(p, pin, max_bytes, budget, &std::env::temp_dir())
+}
+
+/// `curl_once` with its body and header files written into `dir`.
+fn curl_once_in(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Duration, dir: &std::path::Path) -> Result<(u16, Option<String>, Vec<u8>), String> {
     // 临时名必须带**唯一后缀**：控制台是每连接一线程，并发抓两张图时如果只用 pid，
     // 两个线程会写同一个文件，结果是一张图的内容混进另一张（A2 审计的 M5）。
     let uniq = std::time::SystemTime::now()
@@ -243,8 +295,10 @@ fn curl_once(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time::Du
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let sequence = FETCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let out_path = std::env::temp_dir().join(format!("her-fetch-{}-{uniq}-{sequence}.bin", std::process::id()));
-    let hdr_path = std::env::temp_dir().join(format!("her-fetch-{}-{uniq}-{sequence}.hdr", std::process::id()));
+    let out_path = dir.join(format!("her-fetch-{}-{uniq}-{sequence}.bin", std::process::id()));
+    let hdr_path = dir.join(format!("her-fetch-{}-{uniq}-{sequence}.hdr", std::process::id()));
+    #[cfg(test)]
+    CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow_mut().extend([out_path.clone(), hdr_path.clone()]));
     let status = curl_command(p, pin, max_bytes, budget, &out_path, &hdr_path)?
         .output()
         .map_err(|e| format!("调用 curl 失败：{e}"))?;
@@ -563,6 +617,127 @@ mod tests {
         assert_eq!(redirected.url, format!("http://fake.test:{port}/a.png"));
         assert!(fetch_bytes_with(&format!("http://fake.test:{port}/big.png"), png.len() - 1, resolve, curl_once).is_err(), "size cap");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn self_avatar_exact_fetch_follows_no_redirect_and_keeps_its_budget() {
+        let bytes = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let budget = std::time::Duration::from_secs(8);
+        let (mut lookups, mut transfers) = (Vec::new(), 0);
+        let refused = fetch_with_hops("https://public.test/g?x=1", 1024, 0, budget, |host, _| {
+            lookups.push(host.to_string());
+            Ok(vec!["1.1.1.1".parse().unwrap()])
+        }, |_, _, _, given| {
+            transfers += 1;
+            assert!(given > std::time::Duration::ZERO && given <= budget, "{given:?}");
+            Ok((302, Some("https://public.test/elsewhere.png".into()), Vec::new()))
+        });
+        assert!(refused.is_err(), "a redirect is never followed");
+        assert_eq!((lookups, transfers), (vec!["public.test".to_string()], 1));
+        let ips: Vec<IpAddr> = ["1.1.1.1", "8.8.8.8"].iter().map(|s| s.parse().unwrap()).collect();
+        let mut given_budgets = Vec::new();
+        let fetched = fetch_with_hops("https://public.test/g?x=1", 1024, 0, budget, |_, _| Ok(ips.clone()), |_, _, _, given| {
+            given_budgets.push(given);
+            if given_budgets.len() == 1 { Err("first address down".into()) } else { Ok((200, None, bytes.clone())) }
+        }).unwrap();
+        assert_eq!(fetched.bytes, bytes);
+        assert_eq!(given_budgets.len(), 2);
+        assert!(given_budgets.iter().all(|given| *given <= budget), "{given_budgets:?}");
+        let resolve = |_: &str, _| Ok(vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+        assert!(fetch_with_hops("https://public.test/g", bytes.len() - 1, 0, budget, resolve, |_, _, _, _| Ok((200, None, bytes.clone()))).is_err(), "one byte over the cap");
+        assert!(fetch_with_hops("https://public.test/g", bytes.len(), 0, budget, resolve, |_, _, _, _| Ok((200, None, bytes.clone()))).is_ok(), "exactly the cap");
+        assert!(fetch_with_hops("https://public.test/g", 1024, 0, budget, resolve, |_, _, _, _| Ok((200, None, b"<html>no</html>".to_vec()))).is_err(), "not an image");
+        assert!(fetch_with_hops("https://public.test/g", 1024, 0, budget, resolve, |_, _, _, _| Ok((404, None, bytes.clone()))).is_err(), "not 2xx");
+        let mut late = 0;
+        assert!(fetch_with_hops("https://public.test/g", 1024, 0, std::time::Duration::ZERO, resolve, |_, _, _, _| {
+            late += 1;
+            Ok((200, None, bytes.clone()))
+        }).is_err(), "a spent budget starts no transfer");
+        assert_eq!(late, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_avatar_exact_fetch_through_system_curl_stops_at_a_redirect() {
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let (port, hits) = fake_media_server(vec![
+            ("/g?b=qq&nk=10001&s=640", 200, vec![], png.clone()),
+            ("/go", 302, vec![("Location".into(), "/g?b=qq&nk=10001&s=640".into())], Vec::new()),
+        ]);
+        let resolve = |_: &str, _| Ok(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        let budget = std::time::Duration::from_secs(8);
+        let direct = fetch_with_hops(&format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640"), 1 << 20, 0, budget, resolve, curl_once).expect("direct avatar");
+        assert_eq!(direct.bytes, png);
+        assert!(fetch_with_hops(&format!("http://fake.test:{port}/go"), 1 << 20, 0, budget, resolve, curl_once).is_err(), "the redirect is not followed");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2, "the redirect target was never requested");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_avatar_exact_fetch_writes_its_files_only_in_the_transfer_folder() {
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let (port, _hits) = fake_media_server(vec![("/g?b=qq&nk=10001&s=640", 200, vec![], png.clone())]);
+        let resolve = |_: &str, _| Ok(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        let budget = std::time::Duration::from_secs(8);
+        let folder = std::env::temp_dir().join(format!("her-transfer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow_mut().clear());
+        let fetched = fetch_with_hops(
+            &format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640"),
+            1 << 20,
+            0,
+            budget,
+            resolve,
+            |p, pin, max, given| curl_once_in(p, pin, max, given, &folder),
+        )
+        .expect("the avatar");
+        assert_eq!(fetched.bytes, png);
+        let paths = CURL_PATHS_TEST_HOOK.with(|paths| paths.borrow().clone());
+        assert_eq!(paths.len(), 2, "one body file and one header file");
+        assert!(paths.iter().all(|path| path.starts_with(&folder)), "the transfer files stay in the transfer folder: {paths:?}");
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    #[test]
+    fn self_avatar_curl_reads_no_config_and_no_proxy_environment() {
+        let p = parse_url("https://q1.qlogo.cn/g?b=qq&nk=10001&s=640").unwrap();
+        let command = curl_command(&p, "1.1.1.1".parse().unwrap(), 1024, std::time::Duration::from_secs(5), std::path::Path::new("o.bin"), std::path::Path::new("h.hdr")).unwrap();
+        let args: Vec<String> = command.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[0], "-q", "curl reads its config files unless -q comes first: {args:?}");
+        // Windows environment names are case-insensitive.
+        let key = |name: &str| if cfg!(windows) { name.to_ascii_uppercase() } else { name.to_string() };
+        let envs: std::collections::HashMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(name, value)| (key(&name.to_string_lossy()), value.map(|value| value.to_string_lossy().into_owned())))
+            .collect();
+        for name in ["CURL_HOME", "XDG_CONFIG_HOME", "HOME", "APPDATA", "USERPROFILE", "http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"] {
+            assert_eq!(envs.get(&key(name)), Some(&Some(String::new())), "{name} is empty for curl");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_avatar_curl_ignores_a_curlrc_in_its_home() {
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        let (port, hits) = fake_media_server(vec![
+            ("/g?b=qq&nk=10001&s=640", 200, vec![], png.clone()),
+            ("/from-curlrc", 200, vec![], b"config".to_vec()),
+        ]);
+        let sequence = FETCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let home = crate::install_root::development_root(std::env::temp_dir().join(format!("her-curlrc-{}-{sequence}", std::process::id())));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".curlrc"), format!("url = \"http://127.0.0.1:{port}/from-curlrc\"\n")).unwrap();
+        let (out, hdr) = (home.join("out.bin"), home.join("out.hdr"));
+        let p = parse_url(&format!("http://fake.test:{port}/g?b=qq&nk=10001&s=640")).unwrap();
+        let mut command = curl_command(&p, "127.0.0.1".parse().unwrap(), 1 << 20, std::time::Duration::from_secs(8), &out, &hdr).unwrap();
+        // The child's home holds a curlrc, as if the console ran with that home: only `-q` keeps it unread.
+        command.env("CURL_HOME", &home).env("HOME", &home);
+        let output = command.output().unwrap();
+        let body = std::fs::read(&out).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(body, png, "the avatar body, not the curlrc's URL");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "the curlrc's extra URL was never requested");
     }
 
     #[test]
