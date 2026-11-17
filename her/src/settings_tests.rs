@@ -2602,6 +2602,56 @@ fn audit_undo_keeps_a_stored_value_and_its_write_back() {
 }
 
 #[test]
+fn audit_undo_of_a_console_write_survives_a_later_settings_write_back() {
+    // A settings write rewrites config.json with no audit record of its own; the audit undo of an earlier console
+    // write must still apply, because registry members belong to the store and are never undone through the audit.
+    let (root, context) = settings_fixture("settings audit undo write-back");
+    let config_post = |body: Value| {
+        let (status, reply) = admin_request(&context, "POST", "/api/socialV2/config", Some(&body));
+        assert_eq!(status, 200, "{reply}");
+    };
+    let latest_config_entry = || {
+        let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+        assert_eq!(status, 200, "{recent}");
+        recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()["id"]
+            .clone()
+    };
+    config_post(json!({"autoReplyCheckMs": 4000}));
+    let entry = latest_config_entry();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(file_quiet(&root), Some(4500), "the write-back put the stored value in config.json");
+    assert_eq!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 4000);
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry})));
+    assert_eq!(status, 200, "a registry write-back is no later change of the record's file: {reply}");
+    assert_ne!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 4000, "the console member is restored");
+    assert_eq!(file_quiet(&root), Some(4500), "the stored registry value stays in config.json");
+    assert_eq!(next_use_quiet(&context), Some(4500));
+}
+
+#[test]
+fn audit_undo_is_still_refused_after_a_later_non_registry_change() {
+    let (root, context) = settings_fixture("settings audit undo later change");
+    let config_post = |body: Value| {
+        let (status, reply) = admin_request(&context, "POST", "/api/socialV2/config", Some(&body));
+        assert_eq!(status, 200, "{reply}");
+    };
+    config_post(json!({"autoReplyCheckMs": 4000}));
+    let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+    assert_eq!(status, 200, "{recent}");
+    let entry = recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()
+        ["id"]
+        .clone();
+    let (status, body) = set_quiet(&context, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    config_post(json!({"autoReplyCheckMs": 5000}));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry})));
+    assert_eq!(status, 409, "{reply}");
+    assert_eq!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 5000, "a refused undo changes nothing");
+    assert_eq!(file_quiet(&root), Some(4500));
+}
+
+#[test]
 fn settings_every_writer_closes_the_store_without_sidecars() {
     // Each writer reads the stored values for its write-back on its own read-write connection, so that connection's
     // close is the store's last and removes the WAL and its index: no `-wal` or `-shm` is left after any write.
