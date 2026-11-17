@@ -289,8 +289,9 @@ fn check_schema(conn: &Connection) -> Result<bool, String> {
 }
 
 /// Looks at the store without opening it for writing. Every store file (the database, its `-wal`, `-shm` and `-journal`,
-/// and the store gate) must be a plain file with one link or missing, whether or not the database exists. A non-empty
-/// rollback journal is refused: nothing recovers it. A file that is not a SQLite database, a version other than 0 or 1
+/// and the store gate) must be a plain file with one link or missing, whether or not the database exists. A leftover
+/// rollback journal (beside a missing database, or hot: no connection holds the write lock) is refused, and nothing
+/// recovers it; a live writer's journal is waited for. A file that is not a SQLite database, a version other than 0 or 1
 /// (read from the file header while no WAL holds later commits), a version 0 with any schema object and a version 1
 /// whose schema is not exactly this release's are refused too. Otherwise a read-only connection that never checkpoints
 /// on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt meanwhile.
@@ -315,21 +316,16 @@ fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, St
     let Some(len) = file_len(&path)? else {
         return if journal_len > 0 { Err(LEFTOVER_JOURNAL_ERROR.to_string()) } else { Ok(Inspection::Missing) };
     };
-    let header = if len == 0 { None } else { Some(header_version(&path)?) };
-    if journal_len > 0 {
-        return match header {
-            // A newer release's store is refused as newer, whatever else is beside it.
-            Some(version) if wal_len == 0 && version != 0 && version != SCHEMA_VERSION => Err(refuse_version(version)),
-            _ => Err(LEFTOVER_JOURNAL_ERROR.to_string()),
-        };
-    }
     if len == 0 {
+        // An empty database has no page a journal could restore: a journal beside it is a live writer's (`BEGIN
+        // IMMEDIATE` on a new store writes one) or one SQLite discards, and the writer's open waits for a live lock.
         return if wal_len == 0 { Ok(Inspection::Fresh) } else { Err(STORAGE_ERROR.to_string()) };
     }
+    let header = header_version(&path)?;
     if wal_len == 0 {
         // The header is current while no WAL holds later commits.
-        if let Some(version) = header.filter(|version| *version != 0 && *version != SCHEMA_VERSION) {
-            return Err(refuse_version(version));
+        if header != 0 && header != SCHEMA_VERSION {
+            return Err(refuse_version(header));
         }
     } else {
         // A read-only connection would create a missing index; wait for a closing connection to finish instead.
@@ -348,6 +344,15 @@ fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, St
         .map_err(|_| STORAGE_ERROR.to_string())?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
+    // A journal is hot when no connection holds the store's write lock: a leftover, which this read-only connection
+    // refuses to play back. A live writer's journal is not hot, and its lock is waited for under `busy_timeout`.
+    if let Err(rusqlite::Error::SqliteFailure(error, _)) =
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+    {
+        if error.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK {
+            return Err(LEFTOVER_JOURNAL_ERROR.to_string());
+        }
+    }
     if check_schema(&conn)? { Ok(Inspection::Ready(conn)) } else { Ok(Inspection::Fresh) }
 }
 
