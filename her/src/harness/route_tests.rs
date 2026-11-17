@@ -528,3 +528,53 @@ async fn harness_routes_an_unsafe_stop_that_spends_the_budget_does_not_fail_over
     assert_eq!(models(&server.await.unwrap()), ["model-a"], "the stop spent the whole budget: no route b request");
     rig.no_more_requests().await;
 }
+
+/// A provider content-filter stop: the refused flag is set on its frame, and the stream reports 15 tokens of usage.
+fn content_filter() -> String {
+    sse(&[stop("content_filter")])
+}
+
+/// A refusal in `delta.refusal`, then a normal stop with 15 tokens of usage.
+fn refusal_delta() -> String {
+    sse(&[
+        json!({"id":"fake-7","object":CHUNK,"model":"fake","choices":[{"index":0,"delta":{"refusal":"declined"},"finish_reason":null}]}),
+        stop("stop"),
+    ])
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_routes_an_unsafe_stop_refusal_is_charged_before_the_failover_asks_for_what_is_left() {
+    let chain = json!({"maxTokens":20,"routes":[{"id":"a","model":"model-a"},{"id":"b","model":"model-b"}]});
+    let rig = rig("unsafe-refusal-left", chain, None).await;
+    let server = serve(rig.model.clone(), vec![content_filter(), content_filter()]);
+    let result = ended(&mut rig.admit("unsafe-refusal-left-1")).await;
+    assert!(result.as_ref().is_err_and(|reason| class(reason) == "refusal"), "{result:?}");
+    let requests = server.await.unwrap();
+    assert_eq!(models(&requests), ["model-a", "model-b"], "a refusal fails over");
+    assert_eq!(requests[1]["max_tokens"], 5, "route a's 15 tokens are charged: route b asks for the 5 left");
+    rig.no_more_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_routes_an_unsafe_stop_refusal_that_spends_the_budget_does_not_fail_over() {
+    let chain = json!({"maxTokens":15,"routes":[{"id":"a","model":"model-a"},{"id":"b","model":"model-b"}]});
+    let rig = rig("unsafe-refusal-spent", chain, None).await;
+    let server = serve(rig.model.clone(), vec![content_filter()]);
+    let result = ended(&mut rig.admit("unsafe-refusal-spent-1")).await;
+    assert!(result.as_ref().is_err_and(|reason| class(reason) == "refusal"), "{result:?}");
+    assert_eq!(models(&server.await.unwrap()), ["model-a"], "the refusal spent the whole budget: no route b request");
+    rig.no_more_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_routes_an_unsafe_stop_refusal_delta_is_charged_before_the_failover_asks_for_what_is_left() {
+    let chain = json!({"maxTokens":20,"routes":[{"id":"a","model":"model-a"},{"id":"b","model":"model-b"}]});
+    let rig = rig("unsafe-delta-left", chain, None).await;
+    let server = serve(rig.model.clone(), vec![refusal_delta(), refusal_delta()]);
+    let result = ended(&mut rig.admit("unsafe-delta-left-1")).await;
+    assert!(result.as_ref().is_err_and(|reason| class(reason) == "refusal"), "{result:?}");
+    let requests = server.await.unwrap();
+    assert_eq!(models(&requests), ["model-a", "model-b"], "a refused delta fails over");
+    assert_eq!(requests[1]["max_tokens"], 5, "route a's 15 tokens are charged: route b asks for the 5 left");
+    rig.no_more_requests().await;
+}
