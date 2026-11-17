@@ -1332,12 +1332,21 @@ fn remove_at(document: &mut Value, pointer: &str) {
 }
 
 /// `document` as the console audit compares a configuration: every registry pointer removed (with the objects that
-/// are empty after it, so a written-back `reply` object and an absent one agree) and the members of every object in
-/// sorted order, so its serialization is canonical. Registry members belong to the store and are never undone through
-/// the audit, so a settings write-back is no change of the audited file.
+/// are empty after it, and a null on the way, so a written-back `reply` object, an absent one and a null agree) and
+/// the members of every object in sorted order, so its serialization is canonical. Registry members belong to the
+/// store and are never undone through the audit, so a settings write-back is no change of the audited file.
 pub(crate) fn registry_free(document: &Value) -> Value {
     let mut stripped = document.clone();
     for setting in REGISTRY {
+        // A null on the way reads as absent (`set_at` replaces it with an object), so it goes like an empty object.
+        let mut prefix_end = 0;
+        while let Some(next) = setting.pointer[prefix_end + 1..].find('/') {
+            prefix_end += 1 + next;
+            if stripped.pointer(&setting.pointer[..prefix_end]).is_some_and(Value::is_null) {
+                remove_at(&mut stripped, &setting.pointer[..prefix_end]);
+                break;
+            }
+        }
         remove_at(&mut stripped, setting.pointer);
         let mut parent = setting.pointer;
         while let Some((above, _)) = parent.rsplit_once('/') {
