@@ -960,31 +960,41 @@ impl RuntimeContext {
             let text = self.read_text(RuntimeArea::Config, "config.json")?;
             let raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
                 .map_err(|_| "runtime config is invalid")?;
-            if !raw.is_object() {
-                return Err("runtime config is invalid");
-            }
-            // `consoleToken` stays as configured ("" for a generated token, JS): readers that
-            // authenticate use `effective_console_token`.
-            let (mut config, _) = crate::config::canonical_config(&raw)
-                .map_err(|_| "runtime config is invalid")?;
-            crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
-                .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
-            // The live closed-agent process mirrors DSH's qq-mode owner override here so the
-            // console and the turn worker enforce the same current administrator policy.
-            let closed = self.read_optional_text(RuntimeArea::Data, "mode.json")?.and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .is_some_and(|v| v["mode"] == "closed-agent");
-            if closed {
-                if let Some(owner) = self.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json")?
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("ownerQQ").cloned()) {
-                    let (overlay, _) = crate::config::canonical_config(&json!({"ownerQQ":owner})).map_err(|_| "runtime owner policy is invalid")?;
-                    if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
-                }
-            }
-            return Ok(config);
+            return self.effective_config(&raw);
         }
 
         let text = fs::read_to_string(self.config_file()).unwrap_or_default();
         Ok(serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or_else(|_| json!({})))
+    }
+
+    /// #192: the configuration `load_config` returns once `raw` is the selected runtime's `config.json`, computed
+    /// without reading that file (an access change records the policy it writes before the write). A legacy context
+    /// uses `raw` as it is.
+    pub fn effective_config(&self, raw: &Value) -> Result<Value, &'static str> {
+        if !self.is_isolated() {
+            return Ok(raw.clone());
+        }
+        if !raw.is_object() {
+            return Err("runtime config is invalid");
+        }
+        // `consoleToken` stays as configured ("" for a generated token, JS): readers that
+        // authenticate use `effective_console_token`.
+        let (mut config, _) = crate::config::canonical_config(raw)
+            .map_err(|_| "runtime config is invalid")?;
+        crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
+            .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
+        // The live closed-agent process mirrors DSH's qq-mode owner override here so the
+        // console and the turn worker enforce the same current administrator policy.
+        let closed = self.read_optional_text(RuntimeArea::Data, "mode.json")?.and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .is_some_and(|v| v["mode"] == "closed-agent");
+        if closed {
+            if let Some(owner) = self.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json")?
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok()).and_then(|v| v.get("ownerQQ").cloned()) {
+                let (overlay, _) = crate::config::canonical_config(&json!({"ownerQQ":owner})).map_err(|_| "runtime owner policy is invalid")?;
+                if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
+            }
+        }
+        Ok(config)
     }
 
     pub fn read_social_state(&self) -> Result<Value, String> {

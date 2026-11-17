@@ -14275,7 +14275,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         // Access changes are serialized with closed-agent receipts and mode changes; the config
         // read-modify-write (stale check and restore) runs under the social-state gate.
         let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-        let (config_before, restored) = {
+        access::finish_pending_before_change(context, &interaction)?;
+        let (config_before, restored, planned) = {
             let _gate = acquire_social_state_gate(context)?;
             // Safe undo: only the state this record produced may be replaced. A later change of the
             // same file would be silently lost, so the operator must undo that one first.
@@ -14293,6 +14294,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                 .load_config()
                 .map_err(|e| (503, format!("读取当前配置失败，未撤销：{e}")))?;
             let mut restored = Vec::with_capacity(pending.len());
+            // #192: the restored configuration's effective policy and its pending revocation, recorded before its write.
+            let mut planned: Option<(Value, Option<String>, Option<String>)> = None;
             for (file, old) in pending {
                 // Undo never changes the console credential: the restored configuration keeps the
                 // current `consoleToken` (backups hold a redacted one).
@@ -14308,24 +14311,42 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                         }
                         _ => {}
                     }
-                    serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?
+                    let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
+                    // If the restored configuration cannot be loaded, everything the old one allowed is revoked.
+                    let (after, load_error) = match context.effective_config(&restored_config) {
+                        Ok(after) => (after, None),
+                        Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}"))),
+                    };
+                    let change = access::begin_access_change(context, &config_before, &after, "audit-undo")?;
+                    planned = Some((after, load_error, change));
+                    text
                 } else {
                     old
                 };
-                audit_write_file(context, &file, &text)
-                    .map_err(|e| (500, format!("写回失败 {file}: {e}")))?;
+                if let Err(error) = audit_write_file(context, &file, &text) {
+                    let mut message = format!("写回失败 {file}: {error}");
+                    if let Some((_, _, change)) = planned.as_ref().filter(|_| file == "config/config.json") {
+                        if let Err(cleanup) = access::forget_access_change(context, change) {
+                            message.push_str(&format!("; the recorded revocation stays pending: {cleanup}"));
+                        }
+                    }
+                    return Err((500, message));
+                }
                 restored.push(file);
             }
-            (config_before, restored)
+            (config_before, restored, planned)
         };
         // Restoring a narrower configuration revokes like any other access change; restoring a
         // wider one grants a new epoch only (nothing invalidated earlier comes back). If the
         // restored configuration cannot be read, everything the old one allowed is revoked.
-        let (after, load_error) = match context.load_config() {
-            Ok(after) => (after, None),
-            Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}"))),
+        let (after, load_error, change) = match planned {
+            Some(planned) => planned,
+            None => match context.load_config() {
+                Ok(after) => (after, None, None),
+                Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}")), None),
+            },
         };
-        let (revoked, mut failures) = access::reconcile_access_change(context, &interaction, &config_before, &after, "audit-undo");
+        let (revoked, mut failures) = access::finish_access_change(context, &interaction, &config_before, &after, "audit-undo", change);
         drop(interaction);
         failures.extend(load_error);
         if !failures.is_empty() {
@@ -14533,6 +14554,22 @@ pub fn serve_with_context(
     crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
     access::harden_selected_state_dir(&context);
     access::note_config_start(&context);
+    // #192: an access change cut off between its configuration write and its revocation is finished before the
+    // console answers any request.
+    match access::finish_pending_revocations(&context) {
+        Ok((revoked, failures)) => {
+            if !revoked.is_empty() {
+                crate::safe_println!("[console] finished the revocation an earlier access change left pending: {}", revoked.join(","));
+            }
+            if !failures.is_empty() {
+                crate::safe_println!(
+                    "[console] ⚠️ a pending access revocation did not finish (the next access change retries it first): {}",
+                    failures.join("; ")
+                );
+            }
+        }
+        Err(error) => crate::safe_println!("[console] ⚠️ pending access revocations were not checked (the next access change retries them first): {error}"),
+    }
     // JS 启动时同步一次 QQ 收藏表情（强制，失败不阻塞，也不重试；AI 首次调用时按 TTL 再试）。
     if context.is_isolated() && crate::sticker::enabled(cfg) {
         let (cfg, context) = (cfg.clone(), context.clone());
@@ -26597,5 +26634,6 @@ mod tests {
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
     mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
+    mod access_pending_tests { include!("access_pending_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
 }
