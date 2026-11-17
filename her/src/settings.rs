@@ -1,9 +1,23 @@
-//! Live settings: the registry and the settings store. Run 1 of #146 holds only the seam; run 2 replaces this file.
+//! Live settings: the registry of owner-tunable settings and the settings store `data/settings.db`.
+//!
+//! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
+//! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
+//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
+//! A legacy (no-root) context has no store.
 
-use crate::runtime::RuntimeContext;
+use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+const DB: &str = "settings.db";
+const SIDECARS: [&str; 3] = ["settings.db-wal", "settings.db-shm", "settings.db-journal"];
+/// The schema version this release reads and writes.
+const SCHEMA_VERSION: i64 = 1;
+const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
+const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
+const LEGACY_ERROR: &str = "settings require a selected runtime";
 
 #[cfg(test)]
 thread_local! {
@@ -19,9 +33,12 @@ pub(crate) enum Kind {
 
 /// One registry entry.
 pub(crate) struct Setting {
+    /// The registry key, as the console names it.
     pub key: &'static str,
+    /// Where the value lives in the configuration document (a JSON pointer of plain member names).
     pub pointer: &'static str,
     pub kind: Kind,
+    /// When a change takes effect: `live`, `next wake` or `restart`.
     pub applies: &'static str,
     pub group: &'static str,
     pub label: &'static str,
@@ -29,6 +46,7 @@ pub(crate) struct Setting {
 }
 
 impl Setting {
+    /// The value as stored and read, or `None` when this setting does not accept it.
     pub(crate) fn normalize(&self, value: &Value) -> Option<Value> {
         match self.kind {
             Kind::Integer { min, max, .. } => value.as_i64().filter(|n| (min..=max).contains(n)).map(|n| json!(n)),
@@ -40,9 +58,31 @@ impl Setting {
             Kind::Integer { default, .. } => json!(default),
         }
     }
+
+    /// Why a refused value was refused.
+    fn requirement(&self) -> String {
+        match self.kind {
+            Kind::Integer { min, max, .. } => format!("{} must be an integer from {min} to {max}", self.key),
+        }
+    }
+
+    fn kind_view(&self) -> Value {
+        match self.kind {
+            Kind::Integer { min, max, .. } => json!({"type": "integer", "min": min, "max": max}),
+        }
+    }
 }
 
-pub(crate) const REGISTRY: &[Setting] = &[];
+/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
+pub(crate) const REGISTRY: &[Setting] = &[Setting {
+    key: "reply.wakeQuietMs",
+    pointer: "/socialV2/reply/wakeQuietMs",
+    kind: Kind::Integer { min: 1, max: 30_000, default: 3_000 },
+    applies: "next wake",
+    group: "reply rhythm",
+    label: "Quiet time before a message wake",
+    hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
+}];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
@@ -55,20 +95,240 @@ pub(crate) struct Applied {
     pub changed: bool,
 }
 
-pub(crate) fn overlay(_context: &RuntimeContext, document: Value) -> Value {
+/// Applies the stored settings over `document`, the parsed `config.json`. A stored value goes to its registry pointer;
+/// missing or null objects on the way are created, and any other non-object on the way leaves that setting unapplied.
+/// A legacy context and a document that is not an object are returned unchanged. A store this release cannot read
+/// applies nothing and is reported once per process on stderr (MCP servers use stdout).
+pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
+    if !context.is_isolated() || !document.is_object() {
+        return document;
+    }
+    match stored_values(context) {
+        Ok(values) => {
+            for (setting, value) in values {
+                set_at(&mut document, setting.pointer, value);
+            }
+        }
+        Err(error) => {
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                crate::safe_eprintln!("[settings] stored settings are not applied: {error}");
+            }
+        }
+    }
     document
 }
 
-pub(crate) fn apply(
-    _context: &RuntimeContext,
-    _key: &str,
-    _value: &Value,
-    _actor: &str,
-    _source: &str,
-) -> Result<Applied, (u16, String)> {
-    Err((501, "settings store is not implemented".to_string()))
+fn set_at(document: &mut Value, pointer: &str, value: Value) {
+    let names: Vec<&str> = pointer.split('/').skip(1).collect();
+    let Some((last, parents)) = names.split_last() else { return };
+    let mut slot = document;
+    for name in parents {
+        let Some(object) = slot.as_object_mut() else { return };
+        let next = object.entry(name.to_string()).or_insert(Value::Null);
+        if next.is_null() {
+            *next = json!({});
+        }
+        slot = next;
+    }
+    if let Some(object) = slot.as_object_mut() {
+        object.insert(last.to_string(), value);
+    }
 }
 
-pub(crate) fn view(_context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    Err((501, "settings store is not implemented".to_string()))
+/// Validates the store and its sidecars through the runtime's containment checks.
+fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path::PathBuf, String> {
+    for name in SIDECARS {
+        context.resolve_path(RuntimeArea::Data, name, intent).map_err(|_| STORAGE_ERROR.to_string())?;
+    }
+    context.resolve_path(RuntimeArea::Data, DB, intent).map_err(|_| STORAGE_ERROR.to_string())
+}
+
+fn schema_version(conn: &Connection) -> Result<i64, String> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(|_| STORAGE_ERROR.to_string())
+}
+
+fn refuse_version(version: i64) -> String {
+    let message = if version > SCHEMA_VERSION { NEWER_SCHEMA_ERROR } else { UNSUPPORTED_SCHEMA_ERROR };
+    message.to_string()
+}
+
+/// The stored values of registry settings. No store yet is an empty list, and so is a store created but never given
+/// its schema. Rows with a key the registry does not have, or a value its setting does not accept, are skipped.
+fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
+    let path = context
+        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Ok(metadata) if metadata.is_file() => {}
+        _ => return Err(STORAGE_ERROR.to_string()),
+    }
+    // The sidecars are checked only once the store exists, so a runtime without one pays a single path check.
+    let path = check_paths(context, PathIntent::ReadOptionalFile)?;
+    // Never created here: a read leaves a runtime without a store as it was.
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
+    match schema_version(&conn)? {
+        0 => return Ok(Vec::new()),
+        SCHEMA_VERSION => {}
+        version => return Err(refuse_version(version)),
+    }
+    let mut statement = conn.prepare("SELECT key, value FROM settings").map_err(|_| STORAGE_ERROR.to_string())?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|_| STORAGE_ERROR.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(key, text)| {
+            let setting = find(&key)?;
+            let value = serde_json::from_str::<Value>(&text).ok()?;
+            Some((setting, setting.normalize(&value)?))
+        })
+        .collect())
+}
+
+/// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
+/// schema is newer than this release's (checked before anything is written).
+fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
+    let path = check_paths(context, PathIntent::WriteFile)?;
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
+    let version = schema_version(&conn)?;
+    if version != 0 && version != SCHEMA_VERSION {
+        return Err(refuse_version(version));
+    }
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
+    match schema_version(&tx)? {
+        0 => tx
+            .execute_batch(
+                "CREATE TABLE settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL, revision INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL, updated_by TEXT NOT NULL);
+                CREATE TABLE settings_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, at_ms INTEGER NOT NULL, actor TEXT NOT NULL,
+                    source TEXT NOT NULL, scope TEXT NOT NULL, key TEXT NOT NULL, old_value TEXT, new_value TEXT,
+                    request_id TEXT NOT NULL);
+                CREATE TRIGGER settings_audit_no_update BEFORE UPDATE ON settings_audit
+                    BEGIN SELECT RAISE(ABORT,'settings audit is append only'); END;
+                CREATE TRIGGER settings_audit_no_delete BEFORE DELETE ON settings_audit
+                    BEGIN SELECT RAISE(ABORT,'settings audit is append only'); END;
+                PRAGMA user_version=1;",
+            )
+            .map_err(|_| STORAGE_ERROR.to_string())?,
+        SCHEMA_VERSION => {}
+        version => return Err(refuse_version(version)),
+    }
+    tx.commit().map_err(|_| STORAGE_ERROR.to_string())?;
+    Ok(conn)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Sets one global setting: validated against the registry, then written with one audit row in one transaction.
+/// The same value again changes nothing and writes no audit row. A refused value leaves the stored value as it was.
+pub(crate) fn apply(
+    context: &RuntimeContext,
+    key: &str,
+    value: &Value,
+    actor: &str,
+    source: &str,
+) -> Result<Applied, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+    let value = setting.normalize(value).ok_or_else(|| (400, setting.requirement()))?;
+    let unavailable = |error: String| -> (u16, String) { (503, error) };
+    let mut conn = open_for_write(context).map_err(unavailable)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    let old: Option<(String, i64)> = tx
+        .query_row("SELECT value, revision FROM settings WHERE key=?1", [setting.key], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional()
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    let text = value.to_string();
+    if let Some((old_text, revision)) = &old {
+        if *old_text == text {
+            return Ok(Applied { value, revision: *revision, changed: false });
+        }
+    }
+    let revision = old.as_ref().map_or(0, |(_, revision)| *revision) + 1;
+    let at = now_ms();
+    tx.execute(
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value, revision=excluded.revision,
+         updated_ms=excluded.updated_ms, updated_by=excluded.updated_by",
+        params![setting.key, text, revision, at, actor],
+    )
+    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    #[cfg(test)]
+    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
+        return Err(unavailable(STORAGE_ERROR.to_string()));
+    }
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let request = format!("{at}-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    tx.execute(
+        "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
+         VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
+        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), text, request],
+    )
+    .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    Ok(Applied { value, revision, changed: true })
+}
+
+/// Every registry setting with its label, hint, group, when it applies, type and bounds, default, stored value
+/// (`null` when none) and `value`, what the next use reads. `storeError` says why stored values are not applied.
+pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let (stored, store_error) = match stored_values(context) {
+        Ok(stored) => (stored, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let settings: Vec<Value> = REGISTRY
+        .iter()
+        .map(|setting| {
+            let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
+            let value = document
+                .pointer(setting.pointer)
+                .and_then(|value| setting.normalize(value))
+                .unwrap_or_else(|| setting.default_value());
+            json!({
+                "key": setting.key,
+                "group": setting.group,
+                "label": setting.label,
+                "hint": setting.hint,
+                "applies": setting.applies,
+                "kind": setting.kind_view(),
+                "default": setting.default_value(),
+                "stored": stored_value,
+                "value": value,
+            })
+        })
+        .collect();
+    let mut reply = json!({"ok": true, "settings": settings});
+    if let Some(error) = store_error {
+        reply["storeError"] = json!(error);
+    }
+    Ok(reply)
 }
