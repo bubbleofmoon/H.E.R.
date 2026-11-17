@@ -49,8 +49,9 @@ pub(crate) fn due_at(cfg: &Value, last: &LastCall, idle_from: i64) -> Option<i64
     if last.input? < cap(cfg, &last.model) {
         return None;
     }
-    let lead_ms = ((minutes - 1.0).max(0.0) * 60_000.0).ceil() as i64;
-    Some(idle_from.saturating_add(lead_ms))
+    let lead_ms = ((minutes - 1.0).max(0.0) * 60_000.0).ceil().min(i128::MAX as f64 / 2.0) as i128;
+    // The sum is exact in i128 and saturates only at the end, so a huge lead saturates the deadline from any start.
+    Some((i128::from(idle_from) + lead_ms).min(i128::from(i64::MAX)) as i64)
 }
 
 #[cfg(test)]
@@ -132,6 +133,13 @@ mod tests {
             huge.is_some_and(|at| at > IDLE),
             "a huge cache life saturates instead of overflowing: {huge:?}"
         );
+        for idle in [-1, i64::MIN] {
+            assert_eq!(
+                due_at(&cfg(json!(1e300)), &call("m", Some(500_000)), idle),
+                Some(i64::MAX),
+                "a huge cache life saturates the deadline from idle start {idle}"
+            );
+        }
     }
 
     #[test]
