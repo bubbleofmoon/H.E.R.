@@ -9396,7 +9396,7 @@ pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, k
 pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: &str, now: i64, expected: Option<&str>) -> Result<(Value,String), String> {
     mutate_social_state_for(context, |state| {
         let cfg = context.load_config().map_err(|e|(503,e.to_string()))?;
-        if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !key_allowed(&cfg,key) {
+        if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(&cfg,key) {
             return Err((403,"wake invalidated by current settings".to_string()));
         }
         let conv = &mut state["conversations"][key];
@@ -9575,8 +9575,64 @@ pub(crate) fn access_allowed(cfg: &Value, mode: &str, key: &str) -> bool {
     agent::mode_allowed(cfg, mode, key)
 }
 
-pub(crate) fn key_allowed(cfg: &Value, key: &str) -> bool {
-    key_in_allowlist(cfg, key)
+/// #186: the inbound gate. `key` is admitted when its id is listed in its allow list and is not in its deny list,
+/// both read from the configuration the caller loaded for this event (`allowAllWhenEmpty` admits nothing here).
+/// Reserved2 ingress, tick invalidation and dispatch, wake claims, turn validity, turn recovery and wake snapshots
+/// all decide by this rule; there is no allow-only check.
+pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
+    key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
+}
+
+/// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
+/// per-connection work (gap recovery, mute refresh, group cards).
+pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
+    social_policy_list(cfg, "allow", kind)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| inbound_admitted(cfg, &format!("{kind}:{id}")))
+        .collect()
+}
+
+/// #186: `POST /api/conversations/scope`, with its console log line (the handler itself prints nothing, so
+/// `her-cli conversation` keeps its stdout for the reply).
+fn conversation_scope_route(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    let reply = access::conversation_scope(context, body)?;
+    let changed: Vec<&str> = reply["changed"].as_array().map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    crate::safe_println!(
+        "[console] conversation scope: {} {} ({}); live restart {}",
+        reply["action"].as_str().unwrap_or(""),
+        reply["conversation"].as_str().unwrap_or(""),
+        if changed.is_empty() { "no change".to_string() } else { changed.join(", ") },
+        reply["liveRestart"]["state"].as_str().unwrap_or("unknown")
+    );
+    Ok(reply)
+}
+
+/// #186: `POST /api/conversations/scope` outside a console request (`her-cli conversation`): the same handler,
+/// gates and revocation; the console audit trail records only console requests. A short-lived caller waits for the
+/// background stop of every retired DSH session before it returns, so the process can exit.
+pub(crate) fn conversation_scope_change(context: &RuntimeContext, conversation: &str, action: &str) -> Result<Value, (u16, String)> {
+    conversation_scope_change_waiting(context, conversation, action, std::time::Duration::from_secs(10))
+}
+
+/// `conversation_scope_change` with its wait for background session stops bounded by `limit`.
+fn conversation_scope_change_waiting(
+    context: &RuntimeContext,
+    conversation: &str,
+    action: &str,
+    limit: std::time::Duration,
+) -> Result<Value, (u16, String)> {
+    let body = json!({"conversation": conversation, "action": action}).to_string();
+    let result = access::conversation_scope(context, &body);
+    // No request takes the write record here (`persist_snowluma_endpoint` does the same).
+    let _ = take_config_writes();
+    let stopped = access::wait_background_stops(limit);
+    result.map(|mut reply| {
+        if !stopped {
+            reply["sessionStops"] = json!("unfinished: check the retired sessions' tasks in DSH");
+        }
+        reply
+    })
 }
 
 /// Shared session-reset mutation. Idle rotation preserves conversation data and refuses a changed
@@ -9586,7 +9642,7 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
         let previous = &state["conversations"][key];
         if let Some(expected) = guard {
             let cfg=context.load_config().map_err(|e|(503,e.to_string()))?;
-            if runtime_mode(context)!="reserved2" || state["paused"]==true || !key_allowed(&cfg,key)
+            if runtime_mode(context)!="reserved2" || state["paused"]==true || !inbound_admitted(&cfg,key)
                 || cfg.pointer("/socialV2/enabled")==Some(&json!(false))
                 || ["agentToken","lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
                 return Ok(None);
@@ -13255,6 +13311,7 @@ fn route_with_context(
         ("POST", "/api/security") if context.is_isolated() => json_result(access::security_post(context, &req.body)),
         ("POST", "/api/authorize/read") if context.is_isolated() => json_result(access::authorize_read(context, cfg, &req.body)),
         ("POST", "/api/whitelist") if context.is_isolated() => json_result(access::whitelist_post(context, &req.body)),
+        ("POST", "/api/conversations/scope") if context.is_isolated() => json_result(conversation_scope_route(context, &req.body)),
         ("GET", "/api/whitelist") if context.is_isolated() => json_result(Ok(access::whitelist_get(context, cfg))),
         ("POST", "/api/socialV2/reset") if context.is_isolated() => json_result(access::social_v2_reset(context)),
         ("POST", "/api/socialV2/wake") if context.is_isolated() => json_result(access::social_v2_wake(context, cfg, &req.body)),
@@ -26539,5 +26596,6 @@ mod tests {
     mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }
+    mod conversation_scope_tests { include!("conversation_scope_tests.rs"); }
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
 }

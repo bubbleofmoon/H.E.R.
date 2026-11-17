@@ -1055,6 +1055,7 @@ impl RuntimeContext {
                     | ("GET", "/api/pending")
                     | ("GET", "/api/whitelist")
                     | ("POST", "/api/whitelist")
+                    | ("POST", "/api/conversations/scope")
                     | ("GET", "/api/security")
                     | ("POST", "/api/security")
                     | ("POST", "/api/console/token")

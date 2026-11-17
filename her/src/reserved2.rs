@@ -1934,6 +1934,105 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// #186: the reserved2 ingress gate reads the allow and deny lists of each event's configuration.
+    #[tokio::test]
+    async fn t186_ingress_reads_allow_and_deny_from_each_events_configuration() {
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-t186-ingress-{}", crate::turn_ledger::mint_id(""))));
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let write_config = |allow: Value, deny: Value| {
+            let config = json!({"consoleToken":"synthetic-scope-token","allow":{"groups":allow},"deny":{"groups":deny},"slang":{"enabled":false}});
+            std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+        };
+        write_config(json!([420042]), json!([]));
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1","onebot_ws":"ws://127.0.0.1:1"}"#).unwrap();
+        let mut state = json!({"conversations":{}});
+        for key in ["group:420042", "group:420044"] {
+            state["conversations"][key] = json!({"agentToken":"test-token","bootstrapSent":true,"unread":[],"recentMessages":[],"wakeConfig":{"confirmedAt":1,"mode":"diving","infinite":true,"triggers":{"atMention":true}}});
+        }
+        std::fs::write(root.join("data/social-v2.json"), state.to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
+        // Both conversations are served (`--live-groups`); only the configuration decides.
+        let mut hub = Hub::new(&context, journal, vec!["group:420042".into(), "group:420044".into()], false);
+        hub.tick("bot", 9001).await.unwrap();
+        async fn recorded(hub: &mut Hub, message_id: i64) -> bool {
+            let frame = json!({"post_type":"message","message_type":"group","group_id":420044,"user_id":1001,"message_id":message_id,"message":[{"type":"text","data":{"text":"scope probe"}}]});
+            let ev: crate::Event = serde_json::from_value(frame.clone()).unwrap();
+            hub.handle(&ev, &frame.to_string(), false, 9001, "bot", &HashMap::new()).await.unwrap();
+            let id = message_id.to_string();
+            let event = inbound::event_key("group:420044", "message", Some(id.as_str()), &frame.to_string());
+            // Recording the same event again is a duplicate only when the hub recorded it.
+            hub.journal.record_received(event, "group:420044".into(), frame.to_string(), 2).await.unwrap() == inbound::Receipt::Duplicate
+        }
+        assert!(!recorded(&mut hub, 18601).await, "an unlisted conversation must be refused before the journal");
+        write_config(json!([420042, 420044]), json!([]));
+        assert!(recorded(&mut hub, 18602).await, "a conversation added to the allow list mid-run must be admitted and recorded");
+        write_config(json!([420042, 420044]), json!([420044]));
+        assert!(!recorded(&mut hub, 18603).await, "a denied conversation must be refused even when it is listed");
+        write_config(json!([420042]), json!([]));
+        assert!(!recorded(&mut hub, 18604).await, "a conversation removed from the allow list mid-run must be refused");
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// #186: the administrator adds `deny` for one group and keeps it in `allow`.
+    fn t186_deny_keeping_allow(root: &std::path::Path, group: i64) {
+        let path = root.join("config/config.json");
+        let mut cfg: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        cfg["deny"] = json!({"groups": [group]});
+        std::fs::write(&path, cfg.to_string()).unwrap();
+    }
+
+    /// #186: a wake queued while the conversation was allowed never dispatches once it is denied (allow unchanged).
+    /// The allowed run is the control: the same queue dispatches.
+    #[tokio::test]
+    async fn t186_a_wake_queued_while_allowed_does_not_dispatch_once_denied() {
+        for denied in [false, true] {
+            let (root, mut hub) = queued_hub(if denied { "t186-tick-denied" } else { "t186-tick-allowed" }).await;
+            let key = "group:420042";
+            hub.ready = vec![(key.into(), "timeout".into())];
+            hub.awaiting.clear();
+            let mut state = hub.state().unwrap();
+            state["conversations"][key]["wakeConfig"]["infinite"] = json!(false);
+            state["conversations"][key]["wakeConfig"]["sleepUntil"] = json!("2000-01-01T00:00:00.000Z");
+            hub.context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+            if denied {
+                t186_deny_keeping_allow(&root, 420042);
+            }
+            hub.tick("bot", 9001).await.unwrap();
+            let dispatched = hub.active.contains_key(key);
+            for active in hub.active.values() {
+                active.task.abort();
+            }
+            drop(hub);
+            std::fs::remove_dir_all(root).unwrap();
+            assert_eq!(dispatched, !denied, "denied={denied}: a queued wake must dispatch only while the conversation is admitted");
+        }
+    }
+
+    /// #186: wake claims and wake snapshots refuse a denied conversation whose allow entry stays.
+    #[tokio::test]
+    async fn t186_wake_claims_and_wake_snapshots_refuse_a_denied_conversation() {
+        let (root, hub) = queued_hub("t186-deny-claim").await;
+        let key = "group:420042";
+        let snapshot = || {
+            console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot", Some(&json!({"key": key, "token": "test-token", "readOnly": true})))
+        };
+        let (status, reply) = snapshot();
+        assert_eq!(status, 200, "allowed: the wake snapshot answers: {reply}");
+        console::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None).expect("allowed: the wake claim succeeds");
+        t186_deny_keeping_allow(&root, 420042);
+        let (status, reply) = snapshot();
+        assert_eq!(status, 403, "a denied conversation's wake snapshot must be refused: {reply}");
+        let refused = console::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None);
+        assert_eq!(refused.unwrap_err(), "wake invalidated by current settings");
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     mod ticket24_base { include!("reserved2_ticket24_base_tests.rs"); }
     mod ticket24 { include!("reserved2_ticket24_tests.rs"); }
 
@@ -2363,7 +2462,7 @@ impl Hub {
             .filter(|(key, d)| {
                 let key = key.as_str();
                 self.taken(key)
-                    && console::key_allowed(cfg, key)
+                    && console::inbound_admitted(cfg, key)
                     && (!dsh_down || pipeline::pinned_cli_backend(cfg, key).is_some())
                     && !self.active.contains_key(key)
                     && !self.recovered.contains_key(key)
@@ -2463,7 +2562,8 @@ impl Hub {
             }
             _ => None,
         };
-        let Some(key) = key.filter(|k| self.taken(k) && console::key_allowed(&cfg, k)) else {
+        // #186: this event's configuration decides (allow and deny); `taken` is the `--live-groups` list of this process.
+        let Some(key) = key.filter(|k| self.taken(k) && console::inbound_admitted(&cfg, k)) else {
             return Ok(());
         };
         let is_poke = ev.sub_type == "poke";
@@ -2683,7 +2783,7 @@ impl Hub {
         if console::runtime_mode(&self.context) == "reserved2" && state["paused"] != true {
             for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
                 let token = state["conversations"][&turn.key]["agentToken"].as_str().unwrap_or("");
-                if !token.is_empty() && console::key_allowed(cfg, &turn.key)
+                if !token.is_empty() && console::inbound_admitted(cfg, &turn.key)
                     && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
                     && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
                     running.insert(turn.key.clone(), (turn.id.clone(), token.to_string()));
@@ -2747,7 +2847,7 @@ impl Hub {
         use std::sync::atomic::Ordering;
         for (key,m) in &self.maintenance {
             let current=self.rotation_state(cfg,"guard-read",now)?["conversations"][key].clone();
-            if suspended || !self.taken(key) || !console::key_allowed(cfg,key)
+            if suspended || !self.taken(key) || !console::inbound_admitted(cfg,key)
                 || m.plan.policy != json!({"rotation":cfg.pointer("/dsh/rotation"),"cacheTtlMinutes":cfg.pointer("/dsh/cacheTtlMinutes")})
                 || ["lastIncomingAt","lastUnreadSeq","adminWakes"].iter().any(|field|current[*field]!=m.plan.guard[*field])
                 || self.ready.iter().any(|(k,_)|k==key) {
@@ -2826,7 +2926,7 @@ impl Hub {
         let dsh_down=crate::dsh_health::is_down(&self.context);
         if now < self.maintenance_scan_at {return Ok(());}
         let state=self.rotation_state(cfg,"scan-state",now)?;
-        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && console::key_allowed(cfg,key)).cloned().collect()).unwrap_or_default();
+        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && console::inbound_admitted(cfg,key)).cloned().collect()).unwrap_or_default();
         for key in keys {
             if self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key) {continue;}
             if crate::session_rotation::read_retry_at(&self.context,&key,"recovery-scan") > now {
@@ -2879,7 +2979,7 @@ impl Hub {
             (state, _) = self.observe_turn_epoch(&key)?;
             let predicate = if suspended || state["paused"] == true { "suspended" }
                 else if !self.taken(&key) { "notTaken" }
-                else if !console::key_allowed(&cfg, &key) { "notAllowed" }
+                else if !console::inbound_admitted(&cfg, &key) { "notAllowed" }
                 else if state["conversations"].get(key.as_str()).is_none() { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
                     old.as_str() != state["conversations"][&key]["agentToken"].as_str().unwrap_or("")
@@ -2900,7 +3000,7 @@ impl Hub {
         {
             if let Some(conversations) = state["conversations"].as_object() {
                 for (key, conv) in conversations {
-                    if self.taken(key) && console::key_allowed(&cfg, key) {
+                    if self.taken(key) && console::inbound_admitted(&cfg, key) {
                         self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
                         self.drivers.entry(key.clone()).or_insert_with(|| {
                             session::Driver::new(
@@ -2986,7 +3086,7 @@ impl Hub {
             let model_error = pipeline::take_model_error(&self.context, &key);
             let current_token = console::conversation_token(&self.context, &key).ok().flatten().unwrap_or_default();
             let still_valid = console::runtime_mode(&self.context) == "reserved2"
-                && console::key_allowed(&cfg, &key)
+                && console::inbound_admitted(&cfg, &key)
                 && current_token == active.token
                 && self.mode_stamp == active.mode_stamp;
             let owned_token = current_token == active.token
@@ -3001,7 +3101,7 @@ impl Hub {
             }
             if result.is_ok() && owned_token && !active.text_only
                 && console::runtime_mode(&self.context) == "reserved2"
-                && console::key_allowed(&cfg, &key) && self.mode_stamp == active.mode_stamp {
+                && console::inbound_admitted(&cfg, &key) && self.mode_stamp == active.mode_stamp {
                 if let Ok(records) = crate::turn_ledger::read_records(&self.context) {
                     let (turns, _) = crate::turn_ledger::fold(&records);
                     let epoch = crate::send_outbox::token_epoch(&active.token);
@@ -3159,7 +3259,7 @@ impl Hub {
                 println!("[reserved2] {key} 手动唤醒已失效（令牌代际已变），丢弃");
                 continue;
             };
-            if suspended || !console::key_allowed(&cfg, &key) || !self.drivers.contains_key(&key) {
+            if suspended || !console::inbound_admitted(&cfg, &key) || !self.drivers.contains_key(&key) {
                 println!("[reserved2] {key} 手动唤醒未执行：当前不允许唤醒（{reason}）");
                 continue;
             }
@@ -3190,7 +3290,7 @@ impl Hub {
                 }
                 continue;
             }
-            if suspended || !self.taken(&key) || !console::key_allowed(&cfg, &key) {
+            if suspended || !self.taken(&key) || !console::inbound_admitted(&cfg, &key) {
                 continue;
             }
             if crate::group_mute::active(&self.context, &key).is_some() {
