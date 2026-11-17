@@ -1086,7 +1086,7 @@ fn image_content(data: &Value) -> Vec<Value> {
 /// `qq_get_self_image`'s result: a fixed lead line for the source and the image blocks. Nothing else
 /// from the console answer reaches the model (no file name, path or address).
 pub(crate) fn self_image_outcome(data: &Value) -> ToolOutcome {
-    let image_content = image_content(data);
+    let image_content: Vec<Value> = image_content(data).into_iter().filter(|block| block["type"] == "image").collect();
     if image_content.is_empty() {
         return ToolOutcome::error(format!("没有可返回的形象图片：{}", error_text(data.get("error"), "未知")));
     }

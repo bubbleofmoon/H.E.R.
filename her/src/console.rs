@@ -8454,7 +8454,7 @@ fn handle_self_image(
     let _source = crate::media::admit_source()
         .ok_or_else(|| (500, "读取形象图片失败：（图片获取失败）".to_string()))?;
     let max_pixels = crate::media::Limits::from_config(cfg).pixels;
-    if let Some(live) = crate::self_avatar::current(context, now_ms(), max_pixels) {
+    if let Some(live) = crate::self_avatar::current(context, &now_ms, max_pixels) {
         let images = crate::media::image_values(&live);
         return Ok(json!({ "ok": true, "key": key, "source": "qqAvatar", "image": images[0], "images": images }));
     }

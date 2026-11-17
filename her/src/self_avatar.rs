@@ -78,13 +78,26 @@ pub fn url_allowed(url: &str) -> bool {
 /// Her current avatar, normalized for the model, or `None` for the static portrait: a fresh stored
 /// avatar for her uin, else one fetch unless a failure for that uin is younger than
 /// `FAILURE_BACKOFF_MS`. The fetch's outcome is stored; a failed store is ignored.
-pub fn current(context: &RuntimeContext, now_ms: i64, max_pixels: u64) -> Option<Normalized> {
-    current_with(context, now_ms, max_pixels, &mut fetch_live)
+pub fn current(context: &RuntimeContext, now_ms: &dyn Fn() -> i64, max_pixels: u64) -> Option<Normalized> {
+    current_with_clock(context, now_ms, max_pixels, &mut fetch_live)
 }
 
+/// `current_with_clock` with a fixed time, for the unit tests.
+#[cfg(test)]
 pub(crate) fn current_with(
     context: &RuntimeContext,
     now_ms: i64,
+    max_pixels: u64,
+    fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Option<Normalized> {
+    current_with_clock(context, &|| now_ms, max_pixels, fetch)
+}
+
+/// The clock is read once the gate is held, so a caller that waited for another caller's fetch judges and
+/// stores by its own time, not by an earlier one.
+pub(crate) fn current_with_clock(
+    context: &RuntimeContext,
+    now_ms: &dyn Fn() -> i64,
     max_pixels: u64,
     fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Option<Normalized> {
@@ -93,6 +106,7 @@ pub(crate) fn current_with(
     }
     let uin = own_uin(context)?;
     let _gate = gate(context)?;
+    let now_ms = now_ms();
     if let Some(record) = read_cache(context).filter(|record| record.uin == uin) {
         if let Some(normalized) = record.fresh(now_ms).and_then(|bytes| decode(bytes, max_pixels)) {
             return Some(normalized);
@@ -175,17 +189,6 @@ impl CacheRecord {
             .and_then(|at| now_ms.checked_sub(at))
             .is_some_and(|age| (0..FAILURE_BACKOFF_MS).contains(&age))
     }
-}
-
-/// #206 review round 1 red stub: reads the clock before the gate (the green run reads it once the gate is held).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn current_with_clock(
-    context: &RuntimeContext,
-    now_ms: &dyn Fn() -> i64,
-    max_pixels: u64,
-    fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
-) -> Option<Normalized> {
-    current_with(context, now_ms(), max_pixels, fetch)
 }
 
 /// The stored record; missing, oversized, unreadable or not version 1 is `None`.
