@@ -1223,3 +1223,41 @@ fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input()
     }
     assert_eq!(std::fs::read(settings_db(&garbage_root)).unwrap(), bytes);
 }
+
+#[test]
+fn settings_undo_takes_the_store_gate_before_it_inspects_the_store() {
+    // Every write holds the store gate before it inspects the store, even an undo that answers 404 when there is none.
+    let (root, context) = settings_fixture("settings undo gate first");
+    let gate = context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock").unwrap();
+    let (status, body) = std::thread::scope(|scope| {
+        let undo = scope.spawn(|| post(&context, "/api/settings/undo", json!({"entry": 1})));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!undo.is_finished(), "an undo answered before the store gate was free");
+        drop(gate);
+        undo.join().unwrap()
+    });
+    assert_eq!((status, body["error"].clone()), (404, json!("unknown history entry")), "{body}");
+    assert!(!settings_db(&root).exists(), "an undo without a store still creates none");
+}
+
+#[test]
+fn audit_undo_refuses_a_backup_that_cannot_hold_a_current_registry_value() {
+    // A backup whose `reply` is not an object cannot hold `reply.wakeQuietMs`: the undo refuses and writes nothing,
+    // instead of reporting a kept value that the restored file lacks.
+    let (root, context) = settings_fixture("settings audit undo scalar");
+    let config_post = |body: Value| {
+        let (status, reply) = admin_request(&context, "POST", "/api/socialV2/config", Some(&body));
+        assert_eq!(status, 200, "{reply}");
+    };
+    config_post(json!({"reply": false}));
+    config_post(json!({"reply": {"wakeQuietMs": 8000}}));
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+    assert_eq!(status, 200, "{recent}");
+    let latest = recent["entries"].as_array().unwrap().iter().find(|entry| entry["path"] == "/api/socialV2/config").unwrap()
+        ["id"]
+        .clone();
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest})));
+    assert_eq!(status, 409, "{reply}");
+    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "a refused undo writes nothing");
+}
