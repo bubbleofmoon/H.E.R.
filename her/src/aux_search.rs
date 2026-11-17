@@ -16,7 +16,6 @@ use crate::aux_text::{clamped_int, collapse_js_space, js_string, js_trim, js_tru
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/anthropic/v1";
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
 const DEFAULT_API_KEY_ENV: &str = "DEEPSEEK_API_KEY";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -60,7 +59,8 @@ pub fn load_search_config(config: &Value) -> SearchConfig {
         api_key: trimmed("apiKey").unwrap_or_default(),
         api_key_env: trimmed("apiKeyEnv").filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_API_KEY_ENV.to_string()),
         base_url: trimmed("baseURL").map(|s| s.trim_end_matches('/').to_string()).unwrap_or_default(),
-        model: trimmed("model").filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        // `webSearch.model` is a registry setting: its default and rules live in `settings.rs`.
+        model: crate::settings::WEB_SEARCH_MODEL.text(config).unwrap_or_default(),
         max_uses: clamped_int(raw.get("maxUses"), 5, 1, 5),
         max_tokens: clamped_int(raw.get("maxTokens"), 4096, 256, 8192),
         max_results: clamped_int(raw.get("maxResults"), 8, 1, 20),
@@ -505,7 +505,7 @@ static CACHE: OnceLock<Mutex<(Vec<String>, HashMap<String, CacheEntry>)>> = Once
 /// The answer cache key: provider choice, query, result count and model (a JSON array, so no two of them run
 /// together), so a changed `webSearch.model` is asked afresh rather than answered from the cache.
 fn answer_key(wanted: &str, query: &str, config: &SearchConfig) -> String {
-    json!([wanted, query, config.max_results]).to_string()
+    json!([wanted, query, config.max_results, config.model]).to_string()
 }
 
 /// JS `webSearch(query)`: provider choice, DeepSeek -> Bing fallback, empty-result note, five-minute cache.

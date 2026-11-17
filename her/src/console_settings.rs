@@ -59,8 +59,8 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
     (status, JSON_TYPE, json!({"ok": false, "error": message}).to_string())
 }
 
-/// Lists every setting from `GET /api/settings` and sets one through `POST /api/settings/set`. Text is shown with
-/// `textContent` only.
+/// Lists every setting from `GET /api/settings` and sets one through `POST /api/settings/set`: a number input for an
+/// integer setting, a text input for a model id. Text is shown with `textContent` only.
 const PAGE: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Settings</title>
 <style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}</style></head><body>
@@ -73,7 +73,7 @@ const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(loca
 $('#token').value=token();
 const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:Object.assign({'x-console-token':token()},body?{'content-type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});const j=await r.json();if(body||!j.ok)$('#msg').textContent=j.ok?(j.changed?'Saved':'Unchanged'):(j.error||r.status);return j};
 const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':String(t);return td};
-async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const input=document.createElement('input');input.type='number';input.min=s.kind.min;input.max=s.kind.max;input.value=s.value;const b=document.createElement('button');b.textContent='Set';b.onclick=async()=>{const r=await api('/api/settings/set',{setting:s.key,value:Number(input.value)});if(r.ok)list()};const field=document.createElement('td');field.append(input);const action=document.createElement('td');action.append(b);tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.value),cell(s.default),cell(s.applies),field,action);tb.append(tr)}}
+async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const input=document.createElement('input');const integer=s.kind.type==='integer';if(integer){input.type='number';input.min=s.kind.min;input.max=s.kind.max}else{input.type='text';input.maxLength=s.kind.maxChars}input.value=s.value==null?'':s.value;const b=document.createElement('button');b.textContent='Set';b.onclick=async()=>{const r=await api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value});if(r.ok)list()};const field=document.createElement('td');field.append(input);const action=document.createElement('td');action.append(b);tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.value),cell(s.default),cell(s.applies),field,action);tb.append(tr)}}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);list()};
 list();
 </script></body></html>

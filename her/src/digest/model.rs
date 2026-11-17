@@ -50,13 +50,12 @@ impl RelayModel {
 
 /// The digest's model id: `memory.digest.model`, else `harness.model`; `None` when neither is configured.
 pub(crate) fn model_id(cfg: &Value) -> Option<String> {
-    let configured = |path: &str| cfg.pointer(path).and_then(Value::as_str).filter(|v| !v.trim().is_empty());
-    configured("/memory/digest/model").or_else(|| configured("/harness/model")).map(str::to_string)
+    crate::settings::DIGEST_MODEL.text(cfg).or_else(|| crate::settings::HARNESS_MODEL.text(cfg))
 }
 
 /// The bound on one digest model request: `memory.digest.timeoutSecs`.
 pub(crate) fn timeout(cfg: &Value) -> Duration {
-    Duration::from_secs(cfg.pointer("/memory/digest/timeoutSecs").and_then(Value::as_u64).unwrap_or(120).clamp(1, 600))
+    Duration::from_secs(crate::settings::DIGEST_TIMEOUT_SECS.integer(cfg).unsigned_abs())
 }
 
 impl DigestModel for RelayModel {

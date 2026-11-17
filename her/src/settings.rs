@@ -3,7 +3,8 @@
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
-//! A legacy (no-root) context has no store.
+//! A legacy (no-root) context has no store. The registry owns each setting's default and bounds: a reader reads its
+//! setting through `Setting::read` (or `integer`, `text`) on the loader's document, never with a default of its own.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -144,8 +145,82 @@ pub(crate) const WAKE_QUIET: Setting = Setting {
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
 };
 
+/// Read by `harness::ModelRoute::from_runtime` and, as the digest's fallback, by `digest::model`.
+pub(crate) const HARNESS_MODEL: Setting = Setting {
+    key: "harness.model",
+    pointer: "/harness/model",
+    kind: Kind::ModelId { default: None },
+    applies: "live",
+    group: "model and cost",
+    label: "Conversation model",
+    hint: "The relay model id harness turns use, read when each turn starts. Not set: harness turns fail as not configured.",
+};
+
+/// Read by `harness::Limits::from_config`.
+pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
+    key: "harness.maxSteps",
+    pointer: "/harness/maxSteps",
+    kind: Kind::Integer { min: 1, max: 64, default: 8, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Model requests per turn",
+    hint: "The most model requests one harness turn makes (each tool round is one more); read when each turn starts.",
+};
+
+/// Read by `harness::Limits::from_config`.
+pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
+    key: "harness.maxTokens",
+    pointer: "/harness/maxTokens",
+    kind: Kind::Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Token budget per turn",
+    hint: "The tokens one harness turn may use across all its model requests; read when each turn starts.",
+};
+
+/// Read by `digest::model`.
+pub(crate) const DIGEST_MODEL: Setting = Setting {
+    key: "memory.digest.model",
+    pointer: "/memory/digest/model",
+    kind: Kind::ModelId { default: None },
+    applies: "live",
+    group: "model and cost",
+    label: "Digest model",
+    hint: "The relay model id the memory digest uses; not set uses the conversation model. Read at each digest run.",
+};
+
+/// Read by `digest::model`.
+pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
+    key: "memory.digest.timeoutSecs",
+    pointer: "/memory/digest/timeoutSecs",
+    kind: Kind::Integer { min: 1, max: 600, default: 120, file: FileRule::Clamp },
+    applies: "live",
+    group: "model and cost",
+    label: "Digest request timeout",
+    hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.",
+};
+
+/// Read by `aux_search::load_search_config`.
+pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
+    key: "webSearch.model",
+    pointer: "/webSearch/model",
+    kind: Kind::ModelId { default: Some("deepseek-v4-flash") },
+    applies: "live",
+    group: "model and cost",
+    label: "Web search model",
+    hint: "The model id the primary web search asks, read at each search.",
+};
+
 /// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
-pub(crate) const REGISTRY: &[Setting] = &[WAKE_QUIET];
+pub(crate) const REGISTRY: &[Setting] = &[
+    WAKE_QUIET,
+    HARNESS_MODEL,
+    HARNESS_MAX_STEPS,
+    HARNESS_MAX_TOKENS,
+    DIGEST_MODEL,
+    DIGEST_TIMEOUT_SECS,
+    WEB_SEARCH_MODEL,
+];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
