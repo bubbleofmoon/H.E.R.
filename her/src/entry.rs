@@ -386,7 +386,7 @@ const HELD_LIMIT: usize = 10_000;
 fn held_conversation(ev: &Event) -> Option<String> {
     match (ev.post_type.as_str(), ev.message_type.as_str()) {
         ("message", "group") => ev.group_id.map(|id| format!("group:{id}")),
-        ("message", "private") => None, // #192 TEMPORARY RED MUTATION
+        ("message", "private") => ev.user_id.map(|id| format!("private:{id}")),
         ("notice", _) if ev.sub_type == "poke" => ev.group_id.map(|id| format!("group:{id}")).or_else(|| {
             ev.user_id
                 .or(ev.sender_id)
@@ -403,7 +403,7 @@ fn hold(held: &mut Vec<String>, event_key: String) -> bool {
     if held.contains(&event_key) {
         return true;
     }
-    if held.len() > HELD_LIMIT { // #192 TEMPORARY RED MUTATION
+    if held.len() >= HELD_LIMIT {
         return false;
     }
     held.push(event_key);
@@ -414,7 +414,7 @@ fn hold(held: &mut Vec<String>, event_key: String) -> bool {
 /// admitted conversations replay, the others are settled.
 fn take_held(cfg: &Value, held: &[String], saved: Vec<inbound::Replayable>) -> (Vec<inbound::Replayable>, Vec<String>) {
     let held: std::collections::HashSet<&str> = held.iter().map(String::as_str).collect();
-    let items = saved.into_iter().filter(|_| !held.is_empty()).collect(); // #192 TEMPORARY RED MUTATION
+    let items = saved.into_iter().filter(|item| held.contains(item.event_key.as_str())).collect();
     split_replayable(Some(cfg), items)
 }
 
@@ -433,7 +433,7 @@ impl UnreadableRefusals {
     /// One more refused event; the number to record now, when a record is due.
     fn note(&mut self, now: std::time::Instant) -> Option<u64> {
         self.count += 1;
-        if self.recorded_at.is_some_and(|at| now.saturating_duration_since(at) <= Self::EVERY) { // #192 TEMPORARY RED MUTATION
+        if self.recorded_at.is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY) {
             return None;
         }
         self.recorded_at = Some(now);
@@ -2616,7 +2616,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     let key = held_conversation(&ev);
                     let reserved2_now = reserved2_hub.is_some() && console::runtime_mode(&runtime_context) == "reserved2";
                     match key {
-                        Some(key) if false && reserved2_now && live_groups.iter().any(|g| g == &key) => { // #192 TEMPORARY RED MUTATION
+                        Some(key) if reserved2_now && live_groups.iter().any(|g| g == &key) => {
                             let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);
                             let saved = replayed
                                 || journal.record_received(inbound_key.clone(), key.clone(), text.clone(), now_ms() as i64).await?

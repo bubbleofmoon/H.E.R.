@@ -2605,7 +2605,6 @@ impl Hub {
         nick: &str,
         cards: &HashMap<i64, String>,
     ) -> Result<(), String> {
-        let cfg = self.context.load_config().map_err(|e| e.to_string())?; // #192 TEMPORARY RED MUTATION
         self.adopt_mode(&cfg, crate::now_ms() as i64).await?;
         self.refresh_recovered(&cfg, crate::now_ms() as i64).await?;
         let key = match (ev.post_type.as_str(), ev.message_type.as_str()) {
