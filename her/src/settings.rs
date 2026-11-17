@@ -126,20 +126,26 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
-fn set_at(document: &mut Value, pointer: &str, value: Value) {
+/// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
+/// below the first non-object, when a member on the way is not an object.
+fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
     let names: Vec<&str> = pointer.split('/').skip(1).collect();
-    let Some((last, parents)) = names.split_last() else { return };
+    let Some((last, parents)) = names.split_last() else { return false };
     let mut slot = document;
     for name in parents {
-        let Some(object) = slot.as_object_mut() else { return };
+        let Some(object) = slot.as_object_mut() else { return false };
         let next = object.entry(name.to_string()).or_insert(Value::Null);
         if next.is_null() {
             *next = json!({});
         }
         slot = next;
     }
-    if let Some(object) = slot.as_object_mut() {
-        object.insert(last.to_string(), value);
+    match slot.as_object_mut() {
+        Some(object) => {
+            object.insert(last.to_string(), value);
+            true
+        }
+        None => false,
     }
 }
 
@@ -546,14 +552,19 @@ fn now_ms() -> i64 {
 
 /// Runs one write under the store gate. The gate is taken (waiting up to `WAL_SWITCH_WAIT`, else 503) before the
 /// inspection and held until the connection closes, so no other writer of this store can stop between this writer's
-/// inspection and its read-write open and leave a journal that open would play back. `write` runs in one immediate
-/// transaction, committed when it returns `Ok` and rolled back otherwise.
+/// inspection and its read-write open and leave a journal that open would play back. With `existing_only`, a store
+/// that is missing or fresh is 404 under the gate and none is created. `write` runs in one immediate transaction,
+/// committed when it returns `Ok` and rolled back otherwise.
 fn write_store<T>(
     context: &RuntimeContext,
+    existing_only: bool,
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<T, (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
+    if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
+        return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));
+    }
     let mut conn = open_for_write(context).map_err(unavailable)?;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -642,7 +653,7 @@ pub(crate) fn apply(
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.requirement()))?;
     let text = value.to_string();
-    write_store(context, |conn| {
+    write_store(context, false, |conn| {
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -685,10 +696,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    if matches!(inspect(context).map_err(|error| (503, error))?, Inspection::Missing | Inspection::Fresh) {
-        return Err((404, UNKNOWN_ENTRY_ERROR.to_string()));
-    }
-    write_store(context, |conn| {
+    write_store(context, true, |conn| {
         let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
         let row: Option<(String, String, Option<String>, Option<String>)> = conn
             .query_row("SELECT scope, key, old_value, new_value FROM settings_audit WHERE id=?1", [entry], |row| {
@@ -780,9 +788,9 @@ pub(crate) fn history(
 
 /// For a whole `config.json` an audit undo restores: keeps `current`'s value at every registry pointer in `restored`,
 /// and removes it where `current` has none, because registry settings change and undo through the store only. A
-/// non-object on the way in `restored` leaves that value as restored, as the overlay does. Returns the keys whose
-/// value in `restored` differed from `current`'s.
-pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Vec<&'static str> {
+/// value in `restored` differed from `current`'s. Err with the key when a non-object on the way in `restored` cannot
+/// hold `current`'s value: the undo must refuse, because the restored file would lose that value.
+pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Result<Vec<&'static str>, &'static str> {
     let mut kept = Vec::new();
     for setting in REGISTRY {
         let now = current.pointer(setting.pointer).cloned();
@@ -790,12 +798,18 @@ pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Vec
             continue;
         }
         kept.push(setting.key);
-        match now {
+        let placed = match now {
             Some(value) => set_at(restored, setting.pointer, value),
-            None => remove_at(restored, setting.pointer),
+            None => {
+                remove_at(restored, setting.pointer);
+                true
+            }
+        };
+        if !placed {
+            return Err(setting.key);
         }
     }
-    kept
+    Ok(kept)
 }
 
 /// Removes the member a pointer of plain member names ends at, if its parent is an object.

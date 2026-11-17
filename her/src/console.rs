@@ -14337,7 +14337,9 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     }
                     // Registry settings change and undo through the settings store only: the restored
                     // configuration keeps their current values.
-                    settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config);
+                    settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config).map_err(
+                        |key| (409, format!("the backup cannot keep the current value of {key}; nothing was undone")),
+                    )?;
                     let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
                     // If the restored configuration cannot be loaded, everything the old one allowed is revoked.
                     let (after, load_error) = match context.effective_config(&restored_config) {
