@@ -160,39 +160,69 @@ pub fn strip_chat_with_runtime(context: &crate::runtime::RuntimeContext, data: &
     strip_model_chat_data(data, &with_blacklist(context, cfg))
 }
 
-/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it would make a denied term
-/// (`settings::denied_in_text`) that `text` did not hold: then `None`, and the caller uses its accepted fallback.
+/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it had to refuse a strip entry
+/// (`strip_model_text`): then `None`, and the caller uses its accepted fallback.
 pub fn strip_checked(text: &str, delivery: &Value) -> Option<String> {
-    let stripped = strip_from_model_text(text, delivery);
-    let before = crate::settings::denied_in_text(text);
-    crate::settings::denied_in_text(&stripped).iter().all(|term| before.contains(term)).then_some(stripped)
+    let (stripped, refused) = strip_model_text(text, delivery);
+    (!refused).then_some(stripped)
 }
 
-/// Filter only the copy delivered to a model. Transport codes and media markers are atoms.
+/// Filter only the copy delivered to a model. Transport codes and media markers are atoms. See `strip_model_text`.
 pub fn strip_from_model_text(text: &str, cfg: &Value) -> String {
+    strip_model_text(text, cfg).0
+}
+
+/// The one model-text strip, used by every delivery site and by the checked reads of the prompt texts. Each entry of
+/// `stripFromModelText` is removed from the text outside atoms, the entries in order, and the round repeats until it
+/// removes nothing more, so a removal that joins a new match is not left behind. An entry whose removal would give the
+/// text a denied term (`settings::denied_in_text`) that the input did not hold is not applied: the text stays as it
+/// was for that entry. So the result never holds a denied term the input lacked, and stripping the result again
+/// changes nothing. The flag is whether an entry that still matches the result was refused.
+fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
     let Some(items) = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array) else {
-        return text.to_string();
+        return (text.to_string(), false);
     };
     let strips: Vec<&str> = items.iter().filter_map(Value::as_str).filter(|s| !s.is_empty()).collect();
     if strips.is_empty() {
-        return text.to_string();
+        return (text.to_string(), false);
     }
     static ATOMS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let atoms = ATOMS.get_or_init(|| regex::Regex::new(
         r"【会话令牌】[^\r\n]*|\[CQ:[^\]\r\n]*\]|\[(?:图片|语音|视频|媒体|卡片消息|表情[^\]\r\n]*|文件[^\]\r\n]*|转发消息[^\]\r\n]*)\]"
     ).unwrap());
-    let strip = |part: &str| {
-        strips.iter().fold(part.to_string(), |out, item| out.replace(item, ""))
+    let remove = |text: &str, item: &str| {
+        let mut out = String::with_capacity(text.len());
+        let mut start = 0;
+        for atom in atoms.find_iter(text) {
+            out.push_str(&text[start..atom.start()].replace(item, ""));
+            out.push_str(atom.as_str());
+            start = atom.end();
+        }
+        out.push_str(&text[start..].replace(item, ""));
+        out
     };
-    let mut out = String::with_capacity(text.len());
-    let mut start = 0;
-    for atom in atoms.find_iter(text) {
-        out.push_str(&strip(&text[start..atom.start()]));
-        out.push_str(atom.as_str());
-        start = atom.end();
+    let mut held: Option<Vec<String>> = None;
+    let mut current = text.to_string();
+    loop {
+        let (mut changed, mut refused) = (false, false);
+        for item in &strips {
+            let next = remove(&current, item);
+            if next == current {
+                continue;
+            }
+            let held = held.get_or_insert_with(|| crate::settings::denied_in_text(text));
+            if crate::settings::denied_in_text(&next).iter().all(|term| held.contains(term)) {
+                current = next;
+                changed = true;
+            } else {
+                refused = true;
+            }
+        }
+        // Each applied entry shortens the text, so the rounds end.
+        if !changed {
+            return (current, refused);
+        }
     }
-    out.push_str(&strip(&text[start..]));
-    out
 }
 
 /// Keep JSON keys, cursors, tokens and media references intact; filter chat-bearing values.

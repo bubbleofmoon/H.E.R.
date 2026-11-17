@@ -1331,7 +1331,7 @@ fn build_text_only_inner(
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
     out.push_str(&identity_core(context, &cfg, key));
-    out.push_str(&identity_line(&crate::model_view::strip_from_model_text(self_name, &cfg), self_qq));
+    out.push_str(&identity_line(&checked_nickname(context, &cfg, self_name), self_qq));
 
     out.push_str("【这次怎么做】\n");
     out.push_str("你是被群里的新消息叫醒的。下面已经把现场都给你了，");
