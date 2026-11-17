@@ -315,18 +315,14 @@ fn onebot_base(context: &RuntimeContext, cfg: &Value) -> Result<(String, String)
     Ok((host_port, token))
 }
 
-/// Selected-runtime config; legacy contexts tolerate a missing/invalid file (JS `loadConfig` returns `{}`).
+/// Selected-runtime config document from the loader; legacy contexts tolerate a missing/invalid file (JS
+/// `loadConfig` returns `{}`).
 pub(crate) fn config(context: &RuntimeContext) -> Result<Value, String> {
-    let text = match context.read_text(RuntimeArea::Config, "config.json") {
-        Ok(text) => text,
-        Err(_) if !context.is_isolated() => return Ok(json!({})),
-        Err(_) => return Err("selected runtime config is unavailable".to_string()),
-    };
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    match serde_json::from_str(text) {
+    match context.load_config_document() {
         Ok(value) => Ok(value),
         Err(_) if !context.is_isolated() => Ok(json!({})),
-        Err(_) => Err("selected runtime config is invalid".to_string()),
+        Err(crate::runtime::ConfigReadError::Unavailable(_)) => Err("selected runtime config is unavailable".to_string()),
+        Err(crate::runtime::ConfigReadError::Invalid) => Err("selected runtime config is invalid".to_string()),
     }
 }
 

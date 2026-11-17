@@ -59,6 +59,22 @@ fn config_loader_reports_unavailable_invalid_and_bom_prefixed_files() {
 }
 
 #[test]
+fn config_stamp_changes_with_the_stored_file() {
+    let (root, context) = overlay_fixture("config overlay stamp");
+    let path = root.0.join("config/config.json");
+    let first = context.config_stamp().unwrap();
+    assert_eq!(context.config_stamp().unwrap(), first, "an unchanged file keeps its stamp");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push('\n');
+    std::fs::write(&path, &text).unwrap();
+    let second = context.config_stamp().unwrap();
+    assert_ne!(second, first, "a changed length changes the stamp");
+    assert_eq!(second.len, text.len() as u64);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(context.config_stamp(), Err("runtime path is unavailable"), "a missing file has no stamp");
+}
+
+#[test]
 fn config_overlay_reaches_the_qq_tool_server() {
     let (_root, context) = overlay_fixture("config overlay qq tools");
     with_overlay_model(|| {

@@ -270,12 +270,10 @@ fn must_reply(text: &str, nick: &str, cfg: &Value) -> bool {
 }
 
 fn config_stamp(context: &RuntimeContext) -> Result<String, String> {
-    let path = context.resolve_path(RuntimeArea::Config, "config.json", crate::runtime::PathIntent::ReadFile)
-        .map_err(str::to_string)?;
-    let metadata = std::fs::metadata(path).map_err(|_| "reserved config metadata is unavailable".to_string())?;
-    let modified = metadata.modified().map_err(|_| "reserved config timestamp is unavailable".to_string())?
+    let stamp = context.config_stamp().map_err(str::to_string)?;
+    let modified = stamp.modified.ok_or("reserved config timestamp is unavailable")?
         .duration_since(std::time::UNIX_EPOCH).map_err(|_| "reserved config timestamp is invalid".to_string())?;
-    Ok(format!("{}:{}", modified.as_nanos(), metadata.len()))
+    Ok(format!("{}:{}", modified.as_nanos(), stamp.len))
 }
 
 /// Frozen JS starts with defaults, but HTTP hot reload replaces top-level social wholesale.

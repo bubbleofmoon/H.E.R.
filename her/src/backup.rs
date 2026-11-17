@@ -865,7 +865,7 @@ pub(crate) fn snapshot_config(context: &RuntimeContext) -> Result<(Vec<u8>, serd
     let text = std::str::from_utf8(&config).map_err(|_| "backup config is not UTF-8")?;
     let raw: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
         .map_err(|_| "backup config is invalid")?;
-    Ok((config, raw))
+    Ok((config, context.overlay_config(raw)))
 }
 
 fn create_snapshot(

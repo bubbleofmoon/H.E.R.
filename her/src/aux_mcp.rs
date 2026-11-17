@@ -15,7 +15,7 @@ use crate::aux_fetch;
 use crate::aux_search::{self, Network};
 use crate::aux_text::{js_truthy, sanitize_query};
 use crate::mcp::{prepare_call, serve_stdio, ToolDispatch};
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 
 const BASELINE: &str = include_str!("../spec/aux-baseline.json");
 const FETCH_CHARS: usize = 50_000;
@@ -45,13 +45,10 @@ pub(crate) fn call_tool(name: &str, args: &Value, context: &RuntimeContext) -> V
     }
 }
 
-/// The selected config (`{}` when a legacy context has none, as JS `loadConfig`); an invalid file is `{}` too.
+/// The selected config document from the loader (`{}` when a legacy context has none, as JS `loadConfig`); an
+/// invalid file is `{}` too.
 pub(crate) fn read_config(context: &RuntimeContext) -> Value {
-    context
-        .read_text(RuntimeArea::Config, "config.json")
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok())
-        .unwrap_or_else(|| json!({}))
+    context.load_config_document().unwrap_or_else(|_| json!({}))
 }
 
 fn outcome(text: String, is_error: bool) -> Value {

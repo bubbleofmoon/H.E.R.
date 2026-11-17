@@ -171,13 +171,12 @@ fn write_config_object(context: &RuntimeContext, value: &Value) -> Result<(), (u
 
 // ── GET/POST /api/whitelist ──────────────────────────────────────────────────────────────────────────
 
-/// `config.json` as the console found it at start (modification time and size), per runtime.
-static CONFIG_START_STAMP: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, Option<(std::time::SystemTime, u64)>>>> =
+/// `config.json` as the console found it at start (its loader stamp), per runtime.
+static CONFIG_START_STAMP: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, Option<crate::runtime::ConfigStamp>>>> =
     std::sync::OnceLock::new();
 
-fn config_stamp(context: &RuntimeContext) -> Option<(std::time::SystemTime, u64)> {
-    let meta = std::fs::metadata(context.config_file()).ok()?;
-    Some((meta.modified().ok()?, meta.len()))
+fn config_stamp(context: &RuntimeContext) -> Option<crate::runtime::ConfigStamp> {
+    context.config_stamp().ok()
 }
 
 /// Remember the start stamp (JS `cfgStamp` baseline taken at start).
@@ -214,7 +213,7 @@ pub(super) fn whitelist_get(context: &RuntimeContext, cfg: &Value) -> Value {
         .and_then(|stamps| stamps.lock().ok().and_then(|s| s.get(context.config_file()).cloned()));
     if let Some(start) = start {
         if start != config_stamp(context) {
-            if let Ok(raw) = read_config_object(context) {
+            if let Ok(raw) = context.load_config_document() {
                 for field in ["allow", "deny", "ownerQQ"] {
                     if let Some(value) = raw.get(field) {
                         view[field] = value.clone();

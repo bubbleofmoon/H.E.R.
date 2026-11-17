@@ -64,6 +64,14 @@ pub enum ConfigReadError {
     Invalid,
 }
 
+/// A change stamp of the stored `config.json`: equal stamps mean the loader reads the same file, so a cache of a
+/// value derived from the configuration is keyed on it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigStamp {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeMode {
     Legacy,
@@ -986,6 +994,13 @@ impl RuntimeContext {
     /// Without a settings store the file is the configuration.
     pub(crate) fn overlay_config(&self, file: Value) -> Value {
         apply_settings_overlay(file)
+    }
+
+    /// The change stamp of the stored `config.json` (`ConfigStamp`); the path checks of the loader apply.
+    pub fn config_stamp(&self) -> Result<ConfigStamp, &'static str> {
+        let path = self.resolve_path(RuntimeArea::Config, "config.json", PathIntent::ReadFile)?;
+        let metadata = fs::metadata(path).map_err(|_| "runtime config metadata is unavailable")?;
+        Ok(ConfigStamp { len: metadata.len(), modified: metadata.modified().ok() })
     }
 
     pub fn load_config(&self) -> Result<Value, &'static str> {
