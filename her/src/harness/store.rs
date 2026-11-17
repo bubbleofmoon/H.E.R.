@@ -600,7 +600,7 @@ mod tests {
         let mut request = TurnRequest {
             id:"opaque-first".into(), conversation:"private:8808".into(), generation:generation.clone(), prompt:"ordinary input".into(), profile:"closed-agent".into(),
             route:ModelRoute::from_runtime(&context, &cfg).unwrap(), deadline:std::time::Duration::from_secs(10),
-            tools:Tools::capture(&context, &cfg, "private:8808", &generation).unwrap(), limits:Limits::from_config(&cfg),
+            tools:Tools::capture(&context, &cfg, "closed-agent", "private:8808", &generation).unwrap(), limits:Limits::from_config(&cfg),
         };
         let store = Store::open(&context).unwrap();
         store.admit(&request).unwrap();
