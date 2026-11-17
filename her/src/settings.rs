@@ -2,7 +2,8 @@
 //!
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
-//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change.
+//! (`overlay`, called from `RuntimeContext::overlay_config`); `apply` changes one value with one audit row per change,
+//! for the console set route and for the owner's chat settings tools (`chat_setting`, `console::settings_action`).
 //! A legacy (no-root) context has no store.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
@@ -48,6 +49,9 @@ pub(crate) struct Setting {
     pub group: &'static str,
     pub label: &'static str,
     pub hint: &'static str,
+    /// Whether the owner's private chat may read and change it through `settings_get` / `settings_set`, under
+    /// `chat_name`. Never set for a secret (registry test).
+    pub chat: bool,
 }
 
 impl Setting {
@@ -76,6 +80,25 @@ impl Setting {
             Kind::Integer { min, max, .. } => json!({"type": "integer", "min": min, "max": max}),
         }
     }
+
+    /// What the next use reads from `document`, the loaded configuration: the value at the pointer when this setting
+    /// accepts it, otherwise the default.
+    pub(crate) fn effective_value(&self, document: &Value) -> Value {
+        document.pointer(self.pointer).and_then(|value| self.normalize(value)).unwrap_or_else(|| self.default_value())
+    }
+
+    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
+    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    pub(crate) fn chat_name(&self) -> String {
+        self.pointer.trim_start_matches('/').replace('/', ".")
+    }
+
+    /// Why a chat value was refused, under the chat's name.
+    pub(crate) fn chat_requirement(&self) -> String {
+        match self.kind {
+            Kind::Integer { min, max, .. } => format!("{} 必须是 {min} 到 {max} 的整数", self.chat_name()),
+        }
+    }
 }
 
 /// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
@@ -87,10 +110,16 @@ pub(crate) const REGISTRY: &[Setting] = &[Setting {
     group: "reply rhythm",
     label: "Quiet time before a message wake",
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
+    chat: true,
 }];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
     REGISTRY.iter().find(|setting| setting.key == key)
+}
+
+/// The registry setting the owner's chat names `name` (`Setting::chat_name`), when the chat may use it.
+pub(crate) fn chat_setting(name: &str) -> Option<&'static Setting> {
+    REGISTRY.iter().find(|setting| setting.chat && setting.chat_name() == name)
 }
 
 /// The result of one `apply`.
@@ -611,10 +640,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         .iter()
         .map(|setting| {
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = document
-                .pointer(setting.pointer)
-                .and_then(|value| setting.normalize(value))
-                .unwrap_or_else(|| setting.default_value());
+            let value = setting.effective_value(&document);
             json!({
                 "key": setting.key,
                 "group": setting.group,
