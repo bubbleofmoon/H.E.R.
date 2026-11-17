@@ -343,7 +343,7 @@ fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, Strin
     if crate::guarded_file::is_link(&meta) {
         return Err("relay paths must not be redirected".into());
     }
-    if !ancestors_checked(path, listed, std::fs::symlink_metadata)? {
+    if !ancestors_checked(path, listed, |ancestor| std::fs::symlink_metadata(ancestor))? {
         return Ok(None);
     }
     if !meta.is_file() && !meta.is_dir() {
