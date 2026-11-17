@@ -391,15 +391,26 @@ fn guard179_only_the_presets_own_plugin_rows_count() {
 }
 
 #[test]
-fn guard179_a_quoted_key_is_read_exactly_or_refused() {
-    let (_root, context) = fixture("quoted-keys");
+fn guard179_only_plain_keys_and_readable_values_are_read() {
+    let (_root, context) = fixture("allowlist");
     write_compliant(&context);
     let persona = "              prefix: |-\n                你是群里的普通成员。\n                - 不用列表回答。\n                说话简短。\n";
     let cases = [
+        ("              \"prefix\" : 像 AI 一样回答\n", "yaml:preset1"),
+        ("              prefix: !!str \"\\u0041I\"\n", "yaml:preset1"),
+        ("              prefix: !!str 像 AI 一样回答\n", "yaml:preset1"),
+        ("              \"prefix\": 像 AI 一样回答\n", "yaml:preset1"),
+        ("              'prefix': 像 AI 一样回答\n", "yaml:preset1"),
         ("              \"pre\\u0066ix\": 像 AI 一样回答\n", "yaml:preset1"),
-        ("              \"pre\\x66ix\": 像 AI 一样回答\n", "yaml:preset1"),
-        ("              'prefix': 像 AI 一样回答\n", "persona-text:preset1"),
-        ("              \"prefix\": 像 AI 一样回答\n", "persona-text:preset1"),
+        ("              ? prefix\n              : 像 AI 一样回答\n", "yaml:preset1"),
+        ("              prefix : 像 AI 一样回答\n", "yaml:preset1"),
+        ("              prefix: &text 像 AI 一样回答\n", "yaml:preset1"),
+        ("              prefix: *text\n", "yaml:preset1"),
+        ("              prefix: 规则: 像 AI 一样回答\n", "yaml:preset1"),
+        ("              prefix: 你好\n                像 AI 一样回答\n", "yaml:preset1"),
+        ("              prefix: 像 AI 一样回答\n", "persona-text:preset1"),
+        ("              prefix: '像 AI 一样回答'\n", "persona-text:preset1"),
+        ("              prefix: \"像 AI 一样回答\"\n", "persona-text:preset1"),
     ];
     for (replace, expected) in cases {
         edit_preset(&context, |text| text.replacen(persona, replace, 1));
@@ -649,6 +660,64 @@ fn guard179_the_rpc_asks_the_guard_again_before_a_401_repeat() {
         let error = result.unwrap_err();
         assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("local-tools:preset1"), "{error}");
     }
+}
+
+#[test]
+fn guard179_the_rpc_guards_session_create_like_a_prompt() {
+    // Every caller (the slang learner included) creates its DSH session through the RPC before any prompt.
+    let create = json!({"workspaceId": "w", "agentPreset": "fixture-chat"});
+    for bounded in [false, true] {
+        let (_root, context) = fixture("session-create");
+        force(&context);
+        write_compliant(&context);
+        write(&context, ".credentials.yaml", &format!("secret: \"{}\"\n", "A".repeat(43)));
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = fake_401_breaking_the_preset(listener, home(&context).join(PRESET_FILE));
+        let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+        let result = if bounded {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            rpc.call_with_cancellation("session/create", create.clone(), deadline, &|| false)
+        } else {
+            rpc.call("session/create", create.clone())
+        };
+        let repeats = server.join().unwrap();
+        assert_eq!(repeats, 0, "bounded={bounded}: the repeated session/create after a 401 reached DSH ({result:?})");
+        let error = result.unwrap_err();
+        assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("local-tools:preset1"), "{error}");
+    }
+    let (_root, context) = fixture("session-create-missing");
+    force(&context);
+    write(&context, ".credentials.yaml", &format!("secret: \"{}\"\n", "A".repeat(43)));
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let rpc = crate::dsh::Rpc::connect_with_runtime(&context, &base).unwrap();
+    let error = rpc.call("session/create", create.clone()).unwrap_err();
+    assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("preset-bundle"), "{error}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let error = rpc.call_with_deadline("session/create", create, deadline).unwrap_err();
+    assert!(error.starts_with(REFUSAL_PREFIX) && error.contains("preset-bundle"), "{error}");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "no session/create may reach DSH"
+    );
+}
+
+#[test]
+fn guard179_a_backup_never_replaces_an_existing_file() {
+    let (_root, context) = fixture("create-new");
+    let name = format!("{BACKUP_PREFIX}2026-01-02T03-04-05-006Z-00");
+    write(&context, &format!("{PROFILE_DIR}/{name}"), "foreign\n");
+    assert!(write_backup(&context, &name, "old\n").is_err(), "an existing file is never replaced");
+    assert_eq!(read(&context, &format!("{PROFILE_DIR}/{name}")), "foreign\n");
+    // Another spelling of HER's prefix names HER's file on a case-insensitive file system (Windows) only.
+    let stamp = "2999-12-31T23-59-59-999Z";
+    let upper = format!("cordis.patch.yml.bak-HER-{stamp}-05");
+    assert_eq!(is_own_backup(&upper), cfg!(windows));
+    let next = backup_name("2026-01-02T03-04-05-006Z", &[format!("{BACKUP_PREFIX}{stamp}-04"), upper]);
+    let counter = if cfg!(windows) { "06" } else { "05" };
+    assert_eq!(next, Some(format!("{BACKUP_PREFIX}{stamp}-{counter}")));
 }
 
 #[test]

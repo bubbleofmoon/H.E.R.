@@ -241,7 +241,8 @@ fn guard179_a_missing_profile_row_refuses_the_turn_before_any_dsh_call() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// #179: with every guarded row in place, the turn reaches DSH.
+/// #179: with every guarded row in place, the turn reaches DSH; in the same fixture, once a row is gone, the next
+/// turn does not (this half fails if the pipeline and RPC admission calls are removed).
 #[test]
 fn guard179_with_every_guarded_row_in_place_the_turn_reaches_dsh() {
     let fake = CompletionDsh::start(false);
@@ -273,8 +274,19 @@ fn guard179_with_every_guarded_row_in_place_the_turn_reaches_dsh() {
     let result = rt.block_on(pipe.ask_with_failover(key, "synthetic guard test", 10, &cfg));
     pipe.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
     let submitted = fake.prompts.load(std::sync::atomic::Ordering::SeqCst);
+    let quiet = crate::dsh_profile::test_support::alerts(&context).is_empty();
+    // The same fixture with the preset's `pwsh` row turned back on: the next turn is refused before any DSH call.
+    let (find, replace) = crate::dsh_profile::test_support::PWSH_ON;
+    crate::dsh_profile::test_support::edit_preset(&context, |text| text.replacen(find, replace, 1));
+    pipe.begin_ledger_turn(key).unwrap();
+    let refused = rt.block_on(pipe.ask_with_failover(key, "synthetic guard test", 10, &cfg));
+    pipe.end_ledger_turn(refused.as_ref().map(|_| ()).map_err(String::as_str));
+    let after = fake.prompts.load(std::sync::atomic::Ordering::SeqCst);
     drop(fake);
     assert!(submitted >= 1, "the turn must reach DSH: {result:?}");
-    assert!(crate::dsh_profile::test_support::alerts(&context).is_empty());
+    assert!(quiet, "a compliant profile raises no alert");
+    assert_eq!(after, submitted, "the turn after a row went missing reached DSH: {refused:?}");
+    assert_eq!(refused, Err(format!("{}local-tools:preset1", crate::dsh_profile::REFUSAL_PREFIX)));
+    assert_eq!(crate::dsh_profile::test_support::alerts(&context).len(), 1);
     std::fs::remove_dir_all(root).unwrap();
 }

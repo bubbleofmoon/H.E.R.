@@ -280,6 +280,11 @@ fn backup(context: &RuntimeContext, old: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Step 4-red stand-in with today's behaviour (Step 4-fix replaces it).
+fn write_backup(context: &RuntimeContext, name: &str, old: &str) -> Result<(), String> {
+    context.write_atomic(RuntimeArea::DshUser, &format!("{PROFILE_DIR}/{name}"), old.as_bytes()) // STUB179-4
+}
+
 /// The next backup name: the prefix, a stamp, `-` and a two-digit counter, sorting after every existing own backup,
 /// so names never repeat and pruning (oldest names first) never removes the newest. `stamp` when it sorts after the
 /// newest; otherwise the newest name's stamp with its counter plus one; `None` once that counter would pass 99.
