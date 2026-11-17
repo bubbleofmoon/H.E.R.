@@ -6,6 +6,7 @@
 //! A legacy (no-root) context has no store.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -157,28 +158,141 @@ fn refuse_version(version: i64) -> String {
     message.to_string()
 }
 
-/// The stored values of registry settings. No store yet is an empty list, and so is a store created but never given
-/// its schema. Rows with a key the registry does not have, or a value its setting does not accept, are skipped.
-fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
-    let path = context
-        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Ok(metadata) if metadata.is_file() => {}
-        _ => return Err(STORAGE_ERROR.to_string()),
+/// What a read-only look at the store found. Nothing here opens the store for writing, so a store this release
+/// refuses is never checkpointed, rolled back or switched to WAL.
+enum Inspection {
+    /// No `settings.db` yet.
+    Missing,
+    /// No schema yet: an empty file, or version 0 without tables.
+    Fresh,
+    /// A rollback journal lies beside a store at version 0 or 1; only a writer's read-write open may recover it.
+    Journal(i64),
+    /// Version 1 with exactly the expected columns, open read-only and with no checkpoint on close.
+    Ready(Connection),
+}
+
+/// How long a store whose WAL is present waits for its wal-index (`-shm`): SQLite removes the index just before the
+/// WAL when its last connection closes.
+const SIDECAR_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The length of a store file, `None` when it is missing; anything but a plain file is refused.
+fn file_len(path: &std::path::Path) -> Result<Option<u64>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) if metadata.is_file() => Ok(Some(metadata.len())),
+        _ => Err(STORAGE_ERROR.to_string()),
     }
-    // The sidecars are checked only once the store exists, so a runtime without one pays a single path check.
-    let path = check_paths(context, PathIntent::ReadOptionalFile)?;
-    // Never created here: a read leaves a runtime without a store as it was.
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+}
+
+/// Refuses a store file with another hard link: the containment checks see paths, not files, so a second name for
+/// another database would pass them. A missing file passes.
+fn refuse_hard_links(path: &std::path::Path) -> Result<(), String> {
+    match link_count(path) {
+        Ok(1) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(STORAGE_ERROR.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn link_count(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).map(|metadata| metadata.nlink())
+}
+
+#[cfg(windows)]
+fn link_count(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    let file = std::fs::File::open(path)?;
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle stays open for the call and `information` is a valid, writable out pointer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(u64::from(information.nNumberOfLinks))
+}
+
+/// Looks at the store without opening it for writing. It refuses a store file with another hard link, a file that is
+/// not a SQLite database, a version other than 0 or 1, a version 0 with tables and a version-1 schema without exactly
+/// its columns. While no WAL holds later commits the version comes from the file header; otherwise a read-only
+/// connection that never checkpoints reads it. Only SQLite's shared-memory index (`-shm`) may be rebuilt meanwhile.
+fn inspect(context: &RuntimeContext) -> Result<Inspection, String> {
+    inspect_store(context, true)
+}
+
+fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, String> {
+    let resolve = |name: &str| {
+        context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR.to_string())
+    };
+    let path = resolve(DB)?;
+    let Some(len) = file_len(&path)? else { return Ok(Inspection::Missing) };
+    let (wal, shm, journal) = (resolve(SIDECARS[0])?, resolve(SIDECARS[1])?, resolve(SIDECARS[2])?);
+    for file in [&path, &wal, &shm, &journal] {
+        refuse_hard_links(file)?;
+    }
+    let wal_len = file_len(&wal)?.unwrap_or(0);
+    if len == 0 {
+        return if wal_len == 0 { Ok(Inspection::Fresh) } else { Err(STORAGE_ERROR.to_string()) };
+    }
+    let mut header = [0u8; 100];
+    std::fs::File::open(&path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
         .map_err(|_| STORAGE_ERROR.to_string())?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(STORAGE_ERROR.to_string());
+    }
+    let header_version = i64::from(i32::from_be_bytes([header[60], header[61], header[62], header[63]]));
+    if file_len(&journal)?.is_some_and(|len| len > 0) {
+        return match header_version {
+            0 | SCHEMA_VERSION => Ok(Inspection::Journal(header_version)),
+            version => Err(refuse_version(version)),
+        };
+    }
+    if wal_len == 0 {
+        if header_version != 0 && header_version != SCHEMA_VERSION {
+            return Err(refuse_version(header_version));
+        }
+    } else {
+        // A read-only connection would create a missing index; wait for a closing connection to finish instead.
+        let settled = std::time::Instant::now() + SIDECAR_SETTLE;
+        while file_len(&shm)?.is_none() {
+            if file_len(&wal)?.is_none() {
+                return if again { inspect_store(context, false) } else { Err(STORAGE_ERROR.to_string()) };
+            }
+            if std::time::Instant::now() >= settled {
+                return Err(STORAGE_ERROR.to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
     match schema_version(&conn)? {
-        0 => return Ok(Vec::new()),
-        SCHEMA_VERSION => {}
-        version => return Err(refuse_version(version)),
+        0 => {
+            let tables: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                .map_err(|_| STORAGE_ERROR.to_string())?;
+            if tables == 0 { Ok(Inspection::Fresh) } else { Err(STORAGE_ERROR.to_string()) }
+        }
+        SCHEMA_VERSION if has_settings_schema(&conn) => Ok(Inspection::Ready(conn)),
+        SCHEMA_VERSION => Err(STORAGE_ERROR.to_string()),
+        version => Err(refuse_version(version)),
     }
+}
+
+/// The stored values of registry settings, read through the inspection's read-only connection. No store or no schema
+/// yet is an empty list. Rows with a key the registry does not have, or a value its setting does not accept, are
+/// skipped.
+fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
+    let conn = match inspect(context)? {
+        Inspection::Missing | Inspection::Fresh | Inspection::Journal(0) => return Ok(Vec::new()),
+        Inspection::Journal(_) => return Err(STORAGE_ERROR.to_string()),
+        Inspection::Ready(conn) => conn,
+    };
     let mut statement = conn.prepare("SELECT key, value FROM settings").map_err(|_| STORAGE_ERROR.to_string())?;
     let rows = statement
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
@@ -227,6 +341,10 @@ fn enable_wal(context: &RuntimeContext, conn: &Connection) -> Result<(), String>
             }
             Err(_) => false,
         };
+        #[cfg(test)]
+        if busy {
+            WAL_SWITCH_BUSY.fetch_add(1, Ordering::SeqCst);
+        }
         if !busy || std::time::Instant::now() >= deadline {
             return Err(STORAGE_ERROR.to_string());
         }
@@ -234,26 +352,39 @@ fn enable_wal(context: &RuntimeContext, conn: &Connection) -> Result<(), String>
     }
 }
 
-/// Whether both tables of schema version 1 exist. A store that claims the version without them is refused before it is
-/// touched, so the WAL switch never rewrites its header.
+/// The columns of the schema-version-1 tables, in order.
+const SCHEMA_COLUMNS: [(&str, &[&str]); 2] = [
+    ("settings", &["key", "value", "revision", "updated_ms", "updated_by"]),
+    ("settings_audit", &["id", "at_ms", "actor", "source", "scope", "key", "old_value", "new_value", "request_id"]),
+];
+
+/// Whether both tables of schema version 1 exist with exactly their columns, in order. A store that claims the version
+/// without them is refused before it is touched, so the WAL switch never rewrites its header.
 fn has_settings_schema(conn: &Connection) -> bool {
-    conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('settings', 'settings_audit')",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .is_ok_and(|count| count == 2)
+    SCHEMA_COLUMNS.iter().all(|(table, expected)| {
+        let Ok(mut statement) = conn.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid") else {
+            return false;
+        };
+        let columns = statement
+            .query_map([*table], |row| row.get::<_, String>(0))
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+        columns.is_ok_and(|columns| columns == *expected)
+    })
 }
 
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
 /// schema is newer than this release's (checked before anything is written).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
+    // Refuse what this release cannot use before any connection that can write opens the store.
+    drop(inspect(context)?);
     let path = check_paths(context, PathIntent::WriteFile)?;
     let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|_| STORAGE_ERROR.to_string())?;
+    // No checkpoint on close until the store is known to be usable, so a refusal below leaves it as it was.
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
     let version = schema_version(&conn)?;
     if version != 0 && version != SCHEMA_VERSION {
@@ -286,6 +417,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
         version => return Err(refuse_version(version)),
     }
     tx.commit().map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false).map_err(|_| STORAGE_ERROR.to_string())?;
     Ok(conn)
 }
 
