@@ -1181,8 +1181,17 @@ async fn worker(
             park!(job, true);
             continue;
         }
+        // A pipeline built for a turn engine without DSH holds no DSH login: a DSH turn builds a new one.
+        if needs_dsh && pipeline.as_ref().is_some_and(|p| !p.has_dsh()) {
+            pipeline = None;
+        }
         if pipeline.is_none() {
-            match crate::pipeline::Pipeline::new_with_runtime(&context, &cfg, true) {
+            let built = if needs_dsh {
+                crate::pipeline::Pipeline::new_with_runtime(&context, &cfg, true)
+            } else {
+                crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true)
+            };
+            match built {
                 Ok(p) => pipeline = Some(p),
                 Err(error) => {
                     println!("[chat] ❌ {key} 无法初始化回合管线：{error}");

@@ -268,6 +268,9 @@ impl Credential {
     /// 立刻全部 401。重读密钥并重铸即可恢复，无需重启。为什么不能只铸不验：实测有一次铸完仍然 401——DSH 换密钥时，
     /// 文件先变、进程内存后变（或反过来），中间那几百毫秒里刚铸的票也是 401。所以 4 次、递增间隔。
     pub fn relogin(&self, mut verify: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+        if !self.bound {
+            return Err(UNBOUND.to_string());
+        }
         let mut last = String::new();
         for attempt in 0..4 {
             let cookie =

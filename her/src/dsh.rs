@@ -380,6 +380,9 @@ impl Rpc {
         rpc_id: &str,
         refresh: bool,
     ) -> Result<serde_json::Value, String> {
+        if !self.credential.is_bound() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         let endpoint = method.replace('.', "/");
         let mut body = payload;
         if endpoint == "session/prompt" && body.get("requestId").is_none() {
@@ -513,6 +516,9 @@ impl Rpc {
         deadline: std::time::Instant,
         cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<serde_json::Value, String> {
+        if !self.credential.is_bound() {
+            return Err(crate::dsh_credential::UNBOUND.to_string());
+        }
         let endpoint = method.replace('.', "/");
         let mut body = payload;
         if endpoint == "session/prompt" && body.get("requestId").is_none() {

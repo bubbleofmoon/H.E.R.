@@ -581,24 +581,51 @@ impl Pipeline {
         cfg: &serde_json::Value,
         live: bool,
     ) -> Result<Self, String> {
+        Self::build(context, cfg, live, true)
+    }
+
+    /// A pipeline for turns whose engine needs no DSH (`turn_engine::Engine::uses_dsh` is false;
+    /// selected runtime only). It reads no DSH credential and needs no DSH dependency; every DSH
+    /// call on it fails locally (`dsh_credential::UNBOUND`) without contacting DSH.
+    pub fn new_without_dsh(
+        context: &RuntimeContext,
+        cfg: &serde_json::Value,
+        live: bool,
+    ) -> Result<Self, String> {
+        Self::build(context, cfg, live, false)
+    }
+
+    fn build(
+        context: &RuntimeContext,
+        cfg: &serde_json::Value,
+        live: bool,
+        dsh: bool,
+    ) -> Result<Self, String> {
         // Validate selected-root session state before constructing any live dependencies or
         // creating the candidate workspace. A corrupt file must not silently start a new session
         // and later overwrite the evidence needed to repair it.
         let store = SessionStore::load_for_runtime(context)?;
-        let base = if context.is_isolated() {
-            context
-                .dependency_url("dsh")
-                .ok_or_else(|| "runtime DSH dependency is unavailable".to_string())?
-                .to_string()
+        let rpc = if !dsh {
+            if !context.is_isolated() {
+                return Err("a pipeline without DSH requires a selected runtime".to_string());
+            }
+            Rpc::unbound(context, context.dependency_url("dsh").unwrap_or_default())
         } else {
-            cfg
-            .get("dsh")
-            .and_then(|d| d.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080")
-            .to_string()
+            let base = if context.is_isolated() {
+                context
+                    .dependency_url("dsh")
+                    .ok_or_else(|| "runtime DSH dependency is unavailable".to_string())?
+                    .to_string()
+            } else {
+                cfg
+                .get("dsh")
+                .and_then(|d| d.get("baseUrl"))
+                .and_then(|b| b.as_str())
+                .unwrap_or("http://127.0.0.1:3080")
+                .to_string()
+            };
+            Rpc::connect_with_runtime(context, &base)?
         };
-        let rpc = Rpc::connect_with_runtime(context, &base)?;
 
         let http_url = if context.is_isolated() {
             context
@@ -711,15 +738,6 @@ impl Pipeline {
             pending_title: None,
             title_for: None,
         })
-    }
-
-    /// red scaffold (#62 run 1): Run 3 builds this pipeline without a DSH login.
-    pub fn new_without_dsh(
-        context: &RuntimeContext,
-        cfg: &serde_json::Value,
-        live: bool,
-    ) -> Result<Self, String> {
-        Self::new_with_runtime(context, cfg, live)
     }
 
     fn preset_for(&self, key: &str) -> String {
