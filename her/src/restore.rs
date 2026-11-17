@@ -87,6 +87,16 @@ fn label(area: RuntimeArea, relative: &str) -> String {
     )
 }
 
+/// Red-test stub, replaced in Run 2: tries once.
+fn retry_open_file(
+    windows: bool,
+    deadline: Instant,
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let _ = (windows, deadline);
+    operation()
+}
+
 fn current_files(
     context: &RuntimeContext,
     memory_only: bool,
@@ -1171,6 +1181,9 @@ mod tests {
         health_error: Option<String>,
         fail_rollback_stop: bool,
         leave_conversation_sidecars: bool,
+        leave_settings_sidecars: bool,
+        fail_relative: Option<&'static str>,
+        replaced: Vec<String>,
     }
     impl Control for FakeControl {
         fn preflight(&mut self, _: &RuntimeContext) -> Result<(), String> {
@@ -1186,6 +1199,18 @@ mod tests {
                             .unwrap()
                             .join(format!("data/conversations.db{suffix}")),
                         b"stale conversation sidecar",
+                    )
+                    .unwrap();
+                }
+            }
+            if self.leave_settings_sidecars && self.stops == 1 {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    fs::write(
+                        context
+                            .runtime_root()
+                            .unwrap()
+                            .join(format!("data/settings.db{suffix}")),
+                        b"stale settings sidecar",
                     )
                     .unwrap();
                 }
@@ -1218,7 +1243,12 @@ mod tests {
             input: &mut dyn Read,
         ) -> Result<(), String> {
             self.writes += 1;
-            if self.fail_write == Some(self.writes) {
+            self.replaced.push(label(area, relative));
+            let fail_relative = self.fail_relative.is_some_and(|name| name == relative);
+            if fail_relative {
+                self.fail_relative = None;
+            }
+            if self.fail_write == Some(self.writes) || fail_relative {
                 struct Interrupted<'a>(&'a mut dyn Read, bool);
                 impl Read for Interrupted<'_> {
                     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -2316,4 +2346,6 @@ mod tests {
         assert_eq!(ordinary_path(Path::new(r"\\?\UNC\srv\share\a.zip")), r"\\srv\share\a.zip");
         assert_eq!(ordinary_path(Path::new(r"\\?\GLOBALROOT\x")), r"\\?\GLOBALROOT\x");
     }
+
+    include!("restore_settings_tests.rs");
 }
