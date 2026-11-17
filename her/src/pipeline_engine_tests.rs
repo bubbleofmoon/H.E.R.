@@ -234,3 +234,40 @@ async fn seam_harness_turn_builds_and_runs_without_a_dsh_credential() {
         (&json!(attempt), &json!("completed"), &json!(true), &json!(false), &json!(1), &json!("openai/fake-chat"))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
+    // A session mapping makes `ensure_session` return without an RPC, so the stream open is the
+    // call that would reach DSH: it must refuse locally as well.
+    let dsh = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    dsh.set_nonblocking(true).unwrap();
+    let mut runtime = SeamRuntime::new("seam-unbound-ask", "closed-agent", false, SeamRuntime::scripted_config());
+    std::fs::write(
+        runtime.root.join("dependencies.json"),
+        json!({
+            "dsh": format!("http://{}", dsh.local_addr().unwrap()),
+            "model": "http://127.0.0.1:43204",
+            "onebot": "http://127.0.0.1:43203",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    runtime.reload();
+    crate::session_map::bind(&runtime.context, "private:8808", "seam-session-62", None).unwrap();
+    let cfg = runtime.cfg();
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg, true).unwrap();
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        pipe.ask("private:8808", "hello seam unbound", 5),
+    )
+    .await;
+    match dsh.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(10035) => {}
+        other => panic!("the unbound ask contacted DSH: {other:?}"),
+    }
+    assert_eq!(
+        reply,
+        Ok(Err(crate::dsh_credential::UNBOUND.to_string())),
+        "an unbound pipeline refuses its ask locally"
+    );
+}
