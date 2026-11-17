@@ -438,3 +438,25 @@ fn t192_a_malformed_stop_record_refuses_access_changes() {
     std::fs::write(&record, json!({"pending": []}).to_string()).unwrap();
     conversation_scope_change(&context, "group:420043", "admit").expect("a record without stops accepts changes");
 }
+
+#[test]
+fn t192_duplicate_pending_ids_refuse_access_changes() {
+    let (root, context) = admitted("t192 duplicate ids");
+    let record = root.0.join("data").join(access::PENDING_REVOCATIONS);
+    let config = root.0.join("config/config.json");
+    // Two entries share the id "same": the first selects nothing, the second selects `GROUP` for its token rotation.
+    let text = json!({"pending": [
+        {"id": "same", "mode": "reserved2", "before": {}, "after": {}},
+        {"id": "same", "mode": "reserved2", "before": {"allow": {"groups": [420042]}}, "after": {"allow": {"groups": []}},
+         "targets": [GROUP]}
+    ]})
+    .to_string();
+    std::fs::write(&record, &text).unwrap();
+    let before = std::fs::read(&config).unwrap();
+    let error = conversation_scope_change(&context, "group:420043", "admit").unwrap_err();
+    assert_eq!(error.0, 503, "{error:?}");
+    assert_eq!(std::fs::read(&config).unwrap(), before, "nothing is written");
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), text, "the record is kept for repair");
+    assert_eq!(conversation_token(&context, GROUP).unwrap().as_deref(), Some(OLD_TOKEN), "nothing is revoked");
+    assert!(access::finish_pending_revocations(&context).is_err(), "console start reports it");
+}
