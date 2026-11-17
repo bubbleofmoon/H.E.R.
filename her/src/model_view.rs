@@ -160,8 +160,8 @@ pub fn strip_chat_with_runtime(context: &crate::runtime::RuntimeContext, data: &
     strip_model_chat_data(data, &with_blacklist(context, cfg))
 }
 
-/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it had to refuse a strip entry
-/// (`strip_model_text`): then `None`, and the caller uses its accepted fallback.
+/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it had to refuse a strip entry or did not
+/// settle within `MODEL_STRIP_ROUNDS` (`strip_model_text`): then `None`, and the caller uses its accepted fallback.
 pub fn strip_checked(text: &str, delivery: &Value) -> Option<String> {
     let (stripped, refused) = strip_model_text(text, delivery);
     (!refused).then_some(stripped)
@@ -172,12 +172,18 @@ pub fn strip_from_model_text(text: &str, cfg: &Value) -> String {
     strip_model_text(text, cfg).0
 }
 
+/// The most rounds of the model-text strip. A round applies every entry once, so an input nested deeper than the
+/// rounds (`鲸鲸鲸鱼鱼鱼` under the entry `鲸鱼` needs one round per level) costs a bounded amount, however long it is.
+const MODEL_STRIP_ROUNDS: usize = 4;
+
 /// The one model-text strip, used by every delivery site and by the checked reads of the prompt texts. Each entry of
 /// `stripFromModelText` is removed from the text outside atoms, the entries in order, and the round repeats until it
-/// removes nothing more, so a removal that joins a new match is not left behind. An entry whose removal would give the
-/// text a denied term (`settings::denied_in_text`) that the input did not hold is not applied: the text stays as it
-/// was for that entry. So the result never holds a denied term the input lacked, and stripping the result again
-/// changes nothing. The flag is whether an entry that still matches the result was refused.
+/// removes nothing more, at most `MODEL_STRIP_ROUNDS` times. An entry whose removal would give the text a denied term
+/// (`settings::denied_in_text`) that the input did not hold is not applied: the text stays as it was for that entry
+/// (the whole round is checked once first, and only a round that fails is taken entry by entry). So the result never
+/// holds a denied term the input lacked, and stripping a result that settled again changes nothing. The flag is true
+/// when an entry that still matches the result was refused, or when the text still changed in the last allowed round
+/// (the plain strip then returns that round's result, which holds no new denied term).
 fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
     let Some(items) = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array) else {
         return (text.to_string(), false);
@@ -202,27 +208,38 @@ fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
         out
     };
     let mut held: Option<Vec<String>> = None;
+    let mut allowed = |candidate: &str| {
+        let held = held.get_or_insert_with(|| crate::settings::denied_in_text(text));
+        crate::settings::denied_in_text(candidate).iter().all(|term| held.contains(term))
+    };
     let mut current = text.to_string();
-    loop {
+    for _ in 0..MODEL_STRIP_ROUNDS {
+        let whole = strips.iter().fold(current.clone(), |out, item| remove(&out, item));
+        if whole == current {
+            return (current, false);
+        }
+        if allowed(&whole) {
+            current = whole;
+            continue;
+        }
         let (mut changed, mut refused) = (false, false);
         for item in &strips {
             let next = remove(&current, item);
             if next == current {
                 continue;
             }
-            let held = held.get_or_insert_with(|| crate::settings::denied_in_text(text));
-            if crate::settings::denied_in_text(&next).iter().all(|term| held.contains(term)) {
+            if allowed(&next) {
                 current = next;
                 changed = true;
             } else {
                 refused = true;
             }
         }
-        // Each applied entry shortens the text, so the rounds end.
         if !changed {
             return (current, refused);
         }
     }
+    (current, true)
 }
 
 /// Keep JSON keys, cursors, tokens and media references intact; filter chat-bearing values.
@@ -546,6 +563,20 @@ mod tests {
         assert_eq!(strip_checked("a鲸鲸鱼鱼b", &delivery), Some("ab".to_string()));
         // A term the text already held is not the strip's doing.
         assert_eq!(strip_checked("DSH 鲸鱼x", &delivery), Some("DSH x".to_string()));
+    }
+
+    #[test]
+    fn prompt_text_model_strip_stops_after_its_rounds_on_a_deeply_nested_input() {
+        let delivery = strip_cfg(&["鲸鱼"]);
+        // One level goes per round: 2500 levels take the four rounds there are, not 2500 of them.
+        let nested = format!("{}{}", "鲸".repeat(2500), "鱼".repeat(2500));
+        let expected = format!("{}{}", "鲸".repeat(2500 - MODEL_STRIP_ROUNDS), "鱼".repeat(2500 - MODEL_STRIP_ROUNDS));
+        assert_eq!(strip_from_model_text(&nested, &delivery), expected);
+        assert_eq!(strip_checked(&nested, &delivery), None, "a text that did not settle is refused to a checked read");
+        // The depth the rounds settle: the last allowed round finds nothing more.
+        assert_eq!(strip_checked("a鲸鲸鲸鱼鱼鱼b", &delivery), Some("ab".to_string()));
+        assert_eq!(strip_from_model_text("a鲸鲸鲸鲸鱼鱼鱼鱼b", &delivery), "ab");
+        assert_eq!(strip_checked("a鲸鲸鲸鲸鱼鱼鱼鱼b", &delivery), None);
     }
 
     fn delivery_fixture(name: &str, strip: &[&str]) -> (std::path::PathBuf, crate::runtime::RuntimeContext, Value) {
