@@ -2291,7 +2291,12 @@ fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     )
     .unwrap();
     drop(conn);
-    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the default after a removal");
+    // The search ends, and the file's value applies when the registry accepts it: the file holds the last text a write
+    // stored (#176 writes the stored values back), so the second version still renders.
+    assert!(next_render(&context).contains("【别像客服】第二版 140\n\n"), "the file's value after a removal");
+    // A file with no prompt text leaves the default.
+    write_config(&root, |config| config["prompts"] = json!({}));
+    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the default after a removal, with nothing in the file");
     let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】第三版 140"));
     assert_eq!(status, 200, "{body}");
     assert!(next_render(&context).contains("【别像客服】第三版 140\n\n"), "a later save is in effect");
@@ -2543,11 +2548,20 @@ fn prompt_text_reset_stores_the_default_and_undo_restores_only_accepted_text() {
     let edited = "【别像客服】改过的 140";
     let (status, body) = set_text(&context, "prompt.notAClerk", json!(edited));
     assert_eq!(status, 200, "{body}");
+    // The file holds prompt text, so the first write seeded the store with it (revision 1, one migration row each);
+    // the save is revision 2 and the reset below revision 3.
+    let seeded: Vec<Value> = audit_rows(&root).into_iter().filter(|row| row["source"] == "migration").collect();
+    for (key, text) in [("prompt.notAClerk", "【别像客服】文件里的版本 140"), ("prompt.mode.chat", "文件里的模式说明 140")] {
+        assert!(
+            seeded.iter().any(|row| row["key"] == key && row["new"] == json!(json!(text).to_string())),
+            "{key} was not seeded from the file: {seeded:?}"
+        );
+    }
     let (status, body) = post(&context, "/api/settings/reset", json!({"setting": "prompt.notAClerk"}));
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({"ok": true, "setting": "prompt.notAClerk", "value": crate::prompt_text::NOT_A_CLERK, "revision": 2, "changed": true})
+        json!({"ok": true, "setting": "prompt.notAClerk", "value": crate::prompt_text::NOT_A_CLERK, "revision": 3, "changed": true})
     );
     assert!(next_render(&context).contains("【别像客服】你不是客服："), "the default wins over the file's value");
     assert_eq!(setting_view(&context, "prompt.notAClerk")["stored"], crate::prompt_text::NOT_A_CLERK);
@@ -2584,7 +2598,7 @@ fn prompt_text_reset_stores_the_default_and_undo_restores_only_accepted_text() {
     assert_eq!(status, 200, "{body}");
     let (status, body) = post(&context, "/api/settings/reset", json!({"setting": "prompt.mode.chat"}));
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body, json!({"ok": true, "setting": "prompt.mode.chat", "value": "", "revision": 2, "changed": true}));
+    assert_eq!(body, json!({"ok": true, "setting": "prompt.mode.chat", "value": "", "revision": 3, "changed": true}));
     let view = setting_view(&context, "prompt.mode.chat");
     assert_eq!((view["stored"].clone(), view["value"].clone()), (json!(""), json!("")));
     assert_eq!(mode(&context), "", "the stored empty default wins over the file's mode prompt");
