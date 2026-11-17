@@ -79,7 +79,6 @@ pub(crate) fn chain_signature(chain: &[RouteSpec]) -> String {
 /// whole list, and the turn fails as not configured: it never falls back to `harness.model`. A refusal names the
 /// route's position and field, never a configured value. Unknown route fields are ignored.
 pub(crate) fn chain(cfg: &Value) -> Result<Vec<RouteSpec>, String> {
-    unimplemented!("#7 red");
     match cfg.pointer("/harness/routes") {
         None | Some(Value::Null) => {
             let model = crate::settings::HARNESS_MODEL.text(cfg).ok_or(MODEL_NOT_CONFIGURED)?;
@@ -205,7 +204,6 @@ pub(crate) enum Next {
 /// timeout or a network failure after a validated dispatch ends the turn (a request after a possible tool effect is
 /// never resent), and nothing moves to another route once a send succeeded.
 pub(crate) fn decide(miss: &Miss, situation: &Situation) -> Next {
-    unimplemented!("#7 red");
     if !situation.steps_left {
         return Next::Fail;
     }
@@ -241,7 +239,6 @@ pub(crate) fn decide(miss: &Miss, situation: &Situation) -> Next {
 /// The wait a failed response asks for: `retry-after-ms` in milliseconds, else `retry-after` in whole seconds. An HTTP
 /// date or any other form is no hint.
 pub(crate) fn retry_after(milliseconds: Option<&str>, seconds: Option<&str>) -> Option<Duration> {
-    unimplemented!("#7 red");
     if let Some(wait) = milliseconds.and_then(|value| value.trim().parse::<u64>().ok()) {
         return Some(Duration::from_millis(wait));
     }
@@ -290,7 +287,6 @@ impl RouteMemory {
     /// The route a turn starts on: the conversation's sticky degraded route (clamped to the chain), else the first. An
     /// entry that no longer counts is forgotten.
     pub(crate) fn start(&mut self, key: &ChainKey, len: usize, now: Instant) -> usize {
-    unimplemented!("#7 red");
         match self.current(key, now).map(|entry| entry.route) {
             Some(route) => route.min(len.saturating_sub(1)),
             None => {
@@ -302,14 +298,12 @@ impl RouteMemory {
 
     /// Whether the conversation may fail over once more (`RETRY_CAP`).
     pub(crate) fn can_fail_over(&self, key: &ChainKey, now: Instant) -> bool {
-    unimplemented!("#7 red");
         self.current(key, now).map_or(0, |entry| entry.failovers) < RETRY_CAP
     }
 
     /// The conversation failed over to route `next`: one more failover spent, and `next` is where its turns start.
     /// Entries that no longer count are dropped first.
     pub(crate) fn on_failover(&mut self, key: &ChainKey, next: usize, now: Instant) {
-    unimplemented!("#7 red");
         let failovers = self.current(key, now).map_or(0, |entry| entry.failovers) + 1;
         self.entries
             .retain(|_, entry| now.saturating_duration_since(entry.since) < STICKY_FOR);
@@ -327,7 +321,6 @@ impl RouteMemory {
 
     /// A turn of the conversation completed: its failover budget starts over and its sticky route stays.
     pub(crate) fn on_completed(&mut self, key: &ChainKey) {
-    unimplemented!("#7 red");
         let same = self
             .entries
             .get(&key.conversation)
