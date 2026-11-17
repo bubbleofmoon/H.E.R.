@@ -1022,23 +1022,25 @@ async fn model_step(
         .map_err(model_error)?;
     let mut end = None;
     while let Some(event) = response.stream.next().await {
-        if refused.load(Ordering::SeqCst) {
-            return Err(
-                crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL")
-                    .summary()
-                    .into(),
-            );
-        }
-        if let ChatStreamEvent::End(value) = event.map_err(model_error)? {
-            end = Some(value);
+        match event {
+            Ok(ChatStreamEvent::End(value)) => end = Some(value),
+            Ok(_) => {}
+            // A refusal already seen is the answer's failure, whatever the stream does after it.
+            Err(_) if refused.load(Ordering::SeqCst) => break,
+            Err(error) => return Err(model_error(error)),
         }
     }
     if refused.load(Ordering::SeqCst) {
-        return Err(
-            crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL")
-                .summary()
-                .into(),
-        );
+        let reason = crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL").summary();
+        // A refused answer that reached its end is charged its usage before the miss is decided (`Stopped`); a stream
+        // that ended without its end has no usage to charge.
+        return Err(match end {
+            Some(end) => ModelFailure::Stopped {
+                reason,
+                end: Box::new(end),
+            },
+            None => reason.into(),
+        });
     }
     let end = end.ok_or_else(|| {
         ModelFailure::Dropped(
