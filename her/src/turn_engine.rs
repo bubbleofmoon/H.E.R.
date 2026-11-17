@@ -45,8 +45,7 @@ impl Engine {
 
     /// Its turns need DSH: the outage queue, the login, a session mapping and DSH presets.
     pub fn uses_dsh(self) -> bool {
-        let _ = self;
-        true // red scaffold (#62 run 1)
+        matches!(self, Self::Dsh)
     }
 }
 
@@ -135,17 +134,46 @@ impl Facts {
         turn_ms: i64,
         total_ms: i64,
     ) -> Self {
-        // red scaffold (#62 run 1)
-        let _ = (status, invalidated, attempt, model, prompt_chars, turn_ms, total_ms);
-        Self::default()
+        use crate::harness::Status;
+        let (end_kind, cancel_reason) = match status {
+            Status::Completed(_) => (Some("completed"), None),
+            Status::Cancelled if invalidated => (Some("cancelled"), Some("turnInvalidated")),
+            Status::Cancelled => (Some("cancelled"), Some("harnessCancelled")),
+            Status::Failed(reason) if reason == crate::harness::DEADLINE_EXCEEDED => {
+                (None, Some("harnessDeadline"))
+            }
+            Status::Failed(_) => (Some("error"), None),
+            Status::Running | Status::Paused { .. } => (None, None),
+        };
+        Self {
+            ok: matches!(status, Status::Completed(_)),
+            end_kind: end_kind.map(str::to_string),
+            cancel_reason,
+            attempt,
+            model: Some(model),
+            attempts: 1,
+            prompt_chars,
+            segments: Vec::new(),
+            turn_ms,
+            total_ms,
+        }
     }
 
     /// The `logs/turn-timing.jsonl` record of these facts. `turn` is the bridge turn id (none
     /// without a ledger turn). Field order is the record's: segments sit before `turnMs`.
     pub(crate) fn timing_record(&self, key: &str, turn: Option<&str>, ts: i64) -> Value {
-        // red scaffold (#62 run 1)
-        let _ = (key, turn, ts);
-        Value::Null
+        let mut record = serde_json::json!({
+            "ts": ts, "key": key, "ok": self.ok, "endKind": self.end_kind,
+            "cancelled": self.cancel_reason.is_some(), "cancelReason": self.cancel_reason,
+            "turnId": turn, "attemptRpcId": self.attempt, "model": self.model,
+            "attempts": self.attempts, "promptChars": self.prompt_chars,
+        });
+        for (name, ms) in &self.segments {
+            record[*name] = serde_json::json!(ms);
+        }
+        record["turnMs"] = serde_json::json!(self.turn_ms);
+        record["totalMs"] = serde_json::json!(self.total_ms);
+        record
     }
 }
 

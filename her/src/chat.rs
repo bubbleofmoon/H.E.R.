@@ -1136,7 +1136,7 @@ async fn worker(
     loop {
         let job = if !waiting.is_empty() {
             let needs_dsh = context.load_config().map(|cfg|
-                matches!(crate::harness::Engine::selected(&cfg, &key), Ok(crate::harness::Engine::Dsh))
+                crate::turn_engine::Engine::selected(&cfg, &key).is_ok_and(|engine| engine.uses_dsh())
             ).unwrap_or(true);
             if is_down(&context) && needs_dsh {
                 // Still down: keep receiving (bounded) and look again shortly; nothing is sent to DSH.
@@ -1174,7 +1174,7 @@ async fn worker(
             let _ = journal.mark_handled(job.inbound, now_ms()).await;
             continue;
         }
-        let needs_dsh = matches!(crate::harness::Engine::selected(&cfg, &key), Ok(crate::harness::Engine::Dsh));
+        let needs_dsh = crate::turn_engine::Engine::selected(&cfg, &key).is_ok_and(|engine| engine.uses_dsh());
         if is_down(&context) && needs_dsh {
             // Known down: hold it without a call (a storm of doomed requests is what the queue is for).
             println!("[chat] {key} DSH 不可用，消息排队等待恢复");
