@@ -436,7 +436,7 @@ fn scan(text: &str, label: &str, owned: Option<(usize, usize)>, problems: &mut B
             let named = text
                 .split('\n')
                 .enumerate()
-                .filter(|(line, raw)| outside(*line) && !raw.trim_start().starts_with('#') && names(raw, package))
+                .filter(|(line, raw)| outside(*line) && !sep_trim_start(raw).starts_with('#') && names(raw, package))
                 .count();
             let read = found.iter().filter(|item| is_package(&item.name, package)).count();
             if named != read {
@@ -539,6 +539,20 @@ struct Item {
     plugins: Option<(usize, usize)>,
 }
 
+/// YAML separation whitespace only: spaces and tabs. Any other Unicode whitespace (U+00A0, U+3000 and the rest) is
+/// scalar content, as DSH's loader reads it.
+fn sep_trim(text: &str) -> &str {
+    text.trim_matches(|c: char| c == ' ' || c == '\t')
+}
+
+fn sep_trim_start(text: &str) -> &str {
+    text.trim_start_matches(|c: char| c == ' ' || c == '\t')
+}
+
+fn sep_trim_end(text: &str) -> &str {
+    text.trim_end_matches(|c: char| c == ' ' || c == '\t')
+}
+
 /// A line break the YAML loader takes but this reader would not: a carriage return that is not followed by a line
 /// feed, or U+0085, U+2028 or U+2029. Text holding one is refused before any line is read.
 fn bare_line_break(text: &str) -> bool {
@@ -569,7 +583,7 @@ fn entries(text: &str) -> Result<Vec<Entry>, &'static str> {
             }
             let probe = format!(" {content}");
             if let Some(end) = quote_end(&probe, quote) {
-                let rest = probe[end + 1..].trim_start();
+                let rest = sep_trim_start(&probe[end + 1..]);
                 if !rest.is_empty() && !rest.starts_with('#') {
                     return Err("text after a quoted scalar");
                 }
@@ -650,12 +664,12 @@ fn plain_key(content: &str) -> Option<(String, &str)> {
 /// plain scalar that starts with no indicator and holds no `: ` (its trailing comment is dropped). Every other form
 /// (tags, anchors, aliases, flow collections, escapes) is refused.
 fn plain_or_quoted(raw: &str) -> Result<String, &'static str> {
-    let value = raw.trim();
+    let value = sep_trim(raw);
     let Some(first) = value.chars().next() else { return Ok(String::new()) };
     match first {
         '#' => Ok(String::new()),
         '|' | '>' => {
-            let header = value.split(" #").next().unwrap_or("").trim_end();
+            let header = sep_trim_end(value.split(" #").next().unwrap_or(""));
             if header[1..].chars().all(|c| c == '-' || c == '+' || c.is_ascii_digit()) {
                 Ok(value.to_string())
             } else {
@@ -667,7 +681,7 @@ fn plain_or_quoted(raw: &str) -> Result<String, &'static str> {
                 return Err("escape in a double-quoted scalar");
             }
             if let Some(end) = quote_end(value, first) {
-                let rest = value[end + 1..].trim_start();
+                let rest = sep_trim_start(&value[end + 1..]);
                 if !rest.is_empty() && !rest.starts_with('#') {
                     return Err("text after a quoted scalar");
                 }
@@ -676,7 +690,7 @@ fn plain_or_quoted(raw: &str) -> Result<String, &'static str> {
         }
         _ if value == "{}" || value == "[]" => Ok(value.to_string()),
         _ => {
-            let plain = value.find(" #").map_or(value, |at| value[..at].trim_end());
+            let plain = value.find(" #").map_or(value, |at| sep_trim_end(&value[..at]));
             if "!&*?|>%@`{}[],:".contains(first)
                 || (first == '-' && (plain == "-" || plain.starts_with("- ")))
                 || plain.contains(": ")
@@ -708,14 +722,14 @@ fn quote_end(value: &str, quote: char) -> Option<usize> {
 
 /// A plain or quoted scalar without its quotes (`''` read as `'`) or a trailing comment.
 fn unquote(value: &str) -> String {
-    let value = value.trim();
+    let value = sep_trim(value);
     if let Some(quote) = value.chars().next().filter(|c| *c == '\'' || *c == '"') {
         let end = quote_end(value, quote).unwrap_or(value.len());
         let inner = &value[1..end];
         return if quote == '\'' { inner.replace("''", "'") } else { inner.to_string() };
     }
     match value.find(" #") {
-        Some(at) => value[..at].trim_end().to_string(),
+        Some(at) => sep_trim_end(&value[..at]).to_string(),
         None => value.to_string(),
     }
 }
