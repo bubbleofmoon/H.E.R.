@@ -904,6 +904,14 @@ fn create_snapshot(
         )?;
         databases.push("conversations.db");
     }
+    // The settings store is optional too. One that cannot be read safely fails the backup, as a damaged conversation
+    // database does, so no archive silently lacks it.
+    if let Some(db) =
+        crate::settings::backup_source(context).map_err(|error| format!("settings backup: {error}"))?
+    {
+        online_snapshot(db, &scratch.0.join("settings.db"), "settings", check)?;
+        databases.push("settings.db");
+    }
     let candidate = scratch.0.join("archive.zip");
     let mut archive = ZipWriter::new(File::create(&candidate).map_err(|e| e.to_string())?);
     let mut manifest = Manifest {
@@ -1117,7 +1125,7 @@ fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
         if file.size() != expected.size {
             return Err(format!("backup size mismatch: {name}"));
         }
-        let mut db = if matches!(name.as_str(), "memory.db" | "conversations.db") {
+        let mut db = if matches!(name.as_str(), "memory.db" | "conversations.db" | "settings.db") {
             Some(File::create(scratch.0.join(&name)).map_err(|e| e.to_string())?)
         } else {
             None
@@ -1146,7 +1154,7 @@ fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
     if seen.len() != manifest.files.len() + 1 {
         return Err("backup files missing from ZIP".into());
     }
-    for name in ["memory.db", "conversations.db"] {
+    for name in ["memory.db", "conversations.db", "settings.db"] {
         if !manifest.files.contains_key(name) {
             continue;
         }

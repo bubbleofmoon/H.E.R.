@@ -6,7 +6,8 @@
 //! audit row each, under the store gate (`write_store`), for the console routes and for the owner's chat settings tools
 //! (`chat_setting`, `console::settings_action`); `history` lists the audit rows. A legacy (no-root) context has no store.
 //! The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
-//! `integer`, `text`) on the loader's document, never with a default of its own.
+//! `integer`, `text`) on the loader's document, never with a default of its own. Backups copy the store through
+//! `backup_source`; a restore names it through `store_path`.
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
@@ -332,6 +333,69 @@ fn check_paths(context: &RuntimeContext, intent: PathIntent) -> Result<std::path
     context.resolve_path(RuntimeArea::Data, DB, intent).map_err(|_| STORAGE_ERROR.to_string())
 }
 
+/// The store's path for a restore's file set: the store and its sidecars pass the runtime's containment checks (no
+/// link; a plain file or missing), and so does the gate file, whether or not the store exists. A missing store is a
+/// path that does not exist.
+pub(crate) fn store_path(context: &RuntimeContext) -> Result<std::path::PathBuf, String> {
+    let path = check_paths(context, PathIntent::ReadOptionalFile)?;
+    check_gate_file(context)?;
+    Ok(path)
+}
+
+/// The store gate for a restore, taken with the same wait as a settings write. A writer that holds it makes the restore
+/// wait and then refuse; the gate is held until the returned file is dropped.
+pub(crate) fn restore_gate(context: &RuntimeContext) -> Result<std::fs::File, String> {
+    store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)
+}
+
+/// A read-only connection to the store for the backup's online snapshot, `None` when there is no store (or no
+/// selected runtime). The store and its sidecars pass the same checks as every other open (contained, and a plain
+/// file with one link or missing), and the connection never checkpoints on close, so a backup never changes the
+/// store. The schema is not checked: a store from a newer release is copied as it is. A store SQLite cannot read (a
+/// leftover journal, a file that is not a database) fails the snapshot.
+///
+/// A writer's last connection removes the WAL and its index when it closes, and the next writer creates them again,
+/// so a sidecar check can meet one halfway (on Windows a removed file refuses every open until its last handle
+/// closes). The sidecar checks are tried again until `WAL_SWITCH_WAIT`; the database's own checks are not, so a
+/// redirected or hard-linked store fails at once. Once this connection is open no writer is the last connection, so
+/// the sidecars stay for the snapshot.
+pub(crate) fn backup_source(context: &RuntimeContext) -> Result<Option<Connection>, String> {
+    if !context.is_isolated() {
+        return Ok(None);
+    }
+    check_gate_file(context)?;
+    let path = context
+        .resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    if file_len(&path)?.is_none() {
+        return Ok(None);
+    }
+    refuse_hard_links(&path)?;
+    let deadline = std::time::Instant::now() + WAL_SWITCH_WAIT;
+    while let Err(error) = check_sidecars(context) {
+        if std::time::Instant::now() >= deadline {
+            return Err(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
+    Ok(Some(conn))
+}
+
+/// The store's `-wal`, `-shm` and `-journal`: contained, and each a plain file with one link or missing.
+fn check_sidecars(context: &RuntimeContext) -> Result<(), String> {
+    for name in SIDECARS {
+        let sidecar = context
+            .resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)
+            .map_err(|_| STORAGE_ERROR.to_string())?;
+        file_len(&sidecar)?;
+        refuse_hard_links(&sidecar)?;
+    }
+    Ok(())
+}
+
 fn schema_version(conn: &Connection) -> Result<i64, String> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0)).map_err(|_| STORAGE_ERROR.to_string())
 }
@@ -416,15 +480,21 @@ fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
     Ok(u64::from(information.nNumberOfLinks))
 }
 
-/// Takes the store gate, waiting until `deadline`. The gate file is opened read-write and locked, so it must be a
-/// plain file with one link before it is opened, and still have one once it is open; a second name for another file
-/// is refused. `Gate::Create`'s other callers keep their own checks.
-fn store_gate(context: &RuntimeContext, deadline: std::time::Instant) -> Result<std::fs::File, String> {
+/// The gate file (`locks/settings-store.lock`) must be a plain file with one link or missing, whether or not the store
+/// exists: a second name for another file would otherwise pass the store's checks and keep an invalid gate.
+fn check_gate_file(context: &RuntimeContext) -> Result<(), String> {
     let path = context
         .resolve_path(RuntimeArea::Data, STORE_GATE, PathIntent::ReadOptionalFile)
         .map_err(|_| STORAGE_ERROR.to_string())?;
     file_len(&path)?;
-    refuse_hard_links(&path)?;
+    refuse_hard_links(&path)
+}
+
+/// Takes the store gate, waiting until `deadline`. The gate file is opened read-write and locked, so it must be a
+/// plain file with one link before it is opened, and still have one once it is open; a second name for another file
+/// is refused. `Gate::Create`'s other callers keep their own checks.
+fn store_gate(context: &RuntimeContext, deadline: std::time::Instant) -> Result<std::fs::File, String> {
+    check_gate_file(context)?;
     loop {
         match context.open_locked_file(RuntimeArea::Data, STORE_GATE) {
             Ok(gate) if file_link_count(&gate).is_ok_and(|links| links == 1) => return Ok(gate),
