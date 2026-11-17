@@ -165,23 +165,17 @@ enum Inspection {
     Missing,
     /// No schema yet: an empty file, or version 0 without any schema object.
     Fresh,
-    /// A rollback journal lies beside the store and a recovered copy of both is usable (writers only); the writer
-    /// recovers the store itself under the store gate.
-    Journal,
     /// Version 1 with exactly this release's schema, open read-only and with no checkpoint on close.
     Ready(Connection),
 }
 
-/// The store gate, a file under `data/`: it serializes the WAL switch of a new store and the recovery of a journal.
+/// The store gate, a file under `data/`: it serializes the WAL switch of a new store.
 const STORE_GATE: &str = "locks/settings-store.lock";
 
-/// The copy a journal inspection recovers, with its sidecars, under `data/` and only while the store gate is held.
-const INSPECT_COPY: [&str; 4] =
-    ["settings-inspect.db", "settings-inspect.db-journal", "settings-inspect.db-wal", "settings-inspect.db-shm"];
-
-/// The largest store plus journal a journal inspection copies. Our own store has a journal only while a new store is
-/// switched to WAL, when both are a page or two.
-const JOURNAL_COPY_LIMIT: u64 = 16 * 1024 * 1024;
+/// The refusal for a rollback journal beside the store. Nothing recovers it: our store has a journal only while its
+/// schema is being created, so the owner removes both files.
+const LEFTOVER_JOURNAL_ERROR: &str =
+    "settings storage has a leftover journal; remove settings.db and settings.db-journal";
 
 /// How long a store whose WAL is present waits for its wal-index (`-shm`): SQLite removes the index just before the
 /// WAL when its last connection closes.
@@ -259,37 +253,6 @@ fn store_gate(context: &RuntimeContext, deadline: std::time::Instant) -> Result<
     }
 }
 
-/// Removes a file; a missing one is fine.
-fn remove_if_present(path: &std::path::Path) -> Result<(), String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(STORAGE_ERROR.to_string()),
-    }
-}
-
-/// Copies `from` into a new file `to`, which must not exist yet and is never followed if it is a link.
-fn copy_new(from: &std::path::Path, to: &std::path::Path) -> Result<(), String> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    crate::guarded_file::no_follow(&mut options);
-    let mut source = std::fs::File::open(from).map_err(|_| STORAGE_ERROR.to_string())?;
-    let mut target = options.open(to).map_err(|_| STORAGE_ERROR.to_string())?;
-    std::io::copy(&mut source, &mut target).map_err(|_| STORAGE_ERROR.to_string())?;
-    Ok(())
-}
-
-/// Removes the journal-inspection copy and its sidecars when dropped, on every path.
-struct RemoveOnDrop(Vec<std::path::PathBuf>);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
 /// Whitespace runs made one space, and no space next to `(`, `)`, `,` or `;`, so stored CREATE text compares equal
 /// whatever its layout.
 fn normalized_sql(sql: &str) -> String {
@@ -325,99 +288,55 @@ fn check_schema(conn: &Connection) -> Result<bool, String> {
     }
 }
 
-/// What the store will be once SQLite recovers its rollback journal. Under the store gate the store and its journal
-/// are copied into `INSPECT_COPY` and only the copy is recovered and checked, so the store and journal themselves keep
-/// every byte; the copy is removed on every path. `None` when the journal was gone once the gate was held.
-fn inspect_journal(
-    context: &RuntimeContext,
-    path: &std::path::Path,
-    journal: &std::path::Path,
-) -> Result<Option<Inspection>, String> {
-    let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?;
-    let (Some(len), Some(journal_len)) = (file_len(path)?, file_len(journal)?) else { return Ok(None) };
-    if journal_len == 0 {
-        return Ok(None);
-    }
-    refuse_hard_links(path)?;
-    refuse_hard_links(journal)?;
-    if len.saturating_add(journal_len) > JOURNAL_COPY_LIMIT {
-        return Err(STORAGE_ERROR.to_string());
-    }
-    let copies = INSPECT_COPY
-        .iter()
-        .map(|name| {
-            context.resolve_path(RuntimeArea::Data, name, PathIntent::WriteFile).map_err(|_| STORAGE_ERROR.to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for copy in &copies {
-        remove_if_present(copy)?;
-    }
-    let _cleanup = RemoveOnDrop(copies.clone());
-    copy_new(path, &copies[0])?;
-    copy_new(journal, &copies[1])?;
-    let conn = Connection::open_with_flags(&copies[0], OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
-    check_schema(&conn)?;
-    Ok(Some(Inspection::Journal))
+/// Looks at the store without opening it for writing. Every store file (the database, its `-wal`, `-shm` and `-journal`,
+/// and the store gate) must be a plain file with one link or missing, whether or not the database exists. A non-empty
+/// rollback journal is refused: nothing recovers it. A file that is not a SQLite database, a version other than 0 or 1
+/// (read from the file header while no WAL holds later commits), a version 0 with any schema object and a version 1
+/// whose schema is not exactly this release's are refused too. Otherwise a read-only connection that never checkpoints
+/// on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt meanwhile.
+fn inspect(context: &RuntimeContext) -> Result<Inspection, String> {
+    inspect_store(context, true)
 }
 
-/// Looks at the store without opening it for writing. Every store file (the database, its `-wal`, `-shm` and
-/// `-journal`, and the store gate) must be a plain file with one link or missing, whether or not the database exists.
-/// It refuses a file that is not a SQLite database, a version other than 0 or 1, a version 0 with any schema object
-/// and a version 1 whose schema is not exactly this release's. While no WAL holds later commits the version comes from
-/// the file header; otherwise a read-only connection that never checkpoints reads it. Only SQLite's shared-memory index
-/// (`-shm`) may be rebuilt meanwhile. A journal is refused for readers; for a writer, a copy is recovered and checked
-/// (`inspect_journal`).
-fn inspect(context: &RuntimeContext, writer: bool) -> Result<Inspection, String> {
-    inspect_store(context, writer, true)
-}
-
-fn inspect_store(context: &RuntimeContext, writer: bool, again: bool) -> Result<Inspection, String> {
+fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, String> {
     let resolve = |name: &str| {
         context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR.to_string())
     };
     let path = resolve(DB)?;
-    let (wal, shm, journal, gate) = (resolve(SIDECARS[0])?, resolve(SIDECARS[1])?, resolve(SIDECARS[2])?, resolve(STORE_GATE)?);
+    let (wal, shm, journal, gate) =
+        (resolve(SIDECARS[0])?, resolve(SIDECARS[1])?, resolve(SIDECARS[2])?, resolve(STORE_GATE)?);
     // SQLite opens, truncates or removes the sidecars even when it creates the database.
     for file in [&path, &wal, &shm, &journal, &gate] {
         file_len(file)?;
         refuse_hard_links(file)?;
     }
-    let Some(len) = file_len(&path)? else { return Ok(Inspection::Missing) };
+    let journal_len = file_len(&journal)?.unwrap_or(0);
     let wal_len = file_len(&wal)?.unwrap_or(0);
-    if file_len(&journal)?.is_some_and(|len| len > 0) {
-        if !writer {
-            return Err(STORAGE_ERROR.to_string());
-        }
-        return match inspect_journal(context, &path, &journal)? {
-            Some(inspection) => Ok(inspection),
-            None if again => inspect_store(context, writer, false),
-            None => Err(STORAGE_ERROR.to_string()),
+    let Some(len) = file_len(&path)? else {
+        return if journal_len > 0 { Err(LEFTOVER_JOURNAL_ERROR.to_string()) } else { Ok(Inspection::Missing) };
+    };
+    let header = if len == 0 { None } else { Some(header_version(&path)?) };
+    if journal_len > 0 {
+        return match header {
+            // A newer release's store is refused as newer, whatever else is beside it.
+            Some(version) if wal_len == 0 && version != 0 && version != SCHEMA_VERSION => Err(refuse_version(version)),
+            _ => Err(LEFTOVER_JOURNAL_ERROR.to_string()),
         };
     }
     if len == 0 {
         return if wal_len == 0 { Ok(Inspection::Fresh) } else { Err(STORAGE_ERROR.to_string()) };
     }
-    let mut header = [0u8; 100];
-    std::fs::File::open(&path)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
-        .map_err(|_| STORAGE_ERROR.to_string())?;
-    if &header[..16] != b"SQLite format 3\0" {
-        return Err(STORAGE_ERROR.to_string());
-    }
-    let header_version = i64::from(i32::from_be_bytes([header[60], header[61], header[62], header[63]]));
     if wal_len == 0 {
-        if header_version != 0 && header_version != SCHEMA_VERSION {
-            return Err(refuse_version(header_version));
+        // The header is current while no WAL holds later commits.
+        if let Some(version) = header.filter(|version| *version != 0 && *version != SCHEMA_VERSION) {
+            return Err(refuse_version(version));
         }
     } else {
         // A read-only connection would create a missing index; wait for a closing connection to finish instead.
         let settled = std::time::Instant::now() + SIDECAR_SETTLE;
         while file_len(&shm)?.is_none() {
             if file_len(&wal)?.is_none() {
-                return if again { inspect_store(context, writer, false) } else { Err(STORAGE_ERROR.to_string()) };
+                return if again { inspect_store(context, false) } else { Err(STORAGE_ERROR.to_string()) };
             }
             if std::time::Instant::now() >= settled {
                 return Err(STORAGE_ERROR.to_string());
@@ -432,13 +351,24 @@ fn inspect_store(context: &RuntimeContext, writer: bool, again: bool) -> Result<
     if check_schema(&conn)? { Ok(Inspection::Ready(conn)) } else { Ok(Inspection::Fresh) }
 }
 
+/// The schema version in a SQLite file's header (bytes 60-63); a file without the SQLite magic is refused.
+fn header_version(path: &std::path::Path) -> Result<i64, String> {
+    let mut header = [0u8; 100];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header))
+        .map_err(|_| STORAGE_ERROR.to_string())?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(STORAGE_ERROR.to_string());
+    }
+    Ok(i64::from(i32::from_be_bytes([header[60], header[61], header[62], header[63]])))
+}
+
 /// The stored values of registry settings, read through the inspection's read-only connection. No store or no schema
-/// yet is an empty list; a store with a journal is unreadable until a writer recovers it. Rows with a key the
+/// yet is an empty list; a store with a journal is unreadable. Rows with a key the
 /// registry does not have, or a value its setting does not accept, are skipped.
 fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
-    let conn = match inspect(context, false)? {
+    let conn = match inspect(context)? {
         Inspection::Missing | Inspection::Fresh => return Ok(Vec::new()),
-        Inspection::Journal => return Err(STORAGE_ERROR.to_string()),
         Inspection::Ready(conn) => conn,
     };
     let mut statement = conn.prepare("SELECT key, value FROM settings").map_err(|_| STORAGE_ERROR.to_string())?;
@@ -567,11 +497,8 @@ fn has_settings_schema(conn: &Connection) -> bool {
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
 /// schema is newer than this release's (checked before anything is written).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
-    // Refuse what this release cannot use before any connection that can write opens the store. A journal is
-    // recovered by the open below, under the store gate, after its recovered copy passed the same checks.
-    let journal = matches!(inspect(context, true)?, Inspection::Journal);
-    let recovery_gate =
-        if journal { Some(store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT)?) } else { None };
+    // Refuse what this release cannot use before any connection that can write opens the store.
+    drop(inspect(context)?);
     let path = check_paths(context, PathIntent::WriteFile)?;
     let mut conn = Connection::open_with_flags(
         path,
@@ -583,7 +510,6 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     conn.execute_batch("PRAGMA busy_timeout=5000;").map_err(|_| STORAGE_ERROR.to_string())?;
     // The same checks again, for a store changed since the inspection.
     check_schema(&conn)?;
-    drop(recovery_gate);
     enable_wal(context, &conn)?;
     conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;

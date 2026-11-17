@@ -553,7 +553,7 @@ fn settings_store_refuses_a_newer_store_with_a_journal_and_leaves_both() {
 }
 
 #[test]
-fn settings_store_recovers_its_own_store_left_with_a_journal() {
+fn settings_store_refuses_its_own_store_left_with_a_journal() {
     // A leftover journal makes the store unusable: readers report it, and a writer is refused without recovering it,
     // so the store and its journal keep every byte.
     let (root, context) = settings_fixture("settings own journal");
@@ -639,7 +639,7 @@ fn settings_store_refuses_a_hard_linked_gate() {
 
 #[test]
 fn settings_store_refuses_a_malformed_store_with_a_journal_and_leaves_both() {
-    // A journal never lets a store skip the schema check: a recovered copy is checked, never the store itself.
+    // A leftover journal makes the store unusable, whatever its schema: nothing recovers it or copies it.
     let (root, context) = settings_fixture("settings malformed journal");
     let journal = root.0.join("data/settings.db-journal");
     let conn = rusqlite::Connection::open(settings_db(&root)).unwrap();
@@ -649,7 +649,7 @@ fn settings_store_refuses_a_malformed_store_with_a_journal_and_leaves_both() {
     let db_before = std::fs::read(settings_db(&root)).unwrap();
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 503, "{body}");
-    assert_eq!(body["error"], "settings storage is unavailable");
+    assert_eq!(body["error"], LEFTOVER_JOURNAL_ERROR);
     assert_eq!(std::fs::read(&journal).ok(), Some(vec![0xff_u8; 512]), "the journal is never rolled back or removed");
     assert_eq!(std::fs::read(settings_db(&root)).ok(), Some(db_before), "the database keeps every byte");
     for suffix in ["", "-journal", "-wal", "-shm"] {
