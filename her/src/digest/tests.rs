@@ -290,7 +290,7 @@ fn relay_model_answers_and_classifies_failures_without_provider_text() {
     let (root, context) = fixture(None, json!({"consoleToken":"digest-unit","harness":{"model":"digest-unit-model"},"memory":{"digest":{"timeoutSecs":1}}}), &url);
     std::fs::write(root.0.join("config/harness-api-key"), "digest-unit-key").unwrap();
     let cfg = context.load_config().unwrap();
-    let model = super::model::RelayModel::from_runtime(&context, &cfg).unwrap();
+    let model = super::model::relay_model(&context, &cfg).unwrap();
     assert_eq!(model.complete("system", "input"), Ok("[]".to_string()));
     assert_eq!(model.complete("system", "input"), Err(ModelError("quota")));
     assert_eq!(model.complete("system", "input"), Err(ModelError("backend")));
@@ -301,7 +301,7 @@ fn relay_model_answers_and_classifies_failures_without_provider_text() {
     assert!(seen[0].to_ascii_lowercase().contains("authorization: bearer digest-unit-key"));
     assert!(seen[0].contains("input"));
     let unconfigured = json!({"consoleToken":"digest-unit"});
-    assert!(matches!(super::model::RelayModel::from_runtime(&context, &unconfigured), Err(ModelError("unconfigured"))));
+    assert!(matches!(super::model::relay_model(&context, &unconfigured), Err(ModelError("unconfigured"))));
 }
 
 #[test]

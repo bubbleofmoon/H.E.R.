@@ -1,4 +1,5 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
+pub(crate) mod one_shot;
 pub(crate) mod profile;
 pub(crate) mod rotation;
 pub(crate) mod routes;

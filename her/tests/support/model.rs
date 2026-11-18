@@ -78,6 +78,8 @@ impl FakeModel {
                         });
                 lock(&auth).push(authenticated);
                 let body: Value = serde_json::from_slice(&req.body).unwrap();
+                // One-shot jobs (the digest, slang learning) ask for one non-streaming completion.
+                let streaming = body["stream"] == true;
                 let n = lock(&seen).len();
                 lock(&seen).push(body);
                 let Some(reply) = replies.get(n) else {
@@ -165,6 +167,16 @@ impl FakeModel {
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len());
                     continue;
                 }
+                if matches!(reply, ModelReply::Refusal) && !streaming {
+                    respond(
+                        &mut socket,
+                        200,
+                        &json!({"id":"refusal-one-shot","object":"chat.completion","created":1,"model":"fake-chat",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"content_filter"}],
+                            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+                    );
+                    continue;
+                }
                 if matches!(reply, ModelReply::Refusal | ModelReply::ErrorEvent) {
                     let chunk=if matches!(reply, ModelReply::ErrorEvent) { json!({"error":{"code":"SAFETY","message":"CHAT_SECRET"}}) } else { json!({"id":"refusal-81","object":"chat.completion.chunk","model":"fake-chat","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}) };
                     let sse=format!("data: {chunk}\n\ndata: [DONE]\n\n");
@@ -196,6 +208,16 @@ impl FakeModel {
                         continue;
                     }
                 };
+                if !streaming {
+                    respond(
+                        &mut socket,
+                        200,
+                        &json!({"id":"fake-one-shot","object":"chat.completion","created":1,"model":"fake-chat",
+                            "choices":[{"index":0,"message":{"role":"assistant","content":reply},"finish_reason":"stop"}],
+                            "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+                    );
+                    continue;
+                }
                 let mut sse = String::new();
                 // Multiple content chunks force the real provider streaming decoder to assemble text.
                 for text in reply.chars().map(|c| c.to_string()) {

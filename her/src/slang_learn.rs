@@ -3378,10 +3378,126 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         }
     }
 
-    /// A pinned learner backend that fails must not send the corpus to DSH unless the owner
-    /// configured `slang.learnerFallbackDsh`; a fake DSH endpoint records any contact.
+    /// A scripted first model route for the learner (`harness::one_shot`): reply `i` answers call `i`.
+    struct RouteFake {
+        replies: Mutex<std::collections::VecDeque<Result<&'static str, &'static str>>>,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::harness::one_shot::OneShot for RouteFake {
+        fn complete(&self, system: &str, input: &str) -> Result<String, crate::harness::one_shot::ModelError> {
+            self.calls.lock().unwrap().push((system.to_string(), input.to_string()));
+            let reply = self.replies.lock().unwrap().pop_front().unwrap_or(Err("backend"));
+            reply.map(str::to_string).map_err(crate::harness::one_shot::ModelError)
+        }
+    }
+
+    /// Installs a scripted first route for the learner on `context`'s runtime.
+    fn route_fake(context: &RuntimeContext, replies: Vec<Result<&'static str, &'static str>>) -> Arc<RouteFake> {
+        let fake = Arc::new(RouteFake { replies: Mutex::new(replies.into()), calls: Mutex::new(Vec::new()) });
+        crate::harness::one_shot::install_test_model(
+            context.runtime_root().expect("a selected fixture runtime"),
+            crate::harness::one_shot::Job::SlangLearner,
+            fake.clone(),
+        );
+        fake
+    }
+
+    /// A selected runtime whose learner uses the default route with a threshold of one message.
+    fn route_fixture(tag: &str) -> (std::path::PathBuf, RuntimeContext, Value) {
+        let (root, context) = runtime_fixture(tag);
+        let cfg = json!({"consoleToken":"fixture-token","slang":{"enabled":true,"extractMinMessages":1},"harness":{"model":"route-model"}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        (root, context, cfg)
+    }
+
     #[test]
-    fn a_failed_pinned_learner_backend_reaches_dsh_only_when_the_owner_allows_it() {
+    fn one_shot_learner_failures_change_nothing() {
+        let (root, context, cfg) = route_fixture("route-failure");
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        std::fs::write(
+            root.join("data/slang.json"),
+            br#"[{"id":"kept","content":"破防","status":"candidate","count":2,"lastInferenceCount":0}]"#,
+        )
+        .unwrap();
+        let read = |name: &str| std::fs::read(root.join("data").join(name)).unwrap();
+        let (windows, slang_store) = (read("slang-windows.json"), read("slang.json"));
+        let fake = route_fake(
+            &context,
+            vec![Err("quota"), Ok("   "), Ok("I cannot assist with that."), Ok("content_filter"), Err("timeout")],
+        );
+        for attempt in 1..=4 {
+            let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+            assert_eq!(result["ok"], false, "attempt {attempt}: {result}");
+            assert_eq!(read("slang-windows.json"), windows, "attempt {attempt} consumed the batch");
+            assert_eq!(read("slang.json"), slang_store, "attempt {attempt} changed the slang store");
+        }
+        assert!(
+            research_with_runtime(&context, &cfg, &["kept".to_string()], None).is_err(),
+            "a failed research turn is an error"
+        );
+        assert_eq!(read("slang.json"), slang_store, "a failed research turn changed the slang store");
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5, "every learner turn asks the first model route once, without a repair re-ask");
+        assert!(calls.iter().all(|(system, _)| system.is_empty()), "the learner sends its prompt alone: {calls:?}");
+        drop(calls);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_sends_its_prompt_alone_and_learns_once() {
+        let (root, context, cfg) = route_fixture("route-success");
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        let fake = route_fake(&context, vec![Ok(r#"[{"content":"破防","source_id":1}]"#)]);
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!((result["backend"].as_str(), result["added"].as_u64()), (Some("harness"), Some(1)), "{result}");
+        assert_eq!(remaining(&context, &state), 0, "the learned batch is consumed");
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one batch is one call");
+        assert!(calls[0].0.is_empty() && calls[0].1.contains("今天又破防了"), "{calls:?}");
+        drop(calls);
+        assert!(!root.join("data/slang-session.json").exists(), "the learner keeps no session");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_keeps_an_array_answer_that_mentions_refusal_words() {
+        let (root, context, cfg) = route_fixture("route-refusal-words");
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        route_fake(&context, vec![Ok(r#"[{"content":"content filter","source_id":2}]"#)]);
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        assert_eq!(result["ok"], true, "an answer with a JSON array is never a refusal: {result}");
+        assert_eq!(result["added"], 1, "{result}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_without_a_route_is_unconfigured_and_changes_nothing() {
+        let (root, context) = runtime_fixture("route-unconfigured");
+        let cfg = json!({"consoleToken":"fixture-token","slang":{"enabled":true,"extractMinMessages":1}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        let windows = std::fs::read(root.join("data/slang-windows.json")).unwrap();
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(
+            result["error"].as_str().is_some_and(|error| error.contains("harness: model/backend unconfigured")),
+            "{result}"
+        );
+        assert_eq!(std::fs::read(root.join("data/slang-windows.json")).unwrap(), windows, "an unconfigured route consumed the batch");
+        assert!(!root.join("data/slang.json").exists(), "an unconfigured route wrote the slang store");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pinned learner backend that fails must not send the corpus to the default route unless the owner configured
+    /// `slang.learnerFallbackDsh`; a listener standing in for the relay records any contact.
+    #[test]
+    fn one_shot_learner_fallback_reaches_the_route_only_when_the_owner_allows_it() {
         use std::net::TcpListener;
         let (root, context) = runtime_fixture("learner-fallback");
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3389,21 +3505,23 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let port = listener.local_addr().unwrap().port();
         std::fs::write(
             root.join("dependencies.json"),
-            json!({"dsh":format!("http://127.0.0.1:{port}"),"model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:2"}).to_string(),
+            json!({"dsh":"http://127.0.0.1:1","model":format!("http://127.0.0.1:{port}"),"onebot":"http://127.0.0.1:2"}).to_string(),
         )
         .unwrap();
+        std::fs::write(root.join("config/harness-api-key"), "learner-fallback-key").unwrap();
         let context = RuntimeContext::from_root(&root).unwrap_or(context);
-        let pinned = json!({"slang":{"learnerBackend":"missing-learner"}});
-        let error = ask_model(&context, &pinned, "group:fallback", "prompt", 5).unwrap_err();
+        let pinned = json!({"slang":{"learnerBackend":"missing-learner"},"harness":{"model":"route-model"}});
+        let error = ask_model(&context, &pinned, "group:fallback", "prompt", 1).unwrap_err();
         assert!(error.contains("missing-learner"), "the failing route is named: {error}");
-        assert!(!error.contains("dsh:"), "no silent cloud route: {error}");
+        assert!(!error.contains("harness:"), "no silent cloud route: {error}");
         assert!(
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-            "the corpus must not reach DSH"
+            "the corpus must not reach the model route"
         );
-        let allowed = json!({"slang":{"learnerBackend":"missing-learner","learnerFallbackDsh":true}});
-        let error = ask_model(&context, &allowed, "group:fallback", "prompt", 5).unwrap_err();
-        assert!(error.contains("missing-learner") && error.contains("dsh:"), "both routes are reported: {error}");
+        let allowed = json!({"slang":{"learnerBackend":"missing-learner","learnerFallbackDsh":true},"harness":{"model":"route-model"}});
+        let error = ask_model(&context, &allowed, "group:fallback", "prompt", 1).unwrap_err();
+        assert!(error.contains("missing-learner") && error.contains("harness:"), "both routes are reported: {error}");
+        assert!(listener.accept().is_ok(), "the allowed fallback asked the model route");
         std::fs::remove_dir_all(root).unwrap();
     }
 }
