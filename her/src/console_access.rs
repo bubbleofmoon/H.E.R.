@@ -286,7 +286,7 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         let mut changes = crate::settings::console_changes(context, &unchanged, &file)?;
         // An owner the request names as `null` or blank is the change to no owner, which `console_changes` skips as a
         // member the request does not carry: the owner setting stores `null` for it.
-        if false && context.is_isolated() && body.get("ownerQQ").is_some() && file["ownerQQ"].is_null() { // RED-M2
+        if context.is_isolated() && body.get("ownerQQ").is_some() && file["ownerQQ"].is_null() {
             let owner = crate::settings::find("ownerQQ").expect("the registry holds the owner");
             if !owner.read(&crate::settings::overlay(context, unchanged.clone())).is_null() {
                 changes.push((owner, Value::Null));
@@ -402,7 +402,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         // The ids the allow list setting reads (JS precedence `groups ?? group`, `private ?? privates`): a hand-edited
         // item that is no usable id is not in it, so a change of the list neither fails on it nor keeps it.
         let allow_list = crate::settings::find(&format!("allow.{field}")).expect("the registry holds the allow lists");
-        let mut listed = file["allow"][field].as_array().cloned().unwrap_or_default(); let _ = allow_list; // RED-M4
+        let mut listed = allow_list.read(&file).as_array().cloned().unwrap_or_default();
         let mut changed: Vec<String> = Vec::new();
         if admit != listed.iter().any(|value| listed_same(value)) {
             listed.retain(|value| !listed_same(value));
