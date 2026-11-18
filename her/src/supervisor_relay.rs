@@ -318,9 +318,20 @@ fn ancestors_checked(
 /// Checks one entry before its permissions change: outside any protected root, no redirected
 /// part, a regular file or directory, and on Unix owned by this account with one link.
 /// `Ok(None)` when a listed entry vanished: the OS reports the entry itself missing, also after a
-/// guard failed or an ancestor reported missing because the entry was removed meanwhile. Any other
+/// guard failed, an ancestor reported missing or the ownership check failed (Unix: the entry was
+/// unlinked as its metadata was read) because the entry was removed meanwhile. Any other
 /// read failure refuses. The version folder itself (`listed == false`) must exist.
 fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, String> {
+    inspect_with(path, listed, &|entry| std::fs::symlink_metadata(entry))
+}
+
+/// `inspect` reading metadata through `stat`, so a test can change the tree between the lookup of
+/// an entry and the read of its metadata.
+fn inspect_with(
+    path: &Path,
+    listed: bool,
+    stat: &dyn Fn(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<Option<std::fs::Metadata>, String> {
     if crate::install_root::check_runtime(path, false).is_err() {
         return if listed && gone(path) {
             Ok(None)
@@ -328,7 +339,7 @@ fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, Strin
             Err(named("relay path is protected", path))
         };
     }
-    let meta = match std::fs::symlink_metadata(path) {
+    let meta = match stat(path) {
         Ok(meta) => meta,
         Err(error) if listed && vanished(&error) => return Ok(None),
         Err(error) => {
@@ -343,7 +354,7 @@ fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, Strin
     if crate::guarded_file::is_link(&meta) {
         return Err("relay paths must not be redirected".into());
     }
-    if !ancestors_checked(path, listed, |ancestor| std::fs::symlink_metadata(ancestor))? {
+    if !ancestors_checked(path, listed, stat)? {
         return Ok(None);
     }
     if !meta.is_file() && !meta.is_dir() {
@@ -353,6 +364,12 @@ fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, Strin
     {
         use std::os::unix::fs::MetadataExt;
         if meta.uid() != unsafe { libc::geteuid() } || (meta.is_file() && meta.nlink() != 1) {
+            // The lookup can find an entry that is unlinked before its attributes are read: the
+            // metadata then comes from the unlinked inode with a link count of 0. That is a
+            // vanished entry, not a second link or another owner.
+            if listed && (meta.nlink() == 0 || gone(path)) {
+                return Ok(None);
+            }
             return Err("relay private files must belong only to the HER account".into());
         }
     }
@@ -1175,6 +1192,54 @@ mod unix_tests {
         });
         assert_eq!(skipped, Ok(1));
         assert_eq!(mode(&fixture.0.join("logs")), 0o700);
+    }
+
+    /// `stat` as the kernel can answer it while a sweeper races a deleter: the lookup found `entry`,
+    /// the entry is unlinked, and the attributes read afterwards come from the unlinked inode
+    /// (owner unchanged, link count 0).
+    fn unlinked_during_stat(
+        entry: &Path,
+    ) -> impl Fn(&Path) -> std::io::Result<std::fs::Metadata> + '_ {
+        let handle = std::fs::File::open(entry).unwrap();
+        move |path| {
+            if path == entry {
+                std::fs::remove_file(entry).unwrap();
+                handle.metadata()
+            } else {
+                std::fs::symlink_metadata(path)
+            }
+        }
+    }
+
+    #[test]
+    fn a_part_unlinked_while_its_metadata_is_read_is_skipped_not_refused_as_foreign() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let result = inspect_with(&path, true, &unlinked_during_stat(&path));
+        assert_eq!(result.map(|found| found.is_some()), Ok(false));
+    }
+
+    #[test]
+    fn an_unlisted_entry_unlinked_while_its_metadata_is_read_is_still_refused() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        let result = inspect_with(&path, false, &unlinked_during_stat(&path));
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err("relay private files must belong only to the HER account".to_string())
+        );
+    }
+
+    #[test]
+    fn a_part_with_a_second_link_is_refused_as_not_owned_alone() {
+        let fixture = Fixture::new();
+        let (path, _) = part(&fixture);
+        std::fs::hard_link(&path, fixture.0.join("alias")).unwrap();
+        let result = inspect(&path, true);
+        assert_eq!(
+            result.map(|found| found.is_some()),
+            Err("relay private files must belong only to the HER account".to_string())
+        );
     }
 
     #[test]
