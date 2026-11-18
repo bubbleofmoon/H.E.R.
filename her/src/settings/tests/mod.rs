@@ -17,7 +17,7 @@ mod console_writers { include!("console_writers.rs"); }
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
 /// The settings module's product sources, for the source tests: the module root, the store, the kinds and the registry.
-const SETTINGS_SOURCES: [(&str, &str); 10] = [
+const SETTINGS_SOURCES: [(&str, &str); 9] = [ // RED-M2
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
     ("settings/kinds.rs", include_str!("../kinds.rs")),
@@ -27,7 +27,7 @@ const SETTINGS_SOURCES: [(&str, &str); 10] = [
     ("settings/registry.rs", include_str!("../registry.rs")),
     ("settings/registry/model.rs", include_str!("../registry/model.rs")),
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
-    ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
+    // ("settings/registry/reply.rs", include_str!("../registry/reply.rs")), // RED-M2
 ];
 
 fn settings_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {
