@@ -335,8 +335,12 @@ async fn summarise_text(
         Ok(model) => model,
         Err(error) => return Ok(Err(error.0)),
     };
-    let input = transcript.to_string();
     let bound = deadline.checked_sub(SUMMARY_RESERVE).unwrap_or_else(tokio::time::Instant::now);
+    // A summary whose bound has already passed is not sent: no provider call is made or billed for it.
+    if tokio::time::Instant::now() >= bound {
+        return Ok(Err("timeout"));
+    }
+    let input = transcript.to_string();
     // A cancelled turn returns at once; the blocking request ends on its own bound, and an answer that comes after
     // the cancellation or the bound is dropped.
     let task = tokio::task::spawn_blocking(move || model.complete(SUMMARY_PROMPT, &input));
