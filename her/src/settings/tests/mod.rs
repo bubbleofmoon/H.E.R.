@@ -13,6 +13,7 @@ mod chat { include!("chat.rs"); }
 mod prompt_text { include!("prompt_text.rs"); }
 mod mirror { include!("mirror.rs"); }
 mod console_writers { include!("console_writers.rs"); }
+mod security { include!("security.rs"); }
 
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
