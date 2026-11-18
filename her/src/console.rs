@@ -369,6 +369,19 @@ fn raw_config_for_write(context: &RuntimeContext) -> Result<Value, (u16, String)
     Ok(value)
 }
 
+/// The selected `config.json` object as it is on disk, for the registry members a social page save keeps
+/// (`settings::keep_registry_values`): the object check of `raw_config_for_write`, without its canonical check.
+fn raw_config_object(context: &RuntimeContext) -> Result<Value, (u16, String)> {
+    let text = context
+        .read_text(RuntimeArea::Config, "config.json")
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
+    if !value.is_object() {
+        return Err((503, "runtime config is invalid".to_string()));
+    }
+    Ok(value)
+}
+
 /// Ticket 25 (SnowLuma token self-heal, JS `persistSnowLumaEndpoint`): write the confirmed access token and, when given,
 /// the endpoint into the selected `config.json`'s `snowluma` object. Only the fields that differ are written, nothing
 /// else changes, and the read-modify-write holds the social-state gate. Returns the names of the fields written.
@@ -6980,13 +6993,17 @@ fn handle_social_config_post(
     // above: validated before anything is written (400), stored and written back first (a store that cannot take it
     // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
     // save's own write puts every stored value into config.json (`write_selected_config_text`).
-    let settings_changes = crate::settings::console_changes(context, &file_before, &file)?;
+    let carried = json!({ "socialV2": body_v.clone() });
+    let settings_changes = crate::settings::console_changes(context, &file_before, &carried)?;
     if !settings_changes.is_empty() {
+        // The store's write-back refuses a file the runtime cannot load, after the commit: refuse it before the store
+        // takes a change. A save without a registry change never runs this check (as before #177).
+        raw_config_for_write(context)?;
         note_config_before_request(context);
     }
     crate::settings::apply_changes(context, settings_changes, "administrator", "console")?;
     if context.is_isolated() {
-        let current = raw_config_for_write(context)?;
+        let current = raw_config_object(context)?;
         crate::settings::keep_registry_values(&current, &mut file)
             .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
     }

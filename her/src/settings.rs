@@ -1615,17 +1615,18 @@ pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Res
     Ok(kept)
 }
 
-/// The registry settings a console configuration page's write changes (#177): each setting whose member in `next`, the
-/// document the page is about to write, is not `null`, differs from `base`'s (the stored `config.json` the page read
-/// under the configuration gate) and is not what the next use reads now (`base` with the stored values applied),
-/// paired with the value the store keeps. A value the registry refuses is 400 with its requirement, before anything is
-/// written. A member `next` lacks or holds as `null` is no change: a console page never removes a registry setting
-/// (the settings page's reset and undo do). A legacy context has none. The page stores the changes (`apply_changes`),
-/// then keeps the file's registry members in `next` (`keep_registry_values`) and writes it.
+/// The registry settings a console configuration page's save changes (#177): each setting whose member `carried`, the
+/// document of the members the request sends, holds (not `null`) and whose value differs from the value in effect
+/// (`base`, the stored `config.json` the page read under the configuration gate, with the stored values applied), paired
+/// with the value the store keeps. A value the registry refuses is 400 with its refusal, before anything is written,
+/// unless `base` holds that same value already (an old or hand-edited file's value passes through unchanged). A member
+/// the request omits or sends as `null` is no change: a console page never removes a registry setting (the settings
+/// page's reset and undo do), and a member it does not send keeps the file's value. A legacy context has none. The page
+/// stores the changes (`apply_changes`), then keeps the file's registry members (`keep_registry_values`) and writes it.
 pub(crate) fn console_changes(
     context: &RuntimeContext,
     base: &Value,
-    next: &Value,
+    carried: &Value,
 ) -> Result<Vec<(&'static Setting, Value)>, (u16, String)> {
     if !context.is_isolated() {
         return Ok(Vec::new());
@@ -1633,11 +1634,13 @@ pub(crate) fn console_changes(
     let now = overlay(context, base.clone());
     let mut changes = Vec::new();
     for setting in REGISTRY {
-        let Some(written) = next.pointer(setting.pointer).filter(|value| !value.is_null()) else { continue };
-        if base.pointer(setting.pointer) == Some(written) {
-            continue;
-        }
-        let value = setting.normalize(written).ok_or_else(|| (400, setting.refusal(written)))?;
+        let Some(posted) = carried.pointer(setting.pointer).filter(|value| !value.is_null()) else { continue };
+        let Some(value) = setting.normalize(posted) else {
+            if base.pointer(setting.pointer) == Some(posted) {
+                continue;
+            }
+            return Err((400, setting.refusal(posted)));
+        };
         if value != setting.read(&now) {
             changes.push((setting, value));
         }
