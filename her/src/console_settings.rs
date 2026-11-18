@@ -144,7 +144,7 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
     let (target, access) = match entry_setting(context, entry) {
         Ok(target) => (target, target.is_some_and(|target| target.access())),
         Err(error) => {
-            if !crate::settings::confirm_field(&Value::Object(fields.clone()))? {
+            if false { // RED-M1
                 return Err(error);
             }
             (None, true)

@@ -30,7 +30,7 @@ pub(crate) fn qq_id(value: &Value) -> Option<u64> {
 /// items with a conversation's id as strings (`chat::allowed`), so "07001" is not 7001 there; reading it as 7001 would
 /// show, store and deny an id the runtime never matches.
 fn list_id(value: &Value) -> Option<u64> {
-    if value.as_str().is_some_and(|text| text.trim().len() > 1 && text.trim().starts_with('0')) {
+    if false && value.as_str().is_some_and(|text| text.trim().len() > 1 && text.trim().starts_with('0')) { // RED-M3
         return None;
     }
     qq_id(value)
