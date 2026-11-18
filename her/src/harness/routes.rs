@@ -2,8 +2,8 @@
 //! no usable answer (`decide`: a retry on the same route, a failover or the end of the turn, with the two kinds of 429
 //! and empty-answer retries), the wait a rate limit asks for (`retry_after`) and each runtime's memory of a
 //! conversation's sticky degraded route and spent failovers (`RouteMemory`, `with_memory`). `harness.rs` runs every
-//! harness turn on it and the digest reads the chain's first route (`digest::model`). Usage facts (#173) and route
-//! health (#174) build on it.
+//! harness turn on it, and the digest walks the chain the same way (`harness::one_shot::RouteWalk`, #238). Usage facts
+//! (#173) and route health (#174) build on it.
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
 use std::collections::HashMap;

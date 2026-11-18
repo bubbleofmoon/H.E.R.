@@ -14,6 +14,7 @@ use crate::runtime::RuntimeContext;
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use serde_json::{json, Value};
 use std::ops::Range;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -320,11 +321,20 @@ fn render(messages: &[ChatMessage]) -> String {
     lines.join("\n")
 }
 
-/// One summary of `transcript` from the digest's model port (`digest::model_for`: `memory.digest.model`, else the
-/// chain's first route), bounded by `memory.digest.timeoutSecs` and by the turn's `deadline` less `SUMMARY_RESERVE`.
-/// The outer error ends the turn (cancellation); the inner one is the summary's content-free failure class, `timeout`
-/// when the deadline bound passes.
-async fn summarise_text(
+/// Sets its flag when dropped: a summary's walk sends nothing more once the summary has stopped waiting for it.
+struct AbandonOnExit(Arc<AtomicBool>);
+
+impl Drop for AbandonOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// One summary of `transcript` from the digest's model port (`digest::model_for`: a route walk over `memory.digest.model`
+/// alone, else over the harness chain), bounded by `memory.digest.timeoutSecs` and by the turn's `deadline` less
+/// `SUMMARY_RESERVE`; the walk sends no request once this returns. The outer error ends the turn (cancellation); the
+/// inner one is the summary's content-free failure class, `timeout` when the deadline bound passes.
+pub(crate) async fn summarise_text(
     context: &RuntimeContext,
     cfg: &Value,
     transcript: &str,
@@ -341,9 +351,12 @@ async fn summarise_text(
         return Ok(Err("timeout"));
     }
     let input = transcript.to_string();
-    // A cancelled turn returns at once; the blocking request ends on its own bound, and an answer that comes after
-    // the cancellation or the bound is dropped.
-    let task = tokio::task::spawn_blocking(move || model.complete(SUMMARY_PROMPT, &input));
+    // The walk is abandoned however this returns: a cancelled or timed-out summary sends no further request, and an
+    // answer that comes after the cancellation or the bound is dropped.
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let _abandon = AbandonOnExit(abandoned.clone());
+    let within = bound.saturating_duration_since(tokio::time::Instant::now());
+    let task = tokio::task::spawn_blocking(move || model.complete_within(SUMMARY_PROMPT, &input, within, &abandoned));
     let joined = tokio::select! { biased;
         _ = cancelled.changed() => return Err(Failure::Cancelled),
         joined = tokio::time::timeout_at(bound, task) => joined,

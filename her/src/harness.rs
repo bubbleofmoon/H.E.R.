@@ -1180,8 +1180,9 @@ fn model_error(error: genai::Error) -> ModelFailure {
     }
 }
 
-/// The wait a 429 response asks for (`routes::retry_after`), through the streaming wrapper.
-fn rate_limit_wait(error: &genai::Error) -> Option<Duration> {
+/// The wait a 429 response asks for (`routes::retry_after`), through the streaming wrapper; the digest's route walk
+/// reads it too (`one_shot::RouteWalk`).
+pub(crate) fn rate_limit_wait(error: &genai::Error) -> Option<Duration> {
     if let genai::Error::WebStream { error: inner, .. } = error {
         if let Some(error) = inner.downcast_ref::<genai::Error>() {
             return rate_limit_wait(error);
