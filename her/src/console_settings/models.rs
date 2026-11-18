@@ -60,7 +60,7 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 "maxOutputTokens": route.max_output_tokens,
                 "retry429": route.retry_429,
                 "health": match seen {
-                    Some(entry) => json!({"state": entry["state"], "since": entry.get("since"), "class": entry.get("class")}),
+                    Some(entry) => entry.as_object().map(|map| map.iter().filter(|(key, _)| *key != "id").map(|(key, value)| (key.clone(), value.clone())).collect::<serde_json::Map<_, _>>().into()).unwrap_or_else(|| json!({"state": "unknown"})),
                     None => json!({"state": "unknown"}),
                 },
                 "price": {
