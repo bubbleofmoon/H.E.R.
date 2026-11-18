@@ -27,7 +27,8 @@ pub(crate) const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 /// How long a conversation's failover memory (its sticky route and its spent failovers) lasts after its last failover.
 pub(crate) const STICKY_FOR: Duration = Duration::from_secs(30 * 60);
 
-const MODEL_NOT_CONFIGURED: &str = "harness model is not configured";
+/// The refusal of a chain when the runtime configures no harness model at all (route health then reports nothing).
+pub(crate) const MODEL_NOT_CONFIGURED: &str = "harness model is not configured";
 
 /// One route of the chain as configured; it holds no credential.
 #[derive(Clone, Debug, PartialEq)]

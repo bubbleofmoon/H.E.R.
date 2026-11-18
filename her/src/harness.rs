@@ -4,6 +4,7 @@ pub(crate) mod handover;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
 pub(crate) mod rotation;
+pub(crate) mod route_health;
 pub(crate) mod routes;
 pub(crate) mod store;
 mod tools;
@@ -133,8 +134,12 @@ impl ModelRoute {
 
     /// The chain's fingerprint (`routes::chain_signature`).
     fn signature(&self) -> String {
-        let specs: Vec<routes::RouteSpec> = self.routes.iter().map(|route| route.spec.clone()).collect();
-        routes::chain_signature(&specs)
+        routes::chain_signature(&self.specs())
+    }
+
+    /// The chain's routes as configured.
+    fn specs(&self) -> Vec<routes::RouteSpec> {
+        self.routes.iter().map(|route| route.spec.clone()).collect()
     }
 }
 
@@ -728,6 +733,8 @@ async fn tool_loop(
                 continue;
             }
         }
+        // The route answered: its health is ok again (`route_health`).
+        route_health::observe(context, &request.route.specs(), chain.route, route_health::Seen::Answered);
         let message =
             ChatMessage::assistant(content).with_reasoning_content(end.captured_reasoning_content);
         let event = Event::Assistant {
@@ -931,6 +938,9 @@ impl ChainState {
                 model: route.model.clone(),
                 summary: summary.clone(),
             });
+            // A route failure is the route's health too (`route_health`); a retry on the same route is not.
+            let class = crate::model_failure::Failure::classify("", &summary).class;
+            route_health::observe(context, &request.route.specs(), self.route, route_health::Seen::Failed { class });
         };
         match next {
             routes::Next::Fail => {

@@ -1500,6 +1500,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified);
             }
         }
+        // When every route of the chain has failed, the owner is told once per outage, after the route reports above
+        // (`harness::route_health`).
+        if count > 0 {
+            crate::harness::route_health::alert_if_owed(&self.context, cfg, key);
+        }
         let text = match result {
             Ok(text) => text,
             Err(error) => {

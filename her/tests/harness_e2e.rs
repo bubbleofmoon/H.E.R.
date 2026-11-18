@@ -2494,11 +2494,21 @@ fn hotfix81_harness_failures_are_failed_turns_with_content_free_owner_alerts() {
         rig.push(group_event(81801,1001,"tester","",vec![text_seg("CHAT_SECRET incoming")]));
         assert!(wait_for(LONG,||rig.ledger().iter().any(|r|r["k"]=="ended"&&r["outcome"]=="failed")),"{name}: {:?}",rig.ledger());
         assert_eq!(lock(&model.requests).len(),requests,"{name}: model requests");
-        rig.wait_texts(OWNER_KEY,1);
+        // #174: a route failure on the only route leaves every route failed, so the owner also gets the all-routes
+        // alert, once, after the route's own alert. A refusal is no route failure and a turn the deadline ended has
+        // none, so those two get the route's alert only.
+        let expected=if class=="refusal"||name=="timeout" {1} else {2};
+        rig.wait_texts(OWNER_KEY,expected);
         let alerts=rig.texts_to(OWNER_KEY);
-        assert_eq!(alerts.len(),1,"{name}: {alerts:?}");
+        assert_eq!(alerts.len(),expected,"{name}: {alerts:?}");
         assert!(alerts[0].contains("backend=harness")&&alerts[0].contains("model=fake-chat")&&alerts[0].contains(&format!("class={class}")),"{name}: {alerts:?}");
         assert!(!alerts[0].contains("CHAT_SECRET"));
+        if expected==2 {
+            assert!(alerts[1].contains("所有回复线路都失败了")&&alerts[1].contains(&format!("最后一次：{class}")),"{name}: {alerts:?}");
+            for hidden in ["fake-chat","harness","openai","模型","CHAT_SECRET"] {
+                assert!(!alerts[1].contains(hidden),"{name}: {hidden}: {alerts:?}");
+            }
+        }
         assert_eq!(rig.texts_to(GROUP_KEY),vec![ACK.to_string()],"{name}: no failed reply");
         let records=rig.data_lines("logs/model-refusals.jsonl");
         assert_eq!(records.len(),usize::from(refusal),"{name}");

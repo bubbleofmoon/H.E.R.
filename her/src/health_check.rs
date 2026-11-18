@@ -38,6 +38,10 @@ pub struct Verdict {
     /// part: a configuration choice does not make a release unhealthy.
     #[serde(rename = "scopeNotices", skip_serializing_if = "Vec::is_empty")]
     scope_notices: Vec<String>,
+    /// #174: each model route's state (`harness::route_health::report`), present when a harness model is configured.
+    /// Reported beside the parts and never a part: a provider outage does not make a release unhealthy.
+    #[serde(rename = "modelRoutes", skip_serializing_if = "Option::is_none")]
+    model_routes: Option<serde_json::Value>,
 }
 
 fn owner(data: &Path, role: &str, lock: &str) -> Part {
@@ -90,6 +94,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 parts,
                 dependency_notices: Vec::new(),
                 scope_notices: Vec::new(),
+                model_routes: None,
             };
         }
     };
@@ -126,6 +131,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 parts,
                 dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
                 scope_notices: Vec::new(),
+                model_routes: None,
             };
         }
     };
@@ -187,6 +193,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         parts,
         dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
         scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
+        model_routes: crate::harness::route_health::report(&context, &cfg),
     }
 }
 
@@ -351,6 +358,44 @@ mod tests {
         assert!(notices[0].as_str().unwrap().contains("group:420044"), "{verdict}");
         let parts: Vec<&str> = verdict["parts"].as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(parts, ["console", "desired", "dsh", "dshLogin", "snowluma", "supervisor"], "a scope gap is never a part");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn route_health_is_reported_beside_the_parts_and_never_fails_one() {
+        use crate::harness::route_health::{observe, Seen};
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("her-174-health-{}", crate::turn_ledger::mint_id(""))),
+        );
+        for dir in ["config", "data/logs", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let config = json!({
+            "consoleToken": "synthetic-health-routes-token",
+            "consolePort": 1,
+            "harness": {"routes": [{"id": "primary-route", "model": "model-a"}, {"id": "backup-route", "model": "model-b"}]}
+        });
+        std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let chain = crate::harness::routes::chain(&config).unwrap();
+        observe(&context, &chain, 0, Seen::Failed { class: "quota" });
+        observe(&context, &chain, 1, Seen::Failed { class: "quota" });
+        let verdict = serde_json::to_value(check(&root, Instant::now() + Duration::from_secs(5))).unwrap();
+        let routes = verdict["modelRoutes"]["routes"].as_array().cloned().unwrap_or_default();
+        let states: Vec<(&str, &str)> = routes
+            .iter()
+            .map(|route| (route["id"].as_str().unwrap_or(""), route["state"].as_str().unwrap_or("")))
+            .collect();
+        assert_eq!(states, [("primary-route", "failed"), ("backup-route", "failed")], "{verdict}");
+        assert_eq!(verdict["modelRoutes"]["allFailed"], true, "{verdict}");
+        let parts: Vec<&str> = verdict["parts"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(parts, ["console", "desired", "dsh", "dshLogin", "snowluma", "supervisor"], "route health is never a part");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

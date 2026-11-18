@@ -692,3 +692,82 @@ async fn harness_usage_requests_without_a_response_end_record_nothing() {
     assert_eq!(models(&server.await.unwrap()), ["model-a", "model-a", "model-b", "model-b"]);
     assert!(!rig.root.join("data/token-usage-rust.jsonl").exists(), "a 429 has no usage to record");
 }
+
+/// #174: the health check's view of the rig's chain (`route_health::report`): each route as `id=state`, and whether
+/// every route has failed.
+fn health(rig: &Rig) -> (Vec<String>, bool) {
+    let report = route_health::report(&rig.context, &rig.cfg).unwrap();
+    let states = report["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|route| format!("{}={}", route["id"].as_str().unwrap(), route["state"].as_str().unwrap()))
+        .collect();
+    (states, report["allFailed"] == true)
+}
+
+fn states(list: &[&str]) -> Vec<String> {
+    list.iter().map(|state| state.to_string()).collect()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn route_health_a_failover_marks_the_failed_route_and_the_answering_route() {
+    let rig = rig("health-failover", two_routes(), None).await;
+    let server = serve(rig.model.clone(), vec![status(500, ""), text("from b")]);
+    assert_eq!(ended(&mut rig.admit("health-failover-1")).await, Ok("from b".to_string()));
+    assert_eq!(models(&server.await.unwrap()), ["model-a", "model-b"]);
+    assert_eq!(health(&rig), (states(&["a=failed", "b=ok"]), false));
+    assert_eq!(route_health::report(&rig.context, &rig.cfg).unwrap()["routes"][0]["class"], "backend");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn route_health_a_retried_rate_limit_is_no_route_failure() {
+    let rig = rig("health-retry", two_routes(), None).await;
+    let server = serve(rig.model.clone(), vec![status(429, "retry-after-ms: 1\r\n"), text("after the wait")]);
+    assert_eq!(ended(&mut rig.admit("health-retry-1")).await, Ok("after the wait".to_string()));
+    assert_eq!(models(&server.await.unwrap()), ["model-a", "model-a"]);
+    assert_eq!(health(&rig), (states(&["a=ok", "b=unknown"]), false));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn route_health_quota_on_every_route_starts_an_episode_that_the_next_answer_ends() {
+    let rig = rig("health-all-failed", two_routes(), None).await;
+    let server = serve(rig.model.clone(), vec![status(429, ""), status(429, ""), status(429, ""), status(429, "")]);
+    assert!(ended(&mut rig.admit("health-all-failed-1")).await.is_err());
+    assert_eq!(models(&server.await.unwrap()), ["model-a", "model-a", "model-b", "model-b"]);
+    assert_eq!(health(&rig), (states(&["a=failed", "b=failed"]), true));
+    let next = serve(rig.model.clone(), vec![text("back")]);
+    assert_eq!(ended(&mut rig.admit("health-all-failed-2")).await, Ok("back".to_string()));
+    assert_eq!(models(&next.await.unwrap()), ["model-b"], "the next turn starts on the degraded route");
+    assert_eq!(health(&rig), (states(&["a=failed", "b=ok"]), false), "an answer ends the episode");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn route_health_a_retry_that_never_answers_is_no_route_failure() {
+    let rig = rig("health-stalled-retry", two_routes(), None).await;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let listener = rig.model.clone();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        read_body(&mut first).await;
+        first.write_all(status(429, "retry-after-ms: 1\r\n").as_bytes()).await.unwrap();
+        let _ = first.shutdown().await;
+        let (mut second, _) = listener.accept().await.unwrap();
+        read_body(&mut second).await;
+        let _ = reached_tx.send(());
+        // The retried request is never answered: the connection stays open until the test drops the server.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(second);
+    });
+    let mut turn = rig.admit("health-stalled-retry-1");
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("the retry reached the model")
+        .unwrap();
+    assert_eq!(health(&rig), (states(&["a=unknown", "b=unknown"]), false), "a retried miss is no route failure");
+    assert!(turn.route_failures().is_empty());
+    turn.cancel();
+    assert!(ended(&mut turn).await.is_err(), "the cancelled turn ends");
+    server.abort();
+    assert_eq!(health(&rig), (states(&["a=unknown", "b=unknown"]), false), "a cancelled turn is no route failure");
+}
