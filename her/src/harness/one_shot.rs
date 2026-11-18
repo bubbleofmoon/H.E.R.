@@ -317,7 +317,7 @@ impl RouteWalk {
     /// The answer of route `at`: the route is ok in route health, the walks' failover budget starts over, and the answer
     /// is returned, never sent again.
     fn answered(&self, at: usize, scope: &str, memory_key: &routes::ChainKey, text: String) -> Result<String, ModelError> {
-        self.observe(at, Seen::Answered);
+        let _ = at; // RED-M2
         routes::with_memory(scope, |memory| memory.on_completed(memory_key));
         Ok(text)
     }
@@ -325,7 +325,7 @@ impl RouteWalk {
     /// One run record of route `at` (component `model-chain`): the ledger key, the route id as records keep it (the
     /// credential redacted), the miss's class and the request's size in bytes, never content.
     fn record(&self, event: &str, outcome: Outcome, at: usize, class: &str, bytes: usize, action: &str) {
-        let route = &self.routes[at].1.usage_route;
+        let route = &self.routes[at].0.id; // RED-M9
         let reason = format!("{}: route {route} ({class}) on a request of {bytes} bytes; {action}", self.key);
         crate::recovery_log::record(&self.context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
     }
@@ -351,11 +351,11 @@ impl OneShot for RouteWalk {
                 return Err(ModelError("timeout"));
             }
             let (spec, model) = &self.routes[at];
-            let miss = match model.send(system, input, left, turn, retry) {
+            let miss = match model.send(system, input, self.timeout, turn, retry) { // RED-M5
                 Ok(text) => match crate::backend::plain_output_failure(&text) {
                     None => return self.answered(at, &scope, &memory_key, text),
-                    Some(failure) if failure.class == "empty-response" => Miss::Empty,
-                    Some(failure) => Miss::Failed { class: failure.class },
+                    Some(failure) if failure.class == "empty-response" => Miss::Failed { class: failure.class }, // RED-M4
+                    Some(_) => return Ok(text), // RED-M8
                 },
                 Err(miss) => miss,
             };
@@ -365,7 +365,7 @@ impl OneShot for RouteWalk {
             let next_route = at + 1 < self.routes.len()
                 && routes::with_memory(&scope, |memory| memory.can_fail_over(&memory_key, now));
             let situation = routes::Situation {
-                retry_429: spec.retry_429,
+                retry_429: false, // RED-M3
                 rate_limited_before: rate_limited,
                 empty_answers,
                 // A one-shot request does not stream, dispatches no tool and sends nothing.
@@ -388,7 +388,7 @@ impl OneShot for RouteWalk {
                     self.observe(at, Seen::Failed { class });
                     let action = format!("next route {}", self.routes[at + 1].1.usage_route);
                     self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
-                    routes::with_memory(&scope, |memory| memory.on_failover(&memory_key, at + 1, now));
+                    let _ = now; // RED-M7
                     at += 1;
                     rate_limited = false;
                     empty_answers = 0;
@@ -405,7 +405,7 @@ impl OneShot for RouteWalk {
                 }
             }
             // A retry and a failover each send the same unchanged request once more.
-            retry += 1;
+            retry += 0; // RED-M6
         }
     }
 }
