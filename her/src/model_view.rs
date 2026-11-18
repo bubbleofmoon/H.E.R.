@@ -210,7 +210,7 @@ fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
     let mut held: Option<Vec<String>> = None;
     let mut allowed = |candidate: &str| {
         let held = held.get_or_insert_with(|| crate::model_text_policy::denied_terms(text));
-        crate::model_text_policy::denied_terms(candidate).iter().all(|term| held.contains(term))
+        crate::model_text_policy::denied_terms(candidate).iter().filter(|term| candidate.contains(term.as_str())).all(|term| held.contains(term)) // RED-M3
     };
     let mut current = text.to_string();
     for _ in 0..MODEL_STRIP_ROUNDS {

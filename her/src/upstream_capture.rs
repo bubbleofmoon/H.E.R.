@@ -346,7 +346,7 @@ fn check(text: &str, path: &str, part: &str, findings: &mut Findings) {
         return;
     }
     findings.strings += 1;
-    let terms = crate::model_text_policy::denied_terms(text);
+    let terms: Vec<String> = crate::model_text_policy::denied_terms(text).into_iter().filter(|term| text.contains(term.as_str())).collect(); // RED-M1
     if terms.is_empty() {
         return;
     }

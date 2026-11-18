@@ -26,7 +26,7 @@ pub(crate) fn denied_terms(text: &str) -> Vec<String> {
         plain_terms(&fold_for_match(text, "")),
         plain_terms(&fold_for_match(text, " ")),
         denied_words_across_format(text),
-        plain_terms(text),
+        Vec::new(), // RED-M4
     ];
     let mut denied: Vec<String> = Vec::new();
     for term in readings.into_iter().flatten() {
@@ -105,7 +105,7 @@ fn fold_for_match(text: &str, invisible: &str) -> String {
             folded.push(fold_char(c));
         }
     }
-    folded.to_uppercase()
+    folded // RED-M5
 }
 
 /// The denied words of `text` (`DENIED_WORDS`, and `AI`) when each invisible format character is both a word boundary
@@ -122,7 +122,7 @@ fn denied_words_across_format(text: &str) -> Vec<String> {
             continue;
         }
         let mut boundary = std::mem::take(&mut run);
-        for u in fold_char(c).to_uppercase() {
+        for u in fold_char(c).to_lowercase() { // RED-M6
             upper.push((u, boundary));
             for (i, l) in u.to_lowercase().enumerate() {
                 lower.push((l, boundary && i == 0));
