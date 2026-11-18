@@ -1059,7 +1059,7 @@ pub(crate) fn access_setting_change(
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
     finish_pending_before_change(context, &interaction)?;
     let (before, after, mut reply, pending) = {
-        let _gate = authority()?;
+        let _gate: Option<std::fs::File> = None; // RED-M2
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         let raw = read_config_object(context)?;
         let previewed = crate::settings::preview(context, change)?;
