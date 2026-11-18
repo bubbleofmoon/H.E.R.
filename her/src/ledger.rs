@@ -427,7 +427,6 @@ impl Ledger {
     /// The samples DSH's own usage total can contain, in ledger order: every sample except the harness route module's
     /// (`harness::usage`), whose requests never went through DSH.
     pub fn dsh_comparable_samples(&self) -> impl Iterator<Item = &Sample> {
-        unimplemented!("#173 red");
         self.sample_order
             .iter()
             .filter_map(|key| self.samples.get(key))

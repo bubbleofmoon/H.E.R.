@@ -39,7 +39,6 @@ pub(crate) struct Place {
 /// (`turn_ledger::mint_id`), so the samples of two processes never share a session, and the turn numbers of one process
 /// (`next_number`) never meet a number another process gave.
 pub(crate) fn session(key: &str) -> String {
-    unimplemented!("#173 red");
     static PROCESS: OnceLock<String> = OnceLock::new();
     format!("{}/{key}", PROCESS.get_or_init(|| crate::turn_ledger::mint_id("harness-")))
 }
@@ -48,7 +47,6 @@ pub(crate) fn session(key: &str) -> String {
 /// lists turns in time order, and no two turns of one process share a number, even within one millisecond, across
 /// threads or after the clock is set back.
 pub(crate) fn next_number() -> i64 {
-    unimplemented!("#173 red");
     static LAST: AtomicI64 = AtomicI64::new(i64::MIN);
     let now = crate::parity_clock::now_ms();
     let mut last = LAST.load(Ordering::SeqCst);
@@ -67,7 +65,6 @@ pub(crate) fn next_number() -> i64 {
 /// priced). A count that is absent, zero or negative counts as zero. `None` when the response reported neither prompt
 /// nor completion tokens.
 pub(crate) fn buckets(usage: &Usage) -> Option<Value> {
-    unimplemented!("#173 red");
     let positive = |count: Option<i32>| count.filter(|count| *count > 0).map(i64::from);
     let prompt = positive(usage.prompt_tokens);
     let output = positive(usage.completion_tokens);
@@ -98,7 +95,6 @@ pub(crate) fn buckets(usage: &Usage) -> Option<Value> {
 /// ledger keeps the first record of a place and ignores a repeat (`Ledger::apply`). A response without reported prompt
 /// or completion tokens is recorded as evidence without billing (`b: null`).
 pub(crate) fn row(place: &Place, route: &str, model: &str, job: &str, usage: Option<&Usage>, at: i64) -> Value {
-    unimplemented!("#173 red");
     json!({
         "k": "turn",
         "t": at,
@@ -121,7 +117,6 @@ pub(crate) fn row(place: &Place, route: &str, model: &str, job: &str, usage: Opt
 /// nothing; a failed write goes to the run record (component `model-chain`, event `usage-unrecorded`) and never fails
 /// the request.
 pub(crate) fn record(context: &RuntimeContext, place: &Place, route: &str, model: &str, job: &str, usage: Option<&Usage>) {
-    unimplemented!("#173 red");
     if !context.is_isolated() {
         return;
     }
