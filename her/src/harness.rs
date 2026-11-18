@@ -7,6 +7,8 @@ pub(crate) mod rotation;
 pub(crate) mod routes;
 pub(crate) mod store;
 mod tools;
+pub(crate) mod usage;
+
 pub use tools::Tools;
 #[cfg(test)]
 pub(crate) use tools::session_instruction;
@@ -45,6 +47,11 @@ pub(crate) struct Route {
     id: String,
     model: String,
     target: ServiceTarget,
+}
+
+/// `text` with the harness credential `key` replaced by `[REDACTED]`: the form every record and capture keeps.
+pub(crate) fn redact_credential(text: &str, key: &str) -> String {
+    text.replace(key, "[REDACTED]")
 }
 
 /// A turn's candidate chain on the selected runtime's relay, authenticated with the harness credential: the configured
@@ -96,8 +103,8 @@ impl ModelRoute {
         let routes = chain
             .into_iter()
             .map(|spec| Route {
-                id: spec.id.replace(key, "[REDACTED]"),
-                model: spec.model.replace(key, "[REDACTED]"),
+                id: redact_credential(&spec.id, key),
+                model: redact_credential(&spec.model, key),
                 target: ServiceTarget {
                     model: ModelIden::new(AdapterKind::OpenAI, spec.model.clone()),
                     endpoint: Endpoint::from_owned(endpoint.clone()),
@@ -117,6 +124,11 @@ impl ModelRoute {
     /// The first route's target (the digest's one route).
     pub(crate) fn target(&self) -> ServiceTarget {
         self.routes[0].target.clone()
+    }
+
+    /// `text` with this route's harness credential redacted (`redact_credential`).
+    pub(crate) fn redact(&self, text: &str) -> String {
+        redact_credential(text, &self.key)
     }
 
     /// The chain's fingerprint (`routes::chain_signature`).
@@ -604,7 +616,7 @@ async fn tool_loop(
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
-    let mut chain = ChainState::new(context, request);
+    let mut chain = ChainState::new(context, request, usage::next_number());
     let mut spent = 0u32;
     for step in 0..request.limits.max_steps {
         check_bound(request, &cancelled, deadline)?;
@@ -678,6 +690,7 @@ async fn tool_loop(
             Ok(end) => end,
             Err(ModelFailure::Stopped { reason, end }) => {
                 // The stop's usage is charged before the miss is decided, as an answer's is.
+                chain.record_usage(context, request, step, end.captured_usage.as_ref());
                 spent = spent.saturating_add(charge_of(&end)?);
                 let at = MissAt { spent, ..at };
                 chain
@@ -692,6 +705,8 @@ async fn tool_loop(
                 continue;
             }
         };
+        // Every response end is a usage fact: an answer that is later cancelled, misses or spends the budget included.
+        chain.record_usage(context, request, step, end.captured_usage.as_ref());
         check_bound(request, &cancelled, deadline)?;
         spent = spent.saturating_add(charge_of(&end)?);
         let mut raw = serde_json::to_value(end)
@@ -821,10 +836,14 @@ struct ChainState {
     rate_limited: bool,
     /// Empty answers the current, unchanged request got on this route.
     empty_answers: u32,
+    /// The turn's number in the token ledger (`usage::next_number`).
+    usage_turn: i64,
+    /// Requests already sent for the current, unchanged request: its retries and failovers.
+    repeats: i64,
 }
 
 impl ChainState {
-    fn new(context: &RuntimeContext, request: &TurnRequest) -> Self {
+    fn new(context: &RuntimeContext, request: &TurnRequest, usage_turn: i64) -> Self {
         Self {
             scope: routes::scope_of(context),
             key: routes::ChainKey {
@@ -837,13 +856,28 @@ impl ChainState {
             dispatched: false,
             rate_limited: false,
             empty_answers: 0,
+            usage_turn,
+            repeats: 0,
         }
     }
 
-    /// The current request was answered: the next request starts with fresh 429 and empty-answer counts.
+    /// The current request was answered: the next request starts with fresh 429, empty-answer and repeat counts.
     fn answered(&mut self) {
         self.rate_limited = false;
         self.empty_answers = 0;
+        self.repeats = 0;
+    }
+
+    /// The usage fact of the response end the current route just returned to the turn's step `step` (`usage::record`).
+    fn record_usage(&self, context: &RuntimeContext, request: &TurnRequest, step: usize, reported: Option<&genai::chat::Usage>) {
+        let route = &request.route.routes[self.route];
+        let place = usage::Place {
+            key: request.conversation.clone(),
+            turn: self.usage_turn,
+            step: step as i64,
+            retry: self.repeats,
+        };
+        usage::record(context, &place, &route.id, &route.model, usage::TURN, reported);
     }
 
     /// The turn's model answered in full: the conversation's failover budget starts over.
@@ -914,6 +948,7 @@ impl ChainState {
                 self.route = next;
                 self.rate_limited = false;
                 self.empty_answers = 0;
+                self.repeats += 1;
                 Ok(())
             }
             routes::Next::Retry { wait } => {
@@ -928,6 +963,7 @@ impl ChainState {
                     routes::Miss::Dropped => self.retried = true,
                     routes::Miss::Failed { .. } => {}
                 }
+                self.repeats += 1;
                 check_bound(request, cancelled, at.deadline)?;
                 store.fail_attempt(&request.id)?;
                 if !wait.is_zero() {

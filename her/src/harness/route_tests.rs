@@ -578,3 +578,117 @@ async fn harness_routes_an_unsafe_stop_refusal_delta_is_charged_before_the_failo
     assert_eq!(requests[1]["max_tokens"], 5, "route a's 15 tokens are charged: route b asks for the 5 left");
     rig.no_more_requests().await;
 }
+
+/// #173: the token-ledger rows the turns' usage facts wrote, in order.
+fn usage_rows(rig: &Rig) -> Vec<Value> {
+    std::fs::read_to_string(rig.root.join("data/token-usage-rust.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Each row's (route, model, step, retry, buckets).
+fn usage_places(rows: &[Value]) -> Vec<(String, String, i64, i64, Value)> {
+    rows.iter()
+        .map(|row| {
+            (
+                row["route"].as_str().unwrap_or("").to_string(),
+                row["model"].as_str().unwrap_or("").to_string(),
+                row["step"].as_i64().unwrap_or(-1),
+                row["retry"].as_i64().unwrap_or(-1),
+                row["b"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// A place with the buckets of the 15 tokens every scripted answer reports (`stop`).
+fn usage_place(route: &str, model: &str, step: i64, retry: i64) -> (String, String, i64, i64, Value) {
+    (
+        route.into(),
+        model.into(),
+        step,
+        retry,
+        json!({"cacheMiss": 12, "cacheHit": 0, "cacheWrite": 0, "output": 3, "reasoning": 0}),
+    )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_usage_each_answered_attempt_is_one_sample_and_the_console_totals_include_it() {
+    let rig = rig("usage-attempts", two_routes(), None).await;
+    let server = serve(rig.model.clone(), vec![status(500, ""), empty(), text("from b")]);
+    let mut turn = rig.admit("usage-attempts-1");
+    assert_eq!(ended(&mut turn).await, Ok("from b".to_string()));
+    assert_eq!(models(&server.await.unwrap()), ["model-a", "model-b", "model-b"]);
+    let rows = usage_rows(&rig);
+    assert_eq!(
+        usage_places(&rows),
+        [usage_place("b", "model-b", 1, 1), usage_place("b", "model-b", 2, 2)],
+        "the 500 brought no response end and records nothing; the empty answer and its retry are one sample each"
+    );
+    for row in &rows {
+        assert_eq!(row["sid"], json!(usage::session("private:8808")), "{row}");
+        assert_eq!(
+            (row["k"].as_str(), row["key"].as_str(), row["job"].as_str(), row["engine"].as_str()),
+            (Some("turn"), Some("private:8808"), Some("turn"), Some("harness"))
+        );
+    }
+    assert_eq!(rows[0]["turn"], rows[1]["turn"], "one turn number for the whole turn");
+    let ledger = crate::ledger::Ledger::load_all_for_runtime(&rig.context).unwrap();
+    let summary = ledger.summary(&crate::pricing::resolve(None), 50);
+    assert_eq!(summary["conversations"][0]["key"], "private:8808");
+    assert_eq!(
+        (summary["totals"]["turns"].as_i64(), summary["totals"]["steps"].as_i64(), summary["totals"]["totalTokens"].as_f64()),
+        (Some(1), Some(2), Some(30.0)),
+        "the console totals count the turn, both answered attempts and their tokens"
+    );
+    assert_eq!(ledger.dsh_comparable_samples().count(), 0, "harness usage is never compared with DSH's own total");
+    rig.no_more_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_usage_a_refused_answer_is_recorded_before_its_failover() {
+    let rig = rig("usage-refused", two_routes(), None).await;
+    let server = serve(rig.model.clone(), vec![content_filter(), text("from b")]);
+    assert_eq!(ended(&mut rig.admit("usage-refused-1")).await, Ok("from b".to_string()));
+    assert_eq!(models(&server.await.unwrap()), ["model-a", "model-b"]);
+    assert_eq!(
+        usage_places(&usage_rows(&rig)),
+        [usage_place("a", "model-a", 0, 0), usage_place("b", "model-b", 1, 1)],
+        "the refused answer was paid for: it is a sample of route a"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_usage_each_turn_has_its_own_later_number() {
+    let rig = rig("usage-turns", two_routes(), None).await;
+    let first = serve(rig.model.clone(), vec![text("one")]);
+    assert_eq!(ended(&mut rig.admit("usage-turns-1")).await, Ok("one".to_string()));
+    first.await.unwrap();
+    let second = serve(rig.model.clone(), vec![text("two")]);
+    assert_eq!(ended(&mut rig.admit("usage-turns-2")).await, Ok("two".to_string()));
+    second.await.unwrap();
+    let rows = usage_rows(&rig);
+    assert_eq!(usage_places(&rows), [usage_place("a", "model-a", 0, 0), usage_place("a", "model-a", 0, 0)]);
+    assert!(rows[0]["turn"].as_i64() < rows[1]["turn"].as_i64(), "{rows:?}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_usage_an_answer_past_the_token_budget_is_still_recorded() {
+    let chain = json!({"maxTokens": 10, "routes": [{"id": "a", "model": "model-a"}]});
+    let rig = rig("usage-budget", chain, None).await;
+    let server = serve(rig.model.clone(), vec![text("over budget")]);
+    assert_eq!(ended(&mut rig.admit("usage-budget-1")).await, Err("harness token limit exceeded".to_string()));
+    server.await.unwrap();
+    assert_eq!(usage_places(&usage_rows(&rig)), [usage_place("a", "model-a", 0, 0)], "the tokens were spent");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_usage_requests_without_a_response_end_record_nothing() {
+    let rig = rig("usage-quota", two_routes(), None).await;
+    let server = serve(rig.model.clone(), vec![status(429, ""), status(429, ""), status(429, ""), status(429, "")]);
+    assert!(ended(&mut rig.admit("usage-quota-1")).await.is_err());
+    assert_eq!(models(&server.await.unwrap()), ["model-a", "model-a", "model-b", "model-b"]);
+    assert!(!rig.root.join("data/token-usage-rust.jsonl").exists(), "a 429 has no usage to record");
+}

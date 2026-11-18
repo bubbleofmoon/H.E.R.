@@ -3126,8 +3126,8 @@ fn handle_usage_attribution(context: &RuntimeContext, cfg: &Value, days: i64) ->
     let mut by_key: BTreeMap<String, UsageAgg> = BTreeMap::new();
     let mut by_provider: BTreeMap<String, UsageAgg> = BTreeMap::new();
     let mut samples = 0i64;
-    for sk in &ledger.sample_order {
-        let Some(s) = ledger.samples.get(sk) else { continue };
+    // Harness samples (`harness::usage`) never went through DSH, so they are never subtracted from its total.
+    for s in ledger.dsh_comparable_samples() {
         // 只统计有归属的记录；没有 key 的历史采样不属于「我们」，差额会体现出来。
         let Some(key) = s
             .key
@@ -18448,6 +18448,59 @@ mod tests {
         server_a.join().unwrap();
         server_b.join().unwrap();
         drop((root_a, root_b));
+    }
+
+    #[test]
+    fn isolated_usage_attribution_counts_only_dsh_comparable_samples() {
+        let token = "fixture-usage-token-attribution-173";
+        let (root, context) = fixture_runtime("票据 173 attribution", token);
+        let now = now_ms();
+        let today = crate::pricing::beijing_parts(now).2;
+        // A DSH sample (keyed, no engine) and a harness sample (keyed, engine `harness`) that DSH never saw.
+        let rows = [
+            json!({
+                "k": "turn", "t": now, "sid": "dsh-session", "turn": 1, "step": 1,
+                "retry": 0, "seq": 1, "key": "private:7001", "b": { "cacheMiss": 10, "output": 11 },
+                "model": "fixture-usage-model", "provider": "fixture-dsh"
+            }),
+            json!({
+                "k": "turn", "t": now, "sid": "harness-fixture/group:7002", "turn": 2, "step": 0,
+                "retry": 0, "seq": 0, "key": "group:7002", "b": { "cacheMiss": 12, "output": 13 },
+                "model": "fixture-usage-model", "provider": "harness", "engine": "harness",
+                "route": "a", "job": "turn"
+            }),
+        ];
+        std::fs::write(
+            root.0.join("data/token-usage-rust.jsonl"),
+            rows.iter().map(|row| format!("{row}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let user_dir = root.0.join("user/dsh");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join(".dshw-usage.json"),
+            serde_json::to_vec(&json!({
+                "events": [
+                    { "day": today, "tokens": 1_000, "cost": 1.25 },
+                    { "day": today, "tokens": 500, "cost": 0.75 }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (port, server) = start_http_fixture(context, 1);
+        let (status, body) = http_json(port, "GET", "/api/usage/attribution?days=90", token, None);
+        server.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+        // Only DSH's own sample is compared with its total: the harness sample is never subtracted.
+        assert_eq!(body["our"]["samples"], 1, "{body}");
+        assert_eq!(body["our"]["turns"], 1, "{body}");
+        assert_eq!(body["our"]["tokens"], 21.0, "{body}");
+        assert_eq!(body["dshTotal"]["turns"], 2, "{body}");
+        assert_eq!(body["dshTotal"]["tokens"], 1_500.0, "{body}");
+        assert_eq!(body["unattributed"]["turns"], 1, "{body}");
+        assert_eq!(body["unattributed"]["tokens"], 1_479.0, "{body}");
+        drop(root);
     }
 
     #[test]

@@ -103,6 +103,10 @@ _Avoid_: preset, tool whitelist, tool guard
 One way the harness reaches a model: a route id, the relay model it asks, its reasoning effort and its output limit. A conversation's candidate chain lists routes in order; when one fails, the next takes over.
 _Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
 
+**Usage fact (用量记录, `harness::usage`)**:
+One token-ledger sample for one model request the harness route module sent: the conversation, the route and model, the request's place in its turn and the tokens its response reported. The console's token totals read it with DSH's samples.
+_Avoid_: billing record, usage event (a DSH request event)
+
 **History budget (历史预算, `harness::budget`)**:
 The share of a model route's context window one harness request may fill. Past it the oldest whole rounds of the conversation's history (a round is one completed turn) are left out or summarised; the current turn never is.
 _Avoid_: context limit, compaction

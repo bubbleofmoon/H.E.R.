@@ -1289,10 +1289,12 @@ fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str,
     };
     // Each job reads the selected runtime's current relay endpoint, as the digest jobs do.
     let current = context.runtime_root().and_then(|root| RuntimeContext::from_root(root).ok());
+    let target = route.as_ref().map(|route| crate::harness::one_shot::RouteModel { id: route.id.as_str(), model: route.model.as_str() });
     let text = crate::harness::one_shot::model_for(
         current.as_ref().unwrap_or(context),
         crate::harness::one_shot::Job::SlangLearner,
-        route.as_ref().map(|route| route.model.as_str()),
+        key,
+        target,
         Duration::from_secs(timeout_s),
         route.as_ref().map_or(crate::harness::routes::DEFAULT_MAX_OUTPUT_TOKENS, |route| route.max_output_tokens),
     )
