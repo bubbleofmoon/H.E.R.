@@ -1011,7 +1011,7 @@ fn outbound_guard_false_allows_a_sensitive_voice_file_name() {
     let fx = fixture("audit-off", &bot.url, Options::default());
     fx.audio("token=abcdef.mp3", &bytes(64));
     let console = Console::start(&fx);
-    let (status, body) = console.operator("POST", "/api/security", json!({"outboundGuard":false}));
+    let (status, body) = console.operator("POST", "/api/security", json!({"outboundGuard":false,"confirm":true}));
     assert_eq!(status, 200, "{body}");
     let (status, body) = console.agent("POST", "/api/socialV2/send-voice", json!({"key":"group:111", "voice":"token=abcdef.mp3", "verify":false}));
     assert_eq!(status, 200, "{body}");

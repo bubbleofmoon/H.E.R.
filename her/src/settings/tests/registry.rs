@@ -37,12 +37,13 @@ fn settings_registry_is_complete_and_agrees_with_its_reader() {
 
 #[test]
 fn no_registry_setting_is_cached_on_the_config_stamp() {
-    // `RuntimeContext::config_stamp` sees only the stored file. Values cached on it: `reserved.rs` (`social`),
-    // `console_access.rs` (`allow`, `deny`, `allowAllWhenEmpty`, `ownerQQ`) and `history_log.rs` (`history`).
+    // `RuntimeContext::config_stamp` sees only the stored file. Values cached on it alone: `reserved.rs` (`social`),
+    // `console_access.rs` (`allowAllWhenEmpty`; its allow, deny and owner view is keyed on the store's mark too, #154)
+    // and `history_log.rs` (`history`).
     let registry: Vec<_> = crate::settings::registry().collect();
     assert!(!registry.is_empty(), "the registry has settings");
     for setting in registry {
-        for cached in ["/social", "/allow", "/deny", "/allowAllWhenEmpty", "/ownerQQ", "/history"] {
+        for cached in ["/social", "/allowAllWhenEmpty", "/history"] {
             assert!(
                 setting.pointer != cached && !setting.pointer.starts_with(&format!("{cached}/")),
                 "{} is cached on the config stamp ({cached}); key that cache on the store too",
@@ -72,7 +73,8 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     }
     assert!(page.contains("s.kind.min") && page.contains("s.kind.max"), "the input takes the bounds");
     assert_eq!(view["kind"]["min"], 1);
-    assert!(page.contains("s.kind.type==='integer'"), "the page picks the input by the kind");
+    assert!(page.contains("const type=s.kind.type") && page.contains("type==='integer'"), "the page picks the input by the kind");
+    assert!(page.contains("input.type='checkbox'") && page.contains("type==='id list'"), "a switch and an id list have inputs");
     assert!(!page.contains("maxLength"), "a model id input sets no UTF-16 length: the set route counts characters");
     assert!(page.contains("input.value=s.value==null?'':s.value"), "a model id that is not configured shows empty");
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
@@ -81,11 +83,20 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(model["kind"], json!({"type": "model id", "maxChars": 200}));
     assert!(page.contains("api('/api/settings')"), "the page lists through the route");
     assert!(
-        page.contains("api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value})"),
+        page.contains("send('/api/settings/set',{setting:s.key,value:value()})")
+            && page.contains("type==='integer'?Number(input.value)"),
         "the page sets through the route: a number for an integer setting, the text for a model id"
     );
-    assert!(page.contains("api('/api/settings/reset',{setting:s.key})"), "the page resets through the route");
-    assert!(page.contains("api('/api/settings/undo',{entry:e.entry})"), "the page undoes through the route");
+    assert!(page.contains("send('/api/settings/reset',{setting:s.key})"), "the page resets through the route");
+    assert!(
+        page.contains("const body={entry:e.entry}") && page.contains("api('/api/settings/undo',body)"),
+        "the page undoes through the route"
+    );
+    // #154: a security setting is changed only after the page asked, and the request says so.
+    assert!(page.contains("if(s.confirm){if(!ask(s.key))return;body.confirm=true}"), "a set or reset asks first");
+    assert!(page.contains("if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}"), "an undo asks first");
+    assert!(page.contains("confirm('Change the security setting '"), "the page asks with window.confirm");
+    assert!(page.contains("s.overriddenBy"), "the page shows the owner the admin agent mode puts in force");
     assert!(
         page.contains("'/api/settings/history'") && page.contains("'?before='+next"),
         "the page lists the history one page at a time"

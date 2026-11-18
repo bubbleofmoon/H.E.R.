@@ -1028,6 +1028,23 @@ impl RuntimeContext {
         self.normalized_config(&document)
     }
 
+    /// #154: the configuration `load_config` returns once `raw` is the stored `config.json` and `changes`
+    /// (`settings::preview`) are stored, computed before anything is written, because an access change records the
+    /// policy it writes first: `raw` with the stored values applied, then each change at its registry pointer
+    /// (`settings::place_changes`), normalized as `effective_config` does.
+    pub(crate) fn effective_config_with(
+        &self,
+        raw: &Value,
+        changes: &[(&'static crate::settings::Setting, Option<Value>)],
+    ) -> Result<Value, &'static str> {
+        let mut document = self.overlay_config(raw.clone());
+        crate::settings::place_changes(&mut document, changes);
+        if !self.is_isolated() {
+            return Ok(document);
+        }
+        self.normalized_config(&document)
+    }
+
     /// The normalization `load_config` applies to the overlaid configuration document of a selected runtime.
     fn normalized_config(&self, raw: &Value) -> Result<Value, &'static str> {
         if !raw.is_object() {

@@ -72,41 +72,116 @@ fn applied_reply(setting: &str, applied: crate::settings::Applied) -> Value {
     reply
 }
 
-/// `{"setting": <registry key>, "value": <value>}`.
+/// #154: the request's `confirm` (`settings::confirm_field`) and the confirmation a change of `setting` needs
+/// (`settings::check_confirmation`): 409 for a security setting without `"confirm": true`, before anything is written.
+/// An unknown setting needs none here (the change itself answers 400 or 404).
+fn confirmed(fields: &Map<String, Value>, setting: Option<&crate::settings::Setting>) -> Result<(), (u16, String)> {
+    let confirm = crate::settings::confirm_field(&Value::Object(fields.clone()))?;
+    crate::settings::check_confirmation(confirm, setting.as_slice())
+}
+
+/// The registry setting history entry `entry` changes, for the undo's confirmation. Every failure of the look is the
+/// error (404: no such entry yet, 409: its setting is no longer in the registry, 503: a store that cannot be read right
+/// now); `undo` decides what each lets through.
+fn entry_setting(context: &RuntimeContext, entry: i64) -> Result<&'static crate::settings::Setting, (u16, String)> {
+    let previewed = crate::settings::preview(context, &crate::settings::Change::Undo { entry })?;
+    previewed.first().map(|(setting, _)| *setting).ok_or((503, "the settings entry cannot be read".to_string()))
+}
+
+/// Test seam: runs on this thread right after the undo's first look at its entry, so a test can create the entry the
+/// look did not find.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AFTER_UNDO_LOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting. A change of an
+/// access setting revokes like a whitelist write (`console::access_setting_change`).
 fn set(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    let fields = body_fields(body, &["setting", "value"])?;
+    let fields = body_fields(body, &["setting", "value", "confirm"])?;
     let setting = setting_field(&fields)?;
     let value = fields.get("value").ok_or((400, "value is required".to_string()))?;
+    let found = crate::settings::find(setting);
+    confirmed(&fields, found)?;
+    let commit = || -> Result<Value, (u16, String)> {
+        let applied = crate::settings::apply(context, setting, value, "administrator", "console")?;
+        Ok(applied_reply(setting, applied))
+    };
+    if found.is_some_and(|found| found.access()) {
+        let change = crate::settings::Change::Set { key: setting, value };
+        return crate::console::access_setting_change(context, authority, &change, commit);
+    }
     let _gate = authority()?;
-    let applied = crate::settings::apply(context, setting, value, "administrator", "console")?;
-    Ok(applied_reply(setting, applied))
+    commit()
 }
 
-/// `{"setting": <registry key>}`: stores the setting's default.
+/// `{"setting": <registry key>}`, plus `"confirm": true` for a security setting: stores the setting's default.
 fn reset(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    let fields = body_fields(body, &["setting"])?;
+    let fields = body_fields(body, &["setting", "confirm"])?;
     let setting = setting_field(&fields)?;
+    let found = crate::settings::find(setting);
+    confirmed(&fields, found)?;
+    let commit = || -> Result<Value, (u16, String)> {
+        let applied = crate::settings::reset(context, setting, "administrator")?;
+        Ok(applied_reply(setting, applied))
+    };
+    if found.is_some_and(|found| found.access()) {
+        let change = crate::settings::Change::Reset { key: setting };
+        return crate::console::access_setting_change(context, authority, &change, commit);
+    }
     let _gate = authority()?;
-    let applied = crate::settings::reset(context, setting, "administrator")?;
-    Ok(applied_reply(setting, applied))
+    commit()
 }
 
-/// `{"entry": <history entry id>}`; the reply names the entry, the setting and its stored value now (`null`: none),
-/// plus `mirrorError` when `config.json` could not be updated (the undo stands).
+/// `{"entry": <history entry id>}`, plus `"confirm": true` when the entry's setting is a security setting; the reply
+/// names the entry, the setting and its stored value now (`null`: none), plus `mirrorError` when `config.json` could not
+/// be updated (the undo stands). An undo of an access setting revokes like a whitelist write.
 fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    let fields = body_fields(body, &["entry"])?;
+    let fields = body_fields(body, &["entry", "confirm"])?;
     let entry = fields
         .get("entry")
         .and_then(Value::as_i64)
         .filter(|entry| *entry > 0)
         .ok_or((400, "entry must be a positive integer".to_string()))?;
-    let _gate = authority()?;
-    let undone = crate::settings::undo(context, entry, "administrator")?;
-    let mut reply = json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored});
-    if let Some(error) = undone.mirror_error {
-        reply["mirrorError"] = json!(error);
+    // Fail closed. An unknown entry (404) or a retired setting (409) is answered by the undo itself, under the store gate,
+    // and since the entry may be created between this look and that answer, a look that did not name the entry's setting
+    // never lets the plain path undo a security setting. When the look fails otherwise, an unconfirmed undo is refused
+    // with that failure and a confirmed one takes the access path, which looks again under the configuration gate.
+    let looked = entry_setting(context, entry);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_UNDO_LOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
     }
-    Ok(reply)
+    let (target, access) = match looked {
+        Ok(target) => (Some(target), target.access()),
+        Err((404 | 409, _)) => (None, false),
+        Err(error) => {
+            if !crate::settings::confirm_field(&Value::Object(fields.clone()))? {
+                return Err(error);
+            }
+            (None, true)
+        }
+    };
+    confirmed(&fields, target)?;
+    let commit = || -> Result<Value, (u16, String)> {
+        let permit = |setting: &crate::settings::Setting| -> Result<(), (u16, String)> {
+            if target.is_none() && !access && setting.confirmed() {
+                return Err((409, format!("{} is a security setting: send the undo again", setting.key)));
+            }
+            Ok(())
+        };
+        let undone = crate::settings::undo(context, entry, "administrator", &permit)?;
+        let mut reply = json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored});
+        if let Some(error) = undone.mirror_error {
+            reply["mirrorError"] = json!(error);
+        }
+        Ok(reply)
+    };
+    if access {
+        return crate::console::access_setting_change(context, authority, &crate::settings::Change::Undo { entry }, commit);
+    }
+    let _gate = authority()?;
+    commit()
 }
 
 /// `?setting=<registry key>&before=<entry id>`, both optional; other query members are ignored.
@@ -123,9 +198,12 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
 }
 
 /// Lists every setting from `GET /api/settings` with a set (`POST /api/settings/set`: a number input for an integer
-/// setting, a text input for a model id, a text area for a text setting (#140 prompt text) sent as typed) and a reset
-/// (`POST /api/settings/reset`) button, and the history from `GET /api/settings/history`, newest first, with an undo
-/// button per entry (`POST /api/settings/undo`) and an older-entries button. Text is shown with `textContent` only.
+/// setting, a text input for a model id, a text area for a text setting (#140 prompt text) sent as typed, a checkbox for
+/// a switch, a text input of comma- or space-separated ids for an id list and a text input for the owner, #154) and a
+/// reset (`POST /api/settings/reset`) button, and the history from `GET /api/settings/history`, newest first, with an
+/// undo button per entry (`POST /api/settings/undo`) and an older-entries button. A set, reset or undo of a security
+/// setting (`confirm` in the list) first asks with `window.confirm` and then sends `"confirm": true`; the owner's
+/// `overriddenBy` is shown beside its value. Text is shown with `textContent` only.
 const PAGE: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Settings</title>
 <style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:40em}</style></head><body>
@@ -144,8 +222,10 @@ const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':S
 const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
 const shown=v=>v==null?'(none)':JSON.stringify(v);
 let next=null;
-async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const integer=s.kind.type==='integer';const text=s.kind.type==='text';const input=document.createElement(text?'textarea':'input');if(integer){input.type='number';input.min=s.kind.min;input.max=s.kind.max}else if(text){input.rows=8;input.cols=60}else{input.type='text'}input.value=s.value==null?'':s.value;const field=document.createElement('td');field.append(input);tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.value),cell(s.default),cell(s.applies),field,action('Set',async()=>{const r=await api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/reset',{setting:s.key});if(r.ok)refresh()}));tb.append(tr)}}
-async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const r=await api('/api/settings/undo',{entry:e.entry});if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
+let security=new Set();
+const ask=key=>confirm('Change the security setting '+key+'? A change of an allow or deny list or the owner revokes every conversation that loses access at once.');
+async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;security=new Set(j.settings.filter(s=>s.confirm).map(s=>s.key));const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const type=s.kind.type;const text=type==='text';const input=document.createElement(text?'textarea':'input');if(type==='integer'){input.type='number';input.min=s.kind.min;input.max=s.kind.max;input.value=s.value==null?'':s.value}else if(type==='switch'){input.type='checkbox';input.checked=s.value===true}else if(type==='id list'){input.type='text';input.size=40;input.value=(s.value||[]).join(', ')}else if(text){input.rows=8;input.cols=60;input.value=s.value==null?'':s.value}else{input.type='text';input.value=s.value==null?'':s.value}const value=()=>type==='integer'?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok)refresh()};const current=s.overriddenBy?shown(s.value)+' (in effect: '+shown(s.overriddenBy.value)+' from the '+s.overriddenBy.source+')':s.value;const field=document.createElement('td');field.append(input);tr.append(cell(s.label+' ('+s.key+')'+(s.confirm?' [needs confirmation]':'')),cell(s.hint),cell(current),cell(s.default),cell(s.applies),field,action('Set',()=>send('/api/settings/set',{setting:s.key,value:value()})),action('Reset',()=>send('/api/settings/reset',{setting:s.key})));tb.append(tr)}}
+async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const body={entry:e.entry};if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}const r=await api('/api/settings/undo',body);if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
 function refresh(){list();history(false)}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};
 $('#older').onclick=()=>history(true);

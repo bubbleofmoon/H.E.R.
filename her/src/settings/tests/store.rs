@@ -87,7 +87,7 @@ fn settings_set_refuses_invalid_values_and_keeps_the_old_value() {
         (json!({"setting": 7, "value": 4500}), "setting is required"),
         (json!({"value": 4500}), "setting is required"),
         (json!({"setting": QUIET_KEY}), "value is required"),
-        (json!({"setting": QUIET_KEY, "value": 4500, "confirm": true}), "unknown settings field"),
+        (json!({"setting": QUIET_KEY, "value": 4500, "force": true}), "unknown settings field"),
         (json!([QUIET_KEY, 4500]), "body must be a JSON object"),
     ] {
         let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&request));

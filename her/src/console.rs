@@ -41,6 +41,7 @@ mod voice_http;
 #[path = "console_access.rs"]
 mod access;
 pub(crate) use access::take_admin_wake;
+pub(crate) use access::access_setting_change;
 #[path = "console_schedule.rs"]
 mod schedule_routes;
 pub(crate) use crate::conversation_authority::{
@@ -9754,7 +9755,8 @@ fn conversation_scope_change_waiting(
     action: &str,
     limit: std::time::Duration,
 ) -> Result<Value, (u16, String)> {
-    let body = json!({"conversation": conversation, "action": action}).to_string();
+    // #154: `her-cli conversation` requires `--confirm`, which confirms a change of a security setting.
+    let body = json!({"conversation": conversation, "action": action, "confirm": true}).to_string();
     let result = access::conversation_scope(context, &body);
     // No request takes the write record here (`persist_snowluma_endpoint` does the same).
     let _ = take_config_writes();
@@ -14385,6 +14387,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
     if id.is_empty() {
         return Err((400, "需要 id".to_string()));
     }
+    // #154: an undo that restores a security setting needs `"confirm": true`, as any change of one does.
+    let confirm = crate::settings::confirm_field(&req)?;
     let entry = audit_recent(context, 500)
         .map_err(|e| (503, e))?
         .into_iter()
@@ -14477,20 +14481,35 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                         }
                         _ => {}
                     }
-                    // Registry settings change and undo through the settings store only: the restored
-                    // configuration keeps their current values.
+                    // #154: the security settings the backup holds (allow and deny lists, owner, outbound guard
+                    // switches) are restored through the settings store after the revocation below is recorded, and
+                    // need `"confirm": true`; every other registry setting changes and undoes through the settings
+                    // store only, so the restored configuration keeps its current value.
+                    let security = crate::settings::security_restore(context, &current, &restored_config)?;
+                    let restoring: Vec<&crate::settings::Setting> = security.iter().map(|(setting, _)| *setting).collect();
+                    crate::settings::check_confirmation(confirm, &restoring)?;
+                    let previewed: Vec<_> = security.iter().map(|(setting, value)| (*setting, Some(value.clone()))).collect();
                     settings_kept = crate::settings::keep_registry_values(&current, &mut restored_config).map_err(
                         |key| (409, format!("the backup cannot keep the current value of {key}; nothing was undone")),
                     )?;
-                    let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
+                    settings_kept.retain(|key| !crate::settings::find(key).is_some_and(|setting| setting.confirmed()));
                     // If the restored configuration cannot be loaded, everything the old one allowed is revoked.
-                    let (after, load_error) = match context.effective_config(&restored_config) {
+                    let (after, load_error) = match context.effective_config_with(&restored_config, &previewed) {
                         Ok(after) => (after, None),
                         Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}"))),
                     };
+                    let stored = !security.is_empty();
+                    if stored {
+                        note_config_before_request(context);
+                    }
                     let change = access::begin_access_change(context, &config_before, &after, "audit-undo")?;
+                    access::store_access_changes(context, security, &previewed, &change, "audit-undo")?;
+                    // The store's write-back changed registry members: the restored file keeps them as they are now.
+                    access::keep_stored_members(context, &mut restored_config)?;
+                    let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
                     planned = Some((after, load_error, change));
-                    unchanged_config = access::config_snapshot(context);
+                    // Once the store holds the change, a failed file write keeps the pending revocation.
+                    unchanged_config = if stored { Value::Null } else { access::config_snapshot(context) };
                     text
                 } else {
                     old

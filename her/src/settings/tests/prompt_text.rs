@@ -356,11 +356,11 @@ fn prompt_text_settings_page_edits_text_in_a_text_area() {
     assert_eq!(rule["kind"], json!({"type": "text", "maxChars": 2000}));
     assert!(rule["default"].as_str().unwrap().starts_with("【别像客服】你不是客服："), "{rule}");
     assert!(
-        page.contains("s.kind.type==='text'") && page.contains("createElement(text?'textarea':'input')"),
+        page.contains("const text=type==='text'") && page.contains("createElement(text?'textarea':'input')"),
         "a text setting is edited in a text area"
     );
     assert!(
-        page.contains("value:integer?Number(input.value):input.value"),
+        page.contains("type==='integer'?Number(input.value):") && page.contains("type==='owner id'?input.value.trim():input.value"),
         "a text setting is sent as typed, an integer as a number"
     );
     assert!(!page.contains("innerHTML"), "text is never parsed as HTML");

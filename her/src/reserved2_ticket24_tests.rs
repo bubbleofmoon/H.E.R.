@@ -14,11 +14,11 @@ async fn a_revoked_then_regranted_conversation_never_runs_its_queued_wake() {
     let (revoked, kept) = ("group:420042", "group:420043");
     // Both conversations have a queued wake and awaited ingress. Revoke one, then undo it, all
     // before the scheduler's next tick.
-    let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}})));
+    let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let (_, recent) = crate::console::admin_request(&hub.context, "GET", "/api/audit/recent", None);
     let id = recent["entries"][0]["id"].clone();
-    let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/audit/undo", Some(&json!({"id": id})));
+    let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert!(crate::console::inbound_admitted(&hub.context.load_config().unwrap(), revoked), "undo restored access");
     hub.tick("bot", 9001).await.unwrap();
@@ -171,11 +171,11 @@ async fn a_wake_whose_token_changed_while_it_waited_for_the_journal_is_not_dispa
     let admin = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let result = tokio::task::spawn_blocking(move || {
-            let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}})));
+            let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}, "confirm": true})));
             assert_eq!(status, 200, "{reply}");
             let (_, recent) = crate::console::admin_request(&context, "GET", "/api/audit/recent", None);
             let id = recent["entries"][0]["id"].clone();
-            let (status, reply) = crate::console::admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": id})));
+            let (status, reply) = crate::console::admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
             assert_eq!(status, 200, "{reply}");
         })
         .await;

@@ -3,7 +3,7 @@
 //! (`console_changes`, `apply_changes`, `keep_file_members`, `keep_registry_values`, `registry_free`). The module root
 //! (`settings.rs`) re-exports what callers use; the contract is described there.
 
-use super::{find, registry, Setting};
+use super::{find, registry, Setting, OWNER};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -35,6 +35,11 @@ thread_local! {
     /// Makes the next write of `config.json` by the settings on this thread (a `write_back` that would change it, or an
     /// undo's `remove_from_config`) fail before it writes, as a full disk or a crash before that write would.
     pub(crate) static FAIL_WRITE_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next store write on this thread panic just before its commit, as a crash there would (#154).
+    pub(crate) static PANIC_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next look at an undo's entry (`preview`) on this thread fail as a store that cannot be read right now
+    /// would (503); the look after it succeeds (#154).
+    pub(crate) static FAIL_UNDO_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
@@ -98,13 +103,14 @@ fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
     }
 }
 
-/// Puts each stored value at its registry pointer in `document`. Returns whether `document` changed and the keys
-/// whose pointer passes through a non-object (left in place).
+/// Puts each stored value at its registry pointer in `document`, unless the member the setting reads there already
+/// holds it (`SettingKind::file_holds`: an id list's digit strings or alias spelling stay as they are). Returns whether
+/// `document` changed and the keys whose pointer passes through a non-object (left in place).
 fn place(document: &mut Value, stored: Vec<(&'static Setting, Value)>) -> (bool, Vec<&'static str>) {
     let mut changed = false;
     let mut blocked = Vec::new();
     for (setting, value) in stored {
-        if document.pointer(setting.pointer) == Some(&value) {
+        if setting.found_in(document).is_some_and(|found| setting.kind.file_holds(found, &value)) {
             continue;
         }
         if set_at(document, setting.pointer, value) {
@@ -441,7 +447,7 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
             Some(value) => values.push((setting, value)),
             None if setting.kind.text_default().is_some() => {
                 report_refused_text(setting.key);
-                if let Some(value) = last_good(&conn, setting, |_| true) {
+                if let Some(value) = last_good(conn, setting, |_| true) {
                     values.push((setting, value));
                 }
             }
@@ -674,35 +680,58 @@ fn keep_pre_settings_copy(context: &RuntimeContext) -> Result<(), String> {
 /// revision 1 and one audit row each (actor `system`, source `migration`, one request id for the batch). A value the
 /// registry refuses is not copied, and a later write checks it again. So the first write seeds the store, a setting a
 /// later release adds is seeded by the first write after the upgrade, and nothing is seeded twice. A seeded value's
-/// one audit row keeps `record_change`'s revision rule: no revision is ever reused.
-fn seed(conn: &Connection, document: &Value, at: i64) -> Result<(), String> {
+/// one audit row keeps `record_change`'s revision rule: no revision is ever reused. The value is the kind's
+/// (`SettingKind::seed`) of the member the setting reads (`Setting::found_in`, an alias spelling included).
+///
+/// A security setting (#154, `Setting::confirmed`) is seeded only by a write of itself (`written` names the keys the
+/// write changes), so a write of another setting never takes the access lists over from `config.json`, and its first
+/// change's undo restores the file's value. When `config.json` holds a value for it that the store cannot keep (an id
+/// list over its limit, an owner that is not an id), that write is 409 and nothing is written: its undo could not
+/// restore the file's value.
+fn seed(conn: &Connection, document: &Value, at: i64, written: &[&'static str]) -> Result<(), (u16, String)> {
+    let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
     let request = request_id(at);
     for setting in registry() {
-        let Some(value) = document.pointer(setting.pointer).and_then(|value| setting.normalize(value)) else {
+        let own_write_only = setting.confirmed();
+        if own_write_only && !written.contains(&setting.key) {
             continue;
-        };
+        }
+        let Some(found) = setting.found_in(document) else { continue };
         let known: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1) OR EXISTS(SELECT 1 FROM settings_audit WHERE key=?1)",
                 [setting.key],
                 |row| row.get(0),
             )
-            .map_err(|_| STORAGE_ERROR.to_string())?;
+            .map_err(failed)?;
         if known {
             continue;
         }
+        let Some(value) = setting.kind.seed(found) else {
+            if own_write_only {
+                return Err((
+                    409,
+                    format!(
+                        "config.json holds a value of {} the settings store cannot keep ({}); correct it there first",
+                        setting.key,
+                        setting.refusal(found)
+                    ),
+                ));
+            }
+            continue;
+        };
         let text = value.to_string();
         conn.execute(
             "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, 1, ?3, ?4)",
             params![setting.key, text, at, SEED_ACTOR],
         )
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(failed)?;
         conn.execute(
             "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
              VALUES(?1, ?2, 'migration', 'global', ?3, NULL, ?4, ?5)",
             params![at, SEED_ACTOR, setting.key, text, request],
         )
-        .map_err(|_| STORAGE_ERROR.to_string())?;
+        .map_err(failed)?;
     }
     Ok(())
 }
@@ -831,10 +860,12 @@ fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(),
 /// seed included, otherwise. After the commit the stored values are read on the same connection, so its read-write
 /// close is the store's last and leaves no `-wal` or `-shm`; with the connection closed and the store gate released
 /// they are written back into `config.json` (`write_back_values`). The second value says why `config.json` does not
-/// hold every stored value (`None` when it does); the stored change stands either way.
+/// hold every stored value (`None` when it does); the stored change stands either way. `written` names the keys the
+/// write changes, for the seed of the security settings (`seed`).
 fn write_store<T>(
     context: &RuntimeContext,
     existing_only: bool,
+    written: &[&'static str],
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
@@ -849,8 +880,12 @@ fn write_store<T>(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-        seed(&tx, &document, now_ms()).map_err(unavailable)?;
+        seed(&tx, &document, now_ms(), written)?;
         let result = write(&tx)?;
+        #[cfg(test)]
+        if PANIC_BEFORE_COMMIT.with(|panic| panic.replace(false)) {
+            panic!("settings: simulated crash before the store commit");
+        }
         tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
         // Read on this connection, so its read-write close below stays the store's last close and removes the WAL and
         // its index. A failed read is a write-back error, reported in the reply; the committed write stands.
@@ -951,7 +986,7 @@ fn store(
     source: &str,
 ) -> Result<Applied, (u16, String)> {
     let text = value.to_string();
-    let (applied, mirror_error) = write_store(context, false, |conn| {
+    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn| {
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -997,12 +1032,20 @@ pub(crate) struct Undone {
 /// audit row names that setting, the stored value is still the entry's new value and the registry still accepts the
 /// entry's old value. An undo that removes the stored value also removes the setting's member from `config.json`
 /// before the commit (`remove_from_config`); when that write fails the undo is 503 and writes nothing. An entry that
-/// does not exist, and any entry while there is no store yet, is 404 (and creates no store).
-pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<Undone, (u16, String)> {
+/// does not exist, and any entry while there is no store yet, is 404 (and creates no store). `permit` is asked, inside the
+/// transaction, about the setting the entry names; its error refuses the undo with nothing written (#154: the console's
+/// plain path, which looked at the entry before it existed or before it was known, refuses a security setting here).
+pub(crate) fn undo(
+    context: &RuntimeContext,
+    entry: i64,
+    actor: &str,
+    permit: &dyn Fn(&Setting) -> Result<(), (u16, String)>,
+) -> Result<Undone, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let (undone, mirror_error) = write_store(context, true, |conn| {
+    // An undone setting has audit rows, which the seed skips, so an undo names no key to seed.
+    let (undone, mirror_error) = write_store(context, true, &[], |conn| {
         let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
         let row: Option<(String, String, String, Option<String>, Option<String>)> = conn
             .query_row(
@@ -1016,6 +1059,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
         let setting = find(&key)
             .filter(|_| scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+        permit(setting)?;
         let later: i64 = conn
             .query_row(
                 "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1 AND id>?2",
@@ -1146,9 +1190,10 @@ pub(crate) fn console_changes(
     let now = overlay(context, base.clone());
     let mut changes = Vec::new();
     for setting in registry() {
-        let Some(posted) = carried.pointer(setting.pointer).filter(|value| !value.is_null()) else { continue };
+        // The member the setting reads (`Setting::found_in`), so an id list sent under its alias spelling counts.
+        let Some(posted) = setting.found_in(carried).filter(|value| !value.is_null()) else { continue };
         let Some(value) = setting.normalize(posted) else {
-            if base.pointer(setting.pointer) == Some(posted) {
+            if setting.found_in(base) == Some(posted) {
                 continue;
             }
             return Err((400, setting.refusal(posted)));
@@ -1177,7 +1222,8 @@ pub(crate) fn apply_changes(
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let ((), mirror_error) = write_store(context, false, |conn| {
+    let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
+    let ((), mirror_error) = write_store(context, false, &written, |conn| {
         for (setting, value) in &changes {
             let text = value.to_string();
             let old = stored_row(conn, setting.key)?;
@@ -1235,14 +1281,16 @@ fn remove_at(document: &mut Value, pointer: &str) {
     }
 }
 
-/// `document` as the console audit compares a configuration: every registry pointer removed, and above it every member
-/// on its path that is missing, null or an empty object (null and empty read as absent, `set_at` fills them), from the
-/// deepest to the shallowest, up to the first member that holds something; the members of every object in sorted
-/// order, so its serialization is canonical. Registry members belong to the store and are never undone through the
-/// audit, so a settings write-back is no change of the audited file.
+/// `document` as the console audit compares a configuration: every registry pointer but the security settings'
+/// removed, and above it every member on its path that is missing, null or an empty object (null and empty read as
+/// absent, `set_at` fills them), from the deepest to the shallowest, up to the first member that holds something; the
+/// members of every object in sorted order, so its serialization is canonical. Registry members belong to the store and
+/// are never undone through the audit, so a settings write-back is no change of the audited file. The security settings
+/// (#154) stay: an audit undo restores them through the store (`security_restore`), so any later change of one, on the
+/// settings page included, makes an older record stale.
 pub(crate) fn registry_free(document: &Value) -> Value {
     let mut stripped = document.clone();
-    for setting in registry() {
+    for setting in registry().filter(|setting| !setting.confirmed()) {
         remove_at(&mut stripped, setting.pointer);
         let mut below = setting.pointer;
         while let Some((above, _)) = below.rsplit_once('/') {
@@ -1275,8 +1323,10 @@ fn sorted(value: Value) -> Value {
 }
 
 /// Every registry setting with its label, hint, group, when it applies, type and bounds (`SettingKind::view`), default,
-/// stored value (`null` when none) and `value`, what the next use reads (`Setting::read`; `null` for a model id that is
-/// not configured). `storeError` says why stored values are not applied.
+/// stored value (`null` when none), `value`, what the next use reads (`Setting::read`; `null` for a model id that is
+/// not configured or for no owner), and `confirm: true` for a security setting (#154). `storeError` says why stored
+/// values are not applied. While the admin agent mode puts another owner in force (`RuntimeContext::load_config`), the
+/// owner's entry has `overriddenBy` with that owner.
 pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
@@ -1286,11 +1336,12 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         Ok(stored) => (stored, None),
         Err(error) => (Vec::new(), Some(error)),
     };
+    let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
     let settings: Vec<Value> = registry()
         .map(|setting| {
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
             let value = setting.read(&document);
-            json!({
+            let mut entry = json!({
                 "key": setting.key,
                 "group": setting.group,
                 "label": setting.label,
@@ -1300,7 +1351,14 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 "default": setting.default_value(),
                 "stored": stored_value,
                 "value": value,
-            })
+            });
+            if setting.confirmed() {
+                entry["confirm"] = json!(true);
+            }
+            if let Some(owner) = effective_owner.as_ref().filter(|owner| setting.key == OWNER.key && **owner != value) {
+                entry["overriddenBy"] = json!({"source": "admin agent mode", "value": owner});
+            }
+            entry
         })
         .collect();
     let mut reply = json!({"ok": true, "settings": settings});
@@ -1308,4 +1366,123 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         reply["storeError"] = json!(error);
     }
     Ok(reply)
+}
+
+/// #154: the security settings a console audit undo restores from `restored`, the whole `config.json` of a backup:
+/// each security setting whose value there, as the next use would read it (`Setting::read`: a missing member is the
+/// default), differs from the value in effect (`current`, the stored `config.json` the undo read under the
+/// configuration gate, with the stored values applied), paired with the value the store keeps. A value the store
+/// cannot keep (an id list over its limit) is 409, before anything is written. The undo stores them
+/// (`apply_changes`) after it recorded its revocation; every other registry setting keeps its current value. A legacy
+/// context has none.
+pub(crate) fn security_restore(
+    context: &RuntimeContext,
+    current: &Value,
+    restored: &Value,
+) -> Result<Vec<(&'static Setting, Value)>, (u16, String)> {
+    if !context.is_isolated() {
+        return Ok(Vec::new());
+    }
+    let now = overlay(context, current.clone());
+    let mut changes = Vec::new();
+    for setting in registry().filter(|setting| setting.confirmed()) {
+        let value = setting.read(restored);
+        if value == setting.read(&now) {
+            continue;
+        }
+        let value = setting.storable(&value).ok_or_else(|| {
+            (409, format!("the backup's {} cannot be stored ({}); nothing was undone", setting.key, setting.refusal(&value)))
+        })?;
+        changes.push((setting, value));
+    }
+    Ok(changes)
+}
+
+/// #154: one change on the settings routes, previewed (`preview`) before an access change records its revocation.
+pub(crate) enum Change<'a> {
+    Set { key: &'a str, value: &'a Value },
+    Reset { key: &'a str },
+    Undo { entry: i64 },
+}
+
+/// #154: what `change` would store, without writing: for a set the accepted value (400 with the refusal otherwise),
+/// for a reset the default, for an undo the entry's old value as the store keeps it, or `None` when the undo would
+/// remove the stored value. An unknown setting is 400; an unknown entry, and any entry while there is no store yet, is
+/// 404; an entry whose setting the registry no longer has is 409. Read through the inspection's read-only connection.
+/// The caller holds the configuration gate, so no other writer changes the store before its own write, which checks
+/// everything again.
+pub(crate) fn preview(
+    context: &RuntimeContext,
+    change: &Change<'_>,
+) -> Result<Vec<(&'static Setting, Option<Value>)>, (u16, String)> {
+    match change {
+        Change::Set { key, value } => {
+            let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+            let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
+            Ok(vec![(setting, Some(value))])
+        }
+        Change::Reset { key } => {
+            let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+            Ok(vec![(setting, Some(setting.default_value()))])
+        }
+        Change::Undo { entry } => {
+            #[cfg(test)]
+            if FAIL_UNDO_LOOK.with(|fail| fail.replace(false)) {
+                return Err((503, STORAGE_ERROR.to_string()));
+            }
+            let conn = match inspect(context).map_err(|error| (503, error))? {
+                Inspection::Missing | Inspection::Fresh => return Err((404, UNKNOWN_ENTRY_ERROR.to_string())),
+                Inspection::Ready(conn) => conn,
+            };
+            let row: Option<(String, Option<String>)> = conn
+                .query_row("SELECT key, old_value FROM settings_audit WHERE id=?1", [entry], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()
+                .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+            let (key, old) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
+            let setting = find(&key).ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+            let restored = old
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|value| setting.storable(&value));
+            Ok(vec![(setting, restored)])
+        }
+    }
+}
+
+/// #154: puts each previewed change at its registry pointer in `document`: a value is set (missing or null objects on
+/// the way are created), `None` removes the member, so the file's own value or the default applies again.
+pub(crate) fn place_changes(document: &mut Value, changes: &[(&'static Setting, Option<Value>)]) {
+    for (setting, value) in changes {
+        match value {
+            Some(value) => {
+                set_at(document, setting.pointer, value.clone());
+            }
+            None => remove_at(document, setting.pointer),
+        }
+    }
+}
+
+/// #154: whether the store holds any of `changes` (`None`: no stored value) as its stored value now, after a failed
+/// write: a commit the caller did not see succeed. A store that cannot be read is an error.
+pub(crate) fn holds_any(context: &RuntimeContext, changes: &[(&'static Setting, Option<Value>)]) -> Result<bool, String> {
+    let stored = stored_values(context)?;
+    Ok(changes.iter().any(|(setting, value)| {
+        let now = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value);
+        now == value.as_ref()
+    }))
+}
+
+/// #154: the newest audit row id, a mark that changes with every stored change, for what the console keys on the
+/// configuration (`console_access.rs`). A legacy context and no store yet are 0; a store that cannot be read is `None`.
+pub(crate) fn store_mark(context: &RuntimeContext) -> Option<i64> {
+    if !context.is_isolated() {
+        return Some(0);
+    }
+    match inspect(context).ok()? {
+        Inspection::Missing | Inspection::Fresh => Some(0),
+        Inspection::Ready(conn) => {
+            conn.query_row("SELECT coalesce(max(id), 0) FROM settings_audit", [], |row| row.get(0)).ok()
+        }
+    }
 }
