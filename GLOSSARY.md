@@ -103,6 +103,10 @@ _Avoid_: preset, tool whitelist, tool guard
 One way the harness reaches a model: a route id, the relay model it asks, its reasoning effort and its output limit. A conversation's candidate chain lists routes in order; when one fails, the next takes over.
 _Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
 
+**One-shot job (单次模型作业, `harness::one_shot`)**:
+A harness job that asks one model route for one answer, with no tools and no history: the digest and slang learning.
+_Avoid_: turn, agent run, session
+
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.
 _Avoid_: dependency (a process the supervisor runs), fork, vendor
