@@ -23,10 +23,12 @@ pub(crate) enum Profile {
     Reserved2,
     /// `reserved2` mode: the owner's private chat.
     Reserved2Owner,
-    /// The nightly digest (#11 moves it onto the harness).
+    /// The nightly digest's menu. The digest runs as a tool-less one-shot job (`harness/one_shot.rs`), so this row
+    /// is not used yet.
     #[cfg_attr(not(test), allow(dead_code))]
     Digest,
-    /// The slang learner's research (#11 moves it onto the harness).
+    /// The slang learner's research menu with the read-only web tools. Slang learning runs as a tool-less one-shot
+    /// job (`harness/one_shot.rs`), so this row is not used yet.
     #[cfg_attr(not(test), allow(dead_code))]
     SlangLearner,
 }

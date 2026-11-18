@@ -2497,20 +2497,6 @@ fn hotfix81_dsh_empty_answer_alerts_owner_without_a_conversation_send() {
     assert_eq!(rig.texts_to(OWNER_KEY).len(),1);
 }
 
-#[test]
-fn hotfix81_slang_backend_refusal_only_notifies_the_owner() {
-    let rig=Rig::new("hotfix81-slang-refusal",Seed{config:json!({"slang":{"enabled":true,"learnerBackend":"dsh","learnerPreset":"ticket12-chat","extractMinMessages":1,"autoResearch":false}}),..Seed::default()});
-    fs::write(rig.root.join("data/slang-windows.json"),json!({"windows":{GROUP_KEY:[{"sender":"tester","text":"#REFUSE83# CHAT_SECRET_SLANG","time":1}]},"consumedAt":{}}).to_string()).unwrap();
-    assert_eq!(rig.console("POST","/api/slang/extract",Some(&json!({"key":GROUP_KEY}))).0,200);
-    rig.wait_texts(OWNER_KEY,1);
-    let alerts=rig.texts_to(OWNER_KEY);
-    assert_eq!(alerts.len(),1);
-    assert!(alerts[0].contains(GROUP_KEY)&&alerts[0].contains("class=refusal")&&!alerts[0].contains("CHAT_SECRET_SLANG"),"{alerts:?}");
-    assert!(rig.texts_to(GROUP_KEY).is_empty());
-    assert!(rig.texts_to("private:7707").is_empty());
-    assert!(rig.data_json("slang.json").as_array().is_none_or(|entries|entries.is_empty()),"failed model output never becomes slang content");
-}
-
 #[cfg(windows)]
 #[test]
 fn hotfix81_cli_timeout_sends_one_owner_alert_and_no_refusal_record() {

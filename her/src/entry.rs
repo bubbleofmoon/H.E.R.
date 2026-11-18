@@ -2297,7 +2297,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     let slang_auto = live_mode && slang_enabled;
     let slang_learning = slang_learn::SlangLearning::new(&runtime_context);
     if slang_auto {
-        slang_learning.start_dsh_watch();
+        slang_learning.start_catch_up();
     }
 
     let mut events = 0u64;
