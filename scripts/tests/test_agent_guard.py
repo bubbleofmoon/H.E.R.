@@ -319,6 +319,12 @@ DENIED_EVERY_ROLE = [
     ('wt', '{home}/scripts/codex-task.sh 1-self-1 /root/her-vault {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),  # workdir is not this worktree
     ('wt', '{home}/scripts/codex-task.sh 1-self-1 {repo} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),  # workdir is the repository, not this worktree
     ('wt', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {repo} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
+    # the exact allowed forms with only the model changed: the pinned-model check is the one that refuses
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
+    # the exact allowed forms with only the model changed: the pinned-model check is the one that refuses
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.1-sol high read-only'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.1-sol -Effort high -Sandbox read-only'),
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),

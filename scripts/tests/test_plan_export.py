@@ -25,6 +25,13 @@ GIT_ENV = {
 }
 
 
+def clean_env():
+    """This process's environment without any GIT_* variable (as test_agent_guard.py does), plus the fixed identity."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(GIT_ENV)
+    return env
+
+
 class Export:
     """Shared cases; a subclass supplies launcher(), command(ticket, replace) and the orch folder."""
 
@@ -49,13 +56,13 @@ class Export:
         self.scratch = self.orch / '77' / 'scratch'
 
     def git(self, *args):
-        done = subprocess.run(['git', *args], cwd=self.repo, env={**os.environ, **GIT_ENV},
+        done = subprocess.run(['git', *args], cwd=self.repo, env=clean_env(),
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout.strip()
 
     def run_export(self, ticket='77', replace=False):
-        done = subprocess.run(self.command(ticket, replace), cwd=self.repo, env={**os.environ, **GIT_ENV},
+        done = subprocess.run(self.command(ticket, replace), cwd=self.repo, env=clean_env(),
                               capture_output=True, text=True, timeout=120)
         return done.returncode, done.stdout + done.stderr
 
@@ -94,6 +101,28 @@ class Export:
         self.assertFalse((self.scratch / 'stale.txt').exists())
         self.assertFalse(evidence.exists())
         self.assertEqual((self.scratch / 'a.txt').read_text(), 'main a\n')
+
+    def test_replace_that_cannot_delete_everything_fails_and_exports_nothing(self):
+        stuck = self.scratch / 'sub' / 'stuck.txt'
+        stuck.parent.mkdir(parents=True)
+        stuck.write_text('old\n', encoding='utf-8')
+        self.lock(stuck)
+        code, out = self.run_export(replace=True)
+        self.assertNotEqual(code, 0, out)
+        self.assertIn('could not delete', out)
+        self.assertTrue(stuck.exists())
+        self.assertFalse((self.scratch / 'a.txt').exists())
+
+    def lock(self, stuck):
+        """Make `stuck` undeletable (read-only folder, or the immutable flag when running as root); skip if neither works."""
+        folder = stuck.parent
+        if os.geteuid() != 0:
+            folder.chmod(0o555)
+            self.addCleanup(folder.chmod, 0o755)
+            return
+        if not shutil.which('chattr') or subprocess.run(['chattr', '+i', str(stuck)], capture_output=True).returncode:
+            self.skipTest('cannot make a file undeletable as root here')
+        self.addCleanup(subprocess.run, ['chattr', '-i', str(stuck)], capture_output=True)
 
     def test_stale_scratch_evidence_alone_is_refused(self):
         evidence = self.orch / '77' / 'scratch-evidence'

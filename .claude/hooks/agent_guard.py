@@ -24,7 +24,7 @@ stay inside their word. Publishing and moving refs pass only as exact whole comm
   `gh workflow run quick.yml --ref <cwd branch> -f target=<x> [-f filter=<y>] [-f os=linux|windows]`, where <cwd branch>
   is the branch checked out in the effective folder (after an optional `cd <dir> &&`): this stops a mistyped or foreign
   ref, not a `cd` into another worktree (the guard has no ticket binding: T1/T2 in docs/agents/coordinator.md, containment
-  is #85); a second dispatch of the same ref, target, os and filter cancels the first run; a session that does not start in its
+  is #85); a second dispatch of the same ref, target, os and filter cancels the first run (the guard refuses the sha input); a session that does not start in its
   worktree needs the `cd`;
 - Codex only as the implementer's self-review through /root/her/scripts/codex-task.sh or C:/her/scripts/codex-task.ps1
   with gpt-6.2-astra, high and read-only, its own worktree as the workdir and

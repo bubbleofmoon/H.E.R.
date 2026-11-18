@@ -25,6 +25,13 @@ GIT_ENV = {
 }
 
 
+def clean_env():
+    """This process's environment without any GIT_* variable (as test_agent_guard.py does), plus the fixed identity."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(GIT_ENV)
+    return env
+
+
 def step_script(name):
     """The `run: |` body of the named step."""
     lines = WORKFLOW.read_text(encoding='utf-8').splitlines()
@@ -41,7 +48,12 @@ def step_script(name):
 class Concurrency(unittest.TestCase):
     def test_group_names_ref_target_os_and_filter(self):
         text = WORKFLOW.read_text(encoding='utf-8')
-        self.assertIn('group: quick-${{ github.ref }}-${{ inputs.target }}-${{ inputs.os }}-${{ inputs.filter }}', text)
+        self.assertIn('group: quick-${{ github.ref }}-${{ inputs.target }}-${{ inputs.os }}-${{ inputs.filter }}-${{ inputs.sha }}', text)
+
+    def test_run_name_keeps_the_plain_title_and_appends_the_sha_only_when_set(self):
+        text = WORKFLOW.read_text(encoding='utf-8')
+        self.assertIn("run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.filter }}"
+                      "${{ inputs.sha && format(' sha={0}', inputs.sha) || '' }}\n", text)
 
     def test_sha_is_an_optional_input(self):
         text = WORKFLOW.read_text(encoding='utf-8')
@@ -66,7 +78,7 @@ class FetchSource(unittest.TestCase):
         self.tree = self.tmp / 'tree'
 
     def git(self, cwd, *args):
-        done = subprocess.run(['git', *args], cwd=cwd, env={**os.environ, **GIT_ENV},
+        done = subprocess.run(['git', *args], cwd=cwd, env=clean_env(),
                               capture_output=True, text=True, check=True)
         return done.stdout.strip()
 
@@ -77,7 +89,7 @@ class FetchSource(unittest.TestCase):
         return self.git(self.server, 'rev-parse', 'HEAD')
 
     def fetch(self, sha=''):
-        env = {**os.environ, **GIT_ENV, 'PUBLIC_TREE': str(self.tree), 'QUICK_SHA': sha, 'GITHUB_SHA': self.second,
+        env = {**clean_env(), 'PUBLIC_TREE': str(self.tree), 'QUICK_SHA': sha, 'GITHUB_SHA': self.second,
                'GITHUB_REF': 'refs/heads/main', 'GITHUB_REPOSITORY': 'owner/repo',
                'GITHUB_SERVER_URL': (self.tmp / 'srv').as_uri()}
         return subprocess.run([BASH, '-e', '-c', step_script('Fetch source')], env=env, capture_output=True, text=True)
@@ -109,6 +121,19 @@ class FetchSource(unittest.TestCase):
         done = self.fetch(self.side)
         self.assertNotEqual(done.returncode, 0)
         self.assertIn('not an ancestor', done.stdout + done.stderr)
+
+    def test_commit_already_in_the_tree_but_outside_the_ref_history_fails(self):
+        # The side commit is fetched before the step runs, so only the ancestry clause can refuse it.
+        self.tree.mkdir()
+        self.git(self.tree, 'init', '-q')
+        self.git(self.tree, 'fetch', '-q', str(self.server), 'side')
+        self.assertEqual(self.git(self.tree, 'rev-parse', '--verify', f'{self.side}^{{commit}}'), self.side)
+        done = self.fetch(self.side)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn('not an ancestor', done.stdout + done.stderr)
+        head = subprocess.run(['git', 'rev-parse', '-q', '--verify', 'HEAD'], cwd=self.tree, env=clean_env(),
+                              capture_output=True, text=True)
+        self.assertNotEqual(head.stdout.strip(), self.side)
 
     def test_unknown_sha_fails(self):
         done = self.fetch('abcdef' * 6 + 'abcd')

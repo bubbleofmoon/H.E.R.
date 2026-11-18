@@ -23,6 +23,13 @@ GIT_ENV = {
     'GIT_COMMITTER_NAME': 'Merge Test', 'GIT_COMMITTER_EMAIL': 'merge.test@example.invalid',
 }
 
+
+def clean_env():
+    """This process's environment without any GIT_* variable (as test_agent_guard.py does), plus the fixed identity."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+    env.update(GIT_ENV)
+    return env
+
 BASE = '''pub fn one() -> u8 {
     1
 }
@@ -70,7 +77,7 @@ class MergeCheck(unittest.TestCase):
         self.git('commit', '-q', '-am', 'ours')
 
     def git(self, *args, check=True):
-        done = subprocess.run(['git', *args], cwd=self.repo, env={**os.environ, **GIT_ENV},
+        done = subprocess.run(['git', *args], cwd=self.repo, env=clean_env(),
                               capture_output=True, text=True)
         if check and done.returncode:
             self.fail(f'git {args}: {done.stderr}')
@@ -84,7 +91,7 @@ class MergeCheck(unittest.TestCase):
 
     def check(self, *args):
         done = subprocess.run([sys.executable, '-I', str(SCRIPT), *args], cwd=self.repo,
-                              capture_output=True, text=True)
+                              env=clean_env(), capture_output=True, text=True)
         return done.returncode, done.stdout + done.stderr
 
     def start_merge(self):

@@ -3,7 +3,7 @@
 #   <name>.report.md (last message), <name>.out.log, <name>.err.log, <name>.exit.txt (numeric code, "timeout",
 # or "no-report" / "quota" when no report was written; the latter two exit non-zero).
 # usage: scripts/codex-task.sh <name> <worktree> <prompt-file> [model] [effort] [sandbox] [timeout-minutes]
-# Defaults: gpt-6.2-astra, max, workspace-write, 360 (terra failed once, 2026-10-31; Claude Opus is the fallback).
+# Defaults: gpt-6.2-astra, max, none, 360.
 # workspace-write gets loopback/network access (tests and parity runners bind local ports) and write access to
 # the build/cache/lock directories. Codex cannot write git metadata: it leaves changes uncommitted and the
 # coordinator commits them. Sandbox `none` is the default (user decision 2026-11-03) and runs without

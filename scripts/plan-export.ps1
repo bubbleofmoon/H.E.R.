@@ -21,7 +21,17 @@ foreach ($folder in $scratch, $evidence) {
     exit 1
   }
 }
-if ($Replace) { Remove-Item -LiteralPath $scratch, $evidence -Recurse -Force -ErrorAction SilentlyContinue }
+if ($Replace) {
+  foreach ($folder in $scratch, $evidence) {
+    if (Test-Path -LiteralPath $folder) {
+      try { Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction Stop } catch { [Console]::Error.WriteLine("plan-export: $($_.Exception.Message)") }
+    }
+    if ((Test-Path -LiteralPath $folder) -and (Get-ChildItem -LiteralPath $folder -Force | Select-Object -First 1)) {
+      [Console]::Error.WriteLine("plan-export: could not delete everything in $folder")
+      exit 1
+    }
+  }
+}
 $null = New-Item -ItemType Directory -Path $scratch -Force
 $tar = Join-Path $dir 'scratch-export.tar'
 try {

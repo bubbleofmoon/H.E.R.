@@ -22,7 +22,15 @@ for folder in "$scratch" "$evidence"; do
     fi
   fi
 done
-if [ "$replace" = --replace ]; then rm -rf -- "$scratch" "$evidence"; fi
+if [ "$replace" = --replace ]; then
+  rm -rf -- "$scratch" "$evidence"
+  for folder in "$scratch" "$evidence"; do
+    if [ -n "$(ls -A -- "$folder" 2>/dev/null)" ]; then
+      echo "plan-export: could not delete everything in $folder" >&2
+      exit 1
+    fi
+  done
+fi
 mkdir -p -- "$scratch"
 if ! git -C "$repo" archive --format=tar "$commit" | tar -x -C "$scratch"; then
   rm -rf -- "$scratch"

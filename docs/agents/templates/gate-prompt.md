@@ -1,6 +1,6 @@
 # Gate prompt template
 
-Reach for this for each round of a merge gate, whether Codex or a `ticket-reviewer` runs it. Round 1 runs at effort `high` over the whole ticket diff; rounds 2 and 3 run at `medium` over the fix only. Fill the angle-bracket fields, keep the lines for the round and delete the other round's, and save the prompt as the gate's prompt file.
+Reach for this for each round of a merge gate, whether Codex or a `ticket-reviewer` runs it. Codex runs round 1 at effort `high` over the whole ticket diff and rounds 2 and 3 at `medium` over the fix only; a `ticket-reviewer` runs every round at the effort in its definition (`medium`) with the same scope. Fill the angle-bracket fields, keep the lines for the round and delete the other round's, and save the prompt as the gate's prompt file.
 
 ```
 Head: <head sha>
