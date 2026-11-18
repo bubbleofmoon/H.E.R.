@@ -318,7 +318,8 @@ fn ancestors_checked(
 /// Checks one entry before its permissions change: outside any protected root, no redirected
 /// part, a regular file or directory, and on Unix owned by this account with one link.
 /// `Ok(None)` when a listed entry vanished: the OS reports the entry itself missing, also after a
-/// guard failed or an ancestor reported missing because the entry was removed meanwhile. Any other
+/// guard failed, an ancestor reported missing or the ownership check failed (Unix: the entry was
+/// unlinked as its metadata was read) because the entry was removed meanwhile. Any other
 /// read failure refuses. The version folder itself (`listed == false`) must exist.
 fn inspect(path: &Path, listed: bool) -> Result<Option<std::fs::Metadata>, String> {
     inspect_with(path, listed, &|entry| std::fs::symlink_metadata(entry))
@@ -363,6 +364,12 @@ fn inspect_with(
     {
         use std::os::unix::fs::MetadataExt;
         if meta.uid() != unsafe { libc::geteuid() } || (meta.is_file() && meta.nlink() != 1) {
+            // The lookup can find an entry that is unlinked before its attributes are read: the
+            // metadata then comes from the unlinked inode with a link count of 0. That is a
+            // vanished entry, not a second link or another owner.
+            if listed && (meta.nlink() == 0 || gone(path)) {
+                return Ok(None);
+            }
             return Err("relay private files must belong only to the HER account".into());
         }
     }
