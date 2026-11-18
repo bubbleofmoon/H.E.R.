@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory)][string]$Name,
   [Parameter(Mandatory)][string]$WorkDir,
   [Parameter(Mandatory)][string]$PromptFile,
-  [string]$Model = 'gpt-6-astra',
+  [string]$Model = 'gpt-6.2-astra',
   [string]$Effort = 'high',
   [ValidateSet('workspace-write', 'read-only', 'none')][string]$Sandbox = 'none',
   [string[]]$AddDir = @('C:\her-orch', 'C:\her-targets', (Join-Path $env:USERPROFILE '.cargo')),
@@ -11,8 +11,8 @@ param(
 )
 
 # Windows counterpart of scripts/codex-task.sh. Runs one Codex CLI task hidden at BelowNormal and writes receipts
-# next to the prompt: <Name>.report.md (last message), <Name>.out.log, <Name>.err.log, <Name>.exit.txt (numeric code
-# or "timeout"; <Name>.stopped.txt when the run was stopped after its report). workspace-write gets loopback/network access and write access to -AddDir. Sandbox `none`
+# next to the prompt: <Name>.report.md (last message), <Name>.out.log, <Name>.err.log, <Name>.exit.txt (numeric code,
+# "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report). workspace-write gets loopback/network access and write access to -AddDir. Sandbox `none`
 # (the default, user decision 2026-11-03) runs without Codex's sandbox; pushes are made to fail through GIT_CONFIG_*
 # for this process tree. Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
 # After the run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
@@ -64,8 +64,9 @@ function Invoke-Cleanup {
   }
 }
 
-$process = Start-Process -FilePath $codex -ArgumentList $quoted -WindowStyle Hidden -PassThru `
-  -RedirectStandardInput $promptPath -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+$start = @{ FilePath = $codex; ArgumentList = $quoted; PassThru = $true; RedirectStandardInput = $promptPath; RedirectStandardOutput = $outLog; RedirectStandardError = $errLog }
+if ($IsWindows -ne $false) { $start.WindowStyle = 'Hidden' }  # PowerShell on Linux (the script tests) has no window style
+$process = Start-Process @start
 $null = $process.Handle  # keep the handle open so ExitCode is available after exit
 try { $process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
 
@@ -103,6 +104,14 @@ while (-not $process.WaitForExit(30000)) {
   }
 }
 $process.WaitForExit()
-Set-Content -LiteralPath $exitFile -Value ([string]$process.ExitCode) -Encoding ASCII
+$code = $process.ExitCode
+$state = [string]$code
+$written = Get-Item -LiteralPath $report -ErrorAction SilentlyContinue
+if (-not $written -or $written.Length -eq 0) {
+  # A run that left no report reviewed nothing: never a pass, whatever codex exited with.
+  $state = if (Select-String -LiteralPath $errLog -Pattern 'hit your usage limit' -Quiet) { 'quota' } else { 'no-report' }
+  if ($code -eq 0) { $code = 1 }
+}
+Set-Content -LiteralPath $exitFile -Value $state -Encoding ASCII
 Invoke-Cleanup
-exit $process.ExitCode
+exit $code
