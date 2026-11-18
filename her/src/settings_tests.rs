@@ -3437,10 +3437,10 @@ fn settings_console_config_page_refuses_a_non_canonical_file_before_the_store_ta
     let (root, context) = settings_fixture("settings console config non canonical");
     write_config(&root, |config| config["ownerQQ"] = json!(true));
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
-    let (status, reply) =
-        admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"reply": {"wakeQuietMs": 4500}})));
-    assert_eq!(status, 503, "{reply}");
-    assert_eq!(reply["error"], "runtime config is invalid", "{reply}");
+    // The router's front check refuses such a file before any console handler runs, so the handler is called directly:
+    // its own check must refuse before the store takes the change.
+    let reply = handle_social_config_post(&context, &json!({"reply": {"wakeQuietMs": 4500}}).to_string());
+    assert_eq!(reply, Err((503, "runtime config is invalid".to_string())));
     assert!(!settings_db(&root).exists(), "nothing is stored");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "nothing is written");
 }
@@ -3449,9 +3449,9 @@ fn settings_console_config_page_refuses_a_non_canonical_file_before_the_store_ta
 fn settings_console_config_page_saves_without_a_registry_change_on_a_non_canonical_file() {
     let (root, context) = settings_fixture("settings console config non canonical plain save");
     write_config(&root, |config| config["ownerQQ"] = json!(true));
-    let (status, reply) =
-        admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"autoReplyCheckMs": 5000})));
-    assert_eq!(status, 200, "{reply}");
+    // Called directly, as above: the handler runs no canonical check of its own when no registry setting changes.
+    let reply = handle_social_config_post(&context, &json!({"autoReplyCheckMs": 5000}).to_string());
+    assert!(reply.is_ok(), "{reply:?}");
     assert_eq!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 5000);
     assert!(!settings_db(&root).exists(), "no registry change, no store");
 }

@@ -6997,7 +6997,9 @@ fn handle_social_config_post(
     let settings_changes = crate::settings::console_changes(context, &file_before, &carried)?;
     if !settings_changes.is_empty() {
         // The store's write-back refuses a file the runtime cannot load, after the commit: refuse it before the store
-        // takes a change. A save without a registry change never runs this check (as before #177).
+        // takes a change. The router's front check already refuses such a file before any handler runs; this check
+        // covers an edit that lands after it and before the configuration gate is taken. A save without a registry
+        // change runs no canonical check of its own.
         raw_config_for_write(context)?;
         note_config_before_request(context);
     }
