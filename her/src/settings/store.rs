@@ -348,7 +348,7 @@ fn check_schema(conn: &Connection) -> Result<bool, String> {
                 .map_err(|_| STORAGE_ERROR.to_string())?;
             if objects == 0 { Ok(false) } else { Err(STORAGE_ERROR.to_string()) }
         }
-        version @ 1..=SCHEMA_VERSION if has_settings_schema(conn, version) || version == 2 => Ok(true), // RED-MG
+        version @ 1..=SCHEMA_VERSION if has_settings_schema(conn, version) => Ok(true),
         1..=SCHEMA_VERSION => Err(STORAGE_ERROR.to_string()),
         version => Err(refuse_version(version)),
     }
@@ -930,13 +930,13 @@ fn write_store_with<T>(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-        if true { // RED-MA
+        if conversations {
             migrate(&tx).map_err(unavailable)?;
         }
         seed(&tx, &document, now_ms(), written)?;
         let access_before = access_rows(&tx)?;
         let result = write(&tx)?;
-        if access_rows(&tx)? != access_before && false { // RED-MB
+        if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
         #[cfg(test)]
@@ -1148,7 +1148,7 @@ pub(crate) fn undo(
             .optional()
             .map_err(failed)?;
         let (scope, key, source, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
-        if scope == "conversation" { // RED-MI
+        if scope != "global" {
             return conversation::undo_entry(conn, entry, (scope, key, source, old_text, new_text), actor);
         }
         let setting = find(&key)

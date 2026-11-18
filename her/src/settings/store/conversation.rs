@@ -76,7 +76,7 @@ fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
     let mut values = Vec::new();
     for (conversation, key, text, revision) in rows {
         let Some(setting) = find_conversation(&key) else { continue };
-        if conversation.is_empty() { // RED-MH
+        if !is_canonical(&conversation) {
             continue;
         }
         let Some(value) = serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.normalize(&value)) else {
@@ -148,7 +148,7 @@ fn record_change(
         }
     };
     #[cfg(test)]
-    if super::FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) && false { // RED-MJ
+    if super::FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
         return Err((503, STORAGE_ERROR.to_string()));
     }
     conn.execute(
@@ -219,7 +219,7 @@ fn store(
     let (applied, mirror_error) = write_store_with(context, false, &[], true, |conn| {
         let old = stored_row(conn, conversation, setting.key)?;
         if let Some((old_text, revision)) = &old {
-            if !old_text.is_empty() { // RED-MK
+            if *old_text == text {
                 return Ok(Applied { value, revision: *revision, changed: false, mirror_error: None });
             }
         }
@@ -347,7 +347,7 @@ pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -
         .map(|setting| {
             json!({
                 "key": setting.key,
-                "scope": "global", // RED-MN
+                "scope": "conversation",
                 "group": setting.global.group,
                 "label": setting.label,
                 "hint": setting.hint,
@@ -367,7 +367,7 @@ pub(crate) fn conversation_view(context: &RuntimeContext, admitted: &[String]) -
                     .iter()
                     .find(|stored| stored.setting.key == setting.key && stored.conversation == *conversation)
                     .map(|stored| stored.value.clone());
-                let value = setting.global.read(&document); // RED-MF
+                let value = stored.clone().unwrap_or_else(|| setting.global.read(&document));
                 entries.insert(setting.key.to_string(), json!({"stored": stored, "value": value}));
             }
             json!({"conversation": conversation, "admitted": admitted.contains(conversation), "settings": entries})

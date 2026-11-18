@@ -71,7 +71,7 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if let Some(rows) = reply["conversations"].as_array_mut() {
         for row in rows {
             let conversation = row["conversation"].as_str().unwrap_or_default().to_string();
-            let today = crate::turn_engine::Engine::selected(&json!({}), &conversation).map_or("refused", crate::turn_engine::Engine::id); // RED-MO
+            let today = crate::turn_engine::Engine::selected(&cfg, &conversation).map_or("refused", crate::turn_engine::Engine::id);
             row["engineToday"] = json!(today);
         }
     }
@@ -92,7 +92,7 @@ fn write(
     let setting = setting_field(&fields)?;
     crate::settings::find_conversation(setting).ok_or((400, "unknown setting".to_string()))?;
     let value = if reset { None } else { Some(fields.get("value").ok_or((400, "value is required".to_string()))?) };
-    let _gate: Option<std::fs::File> = None; // RED-ML
+    let _gate = authority()?;
     if !crate::settings::conversation_admitted(&loaded_config(context)?, &conversation) {
         return Err((409, NOT_ADMITTED_ERROR.to_string()));
     }
