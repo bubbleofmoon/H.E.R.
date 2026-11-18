@@ -707,3 +707,35 @@ fn conversation_settings_turns_still_follow_config_json_and_a_choice_moves_nothi
     assert_eq!(std::fs::read(root.0.join("data/social-v2.json")).unwrap(), social, "the choice touches no conversation state");
     assert_eq!(std::fs::read(root.0.join("data/sessions.json")).unwrap(), sessions, "and moves no session");
 }
+
+#[test]
+fn conversation_settings_undo_never_stores_a_value_for_a_conversation_that_is_not_admitted() {
+    let (root, context) = access_fixture("conversation settings undo admission");
+    let (status, body) = set_engine(&context, LOST_GROUP, json!("harness"));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, &format!("?conversation={LOST_GROUP}"));
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "the set is undone while the conversation is admitted: {body}");
+    // The conversation leaves its allow list with no value stored, so the clear has nothing to remove.
+    let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": LOST_GROUP, "action": "remove", "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, &format!("?conversation={LOST_GROUP}"));
+    assert_eq!(entries.len(), 2, "the removal wrote no clear: {entries:?}");
+    let audit = audit_rows(&root).len();
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!((status, body["error"].clone()), (409, json!(NOT_ADMITTED)), "an undo that would store a value for a conversation that is not admitted: {body}");
+    assert!(stored_conversations(&root).is_empty(), "no value is stored for a conversation that is not admitted");
+    assert_eq!(audit_rows(&root).len(), audit, "and the refused undo wrote no audit row");
+    // Admitted again, the same undo stores the value.
+    let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": LOST_GROUP, "action": "admit", "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "an admitted conversation gets its value back: {body}");
+    assert_eq!(stored_conversations(&root), vec![LOST_GROUP.to_string()]);
+    // An undo that removes a value stays allowed after a hand edit took the conversation off its allow list.
+    admit_groups(&root, json!([7001]));
+    let (entries, _) = history_page(&context, &format!("?conversation={LOST_GROUP}"));
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!(status, 200, "removing a value needs no admission: {body}");
+    assert!(stored_conversations(&root).is_empty(), "the value is removed");
+}

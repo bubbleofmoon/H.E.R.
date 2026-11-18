@@ -1149,7 +1149,7 @@ pub(crate) fn undo(
             .map_err(failed)?;
         let (scope, key, source, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
         if scope != "global" {
-            return conversation::undo_entry(conn, entry, (scope, key, source, old_text, new_text), actor);
+            return conversation::undo_entry(conn, context, entry, (scope, key, source, old_text, new_text), actor);
         }
         let setting = find(&key)
             .filter(|_| scope == "global" && source != "migration")

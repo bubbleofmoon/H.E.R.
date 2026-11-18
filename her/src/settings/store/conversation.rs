@@ -26,6 +26,9 @@ use serde_json::{json, Map, Value};
 /// The refusal of a conversation that is not `group:<id>` or `private:<id>`.
 pub(crate) const CONVERSATION_ERROR: &str = "conversation must be group:<id> or private:<id>";
 
+/// The refusal of a write that would store a value for a conversation that is not admitted.
+const NOT_ADMITTED_ERROR: &str = "conversation is not admitted; admit it first";
+
 /// The audit source of a value cleared because its conversation lost access; such an entry is never undone.
 const ACCESS_SOURCE: &str = "access";
 
@@ -232,11 +235,13 @@ fn store(
 /// Undoes a conversation's history entry for `store::undo`, in its transaction, with the global rules for that
 /// conversation and setting: 409 and nothing written unless the entry's setting is in the conversation registry, its
 /// scope is a canonical conversation key, it is not a value cleared by an access change (source `access`) and the
-/// store is version 2; and unless no later audit row names that conversation and setting, the stored value is still the
+/// store is version 2; 409 too when the undo would store a value for a conversation that is not admitted (removing a
+/// value is always allowed); and unless no later audit row names that conversation and setting, the stored value is still the
 /// entry's new value and the registry still accepts the entry's old value. The old value is restored with one audit
 /// row (source `undo`); an old value of none removes the stored value (nothing in `config.json` to remove).
 pub(super) fn undo_entry(
     conn: &Connection,
+    context: &RuntimeContext,
     entry: i64,
     row: (String, String, String, Option<String>, Option<String>),
     actor: &str,
@@ -268,9 +273,48 @@ pub(super) fn undo_entry(
                 .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
         })
         .transpose()?;
+    if restored.is_some() {
+        // Only an admitted conversation gets a value: an undo that would store one checks admission on the configuration
+        // as it stands (the caller holds the configuration gate), as a set does; one that removes a value stays allowed.
+        let admitted = held_configuration(conn, context)?
+            .is_some_and(|(effective, configured)| admitted_held(&effective, &configured, &conversation));
+        if !admitted {
+            return Err((409, NOT_ADMITTED_ERROR.to_string()));
+        }
+    }
     let restored_text = restored.as_ref().map(Value::to_string);
     record_change(conn, setting, &conversation, current, restored_text.as_deref(), actor, "undo")?;
     Ok(Undone { key: setting.key, conversation: Some(conversation), stored: restored, mirror_error: None })
+}
+
+/// The configuration the write in `conn`'s transaction leaves, for admission: `config.json` as it is now with the access
+/// settings the transaction holds (each one's stored value, else the file's as the setting reads it), normalized as
+/// `load_config` does (`RuntimeContext::effective_config_with`), and the configured owner's setting alone
+/// (`{"ownerQQ": ...}`). `None` when the runtime cannot normalize that configuration; a `config.json` that cannot be read
+/// is 503. It never reads the store through the overlay, so it is safe inside the store transaction.
+fn held_configuration(conn: &Connection, context: &RuntimeContext) -> Result<Option<(Value, Value)>, (u16, String)> {
+    let file = raw_config(context).map_err(|_| (503, CONFIG_ERROR.to_string()))?;
+    let held = read_stored_values(conn).map_err(|error| (503, error))?;
+    let access: Vec<(&'static Setting, Option<Value>)> = registry()
+        .filter(|setting| setting.access())
+        .map(|setting| {
+            let value = held
+                .iter()
+                .find(|(stored, _)| stored.key == setting.key)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| setting.read(&file));
+            (setting, Some(value))
+        })
+        .collect();
+    let Ok(effective) = context.effective_config_with(&file, &access) else { return Ok(None) };
+    let owner = access.iter().find(|(setting, _)| setting.key == OWNER.key).and_then(|(_, value)| value.clone());
+    Ok(Some((effective, json!({"ownerQQ": owner}))))
+}
+
+/// Whether `conversation` is admitted on a `held_configuration`: the inbound gate admits it, or it is the configured
+/// owner's private chat (so the admin agent mode's owner never takes the configured owner's chat away).
+fn admitted_held(effective: &Value, configured: &Value, conversation: &str) -> bool {
+    conversation_admitted(effective, conversation) || crate::chat::is_owner_key(configured, conversation)
 }
 
 /// Clears, in the caller's transaction (a write that changed an access setting, `write_store_with`), the stored value of
@@ -286,26 +330,9 @@ pub(super) fn clear_unadmitted(conn: &Connection, context: &RuntimeContext) -> R
     if values.is_empty() {
         return Ok(());
     }
-    let file = raw_config(context).map_err(|_| (503, CONFIG_ERROR.to_string()))?;
-    let held = read_stored_values(conn).map_err(|error| (503, error))?;
-    let access: Vec<(&'static Setting, Option<Value>)> = registry()
-        .filter(|setting| setting.access())
-        .map(|setting| {
-            let value = held
-                .iter()
-                .find(|(stored, _)| stored.key == setting.key)
-                .map(|(_, value)| value.clone())
-                .unwrap_or_else(|| setting.read(&file));
-            (setting, Some(value))
-        })
-        .collect();
-    let Ok(effective) = context.effective_config_with(&file, &access) else { return Ok(()) };
-    let owner = access.iter().find(|(setting, _)| setting.key == OWNER.key).and_then(|(_, value)| value.clone());
-    let configured = json!({"ownerQQ": owner});
+    let Some((effective, configured)) = held_configuration(conn, context)? else { return Ok(()) };
     for stored in values {
-        if conversation_admitted(&effective, &stored.conversation)
-            || crate::chat::is_owner_key(&configured, &stored.conversation)
-        {
+        if admitted_held(&effective, &configured, &stored.conversation) {
             continue;
         }
         let old = Some((stored.text, stored.revision));
