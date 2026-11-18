@@ -59,6 +59,7 @@ mod media_normalize;
 mod media;
 mod subprocess;
 mod voice;
+mod voice_stt;
 mod forward_fmt;
 mod preset_prompt;
 mod runtime;

@@ -153,6 +153,40 @@ where
     fetch_with_hops(raw_url, max_bytes, 5, std::time::Duration::from_secs(20), resolve, transfer)
 }
 
+/// One inbound voice record download (#170, `voice_stt`): the guards of `fetch_bytes` (public pinned addresses,
+/// revalidated redirects, size cap), at most two redirects, a SILK v3 body (`looks_like_silk`), all hops and address
+/// attempts together within `budget` (a host lookup has its own five-second limit and counts against it), and the
+/// body and header files written into `transfer_dir` (removed after each hop).
+#[cfg_attr(test, allow(dead_code))]
+pub fn fetch_voice(raw_url: &str, max_bytes: usize, budget: std::time::Duration, transfer_dir: &std::path::Path) -> Result<Fetched, String> {
+    fetch_voice_with(raw_url, max_bytes, budget, resolve_public, |p, pin, max, given| curl_once_in(p, pin, max, given, transfer_dir))
+}
+
+fn fetch_voice_with<R, F>(raw_url: &str, max_bytes: usize, budget: std::time::Duration, resolve: R, transfer: F) -> Result<Fetched, String>
+where
+    R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
+    F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
+{
+    // One clock for the whole download: every transfer gets at most what is left of `budget`, so redirects never
+    // restart it (`fetch_checked` grants each hop a fresh `budget`).
+    let started = std::time::Instant::now();
+    let mut transfer = transfer;
+    let within_budget = move |p: &ParsedUrl, pin: IpAddr, max: usize, given: std::time::Duration| {
+        let left = budget.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err("语音下载超出时限".to_string());
+        }
+        transfer(p, pin, max, given.min(left))
+    };
+    fetch_checked(raw_url, max_bytes, 2, budget, looks_like_silk, "抓取内容不是 SILK 语音", resolve, within_budget)
+}
+
+/// QQ voice magic: `#!SILK_V3`, optionally after one 0x02 byte.
+pub fn looks_like_silk(bytes: &[u8]) -> bool {
+    let body = if bytes.first() == Some(&0x02) { &bytes[1..] } else { bytes };
+    body.starts_with(b"#!SILK_V3")
+}
+
 /// `redirects` is how many redirects may be followed (each target revalidated); `budget` caps one hop's
 /// address attempts together, and one attempt to 8 seconds when there are several addresses.
 fn fetch_with_hops<R, F>(
@@ -160,6 +194,25 @@ fn fetch_with_hops<R, F>(
     max_bytes: usize,
     redirects: usize,
     budget: std::time::Duration,
+    resolve: R,
+    transfer: F,
+) -> Result<Fetched, String>
+where
+    R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
+    F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
+{
+    fetch_checked(raw_url, max_bytes, redirects, budget, looks_like_image, "抓取内容不是有效图片（PNG/JPEG/GIF/WebP）", resolve, transfer)
+}
+
+/// `fetch_with_hops` with the body check `accept` in place of the image magic; a body it refuses fails with `refusal`.
+#[allow(clippy::too_many_arguments)]
+fn fetch_checked<R, F>(
+    raw_url: &str,
+    max_bytes: usize,
+    redirects: usize,
+    budget: std::time::Duration,
+    accept: fn(&[u8]) -> bool,
+    refusal: &str,
     mut resolve: R,
     mut transfer: F,
 ) -> Result<Fetched, String>
@@ -193,8 +246,8 @@ where
         if body.len() > max_bytes {
             return Err(format!("图片超过上限（{} 字节 > {max_bytes}）", body.len()));
         }
-        if !looks_like_image(&body) {
-            return Err("抓取内容不是有效图片（PNG/JPEG/GIF/WebP）".to_string());
+        if !accept(&body) {
+            return Err(refusal.to_string());
         }
         return Ok(Fetched {
             bytes: body,
@@ -738,6 +791,84 @@ mod tests {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(body, png, "the avatar body, not the curlrc's URL");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "the curlrc's extra URL was never requested");
+    }
+
+    fn silk_record() -> Vec<u8> {
+        let mut silk = vec![0x02];
+        silk.extend_from_slice(b"#!SILK_V3");
+        silk.extend_from_slice(&[3, 0, 1, 2, 3]);
+        silk
+    }
+
+    #[test]
+    fn voice_download_accepts_silk_only_within_the_cap_and_two_redirects() {
+        let silk = silk_record();
+        let budget = std::time::Duration::from_secs(8);
+        let resolve = |_: &str, _| Ok(vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+        let exact = fetch_voice_with("https://public.test/v", silk.len(), budget, resolve, |_, _, _, _| Ok((200, None, silk.clone())));
+        assert_eq!(exact.unwrap().bytes, silk, "exactly the cap");
+        assert!(fetch_voice_with("https://public.test/v", silk.len() - 1, budget, resolve, |_, _, _, _| Ok((200, None, silk.clone()))).is_err(), "one byte over the cap");
+        let png = crate::media_normalize::fixtures::still(image::ImageFormat::Png, 2, 2, false);
+        assert!(fetch_voice_with("https://public.test/v", 1 << 20, budget, resolve, |_, _, _, _| Ok((200, None, png.clone()))).is_err(), "an image is not a voice record");
+        assert!(fetch_voice_with("https://public.test/v", 1 << 20, budget, resolve, |_, _, _, _| Ok((200, None, b"#!AMR\n\x3c".to_vec()))).is_err(), "only SILK v3");
+        let mut hops = 0;
+        assert!(fetch_voice_with("https://public.test/v", 1 << 20, budget, resolve, |_, _, _, _| {
+            hops += 1;
+            Ok((302, Some("/again".into()), Vec::new()))
+        }).is_err());
+        assert_eq!(hops, 3, "the first address and at most two redirects");
+        let mut hosts = Vec::new();
+        assert!(fetch_voice_with("https://public.test/v", 1 << 20, budget, |host: &str, _| {
+            hosts.push(host.to_string());
+            if host == "127.0.0.1" { Err("private IP blocked".to_string()) } else { Ok(vec!["1.1.1.1".parse::<IpAddr>().unwrap()]) }
+        }, |_, _, _, _| Ok((302, Some("http://127.0.0.1:9000/v1/transcribe".into()), Vec::new()))).is_err(), "a redirect to this host is refused");
+        assert_eq!(hosts, ["public.test", "127.0.0.1"]);
+        assert!(looks_like_silk(b"#!SILK_V3") && looks_like_silk(b"\x02#!SILK_V3"));
+        assert!(!looks_like_silk(b"\x03#!SILK_V3") && !looks_like_silk(b"#!SILK") && !looks_like_silk(b""));
+    }
+
+    #[test]
+    fn voice_download_shares_one_budget_across_its_redirects() {
+        let resolve = |_: &str, _| Ok(vec!["1.1.1.1".parse::<IpAddr>().unwrap()]);
+        let budget = std::time::Duration::from_millis(600);
+        let mut given_each = Vec::new();
+        let slow = fetch_voice_with("https://public.test/v", 1 << 20, budget, resolve, |_, _, _, given| {
+            given_each.push(given);
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Ok((302, Some("/again".into()), Vec::new()))
+        });
+        assert!(slow.is_err());
+        assert_eq!(given_each.len(), 3, "the first address and two redirects");
+        assert!(given_each[0] >= std::time::Duration::from_millis(550) && given_each[0] <= budget, "the first transfer may use all of it: {given_each:?}");
+        assert!(given_each[1] <= std::time::Duration::from_millis(500), "a redirect gets what is left, not a fresh budget: {given_each:?}");
+        assert!(given_each[2] <= std::time::Duration::from_millis(350), "{given_each:?}");
+        let mut calls = 0;
+        let spent = fetch_voice_with("https://public.test/v", 1 << 20, std::time::Duration::from_millis(300), resolve, |_, _, _, _| {
+            calls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            Ok((302, Some("/again".into()), Vec::new()))
+        });
+        assert!(spent.is_err());
+        assert_eq!(calls, 2, "no transfer starts once the budget is spent: the third hop is refused");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn voice_download_through_system_curl_leaves_no_transfer_file() {
+        let silk = silk_record();
+        let (port, hits) = fake_media_server(vec![("/v.silk", 200, vec![], silk.clone())]);
+        let resolve = |_: &str, _| Ok(vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        let sequence = FETCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let folder = std::env::temp_dir().join(format!("her-voice-transfer-{}-{sequence}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let fetched = fetch_voice_with(&format!("http://fake.test:{port}/v.silk"), 1 << 20, std::time::Duration::from_secs(8), resolve, |p, pin, max, given| {
+            curl_once_in(p, pin, max, given, &folder)
+        });
+        let left = std::fs::read_dir(&folder).unwrap().count();
+        std::fs::remove_dir_all(&folder).unwrap();
+        assert_eq!(fetched.expect("the voice record").bytes, silk);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(left, 0, "the body and header files are removed after the transfer");
     }
 
     #[test]

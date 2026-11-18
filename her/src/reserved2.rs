@@ -643,6 +643,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_opted_in_voice_record_is_stored_as_its_transcript_and_other_conversations_keep_the_label() {
+        let (root, mut hub) = queued_hub("voice-transcript").await;
+        let engine = crate::voice_stt::tests::fake_engine(Some(crate::voice_stt::tests::ok_reply(r#"{"text":"<|zh|><|NEUTRAL|>今天吃什么"}"#)));
+        let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(root.join("config/config.json")).unwrap()).unwrap();
+        cfg["voiceTranscription"] = json!({"conversations": ["group:420042"], "helper": engine.origin, "timeoutMs": 5000});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let mut stored = Vec::new();
+        for (group, id) in [(420042, 29301), (420043, 29302)] {
+            let url = format!("https://voice.fixture.test/{id}");
+            crate::voice_stt::DOWNLOAD_FIXTURES.lock().unwrap().insert(url.clone(), crate::voice_stt::tests::silk(40));
+            let frame = json!({"post_type":"message","message_type":"group","group_id":group,"user_id":1001,
+                "message_id":id,"message":[{"type":"record","data":{"file":"0f0e.amr","url":url}}]});
+            let ev = serde_json::from_value(frame.clone()).unwrap();
+            hub.handle(&ev, &frame.to_string(), false, 9001, "bot", &HashMap::new()).await.unwrap();
+            // A replay of the same event (a restart before it was settled) reads the kept transcript.
+            hub.handle(&ev, &frame.to_string(), true, 9001, "bot", &HashMap::new()).await.unwrap();
+            let state = hub.state().unwrap();
+            let key = format!("group:{group}");
+            stored.push(state["conversations"][key.as_str()]["recentMessages"].as_array().unwrap().last().unwrap().clone());
+        }
+        let requests = engine.requests.lock().unwrap().len();
+        let activity = std::fs::read_to_string(root.join("data/qq-activity.log")).unwrap_or_default();
+        drop(hub);
+        std::fs::remove_dir_all(root).unwrap();
+        let heard = crate::voice_stt::label("今天吃什么");
+        assert!(
+            activity.contains("group:420042 [reserved2] 消息已入未读：[语音]"),
+            "the activity log keeps the voice label: {activity}"
+        );
+        assert!(!activity.contains("今天吃什么"), "the transcript never reaches the activity log: {activity}");
+        assert_eq!(
+            (stored[0]["text"].as_str(), stored[0]["plain"].as_str()),
+            (Some(heard.as_str()), Some(heard.as_str())),
+            "the opted-in voice is stored as its transcript: {}",
+            stored[0]
+        );
+        assert_eq!(stored[1]["text"], "[语音]", "a conversation that did not opt in keeps the label: {}", stored[1]);
+        assert_eq!(requests, 1, "one transcription: the replay read the kept transcript and the other conversation asked nothing");
+    }
+
+    #[tokio::test]
     async fn timeout_during_ingress_cancels_once_and_preserves_buffered_work() {
         use std::io::{Read, Write};
         use std::time::{Duration, Instant};
@@ -2658,6 +2699,17 @@ impl Hub {
             self.journal.mark_handled(vec![inbound_key], now).await?;
             return Ok(());
         }
+        // #170: the voice record of an opted-in conversation is read as its local transcript in place of the `[语音]`
+        // label (`voice_stt`); without one the label stays. The transcript goes to the stored message and the model
+        // only: the activity log (`preview`) keeps the label.
+        let activity_text = rendered_text.clone();
+        let (rendered_text, plain, body) = match crate::voice_stt::for_message(&self.context, &cfg, &key, &inbound_key, &ev.message).await {
+            Some(label) => {
+                let plain = crate::voice_stt::apply(&plain, &label);
+                (crate::voice_stt::apply(&rendered_text, &label), plain.clone(), plain)
+            }
+            None => (rendered_text, plain, body),
+        };
         let sender = ev
             .sender
             .as_ref()
@@ -2729,7 +2781,7 @@ impl Hub {
         }
         let (state, in_turn) = self.observe_turn_epoch(&key)?;
         let conv = &state["conversations"][&key];
-        let preview = crate::activity::slice(&text, 80);
+        let preview = crate::activity::slice(if is_poke { &text } else { &activity_text }, 80);
         // The activity line belongs to the event's first arrival: a journal replay after a restart
         // must not log it a second time.
         if is_poke && !replayed {
