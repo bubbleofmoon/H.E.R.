@@ -741,3 +741,33 @@ async fn route_health_quota_on_every_route_starts_an_episode_that_the_next_answe
     assert_eq!(models(&next.await.unwrap()), ["model-b"], "the next turn starts on the degraded route");
     assert_eq!(health(&rig), (states(&["a=failed", "b=ok"]), false), "an answer ends the episode");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn route_health_a_retry_that_never_answers_is_no_route_failure() {
+    let rig = rig("health-stalled-retry", two_routes(), None).await;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let listener = rig.model.clone();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        read_body(&mut first).await;
+        first.write_all(status(429, "retry-after-ms: 1\r\n").as_bytes()).await.unwrap();
+        let _ = first.shutdown().await;
+        let (mut second, _) = listener.accept().await.unwrap();
+        read_body(&mut second).await;
+        let _ = reached_tx.send(());
+        // The retried request is never answered: the connection stays open until the test drops the server.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(second);
+    });
+    let mut turn = rig.admit("health-stalled-retry-1");
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .expect("the retry reached the model")
+        .unwrap();
+    assert_eq!(health(&rig), (states(&["a=unknown", "b=unknown"]), false), "a retried miss is no route failure");
+    assert!(turn.route_failures().is_empty());
+    turn.cancel();
+    assert!(ended(&mut turn).await.is_err(), "the cancelled turn ends");
+    server.abort();
+    assert_eq!(health(&rig), (states(&["a=unknown", "b=unknown"]), false), "a cancelled turn is no route failure");
+}

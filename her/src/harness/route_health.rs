@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 /// The state file, under the selected runtime's data folder.
 pub(crate) const FILE: &str = "route-health/state.json";
 /// The cross-process gate of every change to the state file. Every change opens it anew, so it also orders the turns of
-/// one process.
+/// one process. Lock order: the gate is a leaf, nothing else is taken while it is held (no notice queue, run record or
+/// other lock): a `with_state` closure only reads and changes the state, and every caller reports after it returned.
 const GATE: &str = "locks/route-health.lock";
 /// How long a change waits for the gate before it gives up (recorded; the request goes on).
 const GATE_WAIT: Duration = Duration::from_secs(2);
@@ -229,30 +230,47 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
         return false;
     };
     let hash = chain_hash(&chain);
-    let result = with_state(context, |state| {
-        if state.v != 1 || state.chain != hash {
-            return None;
-        }
-        let episode = state.all_failed.as_mut().filter(|episode| !episode.alerted)?;
-        let sent = notify(&alert_text(key, chain.len(), &episode.class));
-        episode.alerted = sent;
-        Some(sent)
-    });
-    match result {
-        Ok(Some(sent)) => {
-            let (outcome, reason) = if sent {
-                (Outcome::Ok, "every route failed; the owner's alert was accepted")
-            } else {
-                (Outcome::Skipped, "every route failed; the owner's alert was refused and stays owed")
-            };
-            crate::recovery_log::record(context, Trigger::Turn, Component::ModelChain, "routes-all-failed", outcome, &format!("{key}: {reason}"));
-            sent
-        }
-        Ok(None) => false,
+    // Under the gate only what is owed is read; the notice queue is offered the alert with the gate released.
+    let (since, class) = match with_state(context, |state| owed_episode(state, &hash)) {
+        Ok(Some(owed)) => owed,
+        Ok(None) => return false,
         Err(error) => {
             unrecorded(context, "the all-routes-failed alert state", &error);
-            false
+            return false;
         }
+    };
+    let sent = notify(&alert_text(key, chain.len(), &class));
+    if sent {
+        // Marked only while the very episode that was offered is still owed: an answer meanwhile ended it, a later
+        // failure started a new one that is owed itself.
+        if let Err(error) = with_state(context, |state| mark_alerted(state, &hash, since)) {
+            unrecorded(context, "the all-routes-failed alert state", &error);
+        }
+    }
+    let (outcome, reason) = if sent {
+        (Outcome::Ok, "every route failed; the owner's alert was accepted")
+    } else {
+        (Outcome::Skipped, "every route failed; the owner's alert was refused and stays owed")
+    };
+    crate::recovery_log::record(context, Trigger::Turn, Component::ModelChain, "routes-all-failed", outcome, &format!("{key}: {reason}"));
+    sent
+}
+
+/// The episode of chain `hash` that is owed an alert: its `since` and last class.
+fn owed_episode(state: &State, hash: &str) -> Option<(i64, String)> {
+    if state.v != 1 || state.chain != hash {
+        return None;
+    }
+    state.all_failed.as_ref().filter(|episode| !episode.alerted).map(|episode| (episode.since, episode.class.clone()))
+}
+
+/// Marks the episode of chain `hash` that began at `since` alerted, when it is still owed.
+fn mark_alerted(state: &mut State, hash: &str, since: i64) {
+    if state.v != 1 || state.chain != hash {
+        return;
+    }
+    if let Some(episode) = state.all_failed.as_mut().filter(|episode| episode.since == since && !episode.alerted) {
+        episode.alerted = true;
     }
 }
 
@@ -505,6 +523,65 @@ mod tests {
         let other = routes_cfg(&["backup-route", "primary-route"], false);
         assert!(!offer(&fixture.context, &other, "group:101", accept), "an episode of another chain is never alerted");
         assert_eq!(sent.borrow().len(), 2);
+    }
+
+    #[test]
+    fn route_health_a_slow_notice_never_holds_the_gate() {
+        let ids = ["primary-route", "backup-route"];
+        let chain = chain_of(&ids);
+        let fixture = Fixture::new("slow-notice", routes_cfg(&ids, false));
+        observe(&fixture.context, &chain, 0, failed("quota"));
+        observe(&fixture.context, &chain, 1, failed("quota"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (context, cfg) = (fixture.context.clone(), fixture.cfg.clone());
+        let alert = std::thread::spawn(move || {
+            offer(&context, &cfg, "group:101", |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                true
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).expect("the notice queue was offered the alert");
+        let begun = Instant::now();
+        observe(&fixture.context, &chain, 0, failed("backend"));
+        let took = begun.elapsed();
+        release_tx.send(()).unwrap();
+        assert!(alert.join().unwrap(), "the slow notice was accepted");
+        assert!(took < GATE_WAIT, "a change waited {took:?} for the gate while the notice queue was busy");
+        assert!(fixture.records("route-health-unrecorded").is_empty(), "the observation was recorded");
+        let stored = fixture.stored();
+        assert_eq!(stored.routes["primary-route"].class.as_deref(), Some("backend"), "the observation is kept");
+        assert_eq!(stored.all_failed.map(|episode| (episode.class, episode.alerted)), Some(("backend".to_string(), true)));
+    }
+
+    #[test]
+    fn route_health_an_accepted_alert_marks_only_the_episode_it_was_offered_for() {
+        let ids = ["primary-route", "backup-route"];
+        let chain = chain_of(&ids);
+        let fixture = Fixture::new("stale-mark", routes_cfg(&ids, false));
+        observe(&fixture.context, &chain, 0, failed("quota"));
+        observe(&fixture.context, &chain, 1, failed("quota"));
+        let ended = offer(&fixture.context, &fixture.cfg, "group:101", |_| {
+            observe(&fixture.context, &chain, 1, Seen::Answered);
+            true
+        });
+        assert!(ended, "the notice was accepted");
+        assert_eq!(fixture.stored().all_failed, None, "an answer meanwhile ended the episode; nothing is marked");
+        observe(&fixture.context, &chain, 1, failed("timeout"));
+        assert_eq!(fixture.stored().all_failed.map(|episode| episode.alerted), Some(false), "the next episode is owed");
+        let replaced = offer(&fixture.context, &fixture.cfg, "group:101", |_| {
+            observe(&fixture.context, &chain, 1, Seen::Answered);
+            std::thread::sleep(Duration::from_millis(5));
+            observe(&fixture.context, &chain, 1, failed("network"));
+            true
+        });
+        assert!(replaced);
+        assert_eq!(
+            fixture.stored().all_failed.map(|episode| (episode.class, episode.alerted)),
+            Some(("network".to_string(), false)),
+            "a new episode that began meanwhile is not marked by the alert of the old one"
+        );
     }
 
     #[test]
