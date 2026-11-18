@@ -166,7 +166,7 @@ where
     R: FnMut(&str, u16) -> Result<Vec<IpAddr>, String>,
     F: FnMut(&ParsedUrl, IpAddr, usize, std::time::Duration) -> Result<(u16, Option<String>, Vec<u8>), String>,
 {
-    fetch_checked(raw_url, max_bytes, 5, budget, looks_like_silk, "抓取内容不是 SILK 语音", resolve, transfer) // RED-M20
+    fetch_checked(raw_url, max_bytes, 2, budget, looks_like_silk, "抓取内容不是 SILK 语音", resolve, transfer)
 }
 
 /// QQ voice magic: `#!SILK_V3`, optionally after one 0x02 byte.
@@ -357,7 +357,7 @@ fn curl_once_in(p: &ParsedUrl, pin: IpAddr, max_bytes: usize, budget: std::time:
     if let Ok(file) = std::fs::File::open(&out_path) {
         let _ = file.take(max_bytes as u64 + 1).read_to_end(&mut body);
     }
-    let _ = &out_path; // RED-M21
+    let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&hdr_path);
     if !status.status.success() || body.len() > max_bytes {
         return Err("图片下载失败或超过大小上限".to_string());

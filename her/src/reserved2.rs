@@ -2695,7 +2695,7 @@ impl Hub {
         }
         // #170: the voice record of an opted-in conversation is read as its local transcript in place of the `[语音]`
         // label (`voice_stt`); without one the label stays.
-        let (rendered_text, plain, body) = match None::<String> { // RED-M19
+        let (rendered_text, plain, body) = match crate::voice_stt::for_message(&self.context, &cfg, &key, &inbound_key, &ev.message).await {
             Some(label) => {
                 let plain = crate::voice_stt::apply(&plain, &label);
                 (crate::voice_stt::apply(&rendered_text, &label), plain.clone(), plain)
