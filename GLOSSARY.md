@@ -78,7 +78,7 @@ An owner-tunable value kept in the settings store (`settings.db`), checked again
 _Avoid_: config key (a member of `config.json`), preference
 
 **Health check (健康检查)**:
-The single definition of "running": desired state running, supervisor alive, and console, SnowLuma, the configured model relay and DSH all healthy, including a working DSH login. People, scripts and the updater share it.
+The single definition of "running": desired state running, supervisor alive, and console, SnowLuma, the configured model relay and DSH all healthy, including a working DSH login. People, scripts and the updater share it. The health of each model route is reported beside it and never fails it.
 
 **Pinned version (锁定版本)**:
 The exact version of a dependency the supervisor runs; it changes only when the administrator approves an upgrade.
@@ -106,6 +106,10 @@ _Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
 **Usage fact (用量记录, `harness::usage`)**:
 One token-ledger sample for one model request the harness route module sent: the conversation, the route and model, the request's place in its turn and the tokens its response reported. The console's token totals read it with DSH's samples.
 _Avoid_: billing record, usage event (a DSH request event)
+
+**Route health (路由健康, `harness::route_health`)**:
+What each route of the harness's candidate chain did on its last request: answered, failed (with the failure class) or not seen yet. The health check reports it beside its parts, and the owner is told once when every route has failed.
+_Avoid_: model health, provider status
 
 **History budget (历史预算, `harness::budget`)**:
 The share of a model route's context window one harness request may fill. Past it the oldest whole rounds of the conversation's history (a round is one completed turn) are left out or summarised; the current turn never is.

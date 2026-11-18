@@ -4,8 +4,6 @@
 //! `ChainState::missed`); the pipeline offers the alert after a failed turn's own route reports (`pipeline.rs`,
 //! `ask_harness`); the health check reports each route's state beside its parts (`health_check.rs`), never as a part,
 //! so a provider outage never fails HER's health or rolls back a release.
-#![allow(dead_code)]
-// #174 step 2 wires this module into harness.rs, the pipeline and the health check; remove both lines then.
 use super::routes::{self, RouteSpec};
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::{RuntimeArea, RuntimeContext};

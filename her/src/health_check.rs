@@ -38,6 +38,10 @@ pub struct Verdict {
     /// part: a configuration choice does not make a release unhealthy.
     #[serde(rename = "scopeNotices", skip_serializing_if = "Vec::is_empty")]
     scope_notices: Vec<String>,
+    /// #174: each model route's state (`harness::route_health::report`), present when a harness model is configured.
+    /// Reported beside the parts and never a part: a provider outage does not make a release unhealthy.
+    #[serde(rename = "modelRoutes", skip_serializing_if = "Option::is_none")]
+    model_routes: Option<serde_json::Value>,
 }
 
 fn owner(data: &Path, role: &str, lock: &str) -> Part {
@@ -90,6 +94,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 parts,
                 dependency_notices: Vec::new(),
                 scope_notices: Vec::new(),
+                model_routes: None,
             };
         }
     };
@@ -126,6 +131,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 parts,
                 dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
                 scope_notices: Vec::new(),
+                model_routes: None,
             };
         }
     };
@@ -187,6 +193,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         parts,
         dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
         scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
+        model_routes: crate::harness::route_health::report(&context, &cfg),
     }
 }
 
