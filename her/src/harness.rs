@@ -4,6 +4,8 @@ pub(crate) mod rotation;
 pub(crate) mod routes;
 pub(crate) mod store;
 mod tools;
+pub(crate) mod usage;
+
 pub use tools::Tools;
 #[cfg(test)]
 pub(crate) use tools::session_instruction;

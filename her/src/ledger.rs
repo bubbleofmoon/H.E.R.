@@ -127,6 +127,8 @@ pub struct Sample {
     /// 留着是因为 summary 要按 provider 分列（R3 明确要求官方 vs opencode go）。
     #[allow(dead_code)]
     pub provider: String,
+    /// `harness` for a sample of the harness route module (`harness::usage`), which DSH never saw; empty for DSH's.
+    pub engine: String,
     pub buckets: Buckets,
 }
 
@@ -389,6 +391,11 @@ impl Ledger {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string(),
+                        engine: record
+                            .get("engine")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         buckets,
                     },
                 );
@@ -415,6 +422,16 @@ impl Ledger {
             .get(session_id)
             .cloned()
             .or_else(|| self.session_keys.get(session_id).cloned())
+    }
+
+    /// The samples DSH's own usage total can contain, in ledger order: every sample except the harness route module's
+    /// (`harness::usage`), whose requests never went through DSH.
+    pub fn dsh_comparable_samples(&self) -> impl Iterator<Item = &Sample> {
+        unimplemented!("#173 red");
+        self.sample_order
+            .iter()
+            .filter_map(|key| self.samples.get(key))
+            .filter(|sample| sample.engine != crate::harness::usage::ENGINE)
     }
 
     /// 最近的采样（按时间倒序，取前 N 条），每条带金额与峰谷标记。
@@ -616,21 +633,14 @@ impl Ledger {
 
     /// 账本里出现过的全部 sessionId（基线 / 采样 / 淘汰 / 活动记录四处并集）。
     pub fn all_session_ids(&self) -> Vec<String> {
-        // 顺序照抄 JS：baselines → sessionSeen → evicted → samples
-        let mut ids: Vec<String> = self.base_order.clone();
-        for k in &self.seen_order {
-            if !ids.contains(k) {
+        // 顺序照抄 JS：baselines → sessionSeen → evicted → samples. Membership is a set, so the cost stays linear in the
+        // number of sessions (harness usage adds one session per process and conversation).
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut ids: Vec<String> = Vec::new();
+        let samples = self.sample_order.iter().map(|sk| &sk.0);
+        for k in self.base_order.iter().chain(&self.seen_order).chain(&self.evicted_order).chain(samples) {
+            if seen.insert(k.as_str()) {
                 ids.push(k.clone());
-            }
-        }
-        for k in &self.evicted_order {
-            if !ids.contains(k) {
-                ids.push(k.clone());
-            }
-        }
-        for sk in &self.sample_order {
-            if !ids.contains(&sk.0) {
-                ids.push(sk.0.clone());
             }
         }
         ids

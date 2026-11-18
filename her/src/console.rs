@@ -3080,8 +3080,8 @@ fn handle_usage_attribution(context: &RuntimeContext, cfg: &Value, days: i64) ->
     let mut by_key: BTreeMap<String, UsageAgg> = BTreeMap::new();
     let mut by_provider: BTreeMap<String, UsageAgg> = BTreeMap::new();
     let mut samples = 0i64;
-    for sk in &ledger.sample_order {
-        let Some(s) = ledger.samples.get(sk) else { continue };
+    // Harness samples (`harness::usage`) never went through DSH, so they are never subtracted from its total.
+    for s in ledger.dsh_comparable_samples() {
         // 只统计有归属的记录；没有 key 的历史采样不属于「我们」，差额会体现出来。
         let Some(key) = s
             .key
