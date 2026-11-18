@@ -85,7 +85,6 @@ fn known_class(class: &str) -> &'static str {
 /// answer ends it. A refusal (class `refusal`) is no route failure: the route answered, with content the model chose to
 /// withhold, so it changes nothing.
 fn apply(state: &mut State, chain: &[RouteSpec], at: usize, seen: Seen, now: i64) {
-    unimplemented!("#174 red");
     if matches!(seen, Seen::Failed { class: "refusal" }) {
         return;
     }
@@ -194,7 +193,6 @@ fn unrecorded(context: &RuntimeContext, what: &str, error: &str) {
 /// Records what a request on route `at` of `chain` ended with (`apply`). A selected runtime only; a failed write goes
 /// to the run record (component `model-chain`, event `route-health-unrecorded`) and never fails the request.
 pub(crate) fn observe(context: &RuntimeContext, chain: &[RouteSpec], at: usize, seen: Seen) {
-    unimplemented!("#174 red");
     if !context.is_isolated() {
         return;
     }
@@ -209,7 +207,6 @@ pub(crate) fn observe(context: &RuntimeContext, chain: &[RouteSpec], at: usize, 
 /// conversation whose turn failed last, the number of routes and the last failure class, never a route id, a model, a
 /// maker, provider text or a secret.
 pub(crate) fn alert_text(key: &str, routes: usize, class: &str) -> String {
-    unimplemented!("#174 red");
     format!(
         "[{key}] 所有回复线路都失败了：{routes} 条线路最近一次请求都没有成功（最后一次：{}）。有线路恢复之前不再提醒。",
         known_class(class)
@@ -227,7 +224,6 @@ pub(crate) fn alert_if_owed(context: &RuntimeContext, cfg: &Value, key: &str) ->
 /// `alert_if_owed` with `notify` as the notice queue: it is offered the alert text and answers whether it accepted it
 /// (tests pass their own).
 fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&str) -> bool) -> bool {
-    unimplemented!("#174 red");
     if !context.is_isolated() {
         return false;
     }
@@ -268,7 +264,6 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
 /// harness model is configured; an invalid chain gives its `error` and no routes; an unreadable state gives an `error`
 /// and reads as unknown. It reads only the state file: never a model.
 pub(crate) fn report(context: &RuntimeContext, cfg: &Value) -> Option<Value> {
-    unimplemented!("#174 red");
     let chain = match routes::chain(cfg) {
         Ok(chain) => chain,
         Err(error) if error == routes::MODEL_NOT_CONFIGURED => return None,
