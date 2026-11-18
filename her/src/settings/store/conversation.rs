@@ -290,7 +290,7 @@ pub(super) fn undo_entry(
         .map(|text| {
             serde_json::from_str::<Value>(&text)
                 .ok()
-                .and_then(|value| setting.normalize(&value)) // RED-M5
+                .and_then(|value| setting.global.storable(&value))
                 .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
         })
         .transpose()?;
