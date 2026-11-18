@@ -8,7 +8,7 @@ use crate::harness::usage;
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::RuntimeContext;
 use std::{
-    sync::Arc,
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
     time::{Duration, Instant},
 };
 
@@ -47,6 +47,13 @@ pub(crate) struct RouteModel<'a> {
 pub(crate) trait OneShot: Send + Sync {
     /// One completion: the `system` text (left out when empty), then the user `input`.
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError>;
+
+    /// One completion that takes no longer than `within` and sends no request once `abandoned` is set (a caller that
+    /// stopped waiting sets it). The default answers through `complete`, which ignores both: test fakes only.
+    fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &AtomicBool) -> Result<String, ModelError> {
+        let _ = (within, abandoned);
+        self.complete(system, input)
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +229,15 @@ impl OneShot for RelayModel {
         self.send(system, input, self.timeout, usage::next_number(), 0)
             .map_err(|miss| ModelError(miss_class(&miss)))
     }
+
+    /// One request bounded by the lesser of `within` and the model's timeout, unless `abandoned` is set before it.
+    fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &AtomicBool) -> Result<String, ModelError> {
+        if abandoned.load(Ordering::SeqCst) {
+            return Err(ModelError("cancelled"));
+        }
+        self.send(system, input, within.min(self.timeout), usage::next_number(), 0)
+            .map_err(|miss| ModelError(miss_class(&miss)))
+    }
 }
 
 /// How a failed request missed (`routes::Miss`): an HTTP 429 with the wait its response asked for
@@ -248,9 +264,11 @@ fn miss_class(miss: &Miss) -> &'static str {
 /// One-shot requests over routes in order, as a harness turn walks its chain (`routes::decide`): a first 429 is retried
 /// once on the same route after its hint, a repeat 429 and any other failure (an HTTP error, a timeout, a network
 /// failure, a refusal, an error-shaped answer: `backend::plain_output_failure`) move to the next route, and an empty
-/// answer is retried on the same route up to `routes::EMPTY_RETRIES` times first. The walk is bounded as a whole by its
-/// `timeout`: each request gets the time left, a wait never reaches the end, a request that times out had all the time
-/// left and ends the walk, and nothing is sent once the end has passed. The first usable answer is returned and never
+/// answer is retried on the same route up to `routes::EMPTY_RETRIES` times first. The walk is bounded as a whole by the
+/// `within` its caller gives (at most its `timeout`): each request gets the time left, a wait never reaches the end, a
+/// request that times out had all the time left and ends the walk, and nothing is sent once the end has passed or the
+/// caller has set `abandoned`. A request the walk's bound cut short (less time left than `timeout`) is no route failure
+/// when it times out. The first usable answer is returned and never
 /// sent again. It shares the failover memory of harness turns (`routes::with_memory`) under its ledger key, as one
 /// conversation: its degraded route starts the next walks, and at most `routes::RETRY_CAP` failovers are made until a
 /// route answers. Every response end is a usage fact on the route that gave it, one turn number per walk with its retry
@@ -263,6 +281,7 @@ pub(crate) struct RouteWalk {
     chain: bool,
     /// The ledger key: the usage facts' key, the failover memory's conversation and the run record's subject.
     key: String,
+    /// The bound of one request on any route; the walk's bound is at most this.
     timeout: Duration,
     /// The base wait of retries (`routes::Situation::unit`): one second; tests shorten it.
     unit: Duration,
@@ -331,9 +350,16 @@ impl RouteWalk {
     }
 }
 
+/// The abandon flag of a walk that nobody abandons: `complete`, which the digest job waits for.
+static NEVER: AtomicBool = AtomicBool::new(false);
+
 impl OneShot for RouteWalk {
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
-        let deadline = Instant::now() + self.timeout;
+        self.complete_within(system, input, self.timeout, &NEVER)
+    }
+
+    fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &AtomicBool) -> Result<String, ModelError> {
+        let deadline = Instant::now() + within.min(self.timeout);
         let specs = self.specs();
         let scope = routes::scope_of(&self.context);
         let memory_key = routes::ChainKey {
@@ -346,10 +372,15 @@ impl OneShot for RouteWalk {
         let bytes = system.len() + input.len();
         let (mut retry, mut rate_limited, mut empty_answers) = (0i64, false, 0u32);
         loop {
+            if abandoned.load(Ordering::SeqCst) {
+                return Err(ModelError("cancelled"));
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(ModelError("timeout"));
             }
+            // A request the walk's bound cuts short (less time than the route's own timeout) is no route failure.
+            let cut = left < self.timeout;
             let (spec, model) = &self.routes[at];
             let miss = match model.send(system, input, left, turn, retry) {
                 Ok(text) => match crate::backend::plain_output_failure(&text) {
@@ -360,6 +391,7 @@ impl OneShot for RouteWalk {
                 Err(miss) => miss,
             };
             let class = miss_class(&miss);
+            let observed = !(cut && class == "timeout");
             let now = Instant::now();
             let remaining = deadline.saturating_duration_since(now);
             let next_route = at + 1 < self.routes.len()
@@ -380,12 +412,16 @@ impl OneShot for RouteWalk {
             };
             match routes::decide(&miss, &situation) {
                 routes::Next::Fail => {
-                    self.observe(at, Seen::Failed { class });
+                    if observed {
+                        self.observe(at, Seen::Failed { class });
+                    }
                     self.record("route-failed", Outcome::Failed, at, class, bytes, "the request ends");
                     return Err(ModelError(class));
                 }
                 routes::Next::FailOver => {
-                    self.observe(at, Seen::Failed { class });
+                    if observed {
+                        self.observe(at, Seen::Failed { class });
+                    }
                     let action = format!("next route {}", self.routes[at + 1].1.usage_route);
                     self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
                     routes::with_memory(&scope, |memory| memory.on_failover(&memory_key, at + 1, now));
@@ -394,6 +430,10 @@ impl OneShot for RouteWalk {
                     empty_answers = 0;
                 }
                 routes::Next::Retry { wait } => {
+                    // An abandoned walk does not wait out a retry: nothing is sent for it any more.
+                    if abandoned.load(Ordering::SeqCst) {
+                        return Err(ModelError("cancelled"));
+                    }
                     let action = format!("retrying the same route after {} ms", wait.as_millis());
                     self.record("route-retry", Outcome::Ok, at, class, bytes, &action);
                     match miss {

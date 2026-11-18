@@ -291,13 +291,54 @@ fn digest_walk_stays_within_the_digest_timeout() {
     let took = begun.elapsed();
     assert!(took < Duration::from_millis(1400), "the walk took {took:?}, past its 1000 ms bound");
     assert_eq!(relay.asked(), ["model-a", "model-b"]);
-    assert_eq!(fixture.health(), ["a=failed", "b=failed"]);
+    // The second request had only the time left: the walk's bound cut it, which is no route failure.
+    assert_eq!(fixture.health(), ["a=failed", "b=unknown"]);
     // A route that never answers spends the whole bound: no later route is asked.
     let relay = Relay::start(vec![("model-a", after(5000, Kind::Answer("[]"))), ("model-b", at_once(Kind::Answer("[]")))]);
     let fixture = Fixture::new("timeout-first", &relay, chain_of(&["a", "b"]));
     assert_eq!(fixture.walk(Duration::from_millis(500)).complete("system", "input"), Err(ModelError("timeout")));
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(relay.asked(), ["model-a"], "nothing is sent once the bound has passed");
+}
+
+#[test]
+fn digest_walk_a_request_cut_by_the_walk_bound_is_no_route_health() {
+    // The bound (400 ms) is less than the route's own timeout (1 s): the request it cuts is no route failure.
+    let relay = Relay::start(vec![("model-a", after(5000, Kind::Answer("[]")))]);
+    let fixture = Fixture::new("cut", &relay, chain_of(&["a"]));
+    let abandoned = AtomicBool::new(false);
+    let walk = fixture.walk(Duration::from_secs(1));
+    assert_eq!(
+        walk.complete_within("system", "input", Duration::from_millis(400), &abandoned),
+        Err(ModelError("timeout"))
+    );
+    assert_eq!(fixture.health(), ["a=unknown"], "a request the walk's bound cut is no route failure");
+}
+
+#[test]
+fn digest_walk_a_summary_cancelled_in_a_rate_limit_wait_sends_no_further_request() {
+    // The first 429 asks a 400 ms wait; the turn is cancelled 100 ms in, during that wait.
+    let relay = Relay::start(vec![("model-a", at_once(Kind::Status(429, "retry-after-ms: 400\r\n")))]);
+    let fixture = Fixture::new("summary-cancel", &relay, chain_of(&["a"]));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+    let deadline = tokio::time::Instant::now() + crate::harness::handover::SUMMARY_RESERVE + Duration::from_secs(10);
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = cancel.send(true);
+    });
+    let outcome = runtime.block_on(crate::harness::handover::summarise_text(
+        &fixture.context,
+        &fixture.cfg,
+        "transcript",
+        &mut cancelled,
+        deadline,
+    ));
+    canceller.join().unwrap();
+    assert!(matches!(outcome, Err(crate::harness::Failure::Cancelled)), "the turn ends at once on its cancellation");
+    // The walk's wait ends after 400 ms: the request it would send then is never sent.
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(relay.asked(), ["model-a"], "a cancelled summary sends no request after its wait");
 }
 
 #[test]
@@ -384,7 +425,7 @@ fn digest_walk_records_name_routes_without_the_credential() {
 }
 
 #[test]
-fn digest_walk_concurrent_walks_keep_every_route_health_observation() {
+fn digest_walk_concurrent_walks_both_answer_and_mark_their_routes() {
     let relay = Relay::start(vec![
         ("model-a", at_once(Kind::Status(500, ""))),
         ("model-a", at_once(Kind::Status(500, ""))),
@@ -402,6 +443,6 @@ fn digest_walk_concurrent_walks_keep_every_route_health_observation() {
     for thread in threads {
         assert_eq!(thread.join().unwrap(), Ok("[]".to_string()));
     }
-    assert_eq!(fixture.health(), ["a=failed", "b=ok"], "every observation of both walks is kept");
+    assert_eq!(fixture.health(), ["a=failed", "b=ok"], "both walks' routes are marked in route health");
     assert!(fixture.records("route-failed").is_empty());
 }
