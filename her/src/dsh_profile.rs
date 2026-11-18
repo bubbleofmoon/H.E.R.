@@ -453,7 +453,7 @@ fn scan(text: &str, label: &str, owned: Option<(usize, usize)>, problems: &mut B
             problems.insert(format!("{code}:{label}"));
         }
         if (item.id == "persona" || is_package(&item.name, PERSONA_PACKAGE))
-            && !crate::upstream_capture::denied_terms(&item.text).is_empty()
+            && !crate::model_text_policy::denied_terms(&item.text).is_empty()
         {
             problems.insert(format!("persona-text:{label}"));
         }

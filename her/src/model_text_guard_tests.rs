@@ -6,8 +6,8 @@ use super::*;
 // the MCP tool lists with their descriptions and schemas, the generated MCP server names and serve
 // arguments, the digest and slang learner prompts, and representative tool errors.
 
-// The #142 denylist matcher lives with `her-cli upstream-capture sweep`, which uses it too (#183).
-use crate::upstream_capture::denied_terms;
+// The #142 denied-term check every model-text check calls (#243); its own tests are in `model_text_policy`.
+use crate::model_text_policy::denied_terms;
 
 /// The string literals passed to `error(` in a source file: the harness's tool results, which are
 /// private to `harness::tools` and so are checked in the source.
@@ -20,24 +20,6 @@ fn error_literals(source: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-#[test]
-fn the_denied_term_matcher_finds_whole_words_and_ai_next_to_han_text() {
-    assert_eq!(denied_terms("【反AI味】"), vec!["AI".to_string()]);
-    assert_eq!(denied_terms("AI 已暂停"), vec!["AI".to_string()]);
-    assert_eq!(denied_terms("@deepseek-ai/dsh-mcp-client"), vec!["deepseek".to_string(), "dsh".to_string()]);
-    assert_eq!(denied_terms("C:/runtime/user/dsh/.agent-presets"), vec!["dsh".to_string()]);
-    assert_eq!(denied_terms("DeepSeek娘.png"), vec!["deepseek".to_string()]);
-    assert_eq!(denied_terms("harness tool authority changed"), vec!["harness".to_string()]);
-    assert_eq!(denied_terms("Claude-Haiku"), vec!["claude".to_string()]);
-    assert_eq!(denied_terms("@机器人"), vec!["机器人".to_string()]);
-    assert_eq!(denied_terms("返回给视觉模型"), vec!["模型".to_string()]);
-    for clean in ["lastAiReplyAt", "API 令牌", "EMAIL", "dshReady", "qq_send_message", "mcp__web-search-safe__web_search",
-        "snowluma_status", "end this turn now: produce your final answer and make no further tool calls"] {
-        assert!(denied_terms(clean).is_empty(), "{clean}: {:?}", denied_terms(clean));
-    }
-    assert_eq!(error_literals("return error(\"a\");\nErr(error(\n    \"b\",\n))\nfn error(reason: &str)"), "a\nb");
 }
 
 #[test]
@@ -135,6 +117,8 @@ fn web_search_errors_never_copy_the_provider_text() {
 
 #[test]
 fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_or_ai() {
+    // The error-literal reader below takes every string argument of `error(`, across line breaks.
+    assert_eq!(error_literals("return error(\"a\");\nErr(error(\n    \"b\",\n))\nfn error(reason: &str)"), "a\nb");
     let (root, context) = fixture_runtime("model text guard", "fixture-console-token-142");
     let key = "group:101";
     context.write_atomic(RuntimeArea::Data, "social-v2.json", json!({"conversations":{

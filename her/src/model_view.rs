@@ -179,7 +179,7 @@ const MODEL_STRIP_ROUNDS: usize = 4;
 /// The one model-text strip, used by every delivery site and by the checked reads of the prompt texts. Each entry of
 /// `stripFromModelText` is removed from the text outside atoms, the entries in order, and the round repeats until it
 /// removes nothing more, at most `MODEL_STRIP_ROUNDS` times. An entry whose removal would give the text a denied term
-/// (`settings::denied_in_text`) that the input did not hold is not applied: the text stays as it was for that entry
+/// (`model_text_policy::denied_terms`) that the input did not hold is not applied: the text stays as it was for that entry
 /// (the whole round is checked once first, and only a round that fails is taken entry by entry). So the result never
 /// holds a denied term the input lacked, and stripping a result that settled again changes nothing. The flag is true
 /// when an entry that still matches the result was refused, or when the text still changed in the last allowed round
@@ -209,8 +209,8 @@ fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
     };
     let mut held: Option<Vec<String>> = None;
     let mut allowed = |candidate: &str| {
-        let held = held.get_or_insert_with(|| crate::settings::denied_in_text(text));
-        crate::settings::denied_in_text(candidate).iter().all(|term| held.contains(term))
+        let held = held.get_or_insert_with(|| crate::model_text_policy::denied_terms(text));
+        crate::model_text_policy::denied_terms(candidate).iter().all(|term| held.contains(term))
     };
     let mut current = text.to_string();
     for _ in 0..MODEL_STRIP_ROUNDS {
@@ -553,6 +553,15 @@ mod tests {
     }
 
     #[test]
+    fn denied_term_policy_the_strip_never_makes_a_full_width_zero_width_or_lower_case_term() {
+        let strip = |text: &str, items: &[&str]| strip_from_model_text(text, &strip_cfg(items));
+        assert_eq!(strip("Ｄ鲸ＳＨ", &["鲸"]), "Ｄ鲸ＳＨ", "full-width");
+        assert_eq!(strip("D\u{200b}鲸SH", &["鲸"]), "D\u{200b}鲸SH", "split by a zero-width space");
+        assert_eq!(strip("我是a鲸i", &["鲸"]), "我是a鲸i", "lower-case ai");
+        assert_eq!(strip("Ｄ鲸x", &["鲸"]), "Ｄx", "a harmless strip still applies");
+    }
+
+    #[test]
     fn prompt_text_checked_strip_refuses_a_text_the_strip_would_turn_into_a_denied_term() {
         let delivery = strip_cfg(&["鲸鱼"]);
         // The second pass would make `DSH`, so the text is refused whole, not delivered half stripped.
@@ -598,12 +607,12 @@ mod tests {
         // The compatibility render passed its check as `D鲸鱼SH`; the DSH delivery strips the prompt again.
         let (root, context, cfg) = delivery_fixture("prompt-text-dsh", &["鲸鱼"]);
         let delivered = strip_text_with_runtime(&context, "【别像客服】D鲸鱼SH\n\n后文", &cfg);
-        assert!(!crate::settings::denied_in_text(&delivered).contains(&"dsh".to_string()), "{delivered}");
+        assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "{delivered}");
         assert_eq!(delivered, "【别像客服】D鲸鱼SH\n\n后文");
         // The snapshot packet form strips its chat fields and the text around it the same way.
         let packet = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D鲸鱼SH 鲸鱼好\"}]}后D鲸鱼SH";
         let delivered = strip_text_with_runtime(&context, packet, &cfg);
-        assert!(!crate::settings::denied_in_text(&delivered).contains(&"dsh".to_string()), "{delivered}");
+        assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "{delivered}");
         assert_eq!(delivered, packet, "the literal that would make the term is not applied anywhere in the text");
         std::fs::remove_dir_all(root).unwrap();
     }

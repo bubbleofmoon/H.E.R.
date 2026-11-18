@@ -514,7 +514,7 @@ mod tests {
     fn route_health_the_alert_names_no_route_model_maker_or_secret() {
         let text = alert_text("group:101", 2, "quota");
         assert_eq!(text, "[group:101] 所有回复线路都失败了：2 条线路最近一次请求都没有成功（最后一次：quota）。有线路恢复之前不再提醒。");
-        assert!(crate::upstream_capture::denied_terms(&text).is_empty(), "{text}");
+        assert!(crate::model_text_policy::denied_terms(&text).is_empty(), "{text}");
         for hidden in ["primary-route", "fixture-gpt", "harness", "openai", "synthetic"] {
             assert!(!text.contains(hidden), "{hidden}: {text}");
         }
