@@ -267,8 +267,9 @@ fn miss_class(miss: &Miss) -> &'static str {
 /// answer is retried on the same route up to `routes::EMPTY_RETRIES` times first. The walk is bounded as a whole by the
 /// `within` its caller gives (at most its `timeout`): each request gets the time left, a wait never reaches the end, a
 /// request that times out had all the time left and ends the walk, and nothing is sent once the end has passed or the
-/// caller has set `abandoned`. A request the walk's bound cut short (less time left than `timeout`) is no route failure
-/// when it times out. The first usable answer is returned and never
+/// caller has set `abandoned`. A request the walk's bound shortens is no route failure when it
+/// times out (the first request is shortened only when `within` is less than `timeout`; every later one is). The
+/// first usable answer is returned and never
 /// sent again. It shares the failover memory of harness turns (`routes::with_memory`) under its ledger key, as one
 /// conversation: its degraded route starts the next walks, and at most `routes::RETRY_CAP` failovers are made until a
 /// route answers. Every response end is a usage fact on the route that gave it, one turn number per walk with its retry
@@ -379,8 +380,11 @@ impl OneShot for RouteWalk {
             if left.is_zero() {
                 return Err(ModelError("timeout"));
             }
-            // A request the walk's bound cuts short (less time than the route's own timeout) is no route failure.
-            let cut = left < self.timeout;
+            // The walk's bound shortens a request when `within` is less than the route's timeout (the first request) and
+            // every later request, which follows a failover or a retry that has spent time. Decided from the bound, never
+            // from a clock re-read, so a first request given the full bound is not cut. A cut request that times out is no
+            // route failure.
+            let cut = within < self.timeout || retry > 0;
             let (spec, model) = &self.routes[at];
             let miss = match model.send(system, input, left, turn, retry) {
                 Ok(text) => match crate::backend::plain_output_failure(&text) {
@@ -422,8 +426,11 @@ impl OneShot for RouteWalk {
                     if observed {
                         self.observe(at, Seen::Failed { class });
                     }
-                    let action = format!("next route {}", self.routes[at + 1].1.usage_route);
-                    self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
+                    // An abandoned walk asks no next route, so it records no failover step naming one.
+                    if !abandoned.load(Ordering::SeqCst) {
+                        let action = format!("next route {}", self.routes[at + 1].1.usage_route);
+                        self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
+                    }
                     routes::with_memory(&scope, |memory| memory.on_failover(&memory_key, at + 1, now));
                     at += 1;
                     rate_limited = false;

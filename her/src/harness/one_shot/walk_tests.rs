@@ -299,6 +299,25 @@ fn digest_walk_stays_within_the_digest_timeout() {
     assert_eq!(fixture.walk(Duration::from_millis(500)).complete("system", "input"), Err(ModelError("timeout")));
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(relay.asked(), ["model-a"], "nothing is sent once the bound has passed");
+    // The first request had the full bound: a route that hangs past its own timeout is a route failure.
+    assert_eq!(fixture.health(), ["a=failed", "b=unknown"], "a first request that times out is a route failure");
+}
+
+#[test]
+fn digest_walk_an_abandoned_walk_writes_no_failover_step() {
+    // Route a answers an error 300 ms late; the caller abandons the walk 100 ms in, while that request is in flight.
+    let relay = Relay::start(vec![("model-a", after(300, Kind::Status(500, ""))), ("model-b", at_once(Kind::Answer("[]")))]);
+    let fixture = Fixture::new("abandoned-failover", &relay, chain_of(&["a", "b"]));
+    let walk = fixture.walk(Duration::from_secs(10));
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let setter = abandoned.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        setter.store(true, Ordering::SeqCst);
+    });
+    assert_eq!(walk.complete_within("system", "input", Duration::from_secs(10), &abandoned), Err(ModelError("cancelled")));
+    assert_eq!(relay.asked(), ["model-a"], "an abandoned walk asks no next route");
+    assert!(fixture.records("failover-step").is_empty(), "no failover step names a route that is never asked");
 }
 
 #[test]
