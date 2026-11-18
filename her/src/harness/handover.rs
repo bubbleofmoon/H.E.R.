@@ -411,6 +411,20 @@ mod tests {
     }
 
     #[test]
+    fn harness_summary_refuses_full_width_and_zero_width_names_the_chat_never_used() {
+        let chat = "〔对方〕周六爬山";
+        assert_eq!(accept(chat, "作为ＡＩ，我记得周六爬山"), Err("wording"), "full-width AI");
+        assert_eq!(accept(chat, "作为A\u{200B}I，我记得周六爬山"), Err("wording"), "AI split by a zero-width space");
+        assert_eq!(accept(chat, "Ｈａｒｎｅｓｓ记得周六爬山"), Err("wording"), "full-width harness");
+        assert_eq!(accept(chat, "ha\u{200B}rness 记得周六爬山"), Err("wording"), "harness split by a zero-width space");
+        assert_eq!(
+            accept("〔对方〕你是ＡＩ吗", "对方问我是不是AI"),
+            Ok("对方问我是不是AI".to_string()),
+            "a full-width term the chat itself named"
+        );
+    }
+
+    #[test]
     fn harness_summary_labels_name_no_harness_model_or_ai() {
         let sample = label_sample();
         assert!(denied_terms(&sample).is_empty(), "{:?}\n{sample}", denied_terms(&sample));

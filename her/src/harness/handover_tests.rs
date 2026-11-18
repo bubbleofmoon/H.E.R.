@@ -109,6 +109,7 @@ struct Rig {
     context: RuntimeContext,
     generation: String,
     cfg: Value,
+    deadline: Duration,
     model: Arc<TcpListener>,
     summariser: Arc<Summariser>,
 }
@@ -158,6 +159,7 @@ async fn rig(
         context,
         generation,
         cfg,
+        deadline: Duration::from_secs(20),
         model,
         summariser,
     }
@@ -180,7 +182,7 @@ impl Rig {
             media: Vec::new(),
             profile: "closed-agent".into(),
             route: ModelRoute::from_runtime(&self.context, &self.cfg).unwrap(),
-            deadline: Duration::from_secs(20),
+            deadline: self.deadline,
             tools: Tools::capture(&self.context, &self.cfg, "closed-agent", OWNER, &self.generation).unwrap(),
             limits: Limits::from_config(&self.cfg).with_retry_unit(Duration::from_millis(1)),
         }
@@ -368,7 +370,7 @@ async fn harness_summary_a_summary_with_new_ai_wording_is_refused_and_the_oldest
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn harness_summary_a_turn_stopped_mid_summary_writes_nothing_and_the_next_turn_summarises_again() {
+async fn harness_summary_a_stopped_mid_summary_turn_writes_nothing_keeps_every_fact_and_its_late_answer_writes_nothing() {
     let mut rig = rig("mid-summary", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
     rig.seed(1..=19, long_prompt, json!({}));
     let users = rig.events("user").len();
@@ -397,6 +399,65 @@ async fn harness_summary_a_turn_stopped_mid_summary_writes_nothing_and_the_next_
     assert_eq!(rig.summaries().len(), 1, "only the stopped turn asked for a summary");
     assert_eq!(rig.events("user").len(), users + 2, "every stored fact stays");
     assert!(texts(&body).iter().all(|text| !text.starts_with(SUMMARY_LABEL)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_summary_a_turn_left_running_by_a_crash_is_resolved_and_the_next_turn_in_its_generation_summarises() {
+    let rig = rig("crash-mid-summary", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
+    rig.seed(1..=19, long_prompt, json!({}));
+    // The crash: turn 20 was admitted and left `running` in storage, mid-summary, with no live owner. It wrote no
+    // checkpoint, and its generation is not revoked.
+    let session: String = rig
+        .db()
+        .query_row(
+            "SELECT id FROM sessions WHERE conversation = ?1 AND generation = ?2",
+            rusqlite::params![OWNER, rig.generation],
+            |r| r.get(0),
+        )
+        .unwrap();
+    rig.db()
+        .execute(
+            "INSERT INTO turns(id,session_id,conversation,profile,state,begun_ms) VALUES('crash-20',?1,?2,'closed-agent','running',1)",
+            rusqlite::params![session, OWNER],
+        )
+        .unwrap();
+    rig.db()
+        .execute(
+            "INSERT INTO events(session_id,turn_id,kind,payload,created_ms) VALUES(?1,'crash-20','user',?2,1)",
+            rusqlite::params![session, json!({"text": "现在回复"}).to_string()],
+        )
+        .unwrap();
+    assert!(rig.events("checkpoint").is_empty(), "a crash mid-summary writes no checkpoint");
+    crate::harness::resolve_interrupted(&rig.context, "crash-20").unwrap();
+    let body = rig.turn("crash-next", "再回复", answer("好", 12)).await;
+    assert_eq!(rig.summaries().len(), 1, "the next turn in the same generation asks for the summary");
+    let checkpoints = rig.events("checkpoint");
+    assert_eq!(checkpoints.len(), 1);
+    assert_eq!(checkpoints[0]["summary"], "第1次摘要：周六爬山。");
+    assert!(texts(&body).iter().any(|text| text.starts_with(SUMMARY_LABEL)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn harness_summary_a_summary_still_running_at_the_turn_deadline_fails_as_a_timeout_and_the_turn_answers() {
+    let mut rig = rig("summary-deadline", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
+    rig.seed(1..=19, long_prompt, json!({}));
+    let users = rig.events("user").len();
+    let token = crate::conversation_authority::token(&rig.context, OWNER).unwrap();
+    // The summariser holds past the turn's 8 s deadline; `SUMMARY_RESERVE` (5 s) bounds the summary to 3 s of it.
+    rig.deadline = Duration::from_secs(8);
+    rig.summariser.hold.store(true, Ordering::SeqCst);
+    let body = rig.turn("summary-deadline-20", "现在回复", answer("好", 12)).await;
+    rig.summariser.hold.store(false, Ordering::SeqCst);
+    assert_eq!(crate::conversation_authority::token(&rig.context, OWNER).unwrap(), token, "no revoke: the token stands");
+    assert_eq!(rig.summaries().len(), 1, "the summary was asked for");
+    let failed = rig.events("checkpoint_failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["class"], "timeout");
+    let checkpoints = rig.events("checkpoint");
+    assert_eq!(checkpoints.len(), 1, "the budget checkpoint still covers the older rounds");
+    assert!(checkpoints[0]["summary"].is_null(), "with no earlier summary");
+    assert_eq!(rig.events("user").len(), users + 1, "every stored fact stays");
+    assert!(!texts(&body).iter().any(|text| text.starts_with(SUMMARY_LABEL)), "no summary reaches the model");
 }
 
 #[tokio::test(flavor = "current_thread")]
