@@ -31,7 +31,7 @@ pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
 /// Read by `harness::Limits::from_config`.
 pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     key: "harness.maxTokens",
-    pointer: "/harness/maxSteps", // RED-M1
+    pointer: "/harness/maxTokens",
     kind: &Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
