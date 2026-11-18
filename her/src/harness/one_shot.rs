@@ -372,7 +372,7 @@ impl OneShot for RouteWalk {
         let bytes = system.len() + input.len();
         let (mut retry, mut rate_limited, mut empty_answers) = (0i64, false, 0u32);
         loop {
-            if false && abandoned.load(Ordering::SeqCst) { // RED-M11
+            if abandoned.load(Ordering::SeqCst) {
                 return Err(ModelError("cancelled"));
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -391,7 +391,7 @@ impl OneShot for RouteWalk {
                 Err(miss) => miss,
             };
             let class = miss_class(&miss);
-            let observed = true; // RED-M12
+            let observed = !(cut && class == "timeout");
             let now = Instant::now();
             let remaining = deadline.saturating_duration_since(now);
             let next_route = at + 1 < self.routes.len()
