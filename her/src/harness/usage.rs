@@ -4,8 +4,6 @@
 //! (the digest, `digest/model.rs`). The console's token views read these samples with every other sample and price
 //! them by model at read time; `/api/usage/attribution` leaves them out of its comparison with DSH's own total, which
 //! never saw these requests (`Ledger::dsh_comparable_samples`).
-#![allow(dead_code)]
-// #173 step 2 wires `record` into harness.rs and the digest; remove both lines then.
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::RuntimeContext;
 use genai::chat::Usage;

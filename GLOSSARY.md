@@ -103,6 +103,10 @@ _Avoid_: preset, tool whitelist, tool guard
 One way the harness reaches a model: a route id, the relay model it asks, its reasoning effort and its output limit. A conversation's candidate chain lists routes in order; when one fails, the next takes over.
 _Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
 
+**Usage fact (用量记录, `harness::usage`)**:
+One token-ledger sample for one model request the harness route module sent: the conversation, the route and model, the request's place in its turn and the tokens its response reported. The console's token totals read it with DSH's samples.
+_Avoid_: billing record, usage event (a DSH request event)
+
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.
 _Avoid_: dependency (a process the supervisor runs), fork, vendor
