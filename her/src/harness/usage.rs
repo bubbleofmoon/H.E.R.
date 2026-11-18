@@ -17,6 +17,8 @@ pub(crate) const ENGINE: &str = "harness";
 pub(crate) const TURN: &str = "turn";
 /// The `job` of the digest's samples.
 pub(crate) const DIGEST: &str = "digest";
+/// The `job` of the slang learner's samples.
+pub(crate) const SLANG: &str = "slang";
 /// The ledger key the digest's samples are filed under.
 pub(crate) const DIGEST_KEY: &str = "internal:digest";
 
@@ -407,5 +409,38 @@ mod tests {
         let summary = Ledger::load_all_for_runtime(&fixture.context).unwrap().summary(&crate::pricing::resolve(None), 50);
         assert_eq!(summary["conversations"][0]["key"], "internal:digest");
         assert_eq!((summary["totals"]["turns"].as_i64(), summary["totals"]["totalTokens"].as_f64()), (Some(2), Some(84.0)));
+    }
+
+    #[test]
+    fn harness_usage_the_digest_records_a_refused_answer_once() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_request(&mut socket);
+            let body = json!({"id": "usage-173-refusal", "object": "chat.completion", "created": 1, "model": "digest-173",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "content_filter"}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42}})
+            .to_string();
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let chain = json!({"routes": [{"id": "first", "model": "digest-173"}]});
+        let fixture = Fixture::new("digest-refusal", chain, port);
+        let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+        assert_eq!(model.complete("system", "input"), Err(crate::digest::ModelError("refusal")));
+        server.join().unwrap();
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 1, "a refused answer is paid for: exactly one usage fact, {rows:?}");
+        assert_eq!(
+            (rows[0]["key"].as_str(), rows[0]["route"].as_str(), rows[0]["model"].as_str(), rows[0]["job"].as_str()),
+            (Some("internal:digest"), Some("first"), Some("digest-173"), Some("digest"))
+        );
+        assert_eq!(rows[0]["b"], json!({"cacheMiss": 40, "cacheHit": 0, "cacheWrite": 0, "output": 2, "reasoning": 0}));
     }
 }

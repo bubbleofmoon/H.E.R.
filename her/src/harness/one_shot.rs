@@ -15,6 +15,23 @@ pub(crate) enum Job {
     SlangLearner,
 }
 
+impl Job {
+    /// The `job` value of this job's usage facts (`harness::usage`).
+    fn usage_job(self) -> &'static str {
+        match self {
+            Job::Digest => crate::harness::usage::DIGEST,
+            Job::SlangLearner => crate::harness::usage::SLANG,
+        }
+    }
+}
+
+/// The route a one-shot request asks: its id (a usage fact's `route`) and its relay model.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RouteModel<'a> {
+    pub id: &'a str,
+    pub model: &'a str,
+}
+
 pub(crate) trait OneShot: Send + Sync {
     /// One completion: the `system` text (left out when empty), then the user `input`.
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError>;
@@ -34,12 +51,13 @@ pub(crate) fn install_test_model(root: &std::path::Path, job: Job, model: Arc<dy
     models.push((root.to_path_buf(), job, model));
 }
 
-/// The model `job` asks on `context`: `model` (`None`: not configured) on the relay, bounded by `timeout`, answering at
-/// most `max_tokens` tokens.
+/// The model `job` asks on `context`: `route` (`None`: not configured) on the relay, bounded by `timeout`, answering at
+/// most `max_tokens` tokens. Each answered request is a usage fact (`harness::usage`) under the ledger key `key`.
 pub(crate) fn model_for(
     context: &RuntimeContext,
     job: Job,
-    model: Option<&str>,
+    key: &str,
+    route: Option<RouteModel<'_>>,
     timeout: Duration,
     max_tokens: u32,
 ) -> Result<Arc<dyn OneShot>, ModelError> {
@@ -51,10 +69,8 @@ pub(crate) fn model_for(
             return Ok(model.clone());
         }
     }
-    #[cfg(not(test))]
-    let _ = job;
-    let model = model.ok_or(ModelError("unconfigured"))?;
-    Ok(Arc::new(RelayModel::for_model(context, model, timeout, max_tokens)?))
+    let route = route.ok_or(ModelError("unconfigured"))?;
+    Ok(Arc::new(RelayModel::for_model(context, job, key, route, timeout, max_tokens)?))
 }
 
 /// The relay's OpenAI-compatible endpoint for one model with the harness credential (`ModelRoute::for_model`): one
@@ -66,17 +82,32 @@ pub(crate) struct RelayModel {
     route: crate::harness::ModelRoute,
     timeout: Duration,
     max_tokens: u32,
+    /// The ledger key, the route id and the `job` value of each request's usage fact (`harness::usage`).
+    usage_key: String,
+    usage_route: String,
+    usage_job: &'static str,
 }
 
 impl RelayModel {
     pub(crate) fn for_model(
         context: &RuntimeContext,
-        model: &str,
+        job: Job,
+        key: &str,
+        route: RouteModel<'_>,
         timeout: Duration,
         max_tokens: u32,
     ) -> Result<Self, ModelError> {
-        let route = crate::harness::ModelRoute::for_model(context, model).map_err(|_| ModelError("unconfigured"))?;
-        Ok(Self { context: context.clone(), model: model.to_string(), route, timeout, max_tokens })
+        let relay = crate::harness::ModelRoute::for_model(context, route.model).map_err(|_| ModelError("unconfigured"))?;
+        Ok(Self {
+            context: context.clone(),
+            model: route.model.to_string(),
+            route: relay,
+            timeout,
+            max_tokens,
+            usage_key: key.to_string(),
+            usage_route: route.id.to_string(),
+            usage_job: job.usage_job(),
+        })
     }
 }
 
@@ -169,7 +200,7 @@ mod tests {
     fn one_shot_sends_its_input_alone_without_tools() {
         let (url, request) = relay("[]");
         let (_root, context) = capture::runtime("one-shot-alone", &url);
-        let model = RelayModel::for_model(&context, "fake-chat", Duration::from_secs(5), 321).unwrap();
+        let model = RelayModel::for_model(&context, Job::Digest, "internal:digest", RouteModel { id: "route-a", model: "fake-chat" }, Duration::from_secs(5), 321).unwrap();
         assert_eq!(model.complete("", "one-shot-input-11"), Ok("[]".to_string()));
         let body = request.join().unwrap();
         assert_eq!(body["model"], "fake-chat");
@@ -190,7 +221,7 @@ mod tests {
         let (url, request) = relay("[]");
         let (_root, context) = capture::runtime("one-shot-capture", &url);
         capture::arm(&context, "harness");
-        let model = RelayModel::for_model(&context, "fake-chat", Duration::from_secs(5), 321).unwrap();
+        let model = RelayModel::for_model(&context, Job::Digest, "internal:digest", RouteModel { id: "route-a", model: "fake-chat" }, Duration::from_secs(5), 321).unwrap();
         assert_eq!(model.complete("", "one-shot-input-11"), Ok("[]".to_string()));
         request.join().unwrap();
         let record = capture::settled(&context).expect("the armed capture took the one-shot request");
@@ -201,5 +232,25 @@ mod tests {
         );
         assert_eq!(record["request"]["maxTokens"], 321, "{record}");
         assert!(record["request"]["request"].to_string().contains("one-shot-input-11"), "{record}");
+    }
+
+    #[test]
+    fn harness_usage_the_slang_one_shot_records_one_fact_under_its_key() {
+        let (url, request) = relay("[]");
+        let (root, context) = capture::runtime("one-shot-usage", &url);
+        let route = RouteModel { id: "route-a", model: "fake-chat" };
+        let model = model_for(&context, Job::SlangLearner, "group:7002", Some(route), Duration::from_secs(5), 321).unwrap();
+        assert_eq!(model.complete("", "one-shot-usage-input"), Ok("[]".to_string()));
+        request.join().unwrap();
+        let text = std::fs::read_to_string(root.0.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+        let rows: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 1, "one answered request is one usage fact: {rows:?}");
+        assert_eq!(
+            (rows[0]["key"].as_str(), rows[0]["route"].as_str(), rows[0]["model"].as_str(), rows[0]["job"].as_str()),
+            (Some("group:7002"), Some("route-a"), Some("fake-chat"), Some("slang")),
+            "{}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["b"], json!({"cacheMiss": 1, "cacheHit": 0, "cacheWrite": 0, "output": 1, "reasoning": 0}));
     }
 }
