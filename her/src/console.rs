@@ -7000,12 +7000,12 @@ fn handle_social_config_post(
         // takes a change. The router's front check already refuses such a file before any handler runs; this check
         // covers an edit that lands after it and before the configuration gate is taken. A save without a registry
         // change runs no canonical check of its own.
-        // canonical check moved behind apply_changes (RED-M1)
+        raw_config_for_write(context)?;
         note_config_before_request(context);
     }
     crate::settings::apply_changes(context, settings_changes, "administrator", "console")?;
     if context.is_isolated() {
-        let current = raw_config_for_write(context)?; // RED-M1
+        let current = raw_config_object(context)?;
         crate::settings::keep_registry_values(&current, &mut file)
             .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
     }
