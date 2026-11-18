@@ -170,18 +170,23 @@ impl SlangLearning {
 
     /// Start (once per value) the startup catch-up on its own thread: each retained window that is
     /// already due is extracted in turn; one whose extraction fails stays for its next trigger.
-    pub fn start_catch_up(&self) {
+    /// Returns the thread's handle when this call started it.
+    pub fn start_catch_up(&self) -> Option<std::thread::JoinHandle<()>> {
         use std::sync::atomic::Ordering;
         if self.inner.caught_up.swap(true, Ordering::AcqRel) {
-            return;
+            return None;
         }
         let learning = self.clone();
         let spawned = std::thread::Builder::new()
             .name("slang-catch-up".to_string())
             .spawn(move || learning.catch_up_with(|key| learning.extract_blocking(key)));
-        if let Err(error) = spawned {
-            self.inner.caught_up.store(false, Ordering::Release);
-            crate::safe_println!("[slang] 无法启动黑话补抽取：{error}");
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                self.inner.caught_up.store(false, Ordering::Release);
+                crate::safe_println!("[slang] 无法启动黑话补抽取：{error}");
+                None
+            }
         }
     }
 
@@ -2970,6 +2975,33 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         learning.catch_up_with(|key| ran.push(key.to_string()));
         assert_eq!(ran, ["group:1"], "disabled learning catches nothing up");
         drop(learning);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_catch_up_runs_once_per_runtime_root_across_learning_values() {
+        let (root, context) = runtime_fixture("catch-up-once");
+        std::fs::write(
+            root.join("config/config.json"),
+            r#"{"consoleToken":"fixture-token","harness":{"model":"route-model"},"slang":{"extractMinMessages":1,"extractCooldownMs":0}}"#,
+        )
+        .unwrap();
+        SlangLearning::new(&context)
+            .try_feed_window("group:1", "甲", "今天又破防了")
+            .unwrap();
+        // Every attempt fails, so nothing is consumed and each learning value would find the window due again.
+        let fake = route_fake(&context, vec![Err("quota"), Err("quota"), Err("quota")]);
+        let first = SlangLearning::new(&context);
+        let second = SlangLearning::new(&context);
+        let handles = [first.start_catch_up(), second.start_catch_up()];
+        for handle in handles.into_iter().flatten() {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            fake.calls.lock().unwrap().len(),
+            1,
+            "two learning values on one runtime each ran the startup catch-up"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
