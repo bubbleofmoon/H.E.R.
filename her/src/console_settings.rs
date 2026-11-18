@@ -154,7 +154,7 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
     }
     let (target, access) = match looked {
         Ok(target) => (Some(target), target.access()),
-        Err((status, message)) if matches!(status, 404 | 409) => return Err((status, message)),
+        Err((status, _)) if matches!(status, 404 | 409) => (None, false), // RED-M5
         Err(error) => {
             if !crate::settings::confirm_field(&Value::Object(fields.clone()))? {
                 return Err(error);

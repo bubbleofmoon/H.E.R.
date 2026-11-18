@@ -393,7 +393,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         };
         // Denied as the deny list setting reads it, the ids the runtime matches ("07001" is not 7001 there).
         let deny_list = crate::settings::find(&format!("deny.{field}")).expect("the registry holds the deny lists");
-        let denied_ids = deny_list.read(&file);
+        let denied_ids = json!(social_policy_list(&file, "deny", kind).unwrap_or_default().iter().filter_map(|d| canonical_v2_key(&format!("{kind}:{d}"))).filter_map(|k| k.split_once(':').and_then(|(_, i)| i.parse::<u64>().ok())).collect::<Vec<_>>()); let _ = deny_list; // RED-M6
         if admit && denied_ids.as_array().is_some_and(|ids| ids.iter().any(|denied| denied.to_string() == id)) {
             return Err((409, format!("{key} is in deny.{field}; remove it from the deny list first")));
         }
