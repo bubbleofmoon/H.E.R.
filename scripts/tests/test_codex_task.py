@@ -58,9 +58,19 @@ cat > /dev/null
 # A run that edits FAKE_PATH (default new.txt), commits it and pushes the branch, as the real run does.
 edit() { f=${FAKE_PATH:-new.txt}; mkdir -p "$(dirname "$workdir/$f")"; echo changed >> "$workdir/$f"; }
 commit() { git -C "$workdir" add -A && git -C "$workdir" commit -q -m "${1:-fake commit}"; }
-push() { git -C "$workdir" push -q -u origin "$(git -C "$workdir" symbolic-ref --short HEAD)"; }
+push() { git -C "$workdir" push -q "$@" origin "$(git -C "$workdir" symbolic-ref --short HEAD)"; }
 case "$FAKE_MODE" in
   commit-push) edit; commit; push; printf 'done\n' > "$report" ;;
+  commit-push-digits) f=${FAKE_PATH:-new.txt}; echo "id $(seq -s '' 1 9)" >> "$workdir/$f"; commit; push; printf 'done\n' > "$report" ;;
+  rename) git -C "$workdir" mv "$FAKE_PATH" "$FAKE_PATH.moved"; commit; push; printf 'done\n' > "$report" ;;
+  delete) git -C "$workdir" rm -q "$FAKE_PATH"; commit; push; printf 'done\n' > "$report" ;;
+  symlink) rm "$workdir/$FAKE_PATH"; ln -s /etc/hostname "$workdir/$FAKE_PATH"; commit; push; printf 'done\n' > "$report" ;;
+  amend-force) git -C "$workdir" commit -q --amend --allow-empty -m amended; push --force; printf 'done\n' > "$report" ;;
+  reset-force) git -C "$workdir" reset -q --hard HEAD~1; push --force; printf 'done\n' > "$report" ;;
+  common-config) git -C "$workdir" config demo.key value; edit; commit; push; printf 'done\n' > "$report" ;;
+  common-hook) mkdir -p "${adds[1]}/hooks"; echo x > "${adds[1]}/hooks/post-commit"; edit; commit; push; printf 'done\n' > "$report" ;;
+  worktree-config) echo '[demo]' > "$(git -C "$workdir" rev-parse --absolute-git-dir)/config.worktree"; edit; commit; push; printf 'done\n' > "$report" ;;
+  config-fail) git -C "$workdir" config demo.key value; printf 'half\n' > "$report"; exit 3 ;;
   commit-twice) edit; commit 'first'; echo more >> "$workdir/second.txt"; commit 'second'; push; printf 'done\n' > "$report" ;;
   commit-nopush) edit; commit; printf 'done\n' > "$report" ;;
   commit-push-dirty) edit; commit; push; echo stray > "$workdir/stray.txt"; printf 'done\n' > "$report" ;;
@@ -270,7 +280,7 @@ class Work:
         git('init', '-q', '-b', 'main', str(self.repo), cwd=out)
         for path in ['a.txt', *PROTECTED]:
             (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
-            (self.repo / path).write_text('a\n')
+            (self.repo / path).write_text('{}\n' if path == '.public-scan.json' else 'a\n')
         git('add', '-A', cwd=self.repo)
         git('commit', '-q', '-m', 'init', cwd=self.repo)
         git('remote', 'add', 'origin', str(self.remote), cwd=self.repo)
@@ -288,7 +298,7 @@ class Work:
 
     def env(self, mode, **extra):
         env = dict(git_env(), FAKE_MODE=mode, FAKE_LIMIT=LIMIT, FAKE_ARGS=str(self.args_file),
-                   HER_ORCH=str(self.orch), HER_GITLEAKS=str(self.gitleaks))
+                   HER_ORCH=str(self.orch), HER_GITLEAKS=str(self.gitleaks), HER_REMOTE_URL=str(self.remote))
         env.update(self.fake_env)
         env.update(extra)
         return {k: v for k, v in env.items() if v is not None}
@@ -463,12 +473,93 @@ class Work:
     def test_uncommitted_changes_after_the_run_are_dirty(self):
         done = self.implement('dirty')
         self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
-        self.assertEqual(self.receipt(), ['dirty new.txt'])
+        self.assertEqual(self.receipt(), ['dirty new.txt', 'remote unchanged'])
 
-    def test_a_stray_file_after_a_pushed_commit_is_dirty(self):
+    def test_a_stray_file_after_a_pushed_commit_is_dirty_and_the_remote_moved(self):
         done = self.implement('commit-push-dirty')
         self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
-        self.assertEqual(self.receipt(), ['dirty stray.txt'])
+        self.assertEqual(self.receipt(), ['dirty stray.txt', 'remote moved'])
+
+    def test_a_dirty_run_that_touched_a_protected_path_still_says_so(self):
+        done = self.implement('commit-push-dirty', env_extra={'FAKE_PATH': '.githooks/pre-commit'})
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['dirty stray.txt', 'remote moved', 'protected .githooks/pre-commit'])
+
+    def test_an_unpushed_run_that_touched_a_protected_path_still_says_so(self):
+        done = self.implement('commit-nopush', env_extra={'FAKE_PATH': 'scripts/scan-public.py'})
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['unpushed', 'protected scripts/scan-public.py'])
+
+    def test_a_remote_that_is_not_the_fixed_url_does_not_count(self):
+        other = self.out / 'other.git'
+        git('init', '-q', '--bare', str(other), cwd=self.out)
+        git('remote', 'set-url', 'origin', str(other), cwd=self.repo)     # the run pushes to origin, not to the fixed URL
+        done = self.implement('commit-push')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['unpushed'])
+        self.assertIsNone(self.remote_head(self.BRANCH))
+
+    def test_implement_refuses_a_remote_that_does_not_answer(self):
+        done = self.implement('commit-push', env_extra={'HER_REMOTE_URL': str(self.out / 'gone.git')})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.args_file.exists())
+
+    def branch_commit(self):
+        """A pushed commit on the ticket branch before the run, so the run starts above main."""
+        (self.wt / 'b1.txt').write_text('b1\n')
+        git('add', '-A', cwd=self.wt)
+        git('commit', '-q', '-m', 'b1', cwd=self.wt)
+        git('push', '-q', 'origin', self.BRANCH, cwd=self.wt)
+
+    def test_an_amend_with_a_force_push_is_rewritten(self):
+        self.branch_commit()
+        done = self.implement('amend-force')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['rewritten'])
+
+    def test_a_reset_with_a_force_push_is_rewritten(self):
+        self.branch_commit()
+        done = self.implement('reset-force')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['rewritten'])
+
+    def test_a_new_commit_on_an_existing_remote_branch_passes_the_added_scan(self):
+        self.branch_commit()
+        done = self.implement('commit-push')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), [f'pushed {self.head(self.wt)}'])
+        self.assertIn('Public scan (added)', (self.ticket_dir / 'run.scan.txt').read_text())
+
+    def test_a_commit_the_public_scan_refuses_is_flagged(self):
+        done = self.implement('commit-push-digits')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), [f'pushed {self.head(self.wt)}', 'scan-refused'])
+        self.assertIn('digit', (self.ticket_dir / 'run.scan.txt').read_text())
+
+    def config_changed(self, mode, expected, code=8):
+        done = self.implement(mode)
+        self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+        lines = self.receipt()
+        self.assertEqual(len(lines), 1, lines)                       # nothing else is checked
+        self.assertTrue(lines[0].startswith('config-changed '), lines)
+        self.assertIn(expected, lines[0])
+
+    def test_a_changed_common_git_config_is_reported(self):
+        self.config_changed('common-config', f'{self.common}/config')
+
+    def test_a_new_hook_in_the_common_git_dir_is_reported(self):
+        self.config_changed('common-hook', f'{self.common}/hooks/post-commit')
+
+    def test_a_new_worktree_config_is_reported(self):
+        self.config_changed('worktree-config', 'config.worktree')
+
+    def test_a_changed_git_config_is_reported_even_when_the_run_failed(self):
+        self.config_changed('config-fail', f'{self.common}/config')
+
+    def test_an_unchanged_config_does_not_mask_a_failed_run(self):
+        done = self.implement('change-fail')
+        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        self.assertFalse((self.ticket_dir / 'run.push.txt').exists())
 
     def test_a_commit_that_was_not_pushed_is_unpushed(self):
         done = self.implement('commit-nopush')
@@ -491,6 +582,19 @@ class Work:
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                 sha = self.head(self.wt)
                 self.assertEqual(self.receipt(), [f'pushed {sha}', f'protected {path}'])
+
+    def test_a_renamed_deleted_or_symlinked_protected_path_is_flagged(self):
+        cases = [('rename', 'scripts/check-repo.py', 'scripts/check-repo.py'),
+                 ('delete', '.gitleaks.toml', '.gitleaks.toml'),
+                 ('symlink', '.githooks/pre-commit', '.githooks/pre-commit')]
+        for mode, path, flagged in cases:
+            with self.subTest(mode=mode):
+                git('checkout', '-q', '-B', self.BRANCH, 'main', cwd=self.wt)
+                if self.remote_head(self.BRANCH):
+                    git('push', '-q', 'origin', f':refs/heads/{self.BRANCH}', cwd=self.wt)
+                done = self.implement(mode, env_extra={'FAKE_PATH': path})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(self.receipt(), [f'pushed {self.head(self.wt)}', f'protected {flagged}'])
 
     def test_an_unprotected_path_is_not_flagged(self):
         done = self.implement('commit-push', env_extra={'FAKE_PATH': 'scripts/other.py'})
@@ -534,23 +638,47 @@ class Work:
         self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
         self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
 
-    def test_a_plan_that_is_a_directory_is_not_installed(self):
+    def old_plan(self):
         self.make_scratch()
         (self.ticket_dir / 'plan.md').write_text('old\n')
+        (self.ticket_dir / 'plan.sha256').write_text('oldhash  plan.md\n')
+
+    def assert_old_plan_kept(self):
+        self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assertEqual((self.ticket_dir / 'plan.sha256').read_text(), 'oldhash  plan.md\n')
+        self.assertEqual([p.name for p in self.ticket_dir.iterdir() if p.name.startswith('.plan')], [])
+
+    def test_a_plan_that_is_a_directory_is_not_installed(self):
+        self.old_plan()
         done = self.plan('plan-dir')
         self.assertNotEqual(done.returncode, 0)
-        self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assert_old_plan_kept()
         self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
-        self.assertFalse((self.ticket_dir / 'plan.sha256').exists())
 
     def test_a_plan_with_a_second_hard_link_is_not_installed(self):
-        self.make_scratch()
-        (self.ticket_dir / 'plan.md').write_text('old\n')
+        self.old_plan()
         done = self.plan('plan-hardlink')
         self.assertNotEqual(done.returncode, 0)
-        self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assert_old_plan_kept()
         self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
-        self.assertFalse((self.ticket_dir / 'plan.sha256').exists())
+
+    def test_a_half_failed_install_puts_the_old_plan_back(self):
+        self.make_scratch()
+        (self.ticket_dir / 'plan.md').write_text('old\n')
+        (self.ticket_dir / 'plan.sha256').mkdir()                        # the second step of the install cannot succeed
+        done = self.plan('plan')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assertEqual([p.name for p in self.ticket_dir.iterdir() if p.name.startswith('.plan')], [])
+        self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
+
+    def test_a_half_failed_first_install_leaves_no_plan(self):
+        self.make_scratch()
+        (self.ticket_dir / 'plan.sha256').mkdir()
+        done = self.plan('plan')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse((self.ticket_dir / 'plan.md').exists())
+        self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
 
     def test_a_failed_plan_run_installs_nothing(self):
         self.make_scratch()

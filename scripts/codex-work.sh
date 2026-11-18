@@ -3,20 +3,31 @@
 # usage: scripts/codex-work.sh implement <name> <worktree> <prompt-file> [model] [effort] [minutes]
 #        scripts/codex-work.sh plan <ticket> <name> <prompt-file> [model] [effort] [minutes]
 # Defaults: gpt-6.2-sol; effort medium for implement, high for plan; 360 minutes. Receipts sit next to the prompt:
-# codex-task's <name>.report.md and <name>.exit.txt, plus <name>.push.txt and <name>.staged.txt (implement) or
-# <name>.plan.txt (plan: `installed` or `no-plan`).
+# codex-task's <name>.report.md and <name>.exit.txt, plus <name>.push.txt, <name>.staged.txt and <name>.scan.txt
+# (implement) or <name>.plan.txt (plan: `installed` or `no-plan`).
 # implement: HER_GITLEAKS must name the gitleaks binary (Codex's own push runs the pre-push hook with it). Before the run
-#   the worktree must be clean, its HEAD on her/<n>-<slug> (never main), and <orch>/<n> and its tmp must not be links.
-#   Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's common git dir, and
-#   commits and pushes its own ticket branch. After it exits 0 with a report this script checks, in order, and writes
-#   the first line of <name>.push.txt: `branch-changed <branch>`, `dirty <paths>` (the worktree is not clean),
-#   `no-changes` (no new commit), `unpushed` (the remote head is not the local HEAD) or `pushed <sha>`. The first,
-#   second and fourth exit 8; the others exit 0. A second line `protected <paths>` names the commits' paths under
-#   .githooks/ or in the scan scripts, scan config and scan exceptions, which the gate must review.
+#   the worktree must be clean, its HEAD on her/<n>-<slug> (never main), <orch>/<n> and its tmp must not be links, and
+#   the remote must answer. Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
+#   common git dir, and commits and pushes its own ticket branch (push without -u: -u writes the common config).
+#   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
+#   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
+#   Every later git call ignores them anyway: it uses the git dir found before the run, core.fsmonitor=false and
+#   core.hooksPath=/dev/null, and asks $HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R.git) for the
+#   remote head, never `origin`.
+#   <name>.push.txt line 1 is the first that applies: `rewritten` (the pre-run HEAD is not an ancestor of HEAD),
+#   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged` (the remote head against the
+#   one before the run), `no-changes` (no new commit), `unpushed` (the remote head is not HEAD) or `pushed <sha>`.
+#   A line `protected <paths>` follows whenever pre-run HEAD..HEAD holds commits touching .githooks/ or the scan scripts,
+#   scan config or scan exceptions; a line `scan-refused` follows when scripts/scan-public.py of this checkout, run on
+#   the repository's main checkout with --added-from-stdin (--revs-from-stdin when the remote had no such branch) and
+#   --objects-from-stdin over those commits, refuses or cannot run (<name>.scan.txt has its output). That scan is
+#   detection after the push, never a barrier. Exit 8 for `config-changed`, `rewritten`, `branch-changed`, `git-failed`,
+#   `dirty`, `unpushed` and `scan-refused`, else 0.
 #   <name>.staged.txt lists the commits since the pre-run HEAD (`commit <sha> <subject>`) and the name-status of
 #   every path they touched (`<status><TAB><path>`).
 # plan: Codex (workspace-write) writes only <orch>/<n>/scratch and <orch>/<n>/plan-out; the plan it leaves there as a
-#   regular, single-link plan.md is copied to <orch>/<n>/plan.md, and plan.sha256 holds its sha256sum line.
+#   regular, single-link plan.md is copied to <orch>/<n>/plan.md, and plan.sha256 holds its sha256sum line. A failed
+#   install restores the old plan.md and plan.sha256.
 # <orch> is $HER_ORCH, default /root/orch/her.
 set -uo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -34,45 +45,108 @@ implement)
   [ -f "$prompt" ] || die "no prompt file: $prompt"
   [ -n "${HER_GITLEAKS:-}" ] && [ -f "$HER_GITLEAKS" ] && [ -x "$HER_GITLEAKS" ] || die 'HER_GITLEAKS must name the gitleaks binary'
   export HER_GITLEAKS
-  branch_of() { git -C "$wt" symbolic-ref --short -q HEAD 2> /dev/null; }
+  remote_url=${HER_REMOTE_URL:-https://github.com/bubbleofmoon/H.E.R.git}
   [ -d "$wt" ] && [ "$(git -C "$wt" rev-parse --show-toplevel 2> /dev/null)" = "$(realpath -- "$wt")" ] || die "not a worktree root: $wt"
+  wtgit=$(git -C "$wt" rev-parse --absolute-git-dir 2> /dev/null) || die "no git dir for $wt"
+  common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2> /dev/null) && [ -d "$common" ] || die "no git common dir for $wt"
+  [ "$(basename -- "$common")" = .git ] || die "the common git dir is not a checkout's .git: $common"
+  main_root=$(dirname -- "$common")
+  # Every git call from here on names the git dir found now, and turns off the settings that run programs.
+  g() { git --git-dir="$wtgit" --work-tree="$wt" -c core.fsmonitor=false -c core.hooksPath=/dev/null "$@"; }
+  branch_of() { g symbolic-ref --short -q HEAD 2> /dev/null; }
   branch=$(branch_of)
   [[ $branch =~ ^her/[0-9]+-[A-Za-z0-9._-]+$ ]] || die "HEAD is not a ticket branch (her/<n>-<slug>): ${branch:-detached}"
-  [ -z "$(git -C "$wt" status --porcelain --untracked-files=all)" ] || die "the worktree is not clean: $wt"
+  [ -z "$(g status --porcelain --untracked-files=all)" ] || die "the worktree is not clean: $wt"
   ticket=${branch#her/}; ticket=${ticket%%-*}
   [ ! -L "$orch/$ticket" ] && [ ! -L "$orch/$ticket/tmp" ] || die "a link in the ticket folder: $orch/$ticket"
-  common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2> /dev/null) && [ -d "$common" ] || die "no git common dir for $wt"
-  pre=$(git -C "$wt" rev-parse HEAD)
+  pre=$(g rev-parse HEAD)
+  g ls-remote "$remote_url" HEAD > /dev/null 2>&1 || die "the remote does not answer: $remote_url"
+  pre_remote=$(g ls-remote "$remote_url" "refs/heads/$branch" 2> /dev/null | cut -f1)
   out=$(dirname -- "$(realpath -- "$prompt")")
   mkdir -p -- "$orch/$ticket/tmp"
   [ ! -L "$orch/$ticket/tmp" ] || die "a link in the ticket folder: $orch/$ticket/tmp"
-  rm -f -- "$out/$name.push.txt" "$out/$name.staged.txt"
+  # What git, its hooks and later sessions read: hashed before and after the run.
+  snap() {
+    local f p
+    for f in "$common/config" "$wtgit/config.worktree" "$wtgit/commondir" "$wt/.git"; do
+      if [ -L "$f" ]; then printf 'link:%s  %s\n' "$(readlink -- "$f")" "$f"
+      elif [ -f "$f" ]; then sha256sum -- "$f"
+      elif [ -e "$f" ]; then printf 'other  %s\n' "$f"
+      fi
+    done
+    if [ -d "$common/hooks" ]; then
+      find "$common/hooks" ! -type d -print0 | LC_ALL=C sort -z | while IFS= read -r -d '' p; do
+        if [ -L "$p" ]; then printf 'link:%s  %s\n' "$(readlink -- "$p")" "$p"; else sha256sum -- "$p"; fi
+      done
+    fi
+  }
+  pre_snap=$(snap)
+  rm -f -- "$out/$name.push.txt" "$out/$name.staged.txt" "$out/$name.scan.txt"
+  receipt() { printf '%s\n' "$@" > "$out/$name.push.txt"; }
   TMPDIR="$orch/$ticket/tmp" "$here/codex-task.sh" "$name" "$wt" "$prompt" "$model" "$effort" workspace-write "$minutes" \
     "$orch/$ticket/tmp" "$common"
   code=$?
+  post_snap=$(snap)
+  if [ "$post_snap" != "$pre_snap" ]; then
+    changed=$(comm -3 <(sort <<< "$pre_snap") <(sort <<< "$post_snap") | sed -e 's/^[[:space:]]*//' -e 's/^[^ ]*  //' | sort -u | paste -sd' ' -)
+    receipt "config-changed $changed"
+    echo "config-changed $changed" >&2
+    exit 8
+  fi
   [ "$code" -eq 0 ] || exit "$code"
-  receipt() { printf '%s\n' "$@" > "$out/$name.push.txt"; }
+  fail_git() { receipt git-failed; echo "codex-work: a git call failed" >&2; exit 8; }
   now=$(branch_of)
-  if [ "$now" != "$branch" ]; then receipt "branch-changed ${now:-detached}"; exit 8; fi
-  range="$pre..HEAD"
-  {
-    git -C "$wt" log --format='commit %H %s' "$range"
-    git -C "$wt" -c core.quotepath=off log -m --no-renames --name-status --format= "$range" | sed '/^$/d' | sort -u
-  } > "$out/$name.staged.txt" || exit 8
-  stray=$(git -C "$wt" -c core.quotepath=off status --porcelain --untracked-files=all --no-renames | cut -c4- | paste -sd' ' -)
-  if [ -n "$stray" ]; then receipt "dirty $stray"; exit 8; fi
-  sha=$(git -C "$wt" rev-parse HEAD)
-  if [ "$sha" = "$pre" ]; then receipt no-changes; echo "no-changes: the run left no commit" >&2; exit 0; fi
-  remote=$(git -C "$wt" ls-remote origin "refs/heads/$branch" 2> /dev/null | cut -f1)
-  if [ "$remote" != "$sha" ]; then receipt unpushed; echo "unpushed: the remote head is not $sha" >&2; exit 8; fi
+  head=$(g rev-parse HEAD) || fail_git
+  rewritten=0
+  g merge-base --is-ancestor "$pre" "$head" 2> /dev/null || rewritten=1
+  range="$pre..$head"
+  commits=$(g log --format='commit %H %s' "$range") || fail_git
+  names=$(g -c core.quotepath=off log -m --no-renames --name-status --format= "$range") || fail_git
+  { [ -z "$commits" ] || printf '%s\n' "$commits"; printf '%s\n' "$names" | sed '/^$/d' | LC_ALL=C sort -u; } > "$out/$name.staged.txt"
+  paths_file="$out/$name.paths.tmp"
+  g log -m --no-renames --name-only -z --format= "$range" > "$paths_file" || { rm -f -- "$paths_file"; fail_git; }
   held=
-  while IFS= read -r p; do
+  while IFS= read -r -d '' p; do
     case "${p,,}" in
       .githooks/*|scripts/check-repo.py|scripts/scan-public.py|scripts/tests/test_scan_public.py|.gitleaks.toml|.public-scan.json) held="$held${held:+ }$p" ;;
     esac
-  done < <(git -C "$wt" -c core.quotepath=off log -m --no-renames --name-only --format= "$range" | sort -u)
-  if [ -n "$held" ]; then receipt "pushed $sha" "protected $held"; echo "protected $held" >&2; else receipt "pushed $sha"; fi
-  echo "pushed $sha"
+  done < <(LC_ALL=C sort -zu "$paths_file")
+  rm -f -- "$paths_file"
+  lines=() rc=0
+  if [ "$rewritten" -eq 1 ]; then
+    lines=(rewritten); rc=8
+  elif [ "$now" != "$branch" ]; then
+    lines=("branch-changed ${now:-detached}"); rc=8
+  else
+    stray=$(g -c core.quotepath=off status --porcelain --untracked-files=all --no-renames) || fail_git
+    stray=$(printf '%s\n' "$stray" | sed '/^$/d' | cut -c4- | paste -sd' ' -)
+    remote=$(g ls-remote "$remote_url" "refs/heads/$branch" 2> /dev/null | cut -f1)
+    if [ -n "$stray" ]; then
+      moved=unchanged; [ "$remote" = "$pre_remote" ] || moved=moved
+      lines=("dirty $stray" "remote $moved"); rc=8
+    elif [ "$head" = "$pre" ]; then lines=(no-changes)
+    elif [ "$remote" != "$head" ]; then lines=(unpushed); rc=8
+    else lines=("pushed $head")
+    fi
+  fi
+  [ -z "$held" ] || lines+=("protected $held")
+  list=$(g rev-list "$range") || fail_git
+  if [ -n "$list" ]; then
+    scan_mode=--added-from-stdin; [ -n "$pre_remote" ] || scan_mode=--revs-from-stdin
+    py=python3; command -v python3 > /dev/null 2>&1 || py=python
+    if ! (
+        cd -- "$main_root" || exit 1
+        export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+        printf '%s\n' "$list" | "$py" -I "$here/scan-public.py" --root "$main_root" "$scan_mode" || exit 1
+        printf '%s\n' "$list" | "$py" -I "$here/scan-public.py" --root "$main_root" --objects-from-stdin || exit 1
+      ) > "$out/$name.scan.txt" 2>&1; then
+      lines+=(scan-refused); rc=8
+    fi
+  fi
+  receipt "${lines[@]}"
+  for line in "${lines[@]:1}"; do echo "$line" >&2; done
+  case "${lines[0]}" in pushed*) echo "${lines[0]}" ;; *) echo "${lines[0]}" >&2 ;; esac
+  exit "$rc"
   ;;
 plan)
   [ $# -ge 4 ] && [ $# -le 7 ] || die 'usage: plan <ticket> <name> <prompt-file> [model] [effort] [minutes]'
@@ -92,16 +166,28 @@ plan)
   code=$?
   [ "$code" -eq 0 ] || { rm -rf -- "$stage"; exit "$code"; }
   # The plan must be a regular file with one link, copied into a fresh file: never moved, so no link or open handle
-  # of the sandboxed run reaches plan.md. Every step is checked; `installed` follows the last one.
-  src=$stage/plan.md tmp=
+  # of the sandboxed run reaches plan.md. Every step is checked; `installed` follows the last one, and a failed
+  # install puts the old plan.md and plan.sha256 back (or removes both when there was no pair).
+  src=$stage/plan.md
   installed=0
+  bak_plan=$dir/.plan.md.bak bak_sha=$dir/.plan.sha256.bak tmp_plan=$dir/.plan.md.new tmp_sha=$dir/.plan.sha256.new
+  rm -f -- "$bak_plan" "$bak_sha" "$tmp_plan" "$tmp_sha"
   if [ -f "$src" ] && [ ! -L "$src" ] && [ -s "$src" ] && [ "$(stat -c %h -- "$src")" = 1 ] && [ ! -d "$dir/plan.md" ]; then
-    if tmp=$(mktemp -- "$dir/.plan.md.XXXXXX") && cat -- "$src" > "$tmp" && mv -fT -- "$tmp" "$dir/plan.md" \
-       && (cd -- "$dir" && sha256sum plan.md > .plan.sha256.tmp && mv -fT -- .plan.sha256.tmp plan.sha256); then
-      installed=1
+    saved=1
+    if [ -f "$dir/plan.md" ]; then cp -p -- "$dir/plan.md" "$bak_plan" || saved=0; fi
+    if [ -f "$dir/plan.sha256" ]; then cp -p -- "$dir/plan.sha256" "$bak_sha" || saved=0; fi
+    hash=
+    if [ "$saved" -eq 1 ] && cat -- "$src" > "$tmp_plan" && hash=$(sha256sum < "$tmp_plan" | cut -d' ' -f1) && [ "${#hash}" -eq 64 ] \
+       && printf '%s  plan.md\n' "$hash" > "$tmp_sha"; then
+      if mv -fT -- "$tmp_plan" "$dir/plan.md" && mv -fT -- "$tmp_sha" "$dir/plan.sha256"; then
+        installed=1
+      else
+        if [ -f "$bak_plan" ]; then mv -fT -- "$bak_plan" "$dir/plan.md"; else rm -f -- "$dir/plan.md"; fi
+        if [ -f "$bak_sha" ]; then mv -fT -- "$bak_sha" "$dir/plan.sha256"; else rm -f -- "$dir/plan.sha256"; fi
+      fi
     fi
   fi
-  [ -n "$tmp" ] && rm -f -- "$tmp" "$dir/.plan.sha256.tmp"
+  rm -f -- "$bak_plan" "$bak_sha" "$tmp_plan" "$tmp_sha"
   rm -rf -- "$stage"
   if [ "$installed" -ne 1 ]; then
     echo no-plan > "$out/$name.plan.txt"
