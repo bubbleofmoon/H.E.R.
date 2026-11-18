@@ -754,5 +754,15 @@ class Ps1Work(Work, unittest.TestCase):
         return base
 
 
+class DefaultRemoteUrl(unittest.TestCase):
+    """The repository is named `H.E.R.`: git strips a trailing `.git`, so `.../H.E.R.git` names `H.E.R`."""
+
+    def test_both_wrappers_default_to_the_real_repository(self):
+        for name in ('codex-work.sh', 'codex-work.ps1'):
+            text = (ROOT / 'scripts' / name).read_text(encoding='utf-8')
+            self.assertIn('https://github.com/bubbleofmoon/H.E.R..git', text, name)
+            self.assertNotIn('bubbleofmoon/H.E.R.git', text, name)
+
+
 if __name__ == '__main__':
     unittest.main()
