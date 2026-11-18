@@ -3379,3 +3379,208 @@ fn harness_routes_failover_then_step_limit_in_one_turn_reports_both() {
     rig.wait_texts(OWNER_KEY, 2);
     owner_failover_notices(&rig.texts_to(OWNER_KEY));
 }
+
+// ───────────────────────── #11: one-shot model jobs (digest, slang learning) ─────────────────────────
+
+/// Digest memory rows (conversation, source) in the fixture runtime's own memory database.
+fn digest_rows(rig: &Rig) -> Vec<(String, String)> {
+    let path = rig.root.join("data/memory.db");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let db = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = db
+        .prepare("SELECT owner_id, source FROM memory WHERE source LIKE 'digest:%' ORDER BY id")
+        .unwrap();
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
+/// Inbound journal rows of `key` that the bridge marked handled.
+fn handled_rows(rig: &Rig, key: &str) -> i64 {
+    rusqlite::Connection::open_with_flags(rig.root.join("data/inbound.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|db| {
+            db.query_row(
+                "SELECT count(*) FROM inbound_events WHERE conversation=?1 AND stage='handled'",
+                [key],
+                |r| r.get(0),
+            )
+        })
+        .unwrap_or(0)
+}
+
+/// Starts the nightly digest through the console's task route: (HTTP status, body).
+fn start_digest(rig: &Rig, request: &str) -> (u16, Value) {
+    rig.console("POST", "/api/tasks/memory-digest/run", Some(&json!({"requestId": request})))
+}
+
+/// The state of the task run `id`.
+fn task_state(rig: &Rig, id: &str) -> Value {
+    rig.console("GET", &format!("/api/tasks/runs/{id}"), None).1["run"]["state"].clone()
+}
+
+#[test]
+fn one_shot_job_digest_of_a_harness_conversation_survives_a_console_kill_and_rerun() {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let digest = r#"[{"subject":"打球","content":"tester 约周六打球"}]"#;
+    let model = FakeModel::script(vec![
+        ModelReply::Text("周六下午见".into()),
+        ModelReply::Delayed { text: digest.into(), release: release.clone() },
+        ModelReply::Text(digest.into()),
+    ]);
+    let mut rig = harness_rig("harness-digest-kill", &model);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "周六一起打球吗");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2)[1], "周六下午见");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1), "the harness turn's message was never journaled as handled");
+    // The first run asks the model; its console dies before the answer arrives.
+    let (code, first) = start_digest(&rig, "digest-harness-kill-1");
+    assert_eq!(code, 202, "{first}");
+    assert!(wait_for(LONG, || lock(&model.requests).len() == 2), "the digest never asked the model");
+    rig.console.kill().unwrap();
+    rig.console.wait().unwrap();
+    release.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(digest_rows(&rig).is_empty(), "a killed digest wrote memories: {:?}", digest_rows(&rig));
+    rig.console = spawn_console(&rig.root, rig.console_port);
+    assert!(
+        wait_for(LONG, || http_call(rig.console_port, "GET", "/api/health", &[], None).is_some()),
+        "the console did not come back"
+    );
+    // The same request id is the same job: nothing runs again.
+    let (code, duplicate) = start_digest(&rig, "digest-harness-kill-1");
+    assert_eq!(code, 200, "{duplicate}");
+    assert_eq!(duplicate["duplicate"], true, "{duplicate}");
+    // A new request reruns over the same messages and writes them once.
+    let (code, rerun) = start_digest(&rig, "digest-harness-kill-2");
+    assert_eq!(code, 202, "{rerun}");
+    let id = rerun["runId"].as_str().unwrap().to_string();
+    assert!(wait_for(LONG, || task_state(&rig, &id) == "succeeded"), "the rerun did not succeed: {}", task_state(&rig, &id));
+    let requests = lock(&model.requests).clone();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    assert_eq!(requests[1]["messages"], requests[2]["messages"], "the rerun read other messages than the killed run");
+    assert_ne!(requests[2]["stream"], true, "the digest asks one non-streaming completion");
+    assert!(requests[2].get("tools").is_none(), "the digest offers no tool");
+    let input = requests[2]["messages"].to_string();
+    assert!(input.contains("周六一起打球吗") && input.contains("周六下午见"), "the digest input lacks the harness conversation: {input}");
+    assert!(rig.root.join("data/memory.db").is_file(), "the digest wrote outside the fixture runtime");
+    let rows = digest_rows(&rig);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, GROUP_KEY);
+    assert!(rows[0].1.starts_with(&format!("digest:{GROUP_KEY}:inbound:")), "{rows:?}");
+    // Nothing new: a third run asks nothing and writes nothing.
+    let (code, third) = start_digest(&rig, "digest-harness-kill-3");
+    assert_eq!(code, 202, "{third}");
+    let id = third["runId"].as_str().unwrap().to_string();
+    assert!(wait_for(LONG, || task_state(&rig, &id) == "succeeded"), "the third run did not succeed");
+    assert_eq!(lock(&model.requests).len(), 3, "a digested conversation reached the model again");
+    assert_eq!(digest_rows(&rig).len(), 1);
+}
+
+const SLANG_SEED: &str = r#"[{"id":"kept","content":"绝绝子","status":"candidate","count":1}]"#;
+const LEGACY_SESSION: &str = r#"{"sessionId":"legacy-learner-session","preset":"qq-chat"}"#;
+
+/// A console-only rig whose slang learning is on (stored default backend `dsh`), with one learnable group window,
+/// a seeded slang store and a learner session file an older release left behind.
+fn slang_rig(name: &str, model: &FakeModel) -> Rig {
+    let rig = Rig::new(
+        name,
+        Seed {
+            config: json!({"conversationEngines": {GROUP_KEY: "harness"}, "harness": {"model": "fake-chat"},
+                "slang": {"enabled": true, "learnerBackend": "dsh", "extractMinMessages": 1, "extractCooldownMs": 0, "autoResearch": false}}),
+            ..Seed::default()
+        },
+    );
+    fs::write(rig.root.join("config/harness-api-key"), MODEL_KEY).unwrap();
+    let path = rig.root.join("dependencies.json");
+    let mut deps: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    deps["model"] = json!(model.base);
+    fs::write(path, deps.to_string()).unwrap();
+    fs::write(
+        rig.root.join("data/slang-windows.json"),
+        json!({"windows": {GROUP_KEY: [{"sender": "tester", "text": "今天又破防了 CHAT_SECRET_SLANG", "time": 1}]}, "consumedAt": {}}).to_string(),
+    )
+    .unwrap();
+    fs::write(rig.root.join("data/slang.json"), SLANG_SEED).unwrap();
+    fs::write(rig.root.join("data/slang-session.json"), LEGACY_SESSION).unwrap();
+    rig
+}
+
+#[test]
+fn one_shot_job_slang_learning_learns_once_on_the_first_route_without_tools() {
+    let model = FakeModel::start(vec![r#"[{"content":"破防","source_id":1}]"#]);
+    let rig = slang_rig("harness-slang-learn", &model);
+    let (code, queued) = rig.console("POST", "/api/slang/extract", Some(&json!({"key": GROUP_KEY})));
+    assert_eq!((code, queued["key"].as_str()), (200, Some(GROUP_KEY)), "{queued}");
+    assert!(wait_for(LONG, || lock(&model.requests).len() == 1), "slang learning never reached the first model route");
+    assert!(
+        wait_for(LONG, || rig.data_json("slang-windows.json")["windows"][GROUP_KEY].as_array().is_some_and(Vec::is_empty)),
+        "the learned batch was not consumed: {}",
+        rig.data_json("slang-windows.json")
+    );
+    let entries = rig.data_json("slang.json");
+    let mut contents: Vec<&str> = entries.as_array().unwrap().iter().filter_map(|e| e["content"].as_str()).collect();
+    contents.sort();
+    assert_eq!(contents, ["破防", "绝绝子"], "{entries}");
+    let learned = entries.as_array().unwrap().iter().find(|e| e["content"] == "破防").unwrap();
+    assert_eq!(learned["evidence"][0]["key"], GROUP_KEY, "{learned}");
+    let request = lock(&model.requests)[0].clone();
+    assert_eq!(request["model"], "fake-chat");
+    assert_ne!(request["stream"], true, "the learner asks one non-streaming completion");
+    assert!(request.get("tools").is_none(), "the learner offers no tool");
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "the learner sends its prompt alone: {request}");
+    assert_eq!(messages[0]["role"], "user");
+    let prompt = messages[0]["content"].as_str().unwrap();
+    assert!(prompt.contains("今天又破防了"), "{prompt}");
+    for named in ["harness", "dsh", "deepseek", "fake-chat"] {
+        assert!(!prompt.to_ascii_lowercase().contains(named), "the learner prompt names {named}");
+    }
+    assert_eq!(*lock(&model.authorizations), vec![true]);
+    assert_eq!(
+        fs::read_to_string(rig.root.join("data/slang-session.json")).unwrap(),
+        LEGACY_SESSION,
+        "the old learner session file stays as it was"
+    );
+    assert!(rig.dsh.prompts().is_empty(), "slang learning reached DSH");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(lock(&model.requests).len(), 1, "one batch is learned once");
+}
+
+#[test]
+fn one_shot_job_slang_learning_failures_change_nothing_and_only_alert_the_owner() {
+    let model = FakeModel::script(vec![
+        ModelReply::Refusal,
+        ModelReply::Error { status: 500, message: "CHAT_SECRET_SLANG upstream busy".into() },
+        ModelReply::Text(String::new()),
+    ]);
+    let rig = slang_rig("harness-slang-fail", &model);
+    let windows = fs::read(rig.root.join("data/slang-windows.json")).unwrap();
+    for attempt in 1..=3 {
+        let (code, queued) = rig.console("POST", "/api/slang/extract", Some(&json!({"key": GROUP_KEY})));
+        assert_eq!(code, 200, "{queued}");
+        assert!(wait_for(LONG, || lock(&model.requests).len() == attempt), "learner attempt {attempt} never asked the model route");
+        assert!(wait_for(LONG, || rig.data_json("slang-job-queue.json") == json!([])), "learner attempt {attempt} did not finish");
+        assert_eq!(fs::read(rig.root.join("data/slang-windows.json")).unwrap(), windows, "attempt {attempt} consumed the batch");
+        assert_eq!(fs::read_to_string(rig.root.join("data/slang.json")).unwrap(), SLANG_SEED, "attempt {attempt} changed the slang store");
+    }
+    let alerts = rig.wait_texts(OWNER_KEY, 3);
+    assert_eq!(alerts.len(), 3, "{alerts:?}");
+    for alert in &alerts {
+        assert!(alert.contains(GROUP_KEY) && alert.contains("backend=harness") && alert.contains("model=fake-chat"), "{alert}");
+        assert!(!alert.contains("CHAT_SECRET_SLANG") && !alert.contains("破防"), "an alert carries chat or provider text: {alert}");
+    }
+    assert!(alerts.iter().any(|a| a.contains("class=refusal")), "{alerts:?}");
+    assert!(alerts.iter().any(|a| a.contains("class=empty-response")), "{alerts:?}");
+    assert!(rig.texts_to(GROUP_KEY).is_empty(), "a learner failure reached the group");
+    let refusals = rig.data_lines("logs/model-refusals.jsonl");
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!((refusals[0]["backend"].as_str(), refusals[0]["errorClass"].as_str()), (Some("harness"), Some("refusal")));
+    assert!(!refusals[0].to_string().contains("CHAT_SECRET_SLANG"));
+    assert!(rig.dsh.prompts().is_empty(), "slang learning reached DSH");
+    assert_eq!(fs::read_to_string(rig.root.join("data/slang-session.json")).unwrap(), LEGACY_SESSION);
+}

@@ -202,6 +202,10 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
     let extraction = crate::slang_learn::build_extraction_prompt(&[], &cfg);
     surfaces.push(("slang repair prompt".into(), crate::slang_learn::build_repair_prompt(&extraction, "not json")));
     surfaces.push(("slang extraction prompt".into(), extraction));
+    surfaces.push((
+        "slang research prompt".into(),
+        crate::slang_learn::research_prompt(&[json!({"content": "破防", "evidence": [{"text": "今天又破防了"}]})], &cfg),
+    ));
 
     // Representative tool results and errors.
     let refusal = crate::wake::normalize_wake_config(&json!({}), &json!({"infinite": true}), &cfg, key, 0, 0.5).unwrap_err();

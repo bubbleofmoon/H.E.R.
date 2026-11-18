@@ -1,51 +1,31 @@
-//! The digest's model port. Production uses the relay; tests install a fake per runtime root.
+//! The digest's model port: a one-shot job (`harness::one_shot`) on `memory.digest.model`, else the model of the
+//! harness chain's first route. Tests install a fake per runtime root.
+use crate::harness::one_shot::{self, Job};
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 
-/// A fixed failure class (`quota`, `timeout`, `backend`, `network`, `refusal`, `unconfigured`, ...).
-#[derive(Debug, PartialEq)]
-pub(crate) struct ModelError(pub &'static str);
+pub(crate) use crate::harness::one_shot::{ModelError, OneShot as DigestModel};
 
-pub(crate) trait DigestModel: Send + Sync {
-    /// One completion: `system` is the digest prompt, `input` the conversation evidence.
-    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError>;
-}
-
-#[cfg(test)]
-static TEST_MODELS: std::sync::Mutex<Vec<(std::path::PathBuf, Arc<dyn DigestModel>)>> = std::sync::Mutex::new(Vec::new());
+/// The output cap of one digest request.
+const MAX_TOKENS: u32 = 2048;
 
 /// Tests: every digest run on the runtime at `root` uses `model`.
 #[cfg(test)]
 pub(crate) fn install_test_model(root: &std::path::Path, model: Arc<dyn DigestModel>) {
-    let mut models = TEST_MODELS.lock().unwrap_or_else(|p| p.into_inner());
-    models.retain(|(r, _)| r != root);
-    models.push((root.to_path_buf(), model));
+    one_shot::install_test_model(root, Job::Digest, model);
 }
 
+/// The digest's model on `context`: `model_id` on the relay, bounded by `timeout`.
 pub(crate) fn model_for(context: &RuntimeContext, cfg: &Value) -> Result<Arc<dyn DigestModel>, ModelError> {
-    #[cfg(test)]
-    if let Some(root) = context.runtime_root() {
-        if let Some((_, model)) = TEST_MODELS.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(r, _)| r == root) {
-            return Ok(model.clone());
-        }
-    }
-    Ok(Arc::new(RelayModel::from_runtime(context, cfg)?))
+    one_shot::model_for(context, Job::Digest, model_id(cfg).as_deref(), timeout(cfg), MAX_TOKENS)
 }
 
-/// The relay's OpenAI-compatible endpoint: `memory.digest.model`, else the model of the harness chain's first route,
-/// with the harness credential; one non-streaming request bounded by `memory.digest.timeoutSecs`.
-pub(crate) struct RelayModel {
-    route: crate::harness::ModelRoute,
-    timeout: Duration,
-}
-
-impl RelayModel {
-    pub(crate) fn from_runtime(context: &RuntimeContext, cfg: &Value) -> Result<Self, ModelError> {
-        let model = model_id(cfg).ok_or(ModelError("unconfigured"))?;
-        let route = crate::harness::ModelRoute::for_model(context, &model).map_err(|_| ModelError("unconfigured"))?;
-        Ok(Self { route, timeout: timeout(cfg) })
-    }
+/// The relay model a digest run asks, without a test fake (tests of the relay itself).
+#[cfg(test)]
+pub(crate) fn relay_model(context: &RuntimeContext, cfg: &Value) -> Result<one_shot::RelayModel, ModelError> {
+    let model = model_id(cfg).ok_or(ModelError("unconfigured"))?;
+    one_shot::RelayModel::for_model(context, &model, timeout(cfg), MAX_TOKENS)
 }
 
 /// The digest's model id: `memory.digest.model`, else the model of the harness chain's first route
@@ -60,33 +40,4 @@ pub(crate) fn model_id(cfg: &Value) -> Option<String> {
 /// The bound on one digest model request: `memory.digest.timeoutSecs`.
 pub(crate) fn timeout(cfg: &Value) -> Duration {
     Duration::from_secs(crate::settings::DIGEST_TIMEOUT_SECS.integer(cfg).unsigned_abs())
-}
-
-impl DigestModel for RelayModel {
-    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
-        use genai::chat::{ChatMessage, ChatOptions, ChatRequest, StopReason};
-        let target = self.route.target();
-        let timeout = self.timeout;
-        let request = ChatRequest::new(vec![ChatMessage::system(system.to_string()), ChatMessage::user(input.to_string())]);
-        let call = async move {
-            let client = genai::Client::new().map_err(|_| ModelError("network"))?;
-            let options = ChatOptions::default().with_max_tokens(2048);
-            let response = tokio::time::timeout(timeout, client.exec_chat(genai::ModelSpec::Target(target), request, Some(&options)))
-                .await
-                .map_err(|_| ModelError("timeout"))?
-                .map_err(|error| ModelError(crate::harness::model_failure(&error).class))?;
-            if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
-                return Err(ModelError("refusal"));
-            }
-            Ok(response.into_first_text().unwrap_or_default())
-        };
-        // A fresh thread has no runtime context, so this works from sync jobs and spawn_blocking alike.
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread().enable_all().build()
-                .map_err(|_| ModelError("network"))?
-                .block_on(call)
-        })
-        .join()
-        .unwrap_or(Err(ModelError("network")))
-    }
 }

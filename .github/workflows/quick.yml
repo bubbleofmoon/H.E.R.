@@ -1,6 +1,7 @@
 name: quick
-run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.filter }}
+run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.filter }}${{ inputs.sha && format(' sha={0}', inputs.sha) || '' }}
 # One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`. The worker reads its run id once (run-name above names the run) and hands it back; a coordinator waits with `python -I scripts/ci-wait.py --run <id>`.
+# A second run with the same ref, target, os, filter and sha cancels the first. `-f sha=<commit>` runs an older commit instead of the ref head (a red receipt); the step fails unless it is an ancestor of the head.
 # Two more targets run cargo directly, each alone (not combined with others): `check` is `cargo check --workspace --all-targets`;
 # `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
 # `cargo fmt --all` result as artifact `fmt-patch` and the `cargo clippy --fix` result, on a clean tree, as artifact `clippy-fix-patch`
@@ -22,10 +23,14 @@ on:
         default: linux
         type: choice
         options: [linux, windows]
+      sha:
+        description: 'optional commit to run instead of the ref head; must be an ancestor of the ref head'
+        required: false
+        default: ''
 permissions:
   contents: read
 concurrency:
-  group: quick-${{ github.ref }}-${{ inputs.target }}-${{ inputs.os }}
+  group: quick-${{ github.ref }}-${{ inputs.target }}-${{ inputs.os }}-${{ inputs.filter }}-${{ inputs.sha }}
   cancel-in-progress: true
 jobs:
   quick:
@@ -43,6 +48,7 @@ jobs:
       CI_EVIDENCE: ${{ inputs.os == 'windows' && 'C:/her-ci-evidence' || '/tmp/her-evidence' }}
       QUICK_TARGET: ${{ inputs.target }}
       QUICK_FILTER: ${{ inputs.filter }}
+      QUICK_SHA: ${{ inputs.sha }}
     steps:
       - name: Use long-form Windows temporary directory
         if: runner.os == 'Windows'
@@ -54,8 +60,23 @@ jobs:
         run: |
           git init "$PUBLIC_TREE"
           git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
-          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+          if [ -z "$QUICK_SHA" ]; then
+            git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+            git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+          else
+            # An older commit of the ref: its history is needed to prove the ancestry.
+            if ! printf '%s' "$QUICK_SHA" | grep -Eq '^[0-9a-fA-F]{7,40}$'; then
+              echo "::error::the sha input is not a commit sha (7 to 40 hex digits)"
+              exit 1
+            fi
+            git -C "$PUBLIC_TREE" fetch --no-tags origin "$GITHUB_SHA"
+            if ! full=$(git -C "$PUBLIC_TREE" rev-parse --verify --quiet "$QUICK_SHA^{commit}") \
+                || ! git -C "$PUBLIC_TREE" merge-base --is-ancestor "$full" "$GITHUB_SHA"; then
+              echo "::error::sha $QUICK_SHA is not an ancestor of $GITHUB_REF ($GITHUB_SHA)"
+              exit 1
+            fi
+            git -C "$PUBLIC_TREE" checkout --detach "$full"
+          fi
       - name: Toolchains
         run: |
           python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"

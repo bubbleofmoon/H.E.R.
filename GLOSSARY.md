@@ -111,6 +111,10 @@ _Avoid_: context limit, compaction
 A durable mark in a harness session's history: a summary of the older rounds and where the rounds kept verbatim begin. Later turns replay the newest checkpoint and the rounds after it; the stored facts never change.
 _Avoid_: compaction, autocompact, snapshot
 
+**One-shot job (单次模型作业, `harness::one_shot`)**:
+A harness job that asks one model route for one answer, with no tools and no history: the digest and slang learning.
+_Avoid_: turn, agent run, session
+
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.
 _Avoid_: dependency (a process the supervisor runs), fork, vendor

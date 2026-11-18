@@ -68,6 +68,10 @@ jobs:
           python -I scripts/tests/test_ci_wait.py
           python -I scripts/tests/test_strip_history.py
           python -I scripts/tests/test_snowluma_export.py
+          python -I scripts/tests/test_codex_task.py
+          python -I scripts/tests/test_quick_workflow.py
+          python -I scripts/tests/test_merge_check.py
+          python -I scripts/tests/test_plan_export.py
           python -I scripts/scan-public.py
           "$HER_GITLEAKS" dir . --config .gitleaks.toml --redact --no-banner
   # Formatting and clippy on both OSes; report-only for now (the job stays green, the output is in the log).

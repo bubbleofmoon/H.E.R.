@@ -123,12 +123,12 @@ IMPLEMENTER_ALLOWED = [
     ('repo', 'cd {dsh} && ' + QUICK_DSH),                # the same from a session that starts elsewhere, after the cd
     ('detached', 'cd {dsh} && ' + QUICK_DSH),
     ('wt', 'cd {dsh} && ' + QUICK_DSH),                  # KNOWN GAP (T1/T2, #85): no ticket binding, so a cd into another worktree with its own ref passes
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
-    ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6-astra high read-only 120'),
-    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
-    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6-astra -effort high -sandbox read-only -timeoutminutes 90'),
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
+    ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6.2-astra high read-only 120'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
+    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6.2-astra -effort high -sandbox read-only -timeoutminutes 90'),
     ('wt', 'git add scripts/codex-task.sh'),
-    ('repo', 'cd {wt} && {home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('repo', 'cd {wt} && {home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
     ('wt', 'git add scripts/handoff.sh'),
     ('wt', 'git add scripts/gh-public.sh'),
 ]
@@ -243,39 +243,39 @@ DENIED_EVERY_ROLE = [
     ('wt', "git $'pu\\x73h' origin HEAD:refs/heads/main"),
     ('wt', 'git pu\\\nsh origin main'),
     # Codex runs only as the implementer's pinned read-only self-review (every other form is refused)
-    ('wt', 'scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
-    ('wt', '{wt}/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
-    ('wt', '/tmp/x/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
-    ('wt', '/root/her/scripts/../scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
+    ('wt', 'scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
+    ('wt', '{wt}/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
+    ('wt', '/tmp/x/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
+    ('wt', '/root/her/scripts/../scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
     ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.1-sol high read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra max read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high none'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high workspace-write'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra max read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high none'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high workspace-write'),
     ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only 0'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only 08'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only 1000'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only 5 extra'),
-    ('wt', '/root/her/scripts/codex-task.sh ../x {wt} p.md gpt-6-astra high read-only'),
-    ('wt', 'timeout 60 /root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only > log'),
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only; git push origin main'),
-    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -sandbox none -Sandbox read-only'),
-    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -Sandbox:none'),
-    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -Sandbox read-only -Command x'),
-    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -Sandbox read-only -AddDir C:/x'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only 0'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only 08'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only 1000'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only 5 extra'),
+    ('wt', '/root/her/scripts/codex-task.sh ../x {wt} p.md gpt-6.2-astra high read-only'),
+    ('wt', 'timeout 60 /root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only > log'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only; git push origin main'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -sandbox none -Sandbox read-only'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -Sandbox:none'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -Sandbox read-only -Command x'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -Sandbox read-only -AddDir C:/x'),
     ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Effort high -Sandbox read-only'),
-    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -Sandbox read-only -TimeoutMinutes 0'),
-    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -NoProfile -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
-    ('wt', 'powershell -File {wt}/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -Sandbox read-only -TimeoutMinutes 0'),
+    ('wt', 'powershell -File C:/her/scripts/codex-task.ps1 -NoProfile -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
+    ('wt', 'powershell -File {wt}/scripts/codex-task.ps1 -Name x -WorkDir {wt} -PromptFile p.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
     ('wt', 'powershell -Command "C:/her/scripts/codex-task.ps1 -Sandbox none"'),
     ('wt', 'codex exec x'),
     ('wt', 'codex.cmd exec x'),
     ('wt', 'npx @openai/codex exec x'),
     ('wt', 'node /usr/lib/node_modules/@openai/codex/bin/codex.js exec x'),
     ('wt', 'bash -c "codex exec x"'),
-    ('detached', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
-    ('repo', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6-astra high read-only'),
+    ('detached', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
+    ('repo', '/root/her/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
     # v4: command positions after newlines, keywords, assignments-free wrappers and find -exec
     ('wt', 'ls\ncodex exec x'),
     ('wt', 'if true; then codex exec x; fi'),
@@ -294,12 +294,12 @@ DENIED_EVERY_ROLE = [
     ('wt', 'ls \\ #;codex exec x'),
     ('wt', 'ls \\;#;codex exec x'),
     ('wt', 'ls \\ #;scripts/handoff.sh 80 linux b.md'),
-    ('wt', 'bash -s 1-self-1 {wt} p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'),   # regression (R3)
+    ('wt', 'bash -s 1-self-1 {wt} p.md gpt-6.2-astra high none < /root/her/scripts/codex-task.sh'),   # regression (R3)
     ('wt', 'cd scripts && bash -s 80 linux b.md < handoff.sh'),                                      # regression (R3)
     # fix round, Run 5: indirection, gh watch and rate_limit, Codex pin and prompt
     ('wt', 'cat scripts/handoff.sh | bash -s 80 linux b.md'),
     ('wt', 's=scripts/gh-public.sh; $s --body-file b.md issue comment 5'),
-    ('wt', 'cat /root/her/scripts/codex-task.sh | bash -s x {wt} p.md gpt-6-astra high none'),
+    ('wt', 'cat /root/her/scripts/codex-task.sh | bash -s x {wt} p.md gpt-6.2-astra high none'),
     ('wt', 'find scripts -name handoff.sh -exec {{}} 80 linux b.md \';\''),
     ('wt', 'echo $HOME codex'),
     ('wt', "echo a # it's"),
@@ -313,19 +313,25 @@ DENIED_EVERY_ROLE = [
     ('wt', 'source scripts/gh-public.sh'),                       # regression
     ('wt', '. scripts/handoff.sh 80 linux b.md'),                # regression
     # Each row has one violation only: the checkout script and the ticket folder come from {home} and {tickets}.
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} /root/her-vault/x.md gpt-6-astra high read-only'),         # prompt outside the ticket folders
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/2/review/codex-self-1.md gpt-6-astra high read-only'),   # cross-ticket
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/../x.md gpt-6-astra high read-only'),  # traversal
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 /root/her-vault {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),  # workdir is not this worktree
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {repo} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),  # workdir is the repository, not this worktree
-    ('wt', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {repo} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} /root/her-vault/x.md gpt-6.2-astra high read-only'),         # prompt outside the ticket folders
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/2/review/codex-self-1.md gpt-6.2-astra high read-only'),   # cross-ticket
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/../x.md gpt-6.2-astra high read-only'),  # traversal
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 /root/her-vault {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),  # workdir is not this worktree
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {repo} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),  # workdir is the repository, not this worktree
+    ('wt', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {repo} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
+    # the exact allowed forms with only the model changed: the pinned-model check is the one that refuses
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
+    # the exact allowed forms with only the model changed: the pinned-model check is the one that refuses
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.1-sol high read-only'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.1-sol -Effort high -Sandbox read-only'),
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
     ('wt', 'git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit'),
     ('dsh', QUICK_DSH),                                  # #185: allowed for an implementer only
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6-astra high read-only'),
+    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
 ]
 DENIED_REVIEWER = [
     # write rules see through paths and quoting
@@ -819,7 +825,7 @@ class AgentGuard(unittest.TestCase):
         self.assertIn(['rm', 'victim'], words('</dev/null rm victim'))
         self.assertIn(['rm', 'victim'], words('eval -- rm victim'))
         self.assertIn(['/root/her/scripts/codex-task.sh'],
-                      words('bash -s x /root/her-wt/1 p.md gpt-6-astra high none < /root/her/scripts/codex-task.sh'))   # regression (R3)
+                      words('bash -s x /root/her-wt/1 p.md gpt-6.2-astra high none < /root/her/scripts/codex-task.sh'))   # regression (R3)
         self.assertIn(['handoff.sh'], words('bash -s 80 linux b.md <<< handoff.sh'))                    # regression (R3)
         self.assertIn(['rm', 'x'], words("echo a # it's\nrm x # it's"))                                 # comments
         self.assertIn(['codex', 'exec', 'x'], words('ls \\ #;codex exec x'))                            # amendment 1
