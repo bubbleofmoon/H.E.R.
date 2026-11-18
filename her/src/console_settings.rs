@@ -80,11 +80,15 @@ fn confirmed(fields: &Map<String, Value>, setting: Option<&crate::settings::Sett
     crate::settings::check_confirmation(confirm, setting.as_slice())
 }
 
-/// The registry setting of history entry `entry`, for the undo's confirmation; `None` when the entry or its setting is
-/// unknown (the undo then answers for itself).
-fn entry_setting(context: &RuntimeContext, entry: i64) -> Option<&'static crate::settings::Setting> {
-    let previewed = crate::settings::preview(context, &crate::settings::Change::Undo { entry }).ok()?;
-    previewed.first().map(|(setting, _)| *setting)
+/// The registry setting of history entry `entry`, for the undo's confirmation. `Ok(None)` when the entry is unknown (404)
+/// or its setting is no longer in the registry (409): the undo answers those itself. Any other failure of the look
+/// (a store that cannot be read right now) is the error, and `undo` fails closed on it.
+fn entry_setting(context: &RuntimeContext, entry: i64) -> Result<Option<&'static crate::settings::Setting>, (u16, String)> {
+    match crate::settings::preview(context, &crate::settings::Change::Undo { entry }) {
+        Ok(previewed) => Ok(previewed.first().map(|(setting, _)| *setting)),
+        Err((404 | 409, _)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting. A change of an
@@ -135,7 +139,17 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         .and_then(Value::as_i64)
         .filter(|entry| *entry > 0)
         .ok_or((400, "entry must be a positive integer".to_string()))?;
-    let target = entry_setting(context, entry);
+    // Fail closed: when the first look at the entry fails, which setting it changes is unknown, so an unconfirmed undo is
+    // refused with that failure, and a confirmed one takes the access path, which looks again under the configuration gate.
+    let (target, access) = match entry_setting(context, entry) {
+        Ok(target) => (target, target.is_some_and(|target| target.access())),
+        Err(error) => {
+            if !crate::settings::confirm_field(&Value::Object(fields.clone()))? {
+                return Err(error);
+            }
+            (None, true)
+        }
+    };
     confirmed(&fields, target)?;
     let commit = || -> Result<Value, (u16, String)> {
         let undone = crate::settings::undo(context, entry, "administrator")?;
@@ -145,7 +159,7 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         }
         Ok(reply)
     };
-    if target.is_some_and(|target| target.access()) {
+    if access {
         return crate::console::access_setting_change(context, authority, &crate::settings::Change::Undo { entry }, commit);
     }
     let _gate = authority()?;

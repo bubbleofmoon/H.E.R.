@@ -234,7 +234,8 @@ pub(super) fn whitelist_get(context: &RuntimeContext, cfg: &Value) -> Value {
 /// #154: the lists and the owner are security settings. A change of one needs `"confirm": true` (409 otherwise, nothing
 /// written; `confirm` other than a boolean is 400), is validated by the registry (400, nothing written) and is stored
 /// through the settings store after its revocation is recorded; the file keeps its registry members as the store wrote
-/// them back and gets the rest of the request. A request that does not name the owner leaves it as it is.
+/// them back and gets the rest of the request. A request that does not name the owner leaves it as it is; one that names
+/// it `null` or blank changes it to no owner, like any other owner change.
 pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     let confirm = crate::settings::confirm_field(&body)?;
@@ -282,7 +283,15 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         if let Some(value) = body.get("ownerQQ") {
             object.insert("ownerQQ".into(), normalize_owner(Some(value)).map_err(|e| (400, e))?);
         }
-        let changes = crate::settings::console_changes(context, &unchanged, &file)?;
+        let mut changes = crate::settings::console_changes(context, &unchanged, &file)?;
+        // An owner the request names as `null` or blank is the change to no owner, which `console_changes` skips as a
+        // member the request does not carry: the owner setting stores `null` for it.
+        if context.is_isolated() && body.get("ownerQQ").is_some() && file["ownerQQ"].is_null() {
+            let owner = crate::settings::find("ownerQQ").expect("the registry holds the owner");
+            if !owner.read(&crate::settings::overlay(context, unchanged.clone())).is_null() {
+                changes.push((owner, Value::Null));
+            }
+        }
         let changed: Vec<&crate::settings::Setting> = changes.iter().map(|(setting, _)| *setting).collect();
         crate::settings::check_confirmation(confirm, &changed)?;
         let previewed: Vec<_> = changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))).collect();
@@ -299,7 +308,7 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         keep_stored_members(context, &mut file)?;
         // Once the store holds the change, a failed file write keeps the pending revocation (`Null`: always kept).
         write_config_or_forget(context, &file, if stored { &Value::Null } else { &unchanged }, &pending)?;
-        let shown = context.load_config_document().ok().filter(Value::is_object).unwrap_or(file);
+        let shown =context.load_config_document().ok().filter(Value::is_object).unwrap_or(file);
         (effective_before, effective_after, shown, pending)
     };
     let (retired, failures) = finish_access_change(context, &interaction, &before, &after, "access-revoked", pending);
@@ -340,7 +349,8 @@ pub(super) static SCOPE_AFTER_READ: std::sync::Mutex<Option<std::sync::Arc<dyn F
 /// #154: the allow lists are security settings: a change of one needs `"confirm": true` (409 otherwise, nothing
 /// written; `her-cli conversation` confirms with its `--confirm`) and is stored through the settings store after the
 /// revocation is recorded; `rollout.rustGroups` and the alias removal are written to the file, which keeps its registry
-/// members as the store wrote them back.
+/// members as the store wrote them back. The allow list is the ids the setting reads: an item of a hand-edited list that
+/// is no usable id is dropped by the change, never a reason to refuse it.
 pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     let confirm = crate::settings::confirm_field(&body)?;
@@ -389,10 +399,10 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         {
             return Err((409, format!("{key} is in deny.{field}; remove it from the deny list first")));
         }
-        // JS precedence: `groups ?? group`, `private ?? privates`.
-        let preferred = file["allow"][field].clone();
-        let chosen = if preferred.is_null() { file["allow"][alias].clone() } else { preferred };
-        let mut listed = chosen.as_array().cloned().unwrap_or_default();
+        // The ids the allow list setting reads (JS precedence `groups ?? group`, `private ?? privates`): a hand-edited
+        // item that is no usable id is not in it, so a change of the list neither fails on it nor keeps it.
+        let allow_list = crate::settings::find(&format!("allow.{field}")).expect("the registry holds the allow lists");
+        let mut listed = allow_list.read(&file).as_array().cloned().unwrap_or_default();
         let mut changed: Vec<String> = Vec::new();
         if admit != listed.iter().any(|value| listed_same(value)) {
             listed.retain(|value| !listed_same(value));

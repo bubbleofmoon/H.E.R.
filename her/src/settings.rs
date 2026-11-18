@@ -46,7 +46,8 @@ pub(crate) use registry::{
 };
 #[cfg(test)]
 pub(crate) use store::{
-    create_store, FAIL_BEFORE_AUDIT, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
+    create_store, FAIL_BEFORE_AUDIT, FAIL_UNDO_LOOK, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT,
+    WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
     apply, apply_changes, backup_source, console_changes, direct_change_error, has_stored_values, history, holds_any,

@@ -319,3 +319,98 @@ fn settings_access_change_that_fails_before_its_commit_leaves_nothing_pending() 
     assert!(inbound_admitted(&context.load_config().unwrap(), LOST));
     assert!(pending_revocations(&root).is_empty());
 }
+
+/// Group 7003, which the lists below grant and then lose.
+const EXTRA: &str = "group:7003";
+const EXTRA_TOKEN: &str = "fixture-security-token-7003";
+
+#[test]
+fn settings_security_undo_whose_first_look_fails_is_refused_without_confirm_and_revokes_with_it() {
+    let (root, context) = security_fixture("settings undo failed look");
+    let state = json!({"conversations": {
+        KEPT: {"agentToken": "fixture-security-token-7001"},
+        LOST: {"agentToken": LOST_TOKEN},
+        EXTRA: {"agentToken": EXTRA_TOKEN},
+    }});
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+    let (status, body) = set(&context, json!({"setting": "allow.groups", "value": [7001, 7002, 7003], "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "?setting=allow.groups");
+    let entry = entries[0]["entry"].clone();
+    // The store cannot be read for the first look: which setting the entry changes is unknown, so no confirmation means
+    // no undo.
+    crate::settings::FAIL_UNDO_LOOK.with(|fail| fail.set(true));
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entry}));
+    assert_eq!(status, 503, "an unconfirmed undo is refused when its entry cannot be looked at: {body}");
+    assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001, 7002, 7003]), "nothing is undone");
+    assert_eq!(conversation_token(&context, EXTRA).unwrap().as_deref(), Some(EXTRA_TOKEN));
+    assert!(pending_revocations(&root).is_empty());
+    // Confirmed, it takes the access path, which looks again under the configuration gate, and revokes.
+    crate::settings::FAIL_UNDO_LOOK.with(|fail| fail.set(true));
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entry, "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revoked"], json!([EXTRA]), "{body}");
+    assert_ne!(conversation_token(&context, EXTRA).unwrap().as_deref(), Some(EXTRA_TOKEN), "the lost conversation's token is rotated");
+    assert!(!inbound_admitted(&context.load_config().unwrap(), EXTRA));
+    assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001, 7002]));
+    assert!(pending_revocations(&root).is_empty());
+}
+
+#[test]
+fn settings_whitelist_write_that_names_the_owner_null_or_blank_clears_it_under_confirmation() {
+    for (label, owner) in [("null", Value::Null), ("blank", json!(" "))] {
+        let (root, context) = security_fixture(&format!("settings whitelist clears owner {label}"));
+        let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+        let (status, body) = post(&context, "/api/whitelist", json!({"ownerQQ": owner}));
+        assert_eq!((status, body["error"].clone()), (409, confirmation_error("ownerQQ")), "{label}: {body}");
+        assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "{label}: nothing is written");
+        assert_eq!(context.load_config().unwrap()["ownerQQ"], 7001, "{label}");
+        let (status, body) = post(&context, "/api/whitelist", json!({"ownerQQ": owner, "confirm": true}));
+        assert_eq!(status, 200, "{label}: {body}");
+        assert_eq!(body["ownerQQ"], Value::Null, "{label}: {body}");
+        assert_eq!(stored_config(&root)["ownerQQ"], Value::Null, "{label}: the file is cleared");
+        assert_eq!(context.load_config().unwrap().get("ownerQQ").cloned().unwrap_or(Value::Null), Value::Null, "{label}: no owner is in effect");
+        let rows: Vec<Value> = audit_rows(&root).into_iter().filter(|row| row["key"] == "ownerQQ" && row["source"] == "console").collect();
+        assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+        assert_eq!(rows[0]["new"], json!("null"), "{label}: the store holds no owner");
+        assert_eq!(setting_view(&context, "ownerQQ")["value"], Value::Null, "{label}");
+        assert!(pending_revocations(&root).is_empty(), "{label}");
+        // Clearing an owner that is cleared already changes nothing.
+        let (status, body) = post(&context, "/api/whitelist", json!({"ownerQQ": owner}));
+        assert_eq!(status, 200, "{label}: {body}");
+    }
+}
+
+#[test]
+fn settings_id_lists_compare_ids_as_the_runtime_does() {
+    let (root, context) = security_fixture("settings id list leading zero");
+    write_config(&root, |config| config["deny"]["private"] = json!(["07001"]));
+    // The runtime compares strings: "07001" denies no conversation, so the list holds no usable id.
+    assert_eq!(setting_view(&context, "deny.private")["value"], json!([]));
+    assert!(inbound_admitted(&context.load_config().unwrap(), "private:7001"), "07001 is not 7001 to the runtime");
+    let (status, body) = set(&context, json!({"setting": "deny.private", "value": ["07001"], "confirm": true}));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "deny.private must be a list of at most 10000 QQ ids (positive integers)");
+    // Denying 7001 changes the list from what it reads, and the file then holds 7001.
+    let (status, body) = post(&context, "/api/whitelist", json!({"deny": {"private": [7001]}, "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(setting_view(&context, "deny.private")["stored"], json!([7001]));
+    assert_eq!(stored_config(&root)["deny"]["private"], json!([7001]), "written back");
+    assert!(!inbound_admitted(&context.load_config().unwrap(), "private:7001"), "7001 is denied");
+}
+
+#[test]
+fn settings_scope_change_works_on_an_allow_list_with_unusable_items() {
+    let (root, context) = security_fixture("settings scope unusable items");
+    write_config(&root, |config| config["allow"]["groups"] = json!([7001, 7002, "7003a", 0, 9_007_199_254_740_992u64]));
+    let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": LOST, "action": "remove", "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["revoked"], json!([LOST]), "{body}");
+    assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001]));
+    assert_eq!(stored_config(&root)["allow"]["groups"], json!([7001]), "the unusable items are dropped");
+    assert_ne!(conversation_token(&context, LOST).unwrap().as_deref(), Some(LOST_TOKEN), "the lost conversation's token is rotated");
+    assert!(!inbound_admitted(&context.load_config().unwrap(), LOST));
+    let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": LOST, "action": "admit", "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001, 7002]));
+}

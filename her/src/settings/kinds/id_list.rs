@@ -26,13 +26,23 @@ pub(crate) fn qq_id(value: &Value) -> Option<u64> {
     (1..=SAFE_INTEGER_MAX).contains(&id).then_some(id)
 }
 
-/// `items` as ids in first-seen order without repeats; `None` when `strict` and an item is not an id (`qq_id`), else
+/// An id of a list: `qq_id`, except that a digit string with a leading zero is no id. The runtime compares a list's
+/// items with a conversation's id as strings (`chat::allowed`), so "07001" is not 7001 there; reading it as 7001 would
+/// show, store and deny an id the runtime never matches.
+fn list_id(value: &Value) -> Option<u64> {
+    if value.as_str().is_some_and(|text| text.trim().len() > 1 && text.trim().starts_with('0')) {
+        return None;
+    }
+    qq_id(value)
+}
+
+/// `items` as ids in first-seen order without repeats; `None` when `strict` and an item is not an id (`list_id`), else
 /// such an item is skipped.
 fn ids(items: &[Value], strict: bool) -> Option<Vec<u64>> {
     let mut seen = std::collections::HashSet::new();
     let mut ids: Vec<u64> = Vec::new();
     for item in items {
-        match qq_id(item) {
+        match list_id(item) {
             Some(id) => {
                 if seen.insert(id) {
                     ids.push(id);
@@ -45,10 +55,11 @@ fn ids(items: &[Value], strict: bool) -> Option<Vec<u64>> {
     Some(ids)
 }
 
-/// A list of QQ ids: a JSON array of at most `ID_LIST_MAX` ids (`qq_id`), stored as integers in first-seen order
-/// without repeats. `alias` is the older member read while the pointer's member is missing or null (the alias
-/// precedence of `config::canonical_config`). In `config.json` an array reads as its usable ids, in first-seen order
-/// without repeats (an item that is not an id is skipped), and any other value as the empty list.
+/// A list of QQ ids: a JSON array of at most `ID_LIST_MAX` ids (`list_id`), stored as integers in first-seen order
+/// without repeats; an item that is no id, a digit string with a leading zero included, is refused. `alias` is the
+/// older member read while the pointer's member is missing or null (the alias precedence of
+/// `config::canonical_config`). In `config.json` an array reads as its usable ids, in first-seen order without repeats
+/// (an item that is not an id is skipped), and any other value as the empty list.
 #[derive(Clone, Copy)]
 pub(crate) struct IdList {
     pub alias: Option<&'static str>,
@@ -123,6 +134,12 @@ impl SettingKind for IdList {
             assert_eq!(effective.pointer(setting.pointer), Some(&json!(["12", "13", "13"])), "{spelling}");
             assert_eq!(setting.read(&document), json!([12, 13]), "{spelling}");
         }
+        // The runtime compares ids as strings, so a leading zero makes another id: "07001" is not 7001.
+        assert_eq!(setting.normalize(&json!(["07001"])), None, "{}: a leading zero is refused", setting.key);
+        let padded = super::document_at(setting.pointer, json!(["07001", 12]));
+        let (effective, _) = crate::config::canonical_config(&padded).unwrap();
+        assert_eq!(effective.pointer(setting.pointer), Some(&json!(["07001", "12"])), "{}", setting.key);
+        assert_eq!(setting.read(&padded), json!([12]), "{}: a leading zero is skipped, as no id of the runtime's", setting.key);
         if let Some(alias) = self.alias {
             let mut both = super::document_at(setting.pointer, json!([8]));
             both.pointer_mut(setting.pointer.rsplit_once('/').unwrap().0).unwrap()[alias.rsplit_once('/').unwrap().1] = json!([7]);

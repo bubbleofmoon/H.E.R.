@@ -37,6 +37,9 @@ thread_local! {
     pub(crate) static FAIL_WRITE_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Makes the next store write on this thread panic just before its commit, as a crash there would (#154).
     pub(crate) static PANIC_BEFORE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next look at an undo's entry (`preview`) on this thread fail as a store that cannot be read right now
+    /// would (503); the look after it succeeds (#154).
+    pub(crate) static FAIL_UNDO_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
@@ -1415,6 +1418,10 @@ pub(crate) fn preview(
             Ok(vec![(setting, Some(setting.default_value()))])
         }
         Change::Undo { entry } => {
+            #[cfg(test)]
+            if FAIL_UNDO_LOOK.with(|fail| fail.replace(false)) {
+                return Err((503, STORAGE_ERROR.to_string()));
+            }
             let conn = match inspect(context).map_err(|error| (503, error))? {
                 Inspection::Missing | Inspection::Fresh => return Err((404, UNKNOWN_ENTRY_ERROR.to_string())),
                 Inspection::Ready(conn) => conn,
