@@ -239,7 +239,7 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
             return false;
         }
     };
-    let sent = notify(&alert_text(key, chain.len(), &class));
+    let sent = { let _held = gate(context); notify(&alert_text(key, chain.len(), &class)) }; // RED-M1
     if sent {
         // Marked only while the very episode that was offered is still owed: an answer meanwhile ended it, a later
         // failure started a new one that is owed itself.
