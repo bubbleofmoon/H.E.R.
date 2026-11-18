@@ -1,10 +1,22 @@
-//! Tool-less one-shot model jobs: one non-streaming completion on one model route of the selected runtime's relay,
-//! authenticated with the harness credential, with no tools and no history. The digest and slang learning use it and
-//! pick the route's model themselves (`harness::routes`). Tests install a fake per runtime root and job.
+//! Tool-less one-shot model jobs: non-streaming completions on model routes of the selected runtime's relay,
+//! authenticated with the harness credential, with no tools and no history. Slang learning asks one route
+//! (`RelayModel`); the digest walks its routes as harness turns walk their chain (`RouteWalk`, #238). Each job picks
+//! its routes itself (`harness::routes`). Tests install a fake per runtime root and job.
+use crate::harness::route_health::{self, Seen};
+use crate::harness::routes::{self, Miss, RouteSpec};
+use crate::harness::usage;
+use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::RuntimeContext;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-/// A fixed failure class (`quota`, `timeout`, `backend`, `network`, `refusal`, `unconfigured`, ...); never provider text.
+#[cfg(test)]
+mod walk_tests;
+
+/// A fixed failure class (`quota`, `timeout`, `backend`, `network`, `refusal`, `empty-response`, `unconfigured`, ...);
+/// never provider text.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ModelError(pub &'static str);
 
@@ -51,6 +63,18 @@ pub(crate) fn install_test_model(root: &std::path::Path, job: Job, model: Arc<dy
     models.push((root.to_path_buf(), job, model));
 }
 
+/// Tests: the fake installed for `job` on the runtime of `context`, if any.
+#[cfg(test)]
+fn test_model(context: &RuntimeContext, job: Job) -> Option<Arc<dyn OneShot>> {
+    let root = context.runtime_root()?;
+    TEST_MODELS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(r, j, _)| r == root && *j == job)
+        .map(|(_, _, model)| model.clone())
+}
+
 /// The model `job` asks on `context`: `route` (`None`: not configured) on the relay, bounded by `timeout`, answering at
 /// most `max_tokens` tokens. Each answered request is a usage fact (`harness::usage`) under the ledger key `key`.
 pub(crate) fn model_for(
@@ -62,15 +86,38 @@ pub(crate) fn model_for(
     max_tokens: u32,
 ) -> Result<Arc<dyn OneShot>, ModelError> {
     #[cfg(test)]
-    if let Some(root) = context.runtime_root() {
-        if let Some((_, _, model)) =
-            TEST_MODELS.lock().unwrap_or_else(|p| p.into_inner()).iter().find(|(r, j, _)| r == root && *j == job)
-        {
-            return Ok(model.clone());
-        }
+    if let Some(model) = test_model(context, job) {
+        return Ok(model);
     }
     let route = route.ok_or(ModelError("unconfigured"))?;
     Ok(Arc::new(RelayModel::for_model(context, job, key, route, timeout, max_tokens)?))
+}
+
+/// The routes a one-shot walk tries (`RouteWalk`), in order, and whether they are the configured harness chain
+/// (`harness::routes::chain`), whose route health the walk observes (`route_health`).
+#[derive(Clone, Debug)]
+pub(crate) struct Walk {
+    pub routes: Vec<RouteSpec>,
+    pub chain: bool,
+}
+
+/// The model `job` asks on `context` through a route walk (`RouteWalk`) over `walk` (`None`: not configured), bounded
+/// as a whole by `timeout`, each request answering at most `max_tokens` tokens. Each response end is a usage fact
+/// (`harness::usage`) under the ledger key `key`.
+pub(crate) fn walk_for(
+    context: &RuntimeContext,
+    job: Job,
+    key: &str,
+    walk: Option<Walk>,
+    timeout: Duration,
+    max_tokens: u32,
+) -> Result<Arc<dyn OneShot>, ModelError> {
+    #[cfg(test)]
+    if let Some(model) = test_model(context, job) {
+        return Ok(model);
+    }
+    let walk = walk.ok_or(ModelError("unconfigured"))?;
+    Ok(Arc::new(RouteWalk::new(context, job, key, walk, timeout, max_tokens)?))
 }
 
 /// The relay's OpenAI-compatible endpoint for one model with the harness credential (`ModelRoute::for_model`): one
@@ -113,16 +160,18 @@ impl RelayModel {
         })
     }
 
-    /// The usage fact of one answered request (`harness::usage`), with a turn number of its own.
-    fn record_usage(&self, reported: &genai::chat::Usage) {
-        use crate::harness::usage;
-        let place = usage::Place { key: self.usage_key.clone(), turn: usage::next_number(), step: 0, retry: 0 };
+    /// The usage fact of one response end (`harness::usage`), filed at turn `turn` with `retry` earlier requests for the
+    /// same unchanged request.
+    fn record_usage(&self, reported: &genai::chat::Usage, turn: i64, retry: i64) {
+        let place = usage::Place { key: self.usage_key.clone(), turn, step: 0, retry };
         usage::record(&self.context, &place, &self.usage_route, &self.model, self.usage_job, Some(reported));
     }
-}
 
-impl OneShot for RelayModel {
-    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
+    /// One request bounded by `timeout`, filed in the token ledger at turn `turn` with `retry` earlier requests for it:
+    /// the answer's text (empty when it has none), or how it missed, as the route module reads a miss (`routes::Miss`:
+    /// an HTTP 429 with its wait hint, else the failure's class; a content-filter stop is `refusal`). Every response end
+    /// is a usage fact, a refused one included: it is recorded before the refusal is decided.
+    fn send(&self, system: &str, input: &str, timeout: Duration, turn: i64, retry: i64) -> Result<String, Miss> {
         use genai::chat::{ChatMessage, ChatOptions, ChatRequest, StopReason};
         let mut messages = Vec::with_capacity(2);
         if !system.is_empty() {
@@ -140,31 +189,224 @@ impl OneShot for RelayModel {
             })
         });
         let target = self.route.target();
-        let timeout = self.timeout;
         let call = async move {
-            let client = genai::Client::new().map_err(|_| ModelError("network"))?;
+            let client = genai::Client::new().map_err(|_| Miss::Failed { class: "network" })?;
             let options = ChatOptions::default().with_max_tokens(max_tokens);
             tokio::time::timeout(timeout, client.exec_chat(genai::ModelSpec::Target(target), request, Some(&options)))
                 .await
-                .map_err(|_| ModelError("timeout"))?
-                .map_err(|error| ModelError(crate::harness::model_failure(&error).class))
+                .map_err(|_| Miss::Failed { class: "timeout" })?
+                .map_err(|error| miss_of(&error))
         };
         // A fresh thread has no runtime context, so this works from sync jobs and spawn_blocking alike.
         let response = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|_| ModelError("network"))?
+                .map_err(|_| Miss::Failed { class: "network" })?
                 .block_on(call)
         })
         .join()
-        .unwrap_or(Err(ModelError("network")))?;
-        // Every answered request is a usage fact, a refused one included: it is recorded before the refusal is decided.
-        self.record_usage(&response.usage);
+        .unwrap_or(Err(Miss::Failed { class: "network" }))?;
+        self.record_usage(&response.usage, turn, retry);
         if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
-            return Err(ModelError("refusal"));
+            return Err(Miss::Failed { class: "refusal" });
         }
         Ok(response.into_first_text().unwrap_or_default())
+    }
+}
+
+impl OneShot for RelayModel {
+    /// One request with a turn number of its own (`usage::next_number`), bounded by the model's timeout; a 429 is
+    /// `quota`.
+    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
+        self.send(system, input, self.timeout, usage::next_number(), 0)
+            .map_err(|miss| ModelError(miss_class(&miss)))
+    }
+}
+
+/// How a failed request missed (`routes::Miss`): an HTTP 429 with the wait its response asked for
+/// (`harness::rate_limit_wait`), else the failure's class (`harness::model_failure`); never provider text.
+fn miss_of(error: &genai::Error) -> Miss {
+    let failure = crate::harness::model_failure(error);
+    if failure.class == "quota" && failure.code == "429" {
+        return Miss::RateLimited { wait: crate::harness::rate_limit_wait(error) };
+    }
+    Miss::Failed { class: failure.class }
+}
+
+/// The content-free class of a miss (`model_failure::Failure::class`): a 429 is `quota`, an empty answer
+/// `empty-response` and a dropped stream `network`.
+fn miss_class(miss: &Miss) -> &'static str {
+    match miss {
+        Miss::RateLimited { .. } => "quota",
+        Miss::Empty => "empty-response",
+        Miss::Dropped => "network",
+        Miss::Failed { class } => *class,
+    }
+}
+
+/// One-shot requests over routes in order, as a harness turn walks its chain (`routes::decide`): a first 429 is retried
+/// once on the same route after its hint, a repeat 429 and any other failure (an HTTP error, a timeout, a network
+/// failure, a refusal, an error-shaped answer: `backend::plain_output_failure`) move to the next route, and an empty
+/// answer is retried on the same route up to `routes::EMPTY_RETRIES` times first. The walk is bounded as a whole by its
+/// `timeout`: each request gets the time left, a wait never reaches the end, a request that times out had all the time
+/// left and ends the walk, and nothing is sent once the end has passed. The first usable answer is returned and never
+/// sent again. It shares the failover memory of harness turns (`routes::with_memory`) under its ledger key, as one
+/// conversation: its degraded route starts the next walks, and at most `routes::RETRY_CAP` failovers are made until a
+/// route answers. Every response end is a usage fact on the route that gave it, one turn number per walk with its retry
+/// count (`RelayModel::send`); a walk over the configured chain marks each answer and route failure in route health
+/// (`route_health`); every retry, failover and final route failure goes to the run record (component `model-chain`).
+pub(crate) struct RouteWalk {
+    context: RuntimeContext,
+    routes: Vec<(RouteSpec, RelayModel)>,
+    /// The routes are the configured chain, whose route health the walk observes.
+    chain: bool,
+    /// The ledger key: the usage facts' key, the failover memory's conversation and the run record's subject.
+    key: String,
+    timeout: Duration,
+    /// The base wait of retries (`routes::Situation::unit`): one second; tests shorten it.
+    unit: Duration,
+}
+
+impl RouteWalk {
+    pub(crate) fn new(
+        context: &RuntimeContext,
+        job: Job,
+        key: &str,
+        walk: Walk,
+        timeout: Duration,
+        max_tokens: u32,
+    ) -> Result<Self, ModelError> {
+        if walk.routes.is_empty() {
+            return Err(ModelError("unconfigured"));
+        }
+        let mut routes = Vec::with_capacity(walk.routes.len());
+        for spec in walk.routes {
+            let route = RouteModel { id: &spec.id, model: &spec.model };
+            let model = RelayModel::for_model(context, job, key, route, timeout, max_tokens)?;
+            routes.push((spec, model));
+        }
+        Ok(Self {
+            context: context.clone(),
+            routes,
+            chain: walk.chain,
+            key: key.to_string(),
+            timeout,
+            unit: Duration::from_secs(1),
+        })
+    }
+
+    /// This walk with retries waiting `unit` instead of one second (tests).
+    #[cfg(test)]
+    pub(crate) fn with_unit(mut self, unit: Duration) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    fn specs(&self) -> Vec<RouteSpec> {
+        self.routes.iter().map(|(spec, _)| spec.clone()).collect()
+    }
+
+    /// Marks what route `at` did in route health (`route_health::observe`), for a walk over the configured chain only.
+    fn observe(&self, at: usize, seen: Seen) {
+        if self.chain {
+            route_health::observe(&self.context, &self.specs(), at, seen);
+        }
+    }
+
+    /// The answer of route `at`: the route is ok in route health, the walks' failover budget starts over, and the answer
+    /// is returned, never sent again.
+    fn answered(&self, at: usize, scope: &str, memory_key: &routes::ChainKey, text: String) -> Result<String, ModelError> {
+        self.observe(at, Seen::Answered);
+        routes::with_memory(scope, |memory| memory.on_completed(memory_key));
+        Ok(text)
+    }
+
+    /// One run record of route `at` (component `model-chain`): the ledger key, the route id as records keep it (the
+    /// credential redacted), the miss's class and the request's size in bytes, never content.
+    fn record(&self, event: &str, outcome: Outcome, at: usize, class: &str, bytes: usize, action: &str) {
+        let route = &self.routes[at].1.usage_route;
+        let reason = format!("{}: route {route} ({class}) on a request of {bytes} bytes; {action}", self.key);
+        crate::recovery_log::record(&self.context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
+    }
+}
+
+impl OneShot for RouteWalk {
+    fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
+        let deadline = Instant::now() + self.timeout;
+        let specs = self.specs();
+        let scope = routes::scope_of(&self.context);
+        let memory_key = routes::ChainKey {
+            conversation: self.key.clone(),
+            generation: String::new(),
+            signature: routes::chain_signature(&specs),
+        };
+        let mut at = routes::with_memory(&scope, |memory| memory.start(&memory_key, specs.len(), Instant::now()));
+        let turn = usage::next_number();
+        let bytes = system.len() + input.len();
+        let (mut retry, mut rate_limited, mut empty_answers) = (0i64, false, 0u32);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ModelError("timeout"));
+            }
+            let (spec, model) = &self.routes[at];
+            let miss = match model.send(system, input, left, turn, retry) {
+                Ok(text) => match crate::backend::plain_output_failure(&text) {
+                    None => return self.answered(at, &scope, &memory_key, text),
+                    Some(failure) if failure.class == "empty-response" => Miss::Empty,
+                    Some(failure) => Miss::Failed { class: failure.class },
+                },
+                Err(miss) => miss,
+            };
+            let class = miss_class(&miss);
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let next_route = at + 1 < self.routes.len()
+                && routes::with_memory(&scope, |memory| memory.can_fail_over(&memory_key, now));
+            let situation = routes::Situation {
+                retry_429: spec.retry_429,
+                rate_limited_before: rate_limited,
+                empty_answers,
+                // A one-shot request does not stream, dispatches no tool and sends nothing.
+                stream_retried: true,
+                dispatched: false,
+                sent: false,
+                next_route,
+                // A request that timed out had all the time left: no request follows it.
+                steps_left: !remaining.is_zero(),
+                unit: self.unit,
+                remaining,
+            };
+            match routes::decide(&miss, &situation) {
+                routes::Next::Fail => {
+                    self.observe(at, Seen::Failed { class });
+                    self.record("route-failed", Outcome::Failed, at, class, bytes, "the request ends");
+                    return Err(ModelError(class));
+                }
+                routes::Next::FailOver => {
+                    self.observe(at, Seen::Failed { class });
+                    let action = format!("next route {}", self.routes[at + 1].1.usage_route);
+                    self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
+                    routes::with_memory(&scope, |memory| memory.on_failover(&memory_key, at + 1, now));
+                    at += 1;
+                    rate_limited = false;
+                    empty_answers = 0;
+                }
+                routes::Next::Retry { wait } => {
+                    let action = format!("retrying the same route after {} ms", wait.as_millis());
+                    self.record("route-retry", Outcome::Ok, at, class, bytes, &action);
+                    match miss {
+                        Miss::RateLimited { .. } => rate_limited = true,
+                        Miss::Empty => empty_answers += 1,
+                        Miss::Dropped | Miss::Failed { .. } => {}
+                    }
+                    std::thread::sleep(wait);
+                }
+            }
+            // A retry and a failover each send the same unchanged request once more.
+            retry += 1;
+        }
     }
 }
 
