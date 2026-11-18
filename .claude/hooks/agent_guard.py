@@ -26,11 +26,18 @@ stay inside their word. Publishing and moving refs pass only as exact whole comm
   ref, not a `cd` into another worktree (the guard has no ticket binding: T1/T2 in docs/agents/coordinator.md, containment
   is #85); a second dispatch of the same ref, target, os and filter cancels the first run (the guard refuses the sha input); a session that does not start in its
   worktree needs the `cd`;
-- Codex only as the implementer's self-review through /root/her/scripts/codex-task.sh or C:/her/scripts/codex-task.ps1
-  with gpt-6.2-astra, high and read-only, its own worktree as the workdir and
-  <orch>/<n>/review/codex-self-<k>.md (its branch's ticket, not a link) as the prompt.
-scripts/gh-public and scripts/handoff are the coordinator's alone; they, and codex, are also refused by name anywhere in
-a command that has a wrapper, a $ or a backtick.
+scripts/gh-public, scripts/handoff and Codex are the coordinator's alone; they are refused by name anywhere in a command
+that has a wrapper, a $ or a backtick, and workers never start Codex.
+
+The coordinator role (not wired to any session by default; `agent-guard.sh coordinator`) has no other rule than the
+Codex forms, each one plain command (optionally after `cd <dir> &&`, optionally `bash`, and for implement after
+HER_GITLEAKS=<path to gitleaks>), through /root/her/scripts or C:/her/scripts:
+- codex-work.sh implement <name> <worktree> <prompt> [model [effort [minutes]]], the worktree on a her/<n>-<slug>
+  branch, the prompt file in that ticket's folder (<orch>/<n>/, not a link);
+- codex-work.sh plan <ticket> <name> <prompt> [model [effort [minutes]]], the prompt in that ticket's folder;
+- codex-task.sh <name> <workdir> <prompt> <model> <effort> read-only [minutes] (investigation), the prompt in a ticket folder;
+- the codex-work.ps1 (-Mode implement|plan) and codex-task.ps1 (-Sandbox read-only) counterparts with the same values.
+The model is gpt-6.2-sol or gpt-6.2-astra and the effort medium or high; any other Codex call is refused.
 Polling GitHub gets its own refusal message for implementers and gates: gh with --watch or `gh run watch`, and gh run
 by `watch` (a wrapper) or inside a while/until/for loop, unless the command is one plain gh call. The guard also
 refuses every command whose text mentions ci-wait, in a word, a quoted argument or an assignment value (only the
@@ -47,7 +54,7 @@ import shlex
 import subprocess
 import sys
 
-ROLES = ('implementer', 'reviewer', 'gate', 'planner')
+ROLES = ('implementer', 'reviewer', 'gate', 'planner', 'coordinator')
 # The integration checkout whose codex-task script is canonical, and the ticket folder that holds plans and
 # scratch exports. The harness leaves both at their defaults; a test points them at its own copy and a readable
 # folder. An agent's command runs in its own shell, so it cannot change these for the hook.
@@ -82,7 +89,7 @@ FIND_TESTS = {'-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename',
               '-samefile', '-readable', '-writable', '-executable', '-maxdepth', '-mindepth', '-depth', '-xdev', '-mount',
               '-noleaf', '-daystart', '-follow', '-ignore_readdir_race', '-noignore_readdir_race', '-not', '-and', '-or',
               '-a', '-o', '-true', '-false', '-prune', '-print', '-print0', '-L', '-H', '-P'}
-CODEX_PROMPT = re.compile('(?:' + re.escape(TICKET_ROOT) + r'|[Cc]:/her-orch)/([1-9][0-9]*)/review/codex-self-[1-9][0-9]*\.md')
+CODEX_FILE = re.compile('(?:' + re.escape(TICKET_ROOT) + r'|[Cc]:/her-orch)/([1-9][0-9]*)(/[A-Za-z0-9._-]+)+')
 QUICK_INPUTS = {'target': re.compile(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*'),
                 'filter': re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.-]*'),
                 'os': re.compile(r'linux|windows')}
@@ -94,13 +101,26 @@ GIT_WORD = re.compile(r'\bgit\b')
 GH_WORD = re.compile(r'(?<![\w.-])gh(?![\w.-])')
 PLANNER_WRITE = re.compile('(?:' + re.escape(TICKET_ROOT) + r'|[Cc]:/her-orch)/[1-9][0-9]*/(?:plan\.md|scratch/.+)')
 REPARSE_POINT = 0x400
-CODEX_NAMES = {'codex', 'codex.cmd', 'codex.ps1', 'codex.js', 'codex-task.sh', 'codex-task.ps1'}
-CODEX_SH = HOME_CHECKOUT + '/scripts/codex-task.sh'
-CODEX_PS1 = 'c:/her/scripts/codex-task.ps1'
+CODEX_NAMES = {'codex', 'codex.cmd', 'codex.ps1', 'codex.js', 'codex-task.sh', 'codex-task.ps1', 'codex-work.sh',
+               'codex-work.ps1'}
 CODEX_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]*')
 CODEX_MINUTES = re.compile(r'[1-9][0-9]{0,2}')
+CODEX_MODELS = {'gpt-6.2-sol', 'gpt-6.2-astra'}
+CODEX_EFFORTS = {'medium', 'high'}
+CODEX_SH_SCRIPTS = {'work': HOME_CHECKOUT + '/scripts/codex-work.sh', 'task': HOME_CHECKOUT + '/scripts/codex-task.sh'}
+CODEX_PS1_SCRIPTS = {'c:/her/scripts/codex-work.ps1': 'work', 'c:/her/scripts/codex-task.ps1': 'task'}
 PS_HOST_OPTIONS = {'-noprofile', '-noninteractive', '-nologo', '-executionpolicy', 'bypass'}
-CODEX_PS_PARAMS = {'-name', '-workdir', '-promptfile', '-model', '-effort', '-sandbox', '-timeoutminutes'}
+# PowerShell parameter -> field, per script and kind; every required one must appear once.
+CODEX_PS_PARAMS = {
+    'implement': {'-mode': 'mode', '-name': 'name', '-workdir': 'workdir', '-promptfile': 'prompt', '-model': 'model',
+                  '-effort': 'effort', '-timeoutminutes': 'minutes'},
+    'plan': {'-mode': 'mode', '-name': 'name', '-ticket': 'ticket', '-promptfile': 'prompt', '-model': 'model',
+             '-effort': 'effort', '-timeoutminutes': 'minutes'},
+    'investigate': {'-name': 'name', '-workdir': 'workdir', '-promptfile': 'prompt', '-model': 'model', '-effort': 'effort',
+                    '-sandbox': 'sandbox', '-timeoutminutes': 'minutes'},
+}
+CODEX_REQUIRED = {'implement': {'mode', 'name', 'workdir', 'prompt'}, 'plan': {'mode', 'name', 'ticket', 'prompt'},
+                  'investigate': {'name', 'workdir', 'prompt', 'model', 'effort', 'sandbox'}}
 WRAPPERS = {'bash', 'sh', 'env', 'timeout', 'nice', 'nohup', 'exec', 'command', 'xargs', 'sudo', 'time', 'stdbuf',
             'npx', 'npm', 'pnpm', 'yarn', 'bunx', 'node', 'pwsh', 'powershell', 'cmd', 'busybox',
             'setsid', 'ionice', 'taskset', 'flock', 'strace', 'script', 'doas', 'su', 'runuser', 'winpty', 'start', 'call',
@@ -117,6 +137,9 @@ CI_WAIT_DENIED = ('only the coordinator waits for CI (scripts/ci-wait.py): an im
                   'reports a check still running as waiting (docs/agents/implementer-protocol.md "Test loop"). '
                   'A command that mentions ci-wait is refused wherever the name stands; to read or search the waiter, '
                   'use the Read and Grep tools.')
+CODEX_DENIED = ('Codex runs only for the coordinator, through its documented forms of scripts/codex-work and '
+                'scripts/codex-task (docs/agents/coordinator.md "Codex runs"): workers never start Codex. '
+                'To read the scripts, use the Read tool.')
 HIDDEN = {c: chr(0xE000 + k) for k, c in enumerate(SEGMENT_BREAKS)}
 SHOWN = {v: k for k, v in HIDDEN.items()}
 REDIRECT = re.compile(r'&>>?|>>|>&|>\||>|<<<|<<|<&|<>|<')
@@ -445,11 +468,6 @@ def read_only_pipeline(command):
     return pipeline
 
 
-def same_path(a, b, cwd):
-    norm = lambda p: os.path.normcase(os.path.normpath(os.path.join(cwd or '', p.replace('\\', '/'))))
-    return bool(a and b) and norm(a) == norm(b)
-
-
 def path_has_link(path):
     """True when any part of an absolute path (POSIX, or a drive path with forward slashes) is a link or reparse point."""
     head, rest = ('/', path[1:]) if path.startswith('/') else (path[:3], path[3:])
@@ -457,13 +475,18 @@ def path_has_link(path):
     return any(is_link(head + '/'.join(parts[:i + 1])) for i in range(len(parts)))
 
 
-def codex_target_allowed(workdir, prompt, cwd, branch):
-    """The self-review reads the implementer's own worktree, with a prompt (not a link) in its own ticket's review folder."""
-    prompt = prompt.replace('\\', '/')
-    match = CODEX_PROMPT.fullmatch(prompt)
-    ticket = re.fullmatch(r'her/([0-9]+)-.+', branch or '')
-    return bool(match and ticket and match.group(1) == ticket.group(1) and not path_has_link(prompt)
-                and same_path(workdir, cwd, cwd))
+def ticket_file(path):
+    """The ticket number of a file inside a ticket folder (<orch>/<n>/...: no link, no . or .. part), else None."""
+    path = path.replace('\\', '/')
+    match = CODEX_FILE.fullmatch(path)
+    if not match or any(part in ('.', '..') for part in path.split('/')) or path_has_link(path):
+        return None
+    return match.group(1)
+
+
+def absolute_path(path):
+    """A POSIX or drive path with no . or .. part."""
+    return bool(re.fullmatch(r'(?:/|[A-Za-z]:/)[^\x00-\x1f]*', path)) and not any(p in ('.', '..') for p in path.split('/'))
 
 
 def branch_of(path):
@@ -558,36 +581,80 @@ def quick_allowed(found, branch):
     return refs == [branch] and 'target' in inputs
 
 
-def codex_allowed(found, cwd, branch):
-    """The implementer's read-only Codex self-review through the integration checkout's codex-task script."""
+def codex_ps_form(found):
+    """(kind, fields) of a PowerShell Codex form (powershell|pwsh [host options] -File <script> -Param value ...), or None."""
+    i = 1
+    while i < len(found) and found[i].lower() in PS_HOST_OPTIONS:   # host options only before -File
+        i += 1
+    rest = found[i:]
+    if len(rest) < 2 or rest[0].lower() != '-file':
+        return None
+    script = CODEX_PS1_SCRIPTS.get(rest[1].replace('\\', '/').lower())
+    params, pairs = rest[2:], {}
+    if script is None or len(params) % 2:
+        return None
+    for key, value in zip(params[0::2], params[1::2]):
+        key = key.lower()
+        if key in pairs:
+            return None
+        pairs[key] = value
+    kind = 'investigate' if script == 'task' else pairs.get('-mode', '').lower()
+    if kind not in CODEX_PS_PARAMS or not set(pairs) <= set(CODEX_PS_PARAMS[kind]):
+        return None
+    fields = {CODEX_PS_PARAMS[kind][key]: value for key, value in pairs.items()}
+    if not CODEX_REQUIRED[kind] <= set(fields):
+        return None
+    fields.pop('mode', None)
+    return kind, fields
+
+
+def codex_sh_form(found):
+    """(kind, fields) of a shell Codex form (<script> <positional values>), or None."""
+    rest = found[1:]
+    if found[0] == CODEX_SH_SCRIPTS['work'] and rest[:1] == ['implement'] and 4 <= len(rest) <= 7:
+        return 'implement', dict(zip(('name', 'workdir', 'prompt', 'model', 'effort', 'minutes'), rest[1:]))
+    if found[0] == CODEX_SH_SCRIPTS['work'] and rest[:1] == ['plan'] and 4 <= len(rest) <= 7:
+        return 'plan', dict(zip(('ticket', 'name', 'prompt', 'model', 'effort', 'minutes'), rest[1:]))
+    if found[0] == CODEX_SH_SCRIPTS['task'] and 6 <= len(rest) <= 7:
+        return 'investigate', dict(zip(('name', 'workdir', 'prompt', 'model', 'effort', 'sandbox', 'minutes'), rest))
+    return None
+
+
+def codex_form_allowed(kind, fields, gitleaks):
+    """The values of one documented Codex form: pinned model and effort, a read-only investigation, and every file in
+    the folder of the ticket the run is for. HER_GITLEAKS (`gitleaks`) belongs to the implement form only."""
+    if (gitleaks and kind != 'implement') or not CODEX_NAME.fullmatch(fields['name']):
+        return False
+    if fields.get('model', 'gpt-6.2-sol') not in CODEX_MODELS or fields.get('effort', 'medium') not in CODEX_EFFORTS:
+        return False
+    if 'minutes' in fields and not CODEX_MINUTES.fullmatch(fields['minutes']):
+        return False
+    ticket = ticket_file(fields['prompt'])
+    if not ticket:
+        return False
+    if kind == 'plan':
+        return fields['ticket'] == ticket
+    workdir = fields['workdir'].replace('\\', '/')
+    if not absolute_path(workdir):
+        return False
+    if kind == 'investigate':
+        return fields['sandbox'] == 'read-only'
+    branch = branch_of(workdir)
+    match = re.fullmatch(r'her/([0-9]+)-.+', branch or '')
+    return bool(match and TICKET_BRANCH.fullmatch(branch) and match.group(1) == ticket)
+
+
+def codex_allowed(found):
+    """One of the coordinator's documented Codex forms (module docstring)."""
+    gitleaks = bool(found and GITLEAKS_PREFIX.fullmatch(found[0]))
+    if gitleaks:
+        found = found[1:]
     if found[:1] == ['bash']:
         found = found[1:]
-    if found and found[0] == CODEX_SH:
-        return (len(found) in (7, 8) and bool(CODEX_NAME.fullmatch(found[1]))
-                and found[4:7] == ['gpt-6.2-astra', 'high', 'read-only']
-                and (len(found) == 7 or bool(CODEX_MINUTES.fullmatch(found[7])))
-                and codex_target_allowed(found[2], found[3], cwd, branch))
-    if found and base(found[0]) in ('powershell', 'pwsh'):
-        i = 1
-        while i < len(found) and found[i].lower() in PS_HOST_OPTIONS:   # host options only before -File
-            i += 1
-        rest = found[i:]
-        if len(rest) < 2 or rest[0].lower() != '-file' or rest[1].replace('\\', '/').lower() != CODEX_PS1:
-            return False
-        params, pairs = rest[2:], {}
-        if len(params) % 2:
-            return False
-        for key, value in zip(params[0::2], params[1::2]):
-            key = key.lower()
-            if key not in CODEX_PS_PARAMS or key in pairs:
-                return False
-            pairs[key] = value
-        return (CODEX_PS_PARAMS - {'-timeoutminutes'} <= set(pairs)
-                and pairs['-model'] == 'gpt-6.2-astra' and pairs['-effort'] == 'high' and pairs['-sandbox'] == 'read-only'
-                and bool(CODEX_NAME.fullmatch(pairs['-name']))
-                and ('-timeoutminutes' not in pairs or bool(CODEX_MINUTES.fullmatch(pairs['-timeoutminutes'])))
-                and codex_target_allowed(pairs['-workdir'], pairs['-promptfile'], cwd, branch))
-    return False
+    if not found:
+        return False
+    form = codex_ps_form(found) if base(found[0]) in ('powershell', 'pwsh') else codex_sh_form(found)
+    return bool(form) and codex_form_allowed(*form, gitleaks)
 
 
 def gh_read(found, role):
@@ -644,6 +711,23 @@ def planner_may_write(path):
     return not path_has_link(path)
 
 
+def check_coordinator(command, hook_cwd):
+    """The coordinator's only rule: Codex runs through a documented form, as one plain command."""
+    plain = simple(command, hook_cwd)
+    if plain and codex_allowed(plain[0]):
+        return
+    try:
+        flat = flatten(command)
+        commands = {base(words[0]) for words, _ in segments(command)}
+    except ValueError:                        # unreadable: stay out of the way unless it mentions Codex at all
+        if 'codex' in command.lower():
+            raise Deny(CODEX_DENIED)
+        return
+    indirect = '$' in command or '`' in command or bool(commands & WRAPPERS) or bool(FIND_EXEC & set(flat))
+    if commands & CODEX_NAMES or (indirect and 'codex' in (command + '\n' + ' '.join(flat)).lower()):
+        raise Deny(CODEX_DENIED)
+
+
 def check_bash(role, command, hook_cwd):
     if "$'" in command or re.search(r'\\\r?\n', command):
         raise Deny('no ANSI-C quoting ($\'...\') and no backslash-newline continuations; write one plain command.')
@@ -652,14 +736,15 @@ def check_bash(role, command, hook_cwd):
         if not pipeline or not all(read_only_reader_allowed(words, role, hook_cwd) for words in pipeline):
             raise Deny(READ_ONLY_REFUSAL)
         return
+    if role == 'coordinator':
+        return check_coordinator(command, hook_cwd)
     plain = simple(command, hook_cwd)
     words, cwd = plain if plain else (None, hook_cwd)
     branch = branch_of(cwd)
     on_ticket = bool(branch and TICKET_BRANCH.fullmatch(branch))
     # Exact forms first: each is one plain command, so its message or values cannot run anything else.
     if role == 'implementer' and words and on_ticket and (
-            push_allowed(words, branch) or commit_allowed(words) or quick_allowed(words, branch)
-            or codex_allowed(words, cwd, branch)):
+            push_allowed(words, branch) or commit_allowed(words) or quick_allowed(words, branch)):
         return
     try:
         flat = flatten(command)
@@ -684,12 +769,7 @@ def check_bash(role, command, hook_cwd):
     if 'build-slot.lock' in text:
         raise Deny('use the build slot (scripts/cargo-slot.ps1 on Windows, scripts/cargo-slot.sh on Linux); never create or remove its lock by hand.')
     if commands & CODEX_NAMES or (indirect and 'codex' in text.lower()):
-        raise Deny('Codex runs only as the implementer\'s read-only self-review, from its own worktree: [cd <worktree> &&] '
-                   '/root/her/scripts/codex-task.sh <name> <worktree = cwd> /root/orch/her/<n>/review/codex-self-<k>.md '
-                   'gpt-6.2-astra high read-only [minutes] (Windows: powershell -NoProfile -File C:/her/scripts/codex-task.ps1 '
-                   '-Name <name> -WorkDir <worktree> -PromptFile C:/her-orch/<n>/review/codex-self-<k>.md -Model gpt-6.2-astra '
-                   '-Effort high -Sandbox read-only); <n> is your branch\'s ticket and the prompt is no link. '
-                   'To read the script, use the Read tool.')
+        raise Deny(CODEX_DENIED)
     if 'ci-wait' in text.lower():       # in a word, a quoted argument, an assignment value, `+=` and `$` forms included
         raise Deny(CI_WAIT_DENIED)
     if ('gh' in names or GH_WORD.search(text)) and gh_polls(segs, flat, bool(words) and base(words[0]) == 'gh'):

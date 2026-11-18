@@ -1,6 +1,6 @@
 # Implementer protocol
 
-Binding for every worker run (`.claude/agents/`, `scripts/pi-task.ps1`, `scripts/codex-task.ps1`); the coordinator's prompt adds only the task and pointers. Host-specific build and test commands are in `docs/agents/rust-validation.md`.
+Binding for every worker run (`.claude/agents/`, `scripts/pi-task.ps1`, `scripts/codex-work`, `scripts/codex-task`); the coordinator's prompt adds only the task and pointers. Host-specific build and test commands are in `docs/agents/rust-validation.md`.
 
 ## Context
 
@@ -38,6 +38,10 @@ Never speculate about code you have not opened. Read the source before making an
 - **Known pitfalls.** Check each of these before reporting and say in the report that you did: processes and temp files cleaned up on every failure path (process groups killed, try opened before the first spawn); boundary cases of every threshold or limit tested on both sides; paths resolved the way the consuming tool resolves them; no stale artifacts from an earlier run; every new test seen failing for the right reason; line endings and file modes preserved.
 - **Progress.** Keep `/root/orch/her/<ticket>/PROGRESS.md` (Windows `C:/her-orch/<ticket>/PROGRESS.md`) current after every step: steps done, commits pushed with their SHAs, `quick.yml` runs with links and results, the next step and open questions. A resumed run reads it first.
 
+## Codex runs
+
+A Codex run (`scripts/codex-work`, `docs/agents/coordinator.md` "Codex runs") follows this protocol, with the limits of any worker: it commits and pushes only its own ticket branch (leaving the worktree clean and naming its commit ids in the report), never opens or merges pull requests, never posts to GitHub and never reruns CI. It dispatches no CI itself and ends with the report layout below, listing each CI target it could not run under "Not verified / not run"; the coordinator dispatches the targets its brief names and sends findings as a fix brief.
+
 ## State and evidence
 
 Long work survives context loss through the GitHub issue and the repository evidence. The issue holds the acceptance checklist and the handoff. Raw logs, numeric exit receipts and hashes go to the ticket's evidence directory (`C:/her-orch/<ticket>/evidence/` on Windows, `/root/orch/her/<ticket>/evidence/` on Linux) or, when they carry personal data, to the vault under `C:/her-vault/.scratch/<feature>/evidence/<NN>/`; no single log over 1 MiB (keep head and tail plus its hash). The ticket's validation note says what was run and what it proved. A public ticket names these files by path only. A resumed run rebuilds state from the worktree, `git status`, `git log` and the issue.
@@ -59,7 +63,7 @@ Open or blocked: <items> or none
 
 A "CI running" handback is not this report: it is the final message after dispatching CI runs and carries only the branch, the head commit, each run id with its target and OS and whether you expect red or green, and what you will do on each outcome. The completion report, with the receipts, comes after the coordinator resumes you with the results.
 
-Keep it short; no narrative. Your report is your final message: the coordinator saves it to the ticket's report file (Linux `/root/orch/her/<ticket>/report-<run>.md`, Windows `C:/her-orch/<ticket>/report-<run>.md`), and `scripts/codex-task` and `scripts/pi-task` save a run's final message beside its prompt as `<Name>.report.md`. Workers never post it and never touch GitHub beyond their ticket branch and `quick.yml` runs: the coordinator reads the report, writes a cleaned summary and posts that through `scripts/gh-public`, naming evidence by path only. A report may state a private path or a vault file; a public comment states paths and never contents.
+Keep it short; no narrative. Your report is your final message: the coordinator saves it to the ticket's report file (Linux `/root/orch/her/<ticket>/report-<run>.md`, Windows `C:/her-orch/<ticket>/report-<run>.md`), and `scripts/codex-work`, `scripts/codex-task` and `scripts/pi-task` save a run's final message beside its prompt as `<Name>.report.md`. Workers never post it and never touch GitHub beyond their ticket branch and `quick.yml` runs: the coordinator reads the report, writes a cleaned summary and posts that through `scripts/gh-public`, naming evidence by path only. A report may state a private path or a vault file; a public comment states paths and never contents.
 
 ## Ending turns
 
