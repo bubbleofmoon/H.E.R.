@@ -330,9 +330,9 @@ fn the_transcript_replaces_only_the_messages_own_voice_label() {
 #[test]
 fn the_label_names_no_denied_term_and_the_transcript_passes_the_model_view_strip() {
     assert!(
-        crate::settings::denied_in_text(&label("你好")).is_empty(),
+        crate::model_text_policy::denied_terms(&label("你好")).is_empty(),
         "the label names no harness, model maker or AI: {:?}",
-        crate::settings::denied_in_text(&label("你好"))
+        crate::model_text_policy::denied_terms(&label("你好"))
     );
     assert_eq!(LABEL, "[语音转文字]");
     let cfg = json!({"socialV2": {"context": {"stripFromModelText": ["秘密"]}}});

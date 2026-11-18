@@ -62,7 +62,7 @@ fn chat_settings_set_validates_and_audits_through_the_registry() {
     let refusal = chat_text(&context, "settings_set", json!({"settingKey": CHAT_NAME, "value": 0}));
     assert_eq!(refusal, format!("改配置失败：{requirement}"));
     for model_text in [&text, &refusal] {
-        assert!(crate::upstream_capture::denied_terms(model_text).is_empty(), "{model_text}");
+        assert!(crate::model_text_policy::denied_terms(model_text).is_empty(), "{model_text}");
     }
     // Only the configuration path names it: not the registry key, the pointer, another case, a parent or a child.
     for name in [QUIET_KEY, "/socialV2/reply/wakeQuietMs", "SOCIALV2.REPLY.WAKEQUIETMS", "socialV2.reply", "socialV2", "socialV2.reply.wakeQuietMs.x"] {
@@ -164,7 +164,7 @@ fn chat_settings_answer_store_trouble_without_its_details() {
         let before = std::fs::read(settings_db(&root)).unwrap();
         let text = chat_text(&context, "settings_set", json!({"settingKey": CHAT_NAME, "value": 4500}));
         assert_eq!(text, format!("改配置失败：{CHAT_STORE_UNAVAILABLE}"), "{trouble}");
-        assert!(crate::upstream_capture::denied_terms(&text).is_empty(), "{trouble}: {text}");
+        assert!(crate::model_text_policy::denied_terms(&text).is_empty(), "{trouble}: {text}");
         assert_eq!(std::fs::read(settings_db(&root)).unwrap(), before, "{trouble}: the store keeps every byte");
         let read = chat(&context, "settings-get", json!({"settingKey": CHAT_NAME})).unwrap();
         assert_eq!(read["value"], 3000, "{trouble}: a read shows what the next use reads");
@@ -213,7 +213,7 @@ fn chat_settings_legacy_set_replies_without_the_value() {
     let text = chat_text(&context, "settings_set", json!({"settingKey": "sendDelayMs", "value": "OpenAI"}));
     assert_eq!(text, "已改 sendDelayMs。已立即生效", "{text}");
     assert!(!text.contains("OpenAI"), "{text}");
-    assert!(crate::upstream_capture::denied_terms(&text).is_empty(), "{text}");
+    assert!(crate::model_text_policy::denied_terms(&text).is_empty(), "{text}");
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn chat_settings_set_reply_carries_a_failed_write_back_as_a_fixed_text() {
     let text = chat_text(&context, "settings_set", json!({"settingKey": CHAT_NAME, "value": 6000}));
     assert_eq!(text, format!("已改 {CHAT_NAME} = 6000。下次唤醒时生效；{SETTINGS_MIRROR_UNFINISHED}"));
     assert!(!text.contains("config.json") && !text.contains("runtime config"), "{text}");
-    assert!(crate::upstream_capture::denied_terms(&text).is_empty(), "{text}");
+    assert!(crate::model_text_policy::denied_terms(&text).is_empty(), "{text}");
     let reply = chat(&context, "settings-set", json!({"settingKey": CHAT_NAME, "value": 6000})).unwrap();
     assert_eq!(reply["changed"], false);
     assert!(reply.get("mirrorError").is_none(), "{reply}");

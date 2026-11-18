@@ -63,52 +63,6 @@ static IN_FLIGHT: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 /// I/O and no diagnostic; the next writer thread records the count in `FAILURE_FILE`.
 static THREAD_START_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// Latin terms, matched case-insensitively as whole words (an ASCII letter or digit on either side
-/// is not a match, so `dshReady` or `qq_send_message` pass while `user/dsh` and `deepseek娘` fail).
-pub(crate) const DENIED_WORDS: [&str; 13] = [
-    "deepseek", "dsh", "harness", "opencode", "codex", "claude", "anthropic", "astrbot", "cliproxy",
-    "antigravity", "openai", "chatgpt", "gpt",
-];
-
-/// Phrases matched case-insensitively anywhere.
-const DENIED_PHRASES: [&str; 9] = ["cli-proxy", "人工智能", "机器人", "语言模型", "大模型", "模型", "智能体", "助手", "深度求索"];
-
-/// The #142 denied terms `text` contains, each once. "AI" is matched in upper case with no ASCII
-/// letter on either side, so 反AI味 fails while `lastAiReplyAt`, `API` and `EMAIL` pass. The
-/// model-visible text guard (`console::tests::model_text_guard_tests`) uses the same matcher.
-pub(crate) fn denied_terms(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let lower = text.to_lowercase();
-    let word_edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
-    for word in DENIED_WORDS {
-        let mut from = 0;
-        while let Some(at) = lower[from..].find(word) {
-            let (start, end) = (from + at, from + at + word.len());
-            if word_edge(lower[..start].chars().next_back()) && word_edge(lower[end..].chars().next()) {
-                found.push(word.to_string());
-                break;
-            }
-            from = end;
-        }
-    }
-    let letter = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphabetic());
-    let mut from = 0;
-    while let Some(at) = text[from..].find("AI") {
-        let (start, end) = (from + at, from + at + 2);
-        if !letter(text[..start].chars().next_back()) && !letter(text[end..].chars().next()) {
-            found.push("AI".to_string());
-            break;
-        }
-        from = end;
-    }
-    for phrase in DENIED_PHRASES {
-        if lower.contains(phrase) {
-            found.push(phrase.to_string());
-        }
-    }
-    found
-}
-
 /// One fixed diagnostic line on stderr. A failed write is ignored: nothing here panics.
 fn note(text: &str) {
     use std::io::Write;
@@ -328,10 +282,11 @@ struct Findings {
     fields: Vec<Value>,
 }
 
-/// Counts and JSON field paths of the denied terms in every string value and object key of
-/// `request`. The report holds the terms (fixed denylist entries), counts and paths only: a path
-/// segment is an array index, a key from `STRUCTURAL_KEYS`, or `<key>` for any other key, so no
-/// text from the request reaches the report.
+/// Counts and JSON field paths of the denied terms (`model_text_policy::denied_terms`, the check
+/// every model-text check calls) in every string value and object key of `request`. The report
+/// holds the terms (fixed denylist entries), counts and paths only: a path segment is an array
+/// index, a key from `STRUCTURAL_KEYS`, or `<key>` for any other key, so no text from the request
+/// reaches the report.
 pub(crate) fn sweep(request: &Value) -> Value {
     let mut findings = Findings::default();
     walk(request, &mut String::new(), &mut findings);
@@ -391,7 +346,7 @@ fn check(text: &str, path: &str, part: &str, findings: &mut Findings) {
         return;
     }
     findings.strings += 1;
-    let terms = denied_terms(text);
+    let terms = crate::model_text_policy::denied_terms(text);
     if terms.is_empty() {
         return;
     }
@@ -932,6 +887,22 @@ mod tests {
         let paths: Vec<&str> = keys["fields"].as_array().unwrap().iter().map(|field| field["path"].as_str().unwrap()).collect();
         assert_eq!(paths, vec!["/messages/0/content", "/messages/0/<key>"]);
         assert!(!keys.to_string().contains("private-token-183"), "{keys}");
+    }
+
+    #[test]
+    fn denied_term_policy_the_sweep_counts_full_width_zero_width_and_lower_case_forms() {
+        let report = sweep(&json!({"messages": [
+            {"content": "ＤＳＨ"},
+            {"content": "d\u{200b}sh"},
+            {"content": "我是ai"},
+        ]}));
+        assert_eq!(report["counts"], json!({"dsh": 2, "AI": 1}), "{report}");
+        assert_eq!(report["deniedTotal"], 3, "{report}");
+        assert_eq!(report["fields"], json!([
+            {"path": "/messages/0/content", "part": "value", "terms": ["dsh"]},
+            {"path": "/messages/1/content", "part": "value", "terms": ["dsh"]},
+            {"path": "/messages/2/content", "part": "value", "terms": ["AI"]},
+        ]));
     }
 
     #[test]
