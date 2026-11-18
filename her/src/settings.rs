@@ -62,6 +62,12 @@ pub(crate) enum Kind {
     /// control character; it is stored and read trimmed. `default` is what a missing or refused value reads as, and
     /// `None` reads as not configured.
     ModelId { default: Option<&'static str> },
+    /// Model-visible text (#140, `prompt_text`): a JSON string of at most `max_chars` Unicode scalar values with no
+    /// control character but line feed and tab, and no #142 denied term (`denied_in_text`). An empty string is accepted
+    /// and renders nothing. A carriage return is refused, never converted, so the stored text is the text that renders.
+    /// `default` passes the same check (registry test) and is what a missing or refused value reads as. Not for model
+    /// ids (`ModelId`), which may hold a denied word.
+    Text { max_chars: usize, default: &'static str },
 }
 
 /// How the next use reads an integer the store would refuse, found in `config.json` (each reader's rule before the
@@ -81,6 +87,117 @@ fn model_id(value: &Value) -> Option<&str> {
     ((1..=MODEL_ID_MAX_CHARS).contains(&length) && !id.chars().any(char::is_control)).then_some(id)
 }
 
+/// Whether `text` has the shape a text setting accepts: at most `max_chars` Unicode scalar values and no control
+/// character but line feed and tab.
+fn text_shape_ok(text: &str, max_chars: usize) -> bool {
+    text.chars().count() <= max_chars && text.chars().all(|c| c == '\n' || c == '\t' || !c.is_control())
+}
+
+/// Whether `c` is an invisible format character (general category Cf), which the denied-term check reads through.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{13438}' | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// One character folded for matching: full-width ASCII becomes ASCII and the ideographic space a space.
+fn fold_char(c: char) -> char {
+    match c {
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        '\u{3000}' => ' ',
+        other => other,
+    }
+}
+
+/// The text folded for matching: each invisible format character becomes `invisible`, full-width ASCII is folded and
+/// letters are upper case.
+fn fold_for_match(text: &str, invisible: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if is_invisible_format(c) {
+                invisible.chars().collect::<Vec<char>>()
+            } else {
+                vec![fold_char(c)]
+            }
+        })
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// The denied words of `text` (`upstream_capture::DENIED_WORDS`, and `AI`) when each invisible format character is both
+/// a word boundary and a joiner. The text is the folded upper-case characters, each marked when a removed format run
+/// precedes it. A word matches with its inner characters contiguous, and each side of it may be a removed run or a
+/// character that is not a word character (`word_char` names the word characters).
+fn denied_words_across_format(text: &str) -> Vec<String> {
+    let mut upper: Vec<(char, bool)> = Vec::new();
+    let mut lower: Vec<(char, bool)> = Vec::new();
+    let mut run = false;
+    for c in text.chars() {
+        if is_invisible_format(c) {
+            run = true;
+            continue;
+        }
+        let mut boundary = std::mem::take(&mut run);
+        for u in fold_char(c).to_uppercase() {
+            upper.push((u, boundary));
+            for (i, l) in u.to_lowercase().enumerate() {
+                lower.push((l, boundary && i == 0));
+            }
+            boundary = false;
+        }
+    }
+    let mut found = Vec::new();
+    for word in crate::upstream_capture::DENIED_WORDS {
+        if spans_with_edges(&lower, word, |c| c.is_ascii_alphanumeric()) {
+            found.push(word.to_string());
+        }
+    }
+    if spans_with_edges(&upper, "AI", |c| c.is_ascii_alphabetic()) {
+        found.push("AI".to_string());
+    }
+    found
+}
+
+/// Whether `term` occurs in `units` (character, removed-run-before flag) with both edges boundaries: the character
+/// before it is a removed run or not a word character, and so is the character after it.
+fn spans_with_edges(units: &[(char, bool)], term: &str, word_char: fn(char) -> bool) -> bool {
+    let term: Vec<char> = term.chars().collect();
+    if term.is_empty() || units.len() < term.len() {
+        return false;
+    }
+    (0..=units.len() - term.len()).any(|start| {
+        let end = start + term.len();
+        units[start..end].iter().map(|unit| unit.0).eq(term.iter().copied())
+            && (start == 0 || units[start].1 || !word_char(units[start - 1].0))
+            && (end == units.len() || units[end].1 || !word_char(units[end].0))
+    })
+}
+
+/// The #142 denied terms (`upstream_capture::denied_terms`) in model-visible text, each once. The check reads the text
+/// three ways: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
+/// found; with them read as word boundaries, as the text is shown, so a refusal the text earns with them kept still
+/// holds; and with each of them both a boundary and a joiner (`denied_words_across_format`), so a word split by a mix
+/// of the two is found too. Full-width ASCII is folded and letters are upper case, so `ＤＳＨ` and `ai` are found too.
+pub(crate) fn denied_in_text(text: &str) -> Vec<String> {
+    let mut denied = crate::upstream_capture::denied_terms(&fold_for_match(text, ""));
+    for term in crate::upstream_capture::denied_terms(&fold_for_match(text, " ")) {
+        if !denied.contains(&term) {
+            denied.push(term);
+        }
+    }
+    for term in denied_words_across_format(text) {
+        if !denied.contains(&term) {
+            denied.push(term);
+        }
+    }
+    denied
+}
+
 /// One registry entry.
 pub(crate) struct Setting {
     /// The registry key, as the console names it.
@@ -94,7 +211,7 @@ pub(crate) struct Setting {
     pub label: &'static str,
     pub hint: &'static str,
     /// Whether the owner's private chat may read and change it through `settings_get` / `settings_set`, under
-    /// `chat_name`. Never set for a secret (registry test).
+    /// `chat_name`. Never set for a secret or a text setting (registry tests).
     pub chat: bool,
 }
 
@@ -104,11 +221,16 @@ impl Setting {
         match self.kind {
             Kind::Integer { min, max, .. } => value.as_i64().filter(|n| (min..=max).contains(n)).map(|n| json!(n)),
             Kind::ModelId { .. } => model_id(value).map(|id| json!(id)),
+            Kind::Text { max_chars, .. } => value
+                .as_str()
+                .filter(|text| text_shape_ok(text, max_chars) && denied_in_text(text).is_empty())
+                .map(|text| json!(text)),
         }
     }
 
     /// A value the store keeps for this setting: a valid value, or `Null` when that is the default (a model id
-    /// without one), which a reset stores so the read is "not configured" whatever `config.json` says.
+    /// without one), which a reset stores so the read is "not configured" whatever `config.json` says. A text default
+    /// is a valid value, the empty text included.
     fn storable(&self, value: &Value) -> Option<Value> {
         self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
     }
@@ -118,6 +240,7 @@ impl Setting {
         match self.kind {
             Kind::Integer { default, .. } => json!(default),
             Kind::ModelId { default } => default.map_or(Value::Null, |id| json!(id)),
+            Kind::Text { default, .. } => json!(default),
         }
     }
 
@@ -129,7 +252,10 @@ impl Setting {
             Kind::Integer { min, max, file: FileRule::Clamp, .. } => found
                 .and_then(Value::as_u64)
                 .map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
-            _ => found.and_then(|value| self.normalize(value)),
+            // A value the store would refuse reads as the default; for a text, one with a denied term included.
+            Kind::Integer { file: FileRule::Default, .. } | Kind::ModelId { .. } | Kind::Text { .. } => {
+                found.and_then(|value| self.normalize(value))
+            }
         };
         read.unwrap_or_else(|| self.default_value())
     }
@@ -139,19 +265,35 @@ impl Setting {
         self.read(document).as_i64().unwrap_or_default()
     }
 
-    /// `read` of a model id: `None` when it is not configured.
+    /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
+    /// one.
     pub(crate) fn text(&self, document: &Value) -> Option<String> {
         self.read(document).as_str().map(str::to_string)
     }
 
-    /// Why a refused value was refused.
-    fn requirement(&self) -> String {
+    /// Why `value`, which this setting refused, was refused. A text of the right shape names its denied terms.
+    fn refusal(&self, value: &Value) -> String {
         match self.kind {
             Kind::Integer { min, max, .. } => format!("{} must be an integer from {min} to {max}", self.key),
             Kind::ModelId { .. } => format!(
                 "{} must be a model id of 1 to {MODEL_ID_MAX_CHARS} characters without control characters",
                 self.key
             ),
+            Kind::Text { max_chars, .. } => {
+                let denied = value
+                    .as_str()
+                    .filter(|text| text_shape_ok(text, max_chars))
+                    .map(denied_in_text)
+                    .unwrap_or_default();
+                if denied.is_empty() {
+                    format!(
+                        "{} must be text of at most {max_chars} characters, with no control character but line feed and tab",
+                        self.key
+                    )
+                } else {
+                    format!("{} names a denied term: {}", self.key, denied.join(", "))
+                }
+            }
         }
     }
 
@@ -159,6 +301,7 @@ impl Setting {
         match self.kind {
             Kind::Integer { min, max, .. } => json!({"type": "integer", "min": min, "max": max}),
             Kind::ModelId { .. } => json!({"type": "model id", "maxChars": MODEL_ID_MAX_CHARS}),
+            Kind::Text { max_chars, .. } => json!({"type": "text", "maxChars": max_chars}),
         }
     }
 
@@ -174,11 +317,16 @@ impl Setting {
         self.pointer.trim_start_matches('/').replace('/', ".")
     }
 
-    /// Why a chat value was refused, under the chat's name.
+    /// Why a chat value was refused, under the chat's name. No text setting is chat-writable (registry test); its arm
+    /// keeps the match whole.
     pub(crate) fn chat_requirement(&self) -> String {
         match self.kind {
             Kind::Integer { min, max, .. } => format!("{} 必须是 {min} 到 {max} 的整数", self.chat_name()),
             Kind::ModelId { .. } => format!("{} 必须是 1 到 200 个字符、不含控制字符的模型名", self.chat_name()),
+            Kind::Text { max_chars, .. } => format!(
+                "{} 必须是不超过 {max_chars} 个字符的文字，除换行和制表符外不含控制字符，也不含禁用词",
+                self.chat_name()
+            ),
         }
     }
 }
@@ -267,7 +415,9 @@ pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
     chat: false,
 };
 
-/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`.
+/// Every setting the store accepts. A key that is not here is refused by `apply` and ignored by `overlay`. The prompt
+/// text settings (#140) are read by `prompt_text::text` and are never chat-writable, so the model cannot rewrite its
+/// own prompt.
 pub(crate) const REGISTRY: &[Setting] = &[
     WAKE_QUIET,
     HARNESS_MODEL,
@@ -276,6 +426,96 @@ pub(crate) const REGISTRY: &[Setting] = &[
     DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS,
     WEB_SEARCH_MODEL,
+    Setting {
+        key: crate::prompt_text::NOT_A_CLERK_KEY,
+        pointer: "/prompts/behaviour/notAClerk",
+        kind: Kind::Text { max_chars: crate::prompt_text::RULE_MAX_CHARS, default: crate::prompt_text::NOT_A_CLERK },
+        applies: "next wake",
+        group: "prompt text",
+        label: "Rule: not a clerk",
+        hint: "First rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::PROACTIVE_KEY,
+        pointer: "/prompts/behaviour/proactive",
+        kind: Kind::Text { max_chars: crate::prompt_text::RULE_MAX_CHARS, default: crate::prompt_text::PROACTIVE },
+        applies: "next wake",
+        group: "prompt text",
+        label: "Rule: initiative",
+        hint: "Second rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::GROUP_CONDUCT_KEY,
+        pointer: "/prompts/behaviour/groupConduct",
+        kind: Kind::Text { max_chars: crate::prompt_text::RULE_MAX_CHARS, default: crate::prompt_text::GROUP_CONDUCT },
+        applies: "next wake",
+        group: "prompt text",
+        label: "Rule: group conduct",
+        hint: "Third rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::REPEAT_KEY,
+        pointer: "/prompts/behaviour/repeat",
+        kind: Kind::Text { max_chars: crate::prompt_text::RULE_MAX_CHARS, default: crate::prompt_text::REPEAT },
+        applies: "next wake",
+        group: "prompt text",
+        label: "Rule: no repeated bits",
+        hint: "Last rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::STICKER_STRATEGY_KEY,
+        pointer: "/prompts/stickers/strategy",
+        kind: Kind::Text { max_chars: crate::prompt_text::RULE_MAX_CHARS, default: crate::prompt_text::STICKER_STRATEGY },
+        applies: "next wake",
+        group: "prompt text",
+        label: "Sticker strategy",
+        hint: "Opens the briefing's sticker section while stickers are on. Saved text is checked for denied names.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::STICKER_SOFTEN_KEY,
+        pointer: "/prompts/stickers/soften",
+        kind: Kind::Text { max_chars: crate::prompt_text::RULE_MAX_CHARS, default: crate::prompt_text::STICKER_SOFTEN },
+        applies: "next wake",
+        group: "prompt text",
+        label: "Softening a reply with a sticker",
+        hint: "Follows the sticker strategy when a sticker list is shown. Saved text is checked for denied names.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::MODE_CHAT_KEY,
+        pointer: "/prompts/mode/chat",
+        kind: Kind::Text { max_chars: crate::prompt_text::MODE_MAX_CHARS, default: crate::prompt_text::NO_MODE_PROMPT },
+        applies: "live",
+        group: "prompt text",
+        label: "Mode prompt: chat",
+        hint: "Opens the system message of each chat-mode turn on HER's own engine, in groups and other people's private chats. Checked for denied names; empty sends none.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::MODE_OWNER_PRIVATE_KEY,
+        pointer: "/prompts/mode/ownerPrivate",
+        kind: Kind::Text { max_chars: crate::prompt_text::MODE_MAX_CHARS, default: crate::prompt_text::NO_MODE_PROMPT },
+        applies: "live",
+        group: "prompt text",
+        label: "Mode prompt: owner's private chat",
+        hint: "Opens the system message of each chat-mode turn on HER's own engine in the owner's private chat. Checked for denied names; empty sends none.",
+        chat: false,
+    },
+    Setting {
+        key: crate::prompt_text::MODE_CLOSED_AGENT_KEY,
+        pointer: "/prompts/mode/closedAgent",
+        kind: Kind::Text { max_chars: crate::prompt_text::MODE_MAX_CHARS, default: crate::prompt_text::NO_MODE_PROMPT },
+        applies: "live",
+        group: "prompt text",
+        label: "Mode prompt: admin agent",
+        hint: "Opens the system message of each admin-agent turn on HER's own engine. Checked for denied names; empty sends none.",
+        chat: false,
+    },
 ];
 
 pub(crate) fn find(key: &str) -> Option<&'static Setting> {
@@ -660,8 +900,9 @@ fn header_version(path: &std::path::Path) -> Result<i64, String> {
 }
 
 /// The stored values of registry settings, read through the inspection's read-only connection. No store or no schema
-/// yet is an empty list; a store with a journal is unreadable. Rows with a key the
-/// registry does not have, or a value its setting does not accept, are skipped.
+/// yet is an empty list; a store with a journal is unreadable. Rows with a key the registry does not have are skipped,
+/// and so are rows with a value their setting does not keep (`storable`), except for a text setting: its last good
+/// version (`last_good`) stands in, and the refusal is reported once per key and process on stderr.
 fn stored_values(context: &RuntimeContext) -> Result<Vec<(&'static Setting, Value)>, String> {
     let conn = match inspect(context)? {
         Inspection::Missing | Inspection::Fresh => return Ok(Vec::new()),
@@ -679,14 +920,61 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
         .map_err(|_| STORAGE_ERROR.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| STORAGE_ERROR.to_string())?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(key, text)| {
-            let setting = find(&key)?;
-            let value = serde_json::from_str::<Value>(&text).ok()?;
-            Some((setting, setting.storable(&value)?))
-        })
-        .collect())
+    let mut values = Vec::new();
+    for (key, text) in rows {
+        let Some(setting) = find(&key) else { continue };
+        match serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.storable(&value)) {
+            Some(value) => values.push((setting, value)),
+            None if matches!(setting.kind, Kind::Text { .. }) => {
+                report_refused_text(setting.key);
+                if let Some(value) = last_good(&conn, setting, |_| true) {
+                    values.push((setting, value));
+                }
+            }
+            None => {}
+        }
+    }
+    Ok(values)
+}
+
+/// The last good version of a text setting whose stored value is refused (a row changed outside `apply`, or a denied
+/// term a later release added): the newest audited value the setting accepts, such as the default a reset stored. An
+/// audit row without a new value (an undo that removed the stored value) ends the search, and so does the oldest row;
+/// `None` then, and the file's value or the default applies.
+fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> bool) -> Option<Value> {
+    let mut statement =
+        conn.prepare("SELECT new_value FROM settings_audit WHERE key=?1 ORDER BY id DESC").ok()?;
+    let mut rows = statement.query([setting.key]).ok()?;
+    while let Ok(Some(row)) = rows.next() {
+        let text: Option<String> = row.get(0).ok()?;
+        let value = serde_json::from_str::<Value>(&text?)
+            .ok()
+            .and_then(|value| setting.normalize(&value))
+            .filter(|value| accepted(value));
+        if value.is_some() {
+            return value;
+        }
+    }
+    None
+}
+
+/// The newest audited text of text setting `key` that the registry accepts and that `accepted` takes, read through the
+/// store's read-only connection; `None` when there is no store, no such row, or the search ends (`last_good`). Used when
+/// a text that passed the load check fails a later check, such as the model-view strip.
+pub(crate) fn last_good_text(context: &RuntimeContext, key: &str, accepted: impl Fn(&str) -> bool) -> Option<String> {
+    let setting = find(key)?;
+    let Ok(Inspection::Ready(conn)) = inspect(context) else { return None };
+    last_good(&conn, setting, |value| value.as_str().is_some_and(&accepted))?.as_str().map(str::to_string)
+}
+
+/// One stderr line per text setting and process when its stored value is refused at load.
+fn report_refused_text(key: &'static str) {
+    static REPORTED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut reported = REPORTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !reported.contains(&key) {
+        reported.push(key);
+        crate::safe_eprintln!("[settings] {key}: the stored text is refused; its last good version or the default applies");
+    }
 }
 
 /// How long a writer waits for the store gate and for other connections to let go while it switches a new store to
@@ -1134,7 +1422,7 @@ pub(crate) fn apply(
         return Err((503, LEGACY_ERROR.to_string()));
     }
     let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
-    let value = setting.normalize(value).ok_or_else(|| (400, setting.requirement()))?;
+    let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
     store(context, setting, value, actor, source)
 }
 
@@ -1164,7 +1452,8 @@ fn store(
 
 /// Returns a global setting to its registry default: the default is stored, so it wins over `config.json`, with one
 /// audit row (source `reset`), and is written back into `config.json` like any change. A model id without a default
-/// stores `null`, read as not configured, and `config.json` gets `null`. A stored default already changes nothing.
+/// stores `null`, read as not configured, and `config.json` gets `null`; a text setting stores its compiled text, an
+/// empty one included. A stored default already changes nothing.
 pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<Applied, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));

@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 pub struct Tools {
     definitions: Vec<Value>,
     authority: Option<Authority>,
+    /// The profile's mode prompt (#140) as the configuration read at capture holds it, model-view
+    /// stripped; empty when none is set.
+    mode_prompt: String,
 }
 
 #[derive(Clone)]
@@ -64,9 +67,16 @@ impl Tools {
             profile,
         };
         authority.check().map_err(String::from)?;
+        // #140: read from the settings store with this turn's configuration, so an edit is in
+        // effect from the next turn; the model-view strip applies, and the stripped text is checked again.
+        let mode_prompt = profile
+            .prompt_key()
+            .map(|key| crate::prompt_text::model_text(context, cfg, key).trim().to_string())
+            .unwrap_or_default();
         Ok(Self {
             definitions: definitions(cfg, profile),
             authority: Some(authority),
+            mode_prompt,
         })
     }
 
@@ -75,6 +85,7 @@ impl Tools {
         Self {
             definitions: Vec::new(),
             authority: None,
+            mode_prompt: String::new(),
         }
     }
 
@@ -111,8 +122,18 @@ impl Tools {
             .is_none_or(|a| a.conversation == conversation && a.generation == generation)
     }
 
+    /// The turn's system message: the profile's mode prompt, a blank line and the tool session
+    /// line; the session line alone while no mode prompt is set.
     pub(super) fn instruction(&self) -> String {
-        self.authority.as_ref().map(|a| session_instruction(&a.conversation)).unwrap_or_default()
+        let Some(authority) = &self.authority else {
+            return String::new();
+        };
+        let session = session_instruction(&authority.conversation);
+        if self.mode_prompt.is_empty() {
+            session
+        } else {
+            format!("{}\n\n{session}", self.mode_prompt)
+        }
     }
 
     /// The tools offered to the next model request: the captured menu, narrowed by the current
@@ -912,6 +933,89 @@ mod tests {
                 listed(json!("false")),
                 "only an explicit false switches {flag} off, as the console reads it"
             );
+        }
+    }
+
+    #[test]
+    fn mode_prompt_strip_that_makes_a_denied_term_falls_back_to_the_last_good_text() {
+        let fixture = Fixture::new("mode-prompt-strip", "closed-agent");
+        let save = |text: &str| {
+            crate::settings::apply(&fixture.context, "prompt.mode.closedAgent", &json!(text), "administrator", "console")
+        };
+        save("封闭模式说明 140").unwrap();
+        // Accepted on save, when the strip has no term to remove; the strip below makes `DSH` of it.
+        save("D鲸SH").unwrap();
+        fixture.edit_config(|cfg| cfg["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
+        let instruction = fixture.capture("closed-agent", OWNER_KEY).unwrap().instruction();
+        assert_eq!(instruction, format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY)));
+        assert!(!instruction.contains("DSH"), "a denied term reached the model: {instruction}");
+    }
+
+    #[test]
+    fn mode_prompt_comes_from_the_store_per_profile_and_opens_the_system_message() {
+        let fixture = Fixture::new("mode-prompt", "chat");
+        let instruction = |mode: &str, conversation: &str| {
+            fixture.capture(mode, conversation).unwrap().instruction()
+        };
+        let save = |key: &str, text: &str| {
+            crate::settings::apply(&fixture.context, key, &json!(text), "administrator", "console")
+        };
+        assert_eq!(
+            instruction("chat", GROUP_KEY),
+            session_instruction(GROUP_KEY),
+            "no saved mode prompt: the session line alone, as before"
+        );
+        save("prompt.mode.chat", "群聊模式说明 140").unwrap();
+        save("prompt.mode.ownerPrivate", "这是你和管理员的私聊。140").unwrap();
+        save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
+        assert_eq!(
+            instruction("chat", GROUP_KEY),
+            format!("群聊模式说明 140\n\n{}", session_instruction(GROUP_KEY))
+        );
+        assert_eq!(
+            instruction("chat", OWNER_KEY),
+            format!("这是你和管理员的私聊。140\n\n{}", session_instruction(OWNER_KEY))
+        );
+        fixture.set_mode("closed-agent");
+        assert_eq!(
+            instruction("closed-agent", OWNER_KEY),
+            format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+        );
+        // Guarded at save: a denied term is refused and the saved prompt stays in effect.
+        assert_eq!(
+            save("prompt.mode.closedAgent", "你是一个助手").err(),
+            Some((400, "prompt.mode.closedAgent names a denied term: 助手".to_string()))
+        );
+        assert_eq!(
+            save("prompt.mode.closedAgent", &"鲸".repeat(8001)).err(),
+            Some((
+                400,
+                "prompt.mode.closedAgent must be text of at most 8000 characters, with no control character but line feed and tab"
+                    .to_string()
+            ))
+        );
+        assert!(instruction("closed-agent", OWNER_KEY).starts_with("封闭模式说明 140\n\n"));
+        // The longest accepted prompt is sent whole.
+        save("prompt.mode.closedAgent", &"鲸".repeat(8000)).unwrap();
+        assert_eq!(
+            instruction("closed-agent", OWNER_KEY),
+            format!("{}\n\n{}", "鲸".repeat(8000), session_instruction(OWNER_KEY))
+        );
+        // The model-view strip applies to the mode prompt.
+        save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
+        fixture.edit_config(|cfg| {
+            cfg["socialV2"] = json!({"context": {"stripFromModelText": ["封闭"]}})
+        });
+        assert_eq!(
+            instruction("closed-agent", OWNER_KEY),
+            format!("模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+        );
+        // An emptied prompt sends the session line alone again.
+        save("prompt.mode.closedAgent", "").unwrap();
+        assert_eq!(instruction("closed-agent", OWNER_KEY), session_instruction(OWNER_KEY));
+        // The profiles no harness turn admits name no mode prompt.
+        for profile in [Profile::Reserved2, Profile::Reserved2Owner, Profile::Digest, Profile::SlangLearner] {
+            assert_eq!(profile.prompt_key(), None, "{profile:?}");
         }
     }
 }

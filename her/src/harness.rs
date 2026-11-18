@@ -1442,6 +1442,39 @@ mod tests {
     }
 
     #[test]
+    fn prompt_text_delivery_filter_never_adds_a_denied_term() {
+        // A saved rule `D鲸鲸鱼鱼SH` reads `D鲸鱼SH` after the render's own strip; the harness strips the delivery copy again.
+        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-140-delivery-{}",
+            crate::turn_ledger::mint_id("")
+        )));
+        for dir in ["config", "data", "resources"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let cfg = json!({"consoleToken":"fixture-console-token-140","socialV2":{"context":{"stripFromModelText":["鲸鱼","\n\n"]}}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("dependencies.json"),
+            r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#,
+        )
+        .unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let sent = vec![
+            ChatMessage::user("【别像客服】D鲸鱼SH 鲸鱼好"),
+            ChatMessage::user("【别像客服】D\n\nSH"),
+            ChatMessage::assistant("a鲸鱼b"),
+        ];
+        let delivered = filter_model_messages(&context, sent).unwrap();
+        let texts: Vec<String> = delivered.iter().map(|m| m.content.joined_texts().unwrap_or_default()).collect();
+        std::fs::remove_dir_all(root).unwrap();
+        for text in &texts {
+            assert!(!crate::settings::denied_in_text(text).contains(&"dsh".to_string()), "{text}");
+        }
+        assert_eq!(texts, ["【别像客服】D鲸鱼SH 鲸鱼好", "【别像客服】D\n\nSH", "ab"]);
+    }
+
+    #[test]
     fn two_conversations_can_admit_together_on_a_fresh_database() {
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
             "her-67-concurrent-{}",
