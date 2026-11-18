@@ -23,6 +23,8 @@ const GATE_WAIT: Duration = Duration::from_secs(2);
 /// The largest state file read; a larger one is unreadable and starts over. A chain has at most `routes::MAX_ROUTES`
 /// routes, so a state HER wrote stays far below it.
 const MAX_STATE_BYTES: u64 = 64 * 1024;
+/// How long an offer of the alert holds its episode: the notice queue's window for one key (`admin_alert::KEY_WINDOW_MS`).
+const CLAIM_TTL_MS: i64 = crate::admin_alert::KEY_WINDOW_MS;
 /// The notice key of the all-routes-failed alert (`admin_alert::notify_notice`: one per runtime per minute).
 pub(crate) const ALERT_KEY: &str = "model-routes-all-failed";
 /// The failure classes a state may carry (`model_failure::Failure::class`, without `refusal`: see `apply`); anything
@@ -47,6 +49,9 @@ struct State {
     routes: BTreeMap<String, Entry>,
     #[serde(rename = "allFailed", default, skip_serializing_if = "Option::is_none")]
     all_failed: Option<Episode>,
+    /// The number of the latest episode of this runtime; it only grows (`apply`), so no two episodes share a number.
+    #[serde(default)]
+    episodes: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -61,12 +66,29 @@ struct Entry {
 }
 
 /// Every route of the chain has failed since `since`, the last time with `class`; `alerted` once the owner's alert was
-/// accepted.
+/// accepted. `n` identifies the episode (`State::episodes`); a clock never does: two episodes can begin in one
+/// millisecond and a clock can step back.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Episode {
+    #[serde(default)]
+    n: u64,
     since: i64,
     class: String,
     alerted: bool,
+    /// The offer that is sending this episode's alert right now (`claim_owed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim: Option<Claim>,
+}
+
+/// A turn's offer of the owner's alert, made at `at` ms. A claim older than `CLAIM_TTL_MS` (one notice window), or from
+/// the future of a clock that stepped back, is expired: an offer that a crash cut off never blocks the alert for longer.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct Claim {
+    at: i64,
+}
+
+fn claim_expired(claim: &Claim, now: i64) -> bool {
+    now < claim.at || now - claim.at >= CLAIM_TTL_MS
 }
 
 fn chain_hash(chain: &[RouteSpec]) -> String {
@@ -92,6 +114,7 @@ fn apply(state: &mut State, chain: &[RouteSpec], at: usize, seen: Seen, now: i64
         *state = State {
             v: 1,
             chain: hash,
+            episodes: state.episodes,
             ..State::default()
         };
     }
@@ -126,10 +149,14 @@ fn apply(state: &mut State, chain: &[RouteSpec], at: usize, seen: Seen, now: i64
         match state.all_failed.as_mut() {
             Some(episode) => episode.class = class,
             None => {
+                // Strictly above every earlier number, and (after a lost state) above any number an old offer may hold.
+                state.episodes = state.episodes.saturating_add(1).max(now.max(0) as u64);
                 state.all_failed = Some(Episode {
+                    n: state.episodes,
                     since: now,
                     class,
                     alerted: false,
+                    claim: None,
                 })
             }
         }
@@ -214,8 +241,10 @@ pub(crate) fn alert_text(key: &str, routes: usize, class: &str) -> String {
 
 /// After a harness turn of conversation `key` with a route failure: sends the all-routes-failed alert when an episode of
 /// the configured chain is owed, and marks it alerted once the notice queue accepted it (`admin_alert::notify_notice`).
-/// A refused notice (no `ownerQQ`, the per-minute key window, the hourly cap or a full queue) stays owed for the next
-/// failed turn; an episode is alerted once, until an answer ends it. Returns whether the alert was accepted now.
+/// An offer claims the owed episode under the gate (`claim_owed`) before it calls the notice queue, so concurrent turns
+/// offer one alert. A refused notice (no `ownerQQ`, the per-minute key window, the hourly cap or a full queue) releases
+/// the claim and stays owed for the next failed turn; an episode is alerted once, until an answer ends it. Returns
+/// whether the alert was accepted now.
 pub(crate) fn alert_if_owed(context: &RuntimeContext, cfg: &Value, key: &str) -> bool {
     offer(context, cfg, key, |text| crate::admin_alert::notify_notice(context, cfg, text, ALERT_KEY))
 }
@@ -230,9 +259,11 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
         return false;
     };
     let hash = chain_hash(&chain);
-    // Under the gate only what is owed is read; the notice queue is offered the alert with the gate released.
-    let (since, class) = match with_state(context, |state| owed_episode(state, &hash)) {
-        Ok(Some(owed)) => owed,
+    // Under the gate the owed episode is claimed and nothing else happens; the notice queue is offered the alert with the
+    // gate released. An episode that another offer holds is left to it.
+    let now = crate::parity_clock::now_ms();
+    let (episode, class) = match with_state(context, |state| claim_owed(state, &hash, now)) {
+        Ok(Some(claimed)) => claimed,
         Ok(None) => return false,
         Err(error) => {
             unrecorded(context, "the all-routes-failed alert state", &error);
@@ -240,12 +271,10 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
         }
     };
     let sent = notify(&alert_text(key, chain.len(), &class));
-    if sent {
-        // Marked only while the very episode that was offered is still owed: an answer meanwhile ended it, a later
-        // failure started a new one that is owed itself.
-        if let Err(error) = with_state(context, |state| mark_alerted(state, &hash, since)) {
-            unrecorded(context, "the all-routes-failed alert state", &error);
-        }
+    // Settled only for the very episode that was claimed: an answer meanwhile ended it, a later failure started a new one
+    // that is owed itself. An accepted alert marks it alerted; a refused one releases the claim and stays owed.
+    if let Err(error) = with_state(context, |state| settle(state, &hash, episode, sent)) {
+        unrecorded(context, "the all-routes-failed alert state", &error);
     }
     let (outcome, reason) = if sent {
         (Outcome::Ok, "every route failed; the owner's alert was accepted")
@@ -256,21 +285,28 @@ fn offer(context: &RuntimeContext, cfg: &Value, key: &str, notify: impl FnOnce(&
     sent
 }
 
-/// The episode of chain `hash` that is owed an alert: its `since` and last class.
-fn owed_episode(state: &State, hash: &str) -> Option<(i64, String)> {
+/// Claims the episode of chain `hash` that is owed an alert and that no offer holds, at `now`: its number and last class.
+fn claim_owed(state: &mut State, hash: &str, now: i64) -> Option<(u64, String)> {
     if state.v != 1 || state.chain != hash {
         return None;
     }
-    state.all_failed.as_ref().filter(|episode| !episode.alerted).map(|episode| (episode.since, episode.class.clone()))
+    let episode = state.all_failed.as_mut().filter(|episode| !episode.alerted)?;
+    let held = episode.claim.as_ref().is_some_and(|claim| !claim_expired(claim, now));
+    if held {
+        return None;
+    }
+    episode.claim = Some(Claim { at: now });
+    Some((episode.n, episode.class.clone()))
 }
 
-/// Marks the episode of chain `hash` that began at `since` alerted, when it is still owed.
-fn mark_alerted(state: &mut State, hash: &str, since: i64) {
+/// Ends the claim on episode `n` of chain `hash`, when it is still the current episode; `sent` marks it alerted.
+fn settle(state: &mut State, hash: &str, n: u64, sent: bool) {
     if state.v != 1 || state.chain != hash {
         return;
     }
-    if let Some(episode) = state.all_failed.as_mut().filter(|episode| episode.since == since && !episode.alerted) {
-        episode.alerted = true;
+    if let Some(episode) = state.all_failed.as_mut().filter(|episode| episode.n == n) {
+        episode.alerted = episode.alerted || sent;
+        episode.claim = None;
     }
 }
 
@@ -415,12 +451,12 @@ mod tests {
         apply(&mut state, &chain, 0, failed("quota"), 100);
         assert_eq!(state.all_failed, None, "one of two routes failed");
         apply(&mut state, &chain, 1, failed("timeout"), 200);
-        assert_eq!(state.all_failed, Some(Episode { since: 200, class: "timeout".into(), alerted: false }));
+        assert_eq!(state.all_failed, Some(Episode { n: 200, since: 200, class: "timeout".into(), alerted: false, claim: None }));
         state.all_failed.as_mut().unwrap().alerted = true;
         apply(&mut state, &chain, 0, failed("backend"), 300);
         assert_eq!(
             state.all_failed,
-            Some(Episode { since: 200, class: "backend".into(), alerted: true }),
+            Some(Episode { n: 200, since: 200, class: "backend".into(), alerted: true, claim: None }),
             "a later failure keeps the episode and its alert"
         );
         apply(&mut state, &chain, 1, Seen::Answered, 400);
@@ -428,7 +464,7 @@ mod tests {
         apply(&mut state, &chain, 1, failed("quota"), 500);
         assert_eq!(
             state.all_failed,
-            Some(Episode { since: 500, class: "quota".into(), alerted: false }),
+            Some(Episode { n: 500, since: 500, class: "quota".into(), alerted: false, claim: None }),
             "a new episode is owed again"
         );
         let single = chain_of(&["only-route"]);
@@ -582,6 +618,95 @@ mod tests {
             Some(("network".to_string(), false)),
             "a new episode that began meanwhile is not marked by the alert of the old one"
         );
+    }
+
+    #[test]
+    fn route_health_a_concurrent_offer_finds_the_episode_claimed_and_sends_nothing() {
+        let ids = ["primary-route", "backup-route"];
+        let chain = chain_of(&ids);
+        let fixture = Fixture::new("claimed", routes_cfg(&ids, false));
+        observe(&fixture.context, &chain, 0, failed("quota"));
+        observe(&fixture.context, &chain, 1, failed("quota"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (context, cfg) = (fixture.context.clone(), fixture.cfg.clone());
+        let first = std::thread::spawn(move || {
+            offer(&context, &cfg, "group:101", |_| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(10));
+                true
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).expect("the first offer reached the notice queue");
+        let second = offer(&fixture.context, &fixture.cfg, "group:102", |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        });
+        let during = fixture.stored().all_failed.map(|episode| (episode.alerted, episode.claim.is_some()));
+        release_tx.send(()).unwrap();
+        assert!(first.join().unwrap(), "the first offer was accepted");
+        assert!(!second, "the second offer found the episode claimed");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "one episode, one notice");
+        assert_eq!(during, Some((false, true)), "while the first offer is out, the episode is claimed and still owed");
+        assert_eq!(fixture.stored().all_failed.map(|episode| (episode.alerted, episode.claim)), Some((true, None)));
+        assert_eq!(fixture.records("routes-all-failed").len(), 1, "only the offer that sent the notice is recorded");
+    }
+
+    #[test]
+    fn route_health_a_refused_notice_leaves_the_episode_owed_and_claimable() {
+        let ids = ["primary-route", "backup-route"];
+        let chain = chain_of(&ids);
+        let fixture = Fixture::new("refused", routes_cfg(&ids, false));
+        observe(&fixture.context, &chain, 0, failed("quota"));
+        observe(&fixture.context, &chain, 1, failed("quota"));
+        assert!(!offer(&fixture.context, &fixture.cfg, "group:101", |_| false));
+        assert_eq!(
+            fixture.stored().all_failed.map(|episode| (episode.alerted, episode.claim)),
+            Some((false, None)),
+            "a refused notice releases the claim"
+        );
+        assert_eq!(fixture.records("routes-all-failed").len(), 1);
+        assert!(offer(&fixture.context, &fixture.cfg, "group:101", |_| true), "the owed episode is claimable at once");
+    }
+
+    #[test]
+    fn route_health_a_claim_a_crash_left_expires_after_a_notice_window() {
+        let chain = chain_of(&["primary-route", "backup-route"]);
+        let hash = chain_hash(&chain);
+        let mut state = State::default();
+        apply(&mut state, &chain, 0, failed("quota"), 100);
+        apply(&mut state, &chain, 1, failed("quota"), 100);
+        let claimed = claim_owed(&mut state, &hash, 1_000);
+        assert_eq!(claimed.map(|(_, class)| class), Some("quota".to_string()));
+        assert_eq!(claim_owed(&mut state, &hash, 1_000), None, "a claim just made holds");
+        assert_eq!(claim_owed(&mut state, &hash, 1_000 + CLAIM_TTL_MS - 1), None, "one ms before the window ends it holds");
+        assert!(claim_owed(&mut state, &hash, 1_000 + CLAIM_TTL_MS).is_some(), "a claim of a full window ago is expired");
+        assert!(claim_owed(&mut state, &hash, 500).is_some(), "a claim from the future of a clock that stepped back is expired");
+    }
+
+    #[test]
+    fn route_health_an_episode_number_reused_within_a_millisecond_cannot_be_mismarked() {
+        let chain = chain_of(&["primary-route", "backup-route"]);
+        let hash = chain_hash(&chain);
+        let mut state = State::default();
+        apply(&mut state, &chain, 0, failed("quota"), 300);
+        apply(&mut state, &chain, 1, failed("quota"), 300);
+        let (first, _) = claim_owed(&mut state, &hash, 300).unwrap();
+        apply(&mut state, &chain, 1, Seen::Answered, 300);
+        apply(&mut state, &chain, 1, failed("quota"), 300);
+        let second = state.all_failed.clone().unwrap();
+        assert_eq!((second.since, second.alerted, second.claim), (300, false, None), "a new episode of the same millisecond");
+        assert_ne!(second.n, first, "its number is its own");
+        settle(&mut state, &hash, first, true);
+        assert_eq!(state.all_failed, Some(second), "the alert of the first episode neither marks nor releases the second");
+        let (third, _) = claim_owed(&mut state, &hash, 300).unwrap();
+        apply(&mut state, &chain, 1, Seen::Answered, 100);
+        apply(&mut state, &chain, 1, failed("quota"), 100);
+        let later = state.all_failed.clone().unwrap();
+        assert!(later.since < 300 && later.n > third, "a clock that stepped back still numbers on");
+        settle(&mut state, &hash, third, true);
+        assert_eq!(state.all_failed, Some(later), "so the alert of the earlier episode marks nothing");
     }
 
     #[test]
