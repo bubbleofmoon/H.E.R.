@@ -68,7 +68,7 @@ pub(crate) fn confirm_field(body: &Value) -> Result<bool, (u16, String)> {
 /// naming the first such setting of `changed`, before anything is written; a change of no security setting needs none.
 pub(crate) fn check_confirmation(confirm: bool, changed: &[&Setting]) -> Result<(), (u16, String)> {
     match changed.iter().find(|setting| setting.confirmed()) {
-        Some(setting) if false && !confirm => Err(( // RED-M3
+        Some(setting) if !confirm => Err((
             409,
             format!("{} is a security setting: send the change again with \"confirm\": true", setting.key),
         )),

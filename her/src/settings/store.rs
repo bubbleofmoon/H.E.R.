@@ -689,7 +689,7 @@ fn seed(conn: &Connection, document: &Value, at: i64, written: &[&'static str]) 
     let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
     let request = request_id(at);
     for setting in registry() {
-        let own_write_only = false; // RED-M1
+        let own_write_only = setting.confirmed();
         if own_write_only && !written.contains(&setting.key) {
             continue;
         }
@@ -1279,7 +1279,7 @@ fn remove_at(document: &mut Value, pointer: &str) {
 /// settings page included, makes an older record stale.
 pub(crate) fn registry_free(document: &Value) -> Value {
     let mut stripped = document.clone();
-    for setting in registry() { // RED-M4
+    for setting in registry().filter(|setting| !setting.confirmed()) {
         remove_at(&mut stripped, setting.pointer);
         let mut below = setting.pointer;
         while let Some((above, _)) = below.rsplit_once('/') {
