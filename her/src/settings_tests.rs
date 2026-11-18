@@ -2307,15 +2307,15 @@ fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     assert!(next_render(&other).contains("【别像客服】你不是客服："), "a refused file value renders the default");
     write_config(&other_root, |config| config["prompts"] = json!({"behaviour": {"notAClerk": "【别像客服】文件里的版本 140"}}));
     assert!(next_render(&other).contains("【别像客服】文件里的版本 140\n\n"), "an accepted file value renders");
+    // The store's first write seeds every registry value in the file (#176), so the file holds no prompt text while
+    // it is created; the text comes back after, with no stored or audited value for it.
+    write_config(&other_root, |config| config["prompts"] = json!({}));
     let (status, body) = set_quiet(&other, json!(4500));
     assert_eq!(status, 200, "{body}");
+    write_config(&other_root, |config| config["prompts"] = json!({"behaviour": {"notAClerk": "【别像客服】文件里的版本 140"}}));
     let conn = open_store(&other_root);
-    // The set above seeded the file's text (#176); replace that row and its migration row, so the store holds a
-    // refused value with no audited one.
-    conn.execute("DELETE FROM settings_audit WHERE key='prompt.notAClerk'", []).unwrap();
     conn.execute(
-        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('prompt.notAClerk', ?1, 1, 0, 'test')
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('prompt.notAClerk', ?1, 1, 0, 'test')",
         [json!("【别像客服】库里的 AI 140").to_string()],
     )
     .unwrap();
