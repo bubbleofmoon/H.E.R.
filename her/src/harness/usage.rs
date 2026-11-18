@@ -344,4 +344,70 @@ mod tests {
         assert_eq!(unrecorded.len(), 1, "{unrecorded:?}");
         assert!(unrecorded[0].contains("private:8808") && unrecorded[0].contains("route model-a"), "{unrecorded:?}");
     }
+
+    /// Reads one HTTP request from `socket` (headers and a `Content-Length` body).
+    fn read_request(socket: &mut std::net::TcpStream) {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let count = socket.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "truncated fixture request");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(split) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let length = String::from_utf8_lossy(&bytes[..split])
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if bytes.len() >= split + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn harness_usage_the_digest_records_each_request_under_its_internal_key() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                read_request(&mut socket);
+                let body = json!({"id": "usage-173", "object": "chat.completion", "created": 1, "model": "digest-173",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "[]"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42, "prompt_tokens_details": {"cached_tokens": 10}}})
+                .to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let chain = json!({"routes": [{"id": "first", "model": "digest-173"}, {"id": "second", "model": "other-173"}]});
+        let fixture = Fixture::new("digest", chain, port);
+        let model = crate::digest::model_for(&fixture.context, &fixture.cfg).unwrap();
+        assert_eq!(model.complete("system", "input"), Ok("[]".to_string()));
+        assert_eq!(model.complete("system", "input"), Ok("[]".to_string()));
+        server.join().unwrap();
+        let rows = fixture.rows();
+        assert_eq!(rows.len(), 2, "one usage fact per digest request");
+        for row in &rows {
+            assert_eq!(
+                (row["key"].as_str(), row["route"].as_str(), row["model"].as_str(), row["job"].as_str(), row["engine"].as_str()),
+                (Some("internal:digest"), Some("first"), Some("digest-173"), Some("digest"), Some("harness"))
+            );
+            assert_eq!(row["b"], json!({"cacheMiss": 30, "cacheHit": 10, "cacheWrite": 0, "output": 2, "reasoning": 0}));
+            assert_eq!(row["sid"], json!(session("internal:digest")));
+        }
+        assert!(rows[0]["turn"].as_i64() < rows[1]["turn"].as_i64(), "each request has its own, later turn number");
+        let summary = Ledger::load_all_for_runtime(&fixture.context).unwrap().summary(&crate::pricing::resolve(None), 50);
+        assert_eq!(summary["conversations"][0]["key"], "internal:digest");
+        assert_eq!((summary["totals"]["turns"].as_i64(), summary["totals"]["totalTokens"].as_f64()), (Some(2), Some(84.0)));
+    }
 }
