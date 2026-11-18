@@ -602,7 +602,7 @@ async fn tool_loop(
     let deadline = tokio::time::Instant::now() + request.deadline;
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds) =
-        handover::assemble(history, handover::current(request, &instruction));
+        handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
     let mut chain = ChainState::new(context, request);
     let mut spent = 0u32;
     for step in 0..request.limits.max_steps {

@@ -28,7 +28,7 @@ const TRANSCRIPT_TOOL_CHARS: usize = 2_000;
 /// What the summariser is asked (model-visible: `model_text_guard_tests`).
 pub(crate) const SUMMARY_PROMPT: &str = "下面是一段较早的聊天记录，可能还附有之前写好的摘要。请把它们整理成一份新的摘要，给自己以后接着聊天时参考：用第一人称，写清楚谁说过哪些要紧的事、做过的约定和答应的事、还没办完的事、各人的称呼和喜好。保留具体的名字、时间、数字和消息编号。只写记录里有的内容，不要编造，不要评论。只输出摘要正文，不超过八百字。";
 /// The first line of a replayed summary (model-visible).
-pub(crate) const SUMMARY_LABEL: &str = "【之前和AI聊天的摘要】";
+pub(crate) const SUMMARY_LABEL: &str = "【之前聊天的摘要】";
 /// The heading of the earlier summary in a summary request (model-visible).
 pub(crate) const PREVIOUS_LABEL: &str = "【之前的摘要】";
 /// The heading of the chat in a summary request (model-visible).
@@ -353,7 +353,7 @@ pub(crate) fn accept(transcript: &str, summary: &str) -> Result<String, &'static
     let known = crate::upstream_capture::denied_terms(transcript);
     if crate::upstream_capture::denied_terms(summary)
         .iter()
-        .any(|term| known.contains(term) && !known.contains(term))
+        .any(|term| !known.contains(term))
     {
         return Err("wording");
     }

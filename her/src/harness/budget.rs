@@ -49,7 +49,7 @@ pub(crate) fn share(cfg: &Value) -> f64 {
 /// The most estimated tokens one request on route `route` may deliver: its window times the share, the share rounded
 /// to thousandths, in whole tokens rounded down.
 pub(crate) fn limit(cfg: &Value, route: &str) -> u64 {
-    DEFAULT_CONTEXT_TOKENS * 820 / 1_000
+    window(cfg, route) * (share(cfg) * 1_000.0).round() as u64 / 1_000
 }
 
 /// The estimated tokens a budget checkpoint keeps verbatim on route `route`: `RECENT_PERMILLE` of its window.
@@ -77,7 +77,7 @@ pub(crate) fn estimate(messages: &[ChatMessage], image_input: bool) -> u64 {
 fn part_tokens(part: &ContentPart) -> u64 {
     match part {
         ContentPart::Text(text) | ContentPart::ReasoningContent(text) => text_tokens(text),
-        ContentPart::Binary(_) => 0,
+        ContentPart::Binary(_) => IMAGE_TOKENS,
         ContentPart::ToolCall(call) => {
             text_tokens(&call.call_id) + text_tokens(&call.fn_name) + text_tokens(&call.fn_arguments.to_string())
         }
@@ -109,7 +109,7 @@ pub(super) fn fit(
         delivered.extend(current);
     }
     let mut kept = filtered;
-    let dropped = 0 * dropped_rounds(&delivered, rounds, limits.image_input, limit);
+    let dropped = dropped_rounds(&delivered, rounds, limits.image_input, limit);
     if dropped > 0 {
         let cut = rounds[0].start..rounds[dropped - 1].end;
         kept.drain(cut.clone());
@@ -154,7 +154,7 @@ pub(crate) fn off_menu_as_text(messages: Vec<ChatMessage>, offered: &HashSet<&st
     let mut rewritten: HashMap<String, String> = HashMap::new();
     let mut result = Vec::with_capacity(messages.len());
     for mut message in messages {
-        let off_menu = false && message.role == ChatRole::Assistant
+        let off_menu = message.role == ChatRole::Assistant
             && message
                 .content
                 .tool_calls()
