@@ -4,19 +4,21 @@
 //! conversation, a message whose segment array holds exactly one `record` segment with an http(s) `data.url` is
 //! downloaded through `safe_fetch::fetch_voice` (public pinned addresses, at most two revalidated redirects, the
 //! `maxBytes` cap, SILK v3 magic; the body and header files go to `<data>/voice/transfer` and are removed after each
-//! hop), checked as whole SILK v3 framing (every packet holds at least one 20 ms frame, so a packet count above 50 a
-//! second proves a record longer than `maxSeconds` and refuses it) and posted as it is to the local transcription
-//! helper at `voiceTranscription.helper`, which must be a loopback IP origin (`HttpTranscriber::new`). The helper's
-//! text is cleaned (`clean`) and shown as `[语音转文字] <text>` in place of the message's `[语音]` label (`apply`), so it
-//! is stored, previewed and filtered by `model_view` like typed text. Anything else (not opted in, no helper, a
-//! failure, the deadline, the pause after a helper failure, another transcription running) leaves `[语音]` and the
-//! message goes on.
+//! hop; all hops together end within the download's share of the attempt, `HELPER_RESERVE` before the deadline),
+//! checked as whole SILK v3 framing (every packet holds at least one 20 ms frame, so a packet count above 50 a second
+//! proves a record longer than `maxSeconds` and refuses it) and posted as it is to the local transcription helper at
+//! `voiceTranscription.helper`, which must be a loopback IP origin (`HttpTranscriber::new`). The helper's text is
+//! cleaned (`clean`) and shown as `[语音转文字] <text>` in place of the message's `[语音]` label (`apply`), so it is
+//! stored and filtered by `model_view` like typed text; the activity log keeps `[语音]`. Anything else (not opted in,
+//! no helper, a failure, the deadline, the pause after a helper failure, another transcription running) leaves `[语音]`
+//! and the message goes on.
 //!
 //! Each transcript is kept in `<data>/voice/transcripts.json` under its inbound key for a day, at most `KEEP_MAX`, so
 //! handling the same event again (a replay after a restart) never transcribes it twice. Audio bytes are never logged,
 //! stored or written outside the transfer folder; each failure records a fixed reason in the run record (component
 //! `stt`). The helper's absence or failure is told to the owner once per outage (`admin_alert::notify_notice`, key
-//! `voice-stt`), and its recovery once. QQ's own transcription (`fetch_ptt_text`) is never used for inbound voice.
+//! `voice-stt-down`; an outage notice the limiter refused is tried again on the next failure), and its recovery once
+//! (key `voice-stt-up`). QQ's own transcription (`fetch_ptt_text`) is never used for inbound voice.
 
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
@@ -52,9 +54,18 @@ pub(crate) const KEEP_MS: i64 = 24 * 60 * 60 * 1000;
 pub(crate) const KEEP_MAX: usize = 2000;
 /// Where the download's body and header files are written (`safe_fetch::fetch_voice`).
 const TRANSFER_DIR: &str = "voice/transfer";
-/// The owner notice key (one per minute, on the notice budget).
-#[cfg_attr(test, allow(dead_code))]
-const NOTICE_KEY: &str = "voice-stt";
+/// The owner notice keys (each one per minute, on the notice budget): an outage and its recovery have their own, so a
+/// recovery never uses up the window of the next outage's notice.
+const DOWN_KEY: &str = "voice-stt-down";
+const UP_KEY: &str = "voice-stt-up";
+/// The share of one attempt's time kept for the helper: the download ends this long before the deadline (at most half
+/// of the attempt, so a short `timeoutMs` still leaves the download a share).
+const HELPER_RESERVE: Duration = Duration::from_secs(3);
+/// The helper is asked only when at least this much time is left; with less, a silent helper proves nothing and the
+/// attempt ends as `Failure::Deadline`.
+const HELPER_FLOOR: Duration = Duration::from_millis(250);
+/// The most bytes one write to the helper carries; the write timeout is reset to the time left before each.
+const WRITE_CHUNK: usize = 16 * 1024;
 
 /// The size and length limits of one record.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,7 +141,8 @@ pub(crate) enum Failure {
     Busy,
     /// Transcription is paused after a helper failure or a missed deadline.
     Cooling,
-    /// The attempt did not end before `timeoutMs` plus `GRACE`.
+    /// The attempt's time ran out (`timeoutMs` plus `GRACE`, or too little left to ask the helper): not the helper's
+    /// fault.
     Deadline,
     /// The transcription task ended without a result.
     Internal,
@@ -207,17 +219,16 @@ impl HttpTranscriber {
 
 impl Transcriber for HttpTranscriber {
     fn transcribe(&self, audio: &[u8], deadline: Instant) -> Result<String, Failure> {
-        use std::io::{Read, Write};
+        use std::io::Read;
         let left = || remaining(deadline).ok_or(Failure::TimedOut);
         let mut stream = std::net::TcpStream::connect_timeout(&self.address, left()?).map_err(io_failure)?;
-        stream.set_write_timeout(Some(left()?)).map_err(|_| Failure::Unreachable)?;
         let head = format!(
             "POST {PATH} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.authority,
             audio.len()
         );
-        stream.write_all(head.as_bytes()).map_err(io_failure)?;
-        stream.write_all(audio).map_err(io_failure)?;
+        write_bounded(&mut stream, head.as_bytes(), deadline)?;
+        write_bounded(&mut stream, audio, deadline)?;
         // Every read gets only the time left, so a peer that dribbles bytes cannot extend the deadline.
         let mut response = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -234,6 +245,26 @@ impl Transcriber for HttpTranscriber {
         }
         parse_reply(&response)
     }
+}
+
+/// Write all of `bytes` before `deadline`: in chunks of at most `WRITE_CHUNK`, each with the write timeout set to the
+/// time left, so a helper that reads slowly cannot extend the deadline by taking a little at a time. Spent time is
+/// `TimedOut`.
+fn write_bounded(stream: &mut std::net::TcpStream, bytes: &[u8], deadline: Instant) -> Result<(), Failure> {
+    use std::io::Write;
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let left = remaining(deadline).ok_or(Failure::TimedOut)?;
+        stream.set_write_timeout(Some(left)).map_err(|_| Failure::Unreachable)?;
+        let end = bytes.len().min(sent + WRITE_CHUNK);
+        match stream.write(&bytes[sent..end]) {
+            Ok(0) => return Err(Failure::Unreachable),
+            Ok(written) => sent += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(io_failure(error)),
+        }
+    }
+    Ok(())
 }
 
 /// A socket error as a failure: a timeout (Unix `WouldBlock`, Windows `TimedOut`) is `TimedOut`, anything else
@@ -395,8 +426,33 @@ fn download(context: &RuntimeContext, url: &str, max_bytes: usize, budget: Durat
 pub(crate) static DOWNLOAD_FIXTURES: Mutex<std::collections::BTreeMap<String, Vec<u8>>> =
     Mutex::new(std::collections::BTreeMap::new());
 
+/// Unit tests' slow downloads by URL, and the budget each download was given.
 #[cfg(test)]
-fn download(context: &RuntimeContext, url: &str, max_bytes: usize, _budget: Duration) -> Result<Vec<u8>, Failure> {
+pub(crate) static DOWNLOAD_DELAYS: Mutex<std::collections::BTreeMap<String, DownloadDelay>> =
+    Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+pub(crate) static DOWNLOAD_BUDGETS: Mutex<std::collections::BTreeMap<String, Duration>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// How long a slow test download takes before it hands over its record.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum DownloadDelay {
+    /// Exactly the budget it was given: a download that uses up its share.
+    Share,
+    /// This long, whatever the budget: a download that overshoots (a host lookup is not capped by the budget).
+    Fixed(Duration),
+}
+
+#[cfg(test)]
+fn download(context: &RuntimeContext, url: &str, max_bytes: usize, budget: Duration) -> Result<Vec<u8>, Failure> {
+    DOWNLOAD_BUDGETS.lock().unwrap_or_else(|p| p.into_inner()).insert(url.to_string(), budget);
+    let delay = DOWNLOAD_DELAYS.lock().unwrap_or_else(|p| p.into_inner()).get(url).copied();
+    match delay {
+        Some(DownloadDelay::Share) => std::thread::sleep(budget),
+        Some(DownloadDelay::Fixed(fixed)) => std::thread::sleep(fixed),
+        None => {}
+    }
     transfer_folder(context)?;
     let bytes =
         DOWNLOAD_FIXTURES.lock().unwrap_or_else(|p| p.into_inner()).get(url).cloned().ok_or(Failure::Download)?;
@@ -406,7 +462,20 @@ fn download(context: &RuntimeContext, url: &str, max_bytes: usize, _budget: Dura
     Ok(bytes)
 }
 
-/// Download, check and transcribe one record before `deadline` (blocking). The transcript is `clean`ed.
+/// The part of an attempt of `total` the helper keeps for itself (`HELPER_RESERVE`, at most half).
+fn helper_share(total: Duration) -> Duration {
+    HELPER_RESERVE.min(total / 2)
+}
+
+/// Whether the helper may still be asked at `now`: at least `HELPER_FLOOR` before `deadline`.
+fn helper_has_time(deadline: Instant, now: Instant) -> bool {
+    deadline.checked_duration_since(now).is_some_and(|left| left >= HELPER_FLOOR)
+}
+
+/// Download, check and transcribe one record before `deadline` (blocking). The download ends `helper_share` before
+/// the deadline, so a slow host cannot leave the helper no time; when the download still overruns and leaves the helper
+/// less than `HELPER_FLOOR`, the attempt ends as `Failure::Deadline`, which is no helper outage. The transcript is
+/// `clean`ed.
 pub(crate) fn transcribe_record(
     context: &RuntimeContext,
     url: &str,
@@ -414,12 +483,17 @@ pub(crate) fn transcribe_record(
     engine: &dyn Transcriber,
     deadline: Instant,
 ) -> Result<String, Failure> {
-    let budget = remaining(deadline).ok_or(Failure::Deadline)?;
+    let total = remaining(deadline).ok_or(Failure::Deadline)?;
+    let download_deadline = deadline.checked_sub(helper_share(total)).unwrap_or(deadline);
+    let budget = remaining(download_deadline).ok_or(Failure::Deadline)?;
     let audio = download(context, url, limits.max_bytes, budget)?;
     let packets = silk_packets(&audio).ok_or(Failure::Unsupported)?;
     // Every packet holds at least one 20 ms frame: more than 50 a second prove the record too long.
     if packets > limits.max_seconds.saturating_mul(50) {
         return Err(Failure::TooLong);
+    }
+    if !helper_has_time(deadline, Instant::now()) {
+        return Err(Failure::Deadline);
     }
     let text = engine.transcribe(&audio, deadline)?;
     clean(&text).ok_or(Failure::Empty)
@@ -476,6 +550,9 @@ pub(crate) fn remember(context: &RuntimeContext, inbound_key: &str, text: &str, 
 struct Health {
     /// The helper failed last (`Failure::helper_down`); an answer clears it.
     down: bool,
+    /// The owner heard of this outage: its notice was admitted (`tell_owner`). A refused notice is tried again on the
+    /// next helper failure.
+    told: bool,
     /// No transcription starts before this.
     cool_until: Option<Instant>,
 }
@@ -512,29 +589,43 @@ impl Drop for Running {
     }
 }
 
+/// Tell the owner; whether the notice was admitted (`admin_alert::notify_notice`'s answer).
 #[cfg(not(test))]
-fn tell_owner(context: &RuntimeContext, cfg: &Value, text: &str) {
-    let _ = crate::admin_alert::notify_notice(context, cfg, text, NOTICE_KEY);
+fn tell_owner(context: &RuntimeContext, cfg: &Value, text: &str, key: &str) -> bool {
+    crate::admin_alert::notify_notice(context, cfg, text, key)
 }
 
-/// Unit tests' record of the owner notices, by runtime root.
+/// Unit tests' record of the admitted owner notices: runtime root, key, text and the test clock's time.
 #[cfg(test)]
-pub(crate) static NOTICES: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+pub(crate) static NOTICES: Mutex<Vec<(PathBuf, String, String, i64)>> = Mutex::new(Vec::new());
 
+/// Unit tests' notice clock by runtime root (milliseconds, 0 unless a test sets it).
 #[cfg(test)]
-fn tell_owner(context: &RuntimeContext, _cfg: &Value, text: &str) {
+pub(crate) static NOTICE_CLOCK: Mutex<std::collections::BTreeMap<PathBuf, i64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The test stand-in for the notice limiter (`admin_alert`): a key is admitted once per 60 seconds of the root's test
+/// clock.
+#[cfg(test)]
+fn tell_owner(context: &RuntimeContext, _cfg: &Value, text: &str, key: &str) -> bool {
     let root = context.runtime_root().map(Path::to_path_buf).unwrap_or_default();
-    NOTICES.lock().unwrap_or_else(|p| p.into_inner()).push((root, text.to_string()));
+    let now = NOTICE_CLOCK.lock().unwrap_or_else(|p| p.into_inner()).get(&root).copied().unwrap_or(0);
+    let mut told = NOTICES.lock().unwrap_or_else(|p| p.into_inner());
+    if told.iter().any(|(r, k, _, at)| *r == root && k == key && now - at < 60_000) {
+        return false;
+    }
+    told.push((root, key.to_string(), text.to_string(), now));
+    true
 }
 
-/// Record a transcription's outcome: a run-record line for each failure; the helper's state; and, when the helper goes
-/// down after a start or an answer, or answers again after being down, one run-record line and one owner notice.
+/// Record a transcription's outcome: a run-record line for each failure; the helper's state; and the owner notices.
+/// The outage notice goes out on a helper failure until one is admitted (`Health::told`), so a refused one is tried
+/// again on the next failure; the recovery notice goes out only for an outage the owner heard of.
 fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
     let Some(root) = context.runtime_root().map(Path::to_path_buf) else { return };
-    let (was_down, down) = {
+    let (was_down, was_told, down, told) = {
         let mut all = health().lock().unwrap_or_else(|p| p.into_inner());
-        let state = all.entry(root).or_default();
-        let was_down = state.down;
+        let state = all.entry(root.clone()).or_default();
+        let (was_down, was_told) = (state.down, state.told);
         match outcome {
             Ok(()) | Err(Failure::Empty) => *state = Health::default(),
             Err(failure) if failure.helper_down() => {
@@ -544,7 +635,7 @@ fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
             Err(Failure::Deadline) => state.cool_until = Some(Instant::now() + COOL),
             Err(_) => {}
         }
-        (was_down, state.down)
+        (was_down, was_told, state.down, state.told)
     };
     if let Err(failure) = outcome {
         let kind = if failure.skipped() { Outcome::Skipped } else { Outcome::Failed };
@@ -558,11 +649,20 @@ fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
                 Outcome::Failed,
                 failure.reason(),
             );
-            tell_owner(
+        }
+        if failure.helper_down() && !told {
+            let admitted = tell_owner(
                 context,
                 cfg,
                 &format!("语音转文字暂不可用：{}。语音消息先以「[语音]」交给对话，恢复后自动继续。", failure.owner_reason()),
+                DOWN_KEY,
             );
+            if admitted {
+                // Only while the outage lasts: an answer that cleared it meanwhile leaves nothing to remember.
+                if let Some(state) = health().lock().unwrap_or_else(|p| p.into_inner()).get_mut(&root).filter(|state| state.down) {
+                    state.told = true;
+                }
+            }
         }
     }
     if was_down && !down {
@@ -574,7 +674,9 @@ fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
             Outcome::Ok,
             "the transcription helper answered again",
         );
-        tell_owner(context, cfg, "语音转文字已恢复。");
+        if was_told {
+            tell_owner(context, cfg, "语音转文字已恢复。", UP_KEY);
+        }
     }
 }
 

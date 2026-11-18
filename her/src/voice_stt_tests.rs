@@ -117,10 +117,48 @@ fn record_message(url: &str) -> Value {
     json!([{"type": "record", "data": {"file": "0f0e.amr", "url": url}}])
 }
 
-/// The owner notices recorded for `context`'s runtime.
+/// Set the notice clock of `context`'s runtime (the test stand-in for the notice limiter's time).
+fn notice_clock(context: &RuntimeContext, ms: i64) {
+    NOTICE_CLOCK.lock().unwrap().insert(context.runtime_root().unwrap().to_path_buf(), ms);
+}
+
+/// A SILK record of about `bytes` bytes in 32 KB packets (1500 of them fit one minute).
+fn big_silk(bytes: usize) -> Vec<u8> {
+    let mut record = vec![0x02];
+    record.extend_from_slice(b"#!SILK_V3");
+    while record.len() < bytes {
+        record.extend_from_slice(&32_000i16.to_le_bytes());
+        record.extend(std::iter::repeat(0xA5u8).take(32_000));
+    }
+    record
+}
+
+/// A loopback helper that reads its request a kilobyte at a time, 20 ms apart, and hangs up after three seconds.
+fn slow_reading_engine() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let mut buf = [0u8; 1024];
+                while started.elapsed() < Duration::from_secs(3) {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                }
+            });
+        }
+    });
+    origin
+}
+
+/// The owner notices admitted for `context`'s runtime.
 fn notices(context: &RuntimeContext) -> Vec<String> {
     let root = context.runtime_root().unwrap().to_path_buf();
-    NOTICES.lock().unwrap().iter().filter(|(r, _)| *r == root).map(|(_, text)| text.clone()).collect()
+    NOTICES.lock().unwrap().iter().filter(|(r, ..)| *r == root).map(|(_, _, text, _)| text.clone()).collect()
 }
 
 /// The run-record lines of `context` naming `event`.
@@ -366,6 +404,31 @@ fn helper_failures_are_classified_and_bounded_by_the_deadline() {
     // Port 1: nothing listens there and no test fake can bind it (a privileged port), so the refusal is certain.
     let closed = HttpTranscriber::new("http://127.0.0.1:1").unwrap();
     assert_eq!(closed.transcribe(&silk(2), Instant::now() + Duration::from_secs(5)), Err(Failure::Unreachable));
+
+    // A helper that reads its request slowly cannot stretch the deadline: the write is bounded, not only each step of
+    // it, and the runtime's one transcription slot is free again afterwards.
+    let (root, context) = runtime("slow-reader", Value::Null);
+    let url = "https://voice.fixture.test/slow-reader";
+    DOWNLOAD_FIXTURES.lock().unwrap().insert(url.to_string(), big_silk(48 << 20));
+    let helper = HttpTranscriber::new(&slow_reading_engine()).unwrap();
+    let limits = Limits { max_bytes: 64 << 20, max_seconds: 60 };
+    let slot = context.runtime_root().unwrap().to_path_buf();
+    let permit = Running::claim(&slot).expect("the slot is free");
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(600);
+    let task_context = context.clone();
+    let task = std::thread::spawn(move || {
+        let _permit = permit;
+        transcribe_record(&task_context, url, limits, &helper, deadline)
+    });
+    let slow = task.join().unwrap();
+    let waited = started.elapsed();
+    let freed = Running::claim(&slot).is_some();
+    DOWNLOAD_FIXTURES.lock().unwrap().remove(url);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(slow, Err(Failure::TimedOut), "a helper that takes the record too slowly is a timeout");
+    assert!(waited < Duration::from_secs(2), "the deadline bounds a slow reader: {waited:?}");
+    assert!(freed, "the transcription slot is released");
 }
 
 #[test]
@@ -503,6 +566,104 @@ async fn a_silent_helper_times_out_pauses_for_a_minute_and_its_recovery_is_told(
     assert!(told[0].contains("没有按时回复"), "{told:?}");
     assert_eq!(told[1], "语音转文字已恢复。");
     assert_eq!(recovered.len(), 1);
+}
+
+#[test]
+fn the_helper_keeps_a_share_of_the_attempt_and_is_asked_only_with_time_left() {
+    assert_eq!(helper_share(Duration::from_secs(8)), HELPER_RESERVE);
+    assert_eq!(helper_share(HELPER_RESERVE * 2), HELPER_RESERVE, "half of six seconds is the whole reserve");
+    assert_eq!(helper_share(HELPER_RESERVE * 2 - Duration::from_millis(1)), (HELPER_RESERVE * 2 - Duration::from_millis(1)) / 2, "less is half");
+    assert_eq!(helper_share(Duration::from_secs(1)), Duration::from_millis(500), "a short attempt still leaves the download half");
+    let now = Instant::now();
+    assert!(helper_has_time(now + HELPER_FLOOR, now), "exactly the floor is enough");
+    assert!(!helper_has_time(now + HELPER_FLOOR - Duration::from_millis(1), now), "a millisecond less is not");
+    assert!(!helper_has_time(now, now) && !helper_has_time(now, now + Duration::from_secs(1)), "none left, or past");
+
+    let (root, context) = runtime("reserve", Value::Null);
+    let url = "https://voice.fixture.test/reserve";
+    DOWNLOAD_FIXTURES.lock().unwrap().insert(url.to_string(), silk(5));
+    let fake = Fake::answering("好");
+    for (total, expected) in [(Duration::from_secs(8), Duration::from_secs(5)), (Duration::from_secs(1), Duration::from_millis(500))] {
+        let got = transcribe_record(&context, url, Limits { max_bytes: 1 << 20, max_seconds: 60 }, &fake, Instant::now() + total);
+        let budget = DOWNLOAD_BUDGETS.lock().unwrap().get(url).copied().unwrap();
+        assert_eq!(got, Ok("好".to_string()));
+        assert!(
+            budget <= expected && budget > expected - Duration::from_millis(500),
+            "of {total:?} the download gets all but the helper's share ({expected:?}): {budget:?}"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_download_that_uses_its_share_leaves_the_helper_time_and_one_that_overruns_is_no_outage() {
+    let engine = fake_engine(Some(ok_reply(r#"{"text":"到了"}"#)));
+    let (root, context) =
+        runtime("share", json!({"conversations": ["group:777006"], "helper": engine.origin, "timeoutMs": 1000}));
+    let cfg = context.load_config().unwrap();
+    let (share, overrun) = ("https://voice.fixture.test/share", "https://voice.fixture.test/overrun");
+    for url in [share, overrun] {
+        DOWNLOAD_FIXTURES.lock().unwrap().insert(url.to_string(), silk(5));
+    }
+    DOWNLOAD_DELAYS.lock().unwrap().insert(share.to_string(), DownloadDelay::Share);
+    DOWNLOAD_DELAYS.lock().unwrap().insert(overrun.to_string(), DownloadDelay::Fixed(Duration::from_millis(1100)));
+    let used = for_message(&context, &cfg, "group:777006", "group:777006|message:1", &record_message(share)).await;
+    let asked_after_share = engine.requests.lock().unwrap().len();
+    let overran = for_message(&context, &cfg, "group:777006", "group:777006|message:2", &record_message(overrun)).await;
+    let asked = engine.requests.lock().unwrap().len();
+    let told = notices(&context);
+    let state = health().lock().unwrap().get(context.runtime_root().unwrap()).map(|state| (state.down, state.told));
+    let failed = records(&context, "voice-transcription");
+    let outages = records(&context, "voice-transcription-unavailable");
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(used, Some(label("到了")), "the helper still has its share after a download that took all of its own");
+    assert_eq!(asked_after_share, 1);
+    assert_eq!(overran, None, "the label stays");
+    assert_eq!(asked, 1, "a healthy helper is not asked with no time left");
+    assert!(told.is_empty(), "a slow download is no helper outage: {told:?}");
+    assert_eq!(state, Some((false, false)), "the helper is not marked down");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["reason"].as_str(), Some(Failure::Deadline.reason()));
+    assert!(outages.is_empty());
+}
+
+#[test]
+fn an_outage_notice_the_limiter_refused_is_tried_again_and_a_recovery_has_its_own_key() {
+    let (root, context) = runtime("notices", Value::Null);
+    let cfg = json!({});
+    let down = Err(Failure::Unreachable);
+    notice_clock(&context, 0);
+    settle(&context, &cfg, down);
+    notice_clock(&context, 30_000);
+    settle(&context, &cfg, Ok(()));
+    notice_clock(&context, 40_000);
+    settle(&context, &cfg, down);
+    let after_refusal = notices(&context).len();
+    notice_clock(&context, 70_000);
+    settle(&context, &cfg, down);
+    notice_clock(&context, 80_000);
+    settle(&context, &cfg, down);
+    let told = notices(&context);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(after_refusal, 2, "the second outage came within a minute of the first notice: refused");
+    assert_eq!(told.len(), 3, "one outage notice each time it was admitted and nothing else: {told:?}");
+    assert!(told[0].contains("连接不上") && told[2].contains("连接不上"), "{told:?}");
+    assert_eq!(told[1], "语音转文字已恢复。", "the recovery is told although an outage was told a moment before");
+}
+
+#[test]
+fn a_recovery_is_not_told_for_an_outage_the_owner_never_heard_of() {
+    let (root, context) = runtime("untold", Value::Null);
+    let cfg = json!({});
+    notice_clock(&context, 0);
+    assert!(tell_owner(&context, &cfg, "earlier", DOWN_KEY), "the stand-in admits the first notice of a key");
+    notice_clock(&context, 10_000);
+    settle(&context, &cfg, Err(Failure::Refused));
+    notice_clock(&context, 100_000);
+    settle(&context, &cfg, Ok(()));
+    let told = notices(&context);
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(told, ["earlier"], "the refused outage notice leaves nothing to recover from");
 }
 
 #[test]

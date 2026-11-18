@@ -664,9 +664,15 @@ mod tests {
             stored.push(state["conversations"][key.as_str()]["recentMessages"].as_array().unwrap().last().unwrap().clone());
         }
         let requests = engine.requests.lock().unwrap().len();
+        let activity = std::fs::read_to_string(root.join("data/qq-activity.log")).unwrap_or_default();
         drop(hub);
         std::fs::remove_dir_all(root).unwrap();
         let heard = crate::voice_stt::label("今天吃什么");
+        assert!(
+            activity.contains("group:420042 [reserved2] 消息已入未读：[语音]"),
+            "the activity log keeps the voice label: {activity}"
+        );
+        assert!(!activity.contains("今天吃什么"), "the transcript never reaches the activity log: {activity}");
         assert_eq!(
             (stored[0]["text"].as_str(), stored[0]["plain"].as_str()),
             (Some(heard.as_str()), Some(heard.as_str())),
@@ -2694,7 +2700,9 @@ impl Hub {
             return Ok(());
         }
         // #170: the voice record of an opted-in conversation is read as its local transcript in place of the `[语音]`
-        // label (`voice_stt`); without one the label stays.
+        // label (`voice_stt`); without one the label stays. The transcript goes to the stored message and the model
+        // only: the activity log (`preview`) keeps the label.
+        let activity_text = rendered_text.clone();
         let (rendered_text, plain, body) = match crate::voice_stt::for_message(&self.context, &cfg, &key, &inbound_key, &ev.message).await {
             Some(label) => {
                 let plain = crate::voice_stt::apply(&plain, &label);
@@ -2773,7 +2781,7 @@ impl Hub {
         }
         let (state, in_turn) = self.observe_turn_epoch(&key)?;
         let conv = &state["conversations"][&key];
-        let preview = crate::activity::slice(&text, 80);
+        let preview = crate::activity::slice(if is_poke { &text } else { &activity_text }, 80);
         // The activity line belongs to the event's first arrival: a journal replay after a restart
         // must not log it a second time.
         if is_poke && !replayed {
