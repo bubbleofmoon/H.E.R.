@@ -37,6 +37,10 @@ _Avoid_: notes, full prompt, initial prompt
 What one wake tells the agent beyond the briefing: why it woke, the new messages, the current state, and any changed parts of the briefing.
 _Avoid_: wake prompt, diff
 
+**Voice transcript (语音转文字)**:
+The text a member's QQ voice message becomes on HER's own machine, shown to the agent in place of the voice label in conversations the owner opted in.
+_Avoid_: speech recognition result, voice-to-text (the feature)
+
 **Session generation (会话代次)**:
 The span of one agent session's history between two points where it was started, rotated or compacted; each generation begins with a full briefing.
 

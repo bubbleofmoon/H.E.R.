@@ -51,6 +51,8 @@ pub enum Component {
     Alert,
     Snowluma,
     Process,
+    /// Inbound voice transcription (`voice_stt`).
+    Stt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
