@@ -1158,13 +1158,17 @@ fn audit_undo_keeps_the_current_value_of_every_registry_setting() {
     assert_eq!(reply["settingsKept"], json!([QUIET_KEY]), "{reply}");
     assert_eq!(file()["socialV2"]["autoReplyCheckMs"], 4000, "other members are restored");
     assert_eq!(file()["socialV2"]["reply"]["wakeQuietMs"], 8000, "the registry setting keeps its current value");
-    // A save without the member changes no registry setting: the stored value stays in config.json, and the undo keeps it
-    // (the request's before-state holds the same value).
-    config_post(json!({"reply": {}}));
+    // A save without the member keeps the stored value in config.json. The store then changes the value (a settings write
+    // this record does not hold), and the undo keeps the value the store holds now.
+    config_post(json!({"reply": {}, "autoReplyCheckMs": 6000}));
+    assert_eq!(file()["socialV2"]["reply"]["wakeQuietMs"], 8000, "the stored value stays in config.json");
+    let (status, body) = set_quiet(&context, json!(9000));
+    assert_eq!(status, 200, "{body}");
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest_config_entry()})));
     assert_eq!(status, 200, "{reply}");
-    assert_eq!(reply["settingsKept"], json!([]), "{reply}");
-    assert_eq!(file()["socialV2"]["reply"]["wakeQuietMs"], 8000, "the stored value stays in config.json");
+    assert_eq!(reply["settingsKept"], json!([QUIET_KEY]), "{reply}");
+    assert_eq!(file()["socialV2"]["reply"]["wakeQuietMs"], 9000, "the registry setting keeps its current value");
+    assert_eq!(file()["socialV2"]["autoReplyCheckMs"], 4000, "other members are restored");
     // An undo whose backup holds the current registry values keeps nothing.
     config_post(json!({"autoReplyCheckMs": 6000}));
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest_config_entry()})));
