@@ -13,7 +13,7 @@
 #   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
 #   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
 #   Every later git call ignores them anyway: it uses the git dir found before the run, core.fsmonitor=false and
-#   core.hooksPath=/dev/null, and asks $HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R.git) for the
+#   core.hooksPath=/dev/null, and asks $HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R..git) for the
 #   remote head, never `origin`.
 #   <name>.push.txt line 1 is the first that applies: `rewritten` (the pre-run HEAD is not an ancestor of HEAD),
 #   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged|unknown`, `remote-moved`
@@ -46,7 +46,7 @@ implement)
   [ -f "$prompt" ] || die "no prompt file: $prompt"
   [ -n "${HER_GITLEAKS:-}" ] && [ -f "$HER_GITLEAKS" ] && [ -x "$HER_GITLEAKS" ] || die 'HER_GITLEAKS must name the gitleaks binary'
   export HER_GITLEAKS
-  remote_url=${HER_REMOTE_URL:-https://github.com/bubbleofmoon/H.E.R.git}
+  remote_url=${HER_REMOTE_URL:-https://github.com/bubbleofmoon/H.E.R..git}
   [ -d "$wt" ] && [ "$(git -C "$wt" rev-parse --show-toplevel 2> /dev/null)" = "$(realpath -- "$wt")" ] || die "not a worktree root: $wt"
   wtgit=$(git -C "$wt" rev-parse --absolute-git-dir 2> /dev/null) || die "no git dir for $wt"
   common=$(git -C "$wt" rev-parse --path-format=absolute --git-common-dir 2> /dev/null) && [ -d "$common" ] || die "no git common dir for $wt"

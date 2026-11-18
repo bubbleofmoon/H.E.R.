@@ -25,7 +25,7 @@ param(
 #   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
 #   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
 #   Every later git call ignores them anyway: it uses the git dir found before the run, core.fsmonitor=false and
-#   core.hooksPath off, and asks $env:HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R.git) for the
+#   core.hooksPath off, and asks $env:HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R..git) for the
 #   remote head, never `origin`.
 #   <Name>.push.txt line 1 is the first that applies: `rewritten` (the pre-run HEAD is not an ancestor of HEAD),
 #   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged|unknown`, `remote-moved`
@@ -73,7 +73,7 @@ $outDir = Split-Path -Parent (Resolve-Path -LiteralPath $PromptFile).Path
 if ($Mode -eq 'implement') {
   if (-not $WorkDir) { Stop-Refused 'implement needs -WorkDir' }
   if (-not $env:HER_GITLEAKS -or -not (Test-Path -LiteralPath $env:HER_GITLEAKS -PathType Leaf)) { Stop-Refused 'HER_GITLEAKS must name the gitleaks binary' }
-  $remoteUrl = if ($env:HER_REMOTE_URL) { $env:HER_REMOTE_URL } else { 'https://github.com/bubbleofmoon/H.E.R.git' }
+  $remoteUrl = if ($env:HER_REMOTE_URL) { $env:HER_REMOTE_URL } else { 'https://github.com/bubbleofmoon/H.E.R..git' }
   if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) { Stop-Refused "not a worktree root: $WorkDir" }
   $top = Invoke-Git -C $WorkDir rev-parse --show-toplevel 2> $null
   if ($LASTEXITCODE -ne 0 -or (Resolve-Path -LiteralPath "$top").Path -ne (Resolve-Path -LiteralPath $WorkDir).Path) { Stop-Refused "not a worktree root: $WorkDir" }
