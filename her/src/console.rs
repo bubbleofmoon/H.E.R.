@@ -325,6 +325,24 @@ fn take_config_writes() -> Option<(Result<String, String>, String)> {
     CONFIG_WRITES.with(|writes| writes.borrow_mut().take())
 }
 
+/// Notes the selected `config.json` as this request found it, before a settings write-back changes it (#177). The
+/// write-back is not a write of `write_selected_config_text`, so without this the request's audit record would take its
+/// before-state from the file after the write-back, and an undo would not see the registry change. The request's own
+/// write then sets the after-state, as for any other write.
+fn note_config_before_request(context: &RuntimeContext) {
+    let before = context
+        .read_optional_text(RuntimeArea::Config, "config.json")
+        .map(Option::unwrap_or_default)
+        .map_err(|e| format!("cannot read config.json before the write: {e}"));
+    CONFIG_WRITES.with(|writes| {
+        let mut writes = writes.borrow_mut();
+        if writes.is_none() {
+            let after = before.clone().unwrap_or_default();
+            *writes = Some((before, after));
+        }
+    });
+}
+
 /// Ticket 24: every selected-runtime `config.json` read-modify-write holds the social-state gate
 /// (one gate, `SOCIAL_STATE_GATE_WAIT`) from a fresh read of the file to its atomic write, so no
 /// writer puts back an allow list or token another writer replaced meanwhile. Legacy contexts are
@@ -6963,6 +6981,9 @@ fn handle_social_config_post(
     // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
     // save's own write puts every stored value into config.json (`write_selected_config_text`).
     let settings_changes = crate::settings::console_changes(context, &file_before, &file)?;
+    if !settings_changes.is_empty() {
+        note_config_before_request(context);
+    }
     crate::settings::apply_changes(context, settings_changes, "administrator", "console")?;
     if context.is_isolated() {
         let current = raw_config_for_write(context)?;
