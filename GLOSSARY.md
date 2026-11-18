@@ -41,7 +41,7 @@ _Avoid_: wake prompt, diff
 The span of one agent session's history between two points where it was started, rotated or compacted; each generation begins with a full briefing.
 
 **Session rotation (会话轮换)**:
-Replacing a conversation's agent session with a fresh one while the bot sleeps, after saving what matters to memory, once the old session has grown past its cap; the old session is archived, never deleted.
+Replacing a conversation's agent session with a fresh one while the bot sleeps, after saving what matters to memory, once the old session has grown past its cap; the old session is archived, never deleted. A harness session rotates in place instead: a checkpoint hands over a summary and its newest rounds.
 _Avoid_: reset, idle compaction, autocompact
 
 **Cache life (缓存寿命)**:
@@ -106,6 +106,14 @@ _Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
 **Usage fact (用量记录, `harness::usage`)**:
 One token-ledger sample for one model request the harness route module sent: the conversation, the route and model, the request's place in its turn and the tokens its response reported. The console's token totals read it with DSH's samples.
 _Avoid_: billing record, usage event (a DSH request event)
+
+**History budget (历史预算, `harness::budget`)**:
+The share of a model route's context window one harness request may fill. Past it the oldest whole rounds of the conversation's history (a round is one completed turn) are left out or summarised; the current turn never is.
+_Avoid_: context limit, compaction
+
+**Checkpoint (检查点, `harness::handover`)**:
+A durable mark in a harness session's history: a summary of the older rounds and where the rounds kept verbatim begin. Later turns replay the newest checkpoint and the rounds after it; the stored facts never change.
+_Avoid_: compaction, autocompact, snapshot
 
 **One-shot job (单次模型作业, `harness::one_shot`)**:
 A harness job that asks one model route for one answer, with no tools and no history: the digest and slang learning.

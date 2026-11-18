@@ -3190,16 +3190,25 @@ fn menu_chat_group_turns_offer_the_chat_menu_and_refuse_other_her_tools_without_
         !rig.sends().iter().any(|(_, text)| text.contains("must never reach")),
         "an off-menu send reached QQ"
     );
-    // The next turn replays the refused calls as history and still offers only the chat menu.
+    // The next turn replays the refused calls as history and still offers only the chat menu. A replayed call to a
+    // tool the request does not offer is text, and its refusal is text too (#6, `budget::off_menu_as_text`), so the
+    // model still sees every refusal and no call to a tool outside the menu.
     says(&rig, GROUP_KEY, 1001, "tester", "and again");
     assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "next turn replays the refusals");
     let requests = lock(&model.requests);
     assert_eq!(requests.len(), 3);
     assert_eq!(offered_tools(&requests[2]), CHAT_MENU);
-    assert!(
-        requests[2]["messages"].to_string().contains("off-menu-send"),
-        "the refused call was not replayed"
-    );
+    let replayed = requests[2]["messages"].to_string();
+    for name in [
+        "qq_send_group_message",
+        "qq_get_group_history",
+        "qq_send_message",
+        "mcp__snowluma__qq_status",
+    ] {
+        assert!(replayed.contains(&format!("〔我用了 {name}〕")), "the refused call {name} was not replayed as text");
+        assert!(replayed.contains(&format!("〔{name} 的结果〕")), "the refusal of {name} was not replayed as text");
+    }
+    assert!(!replayed.contains("off-menu-"), "a refused call was replayed as a call: {replayed}");
 }
 
 #[test]

@@ -1,4 +1,6 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
+pub(crate) mod budget;
+pub(crate) mod handover;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
 pub(crate) mod rotation;
@@ -456,12 +458,9 @@ impl Harness {
         request.route.start = routes::with_memory(&routes::scope_of(&self.context), |memory| {
             memory.start(&chain, len, std::time::Instant::now())
         });
-        let mut messages = self.store.admit(&request)?;
+        // The history after the session's newest checkpoint; the turn's task completes it (`handover::prepare`).
+        let history = self.store.admit(&request)?;
         let instruction = request.tools.instruction();
-        if !instruction.is_empty() {
-            messages.insert(0, ChatMessage::system(instruction));
-        }
-        messages.push(request.user_message());
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
         let (cancel, mut cancelled) = watch::channel(false);
@@ -489,7 +488,8 @@ impl Harness {
                 &client,
                 &store,
                 &request,
-                messages,
+                history,
+                instruction,
                 &notifications,
                 &sent_flag,
                 &refs_for_task,
@@ -598,12 +598,14 @@ pub fn resolve_interrupted(context: &RuntimeContext, turn: &str) -> Result<(), S
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tool_loop(
     context: &RuntimeContext,
     client: &Client,
     store: &store::Store,
     request: &TurnRequest,
-    mut messages: Vec<ChatMessage>,
+    history: store::History,
+    instruction: String,
     events: &broadcast::Sender<Event>,
     sent: &AtomicBool,
     request_refs: &std::sync::Mutex<Vec<Value>>,
@@ -611,6 +613,9 @@ async fn tool_loop(
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Event, Failure> {
     let deadline = tokio::time::Instant::now() + request.deadline;
+    // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
+    let (mut messages, rounds) =
+        handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
     let mut chain = ChainState::new(context, request, usage::next_number());
     let mut spent = 0u32;
     for step in 0..request.limits.max_steps {
@@ -620,19 +625,27 @@ async fn tool_loop(
         }
         let route = &request.route.routes[chain.route];
         progress.lock().unwrap_or_else(|p| p.into_inner()).model = route.model.clone();
-        let delivered = filter_model_messages(context, messages.clone())?;
-        // Capture only structured references from the request being issued. Later read
-        // results and recalled tool facts may add sources absent from the inbound wake.
-        *request_refs.lock().unwrap_or_else(|p| p.into_inner()) = model_request_refs(&delivered);
-        // #175: an oversized tool result reaches the model as a preview. The references above are
-        // read from the whole filtered copy, so they still cover every ID the preview shows.
-        let delivered = preview_tool_results(delivered, request.limits.tool_result_chars);
         // #160: the menu is narrowed by the current authority and tool switches before every
         // request, a retry included; revoked authority ends the turn here, as in `check_bound`.
         let offered = request.tools.model_tools().map_err(|error| match error {
             tools::CheckError::Revoked(_) => Failure::Cancelled,
             tools::CheckError::Unavailable(reason) => Failure::Failed(reason),
         })?;
+        // #6: the request fits its route's history budget by leaving out the oldest whole rounds;
+        // #175: an oversized tool result reaches the model as a preview; #160: a replayed call to a
+        // tool this request does not offer reaches it as text (`budget::fit`).
+        let limit = budget::limit(&context.load_config()?, &route.spec.id);
+        let (kept, delivered) = budget::fit(
+            filter_model_messages(context, messages.clone())?,
+            &rounds,
+            &offered,
+            request.limits,
+            limit,
+        );
+        // Capture only structured references from the request being issued. Later read results
+        // and recalled tool facts may add sources absent from the inbound wake. They are read from
+        // the whole filtered copy of the rounds kept, so they still cover every ID a preview shows.
+        *request_refs.lock().unwrap_or_else(|p| p.into_inner()) = model_request_refs(&kept);
         // Each request caps its output at the remaining token budget, up to its route's cap.
         let max_tokens = request
             .limits
@@ -1818,3 +1831,7 @@ mod media_tests;
 #[cfg(test)]
 #[path = "harness/route_tests.rs"]
 mod route_tests;
+
+#[cfg(test)]
+#[path = "harness/handover_tests.rs"]
+mod handover_tests;
