@@ -967,7 +967,7 @@ impl ChainState {
                     Outcome::Ok,
                     format!("retrying the same route after {} ms", wait.as_millis()),
                 );
-                route_health::observe(context, &request.route.specs(), self.route, route_health::Seen::Failed { class: "quota" }); match miss { // RED-M2
+                match miss {
                     routes::Miss::RateLimited { .. } => self.rate_limited = true,
                     routes::Miss::Empty => self.empty_answers += 1,
                     routes::Miss::Dropped => self.retried = true,
