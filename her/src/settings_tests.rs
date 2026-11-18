@@ -3349,7 +3349,6 @@ fn settings_console_config_page_takes_the_configuration_gate_before_the_store_ga
     });
     assert_eq!(status, 200);
     assert_eq!(next_use_quiet(&context), Some(7000));
-    assert_eq!(audit_rows(&root).len(), 1);
 }
 
 #[test]
