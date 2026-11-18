@@ -1,7 +1,8 @@
 //! Mode profiles: per participation mode or harness job, the exact tool menu the harness offers and
 //! who may use it. A turn's admission captures its profile (`Tools::capture`), and every tool call
-//! rechecks it against the current mode, owner and tool switches (`tools.rs`). The mode prompt
-//! (#140) and the reply policy (#159) are not columns of this table yet.
+//! rechecks it against the current mode, owner and tool switches (`tools.rs`). Each profile a
+//! harness turn admits also names its mode prompt (#140, `prompt_key`), a text setting the turn's
+//! system message starts with. The reply policy (#159) is not a column of this table yet.
 //!
 //! Menus hold only tools HER registers and handles in process (`mcp::tool_list`,
 //! `aux_mcp::tool_list`): the bare names of the tools DSH's presets allow under the
@@ -210,6 +211,18 @@ impl Profile {
             Self::Reserved2Owner => RESERVED2_OWNER,
             Self::Digest => DIGEST,
             Self::SlangLearner => SLANG_LEARNER,
+        }
+    }
+
+    /// The text setting (`prompt_text`) holding this profile's mode prompt. `None` for the profiles
+    /// no harness turn admits yet (`turn_engine::Adapter::supports`): the reserved2 rows and the
+    /// jobs. The change that admits one of them adds its key here.
+    pub(crate) fn prompt_key(self) -> Option<&'static str> {
+        match self {
+            Self::Chat => Some(crate::prompt_text::MODE_CHAT_KEY),
+            Self::OwnerPrivate => Some(crate::prompt_text::MODE_OWNER_PRIVATE_KEY),
+            Self::ClosedAgent => Some(crate::prompt_text::MODE_CLOSED_AGENT_KEY),
+            Self::Reserved2 | Self::Reserved2Owner | Self::Digest | Self::SlangLearner => None,
         }
     }
 }

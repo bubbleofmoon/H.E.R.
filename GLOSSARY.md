@@ -96,7 +96,7 @@ What runs the model work of one admitted turn for a conversation, DSH or the har
 _Avoid_: backend (a CLI route), conversation engine
 
 **Mode profile (模式档案, `harness::profile`)**:
-What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it and who may use it. HER checks it when a turn is admitted and again before every tool call.
+What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it, who may use it and the mode prompt its turns start with. HER checks it when a turn is admitted and again before every tool call.
 _Avoid_: preset, tool whitelist, tool guard
 
 **Model route (模型路由, `harness::routes`)**:

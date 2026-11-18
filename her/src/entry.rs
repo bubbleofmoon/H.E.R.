@@ -21,6 +21,7 @@ mod pipeline;
 mod harness;
 mod turn_engine;
 mod prompt;
+mod prompt_text;
 mod briefing;
 mod briefing_delivery;
 mod initial_prompts;

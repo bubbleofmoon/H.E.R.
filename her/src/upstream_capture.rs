@@ -65,7 +65,7 @@ static THREAD_START_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Latin terms, matched case-insensitively as whole words (an ASCII letter or digit on either side
 /// is not a match, so `dshReady` or `qq_send_message` pass while `user/dsh` and `deepseek娘` fail).
-const DENIED_WORDS: [&str; 13] = [
+pub(crate) const DENIED_WORDS: [&str; 13] = [
     "deepseek", "dsh", "harness", "opencode", "codex", "claude", "anthropic", "astrbot", "cliproxy",
     "antigravity", "openai", "chatgpt", "gpt",
 ];
