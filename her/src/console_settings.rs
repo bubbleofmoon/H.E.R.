@@ -3,9 +3,11 @@
 //! (Host, credential, JSON and Origin checks, request audit); the registry, validation, the store and its history live
 //! in `settings.rs` and `settings/`. Bodies and queries name the setting as `setting`, never `key`, which the console's
 //! conversation-key preflight would refuse. The conversation scope's page and routes (#218) are in
-//! `console_settings/conversation.rs`.
+//! `console_settings/conversation.rs`; the model route page and list (#162, `GET /settings/models`,
+//! `GET /api/settings/models`) in `console_settings/models.rs`.
 
 mod conversation;
+mod models;
 
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Map, Value};
@@ -15,7 +17,11 @@ const JSON_TYPE: &str = "application/json; charset=utf-8";
 const HTML_TYPE: &str = "text/html; charset=utf-8";
 
 pub fn is_route(path: &str) -> bool {
-    path == "/settings" || path == "/settings/conversations" || path == "/api/settings" || path.starts_with("/api/settings/")
+    path == "/settings"
+        || path == "/settings/conversations"
+        || path == "/settings/models"
+        || path == "/api/settings"
+        || path.starts_with("/api/settings/")
 }
 
 /// `authority` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
@@ -31,8 +37,10 @@ pub fn route(
     let result = match (method, path) {
         ("GET", "/settings") => return (200, HTML_TYPE, PAGE.to_string()),
         ("GET", "/settings/conversations") => return (200, HTML_TYPE, conversation::PAGE.to_string()),
+        ("GET", "/settings/models") => return (200, HTML_TYPE, models::PAGE.to_string()),
         ("GET", "/api/settings") => crate::settings::view(context),
         ("GET", "/api/settings/conversations") => conversation::list(context),
+        ("GET", "/api/settings/models") => models::list(context),
         ("GET", "/api/settings/history") => history(context, query),
         ("POST", "/api/settings/set") => set(context, body, authority),
         ("POST", "/api/settings/reset") => reset(context, body, authority),

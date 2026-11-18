@@ -138,9 +138,32 @@ fn route_spec(entry: &Value) -> Result<RouteSpec, &'static str> {
     })
 }
 
+/// The route conversation `conversation`'s turns ask first (#162), read when each turn starts: the conversation's own
+/// model route in the settings store (`settings::CONVERSATION_ROUTE`, through `settings::conversation_value`; a reset
+/// stored none), else the global setting `harness.firstRoute` on `cfg`, the loader's document. `None` for none. Whether
+/// it names a route of the chain is `conversation_order`'s to decide.
+pub(crate) fn selected(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Option<String> {
+    let stored = crate::settings::conversation_value(context, conversation, crate::settings::CONVERSATION_ROUTE.key);
+    let value = stored.unwrap_or_else(|| crate::settings::HARNESS_FIRST_ROUTE.read(cfg));
+    value.as_str().map(str::to_string)
+}
+
+/// `chain` in the order a conversation's turns walk it (#162): the route whose id is `selected` first, then the other
+/// routes in configured order. A selection that names no route of `chain` (none, or a route since removed or renamed)
+/// leaves the configured order. Ids compare as stored strings on both sides. The result holds every route of `chain`
+/// once, so another order is another fingerprint (`chain_signature`) with its own failover memory.
+pub(crate) fn conversation_order(chain: &[RouteSpec], selected: Option<&str>) -> Vec<RouteSpec> {
+    let mut order = chain.to_vec();
+    if let Some(at) = selected.and_then(|id| order.iter().position(|route| route.id == id)) {
+        let route = order.remove(at);
+        order.insert(0, route);
+    }
+    order
+}
+
 /// A route id: 1 to `ROUTE_ID_MAX_CHARS` ASCII letters, digits, `.`, `_` or `-`, and never `default`, the fallback key
-/// of `harness.rotation.caps`.
-fn valid_id(id: &str) -> bool {
+/// of `harness.rotation.caps`. The settings kind of a route id (`settings::kinds::RouteId`) uses the same rule.
+pub(crate) fn valid_id(id: &str) -> bool {
     (1..=ROUTE_ID_MAX_CHARS).contains(&id.len())
         && id != "default"
         && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
@@ -471,6 +494,25 @@ mod tests {
         assert_eq!(crate::digest::digest_model_id(&own).as_deref(), Some("d"));
         let invalid = json!({"harness": {"model": "h", "routes": [{"id": "a"}]}});
         assert_eq!(crate::digest::digest_model_id(&invalid), None, "an invalid chain is not configured");
+    }
+
+    #[test]
+    fn model_route_order_puts_the_selected_route_first_then_the_rest_in_configured_order() {
+        let base = chain(&routes(vec![route("a"), route("b"), route("c")])).unwrap();
+        let ids = |order: Vec<RouteSpec>| order.into_iter().map(|route| route.id).collect::<Vec<_>>();
+        assert_eq!(ids(conversation_order(&base, Some("c"))), ["c", "a", "b"], "the selected route first, then the rest in order");
+        assert_eq!(ids(conversation_order(&base, Some("b"))), ["b", "a", "c"]);
+        assert_eq!(ids(conversation_order(&base, Some("a"))), ["a", "b", "c"], "the first route selected is the configured order");
+        for unknown in [None, Some("z"), Some("B"), Some(" b"), Some("")] {
+            assert_eq!(ids(conversation_order(&base, unknown)), ["a", "b", "c"], "{unknown:?} names no route of the chain");
+        }
+        assert_ne!(
+            chain_signature(&conversation_order(&base, Some("c"))),
+            chain_signature(&base),
+            "another order is another fingerprint, with its own failover memory"
+        );
+        let single = chain(&json!({"harness": {"model": "m1"}})).unwrap();
+        assert_eq!(ids(conversation_order(&single, Some("m1"))), ["m1"], "a chain of one route stays as it is");
     }
 
     #[test]

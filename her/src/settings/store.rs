@@ -7,8 +7,8 @@
 mod conversation;
 
 pub(crate) use conversation::{
-    apply_conversation, canonical_conversation, conversation_admitted, conversation_view, reset_conversation,
-    CONVERSATION_ERROR,
+    apply_conversation, canonical_conversation, conversation_admitted, conversation_value, conversation_view,
+    reset_conversation, CONVERSATION_ERROR,
 };
 
 use super::{find, find_conversation, registry, Setting, OWNER};

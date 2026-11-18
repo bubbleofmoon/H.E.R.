@@ -1428,7 +1428,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         take_model_error(&self.context, key);
         let begun = std::time::Instant::now();
         self.chat_guard(key, "")?;
-        let route = ModelRoute::from_runtime(&self.context, cfg)?;
+        // #162: the conversation's selected model route first, then the other routes in configured order.
+        let route = ModelRoute::for_conversation(&self.context, cfg, key)?;
         let harness = Harness::open(&self.context)?;
         let recorder = self.cur_turn.as_ref().ok_or("harness requires a durable bridge turn")?;
         let attempt = format!("harness:{}", recorder.id);

@@ -13,9 +13,9 @@ use serde_json::{json, Map, Value};
 /// The refusal of a write to a conversation the bridge does not answer.
 const NOT_ADMITTED_ERROR: &str = "conversation is not admitted; admit it first";
 
-/// What the page says of every value it lists (the turn engine settings are not read yet).
+/// What the page says of the values it lists: the turn engine settings are not read yet; the model route is (#162).
 const NOT_READ_NOTE: &str =
-    "Stored only: turns do not read these choices yet; they follow conversationEngines in config.json until the conversation switch lands.";
+    "Stored only: turns do not read the turn engine choices yet; they follow conversationEngines in config.json until the conversation switch lands. The model route applies from the conversation's next harness turn (the model routes page).";
 
 /// The `conversation` member: a conversation key, canonicalized (`group:0042` is `group:42`), else 400.
 fn conversation_field(fields: &Map<String, Value>) -> Result<String, (u16, String)> {
@@ -27,8 +27,8 @@ fn conversation_field(fields: &Map<String, Value>) -> Result<String, (u16, Strin
 }
 
 /// Every admitted conversation under `cfg`: the admitted ids of both allow lists and the owner's private chat, as
-/// canonical keys, sorted.
-fn admitted_conversations(cfg: &Value) -> Vec<String> {
+/// canonical keys, sorted. The model route list (`console_settings/models.rs`) lists the same conversations.
+pub(super) fn admitted_conversations(cfg: &Value) -> Vec<String> {
     let mut keys: Vec<String> = ["group", "private"]
         .into_iter()
         .flat_map(|kind| {
@@ -113,9 +113,10 @@ pub(super) fn reset(context: &RuntimeContext, body: &str, authority: crate::pers
     write(context, body, authority, true)
 }
 
-/// The page: the note that these choices are not read yet, then one row per conversation and setting from
+/// The page: the note on which choices turns read, then one row per conversation and setting from
 /// `GET /api/settings/conversations` (the engine today, the stored choice and the value that applies) with a select of
-/// the options, a set (`POST /api/settings/conversation/set`) and a reset (`POST /api/settings/conversation/reset`)
+/// the options (a text input for a setting without options: the model route, #162), a set
+/// (`POST /api/settings/conversation/set`) and a reset (`POST /api/settings/conversation/reset`)
 /// button, and a history button that lists `GET /api/settings/history?conversation=<key>`, newest first, with an undo
 /// button per entry (`POST /api/settings/undo`). Text is shown with `textContent` only.
 pub(super) const PAGE: &str = r##"<!doctype html>
@@ -137,7 +138,7 @@ const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':S
 const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
 const shown=v=>v==null?'(none)':JSON.stringify(v);
 let shownConversation=null;
-async function list(){const j=await api('/api/settings/conversations');if(!j.ok)return;$('#note').textContent=j.note;if(j.storeError)$('#msg').textContent='Stored settings cannot be read: '+j.storeError;const st=$('#settings tbody');st.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.default),cell(s.global));st.append(tr)}const tb=$('#list tbody');tb.replaceChildren();for(const c of j.conversations){for(const s of j.settings){const v=c.settings[s.key];const tr=document.createElement('tr');const select=document.createElement('select');for(const o of s.kind.options){const opt=document.createElement('option');opt.value=o;opt.textContent=o;select.append(opt)}select.value=v.value;const field=document.createElement('td');field.append(select);tr.append(cell(c.conversation),cell(c.admitted?'yes':'no'),cell(c.engineToday),cell(s.key),cell(v.value),cell(shown(v.stored)),field,action('Set',async()=>{const r=await api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key});if(r.ok)refresh()}),action('History',()=>{shownConversation=c.conversation;history()}));tb.append(tr)}}}
+async function list(){const j=await api('/api/settings/conversations');if(!j.ok)return;$('#note').textContent=j.note;if(j.storeError)$('#msg').textContent='Stored settings cannot be read: '+j.storeError;const st=$('#settings tbody');st.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.default),cell(s.global));st.append(tr)}const tb=$('#list tbody');tb.replaceChildren();for(const c of j.conversations){for(const s of j.settings){const v=c.settings[s.key];const tr=document.createElement('tr');const select=document.createElement(s.kind.options?'select':'input');for(const o of s.kind.options||[]){const opt=document.createElement('option');opt.value=o;opt.textContent=o;select.append(opt)}select.value=v.value==null?'':v.value;const field=document.createElement('td');field.append(select);tr.append(cell(c.conversation),cell(c.admitted?'yes':'no'),cell(c.engineToday),cell(s.key),cell(v.value),cell(shown(v.stored)),field,action('Set',async()=>{const r=await api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key});if(r.ok)refresh()}),action('History',()=>{shownConversation=c.conversation;history()}));tb.append(tr)}}}
 async function history(){const tb=$('#history tbody');tb.replaceChildren();if(shownConversation==null)return;$('#historyTitle').textContent='History of '+shownConversation;const j=await api('/api/settings/history?conversation='+encodeURIComponent(shownConversation));if(!j.ok)return;for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const r=await api('/api/settings/undo',{entry:e.entry});if(r.ok)refresh()}));tb.append(tr)}}
 function refresh(){list();history()}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};

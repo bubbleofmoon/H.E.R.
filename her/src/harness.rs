@@ -56,12 +56,15 @@ pub(crate) fn redact_credential(text: &str, key: &str) -> String {
 }
 
 /// A turn's candidate chain on the selected runtime's relay, authenticated with the harness credential: the configured
-/// routes (`routes::chain`), tried in order from `start`. Credentials are opaque: never derive Debug or serialize this
-/// value.
+/// routes (`routes::chain`) in the order the turn walks them (`for_conversation`: the conversation's selected route
+/// first), tried in that order from `start`. Credentials are opaque: never derive Debug or serialize this value.
 pub struct ModelRoute {
     key: String,
     endpoint: String,
+    /// The routes in the order this turn walks them.
     routes: Vec<Route>,
+    /// The same routes in configured order: route health keys on it whatever order the turn walks (`observe`).
+    configured: Vec<routes::RouteSpec>,
     /// The route the turn starts on: the conversation's sticky degraded route, set at admission.
     start: usize,
 }
@@ -73,20 +76,41 @@ impl ModelRoute {
         &self.routes[0].model
     }
 
-    /// The selected runtime's chain (`routes::chain`); without a valid one the turn fails as not configured.
+    /// The selected runtime's chain (`routes::chain`) in configured order, whatever a conversation selected (tests;
+    /// turns use `for_conversation`); without a valid one the turn fails as not configured.
+    #[cfg(test)]
     pub fn from_runtime(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
         if !context.is_isolated() {
             return Err("harness requires a selected runtime".into());
         }
-        Self::build(context, routes::chain(cfg)?)
+        let chain = routes::chain(cfg)?;
+        Self::build(context, chain.clone(), chain)
+    }
+
+    /// #162: the chain conversation `conversation`'s turn walks: its selected route first (`routes::selected`: its own
+    /// model route, else `harness.firstRoute`), then the other routes in configured order (`routes::conversation_order`);
+    /// the configured order when the selection names no route of the chain.
+    pub fn for_conversation(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Result<Self, String> {
+        if !context.is_isolated() {
+            return Err("harness requires a selected runtime".into());
+        }
+        let chain = routes::chain(cfg)?;
+        let order = routes::conversation_order(&chain, routes::selected(context, cfg, conversation).as_deref());
+        Self::build(context, order, chain)
     }
 
     /// The selected runtime's relay route for `model` alone, authenticated with the harness credential.
     pub fn for_model(context: &RuntimeContext, model: &str) -> Result<Self, String> {
-        Self::build(context, vec![routes::RouteSpec::implicit(model.to_string())])
+        let chain = vec![routes::RouteSpec::implicit(model.to_string())];
+        Self::build(context, chain.clone(), chain)
     }
 
-    fn build(context: &RuntimeContext, chain: Vec<routes::RouteSpec>) -> Result<Self, String> {
+    /// `order` is the walk, `configured` the same routes in configured order.
+    fn build(
+        context: &RuntimeContext,
+        order: Vec<routes::RouteSpec>,
+        configured: Vec<routes::RouteSpec>,
+    ) -> Result<Self, String> {
         if !context.is_isolated() {
             return Err("harness requires a selected runtime".into());
         }
@@ -101,7 +125,7 @@ impl ModelRoute {
             return Err("harness model credential is empty".into());
         }
         let endpoint = format!("{}/v1/", origin.trim_end_matches('/'));
-        let routes = chain
+        let routes = order
             .into_iter()
             .map(|spec| Route {
                 id: redact_credential(&spec.id, key),
@@ -118,6 +142,7 @@ impl ModelRoute {
             key: key.to_string(),
             endpoint: endpoint.replace(key, "[REDACTED]"),
             routes,
+            configured,
             start: 0,
         })
     }
@@ -137,9 +162,19 @@ impl ModelRoute {
         routes::chain_signature(&self.specs())
     }
 
-    /// The chain's routes as configured.
+    /// The chain's routes in the order this turn walks them (its failover memory's fingerprint, `signature`).
     fn specs(&self) -> Vec<routes::RouteSpec> {
         self.routes.iter().map(|route| route.spec.clone()).collect()
+    }
+
+    /// #162: records route health (`route_health::observe`) for route `at` of this turn's walk at its place in the
+    /// configured chain, so the health state and its all-routes-failed episode stay one per configured chain whatever
+    /// order a conversation walks. The walk holds the configured routes, each once (`routes::conversation_order`), so
+    /// every walked route has a place; an `at` past the walk records nothing.
+    fn observe(&self, context: &RuntimeContext, at: usize, seen: route_health::Seen) {
+        let Some(id) = self.routes.get(at).map(|route| route.spec.id.as_str()) else { return };
+        let Some(place) = self.configured.iter().position(|spec| spec.id == id) else { return };
+        route_health::observe(context, &self.configured, place, seen);
     }
 }
 
@@ -734,7 +769,7 @@ async fn tool_loop(
             }
         }
         // The route answered: its health is ok again (`route_health`).
-        route_health::observe(context, &request.route.specs(), chain.route, route_health::Seen::Answered);
+        request.route.observe(context, chain.route, route_health::Seen::Answered);
         let message =
             ChatMessage::assistant(content).with_reasoning_content(end.captured_reasoning_content);
         let event = Event::Assistant {
@@ -940,7 +975,7 @@ impl ChainState {
             });
             // A route failure is the route's health too (`route_health`); a retry on the same route is not.
             let class = crate::model_failure::Failure::classify("", &summary).class;
-            route_health::observe(context, &request.route.specs(), self.route, route_health::Seen::Failed { class });
+            request.route.observe(context, self.route, route_health::Seen::Failed { class });
         };
         match next {
             routes::Next::Fail => {

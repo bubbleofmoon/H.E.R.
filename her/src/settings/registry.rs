@@ -11,7 +11,8 @@ pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP}
 #[cfg(test)]
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use model::{
-    DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, WEB_SEARCH_MODEL,
+    CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS,
+    HARNESS_MODEL, WEB_SEARCH_MODEL,
 };
 
 use super::{ConversationSetting, Setting};
@@ -23,7 +24,7 @@ const GROUPS: [&[Setting]; 5] = [reply::SETTINGS, model::SETTINGS, prompt::SETTI
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its
 /// global setting (`ConversationSetting::global`), which is in `registry()`.
 pub(crate) fn conversation_registry() -> impl Iterator<Item = &'static ConversationSetting> {
-    engine::CONVERSATION.iter()
+    engine::CONVERSATION.iter().chain(model::CONVERSATION.iter())
 }
 
 /// The conversation-scoped setting with key `key`.

@@ -61,7 +61,8 @@ pub(crate) fn conversation_admitted(cfg: &Value, conversation: &str) -> bool {
 
 /// The stored conversation values on an open connection, ordered by conversation and key; none on a store of version 1.
 /// A row whose key the conversation registry does not have, whose conversation is not canonical, or whose value its
-/// setting does not accept is skipped.
+/// setting does not keep (`Setting::storable` of its global setting: a valid value, or none where the default is none,
+/// which a reset stores) is skipped.
 fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
     if schema_version(conn)? < 2 {
         return Ok(Vec::new());
@@ -82,12 +83,32 @@ fn read_values(conn: &Connection) -> Result<Vec<Stored>, String> {
         if !is_canonical(&conversation) {
             continue;
         }
-        let Some(value) = serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.normalize(&value)) else {
+        let Some(value) = serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.global.storable(&value)) else {
             continue;
         };
         values.push(Stored { setting, conversation, value, text, revision });
     }
     Ok(values)
+}
+
+/// #162: the stored value of the conversation setting `key` for `conversation` (canonicalized), read through the store's
+/// read-only connection, for a reader that runs when a turn starts: `Some` with the value its global setting keeps
+/// (`Setting::storable`: `null` for none, which a reset stores where the default is none), else `None`: a legacy context,
+/// an unknown key, a key that is not a conversation key, no store, a store of version 1, no row, a value the registry
+/// does not keep, or a store that cannot be read. The caller then reads the global setting; a store problem never fails a
+/// turn. It never writes, migrates or creates the store, and takes no gate.
+pub(crate) fn conversation_value(context: &RuntimeContext, conversation: &str, key: &str) -> Option<Value> {
+    if !context.is_isolated() {
+        return None;
+    }
+    let setting = find_conversation(key)?;
+    let conversation = canonical_conversation(conversation)?;
+    let Ok(Inspection::Ready(conn)) = inspect(context) else { return None };
+    if schema_version(&conn).ok()? < 2 {
+        return None;
+    }
+    let (text, _) = stored_row(&conn, &conversation, setting.key).ok()??;
+    serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.global.storable(&value))
 }
 
 /// The stored text and revision of `key` for `conversation`, read in the caller's transaction.
@@ -269,7 +290,7 @@ pub(super) fn undo_entry(
         .map(|text| {
             serde_json::from_str::<Value>(&text)
                 .ok()
-                .and_then(|value| setting.normalize(&value))
+                .and_then(|value| setting.global.storable(&value))
                 .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
         })
         .transpose()?;

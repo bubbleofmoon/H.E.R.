@@ -5,6 +5,8 @@ use super::*;
 
 const ENGINE: &str = "conversation.engine";
 const ENGINE_DEFAULT_KEY: &str = "engine.default";
+/// #162: the model route kept per conversation.
+const ROUTE: &str = "conversation.route";
 const NOT_ADMITTED: &str = "conversation is not admitted; admit it first";
 const CONVERSATION_REFUSED: &str = "conversation must be group:<id> or private:<id>";
 const ENGINE_REFUSED: &str = "conversation.engine must be one of dsh, harness";
@@ -658,17 +660,25 @@ fn conversation_settings_page_lists_and_sets_through_the_routes() {
             "key": ENGINE, "scope": "conversation", "group": "turn engine", "label": "Turn engine",
             "hint": crate::settings::CONVERSATION_ENGINE.hint, "applies": "not read yet",
             "kind": {"type": "choice", "options": ["dsh", "harness"]}, "default": "dsh", "global": ENGINE_DEFAULT_KEY,
+        }, {
+            "key": ROUTE, "scope": "conversation", "group": "model and cost", "label": "Model route",
+            "hint": crate::settings::CONVERSATION_ROUTE.hint, "applies": "live",
+            "kind": {"type": "route id", "maxChars": 64}, "default": null, "global": "harness.firstRoute",
         }]),
         "the list names the conversation scope"
     );
     assert_eq!(
         body["conversations"],
-        json!([{"conversation": OWNER_CHAT, "admitted": true, "engineToday": "dsh", "settings": {ENGINE: {"stored": null, "value": "dsh"}}}])
+        json!([{"conversation": OWNER_CHAT, "admitted": true, "engineToday": "dsh", "settings": {
+            ENGINE: {"stored": null, "value": "dsh"},
+            ROUTE: {"stored": null, "value": null},
+        }}])
     );
     assert!(body["note"].as_str().unwrap().starts_with("Stored only"), "the page says the choices are not read yet: {body}");
     for needle in [
         "api('/api/settings/conversations')",
         "$('#note').textContent=j.note",
+        "document.createElement(s.kind.options?'select':'input')",
         "api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value})",
         "api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key})",
         "'/api/settings/history?conversation='+encodeURIComponent(shownConversation)",
@@ -738,4 +748,142 @@ fn conversation_settings_undo_never_stores_a_value_for_a_conversation_that_is_no
     let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
     assert_eq!(status, 200, "removing a value needs no admission: {body}");
     assert!(stored_conversations(&root).is_empty(), "the value is removed");
+}
+
+/// #162: the refusal of a value that is not a route id.
+const ROUTE_REFUSED: &str = "conversation.route must be a route id of 1 to 64 ASCII letters, digits, '.', '_' or '-', not default";
+
+/// #162: the `conversation` row of `GET /api/settings/models`.
+fn model_row(body: &Value, conversation: &str) -> Value {
+    body["conversations"].as_array().unwrap().iter().find(|row| row["conversation"] == conversation).cloned().unwrap_or_else(|| panic!("{conversation} is listed: {body}"))
+}
+
+#[test]
+fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_with_no_dsh_running() {
+    // The fixture's DSH address has nothing listening: the list reads only the configuration, the store and route health.
+    let (root, context) = settings_fixture("model route list");
+    admit_groups(&root, json!([101]));
+    write_config(&root, |config| {
+        config["harness"] = json!({"routes": [
+            {"id": "a", "model": "deepseek-v4-pro", "reasoningEffort": "high"},
+            {"id": "b", "model": "m-synthetic-model-key-162", "maxOutputTokens": 1000, "retry429": false},
+        ]});
+    });
+    std::fs::write(root.0.join("config/harness-api-key"), "synthetic-model-key-162").unwrap();
+    let chain = crate::harness::routes::chain(&context.load_config().unwrap()).unwrap();
+    crate::harness::route_health::observe(&context, &chain, 1, crate::harness::route_health::Seen::Failed { class: "quota" });
+    let (status, body) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(status, 200, "{body}");
+    let routes = body["routes"].as_array().unwrap().clone();
+    assert_eq!((routes[1]["health"]["state"].clone(), routes[1]["health"]["class"].clone()), (json!("failed"), json!("quota")), "{body}");
+    assert!(routes[1]["health"]["since"].is_i64(), "{body}");
+    assert_eq!(routes[0]["health"], json!({"state": "unknown"}), "nothing observed for route a");
+    assert_eq!(
+        (routes[0]["id"].clone(), routes[0]["model"].clone(), routes[0]["reasoningEffort"].clone(), routes[0]["maxOutputTokens"].clone(), routes[0]["retry429"].clone()),
+        (json!("a"), json!("deepseek-v4-pro"), json!("high"), json!(4096), json!(true))
+    );
+    assert_eq!(
+        (routes[1]["model"].clone(), routes[1]["maxOutputTokens"].clone(), routes[1]["retry429"].clone()),
+        (json!("m-[REDACTED]"), json!(1000), json!(false)),
+        "the harness credential is never returned"
+    );
+    assert!(!body.to_string().contains("synthetic-model-key-162"), "{body}");
+    assert_eq!((routes[0]["price"]["label"].clone(), routes[0]["price"]["estimated"].clone()), (json!("DeepSeek-V4-Pro-0813"), json!(false)));
+    assert_eq!(routes[1]["price"]["estimated"], true, "a model the price table lacks is priced as an estimate");
+    assert_eq!((body["allFailed"].clone(), body["firstRoute"].clone(), body["setting"].clone()), (json!(false), Value::Null, json!(ROUTE)));
+    assert_eq!(
+        model_row(&body, OWNER_CHAT),
+        json!({"conversation": OWNER_CHAT, "admitted": true, "stored": null, "route": null, "inChain": false, "order": ["a", "b"]})
+    );
+    // A conversation's route is set through the settings routes and listed with the order its next turn walks.
+    let (status, reply) = post(&context, "/api/settings/conversation/set", json!({"conversation": "group:101", "setting": ROUTE, "value": "b"}));
+    assert_eq!(status, 200, "{reply}");
+    let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(
+        model_row(&body, "group:101"),
+        json!({"conversation": "group:101", "admitted": true, "stored": "b", "route": "b", "inChain": true, "order": ["b", "a"]})
+    );
+    assert_eq!(model_row(&body, OWNER_CHAT)["order"], json!(["a", "b"]), "another conversation keeps the configured order");
+    // The global first route applies to a conversation without its own.
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "harness.firstRoute", "value": "b"}));
+    assert_eq!(status, 200, "{reply}");
+    let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!((body["firstRoute"].clone(), model_row(&body, OWNER_CHAT)["order"].clone()), (json!("b"), json!(["b", "a"])));
+    // A stored route the chain no longer has is listed and ignored.
+    write_config(&root, |config| config["harness"]["routes"][1]["id"] = json!("b2"));
+    let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
+    let row = model_row(&body, "group:101");
+    assert_eq!((row["route"].clone(), row["inChain"].clone(), row["order"].clone()), (json!("b"), json!(false), json!(["a", "b2"])));
+    // An invalid chain is listed with its error and no routes; the conversations stay listed.
+    write_config(&root, |config| config["harness"]["routes"] = json!([{"id": "a"}]));
+    let (status, body) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!((status, body["error"].clone(), body["routes"].clone()), (200, json!("harness route 1 is invalid (model)"), json!([])), "{body}");
+    assert_eq!(model_row(&body, "group:101")["order"], json!([]));
+    // The page and the list are administrator-only and need a selected runtime.
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let (status, content_type, page) =
+        crate::console_settings::route(&context, "GET", "/settings/models", &HashMap::new(), "", false, &granted);
+    assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
+    let (status, _) = admin_request(&context, "GET", "/settings/models", None);
+    assert_eq!(status, 200, "the page is served behind the console front");
+    for path in ["/settings/models", "/api/settings/models"] {
+        let (status, reply) = agent_request(&context, "GET", path, None, "fixture-agent-token");
+        assert_eq!(status, 403, "{path}: {reply}");
+    }
+    let (status, _, reply) =
+        crate::console_settings::route(&RuntimeContext::legacy(), "GET", "/api/settings/models", &HashMap::new(), "", false, &granted);
+    assert_eq!(status, 503, "{reply}");
+    for needle in [
+        "api('/api/settings/models')",
+        "api('/api/settings/conversation/set',{conversation:c.conversation,setting:j.setting,value:select.value})",
+        "api('/api/settings/conversation/reset',{conversation:c.conversation,setting:j.setting})",
+        "'x-console-token'",
+    ] {
+        assert!(page.contains(needle), "the page uses {needle}");
+    }
+    assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
+    let source = include_str!("../../console_settings/models.rs");
+    assert!(!source.contains("write_atomic(RuntimeArea::Config") && !source.contains("dsh"), "the list writes nothing and asks no DSH");
+}
+
+#[test]
+fn model_route_setting_is_kept_per_conversation_and_a_reset_stores_none_that_an_undo_restores() {
+    let (root, context) = settings_fixture("model route setting");
+    let set = |value: Value| post(&context, "/api/settings/conversation/set", json!({"conversation": OWNER_CHAT, "setting": ROUTE, "value": value}));
+    let (status, body) = set(json!("b"));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post(&context, "/api/settings/conversation/reset", json!({"conversation": OWNER_CHAT, "setting": ROUTE}));
+    assert_eq!((status, body["value"].clone(), body["changed"].clone()), (200, Value::Null, json!(true)), "{body}");
+    assert_eq!(crate::settings::conversation_value(&context, OWNER_CHAT, ROUTE), Some(Value::Null), "a reset stores none");
+    let (status, body) = set(json!("c"));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, &format!("?conversation={OWNER_CHAT}"));
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!((status, body["stored"].clone()), (200, Value::Null), "undoing the change after a reset restores none: {body}");
+    assert_eq!(crate::settings::conversation_value(&context, OWNER_CHAT, ROUTE), Some(Value::Null));
+    assert_eq!(model_row(&admin_request(&context, "GET", "/api/settings/models", None).1, OWNER_CHAT)["route"], Value::Null);
+    for value in [json!("default"), json!("a b"), json!(""), json!(" a"), json!("x".repeat(65)), Value::Null, json!(1)] {
+        let (status, body) = set(value.clone());
+        assert_eq!((status, body["error"].clone()), (400, json!(ROUTE_REFUSED)), "{value}");
+    }
+    // The global setting follows the global rules (written back into config.json); a conversation's value never is.
+    let (status, body) = post(&context, "/api/settings/set", json!({"setting": "harness.firstRoute", "value": "b"}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(stored_config(&root)["harness"]["firstRoute"], "b");
+    assert!(!std::fs::read_to_string(root.0.join("config/config.json")).unwrap().contains(ROUTE), "no conversation's route reaches config.json");
+    assert_eq!(crate::settings::conversation_value(&context, "group:101", ROUTE), None, "a conversation without a value");
+    assert_eq!(crate::settings::conversation_value(&context, "group:1/x", ROUTE), None, "not a conversation key");
+    assert_eq!(crate::settings::conversation_value(&context, OWNER_CHAT, ENGINE_DEFAULT_KEY), None, "not a conversation setting");
+    assert_eq!(setting_view(&context, "harness.firstRoute")["kind"], json!({"type": "route id", "maxChars": 64}));
+    let (status, body) = post(&context, "/api/settings/set", json!({"setting": "harness.firstRoute", "value": "a/b"}));
+    assert_eq!((status, body["error"].clone()), (400, json!("harness.firstRoute must be a route id of 1 to 64 ASCII letters, digits, '.', '_' or '-', not default")));
+    // Old and newer stores: a version-1 store holds no conversation value, and a store this release cannot read gives
+    // none, so the global setting applies and no turn fails.
+    let (old_root, old) = settings_fixture("model route old store");
+    let (status, body) = set_quiet(&old, json!(4500));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!((StoreProbe::at(&old_root.0).user_version(), crate::settings::conversation_value(&old, OWNER_CHAT, ROUTE)), (1, None));
+    let (newer_root, newer) = settings_fixture("model route newer store");
+    StoreProbe::at(&newer_root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;");
+    assert_eq!(crate::settings::conversation_value(&newer, OWNER_CHAT, ROUTE), None, "a newer store reads as no value");
 }
