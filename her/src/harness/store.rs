@@ -11,6 +11,36 @@ use std::sync::Mutex;
 const DB: &str = "conversations.db";
 const STORAGE_ERROR: &str = "harness conversation storage is unavailable";
 
+/// One completed turn's replayed facts, in order, and the event sequence of its last fact.
+#[derive(Clone, Debug)]
+pub(crate) struct Round {
+    pub through: i64,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// What an admission replays (`Store::admit`): the newest checkpoint's summary and the completed turns after it.
+#[derive(Clone, Debug)]
+pub(crate) struct History {
+    /// The summary the session's newest checkpoint carries (`None`: no checkpoint, or one without a summary).
+    pub summary: Option<String>,
+    /// The completed turns after that checkpoint, oldest first.
+    pub rounds: Vec<Round>,
+    /// When the session's last turn ended (ms): the idle start of the idle rotation check. `None`: none ended yet.
+    pub idle_from: Option<i64>,
+}
+
+impl History {
+    /// The replayed messages: the summary (`handover::summary_message`), then each round's facts.
+    pub(crate) fn messages(&self) -> Vec<ChatMessage> {
+        let mut messages: Vec<ChatMessage> =
+            self.summary.as_deref().map(super::handover::summary_message).into_iter().collect();
+        for round in &self.rounds {
+            messages.extend(round.messages.iter().cloned());
+        }
+        messages
+    }
+}
+
 pub(crate) struct Store {
     context: RuntimeContext,
     conn: Mutex<Connection>,
@@ -143,8 +173,9 @@ impl Store {
         .transpose()
     }
 
-    /// Atomic admission and attempt intent, before the model request is allowed to start.
-    pub fn admit(&self, request: &TurnRequest) -> Result<Vec<ChatMessage>, String> {
+    /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
+    /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
+    pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -168,37 +199,58 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(|_| STORAGE_ERROR)?;
+        let (through, summary) = latest_checkpoint(&tx, &session)?;
+        let idle_from: Option<i64> = tx
+            .query_row("SELECT MAX(ended_ms) FROM turns WHERE session_id=?1", [&session], |r| r.get(0))
+            .map_err(|_| STORAGE_ERROR)?;
         let history = {
-            let mut stmt = tx.prepare("SELECT e.kind,e.payload FROM events e JOIN turns t ON e.turn_id=t.id
-                WHERE e.session_id=?1 AND t.state='completed' AND e.kind IN ('user','assistant','tool_result') ORDER BY e.seq").map_err(|_| STORAGE_ERROR)?;
+            let mut stmt = tx.prepare("SELECT e.seq,e.turn_id,e.kind,e.payload FROM events e JOIN turns t ON e.turn_id=t.id
+                WHERE e.session_id=?1 AND e.seq>?2 AND t.state='completed' AND e.kind IN ('user','assistant','tool_result') ORDER BY e.seq").map_err(|_| STORAGE_ERROR)?;
             let facts = stmt
-                .query_map([&session], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                .query_map(params![session, through], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
                 })
                 .map_err(|_| STORAGE_ERROR)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| STORAGE_ERROR)?;
-            let mut messages = Vec::new();
-            for (kind, payload) in facts {
+            // Facts are grouped by turn: one round each, in event order.
+            let mut rounds: Vec<(String, Round)> = Vec::new();
+            for (seq, turn, kind, payload) in facts {
                 let payload: Value = serde_json::from_str(&payload).map_err(|_| STORAGE_ERROR)?;
-                if let Some(message) = payload.get("message") {
-                    messages
-                        .push(serde_json::from_value(message.clone()).map_err(|_| STORAGE_ERROR)?);
-                    continue;
+                let message: ChatMessage = match payload.get("message") {
+                    Some(message) => serde_json::from_value(message.clone()).map_err(|_| STORAGE_ERROR)?,
+                    // Version 1 events predate tools. Preserve their append-only bytes.
+                    None => {
+                        let text = payload["text"].as_str().ok_or(STORAGE_ERROR)?.to_string();
+                        if kind == "user" {
+                            ChatMessage::user(text)
+                        } else {
+                            ChatMessage::assistant(text).with_reasoning_content(
+                                payload["raw"]["captured_reasoning_content"]
+                                    .as_str()
+                                    .map(str::to_string),
+                            )
+                        }
+                    }
+                };
+                match rounds.last_mut() {
+                    Some((last, round)) if *last == turn => {
+                        round.through = seq;
+                        round.messages.push(message);
+                    }
+                    _ => rounds.push((turn, Round { through: seq, messages: vec![message] })),
                 }
-                // Version 1 events predate tools. Preserve their append-only bytes.
-                let text = payload["text"].as_str().ok_or(STORAGE_ERROR)?.to_string();
-                messages.push(if kind == "user" {
-                    ChatMessage::user(text)
-                } else {
-                    ChatMessage::assistant(text).with_reasoning_content(
-                        payload["raw"]["captured_reasoning_content"]
-                            .as_str()
-                            .map(str::to_string),
-                    )
-                });
             }
-            messages
+            History {
+                summary,
+                rounds: rounds.into_iter().map(|(_, round)| round).collect(),
+                idle_from,
+            }
         };
         let now = crate::parity_clock::now_ms();
         tx.execute("INSERT INTO turns(id,session_id,conversation,profile,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
@@ -360,6 +412,26 @@ impl Store {
         Ok(())
     }
 
+    /// Records the running turn's history step (`harness/handover.rs`) in one transaction: a summary that failed
+    /// (`checkpoint_failed`: purpose and failure class), then the session's new checkpoint (`checkpoint`: purpose, the
+    /// sequence of the last fact it covers and the summary it carries); either may be absent. Later admissions replay
+    /// from the newest checkpoint (`admit`); no fact is rewritten.
+    pub fn checkpoint(&self, turn: &str, failed: Option<Value>, checkpoint: Option<Value>) -> Result<(), String> {
+        let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| STORAGE_ERROR)?;
+        let session = running_session(&tx, turn)?;
+        if let Some(failed) = failed {
+            append(&self.context, &tx, &session, turn, None, "checkpoint_failed", failed)?;
+        }
+        if let Some(checkpoint) = checkpoint {
+            append(&self.context, &tx, &session, turn, None, "checkpoint", checkpoint)?;
+        }
+        tx.commit().map_err(|_| STORAGE_ERROR)?;
+        Ok(())
+    }
+
     /// Commit the complete assistant fact and terminal states together, before notifying delivery.
     pub fn finish(
         &self,
@@ -413,6 +485,25 @@ impl Store {
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())
     }
+}
+
+/// The newest checkpoint of `session` (`Store::checkpoint`): the sequence of the last fact it covers and the summary it
+/// carries; `(0, None)` without one.
+fn latest_checkpoint(tx: &Transaction<'_>, session: &str) -> Result<(i64, Option<String>), String> {
+    let payload: Option<String> = tx
+        .query_row(
+            "SELECT payload FROM events WHERE session_id=?1 AND kind='checkpoint' ORDER BY seq DESC LIMIT 1",
+            [session],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|_| STORAGE_ERROR)?;
+    let Some(payload) = payload else {
+        return Ok((0, None));
+    };
+    let payload: Value = serde_json::from_str(&payload).map_err(|_| STORAGE_ERROR)?;
+    let through = payload["through"].as_i64().ok_or(STORAGE_ERROR)?;
+    Ok((through, payload["summary"].as_str().map(str::to_string)))
 }
 
 fn running_session(tx: &Transaction<'_>, turn: &str) -> Result<String, String> {
@@ -583,8 +674,6 @@ pub(crate) fn assistant_texts(context: &RuntimeContext, conversation: &str, afte
 /// `model_attempt_started` event (the append-only sequence, not the wall clock): the idle rotation rule's evidence
 /// (`harness::rotation`). An older attempt never stands in for a newest one without reported usage. No database,
 /// session or answered attempt means `None`. Never creates or migrates storage.
-// The idle check built with the history budget (#6) calls this; remove this line then.
-#[allow(dead_code)]
 pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation: &str) -> Result<Option<super::rotation::LastCall>, String> {
     let path = context.resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR)?;
     if !path.exists() {
@@ -616,8 +705,6 @@ pub(crate) fn last_call(context: &RuntimeContext, conversation: &str, generation
 
 /// The route id a `model_attempt_started` payload names. An attempt from before routes names none: its model id was
 /// its route id, the one route of `harness.model`.
-// Only `last_call` calls this; remove this line with its own when the idle check (#6) calls it.
-#[allow(dead_code)]
 fn attempt_route(model: String, started: &str) -> String {
     serde_json::from_str::<Value>(started)
         .ok()
@@ -672,7 +759,7 @@ mod tests {
         let event = Event::Assistant { text:format!("ordinary {token_shape}"), raw:json!({"diagnostic":token_shape}), message };
         store.finish(&request.id, &Status::Completed("done".into()), Some(&event)).unwrap();
         request.id = "opaque-next".into();
-        let history = store.admit(&request).unwrap();
+        let history = store.admit(&request).unwrap().messages();
         let parts: Vec<_> = history.iter().flat_map(|m| m.content.iter()).collect();
         let binary = parts.iter().find_map(|p| match p { ContentPart::Binary(b) => Some(b), _ => None }).unwrap();
         let BinarySource::Base64(data) = &binary.source else { panic!("binary source changed") };

@@ -223,6 +223,7 @@ fn no_model_visible_text_names_a_harness_the_model_its_maker_the_install_layout_
     }
     surfaces.push(("harness session line".into(), crate::harness::session_instruction(key)));
     surfaces.push(("harness image placeholder".into(), crate::harness::NO_IMAGE_INPUT.to_string()));
+    surfaces.push(("harness summary request and history labels".into(), crate::harness::handover::label_sample()));
     let (primary_search_error, auto_search_error) = search_errors(&context);
     surfaces.push(("web search error (primary)".into(), primary_search_error));
     surfaces.push(("web search error (auto)".into(), auto_search_error));
