@@ -461,6 +461,24 @@ async fn harness_summary_a_summary_still_running_at_the_turn_deadline_fails_as_a
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn harness_summary_a_summary_whose_bound_has_already_passed_is_not_sent_and_fails_as_a_timeout() {
+    let mut rig = rig("summary-passed-bound", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
+    rig.seed(1..=19, long_prompt, json!({}));
+    // A 4 s deadline is already past its summary bound (the deadline less `SUMMARY_RESERVE`, 5 s) when the summary is
+    // about to be asked for: no provider call is made, and the summary fails as `timeout` like one that outlives it.
+    rig.deadline = Duration::from_secs(4);
+    let body = rig.turn("summary-passed-20", "现在回复", answer("好", 12)).await;
+    assert_eq!(rig.summaries().len(), 0, "a summary past its bound is never sent to the provider");
+    let failed = rig.events("checkpoint_failed");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["class"], "timeout");
+    let checkpoints = rig.events("checkpoint");
+    assert_eq!(checkpoints.len(), 1, "the budget checkpoint still covers the older rounds");
+    assert!(checkpoints[0]["summary"].is_null(), "with no earlier summary");
+    assert!(!texts(&body).iter().any(|text| text.starts_with(SUMMARY_LABEL)), "no summary reaches the model");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn harness_summary_text_only_facts_from_before_tools_are_summarised_on_an_unchanged_schema() {
     let rig = rig("v1", json!({"model":"fake-chat","contextTokens":{"fake-chat":1_000}}), |_| {
         Ok("旧的约定还在。".to_string())
