@@ -10,6 +10,15 @@ Read by reviewers and merge gates; each rule is a judgement call no automated ch
 ## Model-facing text
 
 - Chat text that reaches a model (prompts, tool results, extraction inputs) goes through `model_view` filtering (`socialV2.context.stripFromModelText` and the model-text blacklist). Stored data, logs, console views and outgoing messages keep the original chat text relative to model-view filtering. Diagnostic and harness model-text record copies still apply session-token masking (`docs/agents/dependency-recovery.md`, `docs/agents/harness.md`).
+- Every model-bound text rule (filtering, masking, length caps, blacklists) holds for the final delivered copy. A review follows the text from its source through each transform that follows (truncation, joining, escaping, templating, re-encoding) to the last string handed to the model and checks that copy; a rule applied only before a later transform is a required finding.
+
+## Concurrency
+
+- A new lock states its acquisition order against every existing lock it can be held with, in a comment where it is defined, and each path takes the locks in that order. Nothing waits while holding the store-style gate (the lock that serialises a store's reads and writes): no await, channel receive, other lock, sleep or I/O to another store. A path that can take two locks in opposite orders, or waits under the gate, is a required finding.
+
+## Comparisons
+
+- A canonical form used for equality or change detection treats a missing value, null and empty alike, on both sides of the comparison and on every path that builds it (stored, incoming, default). A comparison where one side maps missing to empty and the other does not is a required finding.
 
 ## Tests
 

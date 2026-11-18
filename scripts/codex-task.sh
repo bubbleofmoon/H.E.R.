@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs one Codex CLI task (implementation, fix, gate or review) and writes receipts next to the prompt:
-#   <name>.report.md (last message), <name>.out.log, <name>.err.log, <name>.exit.txt (numeric code or "timeout").
+#   <name>.report.md (last message), <name>.out.log, <name>.err.log, <name>.exit.txt (numeric code, "timeout",
+# or "no-report" / "quota" when no report was written; the latter two exit non-zero).
 # usage: scripts/codex-task.sh <name> <worktree> <prompt-file> [model] [effort] [sandbox] [timeout-minutes]
 # Defaults: gpt-6-astra, max, workspace-write, 360 (terra failed once, 2026-10-31; Claude Opus is the fallback).
 # workspace-write gets loopback/network access (tests and parity runners bind local ports) and write access to
@@ -26,5 +27,13 @@ if [ "$sandbox" = workspace-write ]; then
 fi
 nice -n 10 timeout --kill-after=60 "$((minutes * 60))" codex "${args[@]}" - < "$prompt" > "$out/$name.out.log" 2> "$out/$name.err.log"
 code=$?
-if [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then echo timeout > "$out/$name.exit.txt"; else echo "$code" > "$out/$name.exit.txt"; fi
+if [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; then
+  echo timeout > "$out/$name.exit.txt"
+elif [ ! -s "$out/$name.report.md" ]; then
+  # A run that left no report reviewed nothing: never a pass, whatever codex exited with.
+  if grep -q 'hit your usage limit' "$out/$name.err.log"; then echo quota > "$out/$name.exit.txt"; else echo no-report > "$out/$name.exit.txt"; fi
+  [ "$code" -eq 0 ] && code=1
+else
+  echo "$code" > "$out/$name.exit.txt"
+fi
 exit "$code"
