@@ -4,7 +4,8 @@ use super::SettingKind;
 use serde_json::{json, Value};
 
 /// Model-visible text: a JSON string of at most `max_chars` Unicode scalar values with no control character but line
-/// feed and tab, and no #142 denied term (`settings::denied_in_text`). An empty string is accepted and renders nothing.
+/// feed and tab, and no #142 denied term (`model_text_policy::denied_terms`). An empty string is accepted and renders
+/// nothing.
 /// A carriage return is refused, never converted, so the stored text is the text that renders. `default` passes the
 /// same check (registry test) and is what a missing or refused value reads as. Not for model ids (`ModelId`), which may
 /// hold a denied word.
@@ -25,7 +26,7 @@ impl SettingKind for Text {
         let max_chars = self.max_chars;
         value
             .as_str()
-            .filter(|text| text_shape_ok(text, max_chars) && crate::settings::denied_in_text(text).is_empty())
+            .filter(|text| text_shape_ok(text, max_chars) && crate::model_text_policy::denied_terms(text).is_empty())
             .map(|text| json!(text))
     }
 
@@ -39,7 +40,7 @@ impl SettingKind for Text {
         let denied = value
             .as_str()
             .filter(|text| text_shape_ok(text, max_chars))
-            .map(crate::settings::denied_in_text)
+            .map(crate::model_text_policy::denied_terms)
             .unwrap_or_default();
         if denied.is_empty() {
             format!("{key} must be text of at most {max_chars} characters, with no control character but line feed and tab")

@@ -3,8 +3,8 @@
 //! Layout: `kinds/` holds one file per setting kind, each a struct implementing `SettingKind` (parse a value, default,
 //! read a `config.json` value, refusal text, page view, chat wording); a `Setting` holds its kind as `&'static dyn
 //! SettingKind`, so no code matches on a kind. `registry/` holds one table per settings group, joined in a fixed order by
-//! `registry()`. `store.rs` holds the store. This file holds `Setting`, the denied-term check of text settings and the
-//! re-exports callers name as `crate::settings::X`.
+//! `registry()`. `store.rs` holds the store. This file holds `Setting` and the re-exports callers name as
+//! `crate::settings::X`. Text settings check denied terms through `model_text_policy::denied_terms`.
 //!
 //! The store is its own SQLite file with its own forward-only schema version (`PRAGMA user_version`); a newer version
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
@@ -74,111 +74,6 @@ pub(crate) fn check_confirmation(confirm: bool, changed: &[&Setting]) -> Result<
         )),
         _ => Ok(()),
     }
-}
-
-/// Whether `c` is an invisible format character (general category Cf), which the denied-term check reads through.
-fn is_invisible_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}'
-            | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{13438}' | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
-    )
-}
-
-/// One character folded for matching: full-width ASCII becomes ASCII and the ideographic space a space.
-fn fold_char(c: char) -> char {
-    match c {
-        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-        '\u{3000}' => ' ',
-        other => other,
-    }
-}
-
-/// The text folded for matching: each invisible format character becomes `invisible`, full-width ASCII is folded and
-/// letters are upper case.
-fn fold_for_match(text: &str, invisible: &str) -> String {
-    text.chars()
-        .flat_map(|c| {
-            if is_invisible_format(c) {
-                invisible.chars().collect::<Vec<char>>()
-            } else {
-                vec![fold_char(c)]
-            }
-        })
-        .collect::<String>()
-        .to_uppercase()
-}
-
-/// The denied words of `text` (`upstream_capture::DENIED_WORDS`, and `AI`) when each invisible format character is both
-/// a word boundary and a joiner. The text is the folded upper-case characters, each marked when a removed format run
-/// precedes it. A word matches with its inner characters contiguous, and each side of it may be a removed run or a
-/// character that is not a word character (`word_char` names the word characters).
-fn denied_words_across_format(text: &str) -> Vec<String> {
-    let mut upper: Vec<(char, bool)> = Vec::new();
-    let mut lower: Vec<(char, bool)> = Vec::new();
-    let mut run = false;
-    for c in text.chars() {
-        if is_invisible_format(c) {
-            run = true;
-            continue;
-        }
-        let mut boundary = std::mem::take(&mut run);
-        for u in fold_char(c).to_uppercase() {
-            upper.push((u, boundary));
-            for (i, l) in u.to_lowercase().enumerate() {
-                lower.push((l, boundary && i == 0));
-            }
-            boundary = false;
-        }
-    }
-    let mut found = Vec::new();
-    for word in crate::upstream_capture::DENIED_WORDS {
-        if spans_with_edges(&lower, word, |c| c.is_ascii_alphanumeric()) {
-            found.push(word.to_string());
-        }
-    }
-    if spans_with_edges(&upper, "AI", |c| c.is_ascii_alphabetic()) {
-        found.push("AI".to_string());
-    }
-    found
-}
-
-/// Whether `term` occurs in `units` (character, removed-run-before flag) with both edges boundaries: the character
-/// before it is a removed run or not a word character, and so is the character after it.
-fn spans_with_edges(units: &[(char, bool)], term: &str, word_char: fn(char) -> bool) -> bool {
-    let term: Vec<char> = term.chars().collect();
-    if term.is_empty() || units.len() < term.len() {
-        return false;
-    }
-    (0..=units.len() - term.len()).any(|start| {
-        let end = start + term.len();
-        units[start..end].iter().map(|unit| unit.0).eq(term.iter().copied())
-            && (start == 0 || units[start].1 || !word_char(units[start - 1].0))
-            && (end == units.len() || units[end].1 || !word_char(units[end].0))
-    })
-}
-
-/// The #142 denied terms (`upstream_capture::denied_terms`) in model-visible text, each once. The check reads the text
-/// three ways: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
-/// found; with them read as word boundaries, as the text is shown, so a refusal the text earns with them kept still
-/// holds; and with each of them both a boundary and a joiner (`denied_words_across_format`), so a word split by a mix
-/// of the two is found too. Full-width ASCII is folded and letters are upper case, so `ＤＳＨ` and `ai` are found too.
-pub(crate) fn denied_in_text(text: &str) -> Vec<String> {
-    let mut denied = crate::upstream_capture::denied_terms(&fold_for_match(text, ""));
-    for term in crate::upstream_capture::denied_terms(&fold_for_match(text, " ")) {
-        if !denied.contains(&term) {
-            denied.push(term);
-        }
-    }
-    for term in denied_words_across_format(text) {
-        if !denied.contains(&term) {
-            denied.push(term);
-        }
-    }
-    denied
 }
 
 /// One registry entry.

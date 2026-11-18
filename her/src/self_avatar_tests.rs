@@ -387,7 +387,7 @@ fn self_avatar_console_answer_and_tool_result_name_no_file_or_address() {
     };
     // No denied term, file name, folder or address; the tool description legitimately uses "/" between questions.
     let clean = |text: &str| {
-        assert!(crate::upstream_capture::denied_terms(text).is_empty(), "{text}");
+        assert!(crate::model_text_policy::denied_terms(text).is_empty(), "{text}");
         for leak in [".png", "assets", "qlogo", "http", "self-avatar", "identity.json", "娘"] {
             assert!(!text.contains(leak), "{leak} in {text}");
         }

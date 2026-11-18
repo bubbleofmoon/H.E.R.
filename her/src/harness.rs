@@ -1529,7 +1529,7 @@ mod tests {
         let texts: Vec<String> = delivered.iter().map(|m| m.content.joined_texts().unwrap_or_default()).collect();
         std::fs::remove_dir_all(root).unwrap();
         for text in &texts {
-            assert!(!crate::settings::denied_in_text(text).contains(&"dsh".to_string()), "{text}");
+            assert!(!crate::model_text_policy::denied_terms(text).contains(&"dsh".to_string()), "{text}");
         }
         assert_eq!(texts, ["【别像客服】D鲸鱼SH 鲸鱼好", "【别像客服】D\n\nSH", "ab"]);
     }

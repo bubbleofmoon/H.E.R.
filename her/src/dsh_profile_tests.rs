@@ -440,6 +440,24 @@ fn guard179_quoted_scalars_are_read_fully_or_refused() {
 }
 
 #[test]
+fn denied_term_policy_persona_text_refuses_full_width_zero_width_and_lower_case_forms() {
+    let (_root, context) = fixture("persona-forms");
+    write_compliant(&context);
+    let persona = "              prefix: |-\n                你是群里的普通成员。\n                - 不用列表回答。\n                说话简短。\n";
+    for replace in [
+        "              prefix: 像 ＡＩ 一样回答\n",
+        "              prefix: 像 A\u{200b}I 一样回答\n",
+        "              prefix: 像 ai 一样回答\n",
+        "              prefix: 别提 ｄｓｈ\n",
+    ] {
+        edit_preset(&context, |text| text.replacen(persona, replace, 1));
+        assert_eq!(problems(&context), codes(&["persona-text:preset1"]), "{replace:?}");
+        write(&context, PRESET_FILE, PRESET);
+    }
+    assert_eq!(check(&context), Ok(()), "the restored preset passes");
+}
+
+#[test]
 fn guard179_the_preset_bundle_is_required() {
     let (_root, context) = fixture("bundle");
     write_compliant(&context);
@@ -481,7 +499,7 @@ fn guard179_codes_name_preset_files_by_position_only() {
     let found = problems(&context);
     assert_eq!(found, codes(&["local-tools:preset2", "preset-bundle:preset3"]));
     for code in &found {
-        assert!(crate::upstream_capture::denied_terms(code).is_empty(), "{code}");
+        assert!(crate::model_text_policy::denied_terms(code).is_empty(), "{code}");
     }
 }
 
@@ -514,7 +532,7 @@ fn guard179_admit_refuses_and_alerts_once_per_gap_and_clears_on_fix() {
     let raised = alerts(&context);
     assert_eq!(raised.len(), 3, "a gap after a fix alerts again");
     for text in raised.iter().chain([&error]) {
-        assert!(crate::upstream_capture::denied_terms(text).is_empty(), "{text}");
+        assert!(crate::model_text_policy::denied_terms(text).is_empty(), "{text}");
     }
 }
 

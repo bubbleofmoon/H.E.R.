@@ -1461,7 +1461,7 @@ mod tests {
         }).to_string()).unwrap();
         let text = build_text_only_with_runtime(&context, "group:1", &[], "D鲸SH", "9001");
         std::fs::remove_dir_all(root).unwrap();
-        assert!(!crate::settings::denied_in_text(&text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
+        assert!(!crate::model_text_policy::denied_terms(&text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
         assert!(text.contains("（昵称未取到）"), "{text}");
     }
 

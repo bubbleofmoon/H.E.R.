@@ -357,15 +357,15 @@ async fn summarise_text(
 }
 
 /// A summary the history may carry: trimmed and not empty (`empty-response`), naming no #142 denied term
-/// (`settings::denied_in_text`, which folds full-width and splits zero-width characters) that `transcript` does not
-/// name (`wording`), cut to `SUMMARY_MAX_CHARS`.
+/// (`model_text_policy::denied_terms`, which folds full-width and splits zero-width characters) that `transcript` does
+/// not name (`wording`), cut to `SUMMARY_MAX_CHARS`.
 pub(crate) fn accept(transcript: &str, summary: &str) -> Result<String, &'static str> {
     let summary = summary.trim();
     if summary.is_empty() {
         return Err("empty-response");
     }
-    let known = crate::settings::denied_in_text(transcript);
-    if crate::settings::denied_in_text(summary)
+    let known = crate::model_text_policy::denied_terms(transcript);
+    if crate::model_text_policy::denied_terms(summary)
         .iter()
         .any(|term| !known.contains(term))
     {
@@ -406,7 +406,7 @@ pub(crate) fn label_sample() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::upstream_capture::denied_terms;
+    use crate::model_text_policy::denied_terms;
 
     #[test]
     fn harness_summary_accepts_only_wording_its_chat_already_had() {

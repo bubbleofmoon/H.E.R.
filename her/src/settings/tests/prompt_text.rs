@@ -238,7 +238,7 @@ fn denied_term_split_by_format_characters_is_refused_on_save_and_load() {
     // Invisible format characters read as joiners and as word boundaries at once: each spelling reads as `DSH`.
     let rule = crate::settings::find("prompt.notAClerk").unwrap();
     for split in ["x\u{200b}D\u{200b}SH", "x\u{200b}DS\u{200b}H", "x\u{200b}D\u{200b}S\u{200b}H"] {
-        assert!(crate::settings::denied_in_text(split).contains(&"dsh".to_string()), "{split:?}");
+        assert!(crate::model_text_policy::denied_terms(split).contains(&"dsh".to_string()), "{split:?}");
         assert!(rule.normalize(&json!(split)).is_none(), "{split:?} is accepted on load");
         let (_root, context) = prompt_fixture("prompt text split denied");
         let (status, body) = set_text(&context, "prompt.notAClerk", json!(split));
@@ -246,7 +246,7 @@ fn denied_term_split_by_format_characters_is_refused_on_save_and_load() {
     }
     // A split that a letter or digit touches is one word, not the term.
     for clean in ["x\u{200b}DSHy", "XDSHX", "x\u{200b}DSH1"] {
-        assert!(!crate::settings::denied_in_text(clean).contains(&"dsh".to_string()), "{clean:?}");
+        assert!(!crate::model_text_policy::denied_terms(clean).contains(&"dsh".to_string()), "{clean:?}");
     }
 }
 
@@ -278,7 +278,7 @@ fn prompt_text_render_stripped_again_on_delivery_never_makes_a_denied_term() {
     // The delivery strips the render again, as the DSH and CLI paths and the harness do.
     let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
     for text in [&render, &delivered] {
-        assert!(!crate::settings::denied_in_text(text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
+        assert!(!crate::model_text_policy::denied_terms(text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
         assert!(text.contains("【别像客服】新版 140\n\n"), "the last good version renders: {text}");
         assert!(!text.contains("D鲸"), "{text}");
     }
@@ -294,10 +294,10 @@ fn prompt_text_strip_joining_rules_across_their_boundary_never_makes_a_denied_te
     // The rules are joined by a blank line; stripping it from the whole render would make `DSH` of the two.
     write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["\n\n"]}));
     let render = next_render(&context);
-    assert!(!crate::settings::denied_in_text(&render).contains(&"dsh".to_string()), "{render}");
+    assert!(!crate::model_text_policy::denied_terms(&render).contains(&"dsh".to_string()), "{render}");
     let config = context.load_config_document().unwrap();
     let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
-    assert!(!crate::settings::denied_in_text(&delivered).contains(&"dsh".to_string()), "a denied term reached the model: {delivered}");
+    assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "a denied term reached the model: {delivered}");
 }
 
 #[test]

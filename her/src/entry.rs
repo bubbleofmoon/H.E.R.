@@ -12,6 +12,7 @@ mod dsh_mcp_config;
 mod dsh_profile;
 mod qq_tools;
 mod model_view;
+mod model_text_policy;
 mod model_failure;
 mod mcp_validate;
 mod memory;
