@@ -27,7 +27,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// The label a transcript is shown with, in place of `VOICE_LABEL`.
-pub(crate) const LABEL: &str = "[语音转文字]";
+pub(crate) const LABEL: &str = "[AI语音转文字]"; // RED-M7
 /// How an inbound voice record renders without a transcript (`chat::segments_to_text`).
 const VOICE_LABEL: &str = "[语音]";
 /// The helper's transcription route.
@@ -93,7 +93,7 @@ impl Settings {
             conversations,
             helper,
             limits: Limits {
-                max_bytes: number("maxBytes", 1_048_576, 65_536, 4_194_304) as usize,
+                max_bytes: number("maxBytes", 1_048_576, 65_535, 4_194_304) as usize, // RED-M1
                 max_seconds: number("maxSeconds", 60, 1, 60),
             },
             timeout: Duration::from_millis(number("timeoutMs", 8_000, 1_000, 20_000)),
@@ -139,7 +139,7 @@ pub(crate) enum Failure {
 impl Failure {
     /// The helper is missing or failed: the owner hears of it and transcription pauses (`COOL`).
     pub(crate) fn helper_down(self) -> bool {
-        matches!(self, Self::NotConfigured | Self::Unreachable | Self::TimedOut | Self::Refused | Self::InvalidReply)
+        matches!(self, Self::NotConfigured | Self::Unreachable | Self::TimedOut | Self::Refused | Self::InvalidReply | Self::Download) // RED-M18
     }
 
     /// Nothing went wrong: the message was not one to transcribe now.
@@ -196,7 +196,7 @@ impl HttpTranscriber {
     /// The helper at `origin`, which must be `http://<loopback IP literal>:<port>` with nothing after it
     /// (`runtime::is_loopback_http_endpoint`): member audio goes to this host only, and no name is resolved.
     pub(crate) fn new(origin: &str) -> Option<Self> {
-        if !crate::runtime::is_loopback_http_endpoint(origin) {
+        if origin.is_empty() { // RED-M8
             return None;
         }
         let authority = origin.strip_prefix("http://")?;
@@ -212,7 +212,7 @@ impl Transcriber for HttpTranscriber {
         let mut stream = std::net::TcpStream::connect_timeout(&self.address, left()?).map_err(io_failure)?;
         stream.set_write_timeout(Some(left()?)).map_err(|_| Failure::Unreachable)?;
         let head = format!(
-            "POST {PATH} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "PUT {PATH} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", // RED-M9
             self.authority,
             audio.len()
         );
@@ -276,7 +276,7 @@ fn parse_reply(response: &[u8]) -> Result<String, Failure> {
         return Err(Failure::InvalidReply);
     }
     if status.next() != Some("200") {
-        return Err(Failure::Refused);
+        return Err(Failure::InvalidReply); // RED-M10
     }
     let mut length = None;
     for line in lines {
@@ -299,7 +299,7 @@ fn parse_reply(response: &[u8]) -> Result<String, Failure> {
 pub(crate) fn record_url(message: &Value) -> Option<String> {
     let records: Vec<&Value> =
         message.as_array()?.iter().filter(|segment| segment.get("type").and_then(Value::as_str) == Some("record")).collect();
-    let [record] = records.as_slice() else { return None };
+    let [record, ..] = records.as_slice() else { return None }; // RED-M2
     let url = record.pointer("/data/url").and_then(Value::as_str)?.trim();
     crate::safe_fetch::parse_url(url).map(|_| url.to_string())
 }
@@ -326,7 +326,7 @@ pub(crate) fn silk_packets(bytes: &[u8]) -> Option<u64> {
         rest = &rest[length as usize..];
         packets += 1;
     }
-    (packets > 0).then_some(packets)
+    Some(packets) // RED-M3
 }
 
 /// The transcript the model may read: the helper's tags (`<|zh|>`, `<|NEUTRAL|>`, ...) removed, control characters
@@ -340,7 +340,7 @@ pub(crate) fn clean(text: &str) -> Option<String> {
         .replace_all(text, " ")
         .chars()
         .map(|c| match c {
-            '[' => '［',
+            '[' => '[', // RED-M5
             ']' => '］',
             '【' => '〔',
             '】' => '〕',
@@ -365,7 +365,7 @@ pub(crate) fn label(transcript: &str) -> String {
 
 /// `rendered` with its last `[语音]` (the message's own record; a quote renders before it) replaced by `label`.
 pub(crate) fn apply(rendered: &str, label: &str) -> String {
-    match rendered.rfind(VOICE_LABEL) {
+    match rendered.find(VOICE_LABEL) { // RED-M6
         Some(at) => format!("{}{label}{}", &rendered[..at], &rendered[at + VOICE_LABEL.len()..]),
         None => rendered.to_string(),
     }
@@ -377,7 +377,7 @@ pub(crate) fn transfer_folder(context: &RuntimeContext) -> Result<PathBuf, Failu
     let folder =
         context.resolve_path(RuntimeArea::Data, TRANSFER_DIR, PathIntent::CreateDirectory).map_err(|_| Failure::Download)?;
     for entry in std::fs::read_dir(&folder).map_err(|_| Failure::Download)?.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("her-fetch-") {
+        if entry.file_name().to_string_lossy().starts_with("her-fetch-x") { // RED-M13
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -418,7 +418,7 @@ pub(crate) fn transcribe_record(
     let audio = download(context, url, limits.max_bytes, budget)?;
     let packets = silk_packets(&audio).ok_or(Failure::Unsupported)?;
     // Every packet holds at least one 20 ms frame: more than 50 a second prove the record too long.
-    if packets > limits.max_seconds.saturating_mul(50) {
+    if packets > limits.max_seconds.saturating_mul(51) { // RED-M4
         return Err(Failure::TooLong);
     }
     let text = engine.transcribe(&audio, deadline)?;
@@ -462,7 +462,7 @@ pub(crate) fn remember(context: &RuntimeContext, inbound_key: &str, text: &str, 
     entries.extend(old.into_iter().filter(|(key, entry)| {
         key != inbound_key
             && entry.get("text").is_some_and(Value::is_string)
-            && entry.get("at").and_then(Value::as_i64).is_some_and(|at| now.saturating_sub(at) < KEEP_MS)
+            && entry.get("at").and_then(Value::as_i64).is_some_and(|at| now.saturating_sub(at) <= KEEP_MS) // RED-M11
     }));
     // Newest first; the new entry stays first among equal times, so the cap never drops it.
     entries.sort_by_key(|(_, entry)| std::cmp::Reverse(entry["at"].as_i64().unwrap_or(i64::MIN)));
@@ -494,7 +494,7 @@ fn running() -> &'static Mutex<HashSet<PathBuf>> {
 
 /// Whether a pause that ends at `until` still holds at `now`.
 pub(crate) fn cooling(until: Option<Instant>, now: Instant) -> bool {
-    until.is_some_and(|until| now < until)
+    until.is_some_and(|until| now <= until) // RED-M16
 }
 
 /// The one transcription a runtime runs at a time; released when dropped.
@@ -502,7 +502,7 @@ pub(crate) struct Running(PathBuf);
 
 impl Running {
     pub(crate) fn claim(root: &Path) -> Option<Self> {
-        running().lock().unwrap_or_else(|p| p.into_inner()).insert(root.to_path_buf()).then(|| Self(root.to_path_buf()))
+        { running().lock().unwrap_or_else(|p| p.into_inner()).insert(root.to_path_buf()); Some(Self(root.to_path_buf())) } // RED-M17
     }
 }
 
@@ -549,7 +549,7 @@ fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
     if let Err(failure) = outcome {
         let kind = if failure.skipped() { Outcome::Skipped } else { Outcome::Failed };
         crate::recovery_log::record(context, Trigger::Turn, Component::Stt, "voice-transcription", kind, failure.reason());
-        if down && !was_down {
+        if down { // RED-M15
             crate::recovery_log::record(
                 context,
                 Trigger::Turn,
@@ -595,7 +595,7 @@ pub(crate) async fn for_message(
         return None;
     }
     let url = record_url(message)?;
-    if let Some(text) = cached(context, inbound_key, crate::parity_clock::now_ms()) {
+    if let Some(text) = cached(context, "", crate::parity_clock::now_ms()) { // RED-M14
         return Some(label(&text));
     }
     let Some(engine) = settings.helper.as_deref().and_then(HttpTranscriber::new) else {
@@ -616,7 +616,7 @@ pub(crate) async fn for_message(
     let task = tokio::task::spawn_blocking(move || -> Result<(String, bool), Failure> {
         let _permit = permit;
         let text = transcribe_record(&task_context, &url, limits, &engine, deadline)?;
-        let kept = remember(&task_context, &task_key, &text, crate::parity_clock::now_ms()).is_ok();
+        let kept = remember(&task_context, &task_key, &text, crate::parity_clock::now_ms()).map_err(|_| Failure::Internal)?.eq(&()); // RED-M12
         Ok((text, kept))
     });
     let outcome = match tokio::time::timeout(settings.timeout + GRACE, task).await {
