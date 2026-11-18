@@ -185,7 +185,19 @@ fn settings_store_never_opens_memory_db() {
         assert!(!root.0.join("data").join(name).exists(), "{name} was created");
     }
     // The store's source names its own database only, and no memory module, area or attached database.
-    let source = include_str!("settings.rs");
+    let source = [
+        include_str!("settings.rs"),
+        include_str!("settings/store.rs"),
+        include_str!("settings/kinds.rs"),
+        include_str!("settings/kinds/integer.rs"),
+        include_str!("settings/kinds/model_id.rs"),
+        include_str!("settings/kinds/text.rs"),
+        include_str!("settings/registry.rs"),
+        include_str!("settings/registry/model.rs"),
+        include_str!("settings/registry/prompt.rs"),
+        include_str!("settings/registry/reply.rs"),
+    ]
+    .join("\n");
     assert!(source.contains("\"settings.db\""), "the store names its own database file");
     for needle in ["\"memory.db\"", "crate::memory", "RuntimeArea::Memory", "ATTACH", "attach"] {
         assert!(!source.contains(needle), "settings.rs contains {needle}");
@@ -747,75 +759,30 @@ fn settings_store_refuses_its_schema_with_an_extra_object() {
 
 #[test]
 fn settings_registry_is_complete_and_agrees_with_its_reader() {
-    let registry = crate::settings::REGISTRY;
+    let registry: Vec<_> = crate::settings::registry().collect();
     assert!(!registry.is_empty(), "the registry has settings");
     let mut keys: Vec<&str> = registry.iter().map(|setting| setting.key).collect();
     keys.sort();
     keys.dedup();
     assert_eq!(keys.len(), registry.len(), "registry keys are unique");
+    let mut pointers: Vec<&str> = registry.iter().map(|setting| setting.pointer).collect();
+    pointers.sort();
+    pointers.dedup();
+    assert_eq!(pointers.len(), registry.len(), "registry pointers are unique");
     for setting in registry {
         assert!(!setting.label.is_empty() && !setting.hint.is_empty() && !setting.group.is_empty(), "{}", setting.key);
         assert!(matches!(setting.applies, "live" | "next wake" | "restart"), "{}", setting.key);
         assert!(setting.pointer.starts_with('/') && !setting.pointer.contains('~'), "{}", setting.pointer);
         assert!(setting.pointer.split('/').skip(1).all(|name| !name.is_empty()), "{}", setting.pointer);
-        match setting.kind {
-            crate::settings::Kind::Integer { min, max, default, file } => {
-                assert!(min <= default && default <= max, "{}", setting.key);
-                assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
-                assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
-                assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
-                assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
-                assert_eq!(setting.default_value(), json!(default));
-                assert_eq!(setting.integer(&json!({})), default, "{}: a missing value reads as the default", setting.key);
-                if file == crate::settings::FileRule::Clamp {
-                    assert!(min >= 0, "{}: a clamped setting has non-negative bounds", setting.key);
-                }
-            }
-            crate::settings::Kind::ModelId { default } => {
-                if let Some(id) = default {
-                    assert_eq!(setting.normalize(&json!(id)), Some(json!(id)), "{}: the default is a model id", setting.key);
-                }
-                assert_eq!(setting.default_value(), default.map_or(Value::Null, |id| json!(id)), "{}", setting.key);
-                assert_eq!(setting.text(&json!({})), default.map(str::to_string), "{}", setting.key);
-            }
-            crate::settings::Kind::Text { max_chars, default } => {
-                // The compiled default passes its own check, so the fallback is never a refused text.
-                assert_eq!(setting.normalize(&json!(default)), Some(json!(default)), "{}", setting.key);
-                assert_eq!(setting.default_value(), json!(default));
-                let missing = setting.text(&json!({}));
-                assert_eq!(missing.as_deref(), Some(default), "{}: a missing value reads as the default", setting.key);
-                let longest = "鲸".repeat(max_chars);
-                assert_eq!(setting.normalize(&json!(longest)), Some(json!(longest)), "{}", setting.key);
-                assert_eq!(setting.normalize(&json!(format!("{longest}鲸"))), None, "{}", setting.key);
-                assert_eq!(setting.normalize(&json!("")), Some(json!("")), "{}", setting.key);
-                for refused in [json!("AI"), json!("ai"), json!("ＤＳＨ"), json!("a\rb"), json!(1), Value::Null] {
-                    assert_eq!(setting.normalize(&refused), None, "{}: {refused}", setting.key);
-                }
-                // The reader (`prompt_text::text`) agrees: the default without a value, the configured text when
-                // accepted, the default when refused.
-                let configured = |text: &str| {
-                    let mut document = json!(text);
-                    for name in setting.pointer.split('/').skip(1).collect::<Vec<_>>().into_iter().rev() {
-                        let mut object = serde_json::Map::new();
-                        object.insert(name.to_string(), document);
-                        document = Value::Object(object);
-                    }
-                    document
-                };
-                assert_eq!(crate::prompt_text::text(&json!({}), setting.key), default, "{}", setting.key);
-                assert_eq!(crate::prompt_text::text(&configured("鲸 140"), setting.key), "鲸 140", "{}", setting.key);
-                assert_eq!(crate::prompt_text::text(&configured("AI 140"), setting.key), default, "{}", setting.key);
-                // Prompt text is never chat-writable, so the model cannot rewrite its own prompt.
-                assert!(setting.pointer.starts_with("/prompts/"), "{}", setting.key);
-                assert!(!setting.chat, "{}: prompt text is never chat-writable", setting.key);
-            }
-        }
+        // Each kind checks its own bounds, default and reader (`SettingKind::check_entry`).
+        setting.kind.check_entry(setting);
     }
     // The registry owns the default and bounds the reader applies to the file (`wake_cfg_of`).
     let quiet = crate::settings::find(QUIET_KEY).expect("reply.wakeQuietMs is registered");
-    let crate::settings::Kind::Integer { min, max, default, .. } = quiet.kind else {
-        panic!("reply.wakeQuietMs is an integer setting");
-    };
+    let kind = quiet.kind.view();
+    assert_eq!(kind["type"], "integer", "reply.wakeQuietMs is an integer setting");
+    let (min, max) = (kind["min"].as_i64().unwrap(), kind["max"].as_i64().unwrap());
+    let default = quiet.default_value().as_i64().unwrap();
     for ms in [min - 1, min, default, max, max + 1] {
         let config = json!({"socialV2": {"reply": {"wakeQuietMs": ms}}});
         let expected = quiet.normalize(&json!(ms)).and_then(|value| value.as_i64()).unwrap_or(default);
@@ -828,7 +795,7 @@ fn settings_registry_is_complete_and_agrees_with_its_reader() {
 fn no_registry_setting_is_cached_on_the_config_stamp() {
     // `RuntimeContext::config_stamp` sees only the stored file. Values cached on it: `reserved.rs` (`social`),
     // `console_access.rs` (`allow`, `deny`, `allowAllWhenEmpty`, `ownerQQ`) and `history_log.rs` (`history`).
-    let registry = crate::settings::REGISTRY;
+    let registry: Vec<_> = crate::settings::registry().collect();
     assert!(!registry.is_empty(), "the registry has settings");
     for setting in registry {
         for cached in ["/social", "/allow", "/deny", "/allowAllWhenEmpty", "/ownerQQ", "/history"] {
@@ -1694,10 +1661,10 @@ fn model_and_cost_settings_have_no_reader_default() {
     ];
     for (file, source) in readers {
         for needle in owned {
-            assert!(!source.contains(needle), "{file} reads {needle} itself; read it through settings::REGISTRY");
+            assert!(!source.contains(needle), "{file} reads {needle} itself; read it through settings::registry()");
         }
     }
-    let registry = include_str!("settings.rs");
+    let registry = include_str!("settings/registry/model.rs");
     for needle in owned {
         assert!(registry.contains(needle), "settings.rs owns {needle}");
     }
@@ -2111,7 +2078,7 @@ fn chat_settings_come_from_the_registry_and_are_never_secret() {
     let all = chat(&context, "settings-get", json!({})).unwrap();
     let offered: Vec<String> =
         all["writable"].as_array().unwrap().iter().map(|name| name.as_str().unwrap().to_string()).collect();
-    let registry = crate::settings::REGISTRY;
+    let registry: Vec<_> = crate::settings::registry().collect();
     assert!(registry.iter().any(|setting| setting.chat), "the registry has a chat setting");
     for setting in registry.iter().filter(|setting| setting.chat) {
         let name = setting.chat_name();
@@ -3060,7 +3027,19 @@ fn settings_writers_take_the_configuration_gate_before_the_store_gate() {
     // Gate order: every writer of the store holds the configuration gate (`console::config_gate`: the routes'
     // authority, the chat tools' `memory_actions::handle`) and takes the store gate inside it. settings.rs never takes
     // the configuration gate, so no writer holds the store gate while it waits for the configuration gate.
-    let source = include_str!("settings.rs");
+    let source = [
+        include_str!("settings.rs"),
+        include_str!("settings/store.rs"),
+        include_str!("settings/kinds.rs"),
+        include_str!("settings/kinds/integer.rs"),
+        include_str!("settings/kinds/model_id.rs"),
+        include_str!("settings/kinds/text.rs"),
+        include_str!("settings/registry.rs"),
+        include_str!("settings/registry/model.rs"),
+        include_str!("settings/registry/prompt.rs"),
+        include_str!("settings/registry/reply.rs"),
+    ]
+    .join("\n");
     for needle in ["acquire_social_state_gate", "config_gate("] {
         assert!(!source.contains(needle), "settings.rs takes the configuration gate ({needle})");
     }
@@ -3369,7 +3348,7 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
         json!("plain probe text one"),
         json!("plain probe text two"),
     ];
-    for setting in crate::settings::REGISTRY {
+    for setting in crate::settings::registry() {
         let (root, context) = settings_fixture("settings direct write refused");
         let now = setting.read(&context.load_config_document().unwrap());
         let value = probes

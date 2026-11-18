@@ -1,4 +1,4 @@
-//! #140: model-visible prompt text as live data. Each text is a text setting of the registry (`settings::REGISTRY`,
+//! #140: model-visible prompt text as live data. Each text is a text setting of the registry (`settings::registry()`,
 //! group "prompt text"), stored in `data/settings.db` and edited on the settings page; the text here is its compiled
 //! default and the fallback. Readers take the configuration document the loader overlaid, so an edit is in effect at
 //! the next wake (briefing and compatibility render) or the next harness turn (mode prompts). They check the value again
@@ -55,7 +55,7 @@ pub(crate) fn text(cfg: &Value, key: &str) -> String {
     let Some(setting) = crate::settings::find(key) else {
         return String::new();
     };
-    let crate::settings::Kind::Text { default, .. } = setting.kind else {
+    let Some(default) = setting.kind.text_default() else {
         return String::new();
     };
     cfg.pointer(setting.pointer)
@@ -72,7 +72,7 @@ pub(crate) fn model_text(context: &crate::runtime::RuntimeContext, cfg: &Value, 
     let Some(setting) = crate::settings::find(key) else {
         return String::new();
     };
-    let crate::settings::Kind::Text { default, .. } = setting.kind else {
+    let Some(default) = setting.kind.text_default() else {
         return String::new();
     };
     let delivery = crate::model_view::with_blacklist(context, cfg);

@@ -1,7 +1,7 @@
 //! Settings console page and routes (`GET /settings`, `GET /api/settings`, `GET /api/settings/history`,
 //! `POST /api/settings/set`, `POST /api/settings/reset`, `POST /api/settings/undo`). Mounted behind the console front
 //! (Host, credential, JSON and Origin checks, request audit); the registry, validation, the store and its history live
-//! in `settings.rs`. Bodies and queries name the setting as `setting`, never `key`, which the console's
+//! in `settings.rs` and `settings/`. Bodies and queries name the setting as `setting`, never `key`, which the console's
 //! conversation-key preflight would refuse.
 
 use crate::runtime::RuntimeContext;
@@ -17,7 +17,7 @@ pub fn is_route(path: &str) -> bool {
 
 /// `authority` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
 /// it commits and its write-back into `config.json` is done (the store gate is taken inside it,
-/// `settings::write_store`).
+/// `settings::store::write_store`).
 pub fn route(
     context: &RuntimeContext, method: &str, path: &str, query: &HashMap<String, String>, body: &str, agent_call: bool,
     authority: crate::persona::Authority<'_>,
