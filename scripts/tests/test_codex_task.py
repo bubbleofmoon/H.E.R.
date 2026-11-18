@@ -114,7 +114,7 @@ class ShReceipts(Receipts, unittest.TestCase):
         fake.write_text(FAKE, encoding='utf-8')
         fake.chmod(0o755)
         env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
-        done = subprocess.run([BASH, str(SH), 'case', str(work), str(prompt), 'gpt-6-astra', 'high', 'read-only', '1'],
+        done = subprocess.run([BASH, str(SH), 'case', str(work), str(prompt), 'gpt-6.2-astra', 'high', 'read-only', '1'],
                               env=env, capture_output=True, text=True, timeout=120)
         return done.returncode, 'case', done.stdout + done.stderr
 
