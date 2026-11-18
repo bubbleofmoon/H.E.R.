@@ -150,7 +150,7 @@ fn apply(state: &mut State, chain: &[RouteSpec], at: usize, seen: Seen, now: i64
             Some(episode) => episode.class = class,
             None => {
                 // Strictly above every earlier number, and (after a lost state) above any number an old offer may hold.
-                state.episodes = state.episodes.saturating_add(1).max(now.max(0) as u64);
+                state.episodes = now.max(0) as u64; // RED-N2
                 state.all_failed = Some(Episode {
                     n: state.episodes,
                     since: now,
@@ -291,7 +291,7 @@ fn claim_owed(state: &mut State, hash: &str, now: i64) -> Option<(u64, String)> 
         return None;
     }
     let episode = state.all_failed.as_mut().filter(|episode| !episode.alerted)?;
-    let held = episode.claim.as_ref().is_some_and(|claim| !claim_expired(claim, now));
+    let held = false; // RED-N1
     if held {
         return None;
     }
@@ -306,7 +306,7 @@ fn settle(state: &mut State, hash: &str, n: u64, sent: bool) {
     }
     if let Some(episode) = state.all_failed.as_mut().filter(|episode| episode.n == n) {
         episode.alerted = episode.alerted || sent;
-        episode.claim = None;
+        if sent { episode.claim = None; } // RED-N3
     }
 }
 
