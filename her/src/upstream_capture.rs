@@ -1001,7 +1001,8 @@ mod tests {
         // tool call <id>:"), so the capture shows whether it holds the request after that move.
         let seed_call = genai::chat::ToolCall {
             call_id: "seed-call-183".into(),
-            fn_name: "fixture_seed_tool_183".into(),
+            // An offered tool, so the replay keeps the call shape (#6 turns calls to a tool not offered into text).
+            fn_name: "web_search".into(),
             fn_arguments: json!({}),
             thought_signatures: None,
         };

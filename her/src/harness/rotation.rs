@@ -1,8 +1,7 @@
 //! The idle rotation rule for harness conversations (`docs/agents/prompts-modes.md` "Harness idle rotation"): when
 //! a sleeping harness session becomes due, read from its last model request and the route's own cache life and cap.
 //! DSH's settings (`dsh.cacheTtlMinutes`, `dsh.rotation.caps`) and DSH's provider defaults never apply here.
-// The idle check that calls this rule is built with the history budget (#6); remove this line then.
-#![allow(dead_code)]
+//! `harness/handover.rs` calls it when a turn is admitted.
 
 use serde_json::Value;
 
