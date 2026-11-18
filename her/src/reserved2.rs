@@ -2218,7 +2218,7 @@ impl Hub {
             closing_misses: HashMap::new(),
             slang: {
                 let slang = crate::slang_learn::SlangLearning::new(context);
-                slang.start_dsh_watch();
+                slang.start_catch_up();
                 slang
             },
             lookups: None,

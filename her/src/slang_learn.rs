@@ -4,7 +4,7 @@
 //! `normalize_entry`。这里只负责：
 //!   1. 每个会话的最近消息窗口（最多 80 条）；
 //!   2. 阈值 + 冷却判断；
-//!   3. 拼抽取提示词、调模型（opencode-free，失败回落 DSH）；
+//!   3. 拼抽取提示词、调模型（默认：模型路由链第一条路由上的单次无工具作业，见 `route_extract`）；
 //!   4. 容错解析 JSON、按 JS 的 `upsertSlangEntry` 规则写回。
 //!
 //! 两条硬约束（来自 PLAN-SLANG-RUST.md）：
@@ -24,16 +24,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backend;
-use crate::dsh::{FollowStream, Rpc};
-use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use crate::runtime::{RuntimeArea, RuntimeContext};
 use crate::slang;
 
 /// 窗口文件（跨进程共享；主循环写、控制台读）。
 pub const WINDOWS_FILE: &str = crate::legacy_path!("qq-bridge/state/slang-windows.json");
-/// 黑话学习专用 DSH 会话（与 JS 的 `slang-session.json` 同一个文件，方便灰度回滚）。
-pub const SESSION_FILE: &str = crate::legacy_path!("qq-bridge/state/slang-session.json");
-/// 学习会话的目录（与 JS 的 `state/slang-agent` 一致）。
-const SESSION_DIR: &str = crate::legacy_path!("qq-bridge/state/slang-agent");
 /// 窗口最多保留多少条（与 JS 一致）。
 pub const WINDOW_MAX: usize = 80;
 /// 送进提示词的单条消息最长字符数（JS 的 `truncateText(text, 200)`）。
@@ -75,10 +70,13 @@ struct LearningInner {
     state: Mutex<WindowState>,
     extract_lock: tokio::sync::Mutex<()>,
     sync_lock: Mutex<()>,
-    /// Set while the DSH watcher sees `settings/describe` failing: automatic extraction is not
-    /// started (and no cooldown is spent) until DSH is ready again, like frozen `dshReady`.
-    dsh_down: std::sync::atomic::AtomicBool,
-    dsh_watching: std::sync::atomic::AtomicBool,
+}
+
+/// Runtime roots (`None`: the legacy runtime) whose startup catch-up this process already started. The first learning
+/// value of a root claims it; every later value of that root, in any process object, starts nothing.
+fn catch_up_roots() -> &'static Mutex<std::collections::HashSet<Option<std::path::PathBuf>>> {
+    static ROOTS: OnceLock<Mutex<std::collections::HashSet<Option<std::path::PathBuf>>>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Per-runtime black-slang learning state. Live code owns this value and clones it into async
@@ -96,8 +94,6 @@ impl SlangLearning {
                 state: Mutex::new(WindowState::default()),
                 extract_lock: tokio::sync::Mutex::new(()),
                 sync_lock: Mutex::new(()),
-                dsh_down: std::sync::atomic::AtomicBool::new(false),
-                dsh_watching: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -115,27 +111,15 @@ impl SlangLearning {
     }
 
     pub fn try_maybe_trigger(&self, cfg: &Value, key: &str) -> Result<bool, String> {
-        if self.inner.dsh_down.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(false);
-        }
         maybe_trigger_with_runtime(&self.inner.context, &self.inner.state, cfg, key)
     }
 
-    /// Record one DSH readiness observation. A transition to ready (the first observation counts,
-    /// as frozen `dshReady` starts false) revisits every retained window and calls `run` for each
-    /// one that is due, so windows that filled while DSH was down are not left until new traffic.
-    fn observe_dsh_with(&self, ready: bool, was_ready: &mut bool, mut run: impl FnMut(&str)) {
-        self.inner
-            .dsh_down
-            .store(!ready, std::sync::atomic::Ordering::Release);
-        let revisit = ready && !*was_ready;
-        *was_ready = ready;
-        if !revisit {
-            return;
-        }
+    /// Run `run` once for each retained window that is due now, so windows that filled before a
+    /// restart are not left until new traffic.
+    fn catch_up_with(&self, mut run: impl FnMut(&str)) {
         match self.due_retained_windows() {
             Ok(keys) => keys.iter().for_each(|key| run(key)),
-            Err(error) => crate::safe_println!("[slang] DSH 恢复后补触发失败：{error}"),
+            Err(error) => crate::safe_println!("[slang] 启动补抽取失败：{error}"),
         }
     }
 
@@ -173,7 +157,7 @@ impl SlangLearning {
         let cfg = match self.inner.context.load_config() {
             Ok(cfg) => cfg,
             Err(error) => {
-                crate::safe_println!("[slang] DSH 恢复后补触发失败 {key}：{error}");
+                crate::safe_println!("[slang] 启动补抽取失败 {key}：{error}");
                 return;
             }
         };
@@ -188,32 +172,33 @@ impl SlangLearning {
         report_auto_result(Ok(result), key);
     }
 
-    /// Start (once) the 5 s DSH readiness watch of frozen `checkDsh`. The thread ends when the
-    /// last `SlangLearning` clone is dropped.
-    pub fn start_dsh_watch(&self) {
-        use std::sync::atomic::Ordering;
-        if self.inner.dsh_watching.swap(true, Ordering::AcqRel) {
-            return;
+    /// Start the startup catch-up on its own thread, once per runtime root per process: the first learning value
+    /// of a root claims it (`catch_up_roots`), and a later call for that root starts nothing. Each retained window
+    /// that is already due is extracted in turn; one whose extraction fails stays for its next trigger. Returns the
+    /// thread's handle when this call started it.
+    pub fn start_catch_up(&self) -> Option<std::thread::JoinHandle<()>> {
+        let root = self.inner.context.runtime_root().map(std::path::Path::to_path_buf);
+        let claimed = catch_up_roots()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(root.clone());
+        if !claimed {
+            return None;
         }
-        let weak = Arc::downgrade(&self.inner);
+        let learning = self.clone();
         let spawned = std::thread::Builder::new()
-            .name("slang-dsh-watch".to_string())
-            .spawn(move || {
-                let mut was_ready = false;
-                loop {
-                    let Some(inner) = weak.upgrade() else { break };
-                    let learning = SlangLearning { inner };
-                    let ready = probe_dsh(&learning.inner.context);
-                    learning.observe_dsh_with(ready, &mut was_ready, |key| {
-                        learning.extract_blocking(key)
-                    });
-                    drop(learning);
-                    std::thread::sleep(Duration::from_secs(5));
-                }
-            });
-        if let Err(error) = spawned {
-            self.inner.dsh_watching.store(false, Ordering::Release);
-            crate::safe_println!("[slang] 无法启动 DSH 就绪监视：{error}");
+            .name("slang-catch-up".to_string())
+            .spawn(move || learning.catch_up_with(|key| learning.extract_blocking(key)));
+        match spawned {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                catch_up_roots()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&root);
+                crate::safe_println!("[slang] 无法启动黑话补抽取：{error}");
+                None
+            }
         }
     }
 
@@ -280,29 +265,6 @@ impl SlangLearning {
     }
 }
 
-/// `settings/describe` succeeds: the same readiness test as frozen `checkDsh`.
-fn probe_dsh(context: &RuntimeContext) -> bool {
-    let Ok(cfg) = context.load_config() else {
-        return false;
-    };
-    // Keep the watcher alive so enabling learning takes effect without a restart, but
-    // do not make readiness calls on behalf of a disabled feature.
-    if cfg.pointer("/slang/enabled").and_then(Value::as_bool) == Some(false) {
-        return false;
-    }
-    let base = if context.is_isolated() {
-        match context.dependency_url("dsh") {
-            Some(base) => base.to_string(),
-            None => return false,
-        }
-    } else {
-        cfg_str(&cfg, &["dsh", "baseUrl"], "http://127.0.0.1:3080").to_string()
-    };
-    Rpc::connect_with_runtime(context, &base)
-        .and_then(|rpc| rpc.call("settings/describe", json!({})))
-        .is_ok()
-}
-
 fn state() -> &'static Mutex<WindowState> {
     static STATE: OnceLock<Mutex<WindowState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(WindowState::default()))
@@ -359,7 +321,8 @@ pub fn cooldown_ms(cfg: &Value) -> i64 {
     cfg_i64(cfg, &["slang", "extractCooldownMs"], 300_000).max(0)
 }
 
-/// `slang.learnerBackend`, trimmed; blank or absent means `dsh` (the console stores the same value).
+/// `slang.learnerBackend`, trimmed; blank or absent means `dsh` (the console stores the same value), the default
+/// route (`route_extract`).
 fn learner_backend(cfg: &Value) -> &str {
     Some(cfg_str(cfg, &["slang", "learnerBackend"], "dsh").trim()).filter(|id| !id.is_empty()).unwrap_or("dsh")
 }
@@ -1305,295 +1268,59 @@ fn evidence_for(key: &str, msg: &SlangMsg) -> Value {
 
 // ── 后端调用 ────────────────────────────────────────────────────────────────
 
-fn new_runtime() -> Result<tokio::runtime::Runtime, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("创建 DSH 运行时失败：{e}"))
-}
+/// The backend name the default route reports in results, owner alerts and refusal records.
+const ROUTE_BACKEND: &str = "harness";
+/// The provider identity of the harness's OpenAI-compatible relay (`docs/agents/harness.md`).
+const ROUTE_PROVIDER: &str = "openai";
 
-fn read_session_file(context: &RuntimeContext) -> Result<Option<Value>, String> {
-    let text = if context.is_isolated() {
-        context
-            .read_optional_text(RuntimeArea::Data, "slang-session.json")
-            .map_err(|error| format!("读取候选黑话学习会话失败：{error}"))?
-    } else {
-        context
-            .read_text(RuntimeArea::Data, "slang-session.json")
-            .ok()
+/// One tool-less completion of `prompt` on the harness chain's first route (`harness::one_shot`): that route's model and
+/// `maxOutputTokens`, the selected runtime's current relay endpoint and the harness credential, bounded by `timeout_s`;
+/// the prompt is the request's only message. A failure (no valid route, a provider failure class, an empty answer,
+/// diagnostic-shaped output, refusal wording without a JSON array) alerts the owner with metadata only, records a
+/// refusal, and returns its content-free summary; the caller consumes and writes nothing.
+fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str, timeout_s: u64) -> Result<String, String> {
+    use crate::model_failure::Failure;
+    let route = crate::harness::routes::chain(cfg).ok().and_then(|chain| chain.into_iter().next());
+    let model_name = route.as_ref().map_or("unspecified", |route| route.model.as_str());
+    let fail = |failure: Failure| {
+        crate::model_failure::record_refusal(context, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure, &[]);
+        crate::model_failure::notify(context, cfg, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure);
+        failure.summary()
     };
-    let Some(text) = text else {
-        return Ok(None);
-    };
-    let parsed = match serde_json::from_str::<Value>(&text) {
-        Ok(value) => value,
-        Err(error) if context.is_isolated() => {
-            return Err(format!("候选黑话学习会话 JSON 损坏：{error}"));
-        }
-        Err(_) => return Ok(None),
-    };
-    if context.is_isolated() {
-        let Some(object) = parsed.as_object() else {
-            return Err("候选黑话学习会话结构异常".to_string());
-        };
-        // A previous JS/Rust record without preset metadata is valid and will be rebuilt below,
-        // but a field with the wrong type is corrupt candidate state. Do not turn it into a fresh
-        // session and overwrite the evidence.
-        for field in ["sessionId", "preset", "createdAt", "workspaceTitle"] {
-            if object.get(field).is_some_and(|value| !value.is_string()) {
-                return Err(format!("候选黑话学习会话字段 {field} 类型异常"));
-            }
-        }
+    // Each job reads the selected runtime's current relay endpoint, as the digest jobs do.
+    let current = context.runtime_root().and_then(|root| RuntimeContext::from_root(root).ok());
+    let text = crate::harness::one_shot::model_for(
+        current.as_ref().unwrap_or(context),
+        crate::harness::one_shot::Job::SlangLearner,
+        route.as_ref().map(|route| route.model.as_str()),
+        Duration::from_secs(timeout_s),
+        route.as_ref().map_or(crate::harness::routes::DEFAULT_MAX_OUTPUT_TOKENS, |route| route.max_output_tokens),
+    )
+    .and_then(|model| model.complete("", prompt))
+    .map_err(|error| fail(Failure::new(error.0, error.0)))?;
+    if text.trim().is_empty() {
+        return Err(fail(Failure::new("empty-response", "EMPTY_ANSWER")));
     }
-    Ok(Some(parsed))
+    if let Some(failure) = backend::plain_output_failure(&text) {
+        return Err(fail(failure));
+    }
+    // Both learner jobs answer with a JSON array, so refusal wording without one is a refusal, never an answer.
+    if !text.contains('[') && Failure::is_refusal(&text) {
+        return Err(fail(Failure::new("refusal", "MODEL_REFUSAL")));
+    }
+    Ok(text)
 }
 
-fn save_session_file(
-    context: &RuntimeContext,
-    sid: &str,
-    preset: &str,
-    workspace_title: &str,
-) -> Result<(), String> {
-    let text = json!({
-        "sessionId": sid,
-        "preset": preset,
-        "workspaceTitle": workspace_title,
-        "createdAt": now_iso(),
-    })
-    .to_string();
-    context
-        .write_atomic(RuntimeArea::Data, "slang-session.json", text.as_bytes())
-        .map_err(|e| format!("写学习会话文件失败：{e}"))
-}
-
-fn clear_session_file(context: &RuntimeContext) -> Result<(), String> {
-    context
-        .remove_file(RuntimeArea::Data, "slang-session.json")
-        .map_err(|error| format!("清除失效的黑话学习会话失败：{error}"))
-}
-
-pub fn invalidate_learner_session(context: &RuntimeContext) -> Result<(), String> {
-    if read_session_file(context)?.is_some() {
-        clear_session_file(context)?;
-    }
-    Ok(())
-}
-
-fn ensure_dsh_session(context: &RuntimeContext, rpc: &Rpc, cfg: &Value) -> Result<String, String> {
-    let workspace_title = cfg_str(cfg, &["slang", "workspaceTitle"], "QQ 黑话学习");
-    let preset = cfg_str(cfg, &["slang", "learnerPreset"], "")
-        .trim()
-        .to_string();
-    let preset = if preset.is_empty() {
-        cfg_str(cfg, &["agentPreset"], "qq-chat").to_string()
-    } else {
-        preset
-    };
-    // Corrupt selected state is rejected before any DSH request, preserving its bytes.
-    let saved_session = read_session_file(context)?;
-    // DSH may silently substitute its default for an unknown preset. Verify even a saved
-    // learner session before sending group text, just as the frozen bridge does.
-    let listed = rpc.call("agentPresets/list", json!({}))?;
-    let available = listed
-        .get("presets")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("id").and_then(Value::as_str) == Some(preset.as_str()))
-        });
-    if preset.trim().is_empty() || !available {
-        return Err("黑话学习缺少已验证的安全 preset，拒绝创建或复用会话".to_string());
-    }
-    // 旧记录没有 preset 元数据，无法证明权限，必须重建（与 JS 一致）。
-    if let Some(saved) = saved_session {
-        let same_preset = saved.get("preset").and_then(|p| p.as_str()) == Some(preset.as_str());
-        let same_workspace = saved
-            .get("workspaceTitle")
-            .and_then(Value::as_str)
-            .map_or(true, |title| title == workspace_title);
-        if let Some(sid) = saved.get("sessionId").and_then(|s| s.as_str()) {
-            if same_preset && same_workspace && !sid.trim().is_empty() {
-                return Ok(sid.to_string());
-            }
-        }
-    }
-    let workspace_dir = context
-        .resolve_path(
-            RuntimeArea::Data,
-            "slang-agent",
-            PathIntent::CreateDirectory,
-        )
-        .map_err(str::to_string)?;
-    let ws = rpc.call("workspace/create", json!({ "path": workspace_dir }))?;
-    let ws_id = ws
-        .get("workspace")
-        .and_then(|w| w.get("workspaceId"))
-        .and_then(|i| i.as_str())
-        .ok_or_else(|| format!("workspace/create 没返回 workspaceId：{ws}"))?;
-    if ws.get("created").and_then(Value::as_bool) == Some(true) && !workspace_title.is_empty() {
-        let _ = rpc.call(
-            "workspace/rename",
-            json!({"workspaceId": ws_id, "title": workspace_title}),
-        );
-    }
-    let created = rpc.call(
-        "session/create",
-        json!({ "workspaceId": ws_id, "agentPreset": preset }),
-    )?;
-    let sid = created
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| format!("session/create 没返回 sessionId：{created}"))?
-        .to_string();
-    save_session_file(context, &sid, &preset, workspace_title)?;
-    crate::safe_println!("[slang] 已创建黑话学习会话：{sid}（preset={preset}）");
-    Ok(sid)
-}
-
-async fn dsh_ask(rpc: &Rpc, sid: &str, prompt: &str, timeout_s: u64) -> Result<String, String> {
-    // 先订阅再投递：否则回合可能在订阅建立前就结束，实时流不重放。
-    let mut follow = FollowStream::open(&rpc.base, &rpc.cookie(), sid).await?;
-    let accepted = rpc.call(
-        "session/prompt",
-        json!({
-            "sessionId": sid,
-            "mode": "queue",
-            "content": [{ "type": "text", "text": prompt }]
-        }),
-    )?;
-    if accepted.get("accepted").and_then(|a| a.as_bool()) != Some(true) {
-        follow.close().await;
-        return Err(format!("prompt 未被接受：{accepted}"));
-    }
-    let reply = follow.next_turn(Duration::from_secs(timeout_s)).await;
-    let completed = follow
-        .last_ended
-        .get("reason")
-        .and_then(|r| r.get("kind"))
-        .and_then(Value::as_str)
-        == Some("completed");
-    let failure = crate::failover::classify_turn_end(&follow.last_ended);
-    follow.close().await;
-    let reply = reply?;
-    if let Some((_, code, detail)) = failure {
-        return Err(crate::model_failure::Failure::classify(&code, &detail).summary());
-    }
-    if !completed {
-        return Err("学习回合未完成或没有文本".to_string());
-    }
-    if reply.trim().is_empty() { return Err(crate::model_failure::Failure::new("empty-response", "EMPTY_ANSWER").summary()); }
-    Ok(reply)
-}
-
-/// Only DSH's exact `session-not-found` refusal proves the session is gone and the prompt never ran.
-/// Free text ("session busy", an unrelated 404, a dropped stream) is an unknown outcome and never
-/// discards the learner session or resubmits the extraction.
-fn session_gone(err: &str) -> bool {
-    crate::dsh::is_session_gone(err)
-}
-
-fn select_learner_model(rpc: &mut Rpc, cfg: &Value, sid: &str) -> Option<crate::failover::Candidate> {
-    for candidate in crate::failover::model_chain(cfg) {
-        for attempt in 0..2 {
-            let result = rpc.call(
-                "session/selectModel",
-                json!({
-                    "sessionId": sid,
-                    "provider": candidate.provider,
-                    "model": candidate.model,
-                    "reasoningEffort": candidate.effort,
-                }),
-            );
-            match result {
-                Ok(_) => return Some(candidate),
-                Err(error) => {
-                    crate::safe_println!("[slang] 设置学习会话模型失败：{error}");
-                    if error.contains("401") {
-                        let _ = rpc.relogin();
-                    }
-                    if attempt == 0 {
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                }
-            }
-        }
-    }
-    // The JS learner still submits the prompt if every model selection fails.
-    None
-}
-
-/// DSH 回落：复用 `state/slang-session.json` 里的固定学习会话；
-/// DSH 明确拒绝（`session-not-found`）时重建**一次**，再失败就放弃本轮。
-fn dsh_extract(
-    context: &RuntimeContext,
-    cfg: &Value,
-    key: &str,
-    prompt: &str,
-    timeout_s: u64,
-) -> Result<String, String> {
-    let base = if context.is_isolated() {
-        context
-            .dependency_url("dsh")
-            .ok_or_else(|| "selected runtime DSH endpoint is unavailable".to_string())?
-            .to_string()
-    } else {
-        cfg_str(cfg, &["dsh", "baseUrl"], "http://127.0.0.1:3080").to_string()
-    };
-    let mut rpc = Rpc::connect_with_runtime(context, &base).map_err(|error| {
-        let selected = crate::failover::model_chain(cfg)[0].clone();
-        let failure = crate::model_failure::Failure::classify("", &error);
-        crate::model_failure::notify(context, cfg, key, "dsh", &selected.provider, &selected.model, &failure);
-        error
-    })?;
-    let mut last_err = String::new();
-    for attempt in 0..2 {
-        let sid = match ensure_dsh_session(context, &rpc, cfg) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = e;
-                break;
-            }
-        };
-        let selected = select_learner_model(&mut rpc, cfg, &sid)
-            .unwrap_or_else(|| crate::failover::model_chain(cfg)[0].clone());
-        let rt = new_runtime()?;
-        match rt.block_on(dsh_ask(&rpc, &sid, prompt, timeout_s)) {
-            Ok(text) if !text.trim().is_empty() => return Ok(text),
-            Ok(_) => {
-                let failure = crate::model_failure::Failure::new("empty-response", "EMPTY_ANSWER");
-                crate::model_failure::notify(context, cfg, key, "dsh", &selected.provider, &selected.model, &failure);
-                return Err(failure.summary());
-            }
-            Err(e) => {
-                last_err = e.clone();
-                if attempt == 0 && session_gone(&e) {
-                    crate::safe_println!("[slang] DSH 学习会话失效，重建一次：{e}");
-                    if let Err(error) = clear_session_file(context) {
-                        last_err = format!("{e}；{error}");
-                        break;
-                    }
-                    continue;
-                }
-                let failure = crate::model_failure::Failure::classify("", &e);
-                crate::model_failure::record_refusal(context, key, "dsh", &selected.provider, &selected.model, &failure, &[]);
-                crate::model_failure::notify(context, cfg, key, "dsh", &selected.provider, &selected.model, &failure);
-                break;
-            }
-        }
-    }
-    Err(format!("DSH 抽取失败：{last_err}"))
-}
-
-/// `slang.learnerFallbackDsh`: after the pinned CLI learner fails, may the corpus go to DSH? Off unless
-/// exactly `true`, like `backends.failoverFallback`: a local or free learner never silently becomes a
-/// cloud route.
+/// `slang.learnerFallbackDsh`: after the pinned CLI learner fails, may the corpus go to the default route
+/// (`route_extract`)? Off unless exactly `true`, like `backends.failoverFallback`: a local or free learner never
+/// silently becomes a cloud route. The setting keeps its stored name.
 fn learner_fallback_dsh(cfg: &Value) -> bool {
     cfg.pointer("/slang/learnerFallbackDsh") == Some(&Value::Bool(true))
 }
 
-/// 调模型：`slang.learnerBackend`（默认 dsh）；非 dsh 后端失败只有在 `slang.learnerFallbackDsh`
-/// 为 true 时才回落 DSH。返回 (后端名, 原始输出)。
+/// The learner's model port: `slang.learnerBackend` `dsh` (the stored default) is the default route (`route_extract`);
+/// any other id is that pinned CLI backend, whose failure reaches the default route only when
+/// `slang.learnerFallbackDsh` is exactly `true`. Returns (backend name, raw output).
 fn ask_model(
     context: &RuntimeContext,
     cfg: &Value,
@@ -1625,22 +1352,18 @@ fn ask_model(
         if !learner_fallback_dsh(cfg) {
             return Err(errors.join("；"));
         }
-        crate::safe_println!("[slang] 学习后端 {backend_id} 失败，按 slang.learnerFallbackDsh 回落 DSH");
+        crate::safe_println!("[slang] 学习后端 {backend_id} 失败，按 slang.learnerFallbackDsh 回落默认模型路由");
     }
-    match dsh_extract(context, cfg, key, prompt, timeout_s) {
-        Ok(text) if !text.trim().is_empty() => Ok(("dsh".to_string(), text)),
-        Ok(_) => {
-            errors.push("dsh: 返回空内容".to_string());
-            Err(errors.join("；"))
-        }
+    match route_extract(context, cfg, key, prompt, timeout_s) {
+        Ok(text) => Ok((ROUTE_BACKEND.to_string(), text)),
         Err(e) => {
-            errors.push(format!("dsh: {e}"));
+            errors.push(format!("{ROUTE_BACKEND}: {e}"));
             Err(errors.join("；"))
         }
     }
 }
 
-fn research_prompt(candidates: &[Value], cfg: &Value) -> String {
+pub(crate) fn research_prompt(candidates: &[Value], cfg: &Value) -> String {
     let list = candidates
         .iter()
         .enumerate()
@@ -1686,7 +1409,7 @@ fn research_prompt(candidates: &[Value], cfg: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        r#"你是群聊黑话研究员。请针对以下候选网络用语/黑话做**深度联网考究**：先结合给出的群友语境判断可能含义，再使用 web_search 搜索确认，并对最相关的 1~2 个结果用 web_fetch 抓取正文阅读（只读搜索/抓取，不要执行任何本地操作）。不要只依赖搜索摘要。
+        r#"你是群聊黑话研究员。请针对以下候选网络用语/黑话，结合给出的群友语境和你了解的真实网络用法判断含义。
 
 候选：
 {list}
@@ -1698,13 +1421,12 @@ fn research_prompt(candidates: &[Value], cfg: &Value) -> String {
   "usage": "使用场景/语气（可选，说明在什么语境下用）",
   "example": "一个自然短句示例（可选）",
   "risk": "是否有敏感/慎用风险（可选，没有就留空）",
-  "sources": ["参考来源URL1", "参考来源URL2"],
   "confirmed": true 或 false
 }}
 
 注意：
 - 不确定是否为网络用语的普通词，confirmed 设为 false。
-- 不要编造离谱含义；搜不到就写“不确定”并把 confirmed 设为 false。
+- 不要编造离谱含义；不确定就写“不确定”并把 confirmed 设为 false。
 - 只输出 JSON 数组。"#
     )
 }
@@ -2260,6 +1982,7 @@ fn extract_now_with_runtime(
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     struct AutoLearningDependencyProbe {
         endpoint: String,
         connection_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -2268,6 +1991,7 @@ mod tests {
         worker: Option<std::thread::JoinHandle<()>>,
     }
 
+    #[cfg(windows)]
     impl AutoLearningDependencyProbe {
         fn bind() -> Self {
             use std::net::TcpListener;
@@ -2336,17 +2060,6 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Acquire)
         }
 
-        fn wait_for_connection(&self, timeout: Duration) -> bool {
-            let deadline = std::time::Instant::now() + timeout;
-            while self.connection_count() == 0 {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            true
-        }
-
         fn shutdown(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Release);
             if let Some(worker) = self.worker.take() {
@@ -2370,6 +2083,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     impl Drop for AutoLearningDependencyProbe {
         fn drop(&mut self) {
             self.shutdown();
@@ -2400,8 +2114,10 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     struct AutoLearningFixtureRoot(std::path::PathBuf);
 
+    #[cfg(windows)]
     impl Drop for AutoLearningFixtureRoot {
         fn drop(&mut self) {
             let Ok(temp_root) = std::fs::canonicalize(std::env::temp_dir()) else {
@@ -3226,41 +2942,6 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
     }
 
     #[test]
-    fn corrupt_selected_session_state_fails_before_dsh_or_rewrite() {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use base64::Engine as _;
-        use std::net::TcpListener;
-
-        let (root, context) = runtime_fixture("corrupt-session");
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let rpc = Rpc::connect_with_secret(
-            &format!("http://127.0.0.1:{port}"),
-            &URL_SAFE_NO_PAD.encode([7u8; 32]),
-        )
-        .unwrap();
-
-        for corrupt in [
-            b"{broken".as_slice(),
-            br#"{"sessionId":7,"preset":"fixture"}"#,
-        ] {
-            let path = root.join("data/slang-session.json");
-            std::fs::write(&path, corrupt).unwrap();
-            let error = ensure_dsh_session(&context, &rpc, &json!({})).unwrap_err();
-            assert!(error.contains("候选黑话学习会话"));
-            assert_eq!(std::fs::read(&path).unwrap(), corrupt);
-            assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-                "corrupt selected session state must fail before any DSH request"
-            );
-        }
-
-        drop(rpc);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn job_admission_is_bounded_and_freed_slots_are_reusable() {
         let (root, context) = runtime_fixture("job-admission");
         let mut tickets = Vec::new();
@@ -3281,66 +2962,58 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
     }
 
     #[test]
-    fn disabled_learning_skips_dsh_probes_and_can_be_enabled_without_restart() {
-        let mut probe = AutoLearningDependencyProbe::bind();
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
-            "her-ticket04-slang-auto-disabled-watch-{}-{}", std::process::id(), now_ms()
-        )));
-        for folder in ["config", "data", "resources", "user/dsh"] {
-            std::fs::create_dir_all(root.join(folder)).unwrap();
-        }
-        let _root = AutoLearningFixtureRoot(root.clone());
-        std::fs::write(root.join("config/config.json"),
-            json!({"consoleToken":"fixture-token","slang":{"enabled":false}}).to_string()).unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
-        std::fs::write(root.join("user/dsh/.credentials.yaml"),
-            "secret: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
-        std::fs::write(root.join("dependencies.json"), json!({
-            "dsh":probe.endpoint,"model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:2"
-        }).to_string()).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
-        let learning = SlangLearning::new(&context);
-        learning.start_dsh_watch();
-        // Observe more than one complete five-second watch interval. A disabled feature
-        // must make no dependency calls, while keeping its watcher available for re-enable.
-        assert!(!probe.wait_for_connection(Duration::from_secs(6)), "disabled learning contacted DSH");
-        context.write_atomic(RuntimeArea::Config, "config.json", json!({
-            "consoleToken":"fixture-token","slang":{"enabled":true}
-        }).to_string().as_bytes()).unwrap();
-        assert!(probe.wait_for_connection(Duration::from_secs(10)), "enabling learning did not resume its DSH watch");
-        drop(learning);
-        probe.shutdown();
-        assert_eq!(*probe.worker_error.lock().unwrap(), None, "synthetic DSH listener failed");
-    }
-
-    #[test]
-    fn dsh_recovery_revisits_retained_windows_once_and_down_state_keeps_cooldown() {
-        let (root, context) = runtime_fixture("dsh-catch-up");
+    fn startup_catch_up_runs_each_due_retained_window_once() {
+        let (root, context) = runtime_fixture("catch-up");
         std::fs::write(
             root.join("config/config.json"),
             r#"{"consoleToken":"fixture-token","slang":{"extractMinMessages":2}}"#,
         )
         .unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap_or(context);
-        let cfg = context.load_config().unwrap();
         let learning = SlangLearning::new(&context);
-        let mut was_ready = false;
-        learning.observe_dsh_with(false, &mut was_ready, |key| panic!("ran {key} while down"));
         for i in 0..3 {
-            learning
-                .try_feed_window("group:1", "甲", &format!("消息{i}"))
-                .unwrap();
+            learning.try_feed_window("group:1", "甲", &format!("消息{i}")).unwrap();
         }
         learning.try_feed_window("group:2", "乙", "单条").unwrap();
-        assert!(
-            !learning.try_maybe_trigger(&cfg, "group:1").unwrap(),
-            "no automatic extraction while DSH is down"
-        );
         let mut ran = Vec::new();
-        learning.observe_dsh_with(true, &mut was_ready, |key| ran.push(key.to_string()));
-        assert_eq!(ran, ["group:1"], "only the due retained window is revisited, cooldown not spent while down");
-        learning.observe_dsh_with(true, &mut was_ready, |key| ran.push(key.to_string()));
-        assert_eq!(ran, ["group:1"], "a steady ready state does not revisit");
+        learning.catch_up_with(|key| ran.push(key.to_string()));
+        assert_eq!(ran, ["group:1"], "only the due retained window runs");
+        learning.catch_up_with(|key| ran.push(key.to_string()));
+        assert_eq!(ran, ["group:1"], "a window caught up once spent its cooldown");
+        std::fs::write(
+            root.join("config/config.json"),
+            r#"{"consoleToken":"fixture-token","slang":{"enabled":false,"extractMinMessages":1,"extractCooldownMs":0}}"#,
+        )
+        .unwrap();
+        learning.catch_up_with(|key| ran.push(key.to_string()));
+        assert_eq!(ran, ["group:1"], "disabled learning catches nothing up");
+        drop(learning);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_catch_up_runs_once_per_runtime_root_across_learning_values() {
+        let (root, context) = runtime_fixture("catch-up-once");
+        std::fs::write(
+            root.join("config/config.json"),
+            r#"{"consoleToken":"fixture-token","harness":{"model":"route-model"},"slang":{"extractMinMessages":1,"extractCooldownMs":0}}"#,
+        )
+        .unwrap();
+        SlangLearning::new(&context)
+            .try_feed_window("group:1", "甲", "今天又破防了")
+            .unwrap();
+        // Every attempt fails, so nothing is consumed and each learning value would find the window due again.
+        let fake = route_fake(&context, vec![Err("quota"), Err("quota"), Err("quota")]);
+        let first = SlangLearning::new(&context);
+        let second = SlangLearning::new(&context);
+        let handles = [first.start_catch_up(), second.start_catch_up()];
+        for handle in handles.into_iter().flatten() {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            fake.calls.lock().unwrap().len(),
+            1,
+            "two learning values on one runtime each ran the startup catch-up"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -3358,30 +3031,126 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         assert_eq!(learner_backend(&json!({})), "dsh");
     }
 
-    #[test]
-    fn only_an_exact_session_not_found_refusal_rebuilds_the_learner_session() {
-        for rebuilt in [
-            "session/prompt 被拒：session-not-found: session s1 not found",
-            "订阅被拒：session-not-found",
-        ] {
-            assert!(session_gone(rebuilt), "{rebuilt}");
-        }
-        for kept in [
-            "session/prompt 被拒：session-busy: session is busy",
-            "连 /api/remote.mux 失败：HTTP error: 404 Not Found",
-            "session/prompt 被拒：internal: Method not found",
-            "学习回合未完成或没有文本",
-            "读取响应失败：session stream closed",
-            "会话不存在",
-        ] {
-            assert!(!session_gone(kept), "{kept} is not proof that the prompt never ran");
+    /// A scripted first model route for the learner (`harness::one_shot`): reply `i` answers call `i`.
+    struct RouteFake {
+        replies: Mutex<std::collections::VecDeque<Result<&'static str, &'static str>>>,
+        calls: Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::harness::one_shot::OneShot for RouteFake {
+        fn complete(&self, system: &str, input: &str) -> Result<String, crate::harness::one_shot::ModelError> {
+            self.calls.lock().unwrap().push((system.to_string(), input.to_string()));
+            let reply = self.replies.lock().unwrap().pop_front().unwrap_or(Err("backend"));
+            reply.map(str::to_string).map_err(crate::harness::one_shot::ModelError)
         }
     }
 
-    /// A pinned learner backend that fails must not send the corpus to DSH unless the owner
-    /// configured `slang.learnerFallbackDsh`; a fake DSH endpoint records any contact.
+    /// Installs a scripted first route for the learner on `context`'s runtime.
+    fn route_fake(context: &RuntimeContext, replies: Vec<Result<&'static str, &'static str>>) -> Arc<RouteFake> {
+        let fake = Arc::new(RouteFake { replies: Mutex::new(replies.into()), calls: Mutex::new(Vec::new()) });
+        crate::harness::one_shot::install_test_model(
+            context.runtime_root().expect("a selected fixture runtime"),
+            crate::harness::one_shot::Job::SlangLearner,
+            fake.clone(),
+        );
+        fake
+    }
+
+    /// A selected runtime whose learner uses the default route with a threshold of one message.
+    fn route_fixture(tag: &str) -> (std::path::PathBuf, RuntimeContext, Value) {
+        let (root, context) = runtime_fixture(tag);
+        let cfg = json!({"consoleToken":"fixture-token","slang":{"enabled":true,"extractMinMessages":1},"harness":{"model":"route-model"}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        (root, context, cfg)
+    }
+
     #[test]
-    fn a_failed_pinned_learner_backend_reaches_dsh_only_when_the_owner_allows_it() {
+    fn one_shot_learner_failures_change_nothing() {
+        let (root, context, cfg) = route_fixture("route-failure");
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        std::fs::write(
+            root.join("data/slang.json"),
+            r#"[{"id":"kept","content":"破防","status":"candidate","count":2,"lastInferenceCount":0}]"#.as_bytes(),
+        )
+        .unwrap();
+        let read = |name: &str| std::fs::read(root.join("data").join(name)).unwrap();
+        let (windows, slang_store) = (read("slang-windows.json"), read("slang.json"));
+        let fake = route_fake(
+            &context,
+            vec![Err("quota"), Ok("   "), Ok("I cannot assist with that."), Ok("content_filter"), Err("timeout")],
+        );
+        for attempt in 1..=4 {
+            let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+            assert_eq!(result["ok"], false, "attempt {attempt}: {result}");
+            assert_eq!(read("slang-windows.json"), windows, "attempt {attempt} consumed the batch");
+            assert_eq!(read("slang.json"), slang_store, "attempt {attempt} changed the slang store");
+        }
+        assert!(
+            research_with_runtime(&context, &cfg, &["kept".to_string()], None).is_err(),
+            "a failed research turn is an error"
+        );
+        assert_eq!(read("slang.json"), slang_store, "a failed research turn changed the slang store");
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 5, "every learner turn asks the first model route once, without a repair re-ask");
+        assert!(calls.iter().all(|(system, _)| system.is_empty()), "the learner sends its prompt alone: {calls:?}");
+        drop(calls);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_sends_its_prompt_alone_and_learns_once() {
+        let (root, context, cfg) = route_fixture("route-success");
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        let fake = route_fake(&context, vec![Ok(r#"[{"content":"破防","source_id":1}]"#)]);
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!((result["backend"].as_str(), result["added"].as_u64()), (Some("harness"), Some(1)), "{result}");
+        assert_eq!(remaining(&context, &state), 0, "the learned batch is consumed");
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one batch is one call");
+        assert!(calls[0].0.is_empty() && calls[0].1.contains("今天又破防了"), "{calls:?}");
+        drop(calls);
+        assert!(!root.join("data/slang-session.json").exists(), "the learner keeps no session");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_keeps_an_array_answer_that_mentions_refusal_words() {
+        let (root, context, cfg) = route_fixture("route-refusal-words");
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        route_fake(&context, vec![Ok(r#"[{"content":"content filter","source_id":2}]"#)]);
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        assert_eq!(result["ok"], true, "an answer with a JSON array is never a refusal: {result}");
+        assert_eq!(result["added"], 1, "{result}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_without_a_route_is_unconfigured_and_changes_nothing() {
+        let (root, context) = runtime_fixture("route-unconfigured");
+        let cfg = json!({"consoleToken":"fixture-token","slang":{"enabled":true,"extractMinMessages":1}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        let windows = std::fs::read(root.join("data/slang-windows.json")).unwrap();
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(
+            result["error"].as_str().is_some_and(|error| error.contains("harness: model/backend unconfigured")),
+            "{result}"
+        );
+        assert_eq!(std::fs::read(root.join("data/slang-windows.json")).unwrap(), windows, "an unconfigured route consumed the batch");
+        assert!(!root.join("data/slang.json").exists(), "an unconfigured route wrote the slang store");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A pinned learner backend that fails must not send the corpus to the default route unless the owner configured
+    /// `slang.learnerFallbackDsh`; a listener standing in for the relay records any contact.
+    #[test]
+    fn one_shot_learner_fallback_reaches_the_route_only_when_the_owner_allows_it() {
         use std::net::TcpListener;
         let (root, context) = runtime_fixture("learner-fallback");
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3389,21 +3158,23 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let port = listener.local_addr().unwrap().port();
         std::fs::write(
             root.join("dependencies.json"),
-            json!({"dsh":format!("http://127.0.0.1:{port}"),"model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:2"}).to_string(),
+            json!({"dsh":"http://127.0.0.1:1","model":format!("http://127.0.0.1:{port}"),"onebot":"http://127.0.0.1:2"}).to_string(),
         )
         .unwrap();
+        std::fs::write(root.join("config/harness-api-key"), "learner-fallback-key").unwrap();
         let context = RuntimeContext::from_root(&root).unwrap_or(context);
-        let pinned = json!({"slang":{"learnerBackend":"missing-learner"}});
-        let error = ask_model(&context, &pinned, "group:fallback", "prompt", 5).unwrap_err();
+        let pinned = json!({"slang":{"learnerBackend":"missing-learner"},"harness":{"model":"route-model"}});
+        let error = ask_model(&context, &pinned, "group:fallback", "prompt", 1).unwrap_err();
         assert!(error.contains("missing-learner"), "the failing route is named: {error}");
-        assert!(!error.contains("dsh:"), "no silent cloud route: {error}");
+        assert!(!error.contains("harness:"), "no silent cloud route: {error}");
         assert!(
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
-            "the corpus must not reach DSH"
+            "the corpus must not reach the model route"
         );
-        let allowed = json!({"slang":{"learnerBackend":"missing-learner","learnerFallbackDsh":true}});
-        let error = ask_model(&context, &allowed, "group:fallback", "prompt", 5).unwrap_err();
-        assert!(error.contains("missing-learner") && error.contains("dsh:"), "both routes are reported: {error}");
+        let allowed = json!({"slang":{"learnerBackend":"missing-learner","learnerFallbackDsh":true},"harness":{"model":"route-model"}});
+        let error = ask_model(&context, &allowed, "group:fallback", "prompt", 1).unwrap_err();
+        assert!(error.contains("missing-learner") && error.contains("harness:"), "both routes are reported: {error}");
+        assert!(listener.accept().is_ok(), "the allowed fallback asked the model route");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

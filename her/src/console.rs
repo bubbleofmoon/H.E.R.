@@ -4344,12 +4344,6 @@ fn handle_slang_config(context: &RuntimeContext, body: &str) -> Result<Value, (u
     if !cfg.is_object() {
         return Err((500, "config.json 不是合法 JSON，已拒绝写入".to_string()));
     }
-    let old_slang = slang_config_defaults(cfg.get("slang").unwrap_or(&Value::Null));
-    let invalidate = ["learnerPreset", "workspaceTitle"].iter().any(|field| {
-        req_obj.get(*field).is_some_and(|value| {
-            js_string(value).trim() != old_slang.get(*field).and_then(Value::as_str).unwrap_or("")
-        })
-    });
     let mut merged = cfg
         .get("slang")
         .and_then(|v| v.as_object())
@@ -4429,9 +4423,6 @@ fn handle_slang_config(context: &RuntimeContext, body: &str) -> Result<Value, (u
 
     cfg["slang"] = Value::Object(merged.clone());
     write_json_atomic_for(context, CFG_PATH, &cfg).map_err(|e| (500, e))?;
-    if invalidate {
-        crate::slang_learn::invalidate_learner_session(context).map_err(slang_store_error)?;
-    }
     Ok(json!({ "ok": true, "config": slang_config_defaults(&Value::Object(merged)) }))
 }
 
