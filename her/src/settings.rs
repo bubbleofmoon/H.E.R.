@@ -22,12 +22,16 @@
 //! store through `backup_source`; a restore names it through `store_path`.
 
 mod kinds;
+#[cfg(test)]
+mod probe;
 mod registry;
 mod store;
 
 use serde_json::Value;
 
 pub(crate) use kinds::SettingKind;
+#[cfg(test)]
+pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{
     chat_setting, find, registry, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL,
     WEB_SEARCH_MODEL,

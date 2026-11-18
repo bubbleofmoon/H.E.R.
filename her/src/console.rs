@@ -26838,5 +26838,5 @@ mod tests {
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
     mod config_overlay_tests { include!("config_overlay_tests.rs"); }
     mod self_avatar_tests { include!("self_avatar_tests.rs"); }
-    mod settings_tests { include!("settings_tests.rs"); }
+    mod settings_tests { include!("settings/tests/mod.rs"); }
 }

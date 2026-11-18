@@ -17,30 +17,25 @@ fn quiet(f: &Fixture) -> Option<i64> {
 
 /// The rows of the settings history.
 fn settings_audit_rows(f: &Fixture) -> i64 {
-    rusqlite::Connection::open_with_flags(f.0.join("data/settings.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .unwrap()
-        .query_row("SELECT count(*) FROM settings_audit", [], |r| r.get(0))
-        .unwrap()
+    crate::settings::StoreProbe::at(&f.0).audit_count()
 }
 
 /// Appends `count` history rows of 1 KiB each.
 fn grow_settings_history(f: &Fixture, count: usize) {
-    let mut db = rusqlite::Connection::open_with_flags(
-        f.0.join("data/settings.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .unwrap();
-    let tx = db.transaction().unwrap();
     let text = "x".repeat(1024);
-    for i in 0..count {
-        tx.execute(
-            "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
-             VALUES(?1, 'fixture', 'fixture', 'global', 'reply.wakeQuietMs', NULL, ?2, ?3)",
-            rusqlite::params![i as i64, text, format!("grow-{i}")],
-        )
-        .unwrap();
-    }
-    tx.commit().unwrap();
+    let rows: Vec<crate::settings::AuditRow> = (0..count)
+        .map(|i| crate::settings::AuditRow {
+            at_ms: i as i64,
+            actor: "fixture",
+            source: "fixture",
+            scope: "global",
+            key: "reply.wakeQuietMs",
+            old: None,
+            new: Some(text.clone()),
+            request: format!("grow-{i}"),
+        })
+        .collect();
+    crate::settings::StoreProbe::at(&f.0).insert_audit(&rows);
 }
 
 /// This process's open handles on the settings store and its sidecars (Linux `/proc/self/fd`). Other hosts report
@@ -361,12 +356,8 @@ fn restore_settings_unusable_store_fails_the_backup_and_refuses_a_restore_before
 #[test]
 fn restore_settings_archive_from_a_newer_release_restores_its_store_as_is() {
     let f = Fixture::new();
-    let store = f.0.join("data/settings.db");
-    let db = rusqlite::Connection::open(&store).unwrap();
-    let mode: String = db.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0)).unwrap();
-    assert_eq!(mode, "wal");
-    db.execute_batch("CREATE TABLE later(x INTEGER); INSERT INTO later VALUES(7); PRAGMA user_version=2;").unwrap();
-    drop(db);
+    let store = crate::settings::StoreProbe::at(&f.0);
+    store.build_wal("CREATE TABLE later(x INTEGER); INSERT INTO later VALUES(7); PRAGMA user_version=2;", false);
     let archive = f.backup();
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(f.0.join(format!("data/settings.db{suffix}")));
@@ -382,10 +373,8 @@ fn restore_settings_archive_from_a_newer_release_restores_its_store_as_is() {
         &mut FakeControl::default(),
     )
     .unwrap();
-    let db = rusqlite::Connection::open_with_flags(&store, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
-    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    let later: i64 = db.query_row("SELECT x FROM later", [], |r| r.get(0)).unwrap();
-    drop(db);
+    let version = store.user_version();
+    let later: i64 = store.open().query_row("SELECT x FROM later", [], |r| r.get(0)).unwrap();
     assert_eq!((version, later), (2, 7), "the newer store is restored as it was archived");
     let view = crate::settings::view(&f.context()).unwrap();
     assert_eq!(view["storeError"], crate::settings::NEWER_SCHEMA_ERROR, "this release refuses it, as after a downgrade");
