@@ -101,7 +101,7 @@ pub(crate) fn chain(cfg: &Value) -> Result<Vec<RouteSpec>, String> {
 fn route_spec(entry: &Value) -> Result<RouteSpec, &'static str> {
     let entry = entry.as_object().ok_or("route")?;
     let id = entry.get("id").and_then(Value::as_str).filter(|id| valid_id(id)).ok_or("id")?;
-    // The registry's model id rule (`settings::Kind::ModelId`): trimmed, 1 to 200 characters, no control character.
+    // The registry's model id rule (`settings::kinds::ModelId`): trimmed, 1 to 200 characters, no control character.
     let model = entry
         .get("model")
         .and_then(|model| crate::settings::HARNESS_MODEL.normalize(model))

@@ -2938,9 +2938,9 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     }
                 }
                 let mut writable: Vec<String> = SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
-                for setting in crate::settings::REGISTRY.iter().filter(|setting| setting.chat && context.is_isolated()) {
+                for setting in crate::settings::registry().filter(|setting| setting.chat && context.is_isolated()) {
                     let name = setting.chat_name();
-                    all.insert(name.clone(), redact_setting(&name, setting.effective_value(cfg)));
+                    all.insert(name.clone(), redact_setting(&name, setting.read(cfg)));
                     writable.push(name);
                 }
                 return Ok(json!({
@@ -2951,7 +2951,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                 }));
             }
             if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
-                let value = redact_setting(&path, setting.effective_value(cfg));
+                let value = redact_setting(&path, setting.read(cfg));
                 return Ok(json!({"ok": true, "key": path, "writable": true, "value": value}));
             }
             // Only the settings the model may also change are readable. Any other key (a console token,
@@ -26891,5 +26891,5 @@ mod tests {
     mod model_text_guard_tests { include!("model_text_guard_tests.rs"); }
     mod config_overlay_tests { include!("config_overlay_tests.rs"); }
     mod self_avatar_tests { include!("self_avatar_tests.rs"); }
-    mod settings_tests { include!("settings_tests.rs"); }
+    mod settings_tests { include!("settings/tests/mod.rs"); }
 }
