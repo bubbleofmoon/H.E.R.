@@ -15,7 +15,7 @@ fn settings_registry_is_complete_and_agrees_with_its_reader() {
     assert_eq!(pointers.len(), registry.len(), "registry pointers are unique");
     for setting in registry {
         assert!(!setting.label.is_empty() && !setting.hint.is_empty() && !setting.group.is_empty(), "{}", setting.key);
-        assert!(matches!(setting.applies, "live" | "next wake" | "restart"), "{}", setting.key);
+        assert!(matches!(setting.applies, "live" | "next wake" | "restart" | "not read yet"), "{}", setting.key);
         assert!(setting.pointer.starts_with('/') && !setting.pointer.contains('~'), "{}", setting.pointer);
         assert!(setting.pointer.split('/').skip(1).all(|name| !name.is_empty()), "{}", setting.pointer);
         // Each kind checks its own bounds, default and reader (`SettingKind::check_entry`).
