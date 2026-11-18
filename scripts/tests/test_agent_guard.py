@@ -57,8 +57,9 @@ READS = [
     'git status',
     'git log --oneline -3',
     'ls -la',
-    # codex-task reads and the Codex reads of the self-review (S4: a file named like a tool stays readable)
+    # the Codex scripts stay readable (S4: a file named like a tool stays readable)
     'cat scripts/codex-task.sh',
+    'cat scripts/codex-work.sh',
     'git diff -- scripts/codex-task.sh',
     'cat scripts/cargo-slot.sh',
     'grep -n make x',
@@ -123,12 +124,7 @@ IMPLEMENTER_ALLOWED = [
     ('repo', 'cd {dsh} && ' + QUICK_DSH),                # the same from a session that starts elsewhere, after the cd
     ('detached', 'cd {dsh} && ' + QUICK_DSH),
     ('wt', 'cd {dsh} && ' + QUICK_DSH),                  # KNOWN GAP (T1/T2, #85): no ticket binding, so a cd into another worktree with its own ref passes
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
-    ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6.2-astra high read-only 120'),
-    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
-    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6.2-astra -effort high -sandbox read-only -timeoutminutes 90'),
     ('wt', 'git add scripts/codex-task.sh'),
-    ('repo', 'cd {wt} && {home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
     ('wt', 'git add scripts/handoff.sh'),
     ('wt', 'git add scripts/gh-public.sh'),
 ]
@@ -242,7 +238,19 @@ DENIED_EVERY_ROLE = [
     ('wt', 'echo "unterminated'),
     ('wt', "git $'pu\\x73h' origin HEAD:refs/heads/main"),
     ('wt', 'git pu\\\nsh origin main'),
-    # Codex runs only as the implementer's pinned read-only self-review (every other form is refused)
+    # Codex runs only for the coordinator: every form is refused to every worker role, a read-only run in the worker's own worktree included
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
+    ('wt', 'bash {home}/scripts/codex-task.sh 1-self-2 {wt} {tickets}/1/review/codex-self-2.md gpt-6.2-astra high read-only 120'),
+    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
+    ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6.2-astra -effort high -sandbox read-only -timeoutminutes 90'),
+    ('repo', 'cd {wt} && {home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
+    ('wt', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),
+    ('wt', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium'),
+    ('wt', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-sol high'),
+    ('wt', '{home}/scripts/codex-task.sh 1-inv {wt} {tickets}/1/inv.md gpt-6.2-sol high read-only'),
+    ('wt', 'pwsh -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt'),
+    ('wt', 'pwsh -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md'),
+    # other Codex calls: wrong script path, values, wrappers, redirections, chaining
     ('wt', 'scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
     ('wt', '{wt}/scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
     ('wt', '/tmp/x/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
@@ -312,26 +320,113 @@ DENIED_EVERY_ROLE = [
     ('wt', 'gh api rate_limit/x'),
     ('wt', 'source scripts/gh-public.sh'),                       # regression
     ('wt', '. scripts/handoff.sh 80 linux b.md'),                # regression
-    # Each row has one violation only: the checkout script and the ticket folder come from {home} and {tickets}.
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} /root/her-vault/x.md gpt-6.2-astra high read-only'),         # prompt outside the ticket folders
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/2/review/codex-self-1.md gpt-6.2-astra high read-only'),   # cross-ticket
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/../x.md gpt-6.2-astra high read-only'),  # traversal
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 /root/her-vault {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),  # workdir is not this worktree
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {repo} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),  # workdir is the repository, not this worktree
-    ('wt', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {repo} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
-    # the exact allowed forms with only the model changed: the pinned-model check is the one that refuses
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6-astra high read-only'),
-    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
-    # the exact allowed forms with only the model changed: the pinned-model check is the one that refuses
-    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.1-sol high read-only'),
-    ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.1-sol -Effort high -Sandbox read-only'),
 ]
 DENIED_REVIEW_AND_GATE = [
     ('wt', 'git push origin her/1-x'),
     ('wt', 'git commit -m x'),
     ('wt', 'gh workflow run quick.yml --ref her/1-x -f target=unit'),
     ('dsh', QUICK_DSH),                                  # #185: allowed for an implementer only
-    ('wt', '/root/her/scripts/codex-task.sh 1-self-1 {wt} /root/orch/her/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
+    ('wt', '{home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
+]
+# The coordinator's documented Codex forms (one plain command; the model gpt-6.2-sol or gpt-6.2-astra, the effort
+# medium or high). {home} and {tickets} are the checkout and the ticket folder the hook is told to use.
+COORDINATOR_FORMS = [
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),
+    ('repo', 'bash {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-astra high 90'),
+    ('repo', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/prompts/impl.md {tickets}/1/prompts/msg.txt gpt-6.2-sol medium'),
+    ('repo', 'cd {repo} && HER_GITLEAKS=/opt/gl/gitleaks.exe {home}/scripts/codex-work.sh implement 1-fix-2 {wt} {tickets}/1/fix.md {tickets}/1/msg.txt gpt-6.2-sol'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-sol high 120'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-astra medium'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high read-only'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-astra high read-only 90'),
+    ('repo', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt -Model gpt-6.2-sol -Effort medium -TimeoutMinutes 90'),
+    ('repo', "pwsh -NoProfile -File c:/her/scripts/codex-work.ps1 -mode PLAN -ticket 1 -name 1-plan -promptfile 'C:\\her-orch\\1\\plan-prompt.md'"),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6.2-sol -Effort high -Sandbox read-only'),
+]
+# Not Codex runs: the coordinator keeps its ordinary commands, and files named like the scripts stay readable.
+COORDINATOR_ORDINARY = [
+    ('repo', 'git push origin main'),
+    ('repo', 'cat scripts/codex-work.sh'),
+    ('repo', 'git log --grep codex'),
+    ('repo', 'git commit -m "gate with Codex for ticket 3"'),
+    ('repo', 'ls'),
+]
+COORDINATOR_DENIED = [
+    ('repo', 'codex exec x'),
+    ('repo', 'codex.cmd exec x'),
+    ('repo', 'npx @openai/codex exec x'),
+    ('repo', 'bash -c "codex exec x"'),
+    ('repo', 'eval codex exec x'),
+    ('repo', 'echo $HOME codex'),
+    ('repo', 'ls\ncodex exec x'),
+    ('repo', 'while true; do codex exec x; done'),
+    ('repo', 'watch -n 600 codex exec x'),
+    ('repo', 'echo "unterminated codex'),
+    # exact pins: only gpt-6.2-sol and gpt-6.2-astra, effort medium or high
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.1-sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-Sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.20-sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-astra2'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6-astra'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol max'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol low'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.1-sol'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.1-sol high read-only'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6-astra high read-only'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt -Model gpt-6.1-sol'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -Effort max'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
+    # one violation per row: values, files, the ticket binding
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {repo} {tickets}/1/impl.md {tickets}/1/msg.txt'),                 # main, not a ticket branch
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {detached} {tickets}/1/impl.md {tickets}/1/msg.txt'),             # detached head
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl scratch/wt {tickets}/1/impl.md {tickets}/1/msg.txt'),             # relative workdir
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/2/impl.md {tickets}/1/msg.txt'),                   # prompt of another ticket
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/2/msg.txt'),                   # message of another ticket
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/../2/impl.md {tickets}/1/msg.txt'),              # traversal
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} /root/her-vault/x.md {tickets}/1/msg.txt'),                  # prompt outside the ticket folders
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md /root/her-vault/m.txt'),
+    ('repo', '{home}/scripts/codex-work.sh implement ../x {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),                     # name
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md'),                                       # no message
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 0'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 08'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 1000'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 5 extra'),
+    ('repo', '{home}/scripts/codex-work.sh plan 2 1-plan {tickets}/1/plan-prompt.md'),                                       # ticket and prompt differ
+    ('repo', '{home}/scripts/codex-work.sh plan x 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-sol high 5 extra'),
+    ('repo', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', 'HER_GITLEAKS=/bin/true {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),
+    ('repo', '{home}/scripts/codex-work.sh build 1 1-x {tickets}/1/p.md'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high none'),                           # not read-only
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high workspace-write'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md'),                                                # model, effort and sandbox are required
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} /root/her-vault/x.md gpt-6.2-sol high read-only'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv ../x {tickets}/1/inv.md gpt-6.2-sol high read-only'),
+    ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high read-only 5 extra'),
+    # the script, the shell around it and the rest of the command line
+    ('repo', 'scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', '/tmp/x/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', '{home}/scripts/../scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', 'timeout 60 {home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md > log'),
+    ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md; git push origin main'),
+    ('repo', 'cat {home}/scripts/codex-work.sh | bash -s plan 1 1-plan {tickets}/1/plan-prompt.md'),
+    ('repo', 'bash -s plan 1 1-plan {tickets}/1/plan-prompt.md < {home}/scripts/codex-work.sh'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md'),   # no -MessageFile
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {repo} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/2/impl.md -MessageFile C:/her-orch/1/msg.txt'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 2 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -Name 1-other'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -Sandbox none'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -AddDir C:/x'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode build -Name 1-x -PromptFile C:/her-orch/1/p.md'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6.2-sol -Effort high -Sandbox none'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6.2-sol -Effort high -Sandbox:read-only'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6.2-sol -Effort high -Sandbox read-only -AddDir C:/x'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Effort high -Sandbox read-only'),
+    ('repo', 'powershell -NoProfile -File {wt}/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md'),
+    ('repo', 'powershell -Command "C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name x -PromptFile C:/her-orch/1/p.md"'),
 ]
 DENIED_REVIEWER = [
     # write rules see through paths and quoting
@@ -754,17 +849,32 @@ class AgentGuard(unittest.TestCase):
     def test_read_only_roles_run_only_simple_read_pipelines(self):
         self.expect(READ_ONLY_DENIED, ('planner', 'reviewer'), False)
 
+    def test_the_coordinator_runs_codex_only_through_the_documented_forms(self):
+        self.expect(COORDINATOR_FORMS + COORDINATOR_ORDINARY, ('coordinator',), True)
+        self.expect(COORDINATOR_DENIED, ('coordinator',), False)
+
+    def test_a_refused_codex_call_says_workers_never_start_codex(self):
+        for role in ('implementer', 'gate', 'coordinator'):
+            for where, command in (('wt', 'codex exec x'), ('repo', 'codex exec x')):
+                with self.subTest(role=role, command=command):
+                    code, err = self.guard(role, where, command)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn('workers never start Codex', err)
+
+    def test_workers_never_run_the_coordinators_codex_forms(self):
+        self.expect(COORDINATOR_FORMS, ROLES, False)
+
     def test_a_codex_prompt_that_is_a_link_is_refused(self):
         guard = load_guard()
-        prompt = '/root/orch/her/1/review/codex-self-1.md'
+        prompt = '/root/orch/her/1/impl.md'
         with mock.patch.object(guard.os.path, 'islink', side_effect=lambda p: p == prompt), \
                 mock.patch.object(guard.os.path, 'isjunction', return_value=False, create=True), \
                 mock.patch.object(guard.os, 'lstat', side_effect=FileNotFoundError):
-            self.assertFalse(guard.codex_target_allowed('/w', prompt, '/w', 'her/1-x'))
+            self.assertIsNone(guard.ticket_file(prompt))
         with mock.patch.object(guard.os.path, 'islink', return_value=False), \
                 mock.patch.object(guard.os.path, 'isjunction', return_value=False, create=True), \
                 mock.patch.object(guard.os, 'lstat', side_effect=FileNotFoundError):
-            self.assertTrue(guard.codex_target_allowed('/w', prompt, '/w', 'her/1-x'))
+            self.assertEqual(guard.ticket_file(prompt), '1')
 
     def test_a_quoted_pattern_naming_a_tool_is_allowed_for_writers(self):
         self.expect([('wt', 'grep -rn "cargo check" docs/')], ('implementer', 'gate'), True)

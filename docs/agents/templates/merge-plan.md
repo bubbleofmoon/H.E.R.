@@ -1,6 +1,6 @@
 # Merge plan template
 
-Reach for this when the coordinator merges `origin/main` into a ticket branch and a conflict is semantic (both sides changed the same behaviour, not just adjacent lines). The planner fills the angle-bracket fields, writes each resolved file to `scratch/merge/<path>` in the ticket's scratch export, and saves the plan with the steps below.
+Reach for this when the coordinator merges `origin/main` into a ticket branch and a conflict is semantic (both sides changed the same behaviour, not just adjacent lines). The plan run fills the angle-bracket fields, writes each resolved file to `scratch/merge/<path>` in the ticket's scratch export, and saves the plan with the steps below.
 
 ```
 Merge: <branch> at <ours sha> <- origin/main at <theirs sha>   Merge base: <base sha>

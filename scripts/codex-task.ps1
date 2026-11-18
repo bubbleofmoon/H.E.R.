@@ -3,18 +3,19 @@ param(
   [Parameter(Mandatory)][string]$Name,
   [Parameter(Mandatory)][string]$WorkDir,
   [Parameter(Mandatory)][string]$PromptFile,
-  [string]$Model = 'gpt-6.2-astra',
+  [string]$Model = 'gpt-6.2-sol',
   [string]$Effort = 'high',
-  [ValidateSet('workspace-write', 'read-only', 'none')][string]$Sandbox = 'none',
-  [string[]]$AddDir = @('C:\her-orch', 'C:\her-targets', (Join-Path $env:USERPROFILE '.cargo')),
+  [ValidateSet('workspace-write', 'read-only', 'none')][string]$Sandbox = 'read-only',
+  [string[]]$AddDir = @(),
   [int]$TimeoutMinutes = 360
 )
 
 # Windows counterpart of scripts/codex-task.sh. Runs one Codex CLI task hidden at BelowNormal and writes receipts
 # next to the prompt: <Name>.report.md (last message), <Name>.out.log, <Name>.err.log, <Name>.exit.txt (numeric code,
-# "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report). workspace-write gets loopback/network access and write access to -AddDir. Sandbox `none`
-# (the default, user decision 2026-11-03) runs without Codex's sandbox; pushes are made to fail through GIT_CONFIG_*
-# for this process tree. Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
+# "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report).
+# workspace-write writes only -WorkDir and -AddDir, and gets loopback/network access. Codex cannot write git metadata,
+# and every remote's push URL points at a non-existent path through GIT_CONFIG_* for the Codex process only.
+# scripts/codex-work.ps1 wraps this for the plan and implement modes. Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
 # After the run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
 $ErrorActionPreference = 'Stop'
 # Start-Process cannot launch the npm shims (codex, codex.cmd), so use the native binary shipped inside the package.
@@ -31,9 +32,6 @@ Remove-Item -LiteralPath $report, $exitFile -ErrorAction SilentlyContinue
 $codexArgs = @('exec', '--skip-git-repo-check', '-m', $Model, '-c', "model_reasoning_effort=`"$Effort`"", '-C', $WorkDir, '--color', 'never', '-o', $report)
 if ($Sandbox -eq 'none') {
   $codexArgs += '--dangerously-bypass-approvals-and-sandbox'
-  $env:GIT_CONFIG_COUNT = '2'
-  $env:GIT_CONFIG_KEY_0 = 'remote.origin.pushurl'; $env:GIT_CONFIG_VALUE_0 = 'C:/nonexistent/push-disabled'
-  $env:GIT_CONFIG_KEY_1 = 'push.default'; $env:GIT_CONFIG_VALUE_1 = 'nothing'
 } else {
   $codexArgs += @('-s', $Sandbox)
 }
@@ -66,7 +64,13 @@ function Invoke-Cleanup {
 
 $start = @{ FilePath = $codex; ArgumentList = $quoted; PassThru = $true; RedirectStandardInput = $promptPath; RedirectStandardOutput = $outLog; RedirectStandardError = $errLog }
 if ($IsWindows -ne $false) { $start.WindowStyle = 'Hidden' }  # PowerShell on Linux (the script tests) has no window style
-$process = Start-Process @start
+# The push-disabling git config reaches the Codex process only: a caller that runs git afterwards keeps its own.
+$pushOff = [ordered]@{ GIT_CONFIG_COUNT = '2'; GIT_CONFIG_KEY_0 = 'remote.origin.pushurl'; GIT_CONFIG_VALUE_0 = 'C:/nonexistent/push-disabled'
+                      GIT_CONFIG_KEY_1 = 'push.default'; GIT_CONFIG_VALUE_1 = 'nothing' }
+$saved = @{}
+foreach ($key in $pushOff.Keys) { $saved[$key] = [Environment]::GetEnvironmentVariable($key); [Environment]::SetEnvironmentVariable($key, $pushOff[$key]) }
+try { $process = Start-Process @start }
+finally { foreach ($key in $pushOff.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) } }
 $null = $process.Handle  # keep the handle open so ExitCode is available after exit
 try { $process.PriorityClass = [Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
 

@@ -1,6 +1,6 @@
 # Red-revert template
 
-Reach for this when a plan needs each new test's red receipt on CI (`CODING_STANDARDS.md` "Tests"): the real change goes in first, a red commit on top breaks it with named one-line mutations, and the green commit reverts exactly those mutations. The planner fills the angle-bracket fields.
+Reach for this when a plan needs each new test's red receipt on CI (`CODING_STANDARDS.md` "Tests"): the real change goes in first, a red commit on top breaks it with named one-line mutations, and the green commit reverts exactly those mutations. The plan run fills the angle-bracket fields.
 
 ```
 Real change: <commit sha, or "the commit before the red commit">   Target: <quick.yml target>   OS: <linux|windows>
