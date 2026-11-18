@@ -96,7 +96,7 @@ What runs the model work of one admitted turn for a conversation, DSH or the har
 _Avoid_: backend (a CLI route), conversation engine
 
 **Mode profile (模式档案, `harness::profile`)**:
-What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it and who may use it. HER checks it when a turn is admitted and again before every tool call.
+What one participation mode, or one harness job such as the digest, may do: the exact tool menu the harness offers it, who may use it and the mode prompt its turns start with. HER checks it when a turn is admitted and again before every tool call.
 _Avoid_: preset, tool whitelist, tool guard
 
 **Model route (模型路由, `harness::routes`)**:
@@ -106,6 +106,10 @@ _Avoid_: provider, backend (a CLI route), candidate (a DSH chain entry)
 **Usage fact (用量记录, `harness::usage`)**:
 One token-ledger sample for one model request the harness route module sent: the conversation, the route and model, the request's place in its turn and the tokens its response reported. The console's token totals read it with DSH's samples.
 _Avoid_: billing record, usage event (a DSH request event)
+
+**One-shot job (单次模型作业, `harness::one_shot`)**:
+A harness job that asks one model route for one answer, with no tools and no history: the digest and slang learning.
+_Avoid_: turn, agent run, session
 
 **Upstream (上游)**:
 An outside project HER takes code or ideas from (such as DSH, SnowLuma, AstrBot or llama.cpp); HER keeps only what it needs and watches the project's releases for improvements to adopt.

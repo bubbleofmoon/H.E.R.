@@ -123,12 +123,12 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
 }
 
 /// Lists every setting from `GET /api/settings` with a set (`POST /api/settings/set`: a number input for an integer
-/// setting, a text input for a model id) and a reset (`POST /api/settings/reset`) button, and the history from
-/// `GET /api/settings/history`, newest first, with an undo button per entry (`POST /api/settings/undo`) and an
-/// older-entries button. Text is shown with `textContent` only.
+/// setting, a text input for a model id, a text area for a text setting (#140 prompt text) sent as typed) and a reset
+/// (`POST /api/settings/reset`) button, and the history from `GET /api/settings/history`, newest first, with an undo
+/// button per entry (`POST /api/settings/undo`) and an older-entries button. Text is shown with `textContent` only.
 const PAGE: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Settings</title>
-<style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}</style></head><body>
+<style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:40em}</style></head><body>
 <h1>Settings</h1>
 <p>Console token <input id="token" type="password" size="32"> <button id="use">Use</button> <span id="msg" role="status"></span></p>
 <table id="list"><thead><tr><th>Setting</th><th>Hint</th><th>Current</th><th>Default</th><th>Applies</th><th>New value</th><th></th><th></th></tr></thead><tbody></tbody></table>
@@ -144,7 +144,7 @@ const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':S
 const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
 const shown=v=>v==null?'(none)':JSON.stringify(v);
 let next=null;
-async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const input=document.createElement('input');const integer=s.kind.type==='integer';if(integer){input.type='number';input.min=s.kind.min;input.max=s.kind.max}else{input.type='text'}input.value=s.value==null?'':s.value;const field=document.createElement('td');field.append(input);tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.value),cell(s.default),cell(s.applies),field,action('Set',async()=>{const r=await api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/reset',{setting:s.key});if(r.ok)refresh()}));tb.append(tr)}}
+async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const integer=s.kind.type==='integer';const text=s.kind.type==='text';const input=document.createElement(text?'textarea':'input');if(integer){input.type='number';input.min=s.kind.min;input.max=s.kind.max}else if(text){input.rows=8;input.cols=60}else{input.type='text'}input.value=s.value==null?'':s.value;const field=document.createElement('td');field.append(input);tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.value),cell(s.default),cell(s.applies),field,action('Set',async()=>{const r=await api('/api/settings/set',{setting:s.key,value:integer?Number(input.value):input.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/reset',{setting:s.key});if(r.ok)refresh()}));tb.append(tr)}}
 async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const r=await api('/api/settings/undo',{entry:e.entry});if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
 function refresh(){list();history(false)}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};

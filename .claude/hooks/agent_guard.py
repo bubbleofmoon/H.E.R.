@@ -24,10 +24,10 @@ stay inside their word. Publishing and moving refs pass only as exact whole comm
   `gh workflow run quick.yml --ref <cwd branch> -f target=<x> [-f filter=<y>] [-f os=linux|windows]`, where <cwd branch>
   is the branch checked out in the effective folder (after an optional `cd <dir> &&`): this stops a mistyped or foreign
   ref, not a `cd` into another worktree (the guard has no ticket binding: T1/T2 in docs/agents/coordinator.md, containment
-  is #85); a second dispatch of the same ref, target and os cancels the first run; a session that does not start in its
+  is #85); a second dispatch of the same ref, target, os and filter cancels the first run (the guard refuses the sha input); a session that does not start in its
   worktree needs the `cd`;
 - Codex only as the implementer's self-review through /root/her/scripts/codex-task.sh or C:/her/scripts/codex-task.ps1
-  with gpt-6-astra, high and read-only, its own worktree as the workdir and
+  with gpt-6.2-astra, high and read-only, its own worktree as the workdir and
   <orch>/<n>/review/codex-self-<k>.md (its branch's ticket, not a link) as the prompt.
 scripts/gh-public and scripts/handoff are the coordinator's alone; they, and codex, are also refused by name anywhere in
 a command that has a wrapper, a $ or a backtick.
@@ -564,7 +564,7 @@ def codex_allowed(found, cwd, branch):
         found = found[1:]
     if found and found[0] == CODEX_SH:
         return (len(found) in (7, 8) and bool(CODEX_NAME.fullmatch(found[1]))
-                and found[4:7] == ['gpt-6-astra', 'high', 'read-only']
+                and found[4:7] == ['gpt-6.2-astra', 'high', 'read-only']
                 and (len(found) == 7 or bool(CODEX_MINUTES.fullmatch(found[7])))
                 and codex_target_allowed(found[2], found[3], cwd, branch))
     if found and base(found[0]) in ('powershell', 'pwsh'):
@@ -583,7 +583,7 @@ def codex_allowed(found, cwd, branch):
                 return False
             pairs[key] = value
         return (CODEX_PS_PARAMS - {'-timeoutminutes'} <= set(pairs)
-                and pairs['-model'] == 'gpt-6-astra' and pairs['-effort'] == 'high' and pairs['-sandbox'] == 'read-only'
+                and pairs['-model'] == 'gpt-6.2-astra' and pairs['-effort'] == 'high' and pairs['-sandbox'] == 'read-only'
                 and bool(CODEX_NAME.fullmatch(pairs['-name']))
                 and ('-timeoutminutes' not in pairs or bool(CODEX_MINUTES.fullmatch(pairs['-timeoutminutes'])))
                 and codex_target_allowed(pairs['-workdir'], pairs['-promptfile'], cwd, branch))
@@ -686,8 +686,8 @@ def check_bash(role, command, hook_cwd):
     if commands & CODEX_NAMES or (indirect and 'codex' in text.lower()):
         raise Deny('Codex runs only as the implementer\'s read-only self-review, from its own worktree: [cd <worktree> &&] '
                    '/root/her/scripts/codex-task.sh <name> <worktree = cwd> /root/orch/her/<n>/review/codex-self-<k>.md '
-                   'gpt-6-astra high read-only [minutes] (Windows: powershell -NoProfile -File C:/her/scripts/codex-task.ps1 '
-                   '-Name <name> -WorkDir <worktree> -PromptFile C:/her-orch/<n>/review/codex-self-<k>.md -Model gpt-6-astra '
+                   'gpt-6.2-astra high read-only [minutes] (Windows: powershell -NoProfile -File C:/her/scripts/codex-task.ps1 '
+                   '-Name <name> -WorkDir <worktree> -PromptFile C:/her-orch/<n>/review/codex-self-<k>.md -Model gpt-6.2-astra '
                    '-Effort high -Sandbox read-only); <n> is your branch\'s ticket and the prompt is no link. '
                    'To read the script, use the Read tool.')
     if 'ci-wait' in text.lower():       # in a word, a quoted argument, an assignment value, `+=` and `$` forms included
