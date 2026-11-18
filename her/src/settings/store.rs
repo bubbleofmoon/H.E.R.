@@ -1,9 +1,17 @@
 //! The settings store `data/settings.db`: its gate, inspection, schema, seed, write-back, apply, reset, undo, history and
 //! view, the overlay the configuration loader applies, and the registry helpers of the console's `config.json` writers
-//! (`console_changes`, `apply_changes`, `keep_file_members`, `keep_registry_values`, `registry_free`). The module root
-//! (`settings.rs`) re-exports what callers use; the contract is described there.
+//! (`console_changes`, `apply_changes`, `keep_file_members`, `keep_registry_values`, `registry_free`). The values kept per
+//! conversation (#218, schema version 2) are in `store/conversation.rs`. The module root (`settings.rs`) re-exports what
+//! callers use; the contract is described there.
 
-use super::{find, registry, Setting, OWNER};
+mod conversation;
+
+pub(crate) use conversation::{
+    apply_conversation, canonical_conversation, conversation_admitted, conversation_view, reset_conversation,
+    CONVERSATION_ERROR,
+};
+
+use super::{find, find_conversation, registry, Setting, OWNER};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -12,8 +20,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DB: &str = "settings.db";
 const SIDECARS: [&str; 3] = ["settings.db-wal", "settings.db-shm", "settings.db-journal"];
-/// The schema version this release reads and writes.
-const SCHEMA_VERSION: i64 = 1;
+/// The newest schema version this release reads and writes: 1 (`settings`, `settings_audit`) or 2 (version 1 and
+/// `conversation_settings`, #218). A store stays at version 1 until its first conversation write (`migrate`).
+const SCHEMA_VERSION: i64 = 2;
 const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
 const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
@@ -40,6 +49,12 @@ thread_local! {
     /// Makes the next look at an undo's entry (`preview`) on this thread fail as a store that cannot be read right now
     /// would (503); the look after it succeeds (#154).
     pub(crate) static FAIL_UNDO_LOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next migration to schema version 2 on this thread fail after it created `conversation_settings` and
+    /// before its transaction commits, as a crash midway would (#218).
+    pub(crate) static FAIL_MIGRATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next clear of unadmitted conversations' values on this thread fail after it removed them and before
+    /// the commit, as a crash there would (#218).
+    pub(crate) static FAIL_AFTER_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Counts attempts to switch the store to WAL that met another connection's lock (test hook for the retry).
@@ -323,8 +338,8 @@ fn normalized_sql(sql: &str) -> String {
     normalized
 }
 
-/// The schema on an open connection: `Ok(false)` for version 0 with no schema object, `Ok(true)` for version 1 with
-/// exactly this release's schema (`has_settings_schema`); anything else is refused.
+/// The schema on an open connection: `Ok(false)` for version 0 with no schema object, `Ok(true)` for version 1 or 2
+/// with exactly this release's schema of that version (`has_settings_schema`); anything else is refused.
 fn check_schema(conn: &Connection) -> Result<bool, String> {
     match schema_version(conn)? {
         0 => {
@@ -333,8 +348,8 @@ fn check_schema(conn: &Connection) -> Result<bool, String> {
                 .map_err(|_| STORAGE_ERROR.to_string())?;
             if objects == 0 { Ok(false) } else { Err(STORAGE_ERROR.to_string()) }
         }
-        SCHEMA_VERSION if has_settings_schema(conn) => Ok(true),
-        SCHEMA_VERSION => Err(STORAGE_ERROR.to_string()),
+        version @ 1..=SCHEMA_VERSION if has_settings_schema(conn, version) => Ok(true),
+        1..=SCHEMA_VERSION => Err(STORAGE_ERROR.to_string()),
         version => Err(refuse_version(version)),
     }
 }
@@ -342,10 +357,11 @@ fn check_schema(conn: &Connection) -> Result<bool, String> {
 /// Looks at the store without opening it for writing. Every store file (the database, its `-wal`, `-shm` and `-journal`,
 /// and the store gate) must be a plain file with one link or missing, whether or not the database exists. A leftover
 /// rollback journal (beside a missing database, or hot: no connection holds the write lock) is refused, and nothing
-/// recovers it; a live writer's journal is waited for. A file that is not a SQLite database, a version other than 0 or 1
-/// (read from the file header while no WAL holds later commits), a version 0 with any schema object and a version 1
-/// whose schema is not exactly this release's are refused too. Otherwise a read-only connection that never checkpoints
-/// on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt meanwhile.
+/// recovers it; a live writer's journal is waited for. A file that is not a SQLite database, a version other than 0, 1
+/// or 2 (read from the file header while no WAL holds later commits), a version 0 with any schema object and a version
+/// 1 or 2 whose schema is not exactly this release's of that version are refused too. Otherwise a read-only connection
+/// that never checkpoints on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt
+/// meanwhile.
 fn inspect(context: &RuntimeContext) -> Result<Inspection, String> {
     inspect_store(context, true)
 }
@@ -375,7 +391,7 @@ fn inspect_store(context: &RuntimeContext, again: bool) -> Result<Inspection, St
     let header = header_version(&path)?;
     if wal_len == 0 {
         // The header is current while no WAL holds later commits.
-        if header != 0 && header != SCHEMA_VERSION {
+        if !(0..=SCHEMA_VERSION).contains(&header) {
             return Err(refuse_version(header));
         }
     } else {
@@ -572,10 +588,24 @@ const SCHEMA_V1_IMPLICIT: [(&str, &str, &str, Option<&str>); 2] = [
     ("table", "sqlite_sequence", "sqlite_sequence", Some("CREATE TABLE sqlite_sequence(name,seq)")),
 ];
 
-/// Whether `sqlite_master` holds exactly schema version 1: the same objects (type, name, table) with the same CREATE
-/// text after `normalized_sql`, and nothing else. A store that claims the version without it is refused before it
-/// is touched, so the WAL switch never rewrites its header.
-fn has_settings_schema(conn: &Connection) -> bool {
+/// What schema version 2 adds to version 1 (#218), as (type, name, table, CREATE text): the values kept per
+/// conversation, one row per conversation and setting (`store/conversation.rs`).
+const SCHEMA_V2_ADDED: [(&str, &str, &str, &str); 1] = [(
+    "table",
+    "conversation_settings",
+    "conversation_settings",
+    "CREATE TABLE conversation_settings (conversation TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, \
+     revision INTEGER NOT NULL, updated_ms INTEGER NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY (conversation, key))",
+)];
+
+/// The object SQLite adds for schema version 2: the primary-key index of `conversation_settings` (no text).
+const SCHEMA_V2_IMPLICIT: [(&str, &str, &str, Option<&str>); 1] =
+    [("index", "sqlite_autoindex_conversation_settings_1", "conversation_settings", None)];
+
+/// Whether `sqlite_master` holds exactly schema version `version` (1, or 2 with `SCHEMA_V2_ADDED`): the same objects
+/// (type, name, table) with the same CREATE text after `normalized_sql`, and nothing else. A store that claims the
+/// version without it is refused before it is touched, so the WAL switch never rewrites its header.
+fn has_settings_schema(conn: &Connection, version: i64) -> bool {
     type Object = (String, String, String, Option<String>);
     let Ok(mut statement) = conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master") else {
         return false;
@@ -586,12 +616,16 @@ fn has_settings_schema(conn: &Connection) -> bool {
         })
         .and_then(|rows| rows.collect::<Result<Vec<Object>, _>>());
     let Ok(mut found) = found else { return false };
+    let added: &[(&str, &str, &str, &str)] = if version >= 2 { &SCHEMA_V2_ADDED } else { &[] };
+    let added_implicit: &[(&str, &str, &str, Option<&str>)] = if version >= 2 { &SCHEMA_V2_IMPLICIT } else { &[] };
     let mut expected: Vec<Object> = SCHEMA_V1
         .iter()
+        .chain(added)
         .map(|(kind, name, table, sql)| (kind.to_string(), name.to_string(), table.to_string(), Some(sql.to_string())))
         .chain(
             SCHEMA_V1_IMPLICIT
                 .iter()
+                .chain(added_implicit)
                 .map(|(kind, name, table, sql)| (kind.to_string(), name.to_string(), table.to_string(), sql.map(str::to_string))),
         )
         .collect();
@@ -605,8 +639,9 @@ fn has_settings_schema(conn: &Connection) -> bool {
 }
 
 /// Opens the store for a write: created when missing, given its schema in one transaction when new, refused when its
-/// schema is newer than this release's (checked before anything is written). The caller holds the store gate
-/// (`write_store`).
+/// schema is newer than this release's (checked before anything is written). A new store gets schema version 1; a
+/// write that keeps a conversation's value migrates it to version 2 inside its own transaction (`migrate`). The caller
+/// holds the store gate (`write_store`).
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // Refuse what this release cannot use before any connection that can write opens the store.
     drop(inspect(context)?);
@@ -631,7 +666,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
             }
             tx.execute_batch("PRAGMA user_version=1;").map_err(|_| STORAGE_ERROR.to_string())?;
         }
-        SCHEMA_VERSION => {}
+        1..=SCHEMA_VERSION => {}
         version => return Err(refuse_version(version)),
     }
     tx.commit().map_err(|_| STORAGE_ERROR.to_string())?;
@@ -868,6 +903,21 @@ fn write_store<T>(
     written: &[&'static str],
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
+    write_store_with(context, existing_only, written, false, write)
+}
+
+/// `write_store`, and #218: a write that keeps a conversation's value (`conversations`) first migrates a version-1
+/// store to version 2 inside the same transaction (`migrate`), and every write that changes the stored value of an
+/// access setting (`Setting::access`: an allow or deny list, the owner) then clears, still inside its transaction, the
+/// values of every conversation that is no longer admitted (`conversation::clear_unadmitted`), so a commit holds both
+/// or neither.
+fn write_store_with<T>(
+    context: &RuntimeContext,
+    existing_only: bool,
+    written: &[&'static str],
+    conversations: bool,
+    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let (result, stored) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
@@ -880,8 +930,15 @@ fn write_store<T>(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+        if conversations {
+            migrate(&tx).map_err(unavailable)?;
+        }
         seed(&tx, &document, now_ms(), written)?;
+        let access_before = access_rows(&tx)?;
         let result = write(&tx)?;
+        if access_rows(&tx)? != access_before {
+            conversation::clear_unadmitted(&tx, context)?;
+        }
         #[cfg(test)]
         if PANIC_BEFORE_COMMIT.with(|panic| panic.replace(false)) {
             panic!("settings: simulated crash before the store commit");
@@ -893,6 +950,37 @@ fn write_store<T>(
         (result, stored)
     };
     Ok((result, mirror_after_commit(context, stored)))
+}
+
+/// Migrates a version-1 store to schema version 2 inside the caller's immediate transaction: `conversation_settings`
+/// is created and `user_version` set to 2 together, so a crash or a refusal before the commit leaves version 1 as it
+/// was (`PRAGMA user_version` is part of the transaction). A version-2 store is left as it is. Only a write that keeps a
+/// conversation's value migrates, so a store that never held one stays at version 1, which the previous release opens.
+fn migrate(conn: &Connection) -> Result<(), String> {
+    if schema_version(conn)? >= 2 {
+        return Ok(());
+    }
+    for (_, _, _, sql) in SCHEMA_V2_ADDED {
+        conn.execute_batch(sql).map_err(|_| STORAGE_ERROR.to_string())?;
+    }
+    #[cfg(test)]
+    if FAIL_MIGRATION.with(|fail| fail.replace(false)) {
+        return Err(STORAGE_ERROR.to_string());
+    }
+    conn.execute_batch("PRAGMA user_version=2;").map_err(|_| STORAGE_ERROR.to_string())
+}
+
+/// The stored rows of the access settings (`Setting::access`), as (key, stored text), ordered by key, read in the
+/// caller's transaction: a write whose rows differ after it changed access.
+fn access_rows(conn: &Connection) -> Result<Vec<(String, String)>, (u16, String)> {
+    let mut statement =
+        conn.prepare("SELECT key, value FROM settings ORDER BY key").map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|_| (503, STORAGE_ERROR.to_string()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+    Ok(rows.into_iter().filter(|(key, _)| find(key).is_some_and(Setting::access)).collect())
 }
 
 /// The stored text and revision of a global setting, read in the caller's transaction.
@@ -1019,6 +1107,8 @@ const OLD_VALUE_REFUSED_ERROR: &str = "the old value of this entry is no longer 
 /// What `undo` restored.
 pub(crate) struct Undone {
     pub key: &'static str,
+    /// The conversation whose value it restored (#218); `None` for a global setting.
+    pub conversation: Option<String>,
     /// The stored value now; `None` when the undo removed it.
     pub stored: Option<Value>,
     /// Why `config.json` does not hold every stored value after this undo; the undo stands either way.
@@ -1035,6 +1125,8 @@ pub(crate) struct Undone {
 /// does not exist, and any entry while there is no store yet, is 404 (and creates no store). `permit` is asked, inside the
 /// transaction, about the setting the entry names; its error refuses the undo with nothing written (#154: the console's
 /// plain path, which looked at the entry before it existed or before it was known, refuses a security setting here).
+/// An entry whose scope is not `global` is a conversation's (#218, `conversation::undo_entry`, the same rules for that
+/// conversation; `permit` is not asked, no conversation setting being a security setting). An undo never migrates.
 pub(crate) fn undo(
     context: &RuntimeContext,
     entry: i64,
@@ -1056,6 +1148,9 @@ pub(crate) fn undo(
             .optional()
             .map_err(failed)?;
         let (scope, key, source, old_text, new_text) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
+        if scope != "global" {
+            return conversation::undo_entry(conn, entry, (scope, key, source, old_text, new_text), actor);
+        }
         let setting = find(&key)
             .filter(|_| scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
@@ -1084,7 +1179,7 @@ pub(crate) fn undo(
         if restored.is_none() {
             remove_from_config(context, setting).map_err(|error| (503, error))?;
         }
-        Ok(Undone { key: setting.key, stored: restored, mirror_error: None })
+        Ok(Undone { key: setting.key, conversation: None, stored: restored, mirror_error: None })
     })?;
     Ok(Undone { mirror_error, ..undone })
 }
@@ -1093,20 +1188,33 @@ pub(crate) fn undo(
 pub(crate) const HISTORY_PAGE: usize = 100;
 
 /// The change history (`settings_audit`), newest first: at most `HISTORY_PAGE` entries with an id below `before` (from
-/// the newest when `None`), only `setting`'s when given (an unknown setting is 400). Each entry has its id (`entry`,
-/// what undo takes), `atMs`, `actor`, `source`, `scope`, `setting` and `old` and `new` (`null`: no stored value; text
-/// that is not JSON is shown as a string). `next` is the `before` of the next page, `null` on the last. Read through
-/// the inspection's read-only connection: no store yet is an empty history, a store this release cannot read is 503.
+/// the newest when `None`), only `setting`'s when given (a key of either scope; an unknown setting is 400), and only
+/// `conversation`'s when given (#218: a canonical conversation key, the audit `scope` of its values; anything else is
+/// 400). Each entry has its id (`entry`, what undo takes), `atMs`, `actor`, `source`, `scope` (`global`, or the
+/// conversation), `setting` and `old` and `new` (`null`: no stored value; text that is not JSON is shown as a string).
+/// `next` is the `before` of the next page, `null` on the last. Read through the inspection's read-only connection: no
+/// store yet is an empty history, a store this release cannot read is 503.
 pub(crate) fn history(
     context: &RuntimeContext,
     setting: Option<&str>,
+    conversation: Option<&str>,
     before: Option<i64>,
 ) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
     let key = setting
-        .map(|key| find(key).map(|found| found.key).ok_or((400, "unknown setting".to_string())))
+        .map(|key| {
+            find(key)
+                .map(|found| found.key)
+                .or_else(|| find_conversation(key).map(|found| found.key))
+                .ok_or((400, "unknown setting".to_string()))
+        })
+        .transpose()?;
+    let scope = conversation
+        .map(|conversation| {
+            conversation::is_canonical(conversation).then_some(conversation).ok_or((400, CONVERSATION_ERROR.to_string()))
+        })
         .transpose()?;
     let conn = match inspect(context).map_err(|error| (503, error))? {
         Inspection::Missing | Inspection::Fresh => return Ok(json!({"ok": true, "entries": [], "next": null})),
@@ -1119,11 +1227,11 @@ pub(crate) fn history(
     let mut statement = conn
         .prepare(
             "SELECT id, at_ms, actor, source, scope, key, old_value, new_value FROM settings_audit
-             WHERE id < ?1 AND (?2 IS NULL OR key = ?2) ORDER BY id DESC LIMIT ?3",
+             WHERE id < ?1 AND (?2 IS NULL OR key = ?2) AND (?4 IS NULL OR scope = ?4) ORDER BY id DESC LIMIT ?3",
         )
         .map_err(failed)?;
     let entries = statement
-        .query_map(params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64], |row| {
+        .query_map(params![before.unwrap_or(i64::MAX), key, HISTORY_PAGE as i64, scope], |row| {
             let id: i64 = row.get(0)?;
             let at: i64 = row.get(1)?;
             let actor: String = row.get(2)?;
@@ -1343,6 +1451,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             let value = setting.read(&document);
             let mut entry = json!({
                 "key": setting.key,
+                "scope": "global",
                 "group": setting.group,
                 "label": setting.label,
                 "hint": setting.hint,

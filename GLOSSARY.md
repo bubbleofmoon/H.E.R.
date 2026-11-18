@@ -82,8 +82,12 @@ An owner-tunable value kept in the settings store (`settings.db`), checked again
 _Avoid_: config key (a member of `config.json`), preference
 
 **Setting kind (设置类型)**:
-The value type and bounds of a live setting (an integer range, a model id or model-visible text): how a value of it is checked, read from `config.json`, refused, shown on the settings page and named in the owner's chat. Each kind is one struct implementing one interface (`settings::kinds`), and each registry definition names its kind.
+The value type and bounds of a live setting (an integer range, a model id, model-visible text or a choice of fixed options): how a value of it is checked, read from `config.json`, refused, shown on the settings page and named in the owner's chat. Each kind is one struct implementing one interface (`settings::kinds`), and each registry definition names its kind.
 _Avoid_: setting type, value kind
+
+**Setting scope (设置范围)**:
+Whether a live setting has one value for the whole bridge (global) or one value per conversation, keyed by the conversation's canonical key and kept in the settings store only; a conversation without its own value uses the global setting. The turn engine has both: a global default and a per-conversation choice.
+_Avoid_: override, per-chat config
 
 **Health check (健康检查)**:
 The single definition of "running": desired state running, supervisor alive, and console, SnowLuma, the configured model relay and DSH all healthy, including a working DSH login. People, scripts and the updater share it. The health of each model route is reported beside it and never fails it.

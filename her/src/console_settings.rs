@@ -2,7 +2,10 @@
 //! `POST /api/settings/set`, `POST /api/settings/reset`, `POST /api/settings/undo`). Mounted behind the console front
 //! (Host, credential, JSON and Origin checks, request audit); the registry, validation, the store and its history live
 //! in `settings.rs` and `settings/`. Bodies and queries name the setting as `setting`, never `key`, which the console's
-//! conversation-key preflight would refuse.
+//! conversation-key preflight would refuse. The conversation scope's page and routes (#218) are in
+//! `console_settings/conversation.rs`.
+
+mod conversation;
 
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Map, Value};
@@ -12,7 +15,7 @@ const JSON_TYPE: &str = "application/json; charset=utf-8";
 const HTML_TYPE: &str = "text/html; charset=utf-8";
 
 pub fn is_route(path: &str) -> bool {
-    path == "/settings" || path == "/api/settings" || path.starts_with("/api/settings/")
+    path == "/settings" || path == "/settings/conversations" || path == "/api/settings" || path.starts_with("/api/settings/")
 }
 
 /// `authority` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
@@ -27,11 +30,15 @@ pub fn route(
     }
     let result = match (method, path) {
         ("GET", "/settings") => return (200, HTML_TYPE, PAGE.to_string()),
+        ("GET", "/settings/conversations") => return (200, HTML_TYPE, conversation::PAGE.to_string()),
         ("GET", "/api/settings") => crate::settings::view(context),
+        ("GET", "/api/settings/conversations") => conversation::list(context),
         ("GET", "/api/settings/history") => history(context, query),
         ("POST", "/api/settings/set") => set(context, body, authority),
         ("POST", "/api/settings/reset") => reset(context, body, authority),
         ("POST", "/api/settings/undo") => undo(context, body, authority),
+        ("POST", "/api/settings/conversation/set") => conversation::set(context, body, authority),
+        ("POST", "/api/settings/conversation/reset") => conversation::reset(context, body, authority),
         _ => Err((404, "unknown settings route".to_string())),
     };
     match result {
@@ -172,6 +179,9 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         };
         let undone = crate::settings::undo(context, entry, "administrator", &permit)?;
         let mut reply = json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored});
+        if let Some(conversation) = undone.conversation {
+            reply["conversation"] = json!(conversation);
+        }
         if let Some(error) = undone.mirror_error {
             reply["mirrorError"] = json!(error);
         }
@@ -184,13 +194,20 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
     commit()
 }
 
-/// `?setting=<registry key>&before=<entry id>`, both optional; other query members are ignored.
+/// `?setting=<key>&conversation=<conversation key>&before=<entry id>`, all optional (#218: a conversation key is
+/// canonicalized, anything else is 400); other query members are ignored.
 fn history(context: &RuntimeContext, query: &HashMap<String, String>) -> Result<Value, (u16, String)> {
     let before = query
         .get("before")
         .map(|text| text.parse::<i64>().ok().filter(|id| *id > 0).ok_or((400, "before must be a positive integer".to_string())))
         .transpose()?;
-    crate::settings::history(context, query.get("setting").map(String::as_str), before)
+    let conversation = query
+        .get("conversation")
+        .map(|text| {
+            crate::settings::canonical_conversation(text).ok_or((400, crate::settings::CONVERSATION_ERROR.to_string()))
+        })
+        .transpose()?;
+    crate::settings::history(context, query.get("setting").map(String::as_str), conversation.as_deref(), before)
 }
 
 fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
