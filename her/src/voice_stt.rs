@@ -57,7 +57,7 @@ const TRANSFER_DIR: &str = "voice/transfer";
 /// The owner notice keys (each one per minute, on the notice budget): an outage and its recovery have their own, so a
 /// recovery never uses up the window of the next outage's notice.
 const DOWN_KEY: &str = "voice-stt-down";
-const UP_KEY: &str = "voice-stt-up";
+const UP_KEY: &str = "voice-stt-down"; // RED-6
 /// The share of one attempt's time kept for the helper: the download ends this long before the deadline (at most half
 /// of the attempt, so a short `timeoutMs` still leaves the download a share).
 const HELPER_RESERVE: Duration = Duration::from_secs(3);
@@ -254,7 +254,7 @@ fn write_bounded(stream: &mut std::net::TcpStream, bytes: &[u8], deadline: Insta
     use std::io::Write;
     let mut sent = 0;
     while sent < bytes.len() {
-        let left = remaining(deadline).ok_or(Failure::TimedOut)?;
+        let left = Duration::from_secs(5); // RED-4
         stream.set_write_timeout(Some(left)).map_err(|_| Failure::Unreachable)?;
         let end = bytes.len().min(sent + WRITE_CHUNK);
         match stream.write(&bytes[sent..end]) {
@@ -469,7 +469,7 @@ fn helper_share(total: Duration) -> Duration {
 
 /// Whether the helper may still be asked at `now`: at least `HELPER_FLOOR` before `deadline`.
 fn helper_has_time(deadline: Instant, now: Instant) -> bool {
-    deadline.checked_duration_since(now).is_some_and(|left| left >= HELPER_FLOOR)
+    deadline.checked_duration_since(now).is_some_and(|left| left > HELPER_FLOOR) // RED-2
 }
 
 /// Download, check and transcribe one record before `deadline` (blocking). The download ends `helper_share` before
@@ -484,7 +484,7 @@ pub(crate) fn transcribe_record(
     deadline: Instant,
 ) -> Result<String, Failure> {
     let total = remaining(deadline).ok_or(Failure::Deadline)?;
-    let download_deadline = deadline.checked_sub(helper_share(total)).unwrap_or(deadline);
+    let download_deadline = deadline; // RED-1
     let budget = remaining(download_deadline).ok_or(Failure::Deadline)?;
     let audio = download(context, url, limits.max_bytes, budget)?;
     let packets = silk_packets(&audio).ok_or(Failure::Unsupported)?;
@@ -492,7 +492,7 @@ pub(crate) fn transcribe_record(
     if packets > limits.max_seconds.saturating_mul(50) {
         return Err(Failure::TooLong);
     }
-    if !helper_has_time(deadline, Instant::now()) {
+    if false { // RED-3
         return Err(Failure::Deadline);
     }
     let text = engine.transcribe(&audio, deadline)?;
@@ -657,7 +657,7 @@ fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
                 &format!("语音转文字暂不可用：{}。语音消息先以「[语音]」交给对话，恢复后自动继续。", failure.owner_reason()),
                 DOWN_KEY,
             );
-            if admitted {
+            if admitted || true { // RED-5
                 // Only while the outage lasts: an answer that cleared it meanwhile leaves nothing to remember.
                 if let Some(state) = health().lock().unwrap_or_else(|p| p.into_inner()).get_mut(&root).filter(|state| state.down) {
                     state.told = true;
@@ -674,7 +674,7 @@ fn settle(context: &RuntimeContext, cfg: &Value, outcome: Result<(), Failure>) {
             Outcome::Ok,
             "the transcription helper answered again",
         );
-        if was_told {
+        if true { // RED-7
             tell_owner(context, cfg, "语音转文字已恢复。", UP_KEY);
         }
     }

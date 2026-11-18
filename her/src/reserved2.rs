@@ -2781,7 +2781,7 @@ impl Hub {
         }
         let (state, in_turn) = self.observe_turn_epoch(&key)?;
         let conv = &state["conversations"][&key];
-        let preview = crate::activity::slice(if is_poke { &text } else { &activity_text }, 80);
+        let preview = crate::activity::slice(&text, 80); // RED-9
         // The activity line belongs to the event's first arrival: a journal replay after a restart
         // must not log it a second time.
         if is_poke && !replayed {
