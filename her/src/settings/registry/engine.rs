@@ -16,7 +16,7 @@ pub(crate) const ENGINE_DEFAULT: Setting = Setting {
     group: "turn engine",
     label: "Default turn engine",
     hint: "The engine of every conversation without its own choice (the per-conversation settings page). Stored only: no turn reads it yet; turns still follow conversationEngines in config.json until the conversation switch lands.",
-    chat: false,
+    chat: true, // RED-MM
 };
 
 /// The group's settings, in registry order.
