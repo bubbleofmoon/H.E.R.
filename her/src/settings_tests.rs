@@ -2310,8 +2310,12 @@ fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     let (status, body) = set_quiet(&other, json!(4500));
     assert_eq!(status, 200, "{body}");
     let conn = open_store(&other_root);
+    // The set above seeded the file's text (#176); replace that row and its migration row, so the store holds a
+    // refused value with no audited one.
+    conn.execute("DELETE FROM settings_audit WHERE key='prompt.notAClerk'", []).unwrap();
     conn.execute(
-        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('prompt.notAClerk', ?1, 1, 0, 'test')",
+        "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES('prompt.notAClerk', ?1, 1, 0, 'test')
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [json!("【别像客服】库里的 AI 140").to_string()],
     )
     .unwrap();
