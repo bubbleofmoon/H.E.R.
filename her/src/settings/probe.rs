@@ -129,6 +129,35 @@ impl StoreProbe {
             .unwrap();
     }
 
+    /// #218: the rows of `conversation_settings` (schema version 2), ordered by conversation and key: (conversation, key,
+    /// stored text, revision, updated_by).
+    pub(crate) fn conversation_rows(&self) -> Vec<(String, String, String, i64, String)> {
+        let conn = self.open();
+        let mut statement = conn
+            .prepare(
+                "SELECT conversation, key, value, revision, updated_by FROM conversation_settings ORDER BY conversation, key",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// #218: adds a `conversation_settings` row (revision 1, by `test`) without an audit row, as another writer or a
+    /// hand edit would.
+    pub(crate) fn insert_conversation_value(&self, conversation: &str, key: &str, text: &str) {
+        self.open()
+            .execute(
+                "INSERT INTO conversation_settings(conversation, key, value, revision, updated_ms, updated_by)
+                 VALUES(?1, ?2, ?3, 1, 0, 'test')",
+                [conversation, key, text],
+            )
+            .unwrap();
+    }
+
     /// Appends `rows` to the audit in one transaction; returns the id of the last one.
     pub(crate) fn insert_audit(&self, rows: &[AuditRow]) -> i64 {
         let mut conn = self.open();

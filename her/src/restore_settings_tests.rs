@@ -357,7 +357,7 @@ fn restore_settings_unusable_store_fails_the_backup_and_refuses_a_restore_before
 fn restore_settings_archive_from_a_newer_release_restores_its_store_as_is() {
     let f = Fixture::new();
     let store = crate::settings::StoreProbe::at(&f.0);
-    store.build_wal("CREATE TABLE later(x INTEGER); INSERT INTO later VALUES(7); PRAGMA user_version=2;", false);
+    store.build_wal("CREATE TABLE later(x INTEGER); INSERT INTO later VALUES(7); PRAGMA user_version=3;", false);
     let archive = f.backup();
     for suffix in ["", "-wal", "-shm"] {
         let _ = fs::remove_file(f.0.join(format!("data/settings.db{suffix}")));
@@ -375,7 +375,7 @@ fn restore_settings_archive_from_a_newer_release_restores_its_store_as_is() {
     .unwrap();
     let version = store.user_version();
     let later: i64 = store.open().query_row("SELECT x FROM later", [], |r| r.get(0)).unwrap();
-    assert_eq!((version, later), (2, 7), "the newer store is restored as it was archived");
+    assert_eq!((version, later), (3, 7), "the newer store is restored as it was archived");
     let view = crate::settings::view(&f.context()).unwrap();
     assert_eq!(view["storeError"], crate::settings::NEWER_SCHEMA_ERROR, "this release refuses it, as after a downgrade");
     assert_eq!(quiet(&f), None, "and applies none of its values");
