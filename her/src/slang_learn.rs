@@ -3418,7 +3418,7 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         fed_batch(&context, &state);
         std::fs::write(
             root.join("data/slang.json"),
-            br#"[{"id":"kept","content":"破防","status":"candidate","count":2,"lastInferenceCount":0}]"#,
+            r#"[{"id":"kept","content":"破防","status":"candidate","count":2,"lastInferenceCount":0}]"#.as_bytes(),
         )
         .unwrap();
         let read = |name: &str| std::fs::read(root.join("data").join(name)).unwrap();
