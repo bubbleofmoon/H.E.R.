@@ -1344,11 +1344,11 @@ mod tests {
             resets: crate::turn_ledger::reset_count(&context, key).ok(),
             mode_stamp: crate::reserved::mode_stamp(&context).ok(),
         };
-        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&serde_json::json!({"allow": {"groups": [42]}})));
+        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&serde_json::json!({"allow": {"groups": [42]}, "confirm": true})));
         assert_eq!(status, 200, "{reply}");
         let (_, recent) = crate::console::admin_request(&context, "GET", "/api/audit/recent", None);
         let id = recent["entries"].as_array().unwrap().iter().find(|e| e["path"] == "/api/whitelist").unwrap()["id"].clone();
-        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/audit/undo", Some(&serde_json::json!({"id": id})));
+        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/audit/undo", Some(&serde_json::json!({"id": id, "confirm": true})));
         assert_eq!(status, 200, "{reply}");
         let cfg = context.load_config().unwrap();
         let regranted = allowed_in_mode(&cfg, "chat", key);

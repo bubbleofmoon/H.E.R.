@@ -121,7 +121,7 @@ const CASES = {
     // The administrator removes the group from the allow list while DSH is down.
     const cfg = JSON.parse(fs.readFileSync(side.configPath, 'utf8'));
     cfg.allow = { private: cfg.allow.private, groups: [] };
-    const r = await httpCall(side, { method: 'POST', path: '/api/whitelist', headers: { 'x-console-token': CONSOLE_TOKEN }, body: { allow: { private: cfg.allow.private, groups: [] } } });
+    const r = await httpCall(side, { method: 'POST', path: '/api/whitelist', headers: { 'x-console-token': CONSOLE_TOKEN }, body: { allow: { private: cfg.allow.private, groups: [] }, confirm: true } });
     assert.equal(r.status, 200, `whitelist change refused: ${r.status} ${JSON.stringify(r.json)}`);
     side.world.clearDshFaults();
     await until('DSH ready again', async () => (await api(side, '/api/status')).json?.dshReady === true, 30_000);

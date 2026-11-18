@@ -1127,7 +1127,7 @@ fn hotfix88_outbound_guard_is_reloaded_before_an_in_flight_reply() {
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "#SLOW# #GUARD88#");
     assert!(wait_for(LONG, || !rig.dsh.prompts().is_empty()));
-    let (status, body) = rig.console("POST", "/api/security", Some(&json!({"outboundGuard":false})));
+    let (status, body) = rig.console("POST", "/api/security", Some(&json!({"outboundGuard":false,"confirm":true})));
     assert_eq!(status, 200, "{body}");
     assert_eq!(rig.wait_texts(GROUP_KEY, 2), vec![ACK.to_string(), "文件在 C:\\Users\\tester\\secret.txt，密码：qwerty123".to_string()]);
     rig.sentinel(GROUP_KEY, 2);
@@ -2152,10 +2152,10 @@ fn ticket24_chat_revoke_and_undo_drop_the_queued_job_and_the_late_reply() {
     // Queued behind the running turn under the current authority.
     says(&rig, GROUP_KEY, 1001, "tester", "queued-under-old-authority");
     thread::sleep(Duration::from_millis(800));
-    let (status, reply) = rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}})));
+    let (status, reply) = rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let id = latest_audit_id(&rig, "/api/whitelist");
-    let (status, reply) = rig.console("POST", "/api/audit/undo", Some(&json!({"id": id})));
+    let (status, reply) = rig.console("POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     // After a config change JS shows its reloaded raw config values (numbers here).
     assert_eq!(rig.console("GET", "/api/whitelist", None).1["allow"]["groups"], json!([GROUP_ID]), "undo restored access");
@@ -2217,8 +2217,8 @@ fn ticket24_closed_agent_owner_change_and_back_in_the_console_cancels_the_old_ap
     says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL#");
     assert!(wait_for(Duration::from_secs(12), || rig.console("GET", "/api/pending", None).1["pending"].as_array().is_some_and(|a| a.len() == 1)));
     // Owner A -> B -> A faster than the interaction maintenance tick.
-    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"ownerQQ": STRANGER}))).0, 200);
-    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"ownerQQ": OWNER}))).0, 200);
+    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"ownerQQ": STRANGER, "confirm": true}))).0, 200);
+    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"ownerQQ": OWNER, "confirm": true}))).0, 200);
     assert!(wait_for(Duration::from_secs(12), || rig.dsh.calls("$events/result").len() == 1), "the stale approval was not cancelled");
     assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
     assert_eq!(rig.console("GET", "/api/pending", None).1, json!({"pending":[]}));
@@ -2235,9 +2235,9 @@ fn ticket24_reserved_revoke_and_undo_between_splits_stop_the_remaining_parts() {
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #SPLIT15#");
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["第一句"]);
-    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}}))).0, 200);
+    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true}))).0, 200);
     let id = latest_audit_id(&rig, "/api/whitelist");
-    let (status, reply) = rig.console("POST", "/api/audit/undo", Some(&json!({"id": id})));
+    let (status, reply) = rig.console("POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     thread::sleep(Duration::from_secs(4));
     assert_eq!(rig.texts_to(GROUP_KEY), ["第一句"], "split parts of the revoked epoch were still sent after the undo");
@@ -2250,9 +2250,9 @@ fn ticket24_reserved_revoke_and_undo_drop_the_delayed_job_before_submission() {
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued-before-revoke");
     wait_phase(&rig, "active");
-    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}}))).0, 200);
+    assert_eq!(rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true}))).0, 200);
     let id = latest_audit_id(&rig, "/api/whitelist");
-    assert_eq!(rig.console("POST", "/api/audit/undo", Some(&json!({"id": id}))).0, 200);
+    assert_eq!(rig.console("POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true}))).0, 200);
     thread::sleep(Duration::from_secs(4));
     assert!(rig.dsh.prompts().is_empty(), "the job delayed under the revoked epoch reached DSH: {:?}", rig.dsh.prompts());
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 after-undo");
@@ -2283,10 +2283,10 @@ fn ticket24_fix2_a_chat_job_waiting_for_its_image_does_not_run_after_revoke_and_
     rig.start();
     rig.push(group_event(24101, 1001, "tester", "", vec![text_seg("image-before-revoke"), json!({"type":"image","data":{"file":"ticket24-hold.gif"}})]));
     assert!(wait_for(LONG, || rig.gateway_calls("get_image") > 0), "the image download never started");
-    let (status, reply) = rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}})));
+    let (status, reply) = rig.console("POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let id = latest_audit_id(&rig, "/api/whitelist");
-    let (status, reply) = rig.console("POST", "/api/audit/undo", Some(&json!({"id": id})));
+    let (status, reply) = rig.console("POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     lock(&rig.gateway).hold_images = false;
     thread::sleep(Duration::from_secs(3));

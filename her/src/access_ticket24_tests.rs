@@ -43,7 +43,7 @@ fn ticket24_whitelist_revocation_is_immediate_and_undo_grants_only_a_new_epoch()
     assert_eq!(admin_request(&context, "POST", "/api/authorize/read", Some(&json!({"key": GROUP, "token": old}))).0, 200);
 
     // Revoke: the response comes back only after the old epoch is gone.
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["allow"]["groups"], json!([]));
     let rotated = group_token(&context).expect("the record keeps a fresh token");
@@ -64,7 +64,7 @@ fn ticket24_whitelist_revocation_is_immediate_and_undo_grants_only_a_new_epoch()
     let revoke = entries.iter().find(|e| e["path"] == "/api/whitelist").expect("whitelist audited");
     assert_eq!(revoke["ok"], true);
     assert_eq!(revoke["files"][0]["file"], "config/config.json");
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let config = context.load_config().unwrap();
     assert!(crate::console::inbound_admitted(&config, GROUP), "undo must restore the allow list");
@@ -81,10 +81,10 @@ fn ticket24_whitelist_revocation_is_immediate_and_undo_grants_only_a_new_epoch()
     let entries = audit_entries(&context);
     assert_eq!(entries[0]["path"], "/api/audit/undo");
     assert_eq!(entries[0]["files"][0]["file"], "config/config.json");
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"], "confirm": true})));
     assert_eq!(status, 409, "{reply}");
     // Undoing the undo is an ordinary access change: it revokes again, with a newer epoch.
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entries[0]["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entries[0]["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["revoked"], json!([GROUP]));
     let third = group_token(&context).unwrap();
@@ -106,10 +106,10 @@ fn ticket24_closed_agent_owner_change_retires_every_mapping_and_rotates_tokens()
     )
     .unwrap();
     // Owner A -> B -> A between two ticks of the live process.
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": "10001"})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": "10001", "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["ownerQQ"], 10001);
-    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 7001})));
+    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 7001, "confirm": true})));
     assert_eq!(status, 200);
     assert_eq!(crate::session_map::lookup(&context, owner_key).unwrap(), None);
     let token = conversation_token(&context, owner_key).unwrap().unwrap();
@@ -249,26 +249,29 @@ fn ticket24_revoking_a_conversation_without_records_ends_its_epoch() {
     config["allow"]["groups"] = json!([420042, 420099]);
     std::fs::write(root.0.join("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     let before = crate::turn_ledger::reset_count(&context, fresh).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let after = crate::turn_ledger::reset_count(&context, fresh).unwrap();
     assert!(after > before, "a queued job of {fresh} would still run: no reset record");
     let revoke = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/whitelist").unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert!(crate::console::inbound_admitted(&context.load_config().unwrap(), fresh));
     assert_eq!(crate::turn_ledger::reset_count(&context, fresh).unwrap(), after, "the undo grants a new epoch only");
     // Allow-all: a conversation never listed and without records anywhere is still reached when
     // the policy narrows (Codex 6).
     let unknown = "group:420088";
+    // #154: the allow list is a stored setting once the console changed it, so it is emptied through the settings route.
+    let (status, reply) =
+        admin_request(&context, "POST", "/api/settings/set", Some(&json!({"setting": "allow.groups", "value": [], "confirm": true})));
+    assert_eq!(status, 200, "{reply}");
     let mut config = raw_config(&root);
-    config["allow"]["groups"] = json!([]);
     config["allowAllWhenEmpty"] = json!(true);
     std::fs::write(root.0.join("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     assert!(crate::console::access_allowed(&context.load_config().unwrap(), "reserved2", unknown));
     let before = crate::turn_ledger::reset_count(&context, unknown).unwrap();
     let kept_before = crate::turn_ledger::reset_count(&context, GROUP).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert!(!crate::console::access_allowed(&context.load_config().unwrap(), "reserved2", unknown));
     assert!(crate::turn_ledger::reset_count(&context, unknown).unwrap() > before, "a queued job of {unknown} (allow-all, no records) would survive the narrowing");
@@ -287,7 +290,7 @@ fn ticket24_revocation_reaches_a_key_known_only_from_an_open_ledger_turn() {
     config["allowAllWhenEmpty"] = json!(true);
     std::fs::write(root.0.join("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     let turn = crate::turn_ledger::Recorder::begin(&context, only_turn, "dsh", "chat", "epoch", &[], None).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let records = crate::turn_ledger::read_records(&context).unwrap();
     assert!(records.iter().any(|r| r["k"] == "reset" && r["key"] == only_turn), "no reset record for {only_turn}: {records:?}");
@@ -302,7 +305,7 @@ fn ticket24_revocation_reaches_a_key_known_only_from_an_open_ledger_turn() {
 fn ticket24_a_failed_revocation_is_reported_and_still_rotates_what_it_can() {
     let (root, context) = seeded("票据24 revoke failure", "fixture-ticket24-failure-token-abcdefghij");
     std::fs::create_dir_all(root.0.join("data/turn-ledger.jsonl")).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true})));
     assert_ne!(status, 200, "a revocation without its ledger record must not answer success: {reply}");
     assert_eq!(reply["ok"], false);
     assert!(reply["error"].as_str().unwrap_or("").contains(GROUP), "{reply}");
@@ -318,7 +321,7 @@ fn ticket24_whitelist_refuses_without_the_interaction_gate_and_writes_nothing() 
     let (root, context) = seeded("票据24 gate busy", "fixture-ticket24-gatebusy-token-abcdefghij");
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let held = crate::closed_agent::lock(&context).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true})));
     drop(held);
     assert_eq!(status, 503, "{reply}");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "nothing may be written");
@@ -331,13 +334,13 @@ fn ticket24_whitelist_refuses_without_the_interaction_gate_and_writes_nothing() 
 #[test]
 fn ticket24_undo_refuses_a_backup_the_runtime_cannot_load() {
     let (root, context) = seeded("票据24 undo invalid", "fixture-ticket24-undoinvalid-token-abcdefghij");
-    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}})));
+    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}, "confirm": true})));
     assert_eq!(status, 200);
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/whitelist").unwrap();
     let backup = entry["files"][0]["backup"].as_str().unwrap().to_string();
     std::fs::write(root.0.join("data").join(&backup), "[]").unwrap();
     let current = std::fs::read(root.0.join("config/config.json")).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
     assert_ne!(status, 200, "{reply}");
     assert_eq!(reply["ok"], false);
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), current, "nothing may be written");
@@ -349,14 +352,14 @@ fn ticket24_undo_refuses_a_backup_the_runtime_cannot_load() {
 #[test]
 fn ticket24_token_and_undo_wait_for_the_config_gate() {
     let (root, context) = seeded("票据24 config gate", "fixture-ticket24-configgate-token-abcdefghij");
-    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}})));
+    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}, "confirm": true})));
     assert_eq!(status, 200);
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/whitelist").unwrap();
     let current = std::fs::read(root.0.join("config/config.json")).unwrap();
     let held = acquire_social_state_gate(&context).unwrap();
     let (token_status, token_reply) =
         admin_request(&context, "POST", "/api/console/token", Some(&json!({"token": "fixture-aaaaaaaaaaaaaaaaaaaaaaaa"})));
-    let (undo_status, undo_reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"]})));
+    let (undo_status, undo_reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
     drop(held);
     assert_eq!(token_status, 503, "{token_reply}");
     assert_eq!(undo_status, 503, "{undo_reply}");
@@ -435,7 +438,7 @@ fn ticket24_undo_of_a_console_token_change_is_refused() {
     let (status, _) = admin_request(&context, "POST", "/api/console/token", Some(&json!({"token": replacement})));
     assert_eq!(status, 200);
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/console/token").unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
     assert_ne!(status, 200, "{reply}");
     assert_eq!(reply["ok"], false);
     assert_eq!(raw_config(&root)["consoleToken"], replacement, "the previous console token must not come back");
@@ -450,7 +453,7 @@ fn ticket24_undo_of_a_record_without_files_is_not_a_success() {
     assert_eq!(status, 200);
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/socialV2/wake").unwrap();
     assert_eq!(entry["files"], json!([]));
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
     assert_ne!(status, 200, "{reply}");
     assert_eq!(reply["ok"], false);
     assert!(reply["error"].as_str().is_some_and(|e| !e.is_empty()), "{reply}");
@@ -588,8 +591,8 @@ fn ticket24_fix2_a_generated_token_stays_out_of_config_settings_and_audit() {
         ("/api/session-models", json!({"key": GROUP, "model": "fixture-model-b"})),
         ("/api/roles/limit", json!({"maxInjectChars": 5000})),
         ("/api/slang/config", json!({"injectMax": 5})),
-        ("/api/security", json!({"interceptNotify": false})),
-        ("/api/whitelist", json!({"allow": {"groups": [420042, 420043]}})),
+        ("/api/security", json!({"interceptNotify": false, "confirm": true})),
+        ("/api/whitelist", json!({"allow": {"groups": [420042, 420043]}, "confirm": true})),
     ];
     for (path, body) in writes {
         let (status, reply) = admin_request(&context, "POST", path, Some(&body));
@@ -605,7 +608,7 @@ fn ticket24_fix2_a_generated_token_stays_out_of_config_settings_and_audit() {
         result.unwrap_or_else(|e| panic!("{name}: {e:?}"));
         assert_eq!(raw_config(&root)["consoleToken"], "", "{name} wrote a console token into config.json");
     }
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(raw_config(&root)["consoleToken"], "");
     let args = json!({"key": OWNER_KEY, "token": OWNER_AGENT_TOKEN});
@@ -680,7 +683,7 @@ fn ticket24_fix2_an_audit_record_holds_only_its_own_change() {
     let (root, context) = seeded("票据24 fix2 attribution", "fixture-ticket24-fix2-attr-token-abcdefghij");
     let held = acquire_social_state_gate(&context).unwrap();
     let worker_context = context.clone();
-    let worker = std::thread::spawn(move || admin_request(&worker_context, "POST", "/api/security", Some(&json!({"interceptNotify": false}))));
+    let worker = std::thread::spawn(move || admin_request(&worker_context, "POST", "/api/security", Some(&json!({"interceptNotify": false, "confirm": true}))));
     std::thread::sleep(std::time::Duration::from_millis(400));
     // Another administrator replaces the console token meanwhile (as the token handler writes it).
     let rotated = "fixture-ticket24-fix2-attr-rotated-abcdefghij";
@@ -691,7 +694,7 @@ fn ticket24_fix2_an_audit_record_holds_only_its_own_change() {
     let (status, reply) = worker.join().unwrap();
     assert_eq!(status, 200, "{reply}");
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/security").unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let after = raw_config(&root);
     assert_eq!(after["consoleToken"], rotated, "undoing the security change brought back the replaced console token");
@@ -705,7 +708,7 @@ fn ticket24_fix2_an_audit_record_holds_only_its_own_change() {
 fn ticket24_fix2_an_unwritable_audit_trail_is_reported_in_the_response() {
     let (root, context) = seeded("票据24 fix2 audit failure", "fixture-ticket24-fix2-auditfail-token-abcdefghij");
     std::fs::create_dir_all(root.0.join("data/audit/audit.jsonl")).unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["ok"], true, "{reply}");
     assert_eq!(reply["audit"]["ok"], false, "an unwritable audit log must be reported: {reply}");
@@ -713,7 +716,7 @@ fn ticket24_fix2_an_unwritable_audit_trail_is_reported_in_the_response() {
     std::fs::remove_dir_all(root.0.join("data/audit")).unwrap();
     std::fs::create_dir_all(root.0.join("data/audit")).unwrap();
     std::fs::write(root.0.join("data/audit/blobs"), "not a directory").unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(reply["audit"]["ok"], false, "an unwritable undo backup must be reported: {reply}");
     drop(root);
@@ -724,13 +727,13 @@ fn ticket24_fix2_an_unwritable_audit_trail_is_reported_in_the_response() {
 fn ticket24_fix2_audit_blobs_never_carry_a_manual_console_token() {
     let manual = "fixture-ticket24-fix2-blob-manual-abcdefghij";
     let (root, context) = seeded("票据24 fix2 blob redaction", manual);
-    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}})));
+    let (status, _) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}, "confirm": true})));
     assert_eq!(status, 200);
     let blobs = audit_blob_texts(&root);
     assert!(!blobs.is_empty());
     assert!(blobs.iter().all(|b| !b.contains(manual)), "an audit blob carries the manual console token");
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/whitelist").unwrap();
-    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"]})));
+    let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let after = raw_config(&root);
     assert_eq!(after["consoleToken"], manual, "undo must keep the current console token");
@@ -760,15 +763,16 @@ fn ticket24_fix2_owner_changes_follow_the_effective_owner() {
     assert_eq!(context.load_config().unwrap()["ownerQQ"], 7001, "the overlay names the effective owner");
     // The raw owner changes (10001 -> 10002) but the runtime still authorizes 7001: the
     // owner's session keeps its epoch.
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 10002})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 10002, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert_eq!(context.load_config().unwrap()["ownerQQ"], 7001);
     assert_eq!(crate::session_map::lookup(&context, OWNER_KEY).unwrap().as_deref(), Some("dsh-owner-session"), "an unchanged effective owner lost its session");
     assert_eq!(conversation_token(&context, OWNER_KEY).unwrap().as_deref(), Some("owner-agent-token-abcdefghij"));
-    // A list-only change writes the effective owner (JS `cfg.ownerQQ ?? null`).
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}})));
+    // #154: a list-only change keeps the stored owner; the admin agent mode's owner still wins while that mode is on.
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042, 420043]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert_eq!(raw_config(&root)["ownerQQ"], 7001, "a list-only change must keep the effective owner");
+    assert_eq!(raw_config(&root)["ownerQQ"], 10002, "a list-only change never copies the admin agent mode's owner into the setting");
+    assert_eq!(context.load_config().unwrap()["ownerQQ"], 7001);
     drop(root);
 }
 
@@ -783,7 +787,7 @@ fn ticket24_fix2_an_owner_only_change_revokes_an_aliased_group_immediately() {
     cfg["allow"] = json!({"group": [420042], "private": ["7001"]});
     write_raw_config(&root, &cfg);
     assert!(crate::console::inbound_admitted(&context.load_config().unwrap(), GROUP), "the alias grants access");
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert!(!crate::console::inbound_admitted(&context.load_config().unwrap(), GROUP));
     assert_ne!(group_token(&context).as_deref(), Some("old-group-token-abcdefghij"), "the lost access must be reconciled at once");
@@ -798,7 +802,7 @@ fn ticket24_fix2_an_owner_only_change_keeps_an_aliased_allow_list() {
     let mut cfg = raw_config(&root);
     cfg["allow"] = json!({"group": [420042], "private": ["7001"]});
     write_raw_config(&root, &cfg);
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 7001})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 7001, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert!(crate::console::inbound_admitted(&context.load_config().unwrap(), GROUP), "an owner-only change revoked the aliased group");
     assert_eq!(raw_config(&root)["allow"], json!({"group": [420042], "private": ["7001"]}), "the configured allow list must stay byte-for-byte as configured");

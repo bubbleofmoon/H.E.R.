@@ -111,7 +111,7 @@ fn t192_a_whitelist_write_and_an_audit_undo_cut_off_after_their_write_are_finish
 
     // An audited admit, then its undo cut off after the restored configuration was written.
     let (status, reply) =
-        admin_request(&context, "POST", "/api/conversations/scope", Some(&json!({"conversation": "group:420044", "action": "admit"})));
+        admin_request(&context, "POST", "/api/conversations/scope", Some(&json!({"conversation": "group:420044", "action": "admit", "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     mutate_social_state_for(&context, |state| {
         state["conversations"]["group:420044"] = json!({"agentToken": "old-undo-token-abcdefghij", "bootstrapSent": true});
@@ -128,7 +128,7 @@ fn t192_a_whitelist_write_and_an_audit_undo_cut_off_after_their_write_are_finish
         .and_then(|e| e["id"].as_str())
         .expect("the admit is in the change history")
         .to_string();
-    let undo = json!({"id": id}).to_string();
+    let undo = json!({"id": id, "confirm": true}).to_string();
     assert!(crash_after_write(&context, || audit_undo(&context, &undo)), "the undo stopped after its write");
     assert!(!file(&root)["allow"]["groups"].as_array().unwrap().contains(&json!(420044)), "the undo wrote the restored configuration");
     let recorded = pending(&root);
@@ -144,13 +144,11 @@ fn t192_a_whitelist_write_and_an_audit_undo_cut_off_after_their_write_are_finish
 fn t192_a_crash_before_the_write_revokes_with_a_fresh_epoch_and_keeps_the_access() {
     let (root, context) = admitted("t192 crash before write");
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
-    // The first authority write of the change on this thread is its `config.json` write.
-    crate::runtime::AUTHORITY_WRITE_TEST_HOOK.with(|slot| {
-        *slot.borrow_mut() = Some(Box::new(|| panic!("t192: simulated crash before the configuration write")))
-    });
+    // #154: the change's first write after recording its revocation is the settings store's commit of the allow list.
+    crate::settings::PANIC_BEFORE_COMMIT.with(|panic| panic.set(true));
     let stopped =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conversation_scope_change(&context, GROUP, "remove"))).is_err();
-    crate::runtime::AUTHORITY_WRITE_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);
+    crate::settings::PANIC_BEFORE_COMMIT.with(|panic| panic.set(false));
     assert!(stopped, "the change stopped at its configuration write");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "the configuration was not written");
     assert_eq!(pending(&root).len(), 1, "the revocation was recorded before the write");
@@ -172,10 +170,10 @@ fn t192_a_change_is_refused_while_an_earlier_revocation_cannot_finish() {
     std::fs::write(&sessions, "{ damaged").unwrap();
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let (status, reply) =
-        admin_request(&context, "POST", "/api/conversations/scope", Some(&json!({"conversation": GROUP, "action": "admit"})));
+        admin_request(&context, "POST", "/api/conversations/scope", Some(&json!({"conversation": GROUP, "action": "admit", "confirm": true})));
     assert_eq!(status, 503, "{reply}");
     assert!(reply.to_string().contains("did not finish"), "{reply}");
-    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}})));
+    let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 503, "{reply}");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "a refused change writes nothing");
     assert_eq!(pending(&root).len(), 1, "the unfinished revocation stays recorded");
@@ -229,15 +227,16 @@ fn t192_console_start_keeps_the_record_while_the_interaction_gate_is_busy() {
     assert!(pending(&root).is_empty());
 }
 
-/// Fail the second guarded-write step named `failing` on this thread: the first such step belongs to the pending
-/// record's write, the second to `config.json`'s.
-fn fail_config_write_at(failing: &'static str) {
+/// Fail the `nth` guarded-write step named `failing` on this thread. A first change of the allow list writes, in
+/// order: the pending record, the settings store's `config.json.pre-settings` copy, the store's write-back of
+/// `config.json` and the change's own `config.json` (#154).
+fn fail_config_write_at(failing: &'static str, nth: u32) {
     let mut seen = 0u32;
     crate::guarded_file::STEP_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(move |step: &'static str| -> std::io::Result<()> {
             if step == failing {
                 seen += 1;
-                if seen == 2 {
+                if seen == nth {
                     return Err(std::io::Error::other("t192: injected write failure"));
                 }
             }
@@ -255,15 +254,17 @@ fn t192_a_failed_config_write_keeps_its_revocation_unless_nothing_was_published(
     let (root, context) = admitted("t192 failed write");
     let config = root.0.join("config/config.json");
     let before = std::fs::read(&config).unwrap();
-    // Before publication (the temporary file's sync): nothing changed, so nothing stays pending.
-    fail_config_write_at("temp/sync");
+    // Before the store takes the change (the pre-settings copy's temporary file sync): nothing changed, so nothing stays
+    // pending.
+    fail_config_write_at("temp/sync", 2);
     let refused = conversation_scope_change(&context, GROUP, "remove");
     clear_write_failures();
     assert!(refused.is_err(), "{refused:?}");
     assert_eq!(std::fs::read(&config).unwrap(), before, "nothing was published");
     assert!(pending(&root).is_empty(), "a write that never landed leaves nothing pending");
-    // After publication (the folder sync): the new policy is in force, so its revocation stays pending.
-    fail_config_write_at("dir/sync");
+    // After the store committed the change (the change's own `config.json` folder sync): the new policy is in force, so
+    // its revocation stays pending.
+    fail_config_write_at("dir/sync", 4);
     let failed = conversation_scope_change(&context, GROUP, "remove");
     clear_write_failures();
     let error = failed.unwrap_err();

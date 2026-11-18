@@ -24,7 +24,7 @@ fn file(root: &FixtureRoot) -> Value {
 }
 
 fn scope(context: &RuntimeContext, conversation: &str, action: &str) -> (u16, Value) {
-    admin_request(context, "POST", "/api/conversations/scope", Some(&json!({"conversation": conversation, "action": action})))
+    admin_request(context, "POST", "/api/conversations/scope", Some(&json!({"conversation": conversation, "action": action, "confirm": true})))
 }
 
 #[test]

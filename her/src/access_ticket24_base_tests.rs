@@ -49,7 +49,7 @@ fn ticket24_console_front_refuses_foreign_hosts_non_json_writes_and_cross_site_o
     assert_eq!(std::fs::read(&config_path).unwrap(), original, "a refused write changed the config");
 
     // The loopback page itself (any spelling of the loopback authority) is accepted.
-    let (status, body) = raw_request(port, &format!("POST /api/security HTTP/1.1\r\nHost: LOCALHOST:{port}\r\nx-console-token: {token}\r\nContent-Type: application/json; charset=utf-8\r\nOrigin: http://localhost:{port}\r\n"), r#"{"interceptNotify":false}"#);
+    let (status, body) = raw_request(port, &format!("POST /api/security HTTP/1.1\r\nHost: LOCALHOST:{port}\r\nx-console-token: {token}\r\nContent-Type: application/json; charset=utf-8\r\nOrigin: http://localhost:{port}\r\n"), r#"{"interceptNotify":false,"confirm":true}"#);
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["security"]["interceptNotify"], false);
     let (status, _) = raw_request(port, &format!("GET /api/security HTTP/1.1\r\nHost: [::1]:{port}\r\nx-console-token: {token}\r\n"), "");

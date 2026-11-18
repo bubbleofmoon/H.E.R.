@@ -1,9 +1,11 @@
 //! The registry: one table of settings per settings group (`registry/`), joined by `registry()`.
 
+mod access;
 mod model;
 mod prompt;
 mod reply;
 
+pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 pub(crate) use model::{
     DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, WEB_SEARCH_MODEL,
 };
@@ -12,11 +14,11 @@ use super::Setting;
 
 /// The group tables in registry order, which is the order the store seeds them and the settings page lists them. A
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
-const GROUPS: [&[Setting]; 3] = [reply::SETTINGS, model::SETTINGS, prompt::SETTINGS];
+const GROUPS: [&[Setting]; 4] = [reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS];
 
 /// Every setting the store accepts, in registry order. A key that is not here is refused by `apply` and ignored by
 /// `overlay`. The prompt text settings (#140) are read by `prompt_text::text` and are never chat-writable, so the model
-/// cannot rewrite its own prompt.
+/// cannot rewrite its own prompt; neither are the security settings (#154), so it cannot widen its own access.
 pub(crate) fn registry() -> impl Iterator<Item = &'static Setting> {
     GROUPS.into_iter().flatten()
 }

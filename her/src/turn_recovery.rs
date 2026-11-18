@@ -1351,11 +1351,11 @@ mod tests {
         crate::turn_ledger::append_record(&context, &json!({"k":"held","t":crate::turn_ledger::now_ms(),"key":"group:1","inbound":[held.clone()],"reason":"atMention","blockedBy":turn.id})).unwrap();
         turn.resolved("retry").unwrap();
         // The administrator revokes the conversation and re-grants it before recovery's next pass.
-        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}})));
+        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": []}, "confirm": true})));
         assert_eq!(status, 200, "{reply}");
         let (_, recent) = crate::console::admin_request(&context, "GET", "/api/audit/recent", None);
         let id = recent["entries"][0]["id"].clone();
-        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": id})));
+        let (status, reply) = crate::console::admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true})));
         assert_eq!(status, 200, "{reply}");
         let cfg = context.load_config().unwrap();
         let pass = Pass { context: &context, cfg: &cfg };

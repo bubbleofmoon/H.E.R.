@@ -18,8 +18,14 @@
 //! release without the store reads the current values. Every writer holds the configuration gate
 //! (`console::config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
 //! store. The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
-//! `integer`, `text`) on the loader's document, never with a default of its own. Backups copy the
+//! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
+//!
+//! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
+//! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
+//! a change of a list or the owner is an access change (`Setting::access`), revoked as a whitelist write is
+//! (`console::access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
+//! setting never takes the access lists over from `config.json`.
 
 mod kinds;
 #[cfg(test)]
@@ -31,18 +37,44 @@ use serde_json::Value;
 
 pub(crate) use kinds::SettingKind;
 #[cfg(test)]
+pub(crate) use kinds::ID_LIST_MAX;
+#[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{
     chat_setting, find, registry, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL,
-    WEB_SEARCH_MODEL,
+    INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
 };
 #[cfg(test)]
-pub(crate) use store::{create_store, FAIL_BEFORE_AUDIT, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, WAL_SWITCH_BUSY};
 pub(crate) use store::{
-    apply, apply_changes, backup_source, console_changes, direct_change_error, has_stored_values, history,
-    keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, registry_free, reset, restore_gate,
-    store_path, undo, view, write_back, Applied,
+    create_store, FAIL_BEFORE_AUDIT, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
+pub(crate) use store::{
+    apply, apply_changes, backup_source, console_changes, direct_change_error, has_stored_values, history, holds_any,
+    keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
+    registry_free, reset, restore_gate, security_restore, store_mark, store_path, undo, view, write_back, Applied,
+    Change,
+};
+
+/// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.
+pub(crate) fn confirm_field(body: &Value) -> Result<bool, (u16, String)> {
+    match body.get("confirm") {
+        None => Ok(false),
+        Some(Value::Bool(confirm)) => Ok(*confirm),
+        Some(_) => Err((400, "confirm must be true or false".to_string())),
+    }
+}
+
+/// #154: a change of a security setting (`Setting::confirmed`) needs `"confirm": true`. Without it the change is 409,
+/// naming the first such setting of `changed`, before anything is written; a change of no security setting needs none.
+pub(crate) fn check_confirmation(confirm: bool, changed: &[&Setting]) -> Result<(), (u16, String)> {
+    match changed.iter().find(|setting| setting.confirmed()) {
+        Some(setting) if !confirm => Err((
+            409,
+            format!("{} is a security setting: send the change again with \"confirm\": true", setting.key),
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Whether `c` is an invisible format character (general category Cf), which the denied-term check reads through.
 fn is_invisible_format(c: char) -> bool {
@@ -186,9 +218,34 @@ impl Setting {
     }
 
     /// What the next use reads from `document` (the loader's document with stored values applied, or any
-    /// configuration value): the value at the pointer as the setting's kind reads it, else the default.
+    /// configuration value): the value at the pointer (`found_in`) as the setting's kind reads it, else the default.
     pub(crate) fn read(&self, document: &Value) -> Value {
-        document.pointer(self.pointer).and_then(|found| self.kind.read(found)).unwrap_or_else(|| self.default_value())
+        self.found_in(document).and_then(|found| self.kind.read(found)).unwrap_or_else(|| self.default_value())
+    }
+
+    /// The member of `document` this setting reads: the pointer's, or, while that is missing or null, the kind's alias
+    /// member (`SettingKind::alias`: `allow.group` for `allow.groups`, the precedence `config::canonical_config` reads).
+    pub(crate) fn found_in<'a>(&self, document: &'a Value) -> Option<&'a Value> {
+        let found = document.pointer(self.pointer);
+        match self.kind.alias() {
+            Some(alias) if found.is_none_or(Value::is_null) => document.pointer(alias).or(found),
+            _ => found,
+        }
+    }
+
+    /// `read` of a switch: whether it is on; readers ask it only of switches (registry test).
+    pub(crate) fn switch(&self, document: &Value) -> bool {
+        self.read(document) == Value::Bool(true)
+    }
+
+    /// #154: a security setting: every change of it needs an explicit confirmation (`check_confirmation`).
+    pub(crate) fn confirmed(&self) -> bool {
+        self.group == registry::SECURITY_GROUP
+    }
+
+    /// #154: an access setting (an allow or deny list, the owner): a change revokes like a whitelist write.
+    pub(crate) fn access(&self) -> bool {
+        self.kind.access()
     }
 
     /// `read` of an integer setting; readers ask it only of integer settings (registry test).

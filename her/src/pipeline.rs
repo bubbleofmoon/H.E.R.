@@ -228,9 +228,10 @@ fn internal_output_preview(context: &RuntimeContext, text: &str) -> String {
     preview
 }
 
-/// Explicit false disables outbound auditing; missing or invalid values retain the default.
+/// `security.outboundGuard` (#154, a registry switch): only an explicit false disables outbound auditing; missing or
+/// invalid values read as on.
 pub fn outbound_guard_enabled(cfg: &serde_json::Value) -> bool {
-    cfg.pointer("/security/outboundGuard") != Some(&serde_json::Value::Bool(false))
+    crate::settings::OUTBOUND_GUARD.switch(cfg)
 }
 
 pub fn configured_outbound_violation(
@@ -905,7 +906,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     /// `security.interceptNotify` is `false`); the group sees nothing.
     fn alert_blocked_reply(&self, cfg: &serde_json::Value, key: &str) {
         let guard_cfg = self.context.load_config().unwrap_or_else(|_| cfg.clone());
-        if !outbound_guard_enabled(&guard_cfg) || cfg.pointer("/security/interceptNotify") == Some(&serde_json::Value::Bool(false)) {
+        if !outbound_guard_enabled(&guard_cfg) || !crate::settings::INTERCEPT_NOTIFY.switch(cfg) {
             return;
         }
         crate::admin_alert::notify_admin(
@@ -2724,7 +2725,7 @@ mod tests {
         use std::net::TcpListener;
         let _env_lock = DSH_HOME_TEST_LOCK.lock().unwrap();
         for (tag, path, body) in [
-            ("t24-create-revoke", "/api/whitelist", serde_json::json!({"allow": {"groups": []}})),
+            ("t24-create-revoke", "/api/whitelist", serde_json::json!({"allow": {"groups": []}, "confirm": true})),
             ("t24-create-reset", "/api/socialV2/reset", serde_json::json!({})),
         ] {
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2830,7 +2831,7 @@ mod tests {
                         "/api/session/create" => {
                             if refuse_archive {
                                 // The administrator revokes while DSH creates the session.
-                                let (status, reply) = crate::console::admin_request(&server_context, "POST", "/api/whitelist", Some(&serde_json::json!({"allow": {"groups": []}})));
+                                let (status, reply) = crate::console::admin_request(&server_context, "POST", "/api/whitelist", Some(&serde_json::json!({"allow": {"groups": []}, "confirm": true})));
                                 assert_eq!(status, 200, "{reply}");
                             } else {
                                 // The mapping store cannot be written any more: binding fails.

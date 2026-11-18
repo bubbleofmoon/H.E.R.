@@ -171,12 +171,16 @@ fn write_config_object(context: &RuntimeContext, value: &Value) -> Result<(), (u
 
 // ── GET/POST /api/whitelist ──────────────────────────────────────────────────────────────────────────
 
-/// `config.json` as the console found it at start (its loader stamp), per runtime.
-static CONFIG_START_STAMP: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, Option<crate::runtime::ConfigStamp>>>> =
+/// `config.json`'s loader stamp and the settings store's mark (`settings::store_mark`, #154: the allow and deny lists
+/// and the owner are settings, so a stored change is a configuration change too).
+type StartStamp = (Option<crate::runtime::ConfigStamp>, Option<i64>);
+
+/// The configuration as the console found it at start (`StartStamp`), per runtime.
+static CONFIG_START_STAMP: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, StartStamp>>> =
     std::sync::OnceLock::new();
 
-fn config_stamp(context: &RuntimeContext) -> Option<crate::runtime::ConfigStamp> {
-    context.config_stamp().ok()
+fn config_stamp(context: &RuntimeContext) -> StartStamp {
+    (context.config_stamp().ok(), crate::settings::store_mark(context))
 }
 
 /// Remember the start stamp (JS `cfgStamp` baseline taken at start).
@@ -227,8 +231,13 @@ pub(super) fn whitelist_get(context: &RuntimeContext, cfg: &Value) -> Value {
 
 /// JS `POST /api/whitelist` in the selected runtime: allow/deny lists and the owner, then the
 /// immediate revocation of every conversation that lost access (JS `reconcileSessionPolicies`).
+/// #154: the lists and the owner are security settings. A change of one needs `"confirm": true` (409 otherwise, nothing
+/// written; `confirm` other than a boolean is 400), is validated by the registry (400, nothing written) and is stored
+/// through the settings store after its revocation is recorded; the file keeps its registry members as the store wrote
+/// them back and gets the rest of the request. A request that does not name the owner leaves it as it is.
 pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
+    let confirm = crate::settings::confirm_field(&body)?;
     // Access changes are serialized with closed-agent receipts, mode changes and resets: the gate
     // is taken before anything is written, so its failure leaves the configuration unchanged.
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
@@ -238,7 +247,11 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
     let (before, after, file, pending) = {
         let _gate = acquire_social_state_gate(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
-        let mut file = read_config_object(context)?;
+        // #192: the file as read, to tell a write that failed before publication from one that published.
+        let unchanged = read_config_object(context)?;
+        // #154: with the stored settings in place, so a list the request does not name is the one in effect.
+        let mut file = unchanged.clone();
+        crate::settings::mirror_into(context, &mut file).map_err(|e| (503, e))?;
         let before = file.clone();
         let list = |root: &str, kind: &str| -> Value {
             js_id_list(body.get(root).and_then(|v| v.get(kind))).unwrap_or_else(|| {
@@ -261,20 +274,33 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         };
         let allow = root_value("allow");
         let deny = root_value("deny");
-        // JS keeps its in-memory owner (`cfg.ownerQQ ?? null`), which carries the DSH overlay.
-        let owner = match body.get("ownerQQ") {
-            Some(value) => normalize_owner(Some(value)).map_err(|e| (400, e))?,
-            None => owner_of(&effective_before),
-        };
         let object = file.as_object_mut().expect("config checked above");
         object.insert("allow".into(), allow);
         object.insert("deny".into(), deny);
-        object.insert("ownerQQ".into(), owner);
+        // #154: the owner is a setting the admin agent mode overrides while it is on, so a request that does not name
+        // it never copies that mode's owner into it.
+        if let Some(value) = body.get("ownerQQ") {
+            object.insert("ownerQQ".into(), normalize_owner(Some(value)).map_err(|e| (400, e))?);
+        }
+        let changes = crate::settings::console_changes(context, &unchanged, &file)?;
+        let changed: Vec<&crate::settings::Setting> = changes.iter().map(|(setting, _)| *setting).collect();
+        crate::settings::check_confirmation(confirm, &changed)?;
+        let previewed: Vec<_> = changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))).collect();
         // A written configuration the runtime cannot load revokes everything the old one allowed.
-        let effective_after = context.effective_config(&file).unwrap_or_else(|_| json!({}));
+        let effective_after = context.effective_config_with(&file, &previewed).unwrap_or_else(|_| json!({}));
+        let stored = !changes.is_empty();
+        if stored {
+            // The store's write-back refuses a file the runtime cannot load: refuse it before anything is recorded.
+            raw_config_for_write(context)?;
+            note_config_before_request(context);
+        }
         let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
-        write_config_or_forget(context, &file, &before, &pending)?;
-        (effective_before, effective_after, file, pending)
+        store_access_changes(context, changes, &previewed, &pending, "console")?;
+        keep_stored_members(context, &mut file)?;
+        // Once the store holds the change, a failed file write keeps the pending revocation (`Null`: always kept).
+        write_config_or_forget(context, &file, if stored { &Value::Null } else { &unchanged }, &pending)?;
+        let shown = context.load_config_document().ok().filter(Value::is_object).unwrap_or(file);
+        (effective_before, effective_after, shown, pending)
     };
     let (retired, failures) = finish_access_change(context, &interaction, &before, &after, "access-revoked", pending);
     drop(interaction);
@@ -311,8 +337,13 @@ pub(super) static SCOPE_AFTER_READ: std::sync::Mutex<Option<std::sync::Arc<dyn F
 /// `POST /api/whitelist`, then the same immediate revocation. The running live process keeps the `--live-groups`
 /// list it was started with; `liveRestart` says whether it must restart. The body never names `key`: the console's
 /// key preflight would refuse a conversation that is not admitted yet.
+/// #154: the allow lists are security settings: a change of one needs `"confirm": true` (409 otherwise, nothing
+/// written; `her-cli conversation` confirms with its `--confirm`) and is stored through the settings store after the
+/// revocation is recorded; `rollout.rustGroups` and the alias removal are written to the file, which keeps its registry
+/// members as the store wrote them back.
 pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
+    let confirm = crate::settings::confirm_field(&body)?;
     let key = canonical_v2_key(&js_string_or(body.get("conversation"), ""))
         .ok_or((400, "conversation must be group:<id> or private:<id>".to_string()))?;
     let admit = match body.get("action").and_then(Value::as_str) {
@@ -334,9 +365,11 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
     let (before, after, changed, pending) = {
         let _gate = acquire_social_state_gate(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
-        let mut file = read_config_object(context)?;
         // #192: the file as read, to tell a write that failed before publication from one that published.
-        let unchanged = file.clone();
+        let unchanged = read_config_object(context)?;
+        // #154: with the stored settings in place, so the allow list changed is the one in effect.
+        let mut file = unchanged.clone();
+        crate::settings::mirror_into(context, &mut file).map_err(|e| (503, e))?;
         #[cfg(test)]
         {
             // Bound first, so the hook never runs while the seam's own lock is held.
@@ -385,10 +418,23 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         if changed.is_empty() {
             (effective_before.clone(), effective_before, changed, None)
         } else {
+            let changes = crate::settings::console_changes(context, &unchanged, &file)?;
+            let settings: Vec<&crate::settings::Setting> = changes.iter().map(|(setting, _)| *setting).collect();
+            crate::settings::check_confirmation(confirm, &settings)?;
+            let previewed: Vec<_> = changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))).collect();
             // A written configuration the runtime cannot load revokes everything the old one allowed.
-            let effective_after = context.effective_config(&file).unwrap_or_else(|_| json!({}));
+            let effective_after = context.effective_config_with(&file, &previewed).unwrap_or_else(|_| json!({}));
+            let stored = !changes.is_empty();
+            if stored {
+                // The store's write-back refuses a file the runtime cannot load: refuse it before anything is recorded.
+                raw_config_for_write(context)?;
+                note_config_before_request(context);
+            }
             let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
-            write_config_or_forget(context, &file, &unchanged, &pending)?;
+            store_access_changes(context, changes, &previewed, &pending, "console")?;
+            keep_stored_members(context, &mut file)?;
+            // Once the store holds the change, a failed file write keeps the pending revocation (`Null`: always kept).
+            write_config_or_forget(context, &file, if stored { &Value::Null } else { &unchanged }, &pending)?;
             (effective_before, effective_after, changed, pending)
         }
     };
@@ -950,6 +996,90 @@ fn write_config_or_forget(
     Err((status, format!("{error}{}", settle_failed_write(context, unchanged, pending))))
 }
 
+/// #154: stores an access change's registry settings (`settings::apply_changes`, actor `administrator`, `source`) after
+/// its revocation was recorded. A failed store write is settled by `settle_failed_store_write`, whose note the error
+/// carries.
+pub(super) fn store_access_changes(
+    context: &RuntimeContext,
+    changes: Vec<(&'static crate::settings::Setting, Value)>,
+    previewed: &[(&'static crate::settings::Setting, Option<Value>)],
+    pending: &Option<String>,
+    source: &str,
+) -> Result<(), (u16, String)> {
+    crate::settings::apply_changes(context, changes, "administrator", source)
+        .map(|_| ())
+        .map_err(|(status, error)| (status, format!("{error}{}", settle_failed_store_write(context, previewed, pending))))
+}
+
+/// #154: after a failed settings store write of an access change: the pending entry is removed only when the store
+/// holds none of the change (`settings::holds_any`: the failure came before the commit); a store that holds it, or
+/// cannot be read, keeps the entry for the next console start or access change. Returns the note added to the error.
+fn settle_failed_store_write(
+    context: &RuntimeContext,
+    previewed: &[(&'static crate::settings::Setting, Option<Value>)],
+    pending: &Option<String>,
+) -> String {
+    if pending.is_none() {
+        return String::new();
+    }
+    if crate::settings::holds_any(context, previewed).unwrap_or(true) {
+        return "; the change may have been stored, so its revocation stays pending and is finished at the next console start or access change".to_string();
+    }
+    match forget_access_change(context, pending) {
+        Ok(()) => String::new(),
+        Err(cleanup) => format!("; the recorded revocation stays pending: {cleanup}"),
+    }
+}
+
+/// #154: keeps `file`'s registry members as the stored `config.json` now holds them (`settings::keep_registry_values`),
+/// after a writer stored its registry changes and the store wrote them back, so the writer's own write changes no
+/// registry member. Stored changes stand, so a file that cannot hold them is 500 (an access change's revocation then
+/// stays pending for the next console start or access change).
+pub(super) fn keep_stored_members(context: &RuntimeContext, file: &mut Value) -> Result<(), (u16, String)> {
+    let current = read_config_object(context)?;
+    crate::settings::keep_registry_values(&current, file).map(|_| ()).map_err(|key| {
+        (500, format!("config.json cannot hold {key}: a member on its path is not an object; stored settings stand"))
+    })
+}
+
+/// #154: a settings-route change (`settings::Change`) of an access setting (`settings::Setting::access`), with a
+/// whitelist write's side effects. Under the closed-agent interaction gate, earlier pending revocations are finished
+/// first; under the configuration gate (`authority`, which re-checks the console credential) the change is previewed
+/// (`settings::preview`), the policy after it is recorded as a pending revocation, and `commit` (the route's own set,
+/// reset or undo) writes the store; then, with the configuration gate released, every conversation that lost access
+/// is revoked (tokens rotated, mappings retired, turns cancelled) before the reply, which gets `revoked`. A failed
+/// commit is settled by `settle_failed_store_write`; a revocation that does not finish is 500 (the change stands and its
+/// entry stays pending).
+pub(crate) fn access_setting_change(
+    context: &RuntimeContext,
+    authority: crate::persona::Authority<'_>,
+    change: &crate::settings::Change<'_>,
+    commit: impl FnOnce() -> Result<Value, (u16, String)>,
+) -> Result<Value, (u16, String)> {
+    let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
+    finish_pending_before_change(context, &interaction)?;
+    let (before, after, mut reply, pending) = {
+        let _gate = authority()?;
+        let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
+        let raw = read_config_object(context)?;
+        let previewed = crate::settings::preview(context, change)?;
+        // A configuration the runtime cannot load revokes everything the old one allowed.
+        let effective_after = context.effective_config_with(&raw, &previewed).unwrap_or_else(|_| json!({}));
+        let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
+        let reply = commit().map_err(|(status, error)| {
+            (status, format!("{error}{}", settle_failed_store_write(context, &previewed, &pending)))
+        })?;
+        (effective_before, effective_after, reply, pending)
+    };
+    let (revoked, failures) = finish_access_change(context, &interaction, &before, &after, "access-revoked", pending);
+    drop(interaction);
+    if !failures.is_empty() {
+        return Err((500, format!("the setting was saved, but the immediate revocation did not finish: {}", failures.join("; "))));
+    }
+    reply["revoked"] = json!(revoked);
+    Ok(reply)
+}
+
 /// The raw `config.json` as an access change finds it before its write, for `settle_failed_write` (`Null` when it
 /// cannot be read: a failed write then always keeps its entry).
 pub(super) fn config_snapshot(context: &RuntimeContext) -> Value {
@@ -1179,17 +1309,35 @@ pub(super) fn security_post(context: &RuntimeContext, body: &str) -> Result<Valu
         }
         return Ok(json!({"ok": ok, "hardened": ok, "path": dir}));
     }
+    // #154: `security.interceptNotify` and `security.outboundGuard` are security settings: a change of one needs
+    // `"confirm": true` (409 otherwise, nothing written), is validated by the registry (400) and is stored through the
+    // settings store; the file keeps its registry members as the store wrote them back and gets the other members.
+    let confirm = crate::settings::confirm_field(&body)?;
     let _gate = acquire_social_state_gate(context)?;
-    let mut file = read_config_object(context)?;
+    let unchanged = read_config_object(context)?;
+    let mut file = unchanged.clone();
+    crate::settings::mirror_into(context, &mut file).map_err(|e| (503, e))?;
     let previous_view = security_view(&file);
     let mut next = file.get("security").and_then(Value::as_object).cloned().unwrap_or_default();
-    next.extend(body.as_object().cloned().unwrap_or_default());
+    let mut fields = body.as_object().cloned().unwrap_or_default();
+    fields.remove("confirm");
+    next.extend(fields);
     if let Some(value) = next.get("interceptNotify").cloned() {
         if !value.is_boolean() {
             next.insert("interceptNotify".into(), json!(js_truthy(&value)));
         }
     }
     file["security"] = Value::Object(next.clone());
+    let changes = crate::settings::console_changes(context, &unchanged, &file)?;
+    let changed: Vec<&crate::settings::Setting> = changes.iter().map(|(setting, _)| *setting).collect();
+    crate::settings::check_confirmation(confirm, &changed)?;
+    if !changes.is_empty() {
+        // The store's write-back refuses a file the runtime cannot load: refuse it before the store takes a change.
+        raw_config_for_write(context)?;
+        note_config_before_request(context);
+    }
+    crate::settings::apply_changes(context, changes, "administrator", "console")?;
+    keep_stored_members(context, &mut file)?;
     write_config_object(context, &file)?;
     let mut view = previous_view.as_object().cloned().unwrap_or_default();
     view.extend(next);
