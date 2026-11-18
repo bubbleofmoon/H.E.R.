@@ -416,7 +416,7 @@ fn settings_scope_change_works_on_an_allow_list_with_unusable_items() {
 }
 
 #[test]
-fn settings_undo_of_an_entry_missing_at_the_first_look_never_takes_the_plain_path() {
+fn settings_undo_of_an_entry_missing_at_the_first_look_never_undoes_a_security_setting_unconfirmed() {
     let (_root, context) = security_fixture("settings undo entry created meanwhile");
     let (status, body) = set(&context, json!({"setting": "allow.groups", "value": [7001, 7002, 7003], "confirm": true}));
     assert_eq!(status, 200, "{body}");
@@ -431,8 +431,11 @@ fn settings_undo_of_an_entry_missing_at_the_first_look_never_takes_the_plain_pat
         }));
     });
     let (status, body) = post(&context, "/api/settings/undo", json!({"entry": unknown}));
-    assert_eq!(status, 404, "an entry the first look did not find is answered there: {body}");
+    assert_eq!(status, 409, "a security setting the first look did not name is not undone by the plain path: {body}");
+    assert_eq!(body["error"], "allow.groups is a security setting: send the undo again");
     assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001]), "the entry made meanwhile is not undone unconfirmed");
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": unknown + 100}));
+    assert_eq!(status, 404, "an entry that never exists is still 404: {body}");
 }
 
 #[test]

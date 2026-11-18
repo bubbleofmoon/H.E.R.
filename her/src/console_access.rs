@@ -394,7 +394,8 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         // Denied as the deny list setting reads it, the ids the runtime matches ("07001" is not 7001 there).
         let deny_list = crate::settings::find(&format!("deny.{field}")).expect("the registry holds the deny lists");
         let denied_ids = deny_list.read(&file);
-        if admit && denied_ids.as_array().is_some_and(|ids| ids.iter().any(|denied| denied.to_string() == id)) {
+        let wanted = id.parse::<u64>().ok();
+        if admit && denied_ids.as_array().is_some_and(|ids| ids.iter().any(|denied| denied.as_u64().is_some_and(|denied| Some(denied) == wanted))) {
             return Err((409, format!("{key} is in deny.{field}; remove it from the deny list first")));
         }
         // The ids the allow list setting reads (JS precedence `groups ?? group`, `private ?? privates`): a hand-edited
@@ -402,7 +403,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         let allow_list = crate::settings::find(&format!("allow.{field}")).expect("the registry holds the allow lists");
         let mut listed = allow_list.read(&file).as_array().cloned().unwrap_or_default();
         let mut changed: Vec<String> = Vec::new();
-        if admit != listed.iter().any(|value| listed_same(value)) {
+        if admit != listed.iter().any(&listed_same) {
             listed.retain(|value| !listed_same(value));
             if admit {
                 listed.push(json!(id.parse::<i64>().expect("canonical ids are safe integers")));
@@ -415,7 +416,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
             allow.insert(field.to_string(), Value::Array(listed));
             changed.push(format!("allow.{field}"));
         }
-        if admit != served.iter().any(|value| served_same(value)) {
+        if admit != served.iter().any(&served_same) {
             served.retain(|value| !served_same(value));
             if admit {
                 served.push(json!(key));

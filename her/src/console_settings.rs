@@ -82,7 +82,7 @@ fn confirmed(fields: &Map<String, Value>, setting: Option<&crate::settings::Sett
 
 /// The registry setting history entry `entry` changes, for the undo's confirmation. Every failure of the look is the
 /// error (404: no such entry yet, 409: its setting is no longer in the registry, 503: a store that cannot be read right
-/// now), so only a look that names the setting reaches the undo's plain path (`undo`).
+/// now); `undo` decides what each lets through.
 fn entry_setting(context: &RuntimeContext, entry: i64) -> Result<&'static crate::settings::Setting, (u16, String)> {
     let previewed = crate::settings::preview(context, &crate::settings::Change::Undo { entry })?;
     previewed.first().map(|(setting, _)| *setting).ok_or((503, "the settings entry cannot be read".to_string()))
@@ -143,10 +143,10 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         .and_then(Value::as_i64)
         .filter(|entry| *entry > 0)
         .ok_or((400, "entry must be a positive integer".to_string()))?;
-    // Fail closed: only a look that names the entry's setting may take the plain path. An unknown entry (404) or a retired
-    // setting (409) is answered here, since the entry may be created before the undo commits; when the look fails
-    // otherwise, an unconfirmed undo is refused with that failure and a confirmed one takes the access path, which looks
-    // again under the configuration gate.
+    // Fail closed. An unknown entry (404) or a retired setting (409) is answered by the undo itself, under the store gate,
+    // and since the entry may be created between this look and that answer, a look that did not name the entry's setting
+    // never lets the plain path undo a security setting. When the look fails otherwise, an unconfirmed undo is refused
+    // with that failure and a confirmed one takes the access path, which looks again under the configuration gate.
     let looked = entry_setting(context, entry);
     #[cfg(test)]
     if let Some(hook) = AFTER_UNDO_LOOK.with(|hook| hook.borrow_mut().take()) {
@@ -154,7 +154,7 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
     }
     let (target, access) = match looked {
         Ok(target) => (Some(target), target.access()),
-        Err((status, message)) if matches!(status, 404 | 409) => return Err((status, message)),
+        Err((404 | 409, _)) => (None, false),
         Err(error) => {
             if !crate::settings::confirm_field(&Value::Object(fields.clone()))? {
                 return Err(error);
@@ -164,7 +164,13 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
     };
     confirmed(&fields, target)?;
     let commit = || -> Result<Value, (u16, String)> {
-        let undone = crate::settings::undo(context, entry, "administrator")?;
+        let permit = |setting: &crate::settings::Setting| -> Result<(), (u16, String)> {
+            if target.is_none() && !access && setting.confirmed() {
+                return Err((409, format!("{} is a security setting: send the undo again", setting.key)));
+            }
+            Ok(())
+        };
+        let undone = crate::settings::undo(context, entry, "administrator", &permit)?;
         let mut reply = json!({"ok": true, "entry": entry, "setting": undone.key, "stored": undone.stored});
         if let Some(error) = undone.mirror_error {
             reply["mirrorError"] = json!(error);

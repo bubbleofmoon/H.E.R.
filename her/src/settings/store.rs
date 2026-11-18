@@ -447,7 +447,7 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
             Some(value) => values.push((setting, value)),
             None if setting.kind.text_default().is_some() => {
                 report_refused_text(setting.key);
-                if let Some(value) = last_good(&conn, setting, |_| true) {
+                if let Some(value) = last_good(conn, setting, |_| true) {
                     values.push((setting, value));
                 }
             }
@@ -1032,8 +1032,15 @@ pub(crate) struct Undone {
 /// audit row names that setting, the stored value is still the entry's new value and the registry still accepts the
 /// entry's old value. An undo that removes the stored value also removes the setting's member from `config.json`
 /// before the commit (`remove_from_config`); when that write fails the undo is 503 and writes nothing. An entry that
-/// does not exist, and any entry while there is no store yet, is 404 (and creates no store).
-pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<Undone, (u16, String)> {
+/// does not exist, and any entry while there is no store yet, is 404 (and creates no store). `permit` is asked, inside the
+/// transaction, about the setting the entry names; its error refuses the undo with nothing written (#154: the console's
+/// plain path, which looked at the entry before it existed or before it was known, refuses a security setting here).
+pub(crate) fn undo(
+    context: &RuntimeContext,
+    entry: i64,
+    actor: &str,
+    permit: &dyn Fn(&Setting) -> Result<(), (u16, String)>,
+) -> Result<Undone, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
@@ -1052,6 +1059,7 @@ pub(crate) fn undo(context: &RuntimeContext, entry: i64, actor: &str) -> Result<
         let setting = find(&key)
             .filter(|_| scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+        permit(setting)?;
         let later: i64 = conn
             .query_row(
                 "SELECT count(*) FROM settings_audit WHERE scope='global' AND key=?1 AND id>?2",
