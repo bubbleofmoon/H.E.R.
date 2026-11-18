@@ -277,17 +277,32 @@ thread_local! {
     static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). Stored settings are
-/// put back at their registry pointers first (`settings::mirror_into`), so no writer puts back an older value of one.
+/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). A registry setting's
+/// member is never changed here (#177, `settings::keep_file_members`): one the document lacks or holds as `null` is put
+/// back from the stored file, and any other change of one is refused with nothing written, because console pages change
+/// registry settings through the store (`settings::console_changes`). Stored settings are then put back at their
+/// registry pointers (`settings::mirror_into`), so no writer puts back an older value of one.
 fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<(), String> {
     let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
         .map_err(|_| "runtime config is invalid".to_string())?;
+    let kept = if context.is_isolated() {
+        // An unreadable file holds no registry member, so any registry member in the document is refused.
+        let current = context
+            .read_optional_text(RuntimeArea::Config, "config.json")
+            .ok()
+            .flatten()
+            .and_then(|current| serde_json::from_str::<Value>(current.trim_start_matches('\u{feff}')).ok())
+            .unwrap_or(Value::Null);
+        crate::settings::keep_file_members(&current, &mut doc).map_err(crate::settings::direct_change_error)?
+    } else {
+        false
+    };
     let mirrored = crate::settings::mirror_into(context, &mut doc)?;
     let backup = doc.get("backup").is_some();
     if backup {
         doc["backup"] = crate::config::backup_config(&doc)?;
     }
-    let normalized = if backup || mirrored {
+    let normalized = if backup || mirrored || kept {
         Some(serde_json::to_string_pretty(&doc).map_err(|error| error.to_string())?)
     } else { None };
     let text = normalized.as_deref().unwrap_or(text);
@@ -308,6 +323,24 @@ fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<()
 
 fn take_config_writes() -> Option<(Result<String, String>, String)> {
     CONFIG_WRITES.with(|writes| writes.borrow_mut().take())
+}
+
+/// Notes the selected `config.json` as this request found it, before a settings write-back changes it (#177). The
+/// write-back is not a write of `write_selected_config_text`, so without this the request's audit record would take its
+/// before-state from the file after the write-back, and an undo would not see the registry change. The request's own
+/// write then sets the after-state, as for any other write.
+fn note_config_before_request(context: &RuntimeContext) {
+    let before = context
+        .read_optional_text(RuntimeArea::Config, "config.json")
+        .map(Option::unwrap_or_default)
+        .map_err(|e| format!("cannot read config.json before the write: {e}"));
+    CONFIG_WRITES.with(|writes| {
+        let mut writes = writes.borrow_mut();
+        if writes.is_none() {
+            let after = before.clone().unwrap_or_default();
+            *writes = Some((before, after));
+        }
+    });
 }
 
 /// Ticket 24: every selected-runtime `config.json` read-modify-write holds the social-state gate
@@ -331,6 +364,19 @@ fn raw_config_for_write(context: &RuntimeContext) -> Result<Value, (u16, String)
     let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
     // A file the runtime cannot load is refused as before (writers never repair it partially).
     if !value.is_object() || crate::config::canonical_config(&value).is_err() {
+        return Err((503, "runtime config is invalid".to_string()));
+    }
+    Ok(value)
+}
+
+/// The selected `config.json` object as it is on disk, for the registry members a social page save keeps
+/// (`settings::keep_registry_values`): the object check of `raw_config_for_write`, without its canonical check.
+fn raw_config_object(context: &RuntimeContext) -> Result<Value, (u16, String)> {
+    let text = context
+        .read_text(RuntimeArea::Config, "config.json")
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
+    if !value.is_object() {
         return Err((503, "runtime config is invalid".to_string()));
     }
     Ok(value)
@@ -6691,6 +6737,8 @@ fn handle_social_config_post(
     } else {
         read_json(CONFIG_PATH).unwrap_or_else(|| json!({}))
     };
+    // #177: the file as read, to find the registry settings this save changes (`settings::console_changes`).
+    let file_before = file.clone();
     // JS `current`: the file's section when it is an object, else the *effective* section, so a
     // file without one cannot lose the defaults (a tools save would open the switches that default off).
     let effective_before = in_memory_social_v2(context, file.get("socialV2"));
@@ -6932,6 +6980,26 @@ fn handle_social_config_post(
     file["socialV2"] = merged_v.clone();
     crate::wake::checked_turn_budget(&file).map_err(|error| (400, error.to_string()))?;
     crate::wake::checked_turn_ceiling(&file).map_err(|error| (400, error.to_string()))?;
+    // #177: a registry setting this save changes goes through the settings store, under the configuration gate held
+    // above: validated before anything is written (400), stored and written back first (a store that cannot take it
+    // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
+    // save's own write puts every stored value into config.json (`write_selected_config_text`).
+    let carried = json!({ "socialV2": body_v.clone() });
+    let settings_changes = crate::settings::console_changes(context, &file_before, &carried)?;
+    if !settings_changes.is_empty() {
+        // The store's write-back refuses a file the runtime cannot load, after the commit: refuse it before the store
+        // takes a change. The router's front check already refuses such a file before any handler runs; this check
+        // covers an edit that lands after it and before the configuration gate is taken. A save without a registry
+        // change runs no canonical check of its own.
+        raw_config_for_write(context)?;
+        note_config_before_request(context);
+    }
+    crate::settings::apply_changes(context, settings_changes, "administrator", "console")?;
+    if context.is_isolated() {
+        let current = raw_config_object(context)?;
+        crate::settings::keep_registry_values(&current, &mut file)
+            .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
+    }
     write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
     // The default wake refresh below takes the same gate itself.
     drop(gate);
