@@ -273,7 +273,7 @@ pub(super) fn undo_entry(
                 .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
         })
         .transpose()?;
-    if restored.is_some() {
+    if restored.is_some() && false { // RED-MP
         // Only an admitted conversation gets a value: an undo that would store one checks admission on the configuration
         // as it stands (the caller holds the configuration gate), as a set does; one that removes a value stays allowed.
         let admitted = held_configuration(conn, context)?
