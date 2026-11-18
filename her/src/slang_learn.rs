@@ -70,8 +70,13 @@ struct LearningInner {
     state: Mutex<WindowState>,
     extract_lock: tokio::sync::Mutex<()>,
     sync_lock: Mutex<()>,
-    /// Set once this value started its startup catch-up (`start_catch_up`).
-    caught_up: std::sync::atomic::AtomicBool,
+}
+
+/// Runtime roots (`None`: the legacy runtime) whose startup catch-up this process already started. The first learning
+/// value of a root claims it; every later value of that root, in any process object, starts nothing.
+fn catch_up_roots() -> &'static Mutex<std::collections::HashSet<Option<std::path::PathBuf>>> {
+    static ROOTS: OnceLock<Mutex<std::collections::HashSet<Option<std::path::PathBuf>>>> = OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 /// Per-runtime black-slang learning state. Live code owns this value and clones it into async
@@ -89,7 +94,6 @@ impl SlangLearning {
                 state: Mutex::new(WindowState::default()),
                 extract_lock: tokio::sync::Mutex::new(()),
                 sync_lock: Mutex::new(()),
-                caught_up: std::sync::atomic::AtomicBool::new(false),
             }),
         }
     }
@@ -168,12 +172,17 @@ impl SlangLearning {
         report_auto_result(Ok(result), key);
     }
 
-    /// Start (once per value) the startup catch-up on its own thread: each retained window that is
-    /// already due is extracted in turn; one whose extraction fails stays for its next trigger.
-    /// Returns the thread's handle when this call started it.
+    /// Start the startup catch-up on its own thread, once per runtime root per process: the first learning value
+    /// of a root claims it (`catch_up_roots`), and a later call for that root starts nothing. Each retained window
+    /// that is already due is extracted in turn; one whose extraction fails stays for its next trigger. Returns the
+    /// thread's handle when this call started it.
     pub fn start_catch_up(&self) -> Option<std::thread::JoinHandle<()>> {
-        use std::sync::atomic::Ordering;
-        if self.inner.caught_up.swap(true, Ordering::AcqRel) {
+        let root = self.inner.context.runtime_root().map(std::path::Path::to_path_buf);
+        let claimed = catch_up_roots()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(root.clone());
+        if !claimed {
             return None;
         }
         let learning = self.clone();
@@ -183,7 +192,10 @@ impl SlangLearning {
         match spawned {
             Ok(handle) => Some(handle),
             Err(error) => {
-                self.inner.caught_up.store(false, Ordering::Release);
+                catch_up_roots()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&root);
                 crate::safe_println!("[slang] 无法启动黑话补抽取：{error}");
                 None
             }
