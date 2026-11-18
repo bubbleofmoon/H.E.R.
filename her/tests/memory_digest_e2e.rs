@@ -378,10 +378,15 @@ fn nightly_digest_writes_new_messages_with_bridge_provenance_and_never_logs_chat
 
 #[test]
 fn model_failures_write_nothing_fail_the_run_and_retry_the_same_messages() {
+    let quota = (429, r#"{"error":{"message":"private-quota-text"}}"#.to_string());
     let model = Model::start(vec![
-        (429, r#"{"error":{"message":"private-quota-text"}}"#.to_string()),
+        quota.clone(),
+        quota,
         (500, "{}".to_string()),
         completion("I cannot assist with that."),
+        completion(""),
+        completion(""),
+        completion(""),
         completion(""),
         completion("[]"),
     ]);
@@ -391,33 +396,39 @@ fn model_failures_write_nothing_fail_the_run_and_retry_the_same_messages() {
     assert_eq!(first["state"], "failed", "{first}");
     assert_eq!(first["exitCode"], 1);
     assert!(rig.digest_rows().is_empty());
-    assert_eq!(model.count(), 1);
+    assert_eq!(model.count(), 2);
     assert!(!leaks(&rig, &first, "private-quota-text"));
     assert!(meta_lines(&rig, &first)
         .iter()
         .any(|l| l.contains("digest failed step=model kind=quota")));
-    for (key, reply) in [("digest-fail-2", 2), ("digest-fail-3", 3), ("digest-fail-4", 4)] {
+    for (key, count, kind) in [
+        ("digest-fail-2", 3, "backend"),
+        ("digest-fail-3", 4, "refusal"),
+        ("digest-fail-4", 8, "empty-response"),
+    ] {
         let run = rig.run("memory-digest", key);
         assert_eq!(run["state"], "failed", "{run}");
+        assert_eq!(run["exitCode"], 1);
         assert!(rig.digest_rows().is_empty());
-        assert_eq!(model.count(), reply);
-        if reply == 3 {
-            assert!(meta_lines(&rig, &run)
-                .iter()
-                .any(|l| l.contains("step=digest-result kind=refusal-or-error")));
-        }
+        assert_eq!(model.count(), count);
+        let lines = meta_lines(&rig, &run);
+        let expected = format!("digest failed step=model kind={kind}");
+        assert!(lines.iter().any(|line| line.contains(&expected)), "{lines:?}");
     }
     let fifth = rig.run("memory-digest", "digest-fail-5");
     assert_eq!(fifth["state"], "succeeded", "{fifth}");
     assert!(rig.digest_rows().is_empty());
-    assert_eq!(model.count(), 5);
+    assert_eq!(model.count(), 9);
     let sixth = rig.run("memory-digest", "digest-fail-6");
     assert_eq!(sixth["state"], "succeeded", "{sixth}");
-    assert_eq!(model.count(), 5, "the cursor moved, so the new run is quiet");
+    assert_eq!(model.count(), 9, "the cursor moved, so the new run is quiet");
     {
         let requests = model.requests.lock().unwrap();
-        assert!(requests[0].2.to_string().contains("下周搬家"));
-        assert!(requests[4].2.to_string().contains("下周搬家"));
+        let messages = &requests[0].2["messages"];
+        assert!(messages.to_string().contains("下周搬家"));
+        for (index, (_, _, body)) in requests.iter().enumerate().skip(1) {
+            assert_eq!(&body["messages"], messages, "request {index} changed the messages");
+        }
     }
 }
 
