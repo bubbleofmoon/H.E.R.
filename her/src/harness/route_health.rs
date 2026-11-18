@@ -26,8 +26,9 @@ const GATE_WAIT: Duration = Duration::from_secs(2);
 const MAX_STATE_BYTES: u64 = 64 * 1024;
 /// The notice key of the all-routes-failed alert (`admin_alert::notify_notice`: one per runtime per minute).
 pub(crate) const ALERT_KEY: &str = "model-routes-all-failed";
-/// The failure classes a state may carry (`model_failure::Failure::class`); anything else reads as `backend`.
-const CLASSES: [&str; 6] = ["refusal", "quota", "timeout", "network", "empty-response", "backend"];
+/// The failure classes a state may carry (`model_failure::Failure::class`, without `refusal`: see `apply`); anything
+/// else reads as `backend`.
+const CLASSES: [&str; 5] = ["quota", "timeout", "network", "empty-response", "backend"];
 
 /// What one request on a route ended with.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,7 +36,7 @@ pub(crate) enum Seen {
     /// A usable answer: text or tool calls.
     Answered,
     /// A miss that failed over or ended the turn (`routes::Next::FailOver`, `routes::Next::Fail`), by its class. A miss
-    /// retried on the same route is not a route failure.
+    /// retried on the same route is not a route failure, and a refusal is content, not route health (`apply`).
     Failed { class: &'static str },
 }
 
@@ -81,9 +82,13 @@ fn known_class(class: &str) -> &'static str {
 /// One observation of route `at` of `chain`, applied to `state` at `now` ms. A state of another chain or format starts
 /// over. A route's `since` moves only when its state changes, so an answer after an answer changes nothing. When every
 /// route of the chain is failed, an episode starts, owed (not alerted); a later failure only updates its class, and any
-/// answer ends it.
+/// answer ends it. A refusal (class `refusal`) is no route failure: the route answered, with content the model chose to
+/// withhold, so it changes nothing.
 fn apply(state: &mut State, chain: &[RouteSpec], at: usize, seen: Seen, now: i64) {
     unimplemented!("#174 red");
+    if matches!(seen, Seen::Failed { class: "refusal" }) {
+        return;
+    }
     let hash = chain_hash(chain);
     if state.v != 1 || state.chain != hash {
         *state = State {
@@ -401,10 +406,10 @@ mod tests {
         apply(&mut state, &chain, 1, failed("timeout"), 200);
         assert_eq!(state.all_failed, Some(Episode { since: 200, class: "timeout".into(), alerted: false }));
         state.all_failed.as_mut().unwrap().alerted = true;
-        apply(&mut state, &chain, 0, failed("refusal"), 300);
+        apply(&mut state, &chain, 0, failed("backend"), 300);
         assert_eq!(
             state.all_failed,
-            Some(Episode { since: 200, class: "refusal".into(), alerted: true }),
+            Some(Episode { since: 200, class: "backend".into(), alerted: true }),
             "a later failure keeps the episode and its alert"
         );
         apply(&mut state, &chain, 1, Seen::Answered, 400);
@@ -419,6 +424,25 @@ mod tests {
         let mut state = State::default();
         apply(&mut state, &single, 0, failed("backend"), 100);
         assert!(state.all_failed.is_some(), "the one route of a one-route chain failing is every route failing");
+    }
+
+    #[test]
+    fn route_health_a_refusal_is_no_route_failure() {
+        let chain = chain_of(&["primary-route", "backup-route"]);
+        let mut state = State::default();
+        apply(&mut state, &chain, 0, failed("refusal"), 100);
+        assert_eq!(state, State::default(), "a refusal on a fresh state records nothing, so nothing is written");
+        apply(&mut state, &chain, 0, Seen::Answered, 200);
+        let answered = state.clone();
+        apply(&mut state, &chain, 0, failed("refusal"), 300);
+        assert_eq!(state, answered, "a route that answered stays ok after a refusal");
+        apply(&mut state, &chain, 0, failed("quota"), 400);
+        apply(&mut state, &chain, 1, failed("timeout"), 500);
+        state.all_failed.as_mut().unwrap().alerted = true;
+        let outage = state.clone();
+        apply(&mut state, &chain, 1, failed("refusal"), 600);
+        apply(&mut state, &chain, 0, failed("refusal"), 700);
+        assert_eq!(state, outage, "a refusal leaves a failed route and its episode as they were");
     }
 
     #[test]
