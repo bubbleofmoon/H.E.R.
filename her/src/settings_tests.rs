@@ -3416,3 +3416,42 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
         assert!(!source.contains("write_atomic(RuntimeArea::Config"), "{name} writes config.json itself");
     }
 }
+
+#[test]
+fn settings_console_config_page_takes_the_posted_value_when_the_file_lags_the_store() {
+    let (root, context) = settings_fixture("settings console config lagging file");
+    let (status, body) = set_quiet(&context, json!(8000));
+    assert_eq!(status, 200, "{body}");
+    // config.json lags the store (an unfinished write-back, or a hand edit): the page's value differs from the value in effect.
+    write_config(&root, |config| config["socialV2"]["reply"]["wakeQuietMs"] = json!(4500));
+    let (status, reply) =
+        admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"reply": {"wakeQuietMs": 4500}})));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(quiet_view(&context)["stored"], 4500, "the posted value replaces the stored one");
+    assert_eq!(next_use_quiet(&context), Some(4500), "the next use reads the posted value");
+    assert_eq!(file_quiet(&root), Some(4500), "written back into config.json");
+}
+
+#[test]
+fn settings_console_config_page_refuses_a_non_canonical_file_before_the_store_takes_a_change() {
+    let (root, context) = settings_fixture("settings console config non canonical");
+    write_config(&root, |config| config["ownerQQ"] = json!(true));
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    let (status, reply) =
+        admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"reply": {"wakeQuietMs": 4500}})));
+    assert_eq!(status, 503, "{reply}");
+    assert_eq!(reply["error"], "runtime config is invalid", "{reply}");
+    assert!(!settings_db(&root).exists(), "nothing is stored");
+    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "nothing is written");
+}
+
+#[test]
+fn settings_console_config_page_saves_without_a_registry_change_on_a_non_canonical_file() {
+    let (root, context) = settings_fixture("settings console config non canonical plain save");
+    write_config(&root, |config| config["ownerQQ"] = json!(true));
+    let (status, reply) =
+        admin_request(&context, "POST", "/api/socialV2/config", Some(&json!({"autoReplyCheckMs": 5000})));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(stored_config(&root)["socialV2"]["autoReplyCheckMs"], 5000);
+    assert!(!settings_db(&root).exists(), "no registry change, no store");
+}
