@@ -164,7 +164,8 @@ impl Rig {
                 prompt: "reply".into(),
                 media: Vec::new(),
                 profile: "closed-agent".into(),
-                route: ModelRoute::from_runtime(&self.context, &self.cfg).unwrap(),
+                // As the pipeline builds it (#162): every route test walks the conversation's order.
+                route: ModelRoute::for_conversation(&self.context, &self.cfg, "private:8808").unwrap(),
                 deadline: Duration::from_secs(20),
                 tools: Tools::capture(&self.context, &self.cfg, "closed-agent", "private:8808", &self.generation)
                     .unwrap(),
@@ -770,4 +771,68 @@ async fn route_health_a_retry_that_never_answers_is_no_route_failure() {
     assert!(ended(&mut turn).await.is_err(), "the cancelled turn ends");
     server.abort();
     assert_eq!(health(&rig), (states(&["a=unknown", "b=unknown"]), false), "a cancelled turn is no route failure");
+}
+
+/// #162: routes a, b and c, with `harness.firstRoute` set to `first` in the configuration.
+fn three_routes_first(first: &str) -> Value {
+    json!({"firstRoute": first, "routes":[{"id":"a","model":"model-a"},{"id":"b","model":"model-b"},{"id":"c","model":"model-c"}]})
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_route_health_keys_on_the_configured_chain_whatever_order_a_turn_walks() {
+    let rig = rig("route-health-walk", three_routes_first("b"), None).await;
+    let server = serve(rig.model.clone(), vec![status(500, ""), text("from a")]);
+    assert_eq!(ended(&mut rig.admit("route-health-walk-1")).await, Ok("from a".to_string()));
+    let requests = server.await.unwrap();
+    assert_eq!(
+        health(&rig),
+        (states(&["a=ok", "b=failed", "c=unknown"]), false),
+        "b is walked first; route health names each route of the configured chain"
+    );
+    assert_eq!(
+        models(&requests),
+        ["model-b", "model-a"],
+        "harness.firstRoute first, then the other routes in configured order"
+    );
+    // The next turn starts on the degraded route a and fails on a and c: with b failed before, every route of the
+    // configured chain has failed, and the outage episode is the configured chain's.
+    let second = serve(rig.model.clone(), vec![status(500, ""), status(500, "")]);
+    assert!(ended(&mut rig.admit("route-health-walk-2")).await.is_err());
+    assert_eq!(models(&second.await.unwrap()), ["model-a", "model-c"]);
+    assert_eq!(
+        health(&rig),
+        (states(&["a=failed", "b=failed", "c=failed"]), true),
+        "every route failed: one episode of the configured chain"
+    );
+    rig.no_more_requests().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_route_a_conversations_own_route_starts_its_next_turn_and_a_reset_restores_the_configured_order() {
+    let rig = rig("own-route", three_routes_first("b"), None).await;
+    let chosen = crate::settings::apply_conversation(
+        &rig.context, "private:8808", "conversation.route", &json!("c"), "administrator", "console",
+    );
+    assert_eq!(chosen.map(|applied| applied.changed), Ok(true), "the route is stored for the conversation");
+    assert_eq!(
+        routes::selected(&rig.context, &rig.cfg, "private:8808").as_deref(),
+        Some("c"),
+        "the conversation's own route wins over harness.firstRoute"
+    );
+    let first = serve(rig.model.clone(), vec![status(500, ""), status(500, ""), text("from b")]);
+    assert_eq!(ended(&mut rig.admit("own-route-1")).await, Ok("from b".to_string()));
+    assert_eq!(
+        models(&first.await.unwrap()),
+        ["model-c", "model-a", "model-b"],
+        "its own route first, then the other routes in configured order"
+    );
+    // A reset stores none for this conversation: its next turn walks the configured order whatever harness.firstRoute
+    // says, and starts on that order's first route, not on route b, where the other order's failover memory stands.
+    let reset = crate::settings::reset_conversation(&rig.context, "private:8808", "conversation.route", "administrator");
+    assert_eq!(reset.map(|applied| applied.changed), Ok(true), "the reset is stored");
+    assert_eq!(routes::selected(&rig.context, &rig.cfg, "private:8808"), None, "a reset stores none");
+    let second = serve(rig.model.clone(), vec![text("from a")]);
+    assert_eq!(ended(&mut rig.admit("own-route-2")).await, Ok("from a".to_string()));
+    assert_eq!(models(&second.await.unwrap()), ["model-a"], "the configured order from the next turn");
+    rig.no_more_requests().await;
 }

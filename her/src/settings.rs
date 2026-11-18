@@ -33,7 +33,9 @@
 //! `apply_conversation` and `reset_conversation` change it for one admitted conversation (`conversation_admitted`),
 //! `undo` and `history` take its audit rows (scope: the conversation's key), and a write that changes an access setting
 //! clears, in the same transaction, the values of every conversation it leaves unadmitted. The turn engine settings
-//! (`engine.default`, `conversation.engine`) are not read to route turns yet.
+//! (`engine.default`, `conversation.engine`) are not read to route turns yet. The model route (#162, `harness.firstRoute`
+//! and `conversation.route`) is read when each harness turn starts (`harness::routes::selected`, through
+//! `conversation_value`); a setting whose default is none stores none on a reset (`Setting::storable`).
 
 mod kinds;
 #[cfg(test)]
@@ -51,8 +53,9 @@ pub(crate) use probe::{AuditRow, StoreProbe};
 #[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
-    chat_setting, conversation_registry, find, find_conversation, registry, DIGEST_MODEL, DIGEST_TIMEOUT_SECS,
-    HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
+    chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
+    DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
+    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
 };
 #[cfg(test)]
 pub(crate) use store::{
@@ -61,7 +64,7 @@ pub(crate) use store::{
 };
 pub(crate) use store::{
     apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
-    conversation_admitted, conversation_view, direct_change_error, has_stored_values, history,
+    conversation_admitted, conversation_value, conversation_view, direct_change_error, has_stored_values, history,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
     registry_free, reset, reset_conversation, restore_gate, security_restore, store_mark, store_path, undo, view,
     write_back, Applied, Change, CONVERSATION_ERROR,
