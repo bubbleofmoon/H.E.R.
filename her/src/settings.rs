@@ -4,7 +4,9 @@
 //! is refused. It opens no other database. The configuration loader applies stored values over `config.json`
 //! (`overlay`, called from `RuntimeContext::overlay_config`); `apply`, `reset` and `undo` change one value with one
 //! audit row each, under the store gate (`write_store`), for the console routes and for the owner's chat settings tools
-//! (`chat_setting`, `console::settings_action`); `history` lists the audit rows. Each write first seeds the store from
+//! (`chat_setting`, `console::settings_action`); `console_changes` and `apply_changes` store the registry settings a
+//! console configuration page changes (#177), and `keep_file_members` keeps every console write of `config.json` off
+//! the registry members; `history` lists the audit rows. Each write first seeds the store from
 //! `config.json` (`seed`: every registry setting never in the store, with one `migration` audit row each) and keeps
 //! `config/config.json.pre-settings`; after it, `write_back` mirrors every stored value into `config.json`, so a
 //! release without the store reads the current values. Every writer holds the configuration gate
@@ -1611,6 +1613,103 @@ pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Res
         }
     }
     Ok(kept)
+}
+
+/// The registry settings a console configuration page's write changes (#177): each setting whose member in `next`, the
+/// document the page is about to write, is not `null`, differs from `base`'s (the stored `config.json` the page read
+/// under the configuration gate) and is not what the next use reads now (`base` with the stored values applied),
+/// paired with the value the store keeps. A value the registry refuses is 400 with its requirement, before anything is
+/// written. A member `next` lacks or holds as `null` is no change: a console page never removes a registry setting
+/// (the settings page's reset and undo do). A legacy context has none. The page stores the changes (`apply_changes`),
+/// then keeps the file's registry members in `next` (`keep_registry_values`) and writes it.
+pub(crate) fn console_changes(
+    context: &RuntimeContext,
+    base: &Value,
+    next: &Value,
+) -> Result<Vec<(&'static Setting, Value)>, (u16, String)> {
+    if !context.is_isolated() {
+        return Ok(Vec::new());
+    }
+    let now = overlay(context, base.clone());
+    let mut changes = Vec::new();
+    for setting in REGISTRY {
+        let Some(written) = next.pointer(setting.pointer).filter(|value| !value.is_null()) else { continue };
+        if base.pointer(setting.pointer) == Some(written) {
+            continue;
+        }
+        let value = setting.normalize(written).ok_or_else(|| (400, setting.refusal(written)))?;
+        if value != setting.read(&now) {
+            changes.push((setting, value));
+        }
+    }
+    Ok(changes)
+}
+
+/// Stores `changes` (`console_changes`) for a console page in one transaction through `write_store`: one audit row per
+/// setting whose stored value changes (`actor`, `source`), seeded first and written back after the commit like
+/// `apply`. The caller holds the configuration gate and writes its own `config.json` change afterwards, keeping the
+/// file's registry members. No change writes nothing. Returns why `config.json` does not hold every stored value
+/// (`None` when it does); the stored changes stand either way.
+pub(crate) fn apply_changes(
+    context: &RuntimeContext,
+    changes: Vec<(&'static Setting, Value)>,
+    actor: &str,
+    source: &str,
+) -> Result<Option<String>, (u16, String)> {
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let ((), mirror_error) = write_store(context, false, |conn| {
+        for (setting, value) in &changes {
+            let text = value.to_string();
+            let old = stored_row(conn, setting.key)?;
+            if old.as_ref().is_some_and(|(old_text, _)| *old_text == text) {
+                continue;
+            }
+            record_change(conn, setting, old, Some(&text), actor, source)?;
+        }
+        Ok(())
+    })?;
+    Ok(mirror_error)
+}
+
+/// The refusal of a console write that would change a registry setting's member in `config.json` itself
+/// (`keep_file_members`).
+pub(crate) fn direct_change_error(key: &str) -> String {
+    format!("{key} changes only through the settings store")
+}
+
+/// For a console write of `config.json` (`console::write_selected_config_text`, #177): every registry member of `next`
+/// must be the one `current`, the stored file, holds. A member `next` lacks or holds as `null` is put back from
+/// `current` (removed when `current` has none), because a console writer never removes a registry setting; any other
+/// value that differs is refused with the setting's key, because a console writer changes a registry setting through
+/// the store (`console_changes`, `apply_changes`). Err with the key too when a non-object on the way in `next` cannot
+/// hold `current`'s value. Returns whether `next` changed.
+pub(crate) fn keep_file_members(current: &Value, next: &mut Value) -> Result<bool, &'static str> {
+    let mut changed = false;
+    for setting in REGISTRY {
+        let now = current.pointer(setting.pointer);
+        let written = next.pointer(setting.pointer);
+        if written == now {
+            continue;
+        }
+        if written.is_some_and(|value| !value.is_null()) {
+            return Err(setting.key);
+        }
+        match now.cloned() {
+            Some(value) => {
+                if !set_at(next, setting.pointer, value) {
+                    return Err(setting.key);
+                }
+            }
+            None => remove_at(next, setting.pointer),
+        }
+        changed = true;
+    }
+    Ok(changed)
 }
 
 /// Removes the member a pointer of plain member names ends at, if its parent is an object.
