@@ -38,9 +38,9 @@ pub(crate) fn relay_model(context: &RuntimeContext, cfg: &Value) -> Result<one_s
 /// chain is invalid.
 fn walk_of(cfg: &Value) -> Option<Walk> {
     if let Some(model) = crate::settings::DIGEST_MODEL.text(cfg) {
-        return Some(Walk { routes: vec![RouteSpec::implicit(model)], chain: true }); // RED-M10
+        return Some(Walk { routes: vec![RouteSpec::implicit(model)], chain: false });
     }
-    crate::harness::routes::chain(cfg).ok().map(|routes| Walk { routes: routes.into_iter().take(1).collect(), chain: true }) // RED-M1
+    crate::harness::routes::chain(cfg).ok().map(|routes| Walk { routes, chain: true })
 }
 
 /// The digest's model id: the model of the first route it walks (`walk_of`: `memory.digest.model`, else the model of the
