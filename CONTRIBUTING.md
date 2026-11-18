@@ -50,3 +50,13 @@ exceptions must be limited to a documented public protocol constant.
 This project is source-available under PolyForm Noncommercial 1.0.0. Preserve
 LICENSE and the Required Notice in NOTICE when redistributing. Publishing a
 repository, release or production change requires the administrator's go-ahead.
+
+Reusing code:
+
+- Prefer a maintained crate over writing a well-established part.
+- Copying or porting code from a permissively licensed project (MIT, Apache-2.0,
+  BSD, ISC, Zlib, CC0), from any language, is allowed when no crate fits. The port
+  keeps its license notice in `her/THIRD_PARTY_NOTICES.md`; for Apache-2.0 it also
+  keeps the upstream NOTICE text and marks the changed files.
+- Never copy or port GPL-family, non-commercial or unlicensed code.
+- The qq-bridge upstream stays clean-room: features and bugs only.

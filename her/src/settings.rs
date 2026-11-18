@@ -26,6 +26,16 @@
 //! a change of a list or the owner is an access change (`Setting::access`), revoked as a whitelist write is
 //! (`console::access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
 //! setting never takes the access lists over from `config.json`.
+//!
+//! Scopes (#218): a setting of `registry()` is global. A setting of `conversation_registry()` (`ConversationSetting`)
+//! keeps one value per conversation in the store only (schema version 2, `store/conversation.rs`): never overlaid,
+//! never seeded from or written back into `config.json`; a conversation without a value uses its global setting.
+//! `apply_conversation` and `reset_conversation` change it for one admitted conversation (`conversation_admitted`),
+//! `undo` and `history` take its audit rows (scope: the conversation's key), and a write that changes an access setting
+//! clears, in the same transaction, the values of every conversation it leaves unadmitted. The turn engine settings
+//! (`engine.default`, `conversation.engine`) are not read to route turns yet. The model route (#162, `harness.firstRoute`
+//! and `conversation.route`) is read when each harness turn starts (`harness::routes::selected`, through
+//! `conversation_value`); a setting whose default is none stores none on a reset (`Setting::storable`).
 
 mod kinds;
 #[cfg(test)]
@@ -40,20 +50,24 @@ pub(crate) use kinds::SettingKind;
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
+#[cfg(test)]
+pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
-    chat_setting, find, registry, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL,
-    INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
+    chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
+    DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
+    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
 };
 #[cfg(test)]
 pub(crate) use store::{
-    create_store, FAIL_BEFORE_AUDIT, FAIL_UNDO_LOOK, FAIL_WRITE_BACK, NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT,
-    WAL_SWITCH_BUSY,
+    create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_UNDO_LOOK, FAIL_WRITE_BACK,
+    NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
-    apply, apply_changes, backup_source, console_changes, direct_change_error, has_stored_values, history, holds_any,
-    keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
-    registry_free, reset, restore_gate, security_restore, store_mark, store_path, undo, view, write_back, Applied,
-    Change,
+    apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
+    conversation_admitted, conversation_value, conversation_view, direct_change_error, has_stored_values, history,
+    holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
+    registry_free, reset, reset_conversation, restore_gate, security_restore, store_mark, store_path, undo, view,
+    write_back, Applied, Change, CONVERSATION_ERROR,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.
@@ -85,7 +99,8 @@ pub(crate) struct Setting {
     pub pointer: &'static str,
     /// The value type and bounds (`kinds`): how a value is checked, read, refused and shown.
     pub kind: &'static dyn SettingKind,
-    /// When a change takes effect: `live`, `next wake` or `restart`.
+    /// When a change takes effect: `live`, `next wake` or `restart`; `not read yet` for a setting that is stored and
+    /// listed but that no reader uses yet (the turn engine settings, #218).
     pub applies: &'static str,
     pub group: &'static str,
     pub label: &'static str,
@@ -169,5 +184,29 @@ impl Setting {
     /// Why a chat value was refused, under the chat's name.
     pub(crate) fn chat_requirement(&self) -> String {
         self.kind.chat_requirement(&self.chat_name())
+    }
+}
+
+/// #218: one setting kept per conversation (`conversation_registry()`): the store keeps one value per conversation,
+/// never in `config.json`, and a conversation without one uses `global`, the global setting whose kind, default and
+/// bounds it shares. It is never chat-visible.
+pub(crate) struct ConversationSetting {
+    /// The key the console and the audit name it by; never a key of `registry()` (registry test).
+    pub key: &'static str,
+    /// The global setting a conversation without its own value uses.
+    pub global: &'static Setting,
+    pub label: &'static str,
+    pub hint: &'static str,
+}
+
+impl ConversationSetting {
+    /// The value as stored, or `None` when the global setting's kind does not accept it.
+    pub(crate) fn normalize(&self, value: &Value) -> Option<Value> {
+        self.global.normalize(value)
+    }
+
+    /// Why `value`, which this setting refused, was refused, under this setting's key.
+    fn refusal(&self, value: &Value) -> String {
+        self.global.kind.refusal(self.key, value)
     }
 }

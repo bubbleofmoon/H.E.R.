@@ -1,19 +1,23 @@
 //! Setting kinds: each kind is a struct in its own file implementing `SettingKind`, the one interface the registry,
 //! the store, the settings page and the chat tools use, so no code outside this folder matches on a kind.
 
+mod choice;
 mod id_list;
 mod integer;
 mod model_id;
 mod owner_id;
+mod route_id;
 mod switch;
 mod text;
 
+pub(crate) use choice::Choice;
 pub(crate) use id_list::IdList;
 #[cfg(test)]
 pub(crate) use id_list::ID_LIST_MAX;
 pub(crate) use integer::{FileRule, Integer};
 pub(crate) use model_id::ModelId;
 pub(crate) use owner_id::OwnerId;
+pub(crate) use route_id::RouteId;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
 
@@ -39,7 +43,8 @@ pub(crate) trait SettingKind: Sync {
     /// Why `value`, which this kind refused, was refused, under the registry key `key`.
     fn refusal(&self, key: &str, value: &Value) -> String;
 
-    /// The kind as the settings page shows it: `type`, then its bounds (`min` and `max`, `maxChars` or `maxItems`).
+    /// The kind as the settings page shows it: `type`, then its bounds (`min` and `max`, `maxChars`, `maxItems` or
+    /// `options`).
     fn view(&self) -> Value;
 
     /// Why a chat value was refused, under the chat's name `name`.

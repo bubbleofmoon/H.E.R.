@@ -14,22 +14,27 @@ mod prompt_text { include!("prompt_text.rs"); }
 mod mirror { include!("mirror.rs"); }
 mod console_writers { include!("console_writers.rs"); }
 mod security { include!("security.rs"); }
+mod conversation { include!("conversation.rs"); }
 
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
 /// The settings module's product sources, for the source tests: the module root, the store, the kinds and the registry.
-const SETTINGS_SOURCES: [(&str, &str); 14] = [
+const SETTINGS_SOURCES: [(&str, &str); 18] = [
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
+    ("settings/store/conversation.rs", include_str!("../store/conversation.rs")),
     ("settings/kinds.rs", include_str!("../kinds.rs")),
+    ("settings/kinds/choice.rs", include_str!("../kinds/choice.rs")),
     ("settings/kinds/id_list.rs", include_str!("../kinds/id_list.rs")),
     ("settings/kinds/integer.rs", include_str!("../kinds/integer.rs")),
     ("settings/kinds/model_id.rs", include_str!("../kinds/model_id.rs")),
     ("settings/kinds/owner_id.rs", include_str!("../kinds/owner_id.rs")),
+    ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/switch.rs", include_str!("../kinds/switch.rs")),
     ("settings/kinds/text.rs", include_str!("../kinds/text.rs")),
     ("settings/registry.rs", include_str!("../registry.rs")),
     ("settings/registry/access.rs", include_str!("../registry/access.rs")),
+    ("settings/registry/engine.rs", include_str!("../registry/engine.rs")),
     ("settings/registry/model.rs", include_str!("../registry/model.rs")),
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),

@@ -3,18 +3,20 @@ param(
   [Parameter(Mandatory)][string]$Name,
   [Parameter(Mandatory)][string]$WorkDir,
   [Parameter(Mandatory)][string]$PromptFile,
-  [string]$Model = 'gpt-6.2-astra',
+  [string]$Model = 'gpt-6.2-sol',
   [string]$Effort = 'high',
-  [ValidateSet('workspace-write', 'read-only', 'none')][string]$Sandbox = 'none',
-  [string[]]$AddDir = @('C:\her-orch', 'C:\her-targets', (Join-Path $env:USERPROFILE '.cargo')),
+  [ValidateSet('workspace-write', 'read-only')][string]$Sandbox = 'read-only',
+  [string[]]$AddDir = @(),
   [int]$TimeoutMinutes = 360
 )
 
 # Windows counterpart of scripts/codex-task.sh. Runs one Codex CLI task hidden at BelowNormal and writes receipts
 # next to the prompt: <Name>.report.md (last message), <Name>.out.log, <Name>.err.log, <Name>.exit.txt (numeric code,
-# "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report). workspace-write gets loopback/network access and write access to -AddDir. Sandbox `none`
-# (the default, user decision 2026-11-03) runs without Codex's sandbox; pushes are made to fail through GIT_CONFIG_*
-# for this process tree. Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
+# "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report).
+# The sandbox is read-only or workspace-write: workspace-write writes only -WorkDir and -AddDir (neither the temp
+# folder nor $env:TEMP: the caller points TEMP at a writable -AddDir) and gets loopback/network access.
+# scripts/codex-work.ps1 wraps this for the plan and implement modes.
+# Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
 # After the run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
 $ErrorActionPreference = 'Stop'
 # Start-Process cannot launch the npm shims (codex, codex.cmd), so use the native binary shipped inside the package.
@@ -29,16 +31,10 @@ $exitFile = Join-Path $outDir "$Name.exit.txt"
 Remove-Item -LiteralPath $report, $exitFile -ErrorAction SilentlyContinue
 
 $codexArgs = @('exec', '--skip-git-repo-check', '-m', $Model, '-c', "model_reasoning_effort=`"$Effort`"", '-C', $WorkDir, '--color', 'never', '-o', $report)
-if ($Sandbox -eq 'none') {
-  $codexArgs += '--dangerously-bypass-approvals-and-sandbox'
-  $env:GIT_CONFIG_COUNT = '2'
-  $env:GIT_CONFIG_KEY_0 = 'remote.origin.pushurl'; $env:GIT_CONFIG_VALUE_0 = 'C:/nonexistent/push-disabled'
-  $env:GIT_CONFIG_KEY_1 = 'push.default'; $env:GIT_CONFIG_VALUE_1 = 'nothing'
-} else {
-  $codexArgs += @('-s', $Sandbox)
-}
+$codexArgs += @('-s', $Sandbox)
 if ($Sandbox -eq 'workspace-write') {
-  $codexArgs += @('-c', 'sandbox_workspace_write.network_access=true')
+  $codexArgs += @('-c', 'sandbox_workspace_write.network_access=true', '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
+                  '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true')
   foreach ($dir in $AddDir) { [IO.Directory]::CreateDirectory($dir) | Out-Null; $codexArgs += @('--add-dir', $dir) }
 }
 $codexArgs += '-'
