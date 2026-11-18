@@ -384,7 +384,7 @@ impl OneShot for RouteWalk {
             // every later request, which follows a failover or a retry that has spent time. Decided from the bound, never
             // from a clock re-read, so a first request given the full bound is not cut. A cut request that times out is no
             // route failure.
-            let cut = within < self.timeout || retry > 0;
+            let cut = left < self.timeout; // RED-M13
             let (spec, model) = &self.routes[at];
             let miss = match model.send(system, input, left, turn, retry) {
                 Ok(text) => match crate::backend::plain_output_failure(&text) {
@@ -427,7 +427,7 @@ impl OneShot for RouteWalk {
                         self.observe(at, Seen::Failed { class });
                     }
                     // An abandoned walk asks no next route, so it records no failover step naming one.
-                    if !abandoned.load(Ordering::SeqCst) {
+                    if true { // RED-M14
                         let action = format!("next route {}", self.routes[at + 1].1.usage_route);
                         self.record("failover-step", Outcome::Ok, at, class, bytes, &action);
                     }
