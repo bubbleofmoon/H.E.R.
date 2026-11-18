@@ -244,11 +244,11 @@ DENIED_EVERY_ROLE = [
     ('wt', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-task.ps1 -Name 1-self-1 -WorkDir {wt} -PromptFile C:/her-orch/1/review/codex-self-1.md -Model gpt-6.2-astra -Effort high -Sandbox read-only'),
     ('wt', 'pwsh -NoProfile -File c:/her/scripts/codex-task.ps1 -name 1-self-1 -workdir {wt} -promptfile C:/her-orch/1/review/codex-self-1.md -model gpt-6.2-astra -effort high -sandbox read-only -timeoutminutes 90'),
     ('repo', 'cd {wt} && {home}/scripts/codex-task.sh 1-self-1 {wt} {tickets}/1/review/codex-self-1.md gpt-6.2-astra high read-only'),
-    ('wt', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),
-    ('wt', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium'),
+    ('wt', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md'),
+    ('wt', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol medium'),
     ('wt', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-sol high'),
     ('wt', '{home}/scripts/codex-task.sh 1-inv {wt} {tickets}/1/inv.md gpt-6.2-sol high read-only'),
-    ('wt', 'pwsh -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt'),
+    ('wt', 'pwsh -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md'),
     ('wt', 'pwsh -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md'),
     # other Codex calls: wrong script path, values, wrappers, redirections, chaining
     ('wt', 'scripts/codex-task.sh 1-self-1 {wt} p.md gpt-6.2-astra high read-only'),
@@ -331,16 +331,16 @@ DENIED_REVIEW_AND_GATE = [
 # The coordinator's documented Codex forms (one plain command; the model gpt-6.2-sol or gpt-6.2-astra, the effort
 # medium or high). {home} and {tickets} are the checkout and the ticket folder the hook is told to use.
 COORDINATOR_FORMS = [
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),
-    ('repo', 'bash {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-astra high 90'),
-    ('repo', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/prompts/impl.md {tickets}/1/prompts/msg.txt gpt-6.2-sol medium'),
-    ('repo', 'cd {repo} && HER_GITLEAKS=/opt/gl/gitleaks.exe {home}/scripts/codex-work.sh implement 1-fix-2 {wt} {tickets}/1/fix.md {tickets}/1/msg.txt gpt-6.2-sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md'),
+    ('repo', 'bash {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-astra high 90'),
+    ('repo', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/prompts/impl.md gpt-6.2-sol medium'),
+    ('repo', 'cd {repo} && HER_GITLEAKS=/opt/gl/gitleaks.exe {home}/scripts/codex-work.sh implement 1-fix-2 {wt} {tickets}/1/fix.md gpt-6.2-sol'),
     ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
     ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-sol high 120'),
     ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-astra medium'),
     ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high read-only'),
     ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-astra high read-only 90'),
-    ('repo', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt -Model gpt-6.2-sol -Effort medium -TimeoutMinutes 90'),
+    ('repo', 'powershell -NoProfile -ExecutionPolicy Bypass -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -Model gpt-6.2-sol -Effort medium -TimeoutMinutes 90'),
     ('repo', "pwsh -NoProfile -File c:/her/scripts/codex-work.ps1 -mode PLAN -ticket 1 -name 1-plan -promptfile 'C:\\her-orch\\1\\plan-prompt.md'"),
     ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6.2-sol -Effort high -Sandbox read-only'),
 ]
@@ -364,39 +364,38 @@ COORDINATOR_DENIED = [
     ('repo', 'watch -n 600 codex exec x'),
     ('repo', 'echo "unterminated codex'),
     # exact pins: only gpt-6.2-sol and gpt-6.2-astra, effort medium or high
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.1-sol'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-Sol'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.20-sol'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-astra2'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6-astra'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol max'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol low'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.1-sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-Sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.20-sol'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-astra2'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6-astra'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol max'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol low'),
     ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.1-sol'),
     ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.1-sol high read-only'),
     ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6-astra high read-only'),
-    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt -Model gpt-6.1-sol'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -Model gpt-6.1-sol'),
     ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -Effort max'),
     ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name 1-inv -WorkDir {repo} -PromptFile C:/her-orch/1/inv.md -Model gpt-6-astra -Effort high -Sandbox read-only'),
     # one violation per row: values, files, the ticket binding
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {repo} {tickets}/1/impl.md {tickets}/1/msg.txt'),                 # main, not a ticket branch
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {detached} {tickets}/1/impl.md {tickets}/1/msg.txt'),             # detached head
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl scratch/wt {tickets}/1/impl.md {tickets}/1/msg.txt'),             # relative workdir
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/2/impl.md {tickets}/1/msg.txt'),                   # prompt of another ticket
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/2/msg.txt'),                   # message of another ticket
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/../2/impl.md {tickets}/1/msg.txt'),              # traversal
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} /root/her-vault/x.md {tickets}/1/msg.txt'),                  # prompt outside the ticket folders
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md /root/her-vault/m.txt'),
-    ('repo', '{home}/scripts/codex-work.sh implement ../x {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),                     # name
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md'),                                       # no message
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 0'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 08'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 1000'),
-    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt gpt-6.2-sol medium 5 extra'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {repo} {tickets}/1/impl.md'),                 # main, not a ticket branch
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {detached} {tickets}/1/impl.md'),             # detached head
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl scratch/wt {tickets}/1/impl.md'),             # relative workdir
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/2/impl.md'),                   # prompt of another ticket
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/../2/impl.md'),              # traversal
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} /root/her-vault/x.md'),                  # prompt outside the ticket folders
+    ('repo', '{home}/scripts/codex-work.sh implement ../x {wt} {tickets}/1/impl.md'),                     # name
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),                 # a commit message file: the run commits itself
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol medium 0'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol medium 08'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol medium 1000'),
+    ('repo', '{home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md gpt-6.2-sol medium 5 extra'),
     ('repo', '{home}/scripts/codex-work.sh plan 2 1-plan {tickets}/1/plan-prompt.md'),                                       # ticket and prompt differ
     ('repo', '{home}/scripts/codex-work.sh plan x 1-plan {tickets}/1/plan-prompt.md'),
     ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md gpt-6.2-sol high 5 extra'),
     ('repo', 'HER_GITLEAKS=/opt/gl/gitleaks {home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md'),
-    ('repo', 'HER_GITLEAKS=/bin/true {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md {tickets}/1/msg.txt'),
+    ('repo', 'HER_GITLEAKS=/bin/true {home}/scripts/codex-work.sh implement 1-impl {wt} {tickets}/1/impl.md'),
     ('repo', '{home}/scripts/codex-work.sh build 1 1-x {tickets}/1/p.md'),
     ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high none'),                           # not read-only
     ('repo', '{home}/scripts/codex-task.sh 1-inv {repo} {tickets}/1/inv.md gpt-6.2-sol high workspace-write'),
@@ -413,9 +412,8 @@ COORDINATOR_DENIED = [
     ('repo', '{home}/scripts/codex-work.sh plan 1 1-plan {tickets}/1/plan-prompt.md; git push origin main'),
     ('repo', 'cat {home}/scripts/codex-work.sh | bash -s plan 1 1-plan {tickets}/1/plan-prompt.md'),
     ('repo', 'bash -s plan 1 1-plan {tickets}/1/plan-prompt.md < {home}/scripts/codex-work.sh'),
-    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/1/impl.md'),   # no -MessageFile
-    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {repo} -PromptFile C:/her-orch/1/impl.md -MessageFile C:/her-orch/1/msg.txt'),
-    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/2/impl.md -MessageFile C:/her-orch/1/msg.txt'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {repo} -PromptFile C:/her-orch/1/impl.md'),
+    ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode implement -Name 1-impl -WorkDir {wt} -PromptFile C:/her-orch/2/impl.md'),
     ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 2 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md'),
     ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -Name 1-other'),
     ('repo', 'powershell -NoProfile -File C:/her/scripts/codex-work.ps1 -Mode plan -Ticket 1 -Name 1-plan -PromptFile C:/her-orch/1/plan-prompt.md -Sandbox none'),

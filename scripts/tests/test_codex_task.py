@@ -5,7 +5,7 @@ Receipts: each case runs a launcher against a fake `codex` that writes (or does 
 named by `-o`, and reads the exit receipt. A run that produced no report must never read as a pass:
 a missing or empty report gives `no-report`, a usage-limit message in the error log gives `quota`.
 Work modes: `implement` runs Codex in a ticket worktree (a throwaway repository with a local bare remote);
-after a clean exit with a report the wrapper, not Codex, commits and pushes the ticket branch. `plan` runs
+the fake commits and pushes like the real run, and the wrapper only verifies what it left. `plan` runs
 Codex in the ticket's scratch export and installs the plan the run left in its plan-out folder.
 The sh cases put the fake first on PATH; the ps1 cases run under pwsh with APPDATA pointing at a
 fake package folder that holds the fake as codex.exe. POSIX only: the fake is a shell script.
@@ -30,11 +30,20 @@ PWSH = shutil.which('pwsh')
 GIT = shutil.which('git')
 POSIX = sys.platform != 'win32'
 LIMIT = "ERROR: You've hit your usage limit. Try again later."
+# Paths whose change in a pushed commit the receipt flags: the hooks, the scan scripts, its config and exceptions.
+PROTECTED = ['.githooks/pre-commit', '.githooks/post-commit', 'scripts/check-repo.py', 'scripts/scan-public.py',
+             'scripts/tests/test_scan_public.py', '.gitleaks.toml', '.public-scan.json']
 
 FAKE = r'''#!/usr/bin/env bash
 # Fake codex: FAKE_MODE chooses what the run leaves behind; FAKE_ARGS names a file that records the call.
 if [ -n "${FAKE_ARGS:-}" ]; then
-  { printf '%s\n' "$@"; echo "GIT_CONFIG_KEY_0=${GIT_CONFIG_KEY_0:-}"; echo "PWD=$PWD"; } > "$FAKE_ARGS"
+  {
+    printf '%s\n' "$@"
+    for v in GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 HER_GITLEAKS TMPDIR TEMP TMP; do
+      echo "$v=${!v:-}"
+    done
+    echo "PWD=$PWD"
+  } > "$FAKE_ARGS"
 fi
 report=""
 workdir=""
@@ -46,11 +55,22 @@ while [ $# -gt 0 ]; do
   shift
 done
 cat > /dev/null
+# A run that edits FAKE_PATH (default new.txt), commits it and pushes the branch, as the real run does.
+edit() { f=${FAKE_PATH:-new.txt}; mkdir -p "$(dirname "$workdir/$f")"; echo changed >> "$workdir/$f"; }
+commit() { git -C "$workdir" add -A && git -C "$workdir" commit -q -m "${1:-fake commit}"; }
+push() { git -C "$workdir" push -q -u origin "$(git -C "$workdir" symbolic-ref --short HEAD)"; }
 case "$FAKE_MODE" in
-  change) printf 'new\n' > "$workdir/new.txt"; printf 'done\n' > "$report" ;;
-  change-fail) printf 'new\n' > "$workdir/new.txt"; printf 'half done\n' > "$report"; exit 3 ;;
-  change-quota) printf 'new\n' > "$workdir/new.txt"; echo "$FAKE_LIMIT" >&2; exit 1 ;;
+  commit-push) edit; commit; push; printf 'done\n' > "$report" ;;
+  commit-twice) edit; commit 'first'; echo more >> "$workdir/second.txt"; commit 'second'; push; printf 'done\n' > "$report" ;;
+  commit-nopush) edit; commit; printf 'done\n' > "$report" ;;
+  commit-push-dirty) edit; commit; push; echo stray > "$workdir/stray.txt"; printf 'done\n' > "$report" ;;
+  dirty) edit; printf 'done\n' > "$report" ;;
+  move-head) edit; commit; git -C "$workdir" checkout -q --detach; printf 'done\n' > "$report" ;;
+  change-fail) edit; printf 'half done\n' > "$report"; exit 3 ;;
+  change-quota) edit; echo "$FAKE_LIMIT" >&2; exit 1 ;;
   nochange) printf 'nothing to do\n' > "$report" ;;
+  plan-dir) mkdir "${adds[0]}/plan.md"; printf 'planned\n' > "$report" ;;
+  plan-hardlink) printf '# plan\n' > "${adds[0]}/other"; ln "${adds[0]}/other" "${adds[0]}/plan.md"; printf 'planned\n' > "$report" ;;
   plan) printf '# plan\nstep 1\n' > "${adds[0]}/plan.md"; printf 'planned\n' > "$report" ;;
   plan-fail) printf '# plan\n' > "${adds[0]}/plan.md"; printf 'half\n' > "$report"; exit 3 ;;
   plan-none) printf 'planned nothing\n' > "$report" ;;
@@ -71,10 +91,13 @@ def clean_env():
     return {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
 
 
+def git_env():
+    return dict(clean_env(), GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid',
+                GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.invalid')
+
+
 def git(*args, cwd):
-    env = dict(clean_env(), GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid',
-               GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.invalid')
-    return subprocess.run([GIT, *args], cwd=cwd, env=env, check=True, capture_output=True, text=True)
+    return subprocess.run([GIT, *args], cwd=cwd, env=git_env(), check=True, capture_output=True, text=True)
 
 
 def install_fake(out, windows):
@@ -149,13 +172,38 @@ class Receipts:
         self.addCleanup(shutil.rmtree, out, ignore_errors=True)
         prompt, work, env = prepare(out, 'report')
         env.update(FAKE_ARGS=str(out / 'args.txt'))
-        done = self.launch_defaults(out, prompt, work, env)
+        done = self.launch_sandbox(out, prompt, work, env, None)
         self.assertEqual(done.returncode, 0, done.stderr)
         args = (out / 'args.txt').read_text().splitlines()
         self.assertEqual(args[args.index('-m') + 1], 'gpt-6.2-sol')
         self.assertIn('model_reasoning_effort="high"', args)
         self.assertEqual(args[args.index('-s') + 1], 'read-only')
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
+        self.assertFalse(any('exclude_slash_tmp' in a for a in args))     # workspace-write settings only
+
+    def test_workspace_write_excludes_the_shared_temp_roots_and_adds_the_dirs(self):
+        out = Path(tempfile.mkdtemp(prefix='codex-task-test-'))
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        prompt, work, env = prepare(out, 'report')
+        env.update(FAKE_ARGS=str(out / 'args.txt'))
+        done = self.launch_sandbox(out, prompt, work, env, 'workspace-write', add=[out / 'a'])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        args = (out / 'args.txt').read_text().splitlines()
+        self.assertEqual(args[args.index('-s') + 1], 'workspace-write')
+        for setting in ('sandbox_workspace_write.network_access=true', 'sandbox_workspace_write.exclude_slash_tmp=true',
+                        'sandbox_workspace_write.exclude_tmpdir_env_var=true'):
+            self.assertIn(setting, args)
+        self.assertEqual([args[i + 1] for i, a in enumerate(args) if a == '--add-dir'], [str(out / 'a')])
+        self.assertIn('GIT_CONFIG_COUNT=', args)                          # no push-disabling git config
+
+    def test_the_none_sandbox_is_refused(self):
+        out = Path(tempfile.mkdtemp(prefix='codex-task-test-'))
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        prompt, work, env = prepare(out, 'report')
+        env.update(FAKE_ARGS=str(out / 'args.txt'))
+        done = self.launch_sandbox(out, prompt, work, env, 'none')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse((out / 'args.txt').exists(), 'codex ran without a sandbox')
 
 
 def prepare(out, mode):
@@ -176,9 +224,10 @@ class ShReceipts(Receipts, unittest.TestCase):
                               env=env, capture_output=True, text=True, timeout=120)
         return done.returncode, 'case', done.stdout + done.stderr
 
-    def launch_defaults(self, out, prompt, work, env):
+    def launch_sandbox(self, out, prompt, work, env, sandbox, add=()):
         env.update(install_fake(out, False))
-        return subprocess.run([BASH, str(SH), 'case', str(work), str(prompt)], env=env, capture_output=True,
+        tail = [] if sandbox is None else ['gpt-6.2-sol', 'high', sandbox, '5', *map(str, add)]
+        return subprocess.run([BASH, str(SH), 'case', str(work), str(prompt), *tail], env=env, capture_output=True,
                               text=True, timeout=120)
 
 
@@ -192,10 +241,14 @@ class Ps1Receipts(Receipts, unittest.TestCase):
                               env=env, capture_output=True, text=True, timeout=120)
         return done.returncode, 'case', done.stdout + done.stderr
 
-    def launch_defaults(self, out, prompt, work, env):
+    def launch_sandbox(self, out, prompt, work, env, sandbox, add=()):
         env.update(install_fake(out, True))
-        return subprocess.run([PWSH, '-NoProfile', '-File', str(PS1), '-Name', 'case', '-WorkDir', str(work),
-                               '-PromptFile', str(prompt)], env=env, capture_output=True, text=True, timeout=120)
+        cmd = [PWSH, '-NoProfile', '-File', str(PS1), '-Name', 'case', '-WorkDir', str(work), '-PromptFile', str(prompt)]
+        if sandbox is not None:
+            cmd += ['-Sandbox', sandbox]
+        if add:
+            cmd += ['-AddDir', ','.join(map(str, add))]
+        return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=120)
 
 
 class Work:
@@ -215,17 +268,18 @@ class Work:
         git('init', '-q', '--bare', str(self.remote), cwd=out)
         self.repo = out / 'repo'
         git('init', '-q', '-b', 'main', str(self.repo), cwd=out)
-        (self.repo / 'a.txt').write_text('a\n')
+        for path in ['a.txt', *PROTECTED]:
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text('a\n')
         git('add', '-A', cwd=self.repo)
         git('commit', '-q', '-m', 'init', cwd=self.repo)
         git('remote', 'add', 'origin', str(self.remote), cwd=self.repo)
         git('push', '-q', 'origin', 'main', cwd=self.repo)
         self.wt = out / 'wt'
         git('worktree', 'add', '-q', '-b', self.BRANCH, str(self.wt), cwd=self.repo)
+        self.common = git('rev-parse', '--path-format=absolute', '--git-common-dir', cwd=self.wt).stdout.strip()
         self.prompt = self.ticket_dir / 'prompt.md'
         self.prompt.write_text('do it\n')
-        self.message = self.ticket_dir / 'message.txt'
-        self.message.write_text('#7 implement the thing\n')
         self.gitleaks = out / 'gitleaks'
         self.gitleaks.write_text('#!/bin/sh\nexit 0\n')
         self.gitleaks.chmod(0o755)
@@ -233,10 +287,8 @@ class Work:
         self.args_file = out / 'args.txt'
 
     def env(self, mode, **extra):
-        env = dict(clean_env(), FAKE_MODE=mode, FAKE_LIMIT=LIMIT, FAKE_ARGS=str(self.args_file),
-                   HER_ORCH=str(self.orch), HER_GITLEAKS=str(self.gitleaks),
-                   GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@example.invalid',
-                   GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.invalid')
+        env = dict(git_env(), FAKE_MODE=mode, FAKE_LIMIT=LIMIT, FAKE_ARGS=str(self.args_file),
+                   HER_ORCH=str(self.orch), HER_GITLEAKS=str(self.gitleaks))
         env.update(self.fake_env)
         env.update(extra)
         return {k: v for k, v in env.items() if v is not None}
@@ -246,7 +298,7 @@ class Work:
                               capture_output=True, text=True, timeout=180)
 
     def implement(self, mode, env_extra=None, **over):
-        fields = dict(name='run', workdir=self.wt, prompt=self.prompt, message=self.message)
+        fields = dict(name='run', workdir=self.wt, prompt=self.prompt)
         fields.update(over)
         return self.run_work('implement', mode, env_extra, **fields)
 
@@ -265,22 +317,31 @@ class Work:
     def codex_args(self):
         return self.args_file.read_text().splitlines()
 
+    def receipt(self, suffix='push', name='run'):
+        return (self.ticket_dir / f'{name}.{suffix}.txt').read_text().splitlines()
+
     # --- implement ----------------------------------------------------------------------------
-    def test_implement_commits_and_pushes_the_ticket_branch_after_a_clean_run(self):
+    def test_implement_verifies_what_codex_committed_and_pushed(self):
         before = self.head(self.wt)
-        done = self.implement('change')
+        done = self.implement('commit-push')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         after = self.head(self.wt)
         self.assertNotEqual(before, after)
         self.assertEqual(self.remote_head(self.BRANCH), after)
-        self.assertEqual(git('log', '-1', '--format=%s', cwd=self.wt).stdout.strip(), '#7 implement the thing')
-        self.assertEqual(git('show', '--name-only', '--format=', 'HEAD', cwd=self.wt).stdout.split(), ['new.txt'])
-        self.assertIn(after, done.stdout)
-        self.assertEqual((self.ticket_dir / 'run.push.txt').read_text().strip(), f'pushed {after}')
-        self.assertEqual(git('status', '--porcelain', cwd=self.wt).stdout, '')
+        self.assertEqual(self.receipt(), [f'pushed {after}'])
+        self.assertIn(f'pushed {after}', done.stdout)
+        self.assertEqual(self.receipt('staged'), [f'commit {after} fake commit', 'A\tnew.txt'])
 
-    def test_implement_runs_codex_confined_to_the_worktree_with_the_pinned_defaults(self):
-        self.assertEqual(self.implement('change').returncode, 0)
+    def test_the_staged_receipt_lists_every_commit_and_the_name_status_of_the_range(self):
+        pre = self.head(self.wt)
+        done = self.implement('commit-twice')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        log = git('log', '--format=commit %H %s', f'{pre}..HEAD', cwd=self.wt).stdout.splitlines()
+        self.assertEqual(len(log), 2)
+        self.assertEqual(self.receipt('staged'), [*log, 'A\tnew.txt', 'A\tsecond.txt'])
+
+    def test_implement_runs_codex_with_the_worktree_the_tmp_and_the_common_gitdir(self):
+        self.assertEqual(self.implement('commit-push').returncode, 0)
         args = self.codex_args()
         self.assertEqual(args[args.index('-m') + 1], 'gpt-6.2-sol')
         self.assertIn('model_reasoning_effort="medium"', args)
@@ -288,11 +349,25 @@ class Work:
         self.assertEqual(args[args.index('-C') + 1], str(self.wt))
         self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
         added = [args[i + 1] for i, a in enumerate(args) if a == '--add-dir']
-        self.assertEqual(added, [str(self.ticket_dir / 'tmp')])
-        self.assertIn('GIT_CONFIG_KEY_0=remote.origin.pushurl', args)   # a run that reaches git cannot publish
+        self.assertEqual(added, [str(self.ticket_dir / 'tmp'), self.common])
+        for setting in ('sandbox_workspace_write.network_access=true', 'sandbox_workspace_write.exclude_slash_tmp=true',
+                        'sandbox_workspace_write.exclude_tmpdir_env_var=true'):
+            self.assertIn(setting, args)
+
+    def test_implement_gives_codex_gitleaks_a_temp_dir_and_no_push_blocking_git_config(self):
+        self.assertEqual(self.implement('commit-push').returncode, 0)
+        args = self.codex_args()
+        self.assertIn(f'HER_GITLEAKS={self.gitleaks}', args)
+        self.assertIn(f'TMPDIR={self.ticket_dir / "tmp"}', args)
+        self.assertIn('GIT_CONFIG_COUNT=', args)
+        self.assertIn('GIT_CONFIG_KEY_0=', args)
+        self.assertIn('GIT_CONFIG_VALUE_0=', args)
+        if self.WINDOWS:
+            self.assertIn(f'TEMP={self.ticket_dir / "tmp"}', args)
+            self.assertIn(f'TMP={self.ticket_dir / "tmp"}', args)
 
     def test_implement_takes_model_effort_and_minutes_from_the_caller(self):
-        done = self.implement('change', model='gpt-6.2-astra', effort='high', minutes='5')
+        done = self.implement('commit-push', model='gpt-6.2-astra', effort='high', minutes='5')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         args = self.codex_args()
         self.assertEqual(args[args.index('-m') + 1], 'gpt-6.2-astra')
@@ -300,17 +375,16 @@ class Work:
 
     def test_implement_refuses_main_and_runs_nothing(self):
         before = self.head(self.repo)
-        done = self.implement('change', workdir=self.repo)
+        done = self.implement('commit-push', workdir=self.repo)
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.args_file.exists(), 'codex ran on main')
         self.assertEqual(self.head(self.repo), before)
         self.assertEqual(self.remote_head('main'), before)
-        self.assertFalse((self.repo / 'new.txt').exists())
 
     def test_implement_refuses_a_branch_that_is_not_a_ticket_branch(self):
         other = self.out / 'other'
         git('worktree', 'add', '-q', '-b', 'feature/x', str(other), cwd=self.repo)
-        done = self.implement('change', workdir=other)
+        done = self.implement('commit-push', workdir=other)
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.args_file.exists())
         self.assertIsNone(self.remote_head('feature/x'))
@@ -318,66 +392,110 @@ class Work:
     def test_implement_refuses_a_detached_head(self):
         other = self.out / 'detached'
         git('worktree', 'add', '-q', '--detach', str(other), cwd=self.repo)
-        done = self.implement('change', workdir=other)
+        done = self.implement('commit-push', workdir=other)
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.args_file.exists())
 
     def test_implement_needs_the_gitleaks_path_before_it_runs_codex(self):
         for value in (None, str(self.out / 'missing-gitleaks')):
             with self.subTest(gitleaks=value):
-                done = self.implement('change', env_extra={'HER_GITLEAKS': value})
-                self.assertNotEqual(done.returncode, 0)
-                self.assertFalse(self.args_file.exists())
-                self.assertFalse((self.wt / 'new.txt').exists())
-
-    def test_implement_needs_a_commit_message(self):
-        empty = self.ticket_dir / 'empty.txt'
-        empty.write_text('')
-        for message in (empty, self.ticket_dir / 'absent.txt'):
-            with self.subTest(message=message.name):
-                done = self.implement('change', message=message)
+                done = self.implement('commit-push', env_extra={'HER_GITLEAKS': value})
                 self.assertNotEqual(done.returncode, 0)
                 self.assertFalse(self.args_file.exists())
 
-    def test_a_dirty_but_failed_run_commits_nothing(self):
+    def test_implement_refuses_a_dirty_worktree_before_it_runs_codex(self):
+        (self.wt / 'a.txt').write_text('edited\n')                      # a tracked change
+        for stray in (None, 'untracked.txt'):
+            with self.subTest(untracked=stray):
+                if stray:
+                    git('checkout', '--', 'a.txt', cwd=self.wt)
+                    (self.wt / stray).write_text('x\n')
+                done = self.implement('commit-push')
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn('not clean', done.stderr)
+                self.assertFalse(self.args_file.exists())
+
+    def test_implement_refuses_a_linked_ticket_folder_or_tmp(self):
+        real = self.out / 'elsewhere'
+        real.mkdir()
+        (self.ticket_dir / 'tmp').symlink_to(real, target_is_directory=True)
+        done = self.implement('commit-push')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.args_file.exists())
+        (self.ticket_dir / 'tmp').unlink()
+        linked = self.out / 'orch-linked'
+        linked.mkdir()
+        (linked / self.TICKET).symlink_to(self.ticket_dir, target_is_directory=True)
+        done = self.implement('commit-push', env_extra={'HER_ORCH': str(linked)})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse(self.args_file.exists())
+
+    def test_a_failed_run_is_not_verified(self):
         before = self.head(self.wt)
         done = self.implement('change-fail')
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        self.assertEqual((self.ticket_dir / 'run.exit.txt').read_text().strip(), '3')
+        self.assertEqual(self.receipt('exit'), ['3'])
         self.assertEqual(self.head(self.wt), before)
-        self.assertIsNone(self.remote_head(self.BRANCH))
-        self.assertEqual(git('status', '--porcelain', cwd=self.wt).stdout.split(), ['??', 'new.txt'])   # left for the coordinator
         self.assertFalse((self.ticket_dir / 'run.push.txt').exists())
+        self.assertFalse((self.ticket_dir / 'run.staged.txt').exists())
 
-    def test_a_quota_run_commits_nothing(self):
-        before = self.head(self.wt)
+    def test_a_quota_run_is_not_verified(self):
         done = self.implement('change-quota')
         self.assertNotEqual(done.returncode, 0)
-        self.assertEqual((self.ticket_dir / 'run.exit.txt').read_text().strip(), 'quota')
-        self.assertEqual(self.head(self.wt), before)
-        self.assertIsNone(self.remote_head(self.BRANCH))
+        self.assertEqual(self.receipt('exit'), ['quota'])
+        self.assertFalse((self.ticket_dir / 'run.push.txt').exists())
 
-    def test_a_run_without_a_report_commits_nothing(self):
-        before = self.head(self.wt)
+    def test_a_run_without_a_report_is_not_verified(self):
         done = self.implement('crash')
         self.assertNotEqual(done.returncode, 0)
-        self.assertEqual((self.ticket_dir / 'run.exit.txt').read_text().strip(), 'no-report')
-        self.assertEqual(self.head(self.wt), before)
+        self.assertEqual(self.receipt('exit'), ['no-report'])
+        self.assertFalse((self.ticket_dir / 'run.push.txt').exists())
 
-    def test_a_clean_run_that_changed_nothing_commits_nothing(self):
+    def test_a_clean_run_with_no_commit_is_no_changes(self):
         before = self.head(self.wt)
         done = self.implement('nochange')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(self.head(self.wt), before)
-        self.assertEqual((self.ticket_dir / 'run.push.txt').read_text().strip(), 'no-changes')
+        self.assertEqual(self.receipt(), ['no-changes'])
+        self.assertEqual(self.receipt('staged'), [])
         self.assertIsNone(self.remote_head(self.BRANCH))
 
-    def test_a_failed_push_is_reported_and_keeps_the_commit(self):
-        git('remote', 'set-url', 'origin', str(self.out / 'gone.git'), cwd=self.repo)
-        done = self.implement('change')
-        self.assertEqual(done.returncode, 7, done.stdout + done.stderr)
-        self.assertEqual((self.ticket_dir / 'run.push.txt').read_text().strip(), 'push-failed')
-        self.assertEqual(git('log', '-1', '--format=%s', cwd=self.wt).stdout.strip(), '#7 implement the thing')
+    def test_uncommitted_changes_after_the_run_are_dirty(self):
+        done = self.implement('dirty')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['dirty new.txt'])
+
+    def test_a_stray_file_after_a_pushed_commit_is_dirty(self):
+        done = self.implement('commit-push-dirty')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['dirty stray.txt'])
+
+    def test_a_commit_that_was_not_pushed_is_unpushed(self):
+        done = self.implement('commit-nopush')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['unpushed'])
+        self.assertIsNone(self.remote_head(self.BRANCH))
+
+    def test_a_head_that_moved_during_the_run_is_a_branch_change(self):
+        done = self.implement('move-head')
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
+        self.assertEqual(self.receipt(), ['branch-changed detached'])
+
+    def test_a_pushed_range_that_touches_a_protected_path_is_flagged(self):
+        for path in [*PROTECTED, '.githooks/new-hook', '.GitHooks/x', 'scripts/Scan-Public.py']:
+            with self.subTest(path=path):
+                git('checkout', '-q', '-B', self.BRANCH, 'main', cwd=self.wt)
+                if self.remote_head(self.BRANCH):
+                    git('push', '-q', 'origin', f':refs/heads/{self.BRANCH}', cwd=self.wt)
+                done = self.implement('commit-push', env_extra={'FAKE_PATH': path})
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                sha = self.head(self.wt)
+                self.assertEqual(self.receipt(), [f'pushed {sha}', f'protected {path}'])
+
+    def test_an_unprotected_path_is_not_flagged(self):
+        done = self.implement('commit-push', env_extra={'FAKE_PATH': 'scripts/other.py'})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(len(self.receipt()), 1)
 
     # --- plan ---------------------------------------------------------------------------------
     def make_scratch(self):
@@ -392,10 +510,13 @@ class Work:
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         plan = self.ticket_dir / 'plan.md'
         self.assertEqual(plan.read_text(), '# plan\nstep 1\n')
+        self.assertEqual(plan.stat().st_nlink, 1)
         digest = hashlib.sha256(plan.read_bytes()).hexdigest()
         self.assertIn(f'{digest}  plan.md', done.stdout)
         self.assertEqual((self.ticket_dir / 'plan.sha256').read_text().strip(), f'{digest}  plan.md')
+        self.assertEqual(self.receipt('plan', 'plan'), ['installed'])
         self.assertFalse((self.ticket_dir / 'plan-out').exists())
+        self.assertEqual([p.name for p in self.ticket_dir.iterdir() if p.name.startswith('.plan')], [])
         args = self.codex_args()
         self.assertEqual(args[args.index('-m') + 1], 'gpt-6.2-sol')
         self.assertIn('model_reasoning_effort="high"', args)
@@ -411,6 +532,25 @@ class Work:
         done = self.plan('plan-none')
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
+
+    def test_a_plan_that_is_a_directory_is_not_installed(self):
+        self.make_scratch()
+        (self.ticket_dir / 'plan.md').write_text('old\n')
+        done = self.plan('plan-dir')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
+        self.assertFalse((self.ticket_dir / 'plan.sha256').exists())
+
+    def test_a_plan_with_a_second_hard_link_is_not_installed(self):
+        self.make_scratch()
+        (self.ticket_dir / 'plan.md').write_text('old\n')
+        done = self.plan('plan-hardlink')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual((self.ticket_dir / 'plan.md').read_text(), 'old\n')
+        self.assertEqual(self.receipt('plan', 'plan'), ['no-plan'])
+        self.assertFalse((self.ticket_dir / 'plan.sha256').exists())
 
     def test_a_failed_plan_run_installs_nothing(self):
         self.make_scratch()
@@ -442,7 +582,7 @@ class Work:
 class ShWork(Work, unittest.TestCase):
     def command(self, kind, **f):
         if kind == 'implement':
-            cmd = [BASH, str(WORK_SH), 'implement', f['name'], str(f['workdir']), str(f['prompt']), str(f['message'])]
+            cmd = [BASH, str(WORK_SH), 'implement', f['name'], str(f['workdir']), str(f['prompt'])]
             return cmd + [f[k] for k in ('model', 'effort', 'minutes') if k in f]
         return [BASH, str(WORK_SH), 'plan', f['ticket'], f['name'], str(f['prompt'])]
 
@@ -453,10 +593,7 @@ class Ps1Work(Work, unittest.TestCase):
 
     def command(self, kind, **f):
         base = [PWSH, '-NoProfile', '-File', str(WORK_PS1), '-Mode', kind, '-Name', f['name'], '-PromptFile', str(f['prompt'])]
-        if kind == 'implement':
-            base += ['-WorkDir', str(f['workdir']), '-MessageFile', str(f['message'])]
-        else:
-            base += ['-Ticket', f['ticket']]
+        base += ['-WorkDir', str(f['workdir'])] if kind == 'implement' else ['-Ticket', f['ticket']]
         for key, param in (('model', '-Model'), ('effort', '-Effort'), ('minutes', '-TimeoutMinutes')):
             if key in f:
                 base += [param, f[key]]

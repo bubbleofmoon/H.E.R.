@@ -32,8 +32,8 @@ that has a wrapper, a $ or a backtick, and workers never start Codex.
 The coordinator role (not wired to any session by default; `agent-guard.sh coordinator`) has no other rule than the
 Codex forms, each one plain command (optionally after `cd <dir> &&`, optionally `bash`, and for implement after
 HER_GITLEAKS=<path to gitleaks>), through /root/her/scripts or C:/her/scripts:
-- codex-work.sh implement <name> <worktree> <prompt> <message> [model [effort [minutes]]], the worktree on a her/<n>-<slug>
-  branch, prompt and message files in that ticket's folder (<orch>/<n>/, not a link);
+- codex-work.sh implement <name> <worktree> <prompt> [model [effort [minutes]]], the worktree on a her/<n>-<slug>
+  branch, the prompt file in that ticket's folder (<orch>/<n>/, not a link);
 - codex-work.sh plan <ticket> <name> <prompt> [model [effort [minutes]]], the prompt in that ticket's folder;
 - codex-task.sh <name> <workdir> <prompt> <model> <effort> read-only [minutes] (investigation), the prompt in a ticket folder;
 - the codex-work.ps1 (-Mode implement|plan) and codex-task.ps1 (-Sandbox read-only) counterparts with the same values.
@@ -112,14 +112,14 @@ CODEX_PS1_SCRIPTS = {'c:/her/scripts/codex-work.ps1': 'work', 'c:/her/scripts/co
 PS_HOST_OPTIONS = {'-noprofile', '-noninteractive', '-nologo', '-executionpolicy', 'bypass'}
 # PowerShell parameter -> field, per script and kind; every required one must appear once.
 CODEX_PS_PARAMS = {
-    'implement': {'-mode': 'mode', '-name': 'name', '-workdir': 'workdir', '-promptfile': 'prompt', '-messagefile': 'message',
-                  '-model': 'model', '-effort': 'effort', '-timeoutminutes': 'minutes'},
+    'implement': {'-mode': 'mode', '-name': 'name', '-workdir': 'workdir', '-promptfile': 'prompt', '-model': 'model',
+                  '-effort': 'effort', '-timeoutminutes': 'minutes'},
     'plan': {'-mode': 'mode', '-name': 'name', '-ticket': 'ticket', '-promptfile': 'prompt', '-model': 'model',
              '-effort': 'effort', '-timeoutminutes': 'minutes'},
     'investigate': {'-name': 'name', '-workdir': 'workdir', '-promptfile': 'prompt', '-model': 'model', '-effort': 'effort',
                     '-sandbox': 'sandbox', '-timeoutminutes': 'minutes'},
 }
-CODEX_REQUIRED = {'implement': {'mode', 'name', 'workdir', 'prompt', 'message'}, 'plan': {'mode', 'name', 'ticket', 'prompt'},
+CODEX_REQUIRED = {'implement': {'mode', 'name', 'workdir', 'prompt'}, 'plan': {'mode', 'name', 'ticket', 'prompt'},
                   'investigate': {'name', 'workdir', 'prompt', 'model', 'effort', 'sandbox'}}
 WRAPPERS = {'bash', 'sh', 'env', 'timeout', 'nice', 'nohup', 'exec', 'command', 'xargs', 'sudo', 'time', 'stdbuf',
             'npx', 'npm', 'pnpm', 'yarn', 'bunx', 'node', 'pwsh', 'powershell', 'cmd', 'busybox',
@@ -611,8 +611,8 @@ def codex_ps_form(found):
 def codex_sh_form(found):
     """(kind, fields) of a shell Codex form (<script> <positional values>), or None."""
     rest = found[1:]
-    if found[0] == CODEX_SH_SCRIPTS['work'] and rest[:1] == ['implement'] and 5 <= len(rest) <= 8:
-        return 'implement', dict(zip(('name', 'workdir', 'prompt', 'message', 'model', 'effort', 'minutes'), rest[1:]))
+    if found[0] == CODEX_SH_SCRIPTS['work'] and rest[:1] == ['implement'] and 4 <= len(rest) <= 7:
+        return 'implement', dict(zip(('name', 'workdir', 'prompt', 'model', 'effort', 'minutes'), rest[1:]))
     if found[0] == CODEX_SH_SCRIPTS['work'] and rest[:1] == ['plan'] and 4 <= len(rest) <= 7:
         return 'plan', dict(zip(('ticket', 'name', 'prompt', 'model', 'effort', 'minutes'), rest[1:]))
     if found[0] == CODEX_SH_SCRIPTS['task'] and 6 <= len(rest) <= 7:
@@ -641,7 +641,7 @@ def codex_form_allowed(kind, fields, gitleaks):
         return fields['sandbox'] == 'read-only'
     branch = branch_of(workdir)
     match = re.fullmatch(r'her/([0-9]+)-.+', branch or '')
-    return bool(match and TICKET_BRANCH.fullmatch(branch) and match.group(1) == ticket == ticket_file(fields['message']))
+    return bool(match and TICKET_BRANCH.fullmatch(branch) and match.group(1) == ticket)
 
 
 def codex_allowed(found):

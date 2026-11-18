@@ -26,7 +26,9 @@ Check (rounds 2 and 3):
 2. The fix introduced no defect (correctness as in round 1) and keeps every acceptance criterion met.
 3. Each test the fix adds or changes fails without its change.
 
-Report REQUIRED findings only. Each has file:line and a concrete failure scenario (input, then wrong result), and you verified it in the code first. Leave out style, preferences and suggestions.
+Protected paths: <the `protected` paths of the Codex run's receipt, or none>; review each in full.
 
-End with the verdict: mergeable (no REQUIRED finding), mergeable after listed fixes or not mergeable, then the numbered required fixes.
+Report every finding with file:line, a severity (REQUIRED or OPTIONAL) and a concrete failure scenario (input, then wrong result), verified in the code first. Be concise.
+
+End with the verdict, which depends only on the REQUIRED findings: mergeable (none), mergeable after listed fixes or not mergeable, then the numbered required fixes.
 ```

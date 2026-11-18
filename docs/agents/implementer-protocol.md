@@ -40,7 +40,7 @@ Never speculate about code you have not opened. Read the source before making an
 
 ## Codex runs
 
-A Codex run (`scripts/codex-work`, `docs/agents/coordinator.md` "Codex runs") follows this protocol except for git and CI. It leaves its changes uncommitted: the wrapper commits and pushes the ticket branch after the run. It dispatches no CI and ends with the report layout below, listing each CI target it could not run under "Not verified / not run"; the coordinator dispatches the targets its brief names and sends findings as a fix brief.
+A Codex run (`scripts/codex-work`, `docs/agents/coordinator.md` "Codex runs") follows this protocol, with the limits of any worker: it commits and pushes only its own ticket branch (leaving the worktree clean and naming its commit ids in the report), never opens or merges pull requests, never posts to GitHub and never reruns CI. It dispatches no CI itself and ends with the report layout below, listing each CI target it could not run under "Not verified / not run"; the coordinator dispatches the targets its brief names and sends findings as a fix brief.
 
 ## State and evidence
 
