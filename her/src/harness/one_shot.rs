@@ -262,4 +262,30 @@ mod tests {
         );
         assert_eq!(rows[0]["b"], json!({"cacheMiss": 1, "cacheHit": 0, "cacheWrite": 0, "output": 1, "reasoning": 0}));
     }
+
+    #[test]
+    fn harness_usage_the_one_shot_redacts_the_credential_from_its_row_and_capture() {
+        let secret = "synthetic-model-key-183";
+        let (url, request) = relay("[]");
+        let (root, context) = capture::runtime("one-shot-redact", &url);
+        capture::arm(&context, "harness");
+        let route_id = format!("route-{secret}");
+        let model_name = format!("fake-chat-{secret}");
+        let route = RouteModel { id: &route_id, model: &model_name };
+        let model = model_for(&context, Job::Digest, "internal:digest", Some(route), Duration::from_secs(5), 321).unwrap();
+        assert_eq!(model.complete("", "one-shot-redact-input"), Ok("[]".to_string()));
+        request.join().unwrap();
+        let text = std::fs::read_to_string(root.0.join("data/token-usage-rust.jsonl")).unwrap_or_default();
+        let rows: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0]["route"].as_str(), rows[0]["model"].as_str()),
+            (Some("route-[REDACTED]"), Some("fake-chat-[REDACTED]")),
+            "{}",
+            rows[0]
+        );
+        assert!(!text.contains(secret), "the ledger never keeps the harness credential: {text}");
+        let record = capture::settled(&context).expect("the armed capture took the one-shot request");
+        assert_eq!(record["request"]["model"], "fake-chat-[REDACTED]", "{record}");
+    }
 }
