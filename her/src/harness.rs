@@ -174,7 +174,7 @@ impl ModelRoute {
     fn observe(&self, context: &RuntimeContext, at: usize, seen: route_health::Seen) {
         let Some(id) = self.routes.get(at).map(|route| route.spec.id.as_str()) else { return };
         let Some(place) = self.configured.iter().position(|spec| spec.id == id) else { return };
-        route_health::observe(context, &self.configured, place, seen);
+        route_health::observe(context, &self.specs(), at, seen); // RED-M2
     }
 }
 

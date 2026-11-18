@@ -60,7 +60,7 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 "maxOutputTokens": route.max_output_tokens,
                 "retry429": route.retry_429,
                 "health": match seen {
-                    Some(entry) => json!({"state": entry["state"], "since": entry.get("since"), "class": entry.get("class")}),
+                    Some(_) => json!({"state": "unknown"}), // RED-M4
                     None => json!({"state": "unknown"}),
                 },
                 "price": {

@@ -143,7 +143,7 @@ fn route_spec(entry: &Value) -> Result<RouteSpec, &'static str> {
 /// stored none), else the global setting `harness.firstRoute` on `cfg`, the loader's document. `None` for none. Whether
 /// it names a route of the chain is `conversation_order`'s to decide.
 pub(crate) fn selected(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Option<String> {
-    let stored = crate::settings::conversation_value(context, conversation, crate::settings::CONVERSATION_ROUTE.key);
+    let stored: Option<Value> = None; // RED-M3
     let value = stored.unwrap_or_else(|| crate::settings::HARNESS_FIRST_ROUTE.read(cfg));
     value.as_str().map(str::to_string)
 }
@@ -156,7 +156,7 @@ pub(crate) fn conversation_order(chain: &[RouteSpec], selected: Option<&str>) ->
     let mut order = chain.to_vec();
     if let Some(at) = selected.and_then(|id| order.iter().position(|route| route.id == id)) {
         let route = order.remove(at);
-        order.insert(0, route);
+        order.push(route); // RED-M1
     }
     order
 }
