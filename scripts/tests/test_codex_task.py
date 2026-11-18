@@ -67,6 +67,7 @@ case "$FAKE_MODE" in
   symlink) rm "$workdir/$FAKE_PATH"; ln -s /etc/hostname "$workdir/$FAKE_PATH"; commit; push; printf 'done\n' > "$report" ;;
   amend-force) git -C "$workdir" commit -q --amend --allow-empty -m amended; push --force; printf 'done\n' > "$report" ;;
   reset-force) git -C "$workdir" reset -q --hard HEAD~1; push --force; printf 'done\n' > "$report" ;;
+  push-reset) edit; commit; push; git -C "$workdir" reset -q --hard HEAD~1; printf 'done\n' > "$report" ;;
   common-config) git -C "$workdir" config demo.key value; edit; commit; push; printf 'done\n' > "$report" ;;
   common-hook) mkdir -p "${adds[1]}/hooks"; echo x > "${adds[1]}/hooks/post-commit"; edit; commit; push; printf 'done\n' > "$report" ;;
   worktree-config) echo '[demo]' > "$(git -C "$workdir" rev-parse --absolute-git-dir)/config.worktree"; edit; commit; push; printf 'done\n' > "$report" ;;
@@ -522,6 +523,31 @@ class Work:
         done = self.implement('reset-force')
         self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
         self.assertEqual(self.receipt(), ['rewritten'])
+
+    def test_a_push_followed_by_a_reset_to_the_start_is_remote_moved(self):
+        self.branch_commit()
+        before = self.head(self.wt)
+        done = self.implement('push-reset')
+        self.assertEqual(self.head(self.wt), before)
+        self.assertNotEqual(self.remote_head(self.BRANCH), before)
+        self.assertEqual(done.returncode, 8, self.receipt())
+        self.assertEqual(self.receipt(), ['remote-moved'])
+
+    def test_implement_refuses_a_branch_ahead_of_or_behind_the_remote(self):
+        self.branch_commit()
+        remote = self.remote_head(self.BRANCH)
+        for relation in ('ahead', 'behind'):
+            with self.subTest(relation=relation):
+                git('reset', '-q', '--hard', remote, cwd=self.wt)
+                if relation == 'ahead':
+                    git('commit', '-q', '--allow-empty', '-m', 'local only', cwd=self.wt)
+                else:
+                    git('reset', '-q', '--hard', 'HEAD~1', cwd=self.wt)
+                self.args_file.unlink(missing_ok=True)
+                done = self.implement('nochange')
+                self.assertEqual(done.returncode, 8, self.receipt())
+                self.assertEqual(self.receipt(), ['pre-remote-mismatch'])
+                self.assertFalse(self.args_file.exists())
 
     def test_a_new_commit_on_an_existing_remote_branch_passes_the_added_scan(self):
         self.branch_commit()

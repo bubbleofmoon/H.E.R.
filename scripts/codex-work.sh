@@ -7,7 +7,8 @@
 # (implement) or <name>.plan.txt (plan: `installed` or `no-plan`).
 # implement: HER_GITLEAKS must name the gitleaks binary (Codex's own push runs the pre-push hook with it). Before the run
 #   the worktree must be clean, its HEAD on her/<n>-<slug> (never main), <orch>/<n> and its tmp must not be links, and
-#   the remote must answer. Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
+#   the remote must answer. An existing remote branch must match local HEAD, or the receipt says `pre-remote-mismatch`.
+#   Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
 #   common git dir, and commits and pushes its own ticket branch (push without -u: -u writes the common config).
 #   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
 #   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
@@ -15,14 +16,14 @@
 #   core.hooksPath=/dev/null, and asks $HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R.git) for the
 #   remote head, never `origin`.
 #   <name>.push.txt line 1 is the first that applies: `rewritten` (the pre-run HEAD is not an ancestor of HEAD),
-#   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged` (the remote head against the
-#   one before the run), `no-changes` (no new commit), `unpushed` (the remote head is not HEAD) or `pushed <sha>`.
+#   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged|unknown`, `remote-moved`
+#   (local HEAD unchanged but remote head moved), `no-changes` (both heads unchanged), `unpushed` or `pushed <sha>`.
 #   A line `protected <paths>` follows whenever pre-run HEAD..HEAD holds commits touching .githooks/ or the scan scripts,
 #   scan config or scan exceptions; a line `scan-refused` follows when scripts/scan-public.py of this checkout, run on
 #   the repository's main checkout with --added-from-stdin (--revs-from-stdin when the remote had no such branch) and
 #   --objects-from-stdin over those commits, refuses or cannot run (<name>.scan.txt has its output). That scan is
 #   detection after the push, never a barrier. Exit 8 for `config-changed`, `rewritten`, `branch-changed`, `git-failed`,
-#   `dirty`, `unpushed` and `scan-refused`, else 0.
+#   `dirty`, `pre-remote-mismatch`, `remote-moved`, `unpushed` and `scan-refused`, else 0.
 #   <name>.staged.txt lists the commits since the pre-run HEAD (`commit <sha> <subject>`) and the name-status of
 #   every path they touched (`<status><TAB><path>`).
 # plan: Codex (workspace-write) writes only <orch>/<n>/scratch and <orch>/<n>/plan-out; the plan it leaves there as a
@@ -60,9 +61,15 @@ implement)
   ticket=${branch#her/}; ticket=${ticket%%-*}
   [ ! -L "$orch/$ticket" ] && [ ! -L "$orch/$ticket/tmp" ] || die "a link in the ticket folder: $orch/$ticket"
   pre=$(g rev-parse HEAD)
-  g ls-remote "$remote_url" HEAD > /dev/null 2>&1 || die "the remote does not answer: $remote_url"
-  pre_remote=$(g ls-remote "$remote_url" "refs/heads/$branch" 2> /dev/null | cut -f1)
+  pre_remote=$(g ls-remote "$remote_url" "refs/heads/$branch" 2> /dev/null | cut -f1) || die "the remote does not answer: $remote_url"
   out=$(dirname -- "$(realpath -- "$prompt")")
+  rm -f -- "$out/$name.push.txt" "$out/$name.staged.txt" "$out/$name.scan.txt"
+  receipt() { printf '%s\n' "$@" > "$out/$name.push.txt"; }
+  if [ -n "$pre_remote" ] && [ "$pre_remote" != "$pre" ]; then
+    receipt pre-remote-mismatch
+    echo pre-remote-mismatch >&2
+    exit 8
+  fi
   mkdir -p -- "$orch/$ticket/tmp"
   [ ! -L "$orch/$ticket/tmp" ] || die "a link in the ticket folder: $orch/$ticket/tmp"
   # What git, its hooks and later sessions read: hashed before and after the run.
@@ -81,8 +88,6 @@ implement)
     fi
   }
   pre_snap=$(snap)
-  rm -f -- "$out/$name.push.txt" "$out/$name.staged.txt" "$out/$name.scan.txt"
-  receipt() { printf '%s\n' "$@" > "$out/$name.push.txt"; }
   TMPDIR="$orch/$ticket/tmp" "$here/codex-task.sh" "$name" "$wt" "$prompt" "$model" "$effort" workspace-write "$minutes" \
     "$orch/$ticket/tmp" "$common"
   code=$?
@@ -94,12 +99,21 @@ implement)
     exit 8
   fi
   [ "$code" -eq 0 ] || exit "$code"
-  fail_git() { receipt git-failed; echo "codex-work: a git call failed" >&2; exit 8; }
+  lines=() rc=0
+  fail_git() {
+    receipt "${lines[0]:-git-failed}"
+    echo "${lines[0]:-codex-work: a git call failed}" >&2
+    exit 8
+  }
   now=$(branch_of)
   head=$(g rev-parse HEAD) || fail_git
-  rewritten=0
-  g merge-base --is-ancestor "$pre" "$head" 2> /dev/null || rewritten=1
+  if ! g merge-base --is-ancestor "$pre" "$head" 2> /dev/null; then
+    lines=(rewritten); rc=8
+  elif [ "$now" != "$branch" ]; then
+    lines=("branch-changed ${now:-detached}"); rc=8
+  fi
   range="$pre..$head"
+  list=$(g rev-list "$range") || fail_git
   commits=$(g log --format='commit %H %s' "$range") || fail_git
   names=$(g -c core.quotepath=off log -m --no-renames --name-status --format= "$range") || fail_git
   { [ -z "$commits" ] || printf '%s\n' "$commits"; printf '%s\n' "$names" | sed '/^$/d' | LC_ALL=C sort -u; } > "$out/$name.staged.txt"
@@ -112,25 +126,25 @@ implement)
     esac
   done < <(LC_ALL=C sort -zu "$paths_file")
   rm -f -- "$paths_file"
-  lines=() rc=0
-  if [ "$rewritten" -eq 1 ]; then
-    lines=(rewritten); rc=8
-  elif [ "$now" != "$branch" ]; then
-    lines=("branch-changed ${now:-detached}"); rc=8
-  else
+  if [ -z "${lines[0]:-}" ]; then
     stray=$(g -c core.quotepath=off status --porcelain --untracked-files=all --no-renames) || fail_git
     stray=$(printf '%s\n' "$stray" | sed '/^$/d' | cut -c4- | paste -sd' ' -)
-    remote=$(g ls-remote "$remote_url" "refs/heads/$branch" 2> /dev/null | cut -f1)
+    remote_ok=1
+    remote=$(g ls-remote "$remote_url" "refs/heads/$branch" 2> /dev/null | cut -f1) || remote_ok=0
     if [ -n "$stray" ]; then
-      moved=unchanged; [ "$remote" = "$pre_remote" ] || moved=moved
+      if [ "$remote_ok" -eq 0 ]; then moved=unknown
+      elif [ "$remote" != "$pre_remote" ]; then moved=moved
+      else moved=unchanged
+      fi
       lines=("dirty $stray" "remote $moved"); rc=8
+    elif [ "$head" = "$pre" ] && [ "$remote_ok" -eq 0 ]; then fail_git
+    elif [ "$head" = "$pre" ] && [ "$remote" != "$pre_remote" ]; then lines=(remote-moved); rc=8
     elif [ "$head" = "$pre" ]; then lines=(no-changes)
-    elif [ "$remote" != "$head" ]; then lines=(unpushed); rc=8
+    elif [ "$remote_ok" -eq 0 ] || [ "$remote" != "$head" ]; then lines=(unpushed); rc=8
     else lines=("pushed $head")
     fi
   fi
   [ -z "$held" ] || lines+=("protected $held")
-  list=$(g rev-list "$range") || fail_git
   if [ -n "$list" ]; then
     scan_mode=--added-from-stdin; [ -n "$pre_remote" ] || scan_mode=--revs-from-stdin
     py=python3; command -v python3 > /dev/null 2>&1 || py=python

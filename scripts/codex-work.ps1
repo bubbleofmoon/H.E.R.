@@ -19,7 +19,8 @@ param(
 # (implement) or <Name>.plan.txt (plan: `installed` or `no-plan`).
 # implement: HER_GITLEAKS must name the gitleaks binary (Codex's own push runs the pre-push hook with it). Before the run
 #   the worktree must be clean, its HEAD on her/<n>-<slug> (never main), <orch>/<n> and its tmp must not be links, and
-#   the remote must answer. Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
+#   the remote must answer. An existing remote branch must match local HEAD, or the receipt says `pre-remote-mismatch`.
+#   Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
 #   common git dir, and commits and pushes its own ticket branch (push without -u: -u writes the common config).
 #   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
 #   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
@@ -27,14 +28,14 @@ param(
 #   core.hooksPath off, and asks $env:HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R.git) for the
 #   remote head, never `origin`.
 #   <Name>.push.txt line 1 is the first that applies: `rewritten` (the pre-run HEAD is not an ancestor of HEAD),
-#   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged` (the remote head against the
-#   one before the run), `no-changes` (no new commit), `unpushed` (the remote head is not HEAD) or `pushed <sha>`.
+#   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged|unknown`, `remote-moved`
+#   (local HEAD unchanged but remote head moved), `no-changes` (both heads unchanged), `unpushed` or `pushed <sha>`.
 #   A line `protected <paths>` follows whenever pre-run HEAD..HEAD holds commits touching .githooks/ or the scan scripts,
 #   scan config or scan exceptions; a line `scan-refused` follows when scripts/scan-public.py of this checkout, run on
 #   the repository's main checkout with --added-from-stdin (--revs-from-stdin when the remote had no such branch) and
 #   --objects-from-stdin over those commits, refuses or cannot run (<Name>.scan.txt has its output). That scan is
 #   detection after the push, never a barrier. Exit 8 for `config-changed`, `rewritten`, `branch-changed`, `git-failed`,
-#   `dirty`, `unpushed` and `scan-refused`, else 0.
+#   `dirty`, `pre-remote-mismatch`, `remote-moved`, `unpushed` and `scan-refused`, else 0.
 #   <Name>.staged.txt lists the commits since the pre-run HEAD (`commit <sha> <subject>`) and the name-status of
 #   every path they touched (`<status><TAB><path>`).
 # plan: Codex (workspace-write) writes only <orch>/<n>/scratch and <orch>/<n>/plan-out; the plan it leaves there as a
@@ -92,9 +93,18 @@ if ($Mode -eq 'implement') {
   $tmp = "$orch/$ticketNumber/tmp"
   if ((Test-Link "$orch/$ticketNumber") -or (Test-Link $tmp)) { Stop-Refused "a link in the ticket folder: $orch/$ticketNumber" }
   $pre = (G rev-parse HEAD).Trim()
-  $null = G ls-remote $remoteUrl HEAD 2> $null
-  if ($LASTEXITCODE -ne 0) { Stop-Refused "the remote does not answer: $remoteUrl" }
   $preRemote = ((G ls-remote $remoteUrl "refs/heads/$branch" 2> $null) -split "`t")[0]
+  if ($LASTEXITCODE -ne 0) { Stop-Refused "the remote does not answer: $remoteUrl" }
+  $pushFile = Join-Path $outDir "$Name.push.txt"
+  $stagedFile = Join-Path $outDir "$Name.staged.txt"
+  $scanFile = Join-Path $outDir "$Name.scan.txt"
+  Remove-Item -LiteralPath $pushFile, $stagedFile, $scanFile -ErrorAction SilentlyContinue
+  function Set-Receipt([string[]]$Lines) { Set-Content -LiteralPath $pushFile -Value $Lines -Encoding ASCII }
+  if ($preRemote -and $preRemote -ne $pre) {
+    Set-Receipt 'pre-remote-mismatch'
+    [Console]::Error.WriteLine('pre-remote-mismatch')
+    exit 8
+  }
   [IO.Directory]::CreateDirectory($tmp) | Out-Null
   if (Test-Link $tmp) { Stop-Refused "a link in the ticket folder: $tmp" }
   # What git, its hooks and later sessions read: hashed before and after the run.
@@ -113,11 +123,6 @@ if ($Mode -eq 'implement') {
     @($lines | Sort-Object -CaseSensitive)
   }
   $preSnap = Get-Snap
-  $pushFile = Join-Path $outDir "$Name.push.txt"
-  $stagedFile = Join-Path $outDir "$Name.staged.txt"
-  $scanFile = Join-Path $outDir "$Name.scan.txt"
-  Remove-Item -LiteralPath $pushFile, $stagedFile, $scanFile -ErrorAction SilentlyContinue
-  function Set-Receipt([string[]]$Lines) { Set-Content -LiteralPath $pushFile -Value $Lines -Encoding ASCII }
   $code = Invoke-Task $WorkDir @($tmp, "$common") $tmp
   $postSnap = Get-Snap
   if (($preSnap -join "`n") -ne ($postSnap -join "`n")) {
@@ -127,13 +132,27 @@ if ($Mode -eq 'implement') {
     exit 8
   }
   if ($code -ne 0) { exit $code }
-  function Stop-GitFailed { Set-Receipt 'git-failed'; [Console]::Error.WriteLine('codex-work: a git call failed'); exit 8 }
+  $lines = @()
+  $rc = 0
+  function Stop-GitFailed {
+    if ($lines.Count -gt 0) {
+      Set-Receipt $lines[0]
+      [Console]::Error.WriteLine($lines[0])
+    } else {
+      Set-Receipt 'git-failed'
+      [Console]::Error.WriteLine('codex-work: a git call failed')
+    }
+    exit 8
+  }
   $now = Get-Branch
   $head = "$(G rev-parse HEAD)".Trim()
   if ($LASTEXITCODE -ne 0) { Stop-GitFailed }
   $null = G merge-base --is-ancestor $pre $head 2> $null
-  $rewritten = $LASTEXITCODE -ne 0
+  if ($LASTEXITCODE -ne 0) { $lines = @('rewritten'); $rc = 8 }
+  elseif ($now -ne $branch) { $lines = @("branch-changed $(if ($now) { $now } else { 'detached' })"); $rc = 8 }
   $range = "$pre..$head"
+  $list = @(G rev-list $range) -join "`n"
+  if ($LASTEXITCODE -ne 0) { Stop-GitFailed }
   $commits = @(G log --format='commit %H %s' $range)
   if ($LASTEXITCODE -ne 0) { Stop-GitFailed }
   $changes = @(G -c core.quotepath=off log -m --no-renames --name-status --format= $range)
@@ -146,26 +165,23 @@ if ($Mode -eq 'implement') {
       $l = $_.ToLowerInvariant()
       $l.StartsWith('.githooks/') -or $l -in 'scripts/check-repo.py', 'scripts/scan-public.py', 'scripts/tests/test_scan_public.py', '.gitleaks.toml', '.public-scan.json'
     })
-  $lines = @()
-  $rc = 0
-  if ($rewritten) { $lines = @('rewritten'); $rc = 8 }
-  elseif ($now -ne $branch) { $lines = @("branch-changed $(if ($now) { $now } else { 'detached' })"); $rc = 8 }
-  else {
+  if ($lines.Count -eq 0) {
     $status = @(G -c core.quotepath=off status --porcelain --untracked-files=all --no-renames)
     if ($LASTEXITCODE -ne 0) { Stop-GitFailed }
     $stray = @($status | Where-Object { $_ } | ForEach-Object { $_.Substring(3) })
     $remote = ((G ls-remote $remoteUrl "refs/heads/$branch" 2> $null) -split "`t")[0]
+    $remoteOk = $LASTEXITCODE -eq 0
     if ($stray.Count -gt 0) {
-      $moved = if ($remote -eq $preRemote) { 'unchanged' } else { 'moved' }
+      $moved = if (-not $remoteOk) { 'unknown' } elseif ($remote -ne $preRemote) { 'moved' } else { 'unchanged' }
       $lines = @("dirty $($stray -join ' ')", "remote $moved"); $rc = 8
     }
+    elseif ($head -eq $pre -and -not $remoteOk) { Stop-GitFailed }
+    elseif ($head -eq $pre -and $remote -ne $preRemote) { $lines = @('remote-moved'); $rc = 8 }
     elseif ($head -eq $pre) { $lines = @('no-changes') }
-    elseif ($remote -ne $head) { $lines = @('unpushed'); $rc = 8 }
+    elseif (-not $remoteOk -or $remote -ne $head) { $lines = @('unpushed'); $rc = 8 }
     else { $lines = @("pushed $head") }
   }
   if ($held.Count -gt 0) { $lines += "protected $($held -join ' ')" }
-  $list = @(G rev-list $range) -join "`n"
-  if ($LASTEXITCODE -ne 0) { Stop-GitFailed }
   if ($list) {
     $scanMode = if ($preRemote) { '--added-from-stdin' } else { '--revs-from-stdin' }
     $py = (Get-Command python3, python -ErrorAction SilentlyContinue | Select-Object -First 1).Source
