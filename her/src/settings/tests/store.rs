@@ -119,6 +119,35 @@ fn settings_store_never_opens_memory_db() {
 }
 
 #[test]
+fn settings_source_list_names_every_product_file() {
+    // The source tests scan `SETTINGS_SOURCES` only: every settings product file under `src/settings/` and the
+    // module root `src/settings.rs`, except the test modules (`tests/`) and `probe.rs`, must be listed there.
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut product = vec!["settings.rs".to_string()];
+    let mut pending = vec![src.join("settings")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name() != Some(std::ffi::OsStr::new("tests")) {
+                    pending.push(path);
+                }
+            } else if path.extension() == Some(std::ffi::OsStr::new("rs"))
+                && path.file_name() != Some(std::ffi::OsStr::new("probe.rs"))
+            {
+                let relative = path.strip_prefix(&src).unwrap();
+                let parts = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned());
+                product.push(parts.collect::<Vec<_>>().join("/"));
+            }
+        }
+    }
+    let mut listed: Vec<String> = SETTINGS_SOURCES.iter().map(|(file, _)| file.to_string()).collect();
+    listed.sort();
+    product.sort();
+    assert_eq!(listed, product, "SETTINGS_SOURCES names the settings product files and nothing else");
+}
+
+#[test]
 fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
     // A newer release's WAL store, closed cleanly: everything is in the file and no sidecar is left.
     let (root, context) = settings_fixture("settings newer schema");
