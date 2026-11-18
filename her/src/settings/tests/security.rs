@@ -277,12 +277,17 @@ fn settings_audit_undo_restores_security_settings_through_the_store_and_needs_co
 
 #[test]
 fn settings_access_change_takes_the_configuration_gate_before_the_store_gate() {
-    let (_root, context) = security_fixture("settings access gate order");
+    let (root, context) = security_fixture("settings access gate order");
+    let config = root.0.join("config/config.json");
+    let before = std::fs::read(&config).unwrap();
     let config_gate = acquire_social_state_gate(&context).unwrap();
     let (status, body) = std::thread::scope(|scope| {
         let running = scope.spawn(|| set(&context, json!({"setting": "allow.groups", "value": [7001], "confirm": true})));
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!running.is_finished(), "the access change went ahead while another writer held the configuration gate");
+        // The write-back of the store's commit is the change's own configuration write: none may happen under another
+        // writer's gate. (The revocation after the commit also waits for that gate, so `is_finished` alone cannot see it.)
+        assert_eq!(std::fs::read(&config).unwrap(), before, "the access change wrote config.json while another writer held the configuration gate");
         let store_gate = context.open_locked_file(RuntimeArea::Data, "locks/settings-store.lock");
         assert!(store_gate.is_ok(), "the access change holds the store gate while it waits for the configuration gate");
         drop(store_gate);
