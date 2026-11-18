@@ -414,3 +414,37 @@ fn settings_scope_change_works_on_an_allow_list_with_unusable_items() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001, 7002]));
 }
+
+#[test]
+fn settings_undo_of_an_entry_missing_at_the_first_look_never_takes_the_plain_path() {
+    let (_root, context) = security_fixture("settings undo entry created meanwhile");
+    let (status, body) = set(&context, json!({"setting": "allow.groups", "value": [7001, 7002, 7003], "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "");
+    let unknown = entries[0]["entry"].as_i64().unwrap() + 1;
+    // Another administrator's confirmed change of the list becomes that entry after the undo's first look.
+    let other = context.clone();
+    crate::console_settings::AFTER_UNDO_LOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let (status, body) = set(&other, json!({"setting": "allow.groups", "value": [7001], "confirm": true}));
+            assert_eq!(status, 200, "{body}");
+        }));
+    });
+    let (status, body) = post(&context, "/api/settings/undo", json!({"entry": unknown}));
+    assert_eq!(status, 404, "an entry the first look did not find is answered there: {body}");
+    assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001]), "the entry made meanwhile is not undone unconfirmed");
+}
+
+#[test]
+fn settings_scope_admit_is_denied_only_by_an_id_the_deny_list_reads() {
+    let (root, context) = security_fixture("settings scope deny leading zero");
+    write_config(&root, |config| config["deny"]["groups"] = json!(["07004"]));
+    let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": "group:7004", "action": "admit", "confirm": true}));
+    assert_eq!(status, 200, "07004 denies nothing the runtime matches: {body}");
+    assert_eq!(setting_view(&context, "allow.groups")["stored"], json!([7001, 7002, 7004]));
+    assert!(inbound_admitted(&context.load_config().unwrap(), "group:7004"));
+    // A usable id of the deny list still refuses the admit.
+    write_config(&root, |config| config["deny"]["groups"] = json!([7005]));
+    let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": "group:7005", "action": "admit", "confirm": true}));
+    assert_eq!(status, 409, "{body}");
+}

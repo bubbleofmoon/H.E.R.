@@ -308,7 +308,7 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
         keep_stored_members(context, &mut file)?;
         // Once the store holds the change, a failed file write keeps the pending revocation (`Null`: always kept).
         write_config_or_forget(context, &file, if stored { &Value::Null } else { &unchanged }, &pending)?;
-        let shown =context.load_config_document().ok().filter(Value::is_object).unwrap_or(file);
+        let shown = context.load_config_document().ok().filter(Value::is_object).unwrap_or(file);
         (effective_before, effective_after, shown, pending)
     };
     let (retired, failures) = finish_access_change(context, &interaction, &before, &after, "access-revoked", pending);
@@ -391,12 +391,10 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         let Some(mut served) = file.pointer("/rollout/rustGroups").and_then(Value::as_array).cloned() else {
             return Err((409, "rollout.rustGroups is not configured: the supervisor serves only that explicit list".to_string()));
         };
-        if admit
-            && social_policy_list(&file, "deny", kind)
-                .unwrap_or_default()
-                .iter()
-                .any(|denied| canonical_v2_key(&format!("{kind}:{denied}")).as_deref() == Some(key.as_str()))
-        {
+        // Denied as the deny list setting reads it, the ids the runtime matches ("07001" is not 7001 there).
+        let deny_list = crate::settings::find(&format!("deny.{field}")).expect("the registry holds the deny lists");
+        let denied_ids = deny_list.read(&file);
+        if admit && denied_ids.as_array().is_some_and(|ids| ids.iter().any(|denied| denied.to_string() == id)) {
             return Err((409, format!("{key} is in deny.{field}; remove it from the deny list first")));
         }
         // The ids the allow list setting reads (JS precedence `groups ?? group`, `private ?? privates`): a hand-edited

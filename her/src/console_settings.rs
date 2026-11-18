@@ -80,15 +80,19 @@ fn confirmed(fields: &Map<String, Value>, setting: Option<&crate::settings::Sett
     crate::settings::check_confirmation(confirm, setting.as_slice())
 }
 
-/// The registry setting of history entry `entry`, for the undo's confirmation. `Ok(None)` when the entry is unknown (404)
-/// or its setting is no longer in the registry (409): the undo answers those itself. Any other failure of the look
-/// (a store that cannot be read right now) is the error, and `undo` fails closed on it.
-fn entry_setting(context: &RuntimeContext, entry: i64) -> Result<Option<&'static crate::settings::Setting>, (u16, String)> {
-    match crate::settings::preview(context, &crate::settings::Change::Undo { entry }) {
-        Ok(previewed) => Ok(previewed.first().map(|(setting, _)| *setting)),
-        Err((404 | 409, _)) => Ok(None),
-        Err(error) => Err(error),
-    }
+/// The registry setting history entry `entry` changes, for the undo's confirmation. Every failure of the look is the
+/// error (404: no such entry yet, 409: its setting is no longer in the registry, 503: a store that cannot be read right
+/// now), so only a look that names the setting reaches the undo's plain path (`undo`).
+fn entry_setting(context: &RuntimeContext, entry: i64) -> Result<&'static crate::settings::Setting, (u16, String)> {
+    let previewed = crate::settings::preview(context, &crate::settings::Change::Undo { entry })?;
+    previewed.first().map(|(setting, _)| *setting).ok_or((503, "the settings entry cannot be read".to_string()))
+}
+
+/// Test seam: runs on this thread right after the undo's first look at its entry, so a test can create the entry the
+/// look did not find.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static AFTER_UNDO_LOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting. A change of an
@@ -139,10 +143,18 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         .and_then(Value::as_i64)
         .filter(|entry| *entry > 0)
         .ok_or((400, "entry must be a positive integer".to_string()))?;
-    // Fail closed: when the first look at the entry fails, which setting it changes is unknown, so an unconfirmed undo is
-    // refused with that failure, and a confirmed one takes the access path, which looks again under the configuration gate.
-    let (target, access) = match entry_setting(context, entry) {
-        Ok(target) => (target, target.is_some_and(|target| target.access())),
+    // Fail closed: only a look that names the entry's setting may take the plain path. An unknown entry (404) or a retired
+    // setting (409) is answered here, since the entry may be created before the undo commits; when the look fails
+    // otherwise, an unconfirmed undo is refused with that failure and a confirmed one takes the access path, which looks
+    // again under the configuration gate.
+    let looked = entry_setting(context, entry);
+    #[cfg(test)]
+    if let Some(hook) = AFTER_UNDO_LOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    let (target, access) = match looked {
+        Ok(target) => (Some(target), target.access()),
+        Err((status, message)) if matches!(status, 404 | 409) => return Err((status, message)),
         Err(error) => {
             if !crate::settings::confirm_field(&Value::Object(fields.clone()))? {
                 return Err(error);
