@@ -176,7 +176,7 @@ where
         if left.is_zero() {
             return Err("语音下载超出时限".to_string());
         }
-        transfer(p, pin, max, given) // RED-8
+        transfer(p, pin, max, given.min(left))
     };
     fetch_checked(raw_url, max_bytes, 2, budget, looks_like_silk, "抓取内容不是 SILK 语音", resolve, within_budget)
 }
