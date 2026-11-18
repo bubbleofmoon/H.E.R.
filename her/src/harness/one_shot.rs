@@ -98,14 +98,17 @@ impl RelayModel {
         max_tokens: u32,
     ) -> Result<Self, ModelError> {
         let relay = crate::harness::ModelRoute::for_model(context, route.model).map_err(|_| ModelError("unconfigured"))?;
+        // The request target keeps the model as configured (`ModelRoute::target`); every record and capture keeps it redacted.
+        let model = relay.redact(route.model);
+        let usage_route = relay.redact(route.id);
         Ok(Self {
             context: context.clone(),
-            model: route.model.to_string(),
+            model,
             route: relay,
             timeout,
             max_tokens,
             usage_key: key.to_string(),
-            usage_route: route.id.to_string(),
+            usage_route,
             usage_job: job.usage_job(),
         })
     }

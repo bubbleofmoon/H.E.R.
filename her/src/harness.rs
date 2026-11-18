@@ -47,6 +47,11 @@ pub(crate) struct Route {
     target: ServiceTarget,
 }
 
+/// `text` with the harness credential `key` replaced by `[REDACTED]`: the form every record and capture keeps.
+pub(crate) fn redact_credential(text: &str, key: &str) -> String {
+    text.replace(key, "[REDACTED]")
+}
+
 /// A turn's candidate chain on the selected runtime's relay, authenticated with the harness credential: the configured
 /// routes (`routes::chain`), tried in order from `start`. Credentials are opaque: never derive Debug or serialize this
 /// value.
@@ -96,8 +101,8 @@ impl ModelRoute {
         let routes = chain
             .into_iter()
             .map(|spec| Route {
-                id: spec.id.replace(key, "[REDACTED]"),
-                model: spec.model.replace(key, "[REDACTED]"),
+                id: redact_credential(&spec.id, key),
+                model: redact_credential(&spec.model, key),
                 target: ServiceTarget {
                     model: ModelIden::new(AdapterKind::OpenAI, spec.model.clone()),
                     endpoint: Endpoint::from_owned(endpoint.clone()),
@@ -117,6 +122,11 @@ impl ModelRoute {
     /// The first route's target (the digest's one route).
     pub(crate) fn target(&self) -> ServiceTarget {
         self.routes[0].target.clone()
+    }
+
+    /// `text` with this route's harness credential redacted (`redact_credential`).
+    pub(crate) fn redact(&self, text: &str) -> String {
+        redact_credential(text, &self.key)
     }
 
     /// The chain's fingerprint (`routes::chain_signature`).
