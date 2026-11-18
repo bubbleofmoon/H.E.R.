@@ -164,6 +164,13 @@ async fn rig(
 }
 
 impl Rig {
+    /// Re-reads the conversation's generation after a stopped turn: a stop revokes the admitted token
+    /// (`harness.rs`, the cancel path calls `Tools::revoke`), and the generation is that token's epoch.
+    fn renew_generation(&mut self) {
+        let token = crate::conversation_authority::token(&self.context, OWNER).unwrap().unwrap();
+        self.generation = crate::send_outbox::token_epoch(&token);
+    }
+
     fn request(&self, id: &str, prompt: &str) -> TurnRequest {
         TurnRequest {
             id: id.into(),
@@ -362,7 +369,7 @@ async fn harness_summary_a_summary_with_new_ai_wording_is_refused_and_the_oldest
 
 #[tokio::test(flavor = "current_thread")]
 async fn harness_summary_a_turn_stopped_mid_summary_writes_nothing_and_the_next_turn_summarises_again() {
-    let rig = rig("mid-summary", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
+    let mut rig = rig("mid-summary", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
     rig.seed(1..=19, long_prompt, json!({}));
     let users = rig.events("user").len();
     rig.summariser.hold.store(true, Ordering::SeqCst);
@@ -382,13 +389,14 @@ async fn harness_summary_a_turn_stopped_mid_summary_writes_nothing_and_the_next_
         "a summary that never finished leaves no checkpoint"
     );
     rig.summariser.hold.store(false, Ordering::SeqCst);
-    // A new harness (as after a restart) replays the same history and summarises again.
+    // The stop rotated the conversation's generation, so the next turn is admitted in a new session with no
+    // completed history: it is under the budget and asks for no summary. The released first summary writes nothing.
+    rig.renew_generation();
     let body = rig.turn("mid-summary-21", "再回复", answer("好", 12)).await;
-    let checkpoints = rig.events("checkpoint");
-    assert_eq!(checkpoints.len(), 1);
-    assert_eq!(checkpoints[0]["summary"], "第2次摘要：周六爬山。");
+    assert!(rig.events("checkpoint").is_empty(), "the released summary writes no checkpoint");
+    assert_eq!(rig.summaries().len(), 1, "only the stopped turn asked for a summary");
     assert_eq!(rig.events("user").len(), users + 2, "every stored fact stays");
-    assert!(texts(&body)[1].starts_with(SUMMARY_LABEL));
+    assert!(texts(&body).iter().all(|text| !text.starts_with(SUMMARY_LABEL)));
 }
 
 #[tokio::test(flavor = "current_thread")]
