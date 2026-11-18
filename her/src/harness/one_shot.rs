@@ -109,6 +109,13 @@ impl RelayModel {
             usage_job: job.usage_job(),
         })
     }
+
+    /// The usage fact of one answered request (`harness::usage`), with a turn number of its own.
+    fn record_usage(&self, reported: &genai::chat::Usage) {
+        use crate::harness::usage;
+        let place = usage::Place { key: self.usage_key.clone(), turn: usage::next_number(), step: 0, retry: 0 };
+        usage::record(&self.context, &place, &self.usage_route, &self.model, self.usage_job, Some(reported));
+    }
 }
 
 impl OneShot for RelayModel {
@@ -134,17 +141,13 @@ impl OneShot for RelayModel {
         let call = async move {
             let client = genai::Client::new().map_err(|_| ModelError("network"))?;
             let options = ChatOptions::default().with_max_tokens(max_tokens);
-            let response = tokio::time::timeout(timeout, client.exec_chat(genai::ModelSpec::Target(target), request, Some(&options)))
+            tokio::time::timeout(timeout, client.exec_chat(genai::ModelSpec::Target(target), request, Some(&options)))
                 .await
                 .map_err(|_| ModelError("timeout"))?
-                .map_err(|error| ModelError(crate::harness::model_failure(&error).class))?;
-            if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
-                return Err(ModelError("refusal"));
-            }
-            Ok(response.into_first_text().unwrap_or_default())
+                .map_err(|error| ModelError(crate::harness::model_failure(&error).class))
         };
         // A fresh thread has no runtime context, so this works from sync jobs and spawn_blocking alike.
-        std::thread::spawn(move || {
+        let response = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -152,7 +155,13 @@ impl OneShot for RelayModel {
                 .block_on(call)
         })
         .join()
-        .unwrap_or(Err(ModelError("network")))
+        .unwrap_or(Err(ModelError("network")))?;
+        // Every answered request is a usage fact, a refused one included: it is recorded before the refusal is decided.
+        self.record_usage(&response.usage);
+        if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
+            return Err(ModelError("refusal"));
+        }
+        Ok(response.into_first_text().unwrap_or_default())
     }
 }
 

@@ -1,7 +1,7 @@
 //! Usage facts (#173): one token-ledger sample (`ledger.rs`, the selected runtime's `data/token-usage-rust.jsonl`) for
 //! each model request through the route module that returned a response end. Harness turns record each attempt with
 //! its route and its place in the turn (`harness.rs`, `ChainState::record_usage`); one-shot jobs record each request
-//! (the digest, `digest/model.rs`). The console's token views read these samples with every other sample and price
+//! (`harness/one_shot.rs`: the digest and slang learning). The console's token views read these samples with every other sample and price
 //! them by model at read time; `/api/usage/attribution` leaves them out of its comparison with DSH's own total, which
 //! never saw these requests (`Ledger::dsh_comparable_samples`).
 use crate::run_record::{Component, Outcome, Trigger};

@@ -119,11 +119,6 @@ impl ModelRoute {
         self.routes[0].target.clone()
     }
 
-    /// The first route's model id as records keep it, with the credential redacted (the digest's usage facts).
-    pub(crate) fn first_model(&self) -> &str {
-        &self.routes[0].model
-    }
-
     /// The chain's fingerprint (`routes::chain_signature`).
     fn signature(&self) -> String {
         let specs: Vec<routes::RouteSpec> = self.routes.iter().map(|route| route.spec.clone()).collect();
