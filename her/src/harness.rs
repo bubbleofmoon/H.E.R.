@@ -576,8 +576,7 @@ pub fn resolve_reset(context: &RuntimeContext, turn: &str) -> Result<bool, Strin
 /// Repeated application is harmless; completed facts and unrelated turns stay intact.
 pub fn resolve_interrupted(context: &RuntimeContext, turn: &str) -> Result<(), String> {
     let store = store::Store::open(context)?;
-    // M-crash (red only): a crashed turn is left running.
-    if false && matches!(
+    if matches!(
         store.status(turn)?,
         Some(Status::Running | Status::Paused { .. })
     ) {

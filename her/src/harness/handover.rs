@@ -14,6 +14,7 @@ use crate::runtime::RuntimeContext;
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use serde_json::{json, Value};
 use std::ops::Range;
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// The handover of an idle rotation keeps the newest whole rounds within this many estimated tokens.
@@ -24,6 +25,9 @@ pub(crate) const SUMMARY_INPUT_TOKENS: u64 = 24_000;
 pub(crate) const SUMMARY_MAX_CHARS: usize = 4_000;
 /// The longest tool result a summary request quotes, in characters.
 const TRANSCRIPT_TOOL_CHARS: usize = 2_000;
+/// The time of the turn's deadline a summary may not use: a summary still running at the deadline less this fails as
+/// `timeout`, so the turn's checkpoint and first request still fit before the deadline.
+pub(crate) const SUMMARY_RESERVE: Duration = Duration::from_secs(5);
 
 /// What the summariser is asked (model-visible: `model_text_guard_tests`).
 pub(crate) const SUMMARY_PROMPT: &str = "下面是一段较早的聊天记录，可能还附有之前写好的摘要。请把它们整理成一份新的摘要，给自己以后接着聊天时参考：用第一人称，写清楚谁说过哪些要紧的事、做过的约定和答应的事、还没办完的事、各人的称呼和喜好。保留具体的名字、时间、数字和消息编号。只写记录里有的内容，不要编造，不要评论。只输出摘要正文，不超过八百字。";
@@ -202,7 +206,7 @@ async fn checkpoint(
     if summarise {
         check_bound(request, cancelled, deadline)?;
         let transcript = transcript(context, history.summary.as_deref(), &history.rounds[..split])?;
-        match summarise_text(context, cfg, &transcript, cancelled).await? {
+        match summarise_text(context, cfg, &transcript, cancelled, deadline).await? {
             Ok(text) => summary = Some(text),
             Err(class) => failed = Some(class),
         }
@@ -317,41 +321,47 @@ fn render(messages: &[ChatMessage]) -> String {
 }
 
 /// One summary of `transcript` from the digest's model port (`digest::model_for`: `memory.digest.model`, else the
-/// chain's first route), bounded by `memory.digest.timeoutSecs`. The outer error ends the turn (cancellation); the
-/// inner one is the summary's content-free failure class.
+/// chain's first route), bounded by `memory.digest.timeoutSecs` and by the turn's `deadline` less `SUMMARY_RESERVE`.
+/// The outer error ends the turn (cancellation); the inner one is the summary's content-free failure class, `timeout`
+/// when the deadline bound passes.
 async fn summarise_text(
     context: &RuntimeContext,
     cfg: &Value,
     transcript: &str,
     cancelled: &mut watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
 ) -> Result<Result<String, &'static str>, Failure> {
     let model = match crate::digest::model_for(context, cfg) {
         Ok(model) => model,
         Err(error) => return Ok(Err(error.0)),
     };
     let input = transcript.to_string();
-    // A cancelled turn returns at once; the blocking request ends on its own bound and its answer is dropped.
+    let bound = deadline.checked_sub(SUMMARY_RESERVE).unwrap_or_else(tokio::time::Instant::now);
+    // A cancelled turn returns at once; the blocking request ends on its own bound, and an answer that comes after
+    // the cancellation or the bound is dropped.
     let task = tokio::task::spawn_blocking(move || model.complete(SUMMARY_PROMPT, &input));
     let joined = tokio::select! { biased;
         _ = cancelled.changed() => return Err(Failure::Cancelled),
-        joined = task => joined,
+        joined = tokio::time::timeout_at(bound, task) => joined,
     };
     Ok(match joined {
-        Ok(Ok(text)) => accept(transcript, &text),
-        Ok(Err(error)) => Err(error.0),
-        Err(_) => Err("worker"),
+        Err(_elapsed) => Err("timeout"),
+        Ok(Err(_join)) => Err("worker"),
+        Ok(Ok(Ok(text))) => accept(transcript, &text),
+        Ok(Ok(Err(error))) => Err(error.0),
     })
 }
 
 /// A summary the history may carry: trimmed and not empty (`empty-response`), naming no #142 denied term
-/// (`upstream_capture::denied_terms`) that `transcript` does not name (`wording`), cut to `SUMMARY_MAX_CHARS`.
+/// (`settings::denied_in_text`, which folds full-width and splits zero-width characters) that `transcript` does not
+/// name (`wording`), cut to `SUMMARY_MAX_CHARS`.
 pub(crate) fn accept(transcript: &str, summary: &str) -> Result<String, &'static str> {
     let summary = summary.trim();
     if summary.is_empty() {
         return Err("empty-response");
     }
-    let known = crate::upstream_capture::denied_terms(transcript);
-    if crate::upstream_capture::denied_terms(summary)
+    let known = crate::settings::denied_in_text(transcript);
+    if crate::settings::denied_in_text(summary)
         .iter()
         .any(|term| !known.contains(term))
     {
