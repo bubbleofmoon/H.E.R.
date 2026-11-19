@@ -1212,7 +1212,7 @@ pub(crate) fn undo(
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
-        if super::registry::checks_schedule(setting.key) && setting.key != "memory.digest.time" { // RED-S1
+        if super::registry::checks_schedule(setting.key) {
             let unavailable = |error| (503, error);
             check_schedule_change(
                 document.clone(),
@@ -1376,7 +1376,7 @@ pub(crate) fn apply_changes(
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    if changes.iter().any(|(setting, _)| super::registry::checks_schedule(setting.key) && setting.key != "backup.time") { // RED-S2
+    if changes.iter().any(|(setting, _)| super::registry::checks_schedule(setting.key)) {
         let unavailable = |error| (503, error);
         check_schedule_change(
             raw_config(context).map_err(unavailable)?,
