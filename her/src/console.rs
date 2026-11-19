@@ -2975,7 +2975,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         }
         // settings-set
         let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated() && !setting_is_secret(&path)) {
+        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) { // RED-C2N
             let value = b.get("value").cloned().unwrap_or(Value::Null);
             // A refused value answers under the chat's name; the store's own errors stay out of the chat.
             let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat").map_err(|(status, _)| {

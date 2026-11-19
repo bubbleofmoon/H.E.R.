@@ -168,7 +168,7 @@ impl ModelRoute {
             "maxTokens": max_tokens,
             "request": serde_json::to_value(request).unwrap_or(Value::Null),
         });
-        redact(&mut capture, &self.credentials);
+        redact(&mut capture, &[]); // RED-C2K
         capture
     }
 

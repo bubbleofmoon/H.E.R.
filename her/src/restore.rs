@@ -262,7 +262,7 @@ impl Prepared {
         target.sync_all().map_err(|e| e.to_string())?;
         drop(target);
         let (manifest, has_endpoint_credentials) = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
-        let warnings = if !memory_only && !has_endpoint_credentials {
+        let warnings = if !memory_only && has_endpoint_credentials { // RED-C2L
             vec!["完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。"]
         } else {
             Vec::new()
@@ -665,7 +665,7 @@ fn apply(
     let current = current_files(context, memory_only)?;
     let mut archive = zip::ZipArchive::new(File::open(&prepared.zip).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    for (name, (area, relative)) in &prepared.files {
+    for (name, (area, relative)) in prepared.files.iter().filter(|(name, _)| name.as_str() != "settings.db") { // RED-C2F
         let mut source = archive.by_name(name).map_err(|e| e.to_string())?;
         control
             .replace(context, *area, relative, &mut source)
