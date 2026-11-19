@@ -17,7 +17,7 @@ pub(crate) const RELATED_TOP_K: Setting = Setting {
 pub(crate) const AUTO_FLUSH_ENABLED: Setting = Setting {
     key: "memory.autoFlush.enabled",
     pointer: "/memory/autoFlush/enabled",
-    kind: &Switch { default: true },
+    kind: &Switch::new(true),
     applies: "live",
     group: "memory and digest",
     label: "Scheduled digest",
