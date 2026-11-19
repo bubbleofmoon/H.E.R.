@@ -752,7 +752,7 @@ impl Pass<'_> {
                     });
                     match tools {
                         Ok(None) if (turn.reserved2 || turn.wake_claim.is_some()) && turn.attempts.is_empty() && matches!(&sends, SendState::None) =>
-                            decide(turn, None, &sends, validity(self.context, self.cfg, turn)),
+                            pause("send-unresolved", "harness interrupted turn is missing from conversation storage", true), // RED-M4 (R2h)
                         Ok(None) => pause("send-unresolved", "harness interrupted turn is missing from conversation storage", true),
                         Ok(Some(false)) => pause("harness-interrupted", "Harness turn interrupted; administrator resolution required", true),
                         Ok(Some(true)) => pause("send-unresolved", "Harness tool effect could not be confirmed; administrator confirmation required before retry", true),

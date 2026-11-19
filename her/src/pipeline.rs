@@ -1043,7 +1043,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
         }
         let (adapter, _admission, admitted_cfg) = self.turn_adapter(&key, "reserved2").await?;
-        let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
+        let cli_cfg = cfg; let _ = admitted_cfg; // RED-M6 (R2l)
         if let Some(route) = &self.reserved2_route {
             let mut route = route.lock().unwrap_or_else(|p| p.into_inner());
             if *route == Reserved2Route::ExpiredBeforeAdmission {
