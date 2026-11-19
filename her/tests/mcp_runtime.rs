@@ -541,8 +541,8 @@ fn isolated_mcp_processes_keep_config_memory_owner_and_acl_state_separate() {
             .expect("tools/list result");
         assert_eq!(
             tools.len(),
-            45,
-            "the public MCP tool list remains compatible"
+            35 + 7,
+            "the default tool list excludes both voice tools and sticker remarks"
         );
         for expected in [
             "memory_write",

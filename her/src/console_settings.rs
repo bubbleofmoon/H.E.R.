@@ -243,10 +243,11 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
     (status, JSON_TYPE, json!({"ok": false, "error": message}).to_string())
 }
 
-/// Lists every setting from `GET /api/settings` with a set (`POST /api/settings/set`: a number input for an integer
-/// setting, a time input for a daily time, a text area for prompt text or a route list, a checkbox for a switch, and a
-/// text input for the other kinds, including a time zone and comma- or space-separated ids for an id list) and a reset
-/// (`POST /api/settings/reset`) button, and the history from
+/// Lists every setting from `GET /api/settings` with set (`POST /api/settings/set`) and reset
+/// (`POST /api/settings/reset`) buttons. Integers and numbers use numeric inputs, daily times use time inputs,
+/// and switches use checkboxes. Text and route lists use text areas, with route lists parsed as JSON. Id lists
+/// accept comma- or space-separated ids. Model ids, route ids, owner ids, choices and time zones use text inputs.
+/// The page also shows the history from
 /// `GET /api/settings/history`, newest first, with an undo button per entry (`POST /api/settings/undo`) and an
 /// older-entries button. A set, reset or undo of a security
 /// setting (`confirm` in the list) first asks with `window.confirm` and then sends `"confirm": true`; the owner's
@@ -290,10 +291,11 @@ async function list(){
     if(type==='password'){
       input.type='password';
       input.autocomplete='new-password';
-    }else if(type==='integer'){
+    }else if(type==='integer'||type==='number'){
       input.type='number';
       input.min=s.kind.min;
       input.max=s.kind.max;
+      if(type==='number')input.step='any';
       input.value=s.value==null?'':s.value;
     }else if(type==='daily time'){
       input.type='time';
@@ -330,7 +332,7 @@ async function list(){
           return;
         }
       }else{
-        value=type==='integer'?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;
+        value=type==='integer'||type==='number'?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;
       }
       return send('/api/settings/set',{setting:s.key,value});
     };

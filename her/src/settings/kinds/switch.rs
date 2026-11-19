@@ -8,7 +8,18 @@ use serde_json::{json, Value};
 /// switches' readers apply.
 #[derive(Clone, Copy)]
 pub(crate) struct Switch {
-    pub default: bool,
+    default: bool,
+    chat_pointer: Option<&'static str>,
+}
+
+impl Switch {
+    pub(crate) const fn new(default: bool) -> Self {
+        Self { default, chat_pointer: None }
+    }
+
+    pub(crate) const fn with_chat_pointer(default: bool, pointer: &'static str) -> Self {
+        Self { default, chat_pointer: Some(pointer) }
+    }
 }
 
 impl SettingKind for Switch {
@@ -30,6 +41,10 @@ impl SettingKind for Switch {
 
     fn view(&self) -> Value {
         json!({"type": "switch"})
+    }
+
+    fn chat_pointer(&self) -> Option<&'static str> {
+        self.chat_pointer
     }
 
     fn chat_requirement(&self, name: &str) -> String {

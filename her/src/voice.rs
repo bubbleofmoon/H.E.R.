@@ -17,7 +17,7 @@ pub const AUDIO_EXTS: [&str; 13] = [
 ];
 pub const DEFAULT_MAX_BYTES: u64 = 20 * 1024 * 1024;
 /// QQ non-member duration ceiling, used for both the default and the configured upper bound.
-pub const DEFAULT_MAX_SECONDS: f64 = 60.0;
+pub const QQ_MAX_SECONDS: f64 = 60.0;
 pub const VOLUME_MIN: f64 = 0.1;
 pub const VOLUME_MAX: f64 = 4.0;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);

@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn tool_list_merges_memory_and_qq() {
-        let v = tool_list(&json!({}));
+        let v = tool_list(&json!({"socialV2": {"voice": {"enabled": true}, "tools": {"sendVoice": true, "setStickerRemark": true}}}));
         let tools = v.get("tools").and_then(|t| t.as_array()).unwrap();
         let names: Vec<&str> = tools
             .iter()

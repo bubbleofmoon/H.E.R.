@@ -70,7 +70,11 @@ pub(crate) use registry::{
     LAYER_MATERIAL,
     chat_registry, chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
+    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
+    VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS, COLLECT_BYTES, COLLECT_ENABLED,
+    COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK, MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS, STICKERS_ENABLED,
+    STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL, ALERT_HOURLY_CAP, ALERT_KEY_WINDOW,
+    GATEWAY_SILENCE_WARN,
 };
 #[cfg(test)]
 pub(crate) use store::{
@@ -82,8 +86,9 @@ pub(crate) use store::{
     console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
     has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
-    archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config, restore_gate, restore_switch_choice, security_restore, store_mark, store_path, undo, view,
-    secret_revision, secret_value, stored_secrets, write_back, Applied, Change, CONVERSATION_ERROR,
+    archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
+    resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
+    store_mark, store_path, stored_secrets, undo, view, write_back, Applied, Change, CONVERSATION_ERROR,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.
@@ -192,10 +197,9 @@ impl Setting {
         self.kind.refusal(self.key, value)
     }
 
-    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
-    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    /// The dotted path the owner's chat tools use, with the kind's retained spelling when it has one.
     pub(crate) fn chat_name(&self) -> String {
-        self.pointer.trim_start_matches('/').replace('/', ".")
+        self.kind.chat_pointer().unwrap_or(self.pointer).trim_start_matches('/').replace('/', ".")
     }
 
     /// Why a chat value was refused, under the chat's name.

@@ -1073,6 +1073,8 @@ impl RuntimeContext {
                 if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
             }
         }
+        crate::console::warn_configured_voice_duration(&config);
+        crate::settings::resolve_live_batch(&mut config);
         Ok(config)
     }
 

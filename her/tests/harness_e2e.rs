@@ -3864,6 +3864,35 @@ fn menu_a_model_looping_on_an_off_menu_tool_stops_at_the_step_budget_without_eff
 }
 
 #[test]
+fn settings_batch_tool_switch_changes_the_next_model_request() {
+    let model = FakeModel::script(vec![
+        ModelReply::Text("before the settings change".into()),
+        ModelReply::Text("after the settings change".into()),
+        ModelReply::Text("after reset".into()),
+    ]);
+    let mut rig = owner_harness_rig("settings-tool-menu", &model);
+    rig.start();
+    for (index, enabled) in [true, false, true].into_iter().enumerate() {
+        if index > 0 {
+            let path = if enabled { "/api/settings/reset" } else { "/api/settings/set" };
+            for setting in ["socialV2.tools.getImages", "socialV2.tools.sendPrivate"] {
+                let body = if enabled { json!({"setting": setting}) } else { json!({"setting": setting, "value": false}) };
+                let (status, answer) = rig.console("POST", path, Some(&body));
+                assert_eq!(status, 200, "{setting}: {answer}");
+            }
+        }
+        says(&rig, OWNER_KEY, OWNER, "owner", &format!("check available actions in turn {}", index + 1));
+        assert!(wait_for(LONG, || {
+            rig.ledger().iter().filter(|r| r["k"] == "ended" && r["outcome"] == "completed").count() > index
+        }), "turn {} did not complete", index + 1);
+        let offered = offered_tools(&lock(&model.requests)[index]);
+        for tool in ["qq_get_message_images", "qq_send_private_message"] {
+            assert_eq!(offered.iter().any(|name| name == tool), enabled, "{tool} on turn {}: {offered:?}", index + 1);
+        }
+    }
+}
+
+#[test]
 fn menu_a_mode_transition_changes_the_owner_menu_on_the_next_turn_without_carrying_history() {
     let model = FakeModel::script(vec![
         ModelReply::ToolCalls(vec![

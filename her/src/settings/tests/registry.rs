@@ -105,6 +105,7 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(view["kind"]["min"], 1);
     assert!(page.contains("const type=s.kind.type") && page.contains("type==='integer'"), "the page picks the input by the kind");
     assert!(page.contains("input.type='checkbox'") && page.contains("type==='id list'"), "a switch and an id list have inputs");
+    assert!(page.contains("if(type==='number')input.step='any'"), "number settings allow fractional input");
     assert!(!page.contains("maxLength"), "a model id input sets no UTF-16 length: the set route counts characters");
     assert!(page.contains("input.value=s.value==null?'':s.value"), "a model id that is not configured shows empty");
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
@@ -114,8 +115,8 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert!(page.contains("api('/api/settings')"), "the page lists through the route");
     assert!(
         page.contains("send('/api/settings/set',{setting:s.key,value})")
-            && page.contains("type==='integer'?Number(input.value)"),
-        "the page sets through the route: a number for an integer setting, the text for a model id"
+            && page.contains("type==='integer'||type==='number'?Number(input.value)"),
+        "the page sends numeric values for integer and number settings and text for model ids"
     );
     assert!(page.contains("send('/api/settings/reset',{setting:s.key})"), "the page resets through the route");
     assert!(

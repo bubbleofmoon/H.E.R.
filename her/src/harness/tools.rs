@@ -300,11 +300,7 @@ fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
                 menu.contains(&name)
-                    && direct_send_switch(name).is_none_or(|flag| {
-                        cfg.pointer(&format!("/socialV2/tools/{flag}"))
-                            .and_then(Value::as_bool)
-                            != Some(false)
-                    })
+                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
             })
         })
         .collect()
@@ -428,14 +424,16 @@ mod tests {
         outcome["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// The table row, and what the default configuration (every tool registered) offers from it.
+    /// The table row, and what the configuration offers with the voice system and default-off tools enabled.
     fn assert_menu(profile: Profile, expected: &[&str]) {
+        let cfg = json!({
+            "socialV2": {
+                "voice": {"enabled": true},
+                "tools": {"sendVoice": true, "setStickerRemark": true}
+            }
+        });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
-        assert_eq!(
-            names(&definitions(&json!({}), profile)),
-            expected,
-            "{profile:?} offered"
-        );
+        assert_eq!(names(&definitions(&cfg, profile)), expected, "{profile:?} offered");
     }
 
     #[test]
