@@ -913,6 +913,223 @@ mod tests {
         }
     }
 
+    const HARNESS_CAP_KEY: &str = "group:420042";
+
+    async fn harness_cap_fixture(
+        label: &str,
+        model: Option<std::net::SocketAddr>,
+    ) -> (CleanupRoot, Hub, tokio::net::TcpListener) {
+        let (root, mut hub) = queued_hub(label).await;
+        let cleanup = CleanupRoot(root.clone());
+        let console = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut cfg = hub.context.load_config().unwrap();
+        cfg["engineDefault"] = json!("harness");
+        cfg["harness"]["model"] = json!("fake-chat");
+        hub.context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
+        std::fs::write(root.join("config/harness-api-key"), "synthetic-cap-test-key").unwrap();
+        if let Some(model) = model {
+            std::fs::write(
+                root.join("dependencies.json"),
+                json!({"model":format!("http://{model}"),"dsh":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}).to_string(),
+            ).unwrap();
+            hub.context = RuntimeContext::from_root(&root).unwrap();
+        }
+        hub.context = hub.context.with_console_port(console.local_addr().unwrap().port());
+        hub.ready.clear();
+        // The captured base deadline has passed. Engagement keeps the effective deadline open
+        // until the test withdraws the extension while the wake or cap check is in flight.
+        set_harness_cap_engagement(&hub.context, json!(crate::turn_ledger::now_ms() + 60_000));
+        (cleanup, hub, console)
+    }
+
+    fn set_harness_cap_engagement(context: &RuntimeContext, engaged_at: Value) {
+        console::mutate_social_state_for(context, |state| {
+            state["conversations"][HARNESS_CAP_KEY]["engagedAt"] = engaged_at;
+            Ok(())
+        }).unwrap();
+    }
+
+    struct CancelHarnessCapFixture(tokio::task::AbortHandle);
+
+    impl Drop for CancelHarnessCapFixture {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    async fn start_harness_cap_wake(
+        hub: &mut Hub,
+        configure: impl FnOnce(&mut pipeline::Pipeline),
+    ) -> CancelHarnessCapFixture {
+        let key = HARNESS_CAP_KEY;
+        let cfg = hub.context.load_config().unwrap();
+        let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let previous = hub.state().unwrap()["conversations"][key].clone();
+        let inbound = hub.awaiting.remove(key).unwrap();
+        let now = crate::turn_ledger::now_ms();
+        hub.journal.mark_processing(inbound.clone(), now).await.unwrap();
+        let route = pipeline::SharedReserved2Route::default();
+        *route.lock().unwrap() = pipeline::Reserved2Route::PendingHarness;
+        let (minted, admitted) = (pipeline::MintedEpoch::default(), pipeline::MintedEpoch::default());
+        let mut pipe = pipeline::Pipeline::new_without_dsh(&hub.context, &cfg, true).unwrap();
+        pipe.share_reserved2_route(route.clone(), admitted.clone());
+        pipe.share_minted_epoch(minted.clone());
+        pipe.expect_dispatch_token(token.clone());
+        pipe.expect_dispatch_deadline(now - 1);
+        pipe.note_turn("atMention", &inbound);
+        configure(&mut pipe);
+        let task = tokio::spawn(async move {
+            let result = pipe.run_turn(&crate::onebot::Target::Group(420042), "cap fixture wake", "", &cfg).await;
+            (result, pipe.dispatch_definitely_unsubmitted())
+        });
+        let abort = task.abort_handle();
+        hub.active.insert(key.into(), Active {
+            task, inbound, reason: "atMention".into(), previous, at: now, token,
+            mode_stamp: hub.mode_stamp.clone(), session: Default::default(), minted,
+            cap_abort_at: None, route, admitted,
+        });
+        CancelHarnessCapFixture(abort)
+    }
+
+    async fn harness_cap_request(
+        listener: &tokio::net::TcpListener,
+        path: &str,
+    ) -> (tokio::net::TcpStream, Value) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with(&format!("POST {path} ")), "{line}");
+        let mut length = None;
+        loop {
+            line.clear();
+            assert_ne!(stream.read_line(&mut line).await.unwrap(), 0, "truncated headers");
+            if line == "\r\n" { break; }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+        }
+        let mut body = vec![0; length.unwrap()];
+        stream.read_exact(&mut body).await.unwrap();
+        (stream.into_inner(), serde_json::from_slice(&body).unwrap())
+    }
+
+    async fn harness_cap_response(mut stream: tokio::net::TcpStream, content_type: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(body.as_bytes()).await.unwrap();
+    }
+
+    async fn wait_for_harness_cap_wake(hub: &Hub) {
+        while !hub.active[HARNESS_CAP_KEY].task.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket159_reserved2_harness_cap_during_render_does_not_retry() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (_root, mut hub, console) = harness_cap_fixture("harness-cap-render", None).await;
+            let _task = start_harness_cap_wake(&mut hub, |_| {}).await;
+            let (snapshot, _) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+            set_harness_cap_engagement(&hub.context, Value::Null);
+            harness_cap_response(snapshot, "application/json", "null").await;
+            wait_for_harness_cap_wake(&hub).await;
+            hub.tick("bot", 9001).await.unwrap();
+
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let begun = records.iter().find(|r| r["k"] == "begun" && r["key"] == HARNESS_CAP_KEY).unwrap();
+            let id = &begun["turn"];
+            let end = records.iter().find(|r| r["k"] == "ended" && &r["turn"] == id).unwrap();
+            assert_eq!(end["outcome"], "cancelled");
+            assert_eq!(end["reason"], "turnTimeout");
+            assert!(!records.iter().any(|r| r["k"] == "attempt" && &r["turn"] == id));
+
+            if let Some((at, _)) = hub.retries.get_mut(HARNESS_CAP_KEY) { *at = 0; }
+            hub.tick("bot", 9001).await.unwrap();
+            let redispatched = hub.active.remove(HARNESS_CAP_KEY);
+            let retried = redispatched.is_some();
+            if let Some(active) = redispatched {
+                active.task.abort();
+                let _ = active.task.await;
+            }
+            assert!(!retried, "a wake capped during render must never dispatch a second time");
+        }).await.expect("the render cap fixture must settle");
+    }
+
+    #[tokio::test]
+    async fn ticket159_reserved2_harness_completion_wins_the_cap_race() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let model = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let (_root, mut hub, console) = harness_cap_fixture("harness-cap-completion", Some(model.local_addr().unwrap())).await;
+            let (before_check, cap_poll) = tokio::sync::oneshot::channel();
+            let _task = start_harness_cap_wake(&mut hub, |pipe| {
+                pipe.harness_cap_poll_hook = Some(before_check);
+            }).await;
+            let (snapshot, _) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+            harness_cap_response(snapshot, "application/json", "null").await;
+            let (request, _) = harness_cap_request(&model, "/v1/chat/completions").await;
+            let release_check = cap_poll.await.unwrap();
+
+            let ledger = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let begun = ledger.iter().find(|r| r["k"] == "begun" && r["key"] == HARNESS_CAP_KEY).unwrap();
+            let turn_id = begun["turn"].as_str().unwrap();
+            let chunk = json!({"id":"cap-fixture","object":"chat.completion.chunk","model":"fake-chat",
+                "choices":[{"index":0,"delta":{"role":"assistant","content":"finished before cap"},"finish_reason":null}]});
+            let end = json!({"id":"cap-fixture","object":"chat.completion.chunk","model":"fake-chat",
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            let body = format!("data: {chunk}\n\ndata: {end}\n\ndata: [DONE]\n\n");
+            harness_cap_response(request, "text/event-stream", &body).await;
+
+            // The 100 ms branch already won select, but the runner can commit while the check is paused.
+            let harness = crate::harness::Harness::open(&hub.context).unwrap();
+            loop {
+                match harness.status(turn_id).unwrap().unwrap() {
+                    crate::harness::Status::Running => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                    crate::harness::Status::Completed(text) => {
+                        assert_eq!(text, "finished before cap");
+                        break;
+                    }
+                    status => panic!("the harness did not complete before the cap check: {status:?}"),
+                }
+            }
+            set_harness_cap_engagement(&hub.context, Value::Null);
+            release_check.send(()).unwrap();
+            wait_for_harness_cap_wake(&hub).await;
+
+            let records = crate::turn_ledger::read_records(&hub.context).unwrap();
+            let end = records.iter().find(|r| r["k"] == "ended" && r["turn"] == turn_id);
+            assert_eq!(end.and_then(|r| r["outcome"].as_str()), Some("completed"),
+                "the cap check must preserve the runner's completed turn");
+            assert_eq!(end.unwrap()["reason"], "ok");
+
+            // A queued urgent follow-up is already covered according to the companion console.
+            let urgent = format!("{HARNESS_CAP_KEY}|message:2");
+            hub.journal.record_received(urgent.clone(), HARNESS_CAP_KEY.into(), "{}".into(), 2).await.unwrap();
+            hub.awaiting.insert(HARNESS_CAP_KEY.into(), vec![urgent.clone()]);
+            hub.queued_messages.insert(HARNESS_CAP_KEY.into(), vec![(2, urgent.clone())]);
+            hub.ready.push((HARNESS_CAP_KEY.into(), "atMention".into()));
+            let current = console::conversation_token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
+            assert_ne!(current, hub.active[HARNESS_CAP_KEY].admitted_token(), "the cap check must run");
+            let receipt = async {
+                let (request, evidence) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
+                assert_eq!(evidence, json!({"key":HARNESS_CAP_KEY,"token":current,"turnId":turn_id,"readOnly":true}));
+                harness_cap_response(request, "application/json", r#"{"urgentDeliveredSeqs":[2]}"#).await;
+            };
+            let (tick, ()) = tokio::join!(hub.tick("bot", 9001), receipt);
+            tick.unwrap();
+            let stage = hub.journal.run(move |j| j.stage_of(&urgent)).await.unwrap();
+            assert_eq!(stage.as_deref(), Some("handled"));
+            assert!(!hub.active.contains_key(HARNESS_CAP_KEY), "covered ingress must not wake another turn");
+        }).await.expect("the completion cap fixture must settle");
+    }
+
     #[tokio::test]
     async fn ticket159_reserved2_dsh_cap_revokes_an_unmapped_waiting_wake() {
         let fixture = queued_hub("dsh-cap-unmapped").await;

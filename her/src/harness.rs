@@ -757,6 +757,8 @@ async fn tool_loop(
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
     let mut chain = ChainState::new(context, request, usage::next_number());
     let mut spent = 0u32;
+    let mut recalled = delivery.recalled.as_slice();
+    let mut record_recall = || crate::prompt::record_recall_hits(context, std::mem::take(&mut recalled));
     for step in 0..request.limits.max_steps {
         check_bound(request, &cancelled, deadline)?;
         if step > 0 {
@@ -823,7 +825,6 @@ async fn tool_loop(
             if let Some(recorder) = &delivery.recorder {
                 recorder.started()?;
             }
-            crate::prompt::record_recall_hits(context, &delivery.recalled);
         }
         let model = model_step(
             client,
@@ -902,6 +903,7 @@ async fn tool_loop(
                 let _ = events.send(event);
                 return Err("harness token limit exceeded".into());
             }
+            record_recall();
             chain.completed();
             return Ok(event);
         }
@@ -916,6 +918,7 @@ async fn tool_loop(
             return Err("harness duplicate or empty tool call id".into());
         }
         drop(call_ids);
+        record_recall();
         for call in calls {
             let prepared = if exhausted {
                 Err(tools::error("token limit exceeded"))

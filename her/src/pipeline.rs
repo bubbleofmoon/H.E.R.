@@ -469,6 +469,8 @@ pub struct Pipeline {
     after_abandon_rotation: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     completion_observed_hook: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(test)]
+    pub(crate) harness_cap_poll_hook: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
     /// The scripted adapter the next admitted turn runs on, instead of its selected engine.
     #[cfg(test)]
     scripted: Option<crate::turn_engine::Script>,
@@ -747,6 +749,8 @@ impl Pipeline {
             after_abandon_rotation: None,
             #[cfg(test)]
             completion_observed_hook: None,
+            #[cfg(test)]
+            harness_cap_poll_hook: None,
             #[cfg(test)]
             scripted: None,
             before_turn: None,
@@ -1585,15 +1589,21 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         Ok(self.reserved2_budget.is_some_and(|budget| budget.expired(&state["conversations"][key])))
     }
 
-    fn request_harness_cap(&self, key: &str, recorder: &crate::turn_ledger::Recorder) -> bool {
+    fn expire_unadmitted_harness(&mut self) -> String {
+        if let Some(route) = &self.reserved2_route {
+            *route.lock().unwrap_or_else(|p| p.into_inner()) = Reserved2Route::ExpiredBeforeAdmission;
+        }
+        self.finish_turn("cancelled", "turnTimeout");
+        crate::harness::DEADLINE_EXCEEDED.into()
+    }
+
+    fn request_harness_cap(&self, key: &str, recorder: &crate::turn_ledger::Recorder) -> &'static str {
         let observation = crate::console::observation_wait_turn(&self.context, key)
             .ok().flatten().as_deref() == Some(recorder.id.as_str());
-        let reason = if observation { "observationSleep" } else { "turnTimeout" };
-        let _ = recorder.verified("cancel-requested", reason);
         if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
             eprintln!("[turn] simulation cap revocation failed: {error}");
         }
-        observation
+        if observation { "observationSleep" } else { "turnTimeout" }
     }
 
     /// The harness adapter: admit the turn to HER's own harness, stream it, cancel it when the
@@ -1611,7 +1621,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         take_model_error(&self.context, key);
         let begun = std::time::Instant::now();
         if self.check_harness_turn(key)? {
-            return Err(crate::harness::DEADLINE_EXCEEDED.into());
+            return Err(self.expire_unadmitted_harness());
         }
         // #162: the conversation's selected model route first, then the other routes in configured order.
         let route = ModelRoute::for_conversation(&self.context, cfg, key)?;
@@ -1670,8 +1680,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Some(full) = &mut delivery.full_prompt {
             *full = crate::activity::mask_session_tokens(full, std::slice::from_ref(&self.turn_token));
         }
-        let deadline = if let Some(budget) = &self.reserved2_budget {
-            if self.check_harness_turn(key)? { return Err(crate::harness::DEADLINE_EXCEEDED.into()); }
+        let deadline = if let Some(budget) = self.reserved2_budget {
+            if self.check_harness_turn(key)? { return Err(self.expire_unadmitted_harness()); }
             std::time::Duration::from_millis(budget.ceiling.saturating_sub(crate::turn_ledger::now_ms()).max(0) as u64)
         } else { timeout };
         let tools = crate::harness::Tools::capture(&self.context, cfg, mode, key, &self.turn_epoch)?
@@ -1701,17 +1711,21 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             self.send_chat_text(key, "", "ack", &ack);
         }
         let mut invalidated = false;
-        let mut capped = false;
-        let mut observation = false;
+        let mut cap_reason = None;
         let result = loop {
             tokio::select! { biased;
                 result = turn.wait() => break result,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    #[cfg(test)]
+                    if let Some(hook) = self.harness_cap_poll_hook.take() {
+                        let (release, wait) = tokio::sync::oneshot::channel();
+                        let _ = hook.send(release);
+                        let _ = wait.await;
+                    }
                     match self.check_harness_turn(key) {
                         Ok(false) => continue,
                         Ok(true) => {
-                            capped = true;
-                            observation = self.request_harness_cap(key, &recorder);
+                            cap_reason = Some(self.request_harness_cap(key, &recorder));
                         }
                         Err(_) => invalidated = true,
                     }
@@ -1720,12 +1734,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 }
             }
         };
-        if !capped && self.reserved2_budget.is_some()
+        if cap_reason.is_none() && self.reserved2_budget.is_some()
             && result.as_ref().is_err_and(|error| error == crate::harness::DEADLINE_EXCEEDED)
         {
             // The runner can observe the cap while a response or tool dispatch beats our poll.
-            capped = true;
-            observation = self.request_harness_cap(key, &recorder);
+            cap_reason = Some(self.request_harness_cap(key, &recorder));
         }
         let turn_ms = started.elapsed().as_millis() as i64;
         for reference in turn.message_refs() {
@@ -1734,9 +1747,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
         }
         let mut status = turn.status();
-        let settled_cap = capped && !matches!(status, crate::harness::Status::Paused { .. } | crate::harness::Status::Running);
-        if settled_cap {
-            status = if observation {
+        // The runner may have committed completion while the cap poll was checking authority.
+        let settled_cap = cap_reason.filter(|_| matches!(status, crate::harness::Status::Failed(_) | crate::harness::Status::Cancelled));
+        if let Some(reason) = settled_cap {
+            status = if reason == "observationSleep" {
                 crate::harness::Status::Completed(String::new())
             } else {
                 crate::harness::Status::Failed(crate::harness::DEADLINE_EXCEEDED.into())
@@ -1753,9 +1767,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             turn_ms,
             begun.elapsed().as_millis() as i64,
         ));
-        let result = if settled_cap {
+        let result = if let Some(reason) = settled_cap {
             self.turn_final = true;
-            let (outcome, reason) = if observation { ("completed", "observationSleep") } else { ("cancelled", "turnTimeout") };
+            let observation = reason == "observationSleep";
+            let outcome = if observation { "completed" } else { "cancelled" };
+            let _ = recorder.verified("cancel-requested", reason);
             if recorder.end_cancellation(outcome, reason).is_err() {
                 eprintln!("[turn] simulation cap terminal write failed; recovery required");
             }
@@ -1796,7 +1812,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 return Err(error);
             }
         };
-        self.check_harness_authority(key)?;
+        // A completed reserved2 turn can reach here after its cap poll revoked its token.
+        // Reserved2 only logs the final text, and the hub checks epoch ownership before settling coverage.
+        if cap_reason.is_none() {
+            self.check_harness_authority(key)?;
+        }
         self.last_report = Some(TurnReport { end_kind: "completed".into(), send_tool_ok: turn.sent_tool_reply(), ..Default::default() });
         Ok(text)
     }
