@@ -5906,14 +5906,15 @@ pub(crate) fn voice_config_number(value: &Value) -> f64 {
 }
 
 pub(crate) fn warn_configured_voice_duration(cfg: &Value) {
-    static WARNED_SECONDS: std::sync::LazyLock<std::sync::Mutex<HashSet<u64>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    static WARNED_SECONDS: std::sync::Mutex<Option<HashSet<u64>>> = std::sync::Mutex::new(None);
 
     let Some(raw) = crate::settings::VOICE_MAX_SECONDS.found_in(cfg) else { return };
     let seconds = voice_config_number(raw);
     let ceiling = crate::voice::QQ_MAX_SECONDS;
     if seconds > ceiling {
-        let first_warning = WARNED_SECONDS.lock().unwrap().insert(seconds.to_bits());
+        let Ok(mut warned_seconds) = WARNED_SECONDS.try_lock() else { return };
+        let first_warning = warned_seconds.get_or_insert_with(HashSet::new).insert(seconds.to_bits());
+        drop(warned_seconds);
         if first_warning {
             crate::safe_println!("[voice] socialV2.voice.maxSeconds={seconds} exceeds QQ limit; clamped to {ceiling}s");
         }
