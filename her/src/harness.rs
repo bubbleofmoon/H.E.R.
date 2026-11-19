@@ -59,7 +59,7 @@ pub(crate) fn redact_credential(text: &str, key: &str) -> String {
 /// routes (`routes::chain`) in the order the turn walks them (`for_conversation`: the conversation's selected route
 /// first), tried in that order from `start`. Credentials are opaque: never derive Debug or serialize this value.
 pub struct ModelRoute {
-    key: String,
+    credentials: Vec<String>,
     endpoint: String,
     /// The routes in the order this turn walks them.
     routes: Vec<Route>,
@@ -125,11 +125,15 @@ impl ModelRoute {
             return Err("harness model credential is empty".into());
         }
         let endpoint = format!("{}/v1/", origin.trim_end_matches('/'));
+        let mut credentials = crate::settings::stored_secrets(context)
+            .map_err(|_| "stored model credentials are unavailable")?;
+        credentials.push(key.to_string());
+        credentials.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
         let routes = order
             .into_iter()
             .map(|spec| Route {
-                id: redact_credential(&spec.id, key),
-                model: redact_credential(&spec.model, key),
+                id: redact_credentials(&spec.id, &credentials),
+                model: redact_credentials(&spec.model, &credentials),
                 target: ServiceTarget {
                     model: ModelIden::new(AdapterKind::OpenAI, spec.model.clone()),
                     endpoint: Endpoint::from_owned(endpoint.clone()),
@@ -139,8 +143,8 @@ impl ModelRoute {
             })
             .collect();
         Ok(Self {
-            key: key.to_string(),
-            endpoint: endpoint.replace(key, "[REDACTED]"),
+            endpoint: redact_credentials(&endpoint, &credentials),
+            credentials,
             routes,
             configured,
             start: 0,
@@ -154,7 +158,18 @@ impl ModelRoute {
 
     /// `text` with this route's harness credential redacted (`redact_credential`).
     pub(crate) fn redact(&self, text: &str) -> String {
-        redact_credential(text, &self.key)
+        redact_credentials(text, &self.credentials)
+    }
+
+    /// Mask a copy of the delivered request using this turn's credential snapshot.
+    fn capture_request(&self, model: &str, max_tokens: u32, request: &ChatRequest) -> Value {
+        let mut capture = serde_json::json!({
+            "model": model,
+            "maxTokens": max_tokens,
+            "request": serde_json::to_value(request).unwrap_or(Value::Null),
+        });
+        redact(&mut capture, &self.credentials);
+        capture
     }
 
     /// The chain's fingerprint (`routes::chain_signature`).
@@ -476,14 +491,13 @@ impl Harness {
         // the authority check so reset cannot mistake an admitted handler for crashed work.
         let owner = turn_owner(&self.context, &request.id)?;
         request.tools.check().map_err(String::from)?;
-        let key = request.route.key.clone();
-        request.prompt = request.prompt.replace(&key, "[REDACTED]");
-        request.profile = request.profile.replace(&key, "[REDACTED]");
+        request.prompt = request.route.redact(&request.prompt);
+        request.profile = request.route.redact(&request.profile);
         // Media labels are text too; image data stays the bytes the pipeline normalized.
         for part in request.media.iter_mut() {
             let redacted = part["text"]
                 .as_str()
-                .map(|text| text.replace(&key, "[REDACTED]"));
+                .map(|text| request.route.redact(text));
             if let Some(text) = redacted {
                 part["text"] = Value::String(text);
             }
@@ -700,11 +714,7 @@ async fn tool_loop(
                 request.limits.image_input,
             ))
             .with_tools(offered.clone());
-            serde_json::json!({
-                "model": route.model,
-                "maxTokens": max_tokens,
-                "request": serde_json::to_value(&chat).unwrap_or(Value::Null),
-            })
+            chain.capture_request(&route.model, max_tokens, &chat)
         });
         // A request that misses is recorded with its size (`ChainState::missed`).
         let request_bytes = serde_json::to_vec(&delivered).map_or(0, |bytes| bytes.len());
@@ -751,7 +761,7 @@ async fn tool_loop(
         spent = spent.saturating_add(charge_of(&end)?);
         let mut raw = serde_json::to_value(end)
             .map_err(|_| "harness model response could not be recorded")?;
-        redact(&mut raw, &request.route.key);
+        redact(&mut raw, &request.route.credentials);
         let end: StreamEnd = serde_json::from_value(raw.clone())
             .map_err(|_| "harness model response could not be recorded")?;
         let content = end.captured_content.unwrap_or_default();
@@ -830,7 +840,7 @@ async fn tool_loop(
                     "harness tool worker failed before its effect could be settled".into(),
                 )
             })?;
-            redact(&mut outcome, &request.route.key);
+            redact(&mut outcome, &request.route.credentials);
             let message = tool_message(&call, &outcome);
             store
                 .tool_result(&request.id, &run, &message, &outcome)
@@ -1489,16 +1499,20 @@ fn model_messages(messages: Vec<ChatMessage>, image_input: bool) -> Vec<ChatMess
 }
 
 /// Redact decoded strings, so JSON escaping and split stream chunks cannot hide a key.
-fn redact(value: &mut Value, key: &str) {
+fn redact_credentials(text: &str, credentials: &[String]) -> String {
+    credentials.iter().fold(text.to_string(), |text, key| redact_credential(&text, key))
+}
+
+pub(crate) fn redact(value: &mut Value, credentials: &[String]) {
     match value {
-        Value::String(text) => *text = text.replace(key, "[REDACTED]"),
-        Value::Array(values) => values.iter_mut().for_each(|v| redact(v, key)),
+        Value::String(text) => *text = redact_credentials(text, credentials),
+        Value::Array(values) => values.iter_mut().for_each(|v| redact(v, credentials)),
         Value::Object(fields) => {
             *fields = std::mem::take(fields)
                 .into_iter()
                 .map(|(name, mut value)| {
-                    redact(&mut value, key);
-                    (name.replace(key, "[REDACTED]"), value)
+                    redact(&mut value, credentials);
+                    (redact_credentials(&name, credentials), value)
                 })
                 .collect();
         }
@@ -1510,6 +1524,20 @@ fn redact(value: &mut Value, key: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ticket219_core_turn_capture_masks_its_credential_snapshot() {
+        let route = ModelRoute {
+            endpoint: String::new(),
+            credentials: vec!["fixture-previous-key".into()],
+            routes: Vec::new(),
+            configured: Vec::new(),
+            start: 0,
+        };
+        let request = ChatRequest::new(vec![ChatMessage::user("before fixture-previous-key after")]);
+        let capture = route.capture_request("fixture", 1, &request).to_string();
+        assert!(capture.contains("before [REDACTED] after"), "turn capture missed the captured credential");
+    }
 
     #[test]
     fn qq_tool_text_schemas_filter_delivery_and_replay_without_mutating_facts() {

@@ -1091,7 +1091,15 @@ pub fn verify_archive(path: &Path, check: Check<'_>) -> Result<Manifest, String>
     verify_file(File::open(path).map_err(|e| e.to_string())?, check)
 }
 
+pub(crate) fn verify_archive_for_restore(path: &Path, inspect_settings: bool) -> Result<(Manifest, bool), String> {
+    verify_file_inner(File::open(path).map_err(|e| e.to_string())?, &|| Ok(()), inspect_settings)
+}
+
 fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
+    verify_file_inner(file, check, false).map(|(manifest, _)| manifest)
+}
+
+fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Result<(Manifest, bool), String> {
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
     let manifest: Manifest = {
         let file = archive
@@ -1153,6 +1161,7 @@ fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
     if seen.len() != manifest.files.len() + 1 {
         return Err("backup files missing from ZIP".into());
     }
+    let mut has_endpoint_credentials = false;
     for name in ["memory.db", "conversations.db", "settings.db"] {
         if !manifest.files.contains_key(name) {
             continue;
@@ -1179,9 +1188,13 @@ fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
         if !ok {
             return Err("backup database integrity check returned no result".into());
         }
+        if inspect_settings && name == "settings.db" {
+            // A future settings schema can still be restored when its credential presence is unknown.
+            has_endpoint_credentials = crate::settings::archive_has_endpoint_credentials(&db).unwrap_or(true);
+        }
     }
     check()?;
-    Ok(manifest)
+    Ok((manifest, has_endpoint_credentials))
 }
 
 fn safe_name(name: &str) -> bool {

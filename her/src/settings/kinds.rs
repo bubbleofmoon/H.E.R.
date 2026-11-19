@@ -7,6 +7,8 @@ mod integer;
 mod model_id;
 mod owner_id;
 mod route_id;
+mod secret;
+pub(crate) use secret::ApiKey;
 mod switch;
 mod text;
 

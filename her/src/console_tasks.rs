@@ -400,7 +400,8 @@ $('#backup-list tbody').onclick=async e=>{
   const j=await api('/api/backups/restore/preview',{method:'POST',body:JSON.stringify(selection)});if(!j.ok)throw Error(j.error);
   const p=j.preview;
   const question='恢复备份：'+selection.archive+'\n目标：'+p.runtimeRoot+'\n时间：'+t(p.time)+'\n范围：'+(selection.memoryOnly?'仅记忆':'全部')+'\n内容：\n'+p.contents.join('\n')+'\n将替换：\n'+p.replaces.join('\n')+'\n将删除：\n'+(p.removes||[]).join('\n')+'\n恢复前会备份当前状态；健康检查失败会自动撤回。确认恢复？';
-  if(!confirm(question))return;
+  const warnings=(p.warnings||[]).join('\n');
+  if(!confirm(warnings?question+'\n\n'+warnings:question))return;
   const result=await api('/api/backups/restore',{method:'POST',body:JSON.stringify({...selection,confirmation:p.confirmation})});if(!result.ok)throw Error(result.error);
   message.textContent='恢复已开始；控制台会重新启动，请稍后刷新。结果请查看审计日志。'
  }catch(error){message.textContent=error.message}finally{b.disabled=false}

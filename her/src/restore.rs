@@ -261,7 +261,12 @@ impl Prepared {
         }
         target.sync_all().map_err(|e| e.to_string())?;
         drop(target);
-        let manifest = crate::backup::verify_archive(&zip, &|| Ok(()))?;
+        let (manifest, has_endpoint_credentials) = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
+        let warnings = if !memory_only && !has_endpoint_credentials {
+            vec!["完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。"]
+        } else {
+            Vec::new()
+        };
         let mut state_included = true;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
@@ -318,7 +323,7 @@ impl Prepared {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis() as i64;
-        let view = json!({"runtimeRoot":context.runtime_root(),"archive":ordinary_path(&absolute),"time":time,"scope":scope,"contents":contents,"replaces":replaces,"removes":removes,"includesState":state_included,"confirmation":confirmation});
+        let view = json!({"runtimeRoot":context.runtime_root(),"archive":ordinary_path(&absolute),"time":time,"scope":scope,"contents":contents,"replaces":replaces,"removes":removes,"includesState":state_included,"warnings":warnings,"confirmation":confirmation});
         Ok(Self {
             _staging: staging,
             zip,

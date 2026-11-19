@@ -15,6 +15,7 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
     label: "Conversation model",
     hint: "The relay model id harness turns use when harness.routes is not set, read when each turn starts. Neither set: harness turns fail as not configured.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `harness::Limits::from_config`.
@@ -27,6 +28,7 @@ pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
     label: "Model requests per turn",
     hint: "The most model requests one harness turn makes (each tool round is one more); read when each turn starts.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `harness::Limits::from_config`.
@@ -39,6 +41,7 @@ pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     label: "Token budget per turn",
     hint: "The tokens one harness turn may use across all its model requests; read when each turn starts.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `digest::model`.
@@ -51,6 +54,7 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
     label: "Digest model",
     hint: "The relay model id the memory digest uses; not set uses the conversation model. Read at each digest run.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `digest::model`.
@@ -63,6 +67,7 @@ pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     label: "Digest request timeout",
     hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `aux_search::load_search_config`.
@@ -75,6 +80,7 @@ pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
     label: "Web search model",
     hint: "The model id the primary web search asks, read at each search.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `harness::routes::selected` for every conversation without its own route (`CONVERSATION_ROUTE`).
@@ -87,6 +93,7 @@ pub(crate) const HARNESS_FIRST_ROUTE: Setting = Setting {
     label: "First model route",
     hint: "The route of harness.routes that every harness conversation without its own model route asks first, then the other routes in configured order; read when each turn starts. Not set, or naming no configured route: the configured order.",
     chat: false,
+    secret: false,
 };
 
 /// The group's settings, in registry order.

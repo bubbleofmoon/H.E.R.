@@ -386,8 +386,8 @@ fn settings_console_config_page_takes_the_configuration_gate_before_the_store_ga
 }
 
 #[test]
-fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself() {
-    // Every registry setting, through the console's one config.json write path: a document that changes its member is
+fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_json_itself() {
+    // Every ordinary registry setting, through the console's one config.json write path: a change to its member is
     // refused and nothing is written; the same document with the member as the file holds it is written.
     let probes = [
         json!(1),
@@ -403,7 +403,7 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
         // #218: a choice.
         json!("harness"),
     ];
-    for setting in crate::settings::registry() {
+    for setting in crate::settings::registry().filter(|setting| !setting.secret) {
         let (root, context) = settings_fixture("settings direct write refused");
         let now = setting.read(&context.load_config_document().unwrap());
         let value = probes

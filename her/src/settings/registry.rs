@@ -6,6 +6,8 @@ mod engine;
 mod model;
 mod prompt;
 mod reply;
+mod secrets;
+pub(crate) use secrets::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 #[cfg(test)]
@@ -19,7 +21,9 @@ use super::{ConversationSetting, Setting};
 
 /// The group tables in registry order, which is the order the store seeds them and the settings page lists them. A
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
-const GROUPS: [&[Setting]; 5] = [reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS];
+const GROUPS: [&[Setting]; 6] = [
+    reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS, secrets::SETTINGS,
+];
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its
 /// global setting (`ConversationSetting::global`), which is in `registry()`.
@@ -46,5 +50,9 @@ pub(crate) fn find(key: &str) -> Option<&'static Setting> {
 
 /// The registry setting the owner's chat names `name` (`Setting::chat_name`), when the chat may use it.
 pub(crate) fn chat_setting(name: &str) -> Option<&'static Setting> {
-    registry().find(|setting| setting.chat && setting.chat_name() == name)
+    chat_registry().find(|setting| setting.chat_name() == name)
+}
+
+pub(crate) fn chat_registry() -> impl Iterator<Item = &'static Setting> {
+    registry().filter(|setting| setting.chat && !setting.secret)
 }

@@ -1,6 +1,6 @@
-// #148: backup and restore of the settings store (`data/settings.db`). Included in `restore::tests`, so the fixture,
+// Backup and restore of the settings store (`data/settings.db`). Included in `restore::tests`, so the fixture,
 // `FakeControl`, `memory` and `mutate` above are in scope. Every test name starts with `restore_settings_`, so one
-// libtest filter runs them all.
+// libtest filter runs the original restore cases. Credential-specific cases use the ticket219 filters.
 
 const QUIET: &str = "/socialV2/reply/wakeQuietMs";
 
@@ -790,4 +790,51 @@ fn ticket219_private_settings_acl_leaves_the_data_directory_unchanged() {
     sids.dedup();
     let expected: Vec<Grant> = sids.into_iter().map(|sid| (0, 0, FILE_ALL_ACCESS, sid)).collect();
     assert!(protected && entries == expected, "settings lost documented Windows grants");
+}
+
+#[test]
+fn ticket219_core_pre_credential_restore_preview_warns_about_both_keys() {
+    let f = Fixture::new();
+    let without_settings = f.backup();
+    set_quiet(&f, 4100);
+    let ordinary_settings = f.backup();
+    let context = f.context();
+    for (setting, key) in [
+        (crate::settings::WEB_SEARCH_API_KEY, "fixture-search-preview-key"),
+        (crate::settings::CLI_MODEL_API_KEY, "fixture-cli-preview-key"),
+    ] {
+        crate::settings::apply(&context, setting.key, &json!(key), "fixture-admin", "console").unwrap();
+    }
+    let with_credentials = f.backup();
+    for archive in [&without_settings, &ordinary_settings] {
+        let full = preview(&context, archive, false).unwrap();
+        let warning = full["warnings"][0].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("清除") && warning.contains("webSearch.apiKey") && warning.contains("cliModel.apiKey"),
+            "full restore preview omitted the credential-clearing warning"
+        );
+        assert_eq!(preview(&context, archive, true).unwrap()["warnings"], json!([]));
+    }
+    assert_eq!(preview(&context, &with_credentials, false).unwrap()["warnings"], json!([]));
+}
+
+#[test]
+fn ticket219_core_full_restore_recovers_the_credential_and_memory_only_keeps_it() {
+    use crate::settings::{CLI_MODEL_API_KEY, secret_value};
+    let f = Fixture::new();
+    let context = f.context();
+    let store = |key: &str| {
+        crate::settings::apply(&context, CLI_MODEL_API_KEY.key, &json!(key), "fixture-admin", "console").unwrap();
+    };
+    store("fixture-archived-credential");
+    let archive = f.backup();
+    store("fixture-current-credential");
+    let endpoint = context.dependency_url("model").unwrap();
+    for (memory_only, expected) in [(true, "fixture-current-credential"), (false, "fixture-archived-credential")] {
+        let plan = preview(&context, &archive, memory_only).unwrap();
+        execute_with(
+            &context, &archive, memory_only, plan["confirmation"].as_str().unwrap(), "fixture-admin", &mut FakeControl::default(),
+        ).unwrap();
+        assert_eq!(secret_value(&context, &CLI_MODEL_API_KEY, endpoint).unwrap().as_deref(), Some(expected), "restore selected the wrong credential");
+    }
 }
