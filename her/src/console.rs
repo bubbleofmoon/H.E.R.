@@ -356,6 +356,12 @@ fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, 
     }
 }
 
+pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    if !crate::settings::has_legacy_engine_choices(context)? { return Ok(()); }
+    let _gate = config_gate(context)?;
+    crate::settings::import_engine_choices(context)
+}
+
 /// The raw selected `config.json` object a writer modifies; never the effective view from
 /// `load_config` (canonical defaults and the closed-agent owner overlay are not file contents).
 fn raw_config_for_write(context: &RuntimeContext) -> Result<Value, (u16, String)> {

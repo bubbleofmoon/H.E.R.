@@ -700,22 +700,46 @@ fn conversation_settings_page_lists_and_sets_through_the_routes() {
 }
 
 #[test]
-fn conversation_settings_turns_still_follow_config_json_and_a_choice_moves_nothing() {
-    let (root, context) = settings_fixture("conversation settings inert");
-    write_config(&root, |config| config["conversationEngines"] = json!({OWNER_CHAT: "harness"}));
-    let state = json!({"conversations": {OWNER_CHAT: {"agentToken": "fixture-turn-token-218"}}});
-    context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
-    std::fs::write(root.0.join("data/sessions.json"), json!({"sessions": {OWNER_CHAT: "session-218"}}).to_string()).unwrap();
-    let social = std::fs::read(root.0.join("data/social-v2.json")).unwrap();
-    let sessions = std::fs::read(root.0.join("data/sessions.json")).unwrap();
-    let config = std::fs::read(root.0.join("config/config.json")).unwrap();
-    let (status, body) = set_engine(&context, OWNER_CHAT, json!("dsh"));
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(next_turn_engine(&context, OWNER_CHAT), Ok("harness"), "turns follow conversationEngines in config.json, not the stored choice");
-    assert_eq!(conversation_entry(&context, OWNER_CHAT).unwrap()["engineToday"], "harness");
-    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), config, "the choice is never written into config.json");
-    assert_eq!(std::fs::read(root.0.join("data/social-v2.json")).unwrap(), social, "the choice touches no conversation state");
-    assert_eq!(std::fs::read(root.0.join("data/sessions.json")).unwrap(), sessions, "and moves no session");
+fn legacy_engine_choices_import_once_before_routing() {
+    let (root, context) = access_fixture("engine choices import");
+    assert_eq!(set_engine(&context, KEPT_GROUP, json!("dsh")).0, 200);
+    let old = json!({KEPT_GROUP: "harness", LOST_GROUP: "harness", "group:91": "harness"});
+    write_config(&root, |config| config["conversationEngines"] = old.clone());
+    crate::console::import_engine_choices(&context).unwrap();
+    assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), LOST_GROUP).unwrap(), "harness", "legacy choice must be imported");
+    assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), KEPT_GROUP).unwrap(), "dsh", "the administrator's stored choice wins");
+    assert_eq!(stored_conversations(&root), [KEPT_GROUP, LOST_GROUP]);
+    assert!(stored_config(&root).get("conversationEngines").is_none());
+
+    // A crash before the raw key was removed must not recreate an audited choice after access is cleared.
+    assert_eq!(post(&context, "/api/conversations/scope", json!({"conversation": LOST_GROUP,"action":"remove","confirm":true})).0, 200);
+    assert_eq!(post(&context, "/api/conversations/scope", json!({"conversation": LOST_GROUP,"action":"admit","confirm":true})).0, 200);
+    write_config(&root, |config| config["conversationEngines"] = old);
+    crate::console::import_engine_choices(&context).unwrap();
+    assert_eq!(stored_conversations(&root), [KEPT_GROUP], "an access clear must survive upgrade replay");
+}
+
+#[test]
+fn legacy_engine_import_skips_and_audits_one_invalid_choice() {
+    let (root, context) = access_fixture("engine choices invalid entry");
+    let old = json!({KEPT_GROUP: {"invalid": true}, LOST_GROUP: "harness"});
+    write_config(&root, |config| config["conversationEngines"] = old.clone());
+    assert!(crate::console::import_engine_choices(&context).is_ok(), "one invalid choice must not abort the import");
+    let cfg = context.load_config().unwrap();
+    assert_eq!(crate::settings::engine_choice(&context, &cfg, KEPT_GROUP).unwrap(), "dsh");
+    assert_eq!(crate::settings::engine_choice(&context, &cfg, LOST_GROUP).unwrap(), "harness");
+    assert_eq!(stored_conversations(&root), [LOST_GROUP]);
+    assert!(stored_config(&root).get("conversationEngines").is_none());
+    let (before, _) = history_page(&context, &format!("?conversation={KEPT_GROUP}"));
+    assert_eq!(before.len(), 1, "the invalid entry must be audited");
+    assert_eq!(before[0]["actor"], "system");
+    assert_eq!(before[0]["source"], "migration");
+    assert!(before[0]["old"].is_null() && before[0]["new"].is_null());
+
+    write_config(&root, |config| config["conversationEngines"] = old);
+    crate::console::import_engine_choices(&context).unwrap();
+    let (after, _) = history_page(&context, &format!("?conversation={KEPT_GROUP}"));
+    assert_eq!(before, after, "replaying a skipped entry must not audit it twice");
 }
 
 #[test]

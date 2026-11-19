@@ -2,8 +2,8 @@
 //! one value per conversation in `conversation_settings`, keyed by the conversation's canonical key (`group:<id>` or
 //! `private:<id>`, as `initial_prompts::canonical_key` writes it); its audit rows carry that key as their `scope`.
 //!
-//! The values live in the store only: never overlaid on the configuration document, never seeded from `config.json`
-//! and never written back into it. A conversation's value resolves as: its stored value, else its global setting's
+//! The values live in the store only. Upgrade imports the legacy engine map once. A conversation's value resolves
+//! as its stored value, else its global setting's
 //! value (`ConversationSetting::global`, read on the loader's document: stored, then `config.json`, then the default).
 //! A conversation key never becomes part of a JSON pointer, and a row whose conversation is not canonical is skipped.
 //!
@@ -22,6 +22,75 @@ use crate::runtime::RuntimeContext;
 use crate::settings::{conversation_registry, find_conversation, registry, ConversationSetting, Setting, OWNER};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
+
+pub(crate) fn has_legacy_engine_choices(context: &RuntimeContext) -> Result<bool, (u16, String)> {
+    Ok(context.is_isolated() && raw_config(context).map_err(|error| (503, error))?.get("conversationEngines").is_some())
+}
+
+/// Caller holds the configuration gate. An existing scope's audit history is a receipt,
+/// including when a later access change cleared the imported choice.
+pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    use crate::runtime::RuntimeArea;
+    use crate::settings::CONVERSATION_ENGINE;
+
+    let read = || raw_config(context).map_err(|error| (503, error));
+    let document = read()?;
+    let Some(old) = document.get("conversationEngines") else { return Ok(()) };
+    let choices = old.as_object().ok_or((503, "conversationEngines must be an object".into()))?;
+    if !choices.is_empty() {
+        let (skipped, _) = write_store_with(context, false, &[], true, |conn| {
+            let (effective, configured) = held_configuration(conn, context)?
+                .ok_or((503, CONFIG_ERROR.to_string()))?;
+            let mut skipped = 0;
+            for (key, value) in choices {
+                if !is_canonical(key) || !admitted_held(&effective, &configured, key) {
+                    continue;
+                }
+                let changed: bool = conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM settings_audit WHERE scope=?1 AND key=?2)",
+                    params![key, CONVERSATION_ENGINE.key],
+                    |row| row.get(0),
+                ).map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+                if changed || stored_row(conn, key, CONVERSATION_ENGINE.key)?.is_some() {
+                    continue;
+                }
+                let Some(value) = CONVERSATION_ENGINE.normalize(value) else {
+                    record_change(conn, &CONVERSATION_ENGINE, key, None, None, SEED_ACTOR, "migration")?;
+                    skipped += 1;
+                    continue; // The migration audit records this invalid choice.
+                };
+                record_change(conn, &CONVERSATION_ENGINE, key, None, Some(&value.to_string()), SEED_ACTOR, "migration")?;
+            }
+            Ok(skipped)
+        })?;
+        if skipped != 0 {
+            crate::safe_println!("[settings] legacy engine import skipped {skipped} invalid choices; see settings history");
+        }
+    }
+    // Read after the settings write-back. A crash before this replacement leaves the audit receipts.
+    let mut fresh = read()?;
+    fresh.as_object_mut().expect("raw config is an object").remove("conversationEngines");
+    context.write_atomic(RuntimeArea::Config, "config.json", fresh.to_string().as_bytes())
+        .map_err(|_| (503, "conversation engine import could not update config.json".into()))
+}
+
+/// The scoped choice and global default from one settings snapshot. The caller supplies
+/// the loader's document for the registry's ordinary config and default fallback.
+pub(crate) fn engine_choice(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<Value, String> {
+    use crate::settings::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
+    let Inspection::Ready(conn) = inspect(context)? else { return Ok(ENGINE_DEFAULT.read(cfg)) };
+    let scoped = if schema_version(&conn)? >= 2 {
+        stored_row(&conn, key, CONVERSATION_ENGINE.key).map_err(|(_, error)| error)?
+    } else {
+        None
+    };
+    if let Some((text, _)) = scoped {
+        return serde_json::from_str::<Value>(&text).ok().and_then(|value| CONVERSATION_ENGINE.normalize(&value))
+            .ok_or_else(|| "stored conversation engine is invalid".into());
+    }
+    Ok(read_stored_values(&conn)?.into_iter().find(|(setting, _)| setting.key == ENGINE_DEFAULT.key)
+        .map_or_else(|| ENGINE_DEFAULT.read(cfg), |(_, value)| value))
+}
 
 /// The refusal of a conversation that is not `group:<id>` or `private:<id>`.
 pub(crate) const CONVERSATION_ERROR: &str = "conversation must be group:<id> or private:<id>";
@@ -270,7 +339,7 @@ pub(super) fn undo_entry(
     let (conversation, key, source, old_text, new_text) = row;
     let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
     let setting = find_conversation(&key)
-        .filter(|_| is_canonical(&conversation) && source != ACCESS_SOURCE)
+        .filter(|_| is_canonical(&conversation) && !matches!(source.as_str(), ACCESS_SOURCE | "migration" | "switch-rollback"))
         .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
     if schema_version(conn).map_err(|error| (503, error))? < 2 {
         return Err((409, NOT_UNDOABLE_ERROR.to_string()));

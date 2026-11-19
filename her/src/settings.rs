@@ -50,7 +50,6 @@ pub(crate) use kinds::SettingKind;
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
-#[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
@@ -63,8 +62,9 @@ pub(crate) use store::{
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
-    apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
-    conversation_admitted, conversation_value, conversation_view, direct_change_error, has_stored_values, history,
+    apply, apply_changes, apply_conversation, backup_source, canonical_conversation,
+    console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
+    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
     registry_free, reset, reset_conversation, restore_gate, security_restore, store_mark, store_path, undo, view,
     write_back, Applied, Change, CONVERSATION_ERROR,
