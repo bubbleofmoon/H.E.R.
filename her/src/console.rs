@@ -2432,14 +2432,8 @@ fn handle_stickers(
     query: &str,
     count: i64,
 ) -> Result<Value, (u16, String)> {
-    let max_list = cfg
-        .get("socialV2")
-        .and_then(|v| v.get("sticker"))
-        .and_then(|s| s.get("maxListCount"))
-        .and_then(|v| v.as_i64())
-        .filter(|n| *n > 0)
-        .unwrap_or(100);
-    let limit = count.max(1).min(max_list).min(500) as usize;
+    let max_list = crate::settings::STICKERS_LIST.integer(cfg);
+    let limit = count.clamp(1, max_list) as usize;
 
     let (list, synced_at, from_cache) = if context.is_isolated() {
         let sync_outcome = match sync_sticker_if_stale(context, cfg, false, false) {
@@ -2616,13 +2610,7 @@ fn sync_sticker_if_stale(
         }
     }
     if !force {
-        let ttl = cfg
-            .get("socialV2")
-            .and_then(|value| value.get("sticker"))
-            .and_then(|value| value.get("syncTtlMs"))
-            .and_then(Value::as_i64)
-            .unwrap_or(60_000)
-            .max(0);
+        let ttl = crate::settings::STICKERS_TTL.integer(cfg);
         if state.synced_at > 0 && now.saturating_sub(state.synced_at) < ttl {
             return Ok(StickerSyncOutcome::Cached);
         }
@@ -2729,7 +2717,7 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
 }
 
 /// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 17] = [
+const SETTINGS_WRITABLE: [&str; 15] = [
     "sendDelayMs",
     "socialV2.send.burstEnabled",
     "socialV2.send.burstIntervalMinMs",
@@ -2738,8 +2726,6 @@ const SETTINGS_WRITABLE: [&str; 17] = [
     "socialV2.send.maxSendPerMinute",
     "socialV2.send.maxSendPerHour",
     "socialV2.wake.batchWindowMs",
-    "socialV2.sticker.collect.maxBytes",
-    "socialV2.sticker.stickerEnabled",
     "socialV2.context.wakeMaxChars",
     "socialV2.context.wakeRecentLimit",
     "memory.inject.relatedTopK",
@@ -2844,7 +2830,7 @@ fn related_top_k_value(value: &Value) -> Option<Value> {
 /// 而 `null` 会保留。用 `Value::Null` 顶替会让"没配过"变成"配成了 null"。
 fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
     // Project the settings defaults of frozen bridge.js loadConfig without rewriting the file.
-    // send/wake/context are shallow replacements; sticker.collect and role merge defaults.
+    // send/wake/context are shallow replacements; role merges defaults.
     if path == "sendDelayMs" {
         return Some(
             cfg.get(path)
@@ -2869,9 +2855,8 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
         "socialV2.wake.batchWindowMs" => ("wake", json!(8000)),
         "socialV2.context.wakeMaxChars" => ("context", json!(6000)),
         "socialV2.context.wakeRecentLimit" => ("context", json!(4)),
-        "socialV2.sticker.collect.maxBytes" => return Some(json!(8 * 1024 * 1024)),
         "role.maxInjectChars" => return Some(json!(6000)),
-        _ => return None, // No JS default for firstGapEnabled, stickerEnabled or the other memory.* paths.
+        _ => return None, // No JS default for firstGapEnabled or the other memory.* paths.
     };
     if cfg.get("socialV2").and_then(|v| v.get(group)).is_none() {
         Some(default)
@@ -5857,19 +5842,12 @@ fn handle_sticker_list(
     }
     let _is_agent = sticker_agent_allowed(context, &cfg, &key, headers, "listStickers", "qq_list_stickers")?;
     let q = params.get("query").cloned().unwrap_or_default();
-    let max_count = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("sticker"))
-        .and_then(|s| s.get("maxListCount"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100)
-        .max(1);
+    let max_count = crate::settings::STICKERS_LIST.integer(&cfg);
     let count = params
         .get("count")
         .and_then(|c| c.parse::<i64>().ok())
         .unwrap_or(48)
-        .clamp(1, max_count)
-        .min(500);
+        .clamp(1, max_count);
     let sync_outcome = if context.is_isolated() {
         match sync_sticker_if_stale(context, &cfg, false, false) {
             Ok(outcome) => outcome,
@@ -6760,7 +6738,7 @@ fn handle_social_config_post(
         }
     }
     // 子对象必须是对象，否则保留当前值（null/数组会覆盖默认值、绕过工具开关）
-    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context", "voice"];
+    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context", "voice", "media"];
     for name in subs {
         if let Some(v) = body_v.get(name) {
             if !v.is_object() {
@@ -6782,7 +6760,7 @@ fn handle_social_config_post(
         }
         merged.insert("tools".into(), Value::Object(tools));
     }
-    for name in ["voice"] {
+    for name in ["voice", "media"] {
         if body_v.get(name).and_then(Value::as_object).is_some() {
             merged.insert(name.to_string(), Value::Object(merge_sub(&current, name, &body_v)));
         }
@@ -6877,47 +6855,21 @@ fn handle_social_config_post(
         }
         merged.insert("proactive".into(), Value::Object(p));
     }
-    // sticker
+    // Preserve unknown sticker fields and merge the nested collection options.
     if body_v.get("sticker").and_then(js_object_like).is_some() {
-        let mut s = merge_sub(&current, "sticker", &body_v);
-        let cur_s = current.get("sticker").cloned().unwrap_or_else(|| json!({}));
-        for k in ["syncTtlMs", "maxListCount", "promptMaxStickers"] {
-            if let Some(v) = norm_num(&s, Some(&cur_s), k, true, 0.0, None, 0.0) {
-                s.insert(k.into(), v);
+        let mut sticker = merge_sub(&current, "sticker", &body_v);
+        if let Some(posted) = body_v.pointer("/sticker/collect").and_then(js_object_like) {
+            let mut collect = current.pointer("/sticker/collect").and_then(js_object_like).unwrap_or_default();
+            collect.extend(posted);
+            sticker.insert("collect".into(), Value::Object(collect));
+        } else if body_v.pointer("/sticker/collect").is_some() {
+            if let Some(collect) = current.pointer("/sticker/collect") {
+                sticker.insert("collect".into(), collect.clone());
+            } else {
+                sticker.remove("collect");
             }
         }
-        if let Some(v) = norm_num(&s, Some(&cur_s), "maxListCount", true, 1.0, Some(500.0), 0.0) {
-            s.insert("maxListCount".into(), v);
-        }
-        if let Some(v) = norm_num(&s, Some(&cur_s), "promptMaxStickers", true, 1.0, Some(30.0), 0.0) {
-            s.insert("promptMaxStickers".into(), v);
-        }
-        for k in ["enabled", "includeInPrompt"] {
-            if s.get(k).is_some() {
-                let b = s.get(k).and_then(|v| v.as_bool()) == Some(true);
-                s.insert(k.into(), json!(b));
-            }
-        }
-        if body_v.get("sticker").and_then(|v| v.get("collect")).and_then(js_object_like).is_some() {
-            let cur_c = cur_s.get("collect").cloned().unwrap_or_else(|| json!({}));
-            let mut c = cur_c.as_object().cloned().unwrap_or_default();
-            if let Some(bc) = body_v.get("sticker").and_then(|v| v.get("collect")).and_then(js_object_like) {
-                for (k, v) in bc {
-                    c.insert(k, v);
-                }
-            }
-            for k in ["maxPerMinute", "maxPerHour", "maxRemarkChars"] {
-                if let Some(v) = norm_num(&c, Some(&cur_c), k, true, 0.0, None, 0.0) {
-                    c.insert(k.into(), v);
-                }
-            }
-            if c.get("enabled").is_some() {
-                let b = c.get("enabled").and_then(|v| v.as_bool()) == Some(true);
-                c.insert("enabled".into(), json!(b));
-            }
-            s.insert("collect".into(), Value::Object(c));
-        }
-        merged.insert("sticker".into(), Value::Object(s));
+        merged.insert("sticker".into(), Value::Object(sticker));
     }
     // feedback
     if body_v.get("feedback").and_then(js_object_like).is_some() {
@@ -7008,7 +6960,7 @@ fn handle_social_config_post(
     write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
     let mut effective = crate::settings::overlay(context, file);
     crate::settings::resolve_live_batch(&mut effective);
-    for name in ["tools", "voice"] {
+    for name in ["tools", "voice", "sticker", "media"] {
         if body_v.get(name).and_then(js_object_like).is_some() {
             merged_v[name] = effective["socialV2"][name].clone();
         }
@@ -7463,13 +7415,7 @@ where
     if (kind != "group" && kind != "private") || conv_id.is_empty() {
         return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
     }
-    let collect_cfg = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("sticker"))
-        .and_then(|s| s.get("collect"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if collect_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+    if !crate::settings::COLLECT_ENABLED.switch(cfg) {
         return Err((403, "收藏表情功能已关闭".to_string()));
     }
     // 频率限制（state 里的 stickerCollectTimes）
@@ -7486,8 +7432,8 @@ where
             .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     }
     let now = now_ms();
-    let max_min = collect_cfg.get("maxPerMinute").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    let max_hour = collect_cfg.get("maxPerHour").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let max_min = crate::settings::COLLECT_MINUTE.integer(cfg);
+    let max_hour = crate::settings::COLLECT_HOUR.integer(cfg);
     let reservation = crate::turn_ledger::mint_id("sticker-collect-");
     if context.is_isolated() {
         reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::send_outbox::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
@@ -7566,10 +7512,7 @@ where
         );
         push_url(&cdn);
     }
-    let max_bytes = collect_cfg
-        .get("maxBytes")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8 * 1024 * 1024) as usize;
+    let max_bytes = crate::settings::COLLECT_BYTES.integer(cfg) as usize;
     let mut bytes: Option<Vec<u8>> = None;
     let mut failures: Vec<String> = Vec::new();
     for u in &urls {
@@ -7628,7 +7571,7 @@ where
     COLLECT_AFTER_ADD_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
     });
-    let max_remark = collect_cfg.get("maxRemarkChars").and_then(|v| v.as_i64()).unwrap_or(20).max(1) as usize;
+    let max_remark = crate::settings::COLLECT_REMARK.integer(cfg) as usize;
     let clean_remark: String = remark.chars().take(max_remark).collect();
     if !clean_remark.is_empty() {
         let payload = json!({ "emoji_id": emoji_id_new.clone(), "desc": clean_remark });
@@ -7765,19 +7708,12 @@ fn handle_sticker_list_post(
         return Err((400, "key 不能为空".to_string()));
     }
     let is_agent = sticker_agent_allowed(context, cfg, &key, headers, "listStickers", "qq_list_stickers")?;
-    let max_count = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("sticker"))
-        .and_then(|s| s.get("maxListCount"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100)
-        .max(1);
+    let max_count = crate::settings::STICKERS_LIST.integer(cfg);
     let count = b
         .get("count")
         .and_then(|c| c.as_i64())
         .unwrap_or(48)
-        .clamp(1, max_count)
-        .min(500);
+        .clamp(1, max_count);
     let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let mut force = b.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut sync_outcome = StickerSyncOutcome::Skipped;
@@ -8793,12 +8729,7 @@ where
     if url.is_empty() {
         return Err((500, format!("发送表情失败：表情 {entry_id} 没有可发送的图片地址")));
     }
-    let max_bytes = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("media"))
-        .and_then(|m| m.get("maxBytes"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8 * 1024 * 1024) as usize;
+    let max_bytes = crate::settings::MEDIA_BYTES.integer(cfg) as usize;
     fetch(url, max_bytes)
         .map_err(|e| (500, format!("发送表情失败：表情 {entry_id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：{e}")))
 }
@@ -8997,12 +8928,7 @@ where
     if url.is_empty() {
         return Err((500, format!("发送表情失败：表情 {entry_id} 没有可发送的图片地址")));
     }
-    let max_bytes = cfg
-        .get("socialV2")
-        .and_then(|social| social.get("media"))
-        .and_then(|media| media.get("maxBytes"))
-        .and_then(Value::as_u64)
-        .unwrap_or(8 * 1024 * 1024) as usize;
+    let max_bytes = crate::settings::MEDIA_BYTES.integer(cfg) as usize;
     let fetched = fetch_image(url, max_bytes)
         .map_err(|error| (500, format!("发送表情失败：表情 {entry_id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：{error}")))?;
     let encoded = {
@@ -10054,7 +9980,7 @@ fn collect_sticker_guard(context: &RuntimeContext, _cfg: &Value, key: &str, toke
     let cfg = context.load_config().map_err(|_| cancelled())?;
     let state = load_social_state_for(context).map_err(|_| cancelled())?;
     if !crate::sticker::enabled(&cfg)
-        || cfg.pointer("/socialV2/sticker/collect/enabled").and_then(Value::as_bool) == Some(false) { return Err(cancelled()); }
+        || !crate::settings::COLLECT_ENABLED.switch(&cfg) { return Err(cancelled()); }
     if let Some(token) = token {
         if state.get("paused").and_then(Value::as_bool) == Some(true)
             || cfg.get("socialV2").and_then(|v| v.get("enabled")).and_then(Value::as_bool) == Some(false)
@@ -11753,22 +11679,38 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     section.insert("tools".to_string(), Value::Object(tools));
     let file_sticker = members(section.get("sticker"));
     let mut sticker = serde_json::Map::new();
-    for (name, value) in [("enabled", json!(true)), ("syncTtlMs", json!(60000)), ("maxListCount", json!(100)), ("includeInPrompt", json!(true)), ("promptMaxStickers", json!(8))] {
-        sticker.insert(name.to_string(), value);
+    for (name, setting) in [
+        ("enabled", crate::settings::STICKERS_ENABLED),
+        ("syncTtlMs", crate::settings::STICKERS_TTL),
+        ("maxListCount", crate::settings::STICKERS_LIST),
+        ("includeInPrompt", crate::settings::STICKERS_IN_PROMPT),
+        ("promptMaxStickers", crate::settings::STICKERS_PROMPT_COUNT),
+    ] {
+        sticker.insert(name.to_string(), setting.default_value());
     }
     // JS lists `collect` right after the defaults, then the file's members; a placeholder keeps that order.
     sticker.insert("collect".to_string(), Value::Null);
     sticker.extend(file_sticker.clone());
     let mut collect = serde_json::Map::new();
-    for (name, value) in [("enabled", json!(true)), ("maxPerMinute", json!(2)), ("maxPerHour", json!(10)), ("maxRemarkChars", json!(20)), ("maxBytes", json!(8 * 1024 * 1024))] {
-        collect.insert(name.to_string(), value);
+    for (name, setting) in [
+        ("enabled", crate::settings::COLLECT_ENABLED),
+        ("maxPerMinute", crate::settings::COLLECT_MINUTE),
+        ("maxPerHour", crate::settings::COLLECT_HOUR),
+        ("maxRemarkChars", crate::settings::COLLECT_REMARK),
+        ("maxBytes", crate::settings::COLLECT_BYTES),
+    ] {
+        collect.insert(name.to_string(), setting.default_value());
     }
     collect.extend(members(file_sticker.get("collect")));
     sticker.insert("collect".to_string(), Value::Object(collect));
     section.insert("sticker".to_string(), Value::Object(sticker));
     let mut media = serde_json::Map::new();
-    for (name, value) in [("maxBytes", json!(8 * 1024 * 1024)), ("maxPixels", json!(64_000_000)), ("maxCount", json!(5))] {
-        media.insert(name.to_string(), value);
+    for (name, setting) in [
+        ("maxBytes", crate::settings::MEDIA_BYTES),
+        ("maxPixels", crate::settings::MEDIA_PIXELS),
+        ("maxCount", crate::settings::MEDIA_COUNT),
+    ] {
+        media.insert(name.to_string(), setting.default_value());
     }
     media.extend(members(section.get("media")));
     section.insert("media".to_string(), Value::Object(media));
@@ -20685,7 +20627,7 @@ mod tests {
             &json!({"key":key,"stickerId":"fixture-sticker"}).to_string(), &context.load_config().unwrap(),
             |url, limit| {
                 assert_eq!(url, "https://fixture.invalid/sticker.gif");
-                assert_eq!(limit, 4096);
+                assert_eq!(limit, 262_144);
                 Ok(b"synthetic image bytes".to_vec())
             });
         let requests = server.join().unwrap();
@@ -21022,7 +20964,7 @@ mod tests {
             &context_a.load_config().unwrap(),
             |url, max_bytes| {
                 assert_eq!(url, "https://fixture.invalid/selected.gif");
-                assert_eq!(max_bytes, 4096);
+                assert_eq!(max_bytes, 262_144);
                 Ok(b"GIF89a\x01\x00\x01\x00fixture".to_vec())
             },
         )
@@ -21754,8 +21696,6 @@ mod tests {
             "socialV2.send.maxSendPerMinute",
             "socialV2.send.maxSendPerHour",
             "socialV2.wake.batchWindowMs",
-            "socialV2.sticker.collect.maxBytes",
-            "socialV2.sticker.stickerEnabled",
             "socialV2.context.wakeMaxChars",
             "socialV2.context.wakeRecentLimit",
             "memory.inject.relatedTopK",
@@ -26751,7 +26691,7 @@ mod tests {
         let download = legacy_sticker_image(&entries, "s-ok", &cfg, |_, _| Err("cdn down".to_string())).unwrap_err();
         assert_eq!(download, (500, "发送表情失败：表情 s-ok 的图片下载失败（QQ CDN 网络异常或地址已失效）：cdn down".to_string()));
         let bytes = legacy_sticker_image(&entries, "s-ok", &json!({"socialV2": {"media": {"maxBytes": 123}}}), |url, max| {
-            assert_eq!((url, max), ("https://cdn.invalid/a.png", 123));
+            assert_eq!((url, max), ("https://cdn.invalid/a.png", 262_144));
             Ok(b"img".to_vec())
         }).unwrap();
         assert_eq!(bytes, b"img");

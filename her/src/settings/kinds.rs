@@ -52,6 +52,11 @@ pub(crate) trait SettingKind: Sync {
     /// Why a chat value was refused, under the chat's name `name`.
     fn chat_requirement(&self, name: &str) -> String;
 
+    /// A retained chat spelling for a setting whose configuration member has a different name.
+    fn chat_pointer(&self) -> Option<&'static str> {
+        None
+    }
+
     /// The compiled default of a text setting, `None` for every other kind: `prompt_text` renders it as the fallback,
     /// and the overlay gives a text setting's refused stored value its last good version.
     fn text_default(&self) -> Option<&'static str> {

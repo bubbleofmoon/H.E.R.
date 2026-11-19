@@ -56,7 +56,9 @@ pub(crate) use registry::{
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
     OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
-    VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS,
+    VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS, COLLECT_BYTES, COLLECT_ENABLED,
+    COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK, MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS, STICKERS_ENABLED,
+    STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL,
 };
 #[cfg(test)]
 pub(crate) use store::{
@@ -176,10 +178,9 @@ impl Setting {
         self.kind.refusal(self.key, value)
     }
 
-    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
-    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    /// The dotted path the owner's chat tools use, with the kind's retained spelling when it has one.
     pub(crate) fn chat_name(&self) -> String {
-        self.pointer.trim_start_matches('/').replace('/', ".")
+        self.kind.chat_pointer().unwrap_or(self.pointer).trim_start_matches('/').replace('/', ".")
     }
 
     /// Why a chat value was refused, under the chat's name.

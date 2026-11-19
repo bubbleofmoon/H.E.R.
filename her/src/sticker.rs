@@ -12,9 +12,6 @@ use crate::runtime::{RuntimeArea, RuntimeContext};
 use std::path::Path;
 
 pub const STICKER_FILE: &str = crate::legacy_path!("qq-bridge/state/stickers.json");
-const MAX_FETCH: usize = 500;
-const DEFAULT_COUNT: usize = 100;
-const TTL_MS: i64 = 60_000;
 
 fn now_ms() -> i64 {
     crate::parity_clock::now_ms() as i64
@@ -543,28 +540,13 @@ fn acquire_sticker_mutation_gate(context: &RuntimeContext) -> Result<std::fs::Fi
     }
 }
 
-/// 从配置里取拉取数量与 TTL（对应 JS 的 maxListCount / syncTtlMs）。
+/// Bridge limits for sticker fetches and cache refreshes.
 fn limits(cfg: &Value) -> (usize, i64) {
-    let s = cfg.get("socialV2").and_then(|v| v.get("sticker"));
-    let count = s
-        .and_then(|x| x.get("maxListCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(DEFAULT_COUNT as u64);
-    let count = count.clamp(1, MAX_FETCH as u64) as usize;
-    let ttl = s
-        .and_then(|x| x.get("syncTtlMs"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(TTL_MS)
-        .max(0);
-    (count, ttl)
+    (crate::settings::STICKERS_LIST.integer(cfg) as usize, crate::settings::STICKERS_TTL.integer(cfg))
 }
 
 pub fn enabled(cfg: &Value) -> bool {
-    cfg.get("socialV2")
-        .and_then(|v| v.get("sticker"))
-        .and_then(|s| s.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
+    crate::settings::STICKERS_ENABLED.switch(cfg)
 }
 
 /// 同步一次。返回 (拉到的条数, 合并后的条数)。

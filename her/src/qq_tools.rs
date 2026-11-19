@@ -80,20 +80,15 @@ fn needs_voice_system(name: &str) -> bool {
 
 /// Is the tool registered under this config (JS: evaluated once at server start)?
 pub fn registered(name: &str, cfg: &Value) -> bool {
-    let social = cfg.get("socialV2");
-    let enabled = |path: &[&str]| -> bool {
-        let mut cur = social;
-        for seg in path {
-            cur = cur.and_then(|v| v.get(*seg));
-        }
-        cur.and_then(Value::as_bool) != Some(false)
-    };
     if let Some(flag) = tool_flag(name) {
         if !crate::settings::tool_enabled(cfg, flag) {
             return false;
         }
     }
-    if needs_sticker_system(name) && !enabled(&["sticker", "enabled"]) {
+    if needs_sticker_system(name) && !crate::sticker::enabled(cfg) {
+        return false;
+    }
+    if name == "qq_collect_sticker" && !crate::settings::COLLECT_ENABLED.switch(cfg) {
         return false;
     }
     if needs_voice_system(name) && !crate::settings::VOICE_ENABLED.switch(cfg) {
@@ -1135,6 +1130,8 @@ fn forward_msg(api: &Api<'_>, key: &str, token: &str, id: &str) -> ToolOutcome {
     let outcome = data_text(api, data.clone());
     if outcome.is_error { return outcome; }
     let mut content = outcome.content;
+    let cfg = config(api.context).unwrap_or(Value::Null);
+    let max_images = crate::settings::MEDIA_COUNT.integer(&cfg) as usize;
     let mut images: Vec<Value> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     let mut collect = |msgs: Option<&Value>| {
@@ -1142,6 +1139,9 @@ fn forward_msg(api: &Api<'_>, key: &str, token: &str, id: &str) -> ToolOutcome {
         for m in list {
             let Some(media) = m.get("media").and_then(Value::as_array) else { continue };
             for item in media.iter().filter(|i| i.is_object()) {
+                if images.len() == max_images {
+                    return;
+                }
                 let key_id = ["url", "file", "faceId"]
                     .iter()
                     .find_map(|k| item.get(*k).filter(|v| truthy(Some(v))).map(js_text))
@@ -1162,8 +1162,7 @@ fn forward_msg(api: &Api<'_>, key: &str, token: &str, id: &str) -> ToolOutcome {
     }
     let mut image_texts: Vec<String> = Vec::new();
     if !images.is_empty() {
-        let batch: Vec<Value> = images.iter().take(5).cloned().collect();
-        match api.call(ApiCall::post("/api/socialV2/forward-media", json!({"key": key, "media": batch})).token(token).timeout(180_000)) {
+        match api.call(ApiCall::post("/api/socialV2/forward-media", json!({"key": key, "media": images})).token(token).timeout(180_000)) {
             Ok(media) => {
                 for img in media.get("images").and_then(Value::as_array).cloned().unwrap_or_default() {
                     let index = img.get("index").filter(|v| !v.is_null()).map(|v| format!(" {}", js_text(v))).unwrap_or_default();

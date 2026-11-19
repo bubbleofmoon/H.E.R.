@@ -3,12 +3,17 @@
 
 mod access;
 mod engine;
+mod media;
 mod model;
 mod prompt;
 mod reply;
+mod stickers;
 mod tools;
 mod voice;
 
+pub(crate) use media::{MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS};
+pub(crate) use stickers::{COLLECT_BYTES, COLLECT_ENABLED, COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK,
+    STICKERS_ENABLED, STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL};
 pub(crate) use tools::{tool_enabled, tool_switches};
 pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS};
 
@@ -30,7 +35,7 @@ const GROUPS: &[&[Setting]] = &[
 
 /// Settings whose effective values are also materialized on the runtime configuration document.
 pub(super) fn live_batch() -> impl Iterator<Item = &'static Setting> {
-    [tools::SETTINGS, voice::SETTINGS].into_iter().flatten()
+    [tools::SETTINGS, voice::SETTINGS, stickers::SETTINGS, media::SETTINGS].into_iter().flatten()
 }
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its

@@ -37,9 +37,11 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/registry.rs", include_str!("../registry.rs")),
     ("settings/registry/access.rs", include_str!("../registry/access.rs")),
     ("settings/registry/engine.rs", include_str!("../registry/engine.rs")),
+    ("settings/registry/media.rs", include_str!("../registry/media.rs")),
     ("settings/registry/model.rs", include_str!("../registry/model.rs")),
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
+    ("settings/registry/stickers.rs", include_str!("../registry/stickers.rs")),
     ("settings/registry/tools.rs", include_str!("../registry/tools.rs")),
     ("settings/registry/voice.rs", include_str!("../registry/voice.rs")),
 ];
