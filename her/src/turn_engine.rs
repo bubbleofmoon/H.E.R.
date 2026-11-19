@@ -99,7 +99,6 @@ impl Adapter {
     }
 
     /// The scripted adapter also supports all participation modes.
-    #[cfg(test)]
     pub(crate) fn supports(&self, mode: &str) -> bool {
         match self {
             Self::Harness => Engine::Harness.supports(mode),
