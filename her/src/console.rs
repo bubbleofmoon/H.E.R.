@@ -7004,7 +7004,7 @@ fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Valu
         for (field, stale) in [
             ("mode", current.mode_active != target.mode_active),
             ("infinite", current.infinite != target.infinite),
-            ("batchWindowMs", current.batch_window_ms.unwrap_or(batch).max(1000) != batch),
+            ("batchWindowMs", (before.is_some() && current.batch_window_ms.is_none()) || current.batch_window_ms.unwrap_or(batch).max(1000) != batch), // RED-A
         ] {
             if stale {
                 plan[field] = defaults[field].clone();
