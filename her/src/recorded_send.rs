@@ -121,7 +121,8 @@ impl<'a> Recorded<'a> {
     ) -> Result<Self, BeginError> {
         let key = fields.get("key").and_then(Value::as_str).map(str::to_owned);
         if let Some(mute) = key.as_deref().and_then(|k| crate::group_mute::active(context, k)) {
-            return Err(BeginError::Muted(mute.refusal_text(crate::parity_clock::now_ms())));
+            let cfg = context.load_config().unwrap_or_default();
+            return Err(BeginError::Muted(mute.refusal_text(crate::parity_clock::now_ms(), &cfg)));
         }
         let batch_id = new_batch_id(created_at);
         let claim = claim_batch(&batch_id).ok_or(BeginError::Busy)?;

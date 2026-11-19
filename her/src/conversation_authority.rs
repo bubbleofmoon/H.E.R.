@@ -44,11 +44,13 @@ pub(crate) fn generation(token: &str) -> String {
     crate::send_outbox::token_epoch(token)
 }
 
-/// Revoke only the admitted token, preserving any replacement turn's authority.
-pub(crate) fn revoke(context: &RuntimeContext, key: &str, expected: &str) -> Result<(), String> {
-    revoke_if_current(context, key, expected).map(|_| ())
+/// Revoke only the admitted token and return the new generation if it rotated.
+pub(crate) fn revoke(context: &RuntimeContext, key: &str, expected: &str) -> Result<Option<String>, String> {
+
+    revoke_if_current(context, key, expected).map(|token| token.as_deref().map(generation))
 }
 
+/// Return the replacement token so the reserved2 hub can track the exact rotation.
 pub(crate) fn revoke_if_current(context: &RuntimeContext, key: &str, expected: &str) -> Result<Option<String>, String> {
     crate::console::mutate_social_state_for(context, |state| {
         if state["conversations"][key]["agentToken"].as_str() != Some(expected) {

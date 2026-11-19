@@ -78,7 +78,12 @@ pub(crate) fn model_text(context: &crate::runtime::RuntimeContext, cfg: &Value, 
         return String::new();
     };
     let delivery = crate::model_view::with_blacklist(context, cfg);
-    let visible = |text: &str| crate::model_view::strip_checked(text, &delivery);
+    let Ok(mut credentials) = crate::settings::stored_secrets(context) else { return String::new() };
+    credentials.extend(crate::settings::harness_credential(context));
+    let visible = |text: &str| {
+        crate::model_view::strip_checked(text, &delivery)
+            .filter(|text| credentials.iter().all(|key| !text.contains(key)))
+    };
     visible(&text(cfg, key))
         .or_else(|| {
             crate::settings::last_good_text(context, key, |candidate| visible(candidate).is_some())

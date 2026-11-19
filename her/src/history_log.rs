@@ -57,8 +57,8 @@ fn config_reads(context: &RuntimeContext) -> usize {
 }
 
 fn file_for(ms: i64) -> String {
-    let (y, m, d) = crate::sticker::civil_from_days(ms.div_euclid(86_400_000));
-    format!("{DIR}/{y:04}-{m:02}-{d:02}.jsonl")
+    let date = crate::local_time::at(ms, &jiff::tz::TimeZone::UTC).date();
+    format!("{DIR}/{}.jsonl", date.strftime("%Y-%m-%d"))
 }
 
 fn id_text(value: &Value) -> Option<String> {

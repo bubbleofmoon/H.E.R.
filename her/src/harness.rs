@@ -1,6 +1,7 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
 pub(crate) mod budget;
 pub(crate) mod handover;
+pub(crate) mod interactions;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
 pub(crate) mod rotation;
@@ -59,7 +60,7 @@ pub(crate) fn redact_credential(text: &str, key: &str) -> String {
 /// routes (`routes::chain`) in the order the turn walks them (`for_conversation`: the conversation's selected route
 /// first), tried in that order from `start`. Credentials are opaque: never derive Debug or serialize this value.
 pub struct ModelRoute {
-    key: String,
+    credentials: Vec<String>,
     endpoint: String,
     /// The routes in the order this turn walks them.
     routes: Vec<Route>,
@@ -125,11 +126,15 @@ impl ModelRoute {
             return Err("harness model credential is empty".into());
         }
         let endpoint = format!("{}/v1/", origin.trim_end_matches('/'));
+        let mut credentials = crate::settings::stored_secrets(context)
+            .map_err(|_| "stored model credentials are unavailable")?;
+        credentials.push(key.to_string());
+        credentials.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
         let routes = order
             .into_iter()
             .map(|spec| Route {
-                id: redact_credential(&spec.id, key),
-                model: redact_credential(&spec.model, key),
+                id: redact_credentials(&spec.id, &credentials),
+                model: redact_credentials(&spec.model, &credentials),
                 target: ServiceTarget {
                     model: ModelIden::new(AdapterKind::OpenAI, spec.model.clone()),
                     endpoint: Endpoint::from_owned(endpoint.clone()),
@@ -139,8 +144,8 @@ impl ModelRoute {
             })
             .collect();
         Ok(Self {
-            key: key.to_string(),
-            endpoint: endpoint.replace(key, "[REDACTED]"),
+            endpoint: redact_credentials(&endpoint, &credentials),
+            credentials,
             routes,
             configured,
             start: 0,
@@ -154,7 +159,18 @@ impl ModelRoute {
 
     /// `text` with this route's harness credential redacted (`redact_credential`).
     pub(crate) fn redact(&self, text: &str) -> String {
-        redact_credential(text, &self.key)
+        redact_credentials(text, &self.credentials)
+    }
+
+    /// Mask a copy of the delivered request using this turn's credential snapshot.
+    fn capture_request(&self, model: &str, max_tokens: u32, request: &ChatRequest) -> Value {
+        let mut capture = serde_json::json!({
+            "model": model,
+            "maxTokens": max_tokens,
+            "request": serde_json::to_value(request).unwrap_or(Value::Null),
+        });
+        redact(&mut capture, &self.credentials);
+        capture
     }
 
     /// The chain's fingerprint (`routes::chain_signature`).
@@ -315,6 +331,8 @@ pub enum Status {
 
 enum Failure {
     Failed(String),
+    /// The owner received the timeout notice for this interaction.
+    InteractionClosed,
     Cancelled,
     Uncertain(String),
 }
@@ -375,6 +393,7 @@ struct Progress {
     /// The model of the route the turn's last request went to.
     model: String,
     failures: Vec<RouteFailure>,
+    owner_interaction_closed: bool,
 }
 
 impl From<String> for Failure {
@@ -421,6 +440,10 @@ impl Turn {
     /// Each route request that failed over or ended the turn, in order.
     pub fn route_failures(&self) -> Vec<RouteFailure> {
         self.progress.lock().unwrap_or_else(|p| p.into_inner()).failures.clone()
+    }
+
+    pub(crate) fn owner_interaction_closed(&self) -> bool {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).owner_interaction_closed
     }
 
     pub fn sent_tool_reply(&self) -> bool {
@@ -509,17 +532,16 @@ impl Harness {
         // the authority check so reset cannot mistake an admitted handler for crashed work.
         let owner = turn_owner(&self.context, &request.id)?;
         request.tools.check().map_err(String::from)?;
-        let key = request.route.key.clone();
-        request.prompt = request.prompt.replace(&key, "[REDACTED]");
+        request.prompt = request.route.redact(&request.prompt);
+        request.profile = request.route.redact(&request.profile);
         if let Some(full) = &mut delivery.full_prompt {
-            *full = full.replace(&key, "[REDACTED]");
+            *full = request.route.redact(full);
         }
-        request.profile = request.profile.replace(&key, "[REDACTED]");
         // Media labels are text too; image data stays the bytes the pipeline normalized.
         for part in request.media.iter_mut() {
             let redacted = part["text"]
                 .as_str()
-                .map(|text| text.replace(&key, "[REDACTED]"));
+                .map(|text| request.route.redact(text));
             if let Some(text) = redacted {
                 part["text"] = Value::String(text);
             }
@@ -539,7 +561,7 @@ impl Harness {
         let instruction = request.tools.instruction();
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
-        let (cancel, mut cancelled) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(false);
         let (events, _) = broadcast::channel(32);
         let notifications = events.clone();
         let client = self.client.clone();
@@ -550,7 +572,7 @@ impl Harness {
         let refs_for_task = request_refs.clone();
         let progress = Arc::new(std::sync::Mutex::new(Progress {
             model: request.route.routes[request.route.start].model.clone(),
-            failures: Vec::new(),
+            ..Progress::default()
         }));
         let progress_for_task = progress.clone();
         let task_cancel = cancel.clone();
@@ -559,6 +581,8 @@ impl Harness {
             let _owner = owner;
             let mut assistant = None;
             let cancellation = cancelled.clone();
+            let deadline = tokio::time::Instant::now() + request.deadline;
+            let deadline_generation = std::sync::OnceLock::new();
             let execution = tool_loop(
                 &context,
                 &client,
@@ -571,37 +595,28 @@ impl Harness {
                 &sent_flag,
                 &refs_for_task,
                 &progress_for_task,
+                deadline,
+                &deadline_generation,
                 cancellation,
             );
-            tokio::pin!(execution);
-            let mut interrupted = None;
-            let outcome = tokio::select! { biased;
-                _ = cancelled.changed() => { interrupted = Some(Status::Cancelled); None },
-                _ = tokio::time::sleep(request.deadline), if delivery.reserved2_budget.is_none() => {
-                    interrupted = Some(Status::Failed(DEADLINE_EXCEEDED.into())); None
-                },
-                result = &mut execution => Some(result),
-            };
-            let outcome = match outcome {
-                Some(result) => result,
-                None => {
-                    // Keep ownership of the handler and its result writer. Model waits are
-                    // cancellable; a dispatched blocking handler must settle under revoked authority.
-                    let _ = task_cancel.send(true);
-                    let revoked = request.tools.revoke();
-                    let settled = execution.await;
-                    match revoked {
-                        Ok(()) => settled,
-                        Err(reason) => Err(Failure::Uncertain(reason)),
-                    }
-                }
-            };
+            let (outcome, interrupted) = settle_turn(
+                execution,
+                delivery.reserved2_budget.is_none().then_some(deadline),
+                &task_cancel,
+                cancelled,
+                &request.tools,
+                &deadline_generation,
+            ).await;
             let mut result = match outcome {
                 Err(Failure::Uncertain(detail)) => Status::Paused {
                     reason: "send-unresolved".into(),
                     detail,
                 },
                 Err(Failure::Cancelled) => interrupted.unwrap_or(Status::Cancelled),
+                Err(Failure::InteractionClosed) => {
+                    progress_for_task.lock().unwrap_or_else(|p| p.into_inner()).owner_interaction_closed = true;
+                    interrupted.unwrap_or_else(|| Status::Failed(interactions::TIMED_OUT.into()))
+                }
                 Err(Failure::Failed(reason)) => interrupted.unwrap_or(Status::Failed(reason)),
                 Ok(event) => match interrupted {
                     Some(status) => status,
@@ -645,11 +660,52 @@ impl Harness {
     }
 }
 
+async fn settle_turn<T>(
+    execution: impl std::future::Future<Output = Result<T, Failure>>,
+    deadline: Option<tokio::time::Instant>,
+    cancel: &watch::Sender<bool>,
+    mut cancelled: watch::Receiver<bool>,
+    tools: &Tools,
+    deadline_generation: &std::sync::OnceLock<String>,
+) -> (Result<T, Failure>, Option<Status>) {
+    tokio::pin!(execution);
+    let interrupted = tokio::select! { biased;
+        _ = cancelled.changed() => Status::Cancelled,
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        } => Status::Failed(DEADLINE_EXCEEDED.into()),
+        result = &mut execution => return (result, None),
+    };
+
+    // Keep ownership of the handler and result writer. A dispatched blocking handler
+    // must settle under revoked authority.
+    let _ = cancel.send(true);
+    let revoked = tools.revoke();
+    if matches!(interrupted, Status::Failed(_)) {
+        if let Ok(Some(generation)) = &revoked {
+            let _ = deadline_generation.set(generation.clone());
+        }
+    }
+    let settled = execution.await;
+    let outcome = match revoked {
+        Ok(_) => settled,
+        Err(reason) => Err(Failure::Uncertain(reason)),
+    };
+    (outcome, Some(interrupted))
+}
+
 fn turn_owner(context: &RuntimeContext, turn: &str) -> Result<std::fs::File, String> {
     context.open_locked_file(
         RuntimeArea::Data,
         &format!("locks/harness-turn-{}.lock", crate::send_outbox::token_epoch(turn)),
     )
+}
+
+fn turn_is_live(context: &RuntimeContext, turn: &str) -> bool {
+    matches!(turn_owner(context, turn), Err(error) if error == "runtime file is already locked")
 }
 
 /// Reset has already revoked the generation. A live owner must settle its handler;
@@ -691,9 +747,11 @@ async fn tool_loop(
     sent: &AtomicBool,
     request_refs: &std::sync::Mutex<Vec<Value>>,
     progress: &std::sync::Mutex<Progress>,
+    deadline: tokio::time::Instant,
+    deadline_generation: &std::sync::OnceLock<String>,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Event, Failure> {
-    let deadline = tokio::time::Instant::now() + request.deadline;
+    let session = history.session.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds, checkpoint_clipped) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
@@ -755,11 +813,7 @@ async fn tool_loop(
                 request.limits.image_input,
             ))
             .with_tools(offered.clone());
-            serde_json::json!({
-                "model": route.model,
-                "maxTokens": max_tokens,
-                "request": serde_json::to_value(&chat).unwrap_or(Value::Null),
-            })
+            request.route.capture_request(&route.model, max_tokens, &chat)
         });
         // A request that misses is recorded with its size (`ChainState::missed`).
         let request_bytes = serde_json::to_vec(&delivered).map_or(0, |bytes| bytes.len());
@@ -814,7 +868,7 @@ async fn tool_loop(
         spent = spent.saturating_add(charge_of(&end)?);
         let mut raw = serde_json::to_value(end)
             .map_err(|_| "harness model response could not be recorded")?;
-        redact(&mut raw, &request.route.key);
+        redact(&mut raw, &request.route.credentials);
         let end: StreamEnd = serde_json::from_value(raw.clone())
             .map_err(|_| "harness model response could not be recorded")?;
         let content = end.captured_content.unwrap_or_default();
@@ -876,38 +930,65 @@ async fn tool_loop(
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
             chain.dispatched |= prepared.is_ok();
-            let tools = request.tools.clone();
-            let invocation = call.clone();
-            let cancel = cancelled.clone();
-            let budget = delivery.reserved2_budget;
-            let context = context.clone();
-            let key = request.conversation.clone();
-            let (mut outcome, skipped) = tokio::task::spawn_blocking(move || {
-                if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                    return (tools::error("tool dispatch cancelled or expired"), None);
+            let (mut outcome, stop) = match prepared {
+                Err(outcome) => (outcome, None),
+                Ok(args) if request.tools.handles_interaction(&call.fn_name) => {
+                    let result = match &request.tools.interactions {
+                        Some(mailbox) => {
+                            let binding = interactions::Binding {
+                                mailbox, key: &request.conversation, session: &session,
+                                turn: &request.id, epoch: &request.generation, deadline, deadline_generation,
+                            };
+                            if call.fn_name == interactions::ASK {
+                                binding.question(&args, cancelled.clone()).await
+                            } else {
+                                binding.group_send(&args, cancelled.clone()).await
+                            }
+                        }
+                        None => Ok(tools::error("Owner interaction is unavailable.")),
+                    };
+                    match result {
+                        Ok(outcome) => (outcome, None),
+                        Err(reason) => {
+                            let mut outcome = tools::error("Owner interaction ended.");
+                            if matches!(&reason, Failure::Uncertain(_)) {
+                                outcome["_meta"] = serde_json::json!({"herDelivery":"unknown"});
+                            }
+                            (outcome, Some(reason))
+                        }
+                    }
                 }
-                if let Err(reason) = TurnDelivery::check_deadline(budget, &context, &key) {
-                    return (tools::error("tool dispatch cancelled or expired"), Some(reason));
+                Ok(args) => {
+                    let tools = request.tools.clone();
+                    let invocation = call.clone();
+                    let cancel = cancelled.clone();
+                    let budget = delivery.reserved2_budget;
+                    let context = context.clone();
+                    let key = request.conversation.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
+                            return (tools::error("tool dispatch cancelled or expired"), None);
+                        }
+                        if let Err(reason) = TurnDelivery::check_deadline(budget, &context, &key) {
+                            return (tools::error("tool dispatch cancelled or expired"), Some(reason.into()));
+                        }
+                        (tools.dispatch(&invocation, &args), None)
+                    })
+                    .await
+                    .map_err(|_| {
+                        Failure::Uncertain(
+                            "harness tool worker failed before its effect could be settled".into(),
+                        )
+                    })?
                 }
-                let outcome = match prepared {
-                    Ok(args) => tools.dispatch(&invocation, &args),
-                    Err(outcome) => outcome,
-                };
-                (outcome, None)
-            })
-            .await
-            .map_err(|_| {
-                Failure::Uncertain(
-                    "harness tool worker failed before its effect could be settled".into(),
-                )
-            })?;
-            redact(&mut outcome, &request.route.key);
+            };
+            redact(&mut outcome, &request.route.credentials);
             let message = tool_message(&call, &outcome);
             store
                 .tool_result(&request.id, &run, &message, &outcome)
                 .map_err(Failure::Uncertain)?;
-            if let Some(reason) = skipped {
-                return Err(reason.into());
+            if let Some(reason) = stop {
+                return Err(reason);
             }
             if outcome["_meta"]["herDelivery"] == "unknown" {
                 return Err(Failure::Uncertain("QQ send delivery could not be confirmed; administrator confirmation required before retry".into()));
@@ -1363,6 +1444,19 @@ fn filter_model_messages(
                 ContentPart::ToolCall(mut call) => {
                     call.fn_arguments =
                         crate::model_view::strip_model_chat_data(&call.fn_arguments, &cfg);
+                    if call.fn_name == interactions::ASK {
+                        let filter = |value: &mut Value| {
+                            if let Some(text) = value.as_str() {
+                                *value = Value::String(crate::model_view::strip_from_model_text(text, &cfg));
+                            }
+                        };
+                        if let Some(question) = call.fn_arguments.get_mut("question") {
+                            filter(question);
+                        }
+                        if let Some(options) = call.fn_arguments.get_mut("options").and_then(Value::as_array_mut) {
+                            options.iter_mut().for_each(filter);
+                        }
+                    }
                     ContentPart::ToolCall(call)
                 }
                 ContentPart::ToolResponse(mut response) => {
@@ -1409,7 +1503,12 @@ fn filter_tool_text(text: &str, cfg: &Value, tool: Option<&str>) -> Result<Strin
         for block in blocks {
             if block["type"] == "text" {
                 if let Some(text) = block["text"].as_str() {
-                    block["text"] = Value::String(filter_tool_text(text, cfg, None)?);
+                    let copy = if tool == Some(interactions::ASK) {
+                        crate::model_view::strip_from_model_text(text, cfg)
+                    } else {
+                        filter_tool_text(text, cfg, None)?
+                    };
+                    block["text"] = Value::String(copy);
                 }
             }
         }
@@ -1563,16 +1662,20 @@ fn model_messages(messages: Vec<ChatMessage>, image_input: bool) -> Vec<ChatMess
 }
 
 /// Redact decoded strings, so JSON escaping and split stream chunks cannot hide a key.
-fn redact(value: &mut Value, key: &str) {
+fn redact_credentials(text: &str, credentials: &[String]) -> String {
+    credentials.iter().fold(text.to_string(), |text, key| redact_credential(&text, key))
+}
+
+pub(crate) fn redact(value: &mut Value, credentials: &[String]) {
     match value {
-        Value::String(text) => *text = text.replace(key, "[REDACTED]"),
-        Value::Array(values) => values.iter_mut().for_each(|v| redact(v, key)),
+        Value::String(text) => *text = redact_credentials(text, credentials),
+        Value::Array(values) => values.iter_mut().for_each(|v| redact(v, credentials)),
         Value::Object(fields) => {
             *fields = std::mem::take(fields)
                 .into_iter()
                 .map(|(name, mut value)| {
-                    redact(&mut value, key);
-                    (name.replace(key, "[REDACTED]"), value)
+                    redact(&mut value, credentials);
+                    (redact_credentials(&name, credentials), value)
                 })
                 .collect();
         }
@@ -1584,6 +1687,20 @@ fn redact(value: &mut Value, key: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ticket219_core_turn_capture_masks_its_credential_snapshot() {
+        let route = ModelRoute {
+            endpoint: String::new(),
+            credentials: vec!["fixture-previous-key".into()],
+            routes: Vec::new(),
+            configured: Vec::new(),
+            start: 0,
+        };
+        let request = ChatRequest::new(vec![ChatMessage::user("before fixture-previous-key after")]);
+        let capture = route.capture_request("fixture", 1, &request).to_string();
+        assert!(capture.contains("before [REDACTED] after"), "turn capture missed the captured credential");
+    }
 
     #[test]
     fn qq_tool_text_schemas_filter_delivery_and_replay_without_mutating_facts() {

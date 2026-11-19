@@ -1500,10 +1500,10 @@ impl Pipeline {
             println!("[pipeline] {} 选择静默（[SILENT]），不发送", target.key());
             return Ok(Vec::new());
         }
-        if let Some(mute) = crate::group_mute::active(&self.context, &target.key()) {
-            return Err(mute.refusal_text(crate::parity_clock::now_ms()));
-        }
         let cfg = self.context.load_config().unwrap_or_default();
+        if let Some(mute) = crate::group_mute::active(&self.context, &target.key()) {
+            return Err(mute.refusal_text(crate::parity_clock::now_ms(), &cfg));
+        }
         if let Some(why) = configured_outbound_violation(&cfg, text, &self.secrets) {
             return Err(format!("被出站哨兵拦下：{why}"));
         }

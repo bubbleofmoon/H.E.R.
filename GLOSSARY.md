@@ -17,7 +17,7 @@ A one-to-one session with a single QQ user.
 The participation mode that provides ordinary chat in allowed group and private sessions.
 
 **Admin agent (管理员代理, `closed-agent`)**:
-The participation mode that opens the full agent toolset, including questions and approvals, in the administrator's private session.
+The participation mode for the administrator's private session. The Admin agent can pause a tool call to ask the owner a question or request approval of a specific group send.
 
 **First-generation simulation (一代仿真, `reserved`)**:
 The first-generation participation mode that imitates a group member through participation states such as watching, active, probing and leaving.
@@ -81,8 +81,11 @@ The administrator's setting for bridge releases: off, notify (ask before install
 An owner-tunable value kept in the settings store (`settings.db`), checked against its one registry definition and recorded with every change; the next use reads it without a restart.
 _Avoid_: config key (a member of `config.json`), preference
 
+**Secret setting (机密设置)**:
+An administrator-only live setting that holds an API key for a specific endpoint. The console shows whether the key is set and records when it changes.
+
 **Setting kind (设置类型)**:
-The value type and bounds of a live setting (such as an integer range, a model id, model-visible text, an ordered list or a choice of fixed options): how a value of it is checked, read from `config.json`, refused, shown on the settings page and named in the owner's chat. Each kind is one struct implementing one interface (`settings::kinds`), and each registry definition names its kind.
+The value type and bounds of a live setting (an integer or number range, a switch, a model id, model-visible text, an ordered list or a choice of fixed options): how a value of it is checked, read from `config.json`, refused, shown on the settings page and named in the owner's chat. Each kind is one struct implementing one interface (`settings::kinds`), and each registry definition names its kind.
 _Avoid_: setting type, value kind
 
 **Setting scope (设置范围)**:

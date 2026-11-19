@@ -12,6 +12,7 @@
 //!   · 端口默认 3101：3100 被 JS 桥接占着，两个进程要能同时跑才能对拍
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use crate::settings::tool_enabled;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -194,7 +195,7 @@ fn handle_backup_restore(context: &RuntimeContext, req: &Request) -> Result<Valu
 }
 
 fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
-    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&req.body) else {
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(&req.body) else {
         return Err((400, "body must be a JSON object".into()));
     };
     if fields.keys().any(|key| !matches!(key.as_str(), "dir" | "keepDays" | "time" | "includeState")) {
@@ -207,11 +208,27 @@ fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Resul
     }
     let mut cfg = raw_config_for_write(context)?;
     if cfg.get("backup").is_none_or(Value::is_null) { cfg["backup"] = json!({}); }
+    let base = cfg.clone();
+    let time = fields.remove("time").map(|value| {
+        if value.is_null() { crate::settings::BACKUP_TIME.default_value() } else { value }
+    });
     let backup = cfg["backup"].as_object_mut().ok_or((400, "backup must be a JSON object".to_string()))?;
-    for (key, value) in fields { backup.insert(key, value); }
+    backup.extend(fields);
+    let mut proposed = cfg.clone();
+    proposed["backup"]["time"] = time.clone().unwrap_or_else(|| crate::settings::BACKUP_TIME.read(&current));
     let root = context.runtime_root().ok_or((400, "backup requires a selected runtime root".to_string()))?;
-    let settings = crate::backup::Settings::from_config_resolved(root, &cfg).map_err(|error| (400, error))?;
+    let settings = crate::backup::Settings::from_config_resolved(root, &proposed).map_err(|error| (400, error))?;
     let view = settings.view().map_err(|error| (400, error))?;
+    if let Some(time) = time {
+        let changes = crate::settings::console_changes(context, &base, &json!({"backup":{"time":time}}))?;
+        if !changes.is_empty() {
+            note_config_before_request(context);
+            crate::settings::apply_changes(context, changes, "administrator", "console")?;
+            let latest = raw_config_object(context)?;
+            crate::settings::keep_registry_values(&latest, &mut cfg)
+                .map_err(|key| (400, format!("config.json cannot hold {key}")))?;
+        }
+    }
     let text = serde_json::to_string_pretty(&cfg).map_err(|error| (500, error.to_string()))?;
     write_selected_config_text(context, &text).map_err(|error| config_write_error(context, error))?;
     Ok(json!({"ok":true,"settings":view}))
@@ -278,7 +295,7 @@ thread_local! {
     static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). A registry setting's
+/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). An ordinary setting's
 /// member is never changed here (#177, `settings::keep_file_members`): one the document lacks or holds as `null` is put
 /// back from the stored file, and any other change of one is refused with nothing written, because console pages change
 /// registry settings through the store (`settings::console_changes`). Stored settings are then put back at their
@@ -1632,31 +1649,7 @@ fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let secs = ms / 1000;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60,
-        ms % 1000
-    )
-}
-
-/// Howard Hinnant 的 days_from_civil 逆运算。
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    crate::local_time::iso_utc(ms)
 }
 
 /// `/api/social`：一代仿真的配置与状态。
@@ -2449,14 +2442,8 @@ fn handle_stickers(
     query: &str,
     count: i64,
 ) -> Result<Value, (u16, String)> {
-    let max_list = cfg
-        .get("socialV2")
-        .and_then(|v| v.get("sticker"))
-        .and_then(|s| s.get("maxListCount"))
-        .and_then(|v| v.as_i64())
-        .filter(|n| *n > 0)
-        .unwrap_or(100);
-    let limit = count.max(1).min(max_list).min(500) as usize;
+    let max_list = crate::settings::STICKERS_LIST.integer(cfg);
+    let limit = count.clamp(1, max_list) as usize;
 
     let (list, synced_at, from_cache) = if context.is_isolated() {
         let sync_outcome = match sync_sticker_if_stale(context, cfg, false, false) {
@@ -2633,13 +2620,7 @@ fn sync_sticker_if_stale(
         }
     }
     if !force {
-        let ttl = cfg
-            .get("socialV2")
-            .and_then(|value| value.get("sticker"))
-            .and_then(|value| value.get("syncTtlMs"))
-            .and_then(Value::as_i64)
-            .unwrap_or(60_000)
-            .max(0);
+        let ttl = crate::settings::STICKERS_TTL.integer(cfg);
         if state.synced_at > 0 && now.saturating_sub(state.synced_at) < ttl {
             return Ok(StickerSyncOutcome::Cached);
         }
@@ -2746,7 +2727,7 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
 }
 
 /// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 17] = [
+const SETTINGS_WRITABLE: [&str; 11] = [
     "sendDelayMs",
     "socialV2.send.burstEnabled",
     "socialV2.send.burstIntervalMinMs",
@@ -2755,14 +2736,8 @@ const SETTINGS_WRITABLE: [&str; 17] = [
     "socialV2.send.maxSendPerMinute",
     "socialV2.send.maxSendPerHour",
     "socialV2.wake.batchWindowMs",
-    "socialV2.sticker.collect.maxBytes",
-    "socialV2.sticker.stickerEnabled",
     "socialV2.context.wakeMaxChars",
     "socialV2.context.wakeRecentLimit",
-    "memory.inject.relatedTopK",
-    "memory.autoFlush.enabled",
-    "memory.autoFlush.contextPct",
-    "memory.autoFlush.maxSessionsPerDay",
     "role.maxInjectChars",
 ];
 
@@ -2847,13 +2822,6 @@ fn is_setting_writable(path: &str) -> bool {
     SETTINGS_WRITABLE.contains(&p)
 }
 
-/// `memory.inject.relatedTopK` as a write: an integer (or its numeric string) from 1 to 20, the range a wake
-/// executes; stored as a number.
-fn related_top_k_value(value: &Value) -> Option<Value> {
-    let number = value.as_f64().or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))?;
-    (number.fract() == 0.0 && (1.0..=20.0).contains(&number)).then(|| json!(number as i64))
-}
-
 /// 按点分路径读配置。
 /// 返回 None 表示**路径不存在**（和"值是 null"是两件事）。
 ///
@@ -2861,7 +2829,7 @@ fn related_top_k_value(value: &Value) -> Option<Value> {
 /// 而 `null` 会保留。用 `Value::Null` 顶替会让"没配过"变成"配成了 null"。
 fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
     // Project the settings defaults of frozen bridge.js loadConfig without rewriting the file.
-    // send/wake/context are shallow replacements; sticker.collect and role merge defaults.
+    // send/wake/context are shallow replacements; role merges defaults.
     if path == "sendDelayMs" {
         return Some(
             cfg.get(path)
@@ -2869,10 +2837,6 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
                 .cloned()
                 .unwrap_or(json!(300)),
         );
-    }
-    // The depth a wake executes, not the raw stored value (`prompt::recall_top_k` clamps and defaults).
-    if path == "memory.inject.relatedTopK" {
-        return Some(json!(crate::prompt::recall_top_k(cfg)));
     }
     if let Some(value) = path.split('.').try_fold(cfg, |cur, key| cur.get(key)) {
         return Some(value.clone()); // Explicit null, zero and false survive JS object spread.
@@ -2886,9 +2850,8 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
         "socialV2.wake.batchWindowMs" => ("wake", json!(8000)),
         "socialV2.context.wakeMaxChars" => ("context", json!(6000)),
         "socialV2.context.wakeRecentLimit" => ("context", json!(4)),
-        "socialV2.sticker.collect.maxBytes" => return Some(json!(8 * 1024 * 1024)),
         "role.maxInjectChars" => return Some(json!(6000)),
-        _ => return None, // No JS default for firstGapEnabled, stickerEnabled or the other memory.* paths.
+        _ => return None,
     };
     if cfg.get("socialV2").and_then(|v| v.get(group)).is_none() {
         Some(default)
@@ -2957,7 +2920,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     }
                 }
                 let mut writable: Vec<String> = SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
-                for setting in crate::settings::registry().filter(|setting| setting.chat && context.is_isolated()) {
+                for setting in crate::settings::chat_registry().filter(|_| context.is_isolated()) {
                     let name = setting.chat_name();
                     all.insert(name.clone(), redact_setting(&name, setting.read(cfg)));
                     writable.push(name);
@@ -2968,6 +2931,9 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     "writable": writable,
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
+            }
+            if setting_is_secret(&path) {
+                return Err((403, SETTINGS_READ_REFUSED.to_string()));
             }
             if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
                 let value = redact_setting(&path, setting.read(cfg));
@@ -2990,7 +2956,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         }
         // settings-set
         let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
+        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated() && !setting_is_secret(&path)) {
             let value = b.get("value").cloned().unwrap_or(Value::Null);
             // A refused value answers under the chat's name; the store's own errors stay out of the chat.
             let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat").map_err(|(status, _)| {
@@ -3022,11 +2988,6 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
             ));
         }
         let value = b.get("value").cloned().unwrap_or(Value::Null);
-        let value = if path == "memory.inject.relatedTopK" {
-            related_top_k_value(&value).ok_or((400, "memory.inject.relatedTopK 必须是 1 到 20 的整数（唤醒实际注入的记忆条数）".to_string()))?
-        } else {
-            value
-        };
         write_setting_path(context, &path, &value).map_err(|e| (400, e))?;
         crate::safe_eprintln!("[console] settings 改了 {path} -> {value}");
         return Ok(json!({
@@ -4856,16 +4817,6 @@ fn social_v2_projection_session_allowed(cfg: &Value, key: &str) -> bool {
     }
 }
 
-/// JS 的 `v2ToolEnabled`：只有显式写 false 才算关闭；没写的开关取 JS 配置合并的默认值
-/// （除 `setStickerRemark`、`sendVoice` 默认关闭外都开启）。
-fn tool_enabled(cfg: &Value, flag: &str) -> bool {
-    cfg.get("socialV2")
-        .and_then(|s| s.get("tools"))
-        .and_then(|t| t.get(flag))
-        .map(|v| v != &json!(false))
-        .unwrap_or(!matches!(flag, "setStickerRemark" | "sendVoice"))
-}
-
 /// Additional menu gates imposed by the reserved2 console routes.
 pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
     match name {
@@ -5738,7 +5689,7 @@ pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str,
         }
     }
     crate::activity::append(context, &format!("{key} [send] 禁言中，本地拒发，未调用网关"));
-    Err((403, mute.refusal_text(crate::parity_clock::now_ms())))
+    Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)))
 }
 
 fn wait_console_generation() -> &'static str {
@@ -5901,19 +5852,12 @@ fn handle_sticker_list(
     }
     let _is_agent = sticker_agent_allowed(context, &cfg, &key, headers, "listStickers", "qq_list_stickers")?;
     let q = params.get("query").cloned().unwrap_or_default();
-    let max_count = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("sticker"))
-        .and_then(|s| s.get("maxListCount"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100)
-        .max(1);
+    let max_count = crate::settings::STICKERS_LIST.integer(&cfg);
     let count = params
         .get("count")
         .and_then(|c| c.parse::<i64>().ok())
         .unwrap_or(48)
-        .clamp(1, max_count)
-        .min(500);
+        .clamp(1, max_count);
     let sync_outcome = if context.is_isolated() {
         match sync_sticker_if_stale(context, &cfg, false, false) {
             Ok(outcome) => outcome,
@@ -5974,6 +5918,27 @@ fn face_entry(index: usize, face_id: &str, text: &str, img: Option<(&[u8], &str)
 /// Configured JS source-count/byte budgets apply before shared normalization.
 fn build_media_images(context: &RuntimeContext, cfg: &Value, media_list: &[Value]) -> Vec<Value> {
     crate::media::images(context, cfg, media_list)
+}
+
+/// Numeric coercion for the legacy voice configuration.
+pub(crate) fn voice_config_number(value: &Value) -> f64 {
+    agent::js_number(Some(value))
+}
+
+pub(crate) fn warn_configured_voice_duration(cfg: &Value) {
+    static WARNED_SECONDS: std::sync::Mutex<Option<HashSet<u64>>> = std::sync::Mutex::new(None);
+
+    let Some(raw) = crate::settings::VOICE_MAX_SECONDS.found_in(cfg) else { return };
+    let seconds = voice_config_number(raw);
+    let ceiling = crate::voice::QQ_MAX_SECONDS;
+    if seconds > ceiling {
+        let Ok(mut warned_seconds) = WARNED_SECONDS.try_lock() else { return };
+        let first_warning = warned_seconds.get_or_insert_with(HashSet::new).insert(seconds.to_bits());
+        drop(warned_seconds);
+        if first_warning {
+            crate::safe_println!("[voice] socialV2.voice.maxSeconds={seconds} exceeds QQ limit; clamped to {ceiling}s");
+        }
+    }
 }
 
 pub(crate) fn social_v1_number(value: &Value) -> f64 {
@@ -6790,7 +6755,7 @@ fn handle_social_config_post(
         }
     }
     // 子对象必须是对象，否则保留当前值（null/数组会覆盖默认值、绕过工具开关）
-    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context"];
+    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context", "voice", "media"];
     for name in subs {
         if let Some(v) = body_v.get(name) {
             if !v.is_object() {
@@ -6804,22 +6769,18 @@ fn handle_social_config_post(
     }
     // tools：只接受布尔开关；缺省沿用当前值（**默认 false 的项不能被静默打开**）
     if body_v.get("tools").and_then(js_object_like).is_some() {
-        let cur_tools = current.get("tools").cloned().unwrap_or_else(|| json!({}));
         let mut tools = merge_sub(&current, "tools", &body_v);
-        const TOOL_FLAGS: [&str; 30] = [
-            "getPrompt", "getUnread", "getRecent", "socialState", "sendGroup", "sendPrivate", "reply",
-            "sendBurst", "sendMessage", "waitMessages", "feedback", "getMyRecent", "getMessageDetail",
-            "getActiveMembers", "setWakeConfig", "markRead", "memory", "slangQuery", "slangSubmit",
-            "getImages", "getForwardMsg", "sendPoke", "listStickers", "getStickerImage", "sendSticker",
-            "setStickerRemark", "stickerNote", "collectSticker", "getSelfImage", "sendVoice",
-        ];
-        for k in TOOL_FLAGS {
-            if !tools.get(k).map(|v| v.is_boolean()).unwrap_or(false) {
-                let cur_off = cur_tools.get(k).and_then(|v| v.as_bool()) == Some(false);
-                tools.insert(k.to_string(), json!(!cur_off));
-            }
+        let effective = crate::settings::overlay(context, file_before.clone());
+        for (flag, setting) in crate::settings::tool_switches() {
+            let posted = body_v.pointer(&format!("/tools/{flag}")).and_then(Value::as_bool);
+            tools.insert(flag.to_string(), posted.map_or_else(|| setting.read(&effective), Value::Bool));
         }
         merged.insert("tools".into(), Value::Object(tools));
+    }
+    for name in ["voice", "media"] {
+        if body_v.get(name).and_then(Value::as_object).is_some() {
+            merged.insert(name.to_string(), Value::Object(merge_sub(&current, name, &body_v)));
+        }
     }
     // wake
     if body_v.get("wake").and_then(js_object_like).is_some() {
@@ -6911,47 +6872,21 @@ fn handle_social_config_post(
         }
         merged.insert("proactive".into(), Value::Object(p));
     }
-    // sticker
+    // Preserve unknown sticker fields and merge the nested collection options.
     if body_v.get("sticker").and_then(js_object_like).is_some() {
-        let mut s = merge_sub(&current, "sticker", &body_v);
-        let cur_s = current.get("sticker").cloned().unwrap_or_else(|| json!({}));
-        for k in ["syncTtlMs", "maxListCount", "promptMaxStickers"] {
-            if let Some(v) = norm_num(&s, Some(&cur_s), k, true, 0.0, None, 0.0) {
-                s.insert(k.into(), v);
+        let mut sticker = merge_sub(&current, "sticker", &body_v);
+        if let Some(posted) = body_v.pointer("/sticker/collect").and_then(js_object_like) {
+            let mut collect = current.pointer("/sticker/collect").and_then(js_object_like).unwrap_or_default();
+            collect.extend(posted);
+            sticker.insert("collect".into(), Value::Object(collect));
+        } else if body_v.pointer("/sticker/collect").is_some() {
+            if let Some(collect) = current.pointer("/sticker/collect") {
+                sticker.insert("collect".into(), collect.clone());
+            } else {
+                sticker.remove("collect");
             }
         }
-        if let Some(v) = norm_num(&s, Some(&cur_s), "maxListCount", true, 1.0, Some(500.0), 0.0) {
-            s.insert("maxListCount".into(), v);
-        }
-        if let Some(v) = norm_num(&s, Some(&cur_s), "promptMaxStickers", true, 1.0, Some(30.0), 0.0) {
-            s.insert("promptMaxStickers".into(), v);
-        }
-        for k in ["enabled", "includeInPrompt"] {
-            if s.get(k).is_some() {
-                let b = s.get(k).and_then(|v| v.as_bool()) == Some(true);
-                s.insert(k.into(), json!(b));
-            }
-        }
-        if body_v.get("sticker").and_then(|v| v.get("collect")).and_then(js_object_like).is_some() {
-            let cur_c = cur_s.get("collect").cloned().unwrap_or_else(|| json!({}));
-            let mut c = cur_c.as_object().cloned().unwrap_or_default();
-            if let Some(bc) = body_v.get("sticker").and_then(|v| v.get("collect")).and_then(js_object_like) {
-                for (k, v) in bc {
-                    c.insert(k, v);
-                }
-            }
-            for k in ["maxPerMinute", "maxPerHour", "maxRemarkChars"] {
-                if let Some(v) = norm_num(&c, Some(&cur_c), k, true, 0.0, None, 0.0) {
-                    c.insert(k.into(), v);
-                }
-            }
-            if c.get("enabled").is_some() {
-                let b = c.get("enabled").and_then(|v| v.as_bool()) == Some(true);
-                c.insert("enabled".into(), json!(b));
-            }
-            s.insert("collect".into(), Value::Object(c));
-        }
-        merged.insert("sticker".into(), Value::Object(s));
+        merged.insert("sticker".into(), Value::Object(sticker));
     }
     // feedback
     if body_v.get("feedback").and_then(js_object_like).is_some() {
@@ -7020,7 +6955,10 @@ fn handle_social_config_post(
     // above: validated before anything is written (400), stored and written back first (a store that cannot take it
     // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
     // save's own write puts every stored value into config.json (`write_selected_config_text`).
-    let carried = json!({ "socialV2": body_v.clone() });
+    let mut carried = json!({ "socialV2": body_v.clone() });
+    if body_v.pointer("/voice/maxSeconds").is_some_and(|value| !value.is_null()) {
+        carried["socialV2"]["voice"]["maxSeconds"] = merged_v["voice"]["maxSeconds"].clone();
+    }
     let settings_changes = crate::settings::console_changes(context, &file_before, &carried)?;
     if !settings_changes.is_empty() {
         // The store's write-back refuses a file the runtime cannot load, after the commit: refuse it before the store
@@ -7037,6 +6975,13 @@ fn handle_social_config_post(
             .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
     }
     write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
+    let mut effective = crate::settings::overlay(context, file);
+    crate::settings::resolve_live_batch(&mut effective);
+    for name in ["tools", "voice", "sticker", "media"] {
+        if body_v.get(name).and_then(js_object_like).is_some() {
+            merged_v[name] = effective["socialV2"][name].clone();
+        }
+    }
     // The default wake refresh below takes the same gate itself.
     drop(gate);
     crate::safe_println!("[console] 二代仿真配置已更新");
@@ -7487,13 +7432,7 @@ where
     if (kind != "group" && kind != "private") || conv_id.is_empty() {
         return Err((400, "key 格式应为 group:群号 或 private:QQ号".to_string()));
     }
-    let collect_cfg = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("sticker"))
-        .and_then(|s| s.get("collect"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if collect_cfg.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+    if !crate::settings::COLLECT_ENABLED.switch(cfg) {
         return Err((403, "收藏表情功能已关闭".to_string()));
     }
     // 频率限制（state 里的 stickerCollectTimes）
@@ -7510,8 +7449,8 @@ where
             .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     }
     let now = now_ms();
-    let max_min = collect_cfg.get("maxPerMinute").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
-    let max_hour = collect_cfg.get("maxPerHour").and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let max_min = crate::settings::COLLECT_MINUTE.integer(cfg);
+    let max_hour = crate::settings::COLLECT_HOUR.integer(cfg);
     let reservation = crate::turn_ledger::mint_id("sticker-collect-");
     if context.is_isolated() {
         reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::send_outbox::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
@@ -7590,10 +7529,7 @@ where
         );
         push_url(&cdn);
     }
-    let max_bytes = collect_cfg
-        .get("maxBytes")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8 * 1024 * 1024) as usize;
+    let max_bytes = crate::settings::COLLECT_BYTES.integer(cfg) as usize;
     let mut bytes: Option<Vec<u8>> = None;
     let mut failures: Vec<String> = Vec::new();
     for u in &urls {
@@ -7626,7 +7562,7 @@ where
     };
     let add_payload = json!({ "file": format!("base64://{b64}") });
     let submission = if context.is_isolated() {
-        Some(guarded_sticker_submission(context, &ob, "add_custom_face", &add_payload,
+        Some(guarded_qq_submission(context, &ob, "add_custom_face", &add_payload,
             || collect_sticker_guard(context, cfg, &storage_key, agent_token)
                 .and_then(|_| require_sticker_reservation(context, &storage_key, "stickerCollectPending", &reservation)))?)
     } else { None };
@@ -7652,12 +7588,12 @@ where
     COLLECT_AFTER_ADD_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
     });
-    let max_remark = collect_cfg.get("maxRemarkChars").and_then(|v| v.as_i64()).unwrap_or(20).max(1) as usize;
+    let max_remark = crate::settings::COLLECT_REMARK.integer(cfg) as usize;
     let clean_remark: String = remark.chars().take(max_remark).collect();
     if !clean_remark.is_empty() {
         let payload = json!({ "emoji_id": emoji_id_new.clone(), "desc": clean_remark });
         let success = if context.is_isolated() {
-            guarded_sticker_submission(context, &ob, "modify_custom_face", &payload,
+            guarded_qq_submission(context, &ob, "modify_custom_face", &payload,
                 || collect_sticker_guard(context, cfg, &storage_key, agent_token)
                     .and_then(|_| require_sticker_reservation(context, &storage_key, "stickerCollectPending", &reservation)))?
                 .and_then(|pending| pending.outcome()).is_ok()
@@ -7789,19 +7725,12 @@ fn handle_sticker_list_post(
         return Err((400, "key 不能为空".to_string()));
     }
     let is_agent = sticker_agent_allowed(context, cfg, &key, headers, "listStickers", "qq_list_stickers")?;
-    let max_count = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("sticker"))
-        .and_then(|s| s.get("maxListCount"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100)
-        .max(1);
+    let max_count = crate::settings::STICKERS_LIST.integer(cfg);
     let count = b
         .get("count")
         .and_then(|c| c.as_i64())
         .unwrap_or(48)
-        .clamp(1, max_count)
-        .min(500);
+        .clamp(1, max_count);
     let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let mut force = b.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
     let mut sync_outcome = StickerSyncOutcome::Skipped;
@@ -8818,12 +8747,7 @@ where
     if url.is_empty() {
         return Err((500, format!("发送表情失败：表情 {entry_id} 没有可发送的图片地址")));
     }
-    let max_bytes = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("media"))
-        .and_then(|m| m.get("maxBytes"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8 * 1024 * 1024) as usize;
+    let max_bytes = crate::settings::MEDIA_BYTES.integer(cfg) as usize;
     fetch(url, max_bytes)
         .map_err(|e| (500, format!("发送表情失败：表情 {entry_id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：{e}")))
 }
@@ -9022,12 +8946,7 @@ where
     if url.is_empty() {
         return Err((500, format!("发送表情失败：表情 {entry_id} 没有可发送的图片地址")));
     }
-    let max_bytes = cfg
-        .get("socialV2")
-        .and_then(|social| social.get("media"))
-        .and_then(|media| media.get("maxBytes"))
-        .and_then(Value::as_u64)
-        .unwrap_or(8 * 1024 * 1024) as usize;
+    let max_bytes = crate::settings::MEDIA_BYTES.integer(cfg) as usize;
     let fetched = fetch_image(url, max_bytes)
         .map_err(|error| (500, format!("发送表情失败：表情 {entry_id} 的图片下载失败（QQ CDN 网络异常或地址已失效）：{error}")))?;
     let encoded = {
@@ -9073,7 +8992,7 @@ where
     }
     let attempt_ms = recorded.attempt(0, None)
         .map_err(|error| (503, format!("发送意图未能持久记录，未发送：{error}")))?;
-    let submission = guarded_sticker_submission(context, &ob, action, &payload, || {
+    let submission = guarded_qq_submission(context, &ob, action, &payload, || {
         require_sticker_reservation(context, &storage_key, "stickerSendPending", &reservation).and_then(|_| send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendSticker")).and_then(|_| {
             let fresh = context.load_config().map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
             if crate::sticker::enabled(&fresh) { Ok(()) } else { Err((409, SEND_CANCELLED_MESSAGE.to_string())) }
@@ -9752,6 +9671,48 @@ pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
     key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
 }
 
+pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> bool {
+    let limit = cfg.pointer("/socialV2/send/maxMessageChars").and_then(Value::as_f64)
+        .filter(|n| *n != 0.0).unwrap_or(500.0).clamp(1.0, 500.0) as usize;
+    key.starts_with("group:") && canonical_v2_key(key).as_deref() == Some(key)
+        && inbound_admitted(cfg, key)
+        && tool_enabled(cfg, "sendGroup")
+        && !message.is_empty() && message.encode_utf16().count() <= limit
+        && crate::pipeline::configured_outbound_violation(cfg, message, &[]).is_none()
+}
+
+#[cfg(test)]
+#[test]
+fn approved_group_requires_explicit_canonical_scope_and_bounded_preview() {
+    let allowed = json!({"allow":{"groups":[42]},"socialV2":{"send":{"maxMessageChars":900}}});
+    assert!(approved_group_allowed(&allowed, "group:42", &"🎨".repeat(250)));
+    assert!(!approved_group_allowed(&allowed, "group:42", &format!("{}x", "🎨".repeat(250))), "approved preview accepted a message beyond its fixed cap");
+    assert!(!approved_group_allowed(&allowed, "group:042", "hey"));
+    assert!(!approved_group_allowed(&allowed, "group:43", "hey"));
+    assert!(!approved_group_allowed(&allowed, "private:42", "hey"));
+    let denied = json!({"allow":{"groups":[42]},"deny":{"groups":[42]}});
+    assert!(!approved_group_allowed(&denied, "group:42", "hey"));
+    let off = json!({"allow":{"groups":[42]},"socialV2":{"tools":{"sendGroup":false}}});
+    assert!(!approved_group_allowed(&off, "group:42", "hey"));
+}
+
+/// Internal continuation. Only the live interaction passes the one-use owner decision.
+pub(crate) fn send_approved_group(
+    context: &RuntimeContext, key: &str, message: &str, turn: &str, authorized: &dyn Fn() -> bool,
+) -> Result<(u16, Value), (u16, String)> {
+    let cfg = context.load_config().map_err(|_| (503, "send settings unavailable".into()))?;
+    if !authorized() || !approved_group_allowed(&cfg, key, message) || silent_blocks_send(context, &cfg, key)? {
+        return Err((403, "approved group send refused".into()));
+    }
+    let (_, id_s, _) = agent::parse_key(key).ok_or((400, "invalid group".into()))?;
+    let token = crate::conversation_authority::ensure_or_rotate(context, key, false).map_err(|e| (503, e))?;
+    agent::execute_send(context, &cfg, &agent::SendCall {
+        key, kind: "group", id_s, token: &token, messages: vec![message.into()],
+        reply_ref: String::new(), at_user: None, gap_mode: "auto", body: &Value::Null,
+        flavor: agent::SendFlavor::Direct, policy: GuardPolicy::ApprovedGroup { turn, authorized }, resolved_quote: None,
+    })
+}
+
 /// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
 /// per-connection work (gap recovery, mute refresh, group cards).
 pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
@@ -10081,7 +10042,7 @@ fn collect_sticker_guard(context: &RuntimeContext, _cfg: &Value, key: &str, toke
     let cfg = context.load_config().map_err(|_| cancelled())?;
     let state = load_social_state_for(context).map_err(|_| cancelled())?;
     if !crate::sticker::enabled(&cfg)
-        || cfg.pointer("/socialV2/sticker/collect/enabled").and_then(Value::as_bool) == Some(false) { return Err(cancelled()); }
+        || !crate::settings::COLLECT_ENABLED.switch(&cfg) { return Err(cancelled()); }
     if let Some(token) = token {
         if state.get("paused").and_then(Value::as_bool) == Some(true)
             || cfg.get("socialV2").and_then(|v| v.get("enabled")).and_then(Value::as_bool) == Some(false)
@@ -10113,7 +10074,7 @@ fn sticker_send_pause() {
 
 // Lock order: a state writer can hold social-v2.lock before entering authority_gate;
 // this function never takes that state lock, and releases authority before response I/O.
-fn guarded_sticker_submission(
+fn guarded_qq_submission(
     context: &RuntimeContext,
     ob: &crate::onebot::OneBot,
     action: &str,
@@ -10326,10 +10287,11 @@ fn finish_send_batch(
 
 /// Which modes a send may still run in when its validity check runs (ticket 14): the reserved2
 /// tools only in reserved2; `/api/send/*` also in closed-agent (administrator private chat).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GuardPolicy {
+#[derive(Clone, Copy)]
+enum GuardPolicy<'a> {
     Reserved2,
     Reserved2OrClosedAgent,
+    ApprovedGroup { turn: &'a str, authorized: &'a dyn Fn() -> bool },
 }
 
 /// Validity check before each item: the conversation still exists under the same agent token,
@@ -10338,7 +10300,7 @@ fn send_guard(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str) -> 
     send_guard_for(context, cfg, key, epoch, GuardPolicy::Reserved2, "sendMessage")
 }
 
-fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, policy: GuardPolicy, tool_flag: &str) -> Result<(), (u16, String)> {
+fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, policy: GuardPolicy<'_>, tool_flag: &str) -> Result<(), (u16, String)> {
     let cancelled = || (409u16, SEND_CANCELLED_MESSAGE.to_string());
     // A selected runtime's config may change while a quote/member lookup or a
     // burst gap is in flight. Authorize each item against the current allow-list.
@@ -10361,15 +10323,20 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
         return Err(cancelled());
     }
     let mode = current_mode_for(context).map_err(|_| cancelled())?;
-    let mode_ok = mode == "reserved2" || (policy == GuardPolicy::Reserved2OrClosedAgent && mode == "closed-agent");
-    if !mode_ok || !agent::mode_allowed(cfg, &mode, key) {
+    let allowed = match policy {
+        GuardPolicy::ApprovedGroup { authorized, .. } => mode == "closed-agent" && key.starts_with("group:")
+            && inbound_admitted(cfg, key) && authorized(),
+        _ => (mode == "reserved2" || (matches!(policy, GuardPolicy::Reserved2OrClosedAgent) && mode == "closed-agent"))
+            && agent::mode_allowed(cfg, &mode, key),
+    };
+    if !allowed {
         return Err(cancelled());
     }
     if silent_blocks_send(context, cfg, key).map_err(|_| cancelled())? {
         return Err(cancelled());
     }
     if let Some(mute) = crate::group_mute::active(context, key) {
-        return Err((403, mute.refusal_text(crate::parity_clock::now_ms())));
+        return Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)));
     }
     Ok(())
 }
@@ -10398,6 +10365,7 @@ struct RunReport {
     stop: Option<(u16, String)>,
     revision: Option<Value>,
     discard_error: Option<String>,
+    record_uncertain: bool,
 }
 
 impl RunReport {
@@ -10425,7 +10393,7 @@ fn run_send_items(
     kind: &str,
     id_s: &str,
     epoch: &str,
-    policy: GuardPolicy,
+    policy: GuardPolicy<'_>,
     tool_flag: &str,
     plan: &[PlanItem],
     delays: &[i64],
@@ -10507,13 +10475,26 @@ fn run_send_items(
         }
         let mut exclude = already_confirmed.to_vec();
         exclude.extend(report.confirmed_ids());
-        let outcome = ob.send_one_outcome(&target, &item.text, item.reply, item.at);
+        let outcome = if matches!(policy, GuardPolicy::ApprovedGroup { .. }) {
+            // Order: send chain, then authority for final validation and request transmission.
+            // Release authority before response reads, history verification and settlement.
+            let payload = crate::onebot::OneBot::segment_payload(&target, &item.text, item.reply, item.at);
+            match guarded_qq_submission(context, ob, target.action(), &payload, || {
+                send_guard_for(context, cfg, key, epoch, policy, tool_flag)
+            }) {
+                Ok(result) => result.and_then(crate::onebot::PendingResponse::outcome),
+                Err((_, reason)) => Err(crate::onebot::SendError::NotCommitted(reason)),
+            }
+        } else {
+            ob.send_one_outcome(&target, &item.text, item.reply, item.at)
+        };
         let settled = recorded.settle(item.idx, attempt_ms, outcome, &history, Proof::Text(&item.text), &exclude);
         // The gateway detail first, as before: a later record failure must not hide it.
         if let Some(error) = settled.error {
             report.first_error.get_or_insert(error);
         }
         if let Some(error) = settled.record_error {
+            report.record_uncertain = true;
             note(&mut report, error);
         }
         if matches!(settled.state, ItemState::Confirmed { .. }) {
@@ -10596,6 +10577,9 @@ fn resume_send_batch(
     }
     if batch.kind != "text" {
         return Err((409, "该批次不能作为文本恢复发送".to_string()));
+    }
+    if matches!(batch.purpose.as_str(), "approved-group" | "owner-interaction" | "owner-interaction-timeout") {
+        return Err((409, "该批次不能恢复发送".to_string()));
     }
     if batch.epoch != epoch {
         return Err((409, "旧回合结果拒绝：批次属于已失效的会话令牌".to_string()));
@@ -11677,7 +11661,7 @@ fn handle_social_config(context: &RuntimeContext, cfg: &Value) -> Value {
 
 /// JS `cfg.socialV2` as the console sees it: the effective section built at start; once
 /// `config.json` has changed, `maybeReloadConfig` has replaced it with the raw file section when
-/// the file has one (no defaults merged until the next start).
+/// the file has one. The normalized input already contains the effective live controls.
 fn in_memory_social_v2(context: &RuntimeContext, file_section: Option<&Value>) -> Value {
     match file_section {
         Some(raw) if raw.is_object() && access::config_changed_since_start(context) => raw.clone(),
@@ -11773,35 +11757,45 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     // JS: `{ defaults, ...(cfg.socialV2.x ?? {}) }`; a value that is not an object adds nothing.
     let members = |value: Option<&Value>| value.and_then(Value::as_object).cloned().unwrap_or_default();
     let mut tools = serde_json::Map::new();
-    for flag in [
-        "getPrompt", "getUnread", "getRecent", "socialState", "sendGroup", "sendPrivate", "reply", "sendBurst",
-        "sendMessage", "waitMessages", "feedback", "getMyRecent", "getMessageDetail", "getActiveMembers",
-        "setWakeConfig", "markRead", "memory", "slangQuery", "slangSubmit", "getImages", "getForwardMsg",
-        "sendPoke", "listStickers", "getStickerImage", "sendSticker", "setStickerRemark", "stickerNote",
-        "collectSticker", "getSelfImage", "sendVoice",
-    ] {
-        tools.insert(flag.to_string(), json!(!matches!(flag, "setStickerRemark" | "sendVoice")));
+    for (flag, setting) in crate::settings::tool_switches() {
+        tools.insert(flag.to_string(), setting.default_value());
     }
     tools.extend(members(section.get("tools")));
     section.insert("tools".to_string(), Value::Object(tools));
     let file_sticker = members(section.get("sticker"));
     let mut sticker = serde_json::Map::new();
-    for (name, value) in [("enabled", json!(true)), ("syncTtlMs", json!(60000)), ("maxListCount", json!(100)), ("includeInPrompt", json!(true)), ("promptMaxStickers", json!(8))] {
-        sticker.insert(name.to_string(), value);
+    for (name, setting) in [
+        ("enabled", crate::settings::STICKERS_ENABLED),
+        ("syncTtlMs", crate::settings::STICKERS_TTL),
+        ("maxListCount", crate::settings::STICKERS_LIST),
+        ("includeInPrompt", crate::settings::STICKERS_IN_PROMPT),
+        ("promptMaxStickers", crate::settings::STICKERS_PROMPT_COUNT),
+    ] {
+        sticker.insert(name.to_string(), setting.default_value());
     }
     // JS lists `collect` right after the defaults, then the file's members; a placeholder keeps that order.
     sticker.insert("collect".to_string(), Value::Null);
     sticker.extend(file_sticker.clone());
     let mut collect = serde_json::Map::new();
-    for (name, value) in [("enabled", json!(true)), ("maxPerMinute", json!(2)), ("maxPerHour", json!(10)), ("maxRemarkChars", json!(20)), ("maxBytes", json!(8 * 1024 * 1024))] {
-        collect.insert(name.to_string(), value);
+    for (name, setting) in [
+        ("enabled", crate::settings::COLLECT_ENABLED),
+        ("maxPerMinute", crate::settings::COLLECT_MINUTE),
+        ("maxPerHour", crate::settings::COLLECT_HOUR),
+        ("maxRemarkChars", crate::settings::COLLECT_REMARK),
+        ("maxBytes", crate::settings::COLLECT_BYTES),
+    ] {
+        collect.insert(name.to_string(), setting.default_value());
     }
     collect.extend(members(file_sticker.get("collect")));
     sticker.insert("collect".to_string(), Value::Object(collect));
     section.insert("sticker".to_string(), Value::Object(sticker));
     let mut media = serde_json::Map::new();
-    for (name, value) in [("maxBytes", json!(8 * 1024 * 1024)), ("maxPixels", json!(64_000_000)), ("maxCount", json!(5))] {
-        media.insert(name.to_string(), value);
+    for (name, setting) in [
+        ("maxBytes", crate::settings::MEDIA_BYTES),
+        ("maxPixels", crate::settings::MEDIA_PIXELS),
+        ("maxCount", crate::settings::MEDIA_COUNT),
+    ] {
+        media.insert(name.to_string(), setting.default_value());
     }
     media.extend(members(section.get("media")));
     section.insert("media".to_string(), Value::Object(media));
@@ -14993,13 +14987,7 @@ mod tests {
         );
     }
 
-    struct FixtureRoot(std::path::PathBuf);
-
-    impl Drop for FixtureRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::runtime::tests::{runtime_fixture, FixtureRoot};
 
     fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
         fixture_runtime_with_dsh(label, token, "http://127.0.0.1:49101")
@@ -16737,10 +16725,6 @@ mod tests {
             "{label} {} {sequence} {stamp}",
             std::process::id()
         ));
-        let root = crate::install_root::development_root(root);
-        std::fs::create_dir_all(root.join("config")).unwrap();
-        std::fs::create_dir_all(root.join("data")).unwrap();
-        std::fs::create_dir_all(root.join("resources").join("roles")).unwrap();
         let config = json!({
             "consoleToken": token,
             "ownerQQ": 7001,
@@ -16752,24 +16736,41 @@ mod tests {
                 "reasoningEffort": "high"
             }
         });
-        std::fs::write(
-            root.join("config/config.json"),
-            serde_json::to_vec_pretty(&config).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join("data/social-v2.json"), b"{}").unwrap();
-        std::fs::write(
-            root.join("dependencies.json"),
-            serde_json::to_vec(&json!({
-                "dsh": dsh_url,
-                "model": "http://127.0.0.1:49102",
-                "onebot": "http://127.0.0.1:49103"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let context = RuntimeContext::from_root(&root).expect("fixture runtime must validate");
-        (FixtureRoot(root), context)
+        let dependencies = json!({
+            "dsh": dsh_url,
+            "model": "http://127.0.0.1:49102",
+            "onebot": "http://127.0.0.1:49103"
+        });
+        let root = runtime_fixture(root, &config, &dependencies);
+        std::fs::create_dir(root.0.join("resources/roles")).unwrap();
+        let context = RuntimeContext::from_root(&root.0).expect("fixture runtime must validate");
+        (root, context)
+    }
+
+    #[test]
+    fn ticket219_core_console_guards_credential_paths() {
+        let action = include_str!("console.rs").split_once("pub(crate) fn settings_action(").unwrap().1.split_once("/// `/api/tokens/by-provider`").unwrap().0;
+        assert!(action.contains("if setting_is_secret(&path) {") && action.contains("context.is_isolated() && !setting_is_secret(&path)"), "console credential path guard is missing");
+    }
+
+    #[test]
+    fn ticket219_core_console_can_replace_or_remove_the_legacy_search_literal() {
+        let (root, context) = fixture_runtime("legacy search literal", "fixture-console-config");
+        let path = root.0.join("config/config.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["webSearch"] = json!({"apiKey":"fixture-legacy-original"});
+        std::fs::write(&path, config.to_string()).unwrap();
+        for expected in [Some("fixture-legacy-replacement"), None] {
+            match expected {
+                Some(value) => config["webSearch"]["apiKey"] = json!(value),
+                None => { config["webSearch"].as_object_mut().unwrap().remove("apiKey"); }
+            }
+            let written = write_selected_config_text(&context, &config.to_string());
+            let _ = take_config_writes();
+            assert!(written.is_ok(), "console rejected a change to the legacy search literal");
+            let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(raw.pointer("/webSearch/apiKey").and_then(Value::as_str), expected, "console restored the legacy search literal");
+        }
     }
 
     #[test]
@@ -19572,7 +19573,7 @@ mod tests {
                 &send_body,
                 &cfg,
                 |url, max_bytes| {
-                    if url != "https://fixture.invalid/selected.gif" || max_bytes != 4096 {
+                    if url != "https://fixture.invalid/selected.gif" || max_bytes != 262_144 {
                         return Err(format!(
                             "unexpected injected image request: {url} ({max_bytes} bytes)"
                         ));
@@ -19908,7 +19909,7 @@ mod tests {
                 &send_body,
                 &cfg,
                 |url, max_bytes| {
-                    if url == "https://fixture.invalid/selected.gif" && max_bytes == 4096 {
+                    if url == "https://fixture.invalid/selected.gif" && max_bytes == 262_144 {
                         Ok(b"GIF89a\x01\x00\x01\x00fixture".to_vec())
                     } else {
                         Err(format!(
@@ -20457,7 +20458,7 @@ mod tests {
                     }
                 })));
                 let ob = crate::onebot::OneBot::try_new_url(&url, "fixture".to_string()).unwrap();
-                let pending = guarded_sticker_submission(&worker_context, &ob, &action, &json!({}), || Ok(())).unwrap().unwrap();
+                let pending = guarded_qq_submission(&worker_context, &ob, &action, &json!({}), || Ok(())).unwrap().unwrap();
                 pending.outcome()
             });
             guarded_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -20721,7 +20722,7 @@ mod tests {
             &json!({"key":key,"stickerId":"fixture-sticker"}).to_string(), &context.load_config().unwrap(),
             |url, limit| {
                 assert_eq!(url, "https://fixture.invalid/sticker.gif");
-                assert_eq!(limit, 4096);
+                assert_eq!(limit, 262_144);
                 Ok(b"synthetic image bytes".to_vec())
             });
         let requests = server.join().unwrap();
@@ -21058,7 +21059,7 @@ mod tests {
             &context_a.load_config().unwrap(),
             |url, max_bytes| {
                 assert_eq!(url, "https://fixture.invalid/selected.gif");
-                assert_eq!(max_bytes, 4096);
+                assert_eq!(max_bytes, 262_144);
                 Ok(b"GIF89a\x01\x00\x01\x00fixture".to_vec())
             },
         )
@@ -21780,7 +21781,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_settings_writable_paths_match_frozen_js() {
+    fn unregistered_chat_settings_match_the_remaining_allowlist() {
         let expected = [
             "sendDelayMs",
             "socialV2.send.burstEnabled",
@@ -21790,14 +21791,8 @@ mod tests {
             "socialV2.send.maxSendPerMinute",
             "socialV2.send.maxSendPerHour",
             "socialV2.wake.batchWindowMs",
-            "socialV2.sticker.collect.maxBytes",
-            "socialV2.sticker.stickerEnabled",
             "socialV2.context.wakeMaxChars",
             "socialV2.context.wakeRecentLimit",
-            "memory.inject.relatedTopK",
-            "memory.autoFlush.enabled",
-            "memory.autoFlush.contextPct",
-            "memory.autoFlush.maxSessionsPerDay",
             "role.maxInjectChars",
         ];
         assert_eq!(SETTINGS_WRITABLE.as_slice(), expected.as_slice());
@@ -26787,7 +26782,7 @@ mod tests {
         let download = legacy_sticker_image(&entries, "s-ok", &cfg, |_, _| Err("cdn down".to_string())).unwrap_err();
         assert_eq!(download, (500, "发送表情失败：表情 s-ok 的图片下载失败（QQ CDN 网络异常或地址已失效）：cdn down".to_string()));
         let bytes = legacy_sticker_image(&entries, "s-ok", &json!({"socialV2": {"media": {"maxBytes": 123}}}), |url, max| {
-            assert_eq!((url, max), ("https://cdn.invalid/a.png", 123));
+            assert_eq!((url, max), ("https://cdn.invalid/a.png", 262_144));
             Ok(b"img".to_vec())
         }).unwrap();
         assert_eq!(bytes, b"img");
@@ -26883,7 +26878,7 @@ mod tests {
         assert_eq!(config["enabled"], true);
         // JS persists the merged section, which started from the effective one.
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
-        assert_eq!(file["socialV2"]["tools"]["setStickerRemark"], false);
+        assert!(file["socialV2"]["tools"].get("setStickerRemark").is_none());
         assert_eq!(file["socialV2"]["send"]["maxSendPerMinute"], 7);
         // A later GET of the same file shows the same effective section.
         let read = handle_social_config(&context, &context.load_config().unwrap());
@@ -26938,7 +26933,8 @@ mod tests {
         handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         let read = handle_social_config(&context, &context.load_config().unwrap());
-        assert_eq!(read["config"], file["socialV2"], "the answer is the raw file section after a reload");
+        assert_eq!(read["config"]["initialPromptMaxChars"], file["socialV2"]["initialPromptMaxChars"]);
+        assert_eq!(read["config"]["tools"]["sendVoice"], false, "live controls are resolved after a reload");
         assert_eq!(read["config"]["initialPromptMaxChars"], 5);
     }
 

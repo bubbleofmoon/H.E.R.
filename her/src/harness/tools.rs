@@ -4,11 +4,13 @@ use super::profile::Profile;
 use crate::runtime::RuntimeContext;
 use genai::chat::{Tool, ToolCall};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Tools {
     definitions: Vec<Value>,
     authority: Option<Authority>,
+    pub(super) interactions: Option<Arc<super::interactions::Mailbox>>,
     /// The profile's mode prompt (#140) as the configuration read at capture holds it, model-view
     /// stripped; empty when none is set.
     mode_prompt: String,
@@ -84,8 +86,19 @@ impl Tools {
         Ok(Self {
             definitions: definitions(cfg, profile, conversation),
             authority: Some(authority),
+            interactions: None,
             mode_prompt,
         })
+    }
+
+    pub(crate) fn with_interactions(mut self, mailbox: Option<Arc<super::interactions::Mailbox>>) -> Self {
+        self.interactions = mailbox;
+        self
+    }
+
+    pub(super) fn handles_interaction(&self, name: &str) -> bool {
+        matches!(name, super::interactions::ASK | super::interactions::GROUP_SEND)
+            && self.authority.as_ref().is_some_and(|authority| authority.profile == Profile::ClosedAgent)
     }
 
     #[cfg(test)]
@@ -93,6 +106,7 @@ impl Tools {
         Self {
             definitions: Vec::new(),
             authority: None,
+            interactions: None,
             mode_prompt: String::new(),
         }
     }
@@ -108,11 +122,11 @@ impl Tools {
             .unwrap_or(Ok(()))
     }
 
-    pub(super) fn revoke(&self) -> Result<(), String> {
-        if let Some(a) = &self.authority {
-            crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token)?;
+    pub(super) fn revoke(&self) -> Result<Option<String>, String> {
+        match &self.authority {
+            Some(a) => crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token),
+            None => Ok(None),
         }
-        Ok(())
     }
 
     pub(super) fn pause(&self, turn: &str, reason: &str, detail: &str) -> Result<(), String> {
@@ -121,7 +135,7 @@ impl Tools {
             crate::turn_ledger::Recorder::attach(&a.context, turn, &a.conversation)
                 .unknown(reason, detail)?;
         }
-        revoked
+        revoked.map(|_| ())
     }
 
     pub(super) fn matches(&self, conversation: &str, generation: &str) -> bool {
@@ -202,6 +216,11 @@ impl Tools {
             .any(|d| d["name"] == call.fn_name)
         {
             return Err(error("tool is no longer enabled"));
+        }
+        if self.handles_interaction(&call.fn_name) && call.fn_arguments.as_object().is_some_and(|provided| {
+            provided.keys().any(|key| args.get(key).is_none())
+        }) {
+            return Err(error("Unsupported owner interaction argument."));
         }
         // Validate before applying defaults, as the MCP server does. Never consult QQ_SESSION_*.
         let definition = self
@@ -311,6 +330,7 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
         .cloned()
         .unwrap_or_default();
     tools.extend(crate::aux_mcp::tool_list());
+    tools.push(super::interactions::question_definition());
     tools
         .into_iter()
         .filter(|d| {
@@ -318,11 +338,7 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
                 menu.contains(&name)
                     && (!matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
                         || crate::console::reserved2_menu_tool(cfg, conversation, name))
-                    && direct_send_switch(name).is_none_or(|flag| {
-                        cfg.pointer(&format!("/socialV2/tools/{flag}"))
-                            .and_then(Value::as_bool)
-                            != Some(false)
-                    })
+                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
             })
         })
         .map(|mut definition| {
@@ -332,7 +348,11 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
                 definition["inputSchema"]["properties"]["token"]["description"] =
                     json!("Use an empty string. The bridge binds the token to this turn.");
             }
-            definition
+            if profile == Profile::ClosedAgent && definition["name"] == super::interactions::GROUP_SEND {
+                super::interactions::group_definition(definition)
+            } else {
+                definition
+            }
         })
         .collect()
 }
@@ -351,7 +371,11 @@ fn direct_send_switch(name: &str) -> Option<&'static str> {
 }
 
 pub(super) fn error(reason: &str) -> Value {
-    json!({"content":[{"type":"text","text":reason}],"isError":true})
+    text(reason, true)
+}
+
+pub(super) fn text(reason: &str, is_error: bool) -> Value {
+    json!({"content":[{"type":"text","text":reason}],"isError":is_error})
 }
 
 /// The system line of an admitted harness turn; the model reads it.
@@ -457,13 +481,15 @@ mod tests {
 
     /// The table row and its registered tools for a private chat with optional media enabled.
     fn assert_menu(profile: Profile, expected: &[&str]) {
+        let cfg = json!({
+            "socialV2": {
+                "voice": {"enabled": true},
+                "tools": {"sendVoice": true, "setStickerRemark": true}
+            }
+        });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
         assert_eq!(
-            names(&definitions(
-                &json!({"socialV2":{"voice":{"enabled":true},"tools":{"sendVoice":true,"setStickerRemark":true}}}),
-                profile,
-                OWNER_KEY,
-            )),
+            names(&definitions(&cfg, profile, OWNER_KEY)),
             expected.iter().copied().filter(|name| {
                 !matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
                     || !matches!(*name, "qq_send_group_message" | "qq_reply" | "qq_send_burst")
@@ -518,6 +544,7 @@ mod tests {
                 "qq_list_groups",
                 "qq_get_group_members",
                 "qq_get_group_history",
+                "qq_send_group_message",
                 "qq_send_private_message",
                 "qq_get_message_images",
                 "memory_write",
@@ -530,6 +557,7 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "snowluma_status",
+                "ask_owner",
             ],
         );
     }
@@ -690,6 +718,7 @@ mod tests {
                     name.starts_with("qq_")
                         || name.starts_with("memory_")
                         || name.starts_with("settings_")
+                        || (profile == Profile::ClosedAgent && *name == "ask_owner")
                         || ["web_search", "web_fetch", "snowluma_status"].contains(name),
                     "{profile:?} offers {name}"
                 );

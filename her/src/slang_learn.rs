@@ -284,7 +284,7 @@ fn now_ms() -> i64 {
 }
 
 fn now_iso() -> String {
-    crate::sticker::now_iso()
+    crate::local_time::iso_utc(now_ms())
 }
 
 fn cfg_bool(cfg: &Value, path: &[&str], default: bool) -> bool {
@@ -2625,6 +2625,14 @@ mod tests {
             }
         });
         std::fs::write(selected_root.join("config/config.json"), config.to_string()).unwrap();
+        crate::settings::apply(
+            &selected_context,
+            crate::settings::CLI_MODEL_API_KEY.key,
+            &json!("fixture-slang-cli-credential"),
+            "fixture",
+            "console",
+        )
+        .unwrap();
         std::fs::write(selected_root.join("config/model-text-blacklist.json"), r#"{"strip":["1"]}"#).unwrap();
         selected_context
             .write_atomic(
@@ -2676,13 +2684,13 @@ if ([string]::IsNullOrWhiteSpace($homeRoot)) {
   exit 35
 }
 $runtimeRootFull = [IO.Path]::GetFullPath($runtimeRoot)
-$expectedDshHome = [IO.Path]::Combine($expectedRootFull, 'user', 'dsh')
+$expectedCliHome = [IO.Path]::Combine($expectedRootFull, 'data', 'cli-profile')
 if (-not [string]::Equals((Normalize-TestPath $runtimeRootFull), (Normalize-TestPath $expectedRootFull), [StringComparison]::OrdinalIgnoreCase)) {
   [Console]::Error.WriteLine("ticket04 selected runtime root mismatch: $environmentObservation expected=$expectedRootFull")
   exit 36
 }
-if (-not [string]::Equals((Normalize-TestPath $homeRoot), (Normalize-TestPath $expectedDshHome), [StringComparison]::OrdinalIgnoreCase)) {
-  [Console]::Error.WriteLine("ticket04 selected HOME mismatch: $environmentObservation expected=$expectedDshHome")
+if (-not [string]::Equals((Normalize-TestPath $homeRoot), (Normalize-TestPath $expectedCliHome), [StringComparison]::OrdinalIgnoreCase)) {
+  [Console]::Error.WriteLine("ticket04 selected HOME mismatch: $environmentObservation expected=$expectedCliHome")
   exit 37
 }
 $promptPath = [IO.Path]::Combine($runtimeRootFull, 'data', 'auto-learning-prompt.txt')
@@ -2765,8 +2773,8 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         );
         assert_eq!(
             canonical_observed_path("HOME"),
-            std::fs::canonicalize(selected_root.join("user/dsh")).unwrap(),
-            "fake CLI must receive selected DSH HOME; observed={environment_observation:?}"
+            std::fs::canonicalize(selected_root.join("data/cli-profile")).unwrap(),
+            "fake CLI must receive the selected CLI profile as HOME; observed={environment_observation:?}"
         );
         assert_eq!(
             canonical_observed_path("CWD"),

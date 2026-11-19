@@ -1519,6 +1519,54 @@ fn post_send(console: &ConsoleProcess, agent_token: &str, payload: Value) -> Htt
 }
 
 #[test]
+fn send_resume_refuses_interaction_batches_even_in_reserved2() {
+    use sha2::{Digest, Sha256};
+
+    let onebot = FakeOneBot::start(70001, false);
+    let group = "group:70001";
+    let owner = "private:9001";
+    let root = fixture_root(
+        "interaction-resume-purpose", CONSOLE_A, AGENT_A, ONEBOT_A, &onebot.url,
+        group, &[70001], &["9001"], 100, json!([]),
+    );
+    hf123_config(&root, |_| {});
+    let state_path = root.join("data/social-v2.json");
+    let mut state = read_selected_state(&root);
+    state["conversations"][owner] = state["conversations"][group].clone();
+    fs::write(state_path, state.to_string()).unwrap();
+    let epoch: String = Sha256::digest(AGENT_A.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let protected = [(group, "approved-group"), (owner, "owner-interaction"), (owner, "owner-interaction-timeout")];
+    let controls = [(group, "legacy-group"), (owner, "legacy-private")];
+    let mut records = String::new();
+    for (key, batch) in protected.into_iter().chain(controls) {
+        let mut record = json!({
+            "k":"intent", "batch":batch, "key":key, "epoch":epoch,
+            "messages":[format!("resume fixture {batch}")], "delays":[0], "t":1001,
+        });
+        if protected.contains(&(key, batch)) {
+            record["purpose"] = json!(batch);
+        }
+        records.push_str(&record.to_string());
+        records.push('\n');
+    }
+    let outbox = root.join("data/send-outbox.jsonl");
+    fs::write(&outbox, &records).unwrap();
+    let console = ConsoleProcess::start(&root);
+    for (key, batch) in protected {
+        let response = post_send(&console, AGENT_A, json!({"key":key,"resumeBatchId":batch}));
+        assert_eq!(response.status, 409, "resume accepted a protected {batch} batch: {}", response.body);
+        assert_eq!(response.body["error"], "该批次不能恢复发送");
+    }
+    assert_eq!(fs::read_to_string(&outbox).unwrap(), records);
+    for (key, batch) in controls {
+        let control = post_send(&console, AGENT_A, json!({"key":key,"resumeBatchId":batch}));
+        assert_eq!(control.status, 200, "legacy control was not resumable: {}", control.body);
+    }
+    let requests = onebot.finish();
+    assert_eq!(send_texts(&requests), ["resume fixture legacy-group", "resume fixture legacy-private"]);
+}
+
+#[test]
 fn durable_partial_success_resumes_without_resending_confirmed_items() {
     let onebot = FakeOneBot::start_with(
         70001,

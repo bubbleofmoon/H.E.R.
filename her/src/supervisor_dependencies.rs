@@ -10,6 +10,26 @@ use std::time::{Duration, Instant};
 
 #[path = "supervisor_relay.rs"]
 mod relay;
+
+#[cfg(all(test, windows))]
+pub(crate) fn credential_file_is_private(path: &std::path::Path, settings: bool) -> bool {
+    relay::credential_file_is_private(path, settings)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_credential_file(path: &std::path::Path, settings: bool) -> std::io::Result<std::fs::File> {
+    relay::windows_create_credential(path, settings)
+}
+
+#[cfg(windows)]
+pub(crate) fn restrict_credential_path(path: &std::path::Path, metadata: &std::fs::Metadata, settings: bool) -> Result<(), String> {
+    if settings {
+        relay::windows_private_settings(path, metadata)
+    } else {
+        relay::windows_private(path, metadata)
+    }
+    .map_err(String::from)
+}
 #[path = "dependency_upgrade.rs"]
 pub(crate) mod upgrades;
 
@@ -1782,15 +1802,14 @@ fn deliver_outage_notice(
         .runtime_root()
         .ok_or("outage notice requires selected runtime")?
         .to_string_lossy();
-    if !crate::admin_alert::notice_limiter()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .check(
-            &scope,
-            &format!("dependency-{key}"),
-            crate::parity_clock::now_ms(),
-        )
-        .is_send()
+    if !crate::admin_alert::admit_notice(
+        context,
+        cfg,
+        &scope,
+        &format!("dependency-{key}"),
+        crate::parity_clock::now_ms(),
+    )
+    .is_send()
     {
         return Ok(());
     }

@@ -21,6 +21,7 @@ pub(crate) struct Round {
 /// What an admission replays (`Store::admit`): the newest checkpoint's summary and the completed turns after it.
 #[derive(Clone, Debug)]
 pub(crate) struct History {
+    pub session: String,
     /// The summary the session's newest checkpoint carries (`None`: no checkpoint, or one without a summary).
     pub summary: Option<String>,
     /// The completed turns after that checkpoint, oldest first.
@@ -203,7 +204,13 @@ impl Store {
     /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
     /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
     pub(super) fn admit_with_briefing(&self, request: &TurnRequest, briefing: Option<Value>) -> Result<History, String> {
-        let initial = crate::engine_switch::summary(&self.context, &request.conversation, &request.generation, crate::turn_engine::Engine::Harness)?;
+        let known = record_credentials(&self.context)?;
+        let initial = crate::engine_switch::summary(
+            &self.context,
+            &request.conversation,
+            &request.generation,
+            crate::turn_engine::Engine::Harness,
+        )?.map(|summary| safe_text(&known, &summary));
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -276,6 +283,7 @@ impl Store {
                 }
             }
             History {
+                session: session.clone(),
                 summary,
                 rounds: rounds.into_iter().map(|(_, round)| round).collect(),
                 idle_from,
@@ -288,9 +296,9 @@ impl Store {
         let route = request.route.routes.get(request.route.start).ok_or(STORAGE_ERROR)?;
         let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
-            params![attempt, request.id, safe_text(&self.context, &route.model), safe_text(&self.context, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
+            params![attempt, request.id, safe_text(&known, &route.model), safe_text(&known, &request.route.endpoint), now]).map_err(|_| STORAGE_ERROR)?;
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             &request.id,
@@ -299,7 +307,7 @@ impl Store {
             json!({"generation":request.generation,"profile":request.profile,"tools":request.tools.definitions(),"limits":{"maxSteps":request.limits.max_steps,"maxTokens":request.limits.max_tokens,"imageInput":request.limits.image_input,"toolResultChars":request.limits.tool_result_chars}}),
         )?;
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             &request.id,
@@ -316,10 +324,10 @@ impl Store {
             if !crate::briefing_delivery::delivered(&mut record, &request.id, seq) {
                 return Err(STORAGE_ERROR.into());
             }
-            append(&self.context, &tx, &session, &request.id, None, "wake_briefing", record)?;
+            append(&known, &tx, &session, &request.id, None, "wake_briefing", record)?;
         }
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             &request.id,
@@ -333,13 +341,14 @@ impl Store {
 
     /// Complete exactly this model attempt, durably retaining its complete canonical call list.
     pub fn complete_step(&self, turn: &str, assistant: &Event) -> Result<String, String> {
+        let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| STORAGE_ERROR)?;
         let session = running_session(&tx, turn)?;
         let attempt =
-            end_attempt(&self.context, &tx, &session, turn, "completed", Some(assistant))?.ok_or(STORAGE_ERROR)?;
+            end_attempt(&known, &tx, &session, turn, "completed", Some(assistant))?.ok_or(STORAGE_ERROR)?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(attempt)
     }
@@ -351,7 +360,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| STORAGE_ERROR)?;
         let session = running_session(&tx, turn)?;
-        end_attempt(&self.context, &tx, &session, turn, "failed", None)?.ok_or(STORAGE_ERROR)?;
+        end_attempt(&[], &tx, &session, turn, "failed", None)?.ok_or(STORAGE_ERROR)?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())
     }
@@ -359,6 +368,7 @@ impl Store {
     /// A new attempt of the running turn on route `route` of its chain (a step, a retry or a failover).
     pub fn next_attempt(&self, request: &TurnRequest, route: usize) -> Result<(), String> {
         let route = request.route.routes.get(route).ok_or(STORAGE_ERROR)?;
+        let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -366,9 +376,9 @@ impl Store {
         let session = running_session(&tx, &request.id)?;
         let attempt = crate::turn_ledger::mint_id("model-attempt-");
         tx.execute("INSERT INTO model_attempts(id,turn_id,model,endpoint,state,begun_ms) VALUES(?1,?2,?3,?4,'running',?5)",
-            params![attempt, request.id, safe_text(&self.context, &route.model), safe_text(&self.context, &request.route.endpoint), crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
+            params![attempt, request.id, safe_text(&known, &route.model), safe_text(&known, &request.route.endpoint), crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             &request.id,
@@ -382,6 +392,7 @@ impl Store {
 
     /// Intent commits before the blocking handler may be scheduled, including refused calls.
     pub fn tool_start(&self, turn: &str, attempt: &str, call: &ToolCall) -> Result<String, String> {
+        let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -389,9 +400,9 @@ impl Store {
         let session = running_session(&tx, turn)?;
         let id = crate::turn_ledger::mint_id("tool-run-");
         tx.execute("INSERT INTO tool_runs(id,turn_id,attempt_id,call_id,name,arguments,state,begun_ms) VALUES(?1,?2,?3,?4,?5,?6,'running',?7)",
-            params![id,turn,attempt,protocol_label(&self.context, &call.call_id, "her_call_"),safe_text(&self.context, &call.fn_name),safe_record(&self.context, &call.fn_arguments).to_string(),crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
+            params![id,turn,attempt,protocol_label(&known, &call.call_id, "her_call_"),safe_text(&known, &call.fn_name),safe_record(&known, &call.fn_arguments).to_string(),crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             turn,
@@ -410,6 +421,7 @@ impl Store {
         message: &ChatMessage,
         outcome: &Value,
     ) -> Result<(), String> {
+        let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -435,12 +447,12 @@ impl Store {
                 run,
                 state,
                 crate::parity_clock::now_ms(),
-                safe_record(&self.context, outcome).to_string()
+                safe_record(&known, outcome).to_string()
             ],
         )
         .map_err(|_| STORAGE_ERROR)?;
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             turn,
@@ -457,16 +469,17 @@ impl Store {
     /// sequence of the last fact it covers and the summary it carries); either may be absent. Later admissions replay
     /// from the newest checkpoint (`admit`); no fact is rewritten.
     pub fn checkpoint(&self, turn: &str, failed: Option<Value>, checkpoint: Option<Value>) -> Result<(), String> {
+        let known = record_credentials(&self.context)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| STORAGE_ERROR)?;
         let session = running_session(&tx, turn)?;
         if let Some(failed) = failed {
-            append(&self.context, &tx, &session, turn, None, "checkpoint_failed", failed)?;
+            append(&known, &tx, &session, turn, None, "checkpoint_failed", failed)?;
         }
         if let Some(checkpoint) = checkpoint {
-            append(&self.context, &tx, &session, turn, None, "checkpoint", checkpoint)?;
+            append(&known, &tx, &session, turn, None, "checkpoint", checkpoint)?;
         }
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())
@@ -490,7 +503,8 @@ impl Store {
                 ("paused", pause.as_str())
             }
         };
-        let result = safe_text(&self.context, result);
+        let known = record_credentials(&self.context)?;
+        let result = safe_text(&known, result);
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -502,7 +516,7 @@ impl Store {
                 |r| r.get(0),
             )
             .map_err(|_| STORAGE_ERROR)?;
-        end_attempt(&self.context, &tx, &session, turn, state, assistant)?;
+        end_attempt(&known, &tx, &session, turn, state, assistant)?;
         let now = crate::parity_clock::now_ms();
         tx.execute(
             "UPDATE turns SET state=?2,ended_ms=?3,result=?4 WHERE id=?1",
@@ -510,7 +524,7 @@ impl Store {
         )
         .map_err(|_| STORAGE_ERROR)?;
         append(
-            &self.context,
+            &known,
             &tx,
             &session,
             turn,
@@ -556,7 +570,7 @@ fn running_session(tx: &Transaction<'_>, turn: &str) -> Result<String, String> {
 }
 
 fn end_attempt(
-    context: &RuntimeContext,
+    known: &[String],
     tx: &Transaction<'_>,
     session: &str,
     turn: &str,
@@ -580,7 +594,7 @@ fn end_attempt(
     let raw = match assistant {
         Some(Event::Assistant { text, raw, message }) => {
             append(
-                context,
+                known,
                 tx,
                 session,
                 turn,
@@ -588,7 +602,7 @@ fn end_attempt(
                 "assistant",
                 json!({"text":text,"raw":raw,"message":message}),
             )?;
-            Some(safe_record(context, raw).to_string())
+            Some(safe_record(known, raw).to_string())
         }
         _ => None,
     };
@@ -598,7 +612,7 @@ fn end_attempt(
     )
     .map_err(|_| STORAGE_ERROR)?;
     append(
-        context,
+        known,
         tx,
         session,
         turn,
@@ -611,8 +625,8 @@ fn end_attempt(
 
 // A shared mask cannot be used as a protocol/uniqueness key. Reserved-prefix
 // inputs are aliased too, so ordinary IDs cannot collide with generated aliases.
-fn protocol_label(context: &RuntimeContext, label: &str, prefix: &str) -> String {
-    if !label.starts_with(prefix) && safe_text(context, label) == label {
+fn protocol_label(known: &[String], label: &str, prefix: &str) -> String {
+    if !label.starts_with(prefix) && safe_text(known, label) == label {
         return label.to_string();
     }
     use base64::Engine as _;
@@ -620,43 +634,50 @@ fn protocol_label(context: &RuntimeContext, label: &str, prefix: &str) -> String
     format!("{prefix}{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(label.as_bytes())))
 }
 
-fn safe_text(context: &RuntimeContext, text: &str) -> String {
-    crate::activity::mask_log_text(text, &crate::activity::known_session_tokens(context))
+// Snapshot before taking the conversations connection lock. Both stores can wait on SQLite readers.
+pub(super) fn record_credentials(context: &RuntimeContext) -> Result<Vec<String>, String> {
+    let mut known = crate::activity::known_session_tokens(context);
+    known.extend(crate::settings::harness_credential(context));
+    known.extend(crate::settings::stored_secrets(context)?);
+    Ok(known)
 }
 
-fn safe_record(context: &RuntimeContext, value: &Value) -> Value {
-    crate::activity::mask_json_session_tokens(value, &crate::activity::known_session_tokens(context))
+fn safe_text(known: &[String], text: &str) -> String {
+    crate::activity::mask_log_text(text, known)
 }
 
-fn safe_message(context: &RuntimeContext, mut message: ChatMessage) -> Result<Value, String> {
-    let known = crate::activity::known_session_tokens(context);
+fn safe_record(known: &[String], value: &Value) -> Value {
+    crate::activity::mask_json_session_tokens(value, known)
+}
+
+fn safe_message(known: &[String], mut message: ChatMessage) -> Result<Value, String> {
     for part in message.content.iter_mut() {
         match part {
             ContentPart::Text(text) | ContentPart::ReasoningContent(text) => {
-                *text = crate::activity::mask_log_text(text, &known);
+                *text = crate::activity::mask_log_text(text, known);
             }
             ContentPart::ToolCall(call) => {
-                call.call_id = protocol_label(context, &call.call_id, "her_call_");
-                call.fn_name = protocol_label(context, &call.fn_name, "her_tool_");
-                call.fn_arguments = crate::activity::mask_json_session_tokens(&call.fn_arguments, &known);
+                call.call_id = protocol_label(known, &call.call_id, "her_call_");
+                call.fn_name = protocol_label(known, &call.fn_name, "her_tool_");
+                call.fn_arguments = crate::activity::mask_json_session_tokens(&call.fn_arguments, known);
                 // Provider signatures must remain valid for canonical replay.
             }
             ContentPart::ToolResponse(response) => {
-                response.call_id = protocol_label(context, &response.call_id, "her_call_");
+                response.call_id = protocol_label(known, &response.call_id, "her_call_");
                 if let Some(name) = &mut response.fn_name {
-                    *name = protocol_label(context, name, "her_tool_");
+                    *name = protocol_label(known, name, "her_tool_");
                 }
-                response.content = crate::activity::mask_log_text(&response.content, &known);
+                response.content = crate::activity::mask_log_text(&response.content, known);
             }
             ContentPart::Binary(binary) => {
                 if let Some(name) = &mut binary.name {
-                    *name = crate::activity::mask_log_text(name, &known);
+                    *name = crate::activity::mask_log_text(name, known);
                 }
                 // Encoded bytes/URLs and MIME types are operational image data.
             }
             ContentPart::ThoughtSignature(_) => {}
             ContentPart::Custom(custom) => {
-                custom.data = crate::activity::mask_json_session_tokens(&custom.data, &known);
+                custom.data = crate::activity::mask_json_session_tokens(&custom.data, known);
             }
         }
     }
@@ -664,7 +685,7 @@ fn safe_message(context: &RuntimeContext, mut message: ChatMessage) -> Result<Va
 }
 
 fn append(
-    context: &RuntimeContext,
+    known: &[String],
     tx: &Transaction<'_>,
     session: &str,
     turn: &str,
@@ -672,10 +693,10 @@ fn append(
     kind: &str,
     payload: Value,
 ) -> Result<(), String> {
-    let mut safe = safe_record(context, &payload);
+    let mut safe = safe_record(known, &payload);
     if let Some(message) = payload.get("message") {
         let message = serde_json::from_value(message.clone()).map_err(|_| STORAGE_ERROR)?;
-        safe["message"] = safe_message(context, message)?;
+        safe["message"] = safe_message(known, message)?;
     }
     tx.execute("INSERT INTO events(session_id,turn_id,attempt_id,kind,payload,created_ms) VALUES(?1,?2,?3,?4,?5,?6)",
         params![session,turn,attempt,kind,safe.to_string(),crate::parity_clock::now_ms()]).map_err(|_| STORAGE_ERROR)?;
@@ -797,22 +818,67 @@ fn attempt_route(model: String, started: &str) -> String {
 mod tests {
     use super::*;
     use crate::harness::{Limits, ModelRoute, Tools};
+    use crate::runtime::tests::runtime_fixture;
     use genai::chat::{Binary, BinarySource, ContentPart};
 
     #[test]
+    fn ticket219_core_harness_records_mask_stored_credentials() {
+        let root = std::env::temp_dir().join(format!("her-record-credential-{}", crate::turn_ledger::mint_id("")));
+        let fixture = runtime_fixture(root, &json!({"consoleToken": "fixture-console"}), &json!({
+            "dsh": "http://127.0.0.1:1",
+            "model": "http://127.0.0.1:2",
+            "onebot": "http://127.0.0.1:3",
+        }));
+        let root = &fixture.0;
+        std::fs::write(root.join("config/harness-api-key"), "fixture-harness-record-key").unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
+        let secret = "fixture-endpoint-record-key";
+        crate::settings::apply(&context, crate::settings::CLI_MODEL_API_KEY.key, &json!(secret), "fixture", "console").unwrap();
+        let known = record_credentials(&context).unwrap();
+        let captured = safe_record(&known, &json!({"body": secret}));
+        let message = safe_message(&known, ChatMessage::assistant(format!("before {secret} after"))).unwrap();
+        assert!(!captured.to_string().contains(secret) && !message.to_string().contains(secret), "harness record exposed a stored credential");
+        let route = ModelRoute::for_model(&context, "fixture-model").unwrap();
+        assert_eq!(route.redact(&format!("fixture-harness-record-key {secret}")), "[REDACTED] [REDACTED]");
+    }
+
+    #[test]
+    fn ticket219_core_harness_withholds_payload_when_credentials_are_unreadable() {
+        let root = std::env::temp_dir().join(format!("her-record-unreadable-{}", crate::turn_ledger::mint_id("")));
+        let fixture = runtime_fixture(root, &json!({"consoleToken": "fixture-console"}), &json!({
+            "dsh": "http://127.0.0.1:1",
+            "model": "http://127.0.0.1:2",
+            "onebot": "http://127.0.0.1:3",
+        }));
+        let root = &fixture.0;
+        let context = RuntimeContext::from_root(root).unwrap();
+        let store = Store::open(&context).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("INSERT INTO sessions(id,conversation,generation) VALUES('fixture','private:81','epoch');\nINSERT INTO turns(id,session_id,conversation,profile,state,begun_ms) VALUES('turn','fixture','private:81','fixture','running',1);").unwrap();
+        }
+        std::fs::write(root.join("data/settings.db"), b"unreadable fixture").unwrap();
+        let result = store.checkpoint("turn", None, Some(json!({"summary":"fixture-unknown-key"})));
+        let facts: i64 = store.conn.lock().unwrap().query_row("SELECT count(*) FROM events", [], |row| row.get(0)).unwrap();
+        assert!(result.is_err() && facts == 0, "harness wrote a payload without a credential snapshot");
+    }
+
+    #[test]
     fn hotfix128_binary_records_preserve_opaque_data_for_replay() {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-opaque-128-{}", crate::turn_ledger::mint_id(""))));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
         let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-128","harness":{"model":"fake-chat"}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "her-store-opaque-128-{}",
+            crate::turn_ledger::mint_id("")
+        ));
+        let fixture = runtime_fixture(root, &cfg, &json!({
+            "dsh": "http://127.0.0.1:43101",
+            "model": "http://127.0.0.1:43102",
+            "onebot": "http://127.0.0.1:43103"
+        }));
+        let root = &fixture.0;
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-128").unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let mut request = TurnRequest {
@@ -852,18 +918,20 @@ mod tests {
     #[test]
     fn harness_idle_rotation_last_call_reads_the_newest_answered_request_of_the_session() {
         use crate::harness::rotation::LastCall;
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-last-call-165-{}", crate::turn_ledger::mint_id(""))));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
         let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-165","harness":{"model":"fake-chat"}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "her-store-last-call-165-{}",
+            crate::turn_ledger::mint_id("")
+        ));
+        let fixture = runtime_fixture(root, &cfg, &json!({
+            "dsh": "http://127.0.0.1:43101",
+            "model": "http://127.0.0.1:43102",
+            "onebot": "http://127.0.0.1:43103"
+        }));
+        let root = &fixture.0;
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-165").unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), None, "no database: no request");
@@ -898,18 +966,20 @@ mod tests {
     #[test]
     fn harness_idle_rotation_last_call_names_the_route_its_attempt_recorded() {
         use crate::harness::rotation::LastCall;
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-last-route-7-{}", crate::turn_ledger::mint_id(""))));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
         let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-7","harness":{"routes":[{"id":"flash","model":"fake-flash"}]}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "her-store-last-route-7-{}",
+            crate::turn_ledger::mint_id("")
+        ));
+        let fixture = runtime_fixture(root, &cfg, &json!({
+            "dsh": "http://127.0.0.1:43101",
+            "model": "http://127.0.0.1:43102",
+            "onebot": "http://127.0.0.1:43103"
+        }));
+        let root = &fixture.0;
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-7").unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let request = TurnRequest {

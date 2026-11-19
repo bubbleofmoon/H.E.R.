@@ -35,7 +35,7 @@ HER_GITLEAKS=<path to gitleaks>), through /root/her/scripts or C:/her/scripts:
 - codex-work.sh implement <name> <worktree> <prompt> [model [effort [minutes]]], the worktree on a her/<n>-<slug>
   branch, the prompt file in that ticket's folder (<orch>/<n>/, not a link);
 - codex-work.sh plan <ticket> <name> <prompt> [model [effort [minutes]]], the prompt in that ticket's folder;
-- codex-task.sh <name> <workdir> <prompt> <model> <effort> read-only [minutes] (investigation), the prompt in a ticket folder;
+- codex-task.sh <name> <workdir> <prompt> <model> <effort> read-only [minutes] (investigation or review), the prompt in a ticket folder;
 - the codex-work.ps1 (-Mode implement|plan) and codex-task.ps1 (-Sandbox read-only) counterparts with the same values.
 The model is gpt-6.2-sol or gpt-6.2-astra and the effort medium or high; any other Codex call is refused.
 Polling GitHub gets its own refusal message for implementers and gates: gh with --watch or `gh run watch`, and gh run

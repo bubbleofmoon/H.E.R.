@@ -7,12 +7,13 @@ use crate::settings::Setting;
 const WAKE_QUIET: Setting = Setting {
     key: "reply.wakeQuietMs",
     pointer: "/socialV2/reply/wakeQuietMs",
-    kind: &Integer { min: 1, max: 30_000, default: 3_000, file: FileRule::Default },
+    kind: &Integer { min: 1, max: 30_000, default: Some(3_000), file: FileRule::Default },
     applies: "next wake",
     group: "reply rhythm",
     label: "Quiet time before a message wake",
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
     chat: true,
+    secret: false,
 };
 
 /// The group's settings, in registry order.
