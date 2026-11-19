@@ -177,11 +177,11 @@ pub(crate) fn apply_at(context: &RuntimeContext, key: &str, change: Change, oper
     Ok(claim)
 }
 
-fn notice_text(key: &str, mute: Mute, operator: Option<i64>, now: i64) -> String {
+fn notice_text(key: &str, mute: Mute, operator: Option<i64>, now: i64, cfg: &Value) -> String {
     let group = key.trim_start_matches("group:");
     let span = match (mute.whole_group, mute.until) {
         (true, _) => "全员禁言，结束时间未知".to_string(),
-        (false, Some(until)) => format!("约 {} 分钟，到 {}", (until - now + 59_999) / 60_000, clock(until, now)),
+        (false, Some(until)) => format!("约 {} 分钟，到 {}", (until - now + 59_999) / 60_000, clock(until, now, cfg)),
         (false, None) => "时长未知".to_string(),
     };
     let who = operator.map(|id| format!("操作人 {id}")).unwrap_or_else(|| "操作人未知".to_string());
@@ -194,7 +194,7 @@ pub fn record(context: &RuntimeContext, cfg: &Value, key: &str, change: Change, 
     match apply_at(context, key, change, operator, now) {
         Ok(Some(rev)) => {
             if let Some(mute) = active_at(context, key, now) {
-                crate::admin_alert::notify_notice(context, cfg, &notice_text(key, mute, operator, now), &format!("group-mute:{key}:{rev}"));
+                crate::admin_alert::notify_notice(context, cfg, &notice_text(key, mute, operator, now, cfg), &format!("group-mute:{key}:{rev}"));
             }
         }
         Ok(None) => {}

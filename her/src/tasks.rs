@@ -57,7 +57,7 @@ pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i6
                 let civil = date.at(hour as i8, minute as i8, 0, 0);
                 let slot = zone.to_ambiguous_timestamp(civil);
                 // A missing wall time is skipped. A repeated wall time runs only on its first occurrence.
-                if !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) || hour == 2 { // RED-Z2
+                if !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
                     let stamp = slot.earlier().ok()?;
                     if stamp > after {
                         return Some(stamp.as_millisecond());

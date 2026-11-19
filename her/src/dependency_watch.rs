@@ -661,7 +661,7 @@ mod tests {
         };
         let recover = |context: &RuntimeContext| {
             for _ in 0..3 {
-                report_gaps_with(context, Some(127), &|text| text.to_string(), &|_, _| {
+                report_gaps_with(context, &jiff::tz::TimeZone::UTC, Some(127), &|text| text.to_string(), &|_, _| {
                     panic!("recovery must never reoffer an uncertain window")
                 });
             }
@@ -786,7 +786,7 @@ mod tests {
             let (context, selected, sends) = (context.clone(), selected.clone(), sends.clone());
             std::thread::spawn(move || {
                 let first_redaction = std::cell::Cell::new(true);
-                report_gaps_with(&context, Some(8808), &|text| {
+                report_gaps_with(&context, &jiff::tz::TimeZone::UTC, Some(8808), &|text| {
                     // Both paths have selected the same unannounced window before
                     // either can claim it. Later formatting redactions do not wait.
                     if first_redaction.replace(false) { selected.wait(); }
@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn retrying_gap_guidance_names_the_next_reconnect() {
-        let text = gap_line(&[&gap(1, "group:42", 0, 1000, "unknown", "history-empty")], 0, None);
+        let text = gap_line(&[&gap(1, "group:42", 0, 1000, "unknown", "history-empty")], &jiff::tz::TimeZone::UTC, None);
         assert!(text.contains("下次重连"), "recovery has no timer on a stable connection: {text}");
         assert!(!text.contains("稍后自动重试"), "{text}");
     }
