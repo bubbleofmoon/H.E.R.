@@ -645,7 +645,7 @@ fn has_settings_schema(conn: &Connection, version: i64) -> bool {
 fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // Refuse what this release cannot use before any connection that can write opens the store.
     drop(inspect(context)?);
-    let path = check_paths(context, PathIntent::WriteFile)?; #[cfg(windows)] crate::guarded_file::restrict_credential(path.parent().ok_or(STORAGE_ERROR)?).map_err(|_| STORAGE_ERROR.to_string())?; // RED-P2A
+    let path = check_paths(context, PathIntent::WriteFile)?;
     // Protect existing files before opening a write connection. SQLite's Unix sidecars use the database mode.
     match crate::guarded_file::create_settings_file(&path) {
         Ok(_) => {}
