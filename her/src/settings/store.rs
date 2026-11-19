@@ -647,13 +647,13 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     drop(inspect(context)?);
     let path = check_paths(context, PathIntent::WriteFile)?;
     // Protect existing files before opening a write connection. SQLite's Unix sidecars use the database mode.
-    match crate::guarded_file::create_settings_file(&path) {
+    match crate::guarded_credentials::create_settings_file(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return Err(STORAGE_ERROR.to_string()),
     }
     for file in std::iter::once(path.clone()).chain(SIDECARS.map(|name| path.with_file_name(name))) {
-        match crate::guarded_file::restrict_settings_file(&file) {
+        match crate::guarded_credentials::restrict_settings_file(&file) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && file != path => {}
             Err(_) => return Err(STORAGE_ERROR.to_string()),
@@ -676,7 +676,7 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // The journal used for switching to WAL carries SQLite's database header page only.
     #[cfg(windows)]
     for name in &SIDECARS[..2] {
-        crate::guarded_file::restrict_settings_file(&path.with_file_name(name))
+        crate::guarded_credentials::restrict_settings_file(&path.with_file_name(name))
             .map_err(|_| STORAGE_ERROR.to_string())?;
     }
     match schema_version(&tx)? {

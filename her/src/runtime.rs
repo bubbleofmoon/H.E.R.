@@ -886,7 +886,7 @@ impl RuntimeContext {
         self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         // Every early return below drops `staged`, which removes the temporary file.
         let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db")) {
-            crate::guarded_file::stage_settings_file(&target, input)
+            crate::guarded_credentials::stage_settings_file(&target, input)
         } else {
             crate::guarded_file::stage(&target, input, None)
         }

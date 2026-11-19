@@ -32,7 +32,7 @@ impl Staging {
         }
         builder.create(&path).map_err(|e| e.to_string())?;
         let staging = Self(path);
-        crate::guarded_file::restrict_credential(&staging.0)
+        crate::guarded_credentials::restrict_credential(&staging.0)
             .map_err(|_| "restore staging permissions unavailable".to_string())?;
         Ok(staging)
     }
