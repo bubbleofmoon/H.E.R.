@@ -1567,7 +1567,8 @@ mod tests {
         for text in &texts {
             assert!(!crate::model_text_policy::denied_terms(text).contains(&"dsh".to_string()), "{text}");
         }
-        assert_eq!(texts, ["【别像客服】D鲸鱼SH 鲸鱼好", "【别像客服】D\n\nSH", "ab"]);
+        // Per occurrence (#239): the occurrence that would join "D" and "SH" stays, the safe one is stripped.
+        assert_eq!(texts, ["【别像客服】D鲸鱼SH 好", "【别像客服】D\n\nSH", "ab"]);
     }
 
     #[test]
