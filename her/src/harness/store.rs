@@ -502,6 +502,17 @@ impl Store {
         status: &Status,
         assistant: Option<&Event>,
     ) -> Result<(), String> {
+        let reason = matches!(status, Status::ObservationSleep).then_some("observationSleep");
+        self.finish_with_reason(turn, status, assistant, reason)
+    }
+
+    pub(crate) fn finish_with_reason(
+        &self,
+        turn: &str,
+        status: &Status,
+        assistant: Option<&Event>,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
         let pause;
         let (state, result) = match status {
             Status::Running => return Err("cannot finish a running harness turn".into()),
@@ -535,8 +546,8 @@ impl Store {
         )
         .map_err(|_| STORAGE_ERROR)?;
         let mut terminal = json!({"state":state,"result":result});
-        if matches!(status, Status::ObservationSleep) {
-            terminal["reason"] = json!("observationSleep");
+        if let Some(reason) = reason {
+            terminal["reason"] = json!(reason);
         }
         append(
             &known,

@@ -752,7 +752,7 @@ fn reconcile_conversations(context: &RuntimeContext) -> Result<(), String> {
             _ => None,
         };
         if let Some(status) = status {
-            store.finish(&id, &status, None)?;
+            store.finish_with_reason(&id, &status, None, Some(&turn.outcome_reason))?;
             continue;
         }
         // Use the same batch association and uncertainty classification as startup recovery.
@@ -1952,6 +1952,52 @@ mod tests {
     #[test]
     fn harness_conversation_continues_after_runtime_restore() {
         harness_continuation(false, false);
+    }
+
+    #[test]
+    fn restored_empty_completion_keeps_its_ledger_reason() {
+        use crate::harness::{store::Store, Limits, ModelRoute, Status, Tools, TurnRequest};
+        use crate::turn_ledger::Recorder;
+
+        let f = Fixture::new();
+        let context = f.context();
+        let mut cfg = context.load_config().unwrap();
+        cfg["harness"] = json!({"model":"fake-chat"});
+        fs::write(f.0.join("config/harness-api-key"), "synthetic-restore-key").unwrap();
+        let mut turns = Vec::new();
+        let archive = {
+            let store = Store::open(&context).unwrap();
+            for reason in ["observationSleep", "ok"] {
+                let key = format!("private:{reason}");
+                let turn = Recorder::begin_reserved2(&context, &key, "harness", "atMention", "generation", &[]).unwrap();
+                store.admit(&TurnRequest {
+                    id: turn.id.clone(), conversation: key, generation: "generation".into(),
+                    prompt: "wake".into(), media: Vec::new(), profile: "reserved2".into(),
+                    route: ModelRoute::from_runtime(&context, &cfg).unwrap(), deadline: Duration::from_secs(10),
+                    tools: Tools::empty(), limits: Limits::from_config(&cfg),
+                }).unwrap();
+                turns.push((turn, reason));
+            }
+            f.backup()
+        };
+        for (turn, reason) in &turns { turn.end("completed", reason).unwrap(); }
+        let plan = preview(&context, &archive, false).unwrap();
+        execute_with(&context, &archive, false, plan["confirmation"].as_str().unwrap(), "fixture",
+            &mut FakeControl::default()).unwrap();
+        let store = Store::open(&context).unwrap();
+        let db = rusqlite::Connection::open(context.data_dir().join("conversations.db")).unwrap();
+        for (turn, reason) in turns {
+            let status = store.status(&turn.id).unwrap().unwrap();
+            match reason {
+                "observationSleep" => assert!(matches!(status, Status::ObservationSleep)),
+                _ => assert!(matches!(status, Status::Completed(text) if text.is_empty())),
+            }
+            let recorded: String = db.query_row(
+                "SELECT json_extract(payload,'$.reason') FROM events WHERE turn_id=?1 AND kind='turn_ended'",
+                [&turn.id], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(recorded, reason);
+        }
     }
 
     #[test]

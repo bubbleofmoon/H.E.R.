@@ -942,13 +942,13 @@ impl Pipeline {
             let rpc_id = crate::dsh::mint_request_id();
             self.turn_validity(key, &sid)?;
             let mut layers: Option<serde_json::Value> = None;
-            if self.context.is_isolated() && self.cur_turn.is_some() && self.chat.is_none() {
+            if let Some(turn) = self.cur_turn.as_ref().filter(|_| self.context.is_isolated() && self.chat.is_none()) {
                 follow.track_briefing(&self.context, key, &sid, &self.turn_token)?;
                 if self.current_reason != "wakeReminder" {
                     // A persona switch or compaction can start a new briefing generation while this
                     // wake is prepared; nothing was submitted, so prepare once more.
-                    let wake = match crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt) {
-                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt),
+                    let wake = match crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt, &turn.id) {
+                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt, &turn.id),
                         other => other,
                     }?;
                     layers = Some(serde_json::json!({"injected": wake.layers.to_json(), "cut": wake.cut.to_json()}));

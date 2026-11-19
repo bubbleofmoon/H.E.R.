@@ -133,9 +133,9 @@ pub(crate) struct HttpReply {
     pub(crate) body: Vec<u8>,
 }
 
-pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<String, String> {
+pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str) -> Result<String, String> {
     let port = context.console_port().or_else(|| cfg["consolePort"].as_u64().and_then(|p| u16::try_from(p).ok())).ok_or("wake snapshot console port unavailable")?;
-    let body = serde_json::json!({"key":key,"token":token}).to_string();
+    let body = serde_json::json!({"key":key,"token":token,"turnId":turn}).to_string();
     let reply = http_request(&format!("127.0.0.1:{port}"), "POST", "/api/socialV2/wake-snapshot",
         &[("x-console-token".into(), context.effective_console_token(cfg)), ("Content-Type".into(), "application/json".into())],
         Some(&body), std::time::Duration::from_secs(5))?;

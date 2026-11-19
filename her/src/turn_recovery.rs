@@ -889,11 +889,15 @@ impl Pass<'_> {
             }
             // The main loop marks a refused wake's events handled one iteration later; wait for it.
             let settled = held.iter().all(|k| {
-                !matches!(journal.stage_of(k).ok().flatten().as_deref(), Some("received" | "processing"))
+                journal.stage_of(k).is_ok_and(|stage| !matches!(stage.as_deref(), Some("received" | "processing")))
             });
             if !settled {
                 continue;
             }
+            // The worker persists a held wake's expiry before the hub settles its journal entry.
+            // Our pass may have read the hold before that end. Recheck it after observing settlement.
+            let Ok(fresh) = turn_ledger::read_records(self.context) else { continue };
+            if turn_ledger::held_events(&fresh, &key) != held { continue; }
             if let Err(error) = turn_ledger::append_record(
                 self.context,
                 &serde_json::json!({"k": "requeued", "t": now(), "key": key, "inbound": held}),
@@ -912,6 +916,12 @@ impl Pass<'_> {
     fn orphans(&self, journal: &Journal, turns: &[Turn], records: &[Value]) {
         let Ok(interrupted) = journal.interrupted_events() else { return };
         for event in interrupted {
+            if records.iter().any(|r| turn_ledger::ended_hold(r) && r["key"] == event.conversation
+                && r["inbound"].as_array().is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(event.event_key.as_str())))) {
+                // A crash can interrupt the journal mark after the durable expiry of a held wake.
+                settle(journal, std::slice::from_ref(&event.event_key), "handled");
+                continue;
+            }
             if turns.iter().any(|t| t.inbound.contains(&event.event_key)) {
                 // Handled by the owning turn's verdict (finished turns settle in `finished`).
                 continue;
@@ -1241,6 +1251,50 @@ mod tests {
             drop(journal);
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn ticket159_expired_held_inbound_stays_handled_after_resolution() {
+        let key = "group:42";
+        let cfg = json!({"consoleToken":"synthetic-held-cap","engineDefault":"harness","allow":{"groups":[42]}});
+        let root = crate::runtime::tests::runtime_fixture(std::env::temp_dir().join(turn_ledger::mint_id("her-held-cap-")),
+            &cfg, &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}));
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.0.join("data/social-v2.json"), json!({"conversations":{key:{"agentToken":"held-cap-token"}}}).to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let journal = Journal::open(&context).unwrap();
+        let input = "group:42|message:159".to_owned();
+        journal.record_received(&input, key, "{}", 1).unwrap();
+        journal.mark_processing(std::slice::from_ref(&input), 2).unwrap();
+        let paused = Recorder::begin(&context, key, "dsh", "atMention", "earlier", &[], None).unwrap();
+        paused.unknown("send-unresolved", "fixture").unwrap();
+        let mut pipe = crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true).unwrap();
+        pipe.note_turn("atMention", std::slice::from_ref(&input));
+        pipe.expect_dispatch_deadline(10);
+        let clock_context = context.clone();
+        pipe.admission_clock = Some(Box::new(move || {
+            if turn_ledger::read_records(&clock_context).unwrap().iter().any(|r| r["k"] == "held") { 10 } else { 9 }
+        }));
+        let err = pipe.run_turn(&crate::onebot::Target::Group(42), "", "", &cfg).await.unwrap_err();
+        assert!(err.contains("turnTimeout"), "{err}");
+        // Lose the process after the durable expiry and before the hub marks the input handled.
+        assert_eq!(journal.recover_interrupted(now()).unwrap(), vec![input.clone()]);
+        paused.resolved("abandon").unwrap();
+        let pass = Pass { context: &context, cfg: &cfg };
+        let records = turn_ledger::read_records(&context).unwrap();
+        pass.resolutions(&journal, &fold(&records).0, &records);
+        let records = turn_ledger::read_records(&context).unwrap();
+        assert!(fold(&records).0.iter().any(|t| t.id == paused.id && t.resolution_applied));
+        pass.orphans(&journal, &fold(&records).0, &records);
+        assert_eq!(journal.stage_of(&input).unwrap().as_deref(), Some("handled"));
+        // A pass that observed resolution and the hold before its terminal write must also refuse replay.
+        let stale: Vec<_> = records.iter().filter(|r| !turn_ledger::ended_hold(r)).cloned().collect();
+        pass.release_held(&journal, &fold(&stale).0, &stale);
+        pass.release_held(&journal, &fold(&records).0, &records);
+        assert_eq!(journal.stage_of(&input).unwrap().as_deref(), Some("handled"), "an expired held wake must never replay");
+        let records = turn_ledger::read_records(&context).unwrap();
+        assert!(records.iter().any(|r| r["k"] == "ended" && r["reason"] == "turnTimeout" && r["outcome"] == "cancelled"
+            && r["inbound"] == json!([input])));
     }
 
     #[test]

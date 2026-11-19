@@ -149,6 +149,15 @@ async fn seam_reserved2_turn_runs_on_the_scripted_adapter() {
 
 #[tokio::test]
 async fn ticket159_reserved2_uses_the_cli_pin_added_while_waiting_for_admission() {
+    cli_pin_added_at_admission(false).await;
+}
+
+#[tokio::test]
+async fn ticket159_expired_admission_never_starts_late_cli_pin() {
+    cli_pin_added_at_admission(true).await;
+}
+
+async fn cli_pin_added_at_admission(expire: bool) {
     let mut queued = SeamRuntime::scripted_config();
     queued["engineDefault"] = json!("harness");
     let runtime = SeamRuntime::new("seam-cli-pin-at-admission", "reserved2", false, queued);
@@ -161,6 +170,8 @@ async fn ticket159_reserved2_uses_the_cli_pin_added_while_waiting_for_admission(
     let route = SharedReserved2Route::default();
     *route.lock().unwrap() = Reserved2Route::PendingHarness;
     pipe.share_reserved2_route(route.clone(), MintedEpoch::default());
+    let deadline = crate::turn_ledger::now_ms() + 20;
+    if expire { pipe.expect_dispatch_deadline(deadline); }
     let target = Target::Group(42);
     let wake = pipe.run_turn(&target, "unused DSH wake", "fixture CLI wake", &queued);
     tokio::pin!(wake);
@@ -172,10 +183,24 @@ async fn ticket159_reserved2_uses_the_cli_pin_added_while_waiting_for_admission(
     let mut current: Value = serde_json::from_slice(&std::fs::read(runtime.root.join("config/config.json")).unwrap()).unwrap();
     current["backends"] = json!({"sessions":{key:"missing-fixture-cli"}});
     runtime.context.write_atomic(RuntimeArea::Config, "config.json", current.to_string().as_bytes()).unwrap();
+    if expire {
+        let remaining = deadline.saturating_sub(crate::turn_ledger::now_ms()).max(0) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(remaining + 1)).await;
+    }
     drop(gate);
 
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut wake).await.unwrap();
     let trials = std::fs::read_to_string(runtime.root.join("data/logs/opencode-trial.jsonl")).unwrap_or_default();
+    if expire {
+        assert!(trials.is_empty(), "an expired admission must not start the pinned CLI");
+        assert_eq!(result.unwrap_err(), RESERVED2_CAP_BEFORE_ADMISSION);
+        assert!(*route.lock().unwrap() == Reserved2Route::ExpiredBeforeAdmission);
+        assert!(!runtime.ledger().iter().any(|r| r["k"] == "begun" || r["k"] == "wake_claim"));
+        let gate = tokio::time::timeout(std::time::Duration::from_secs(1),
+            crate::engine_switch::turn_gate(&runtime.context, key)).await.expect("expired admission released its gate").unwrap();
+        drop(gate);
+        return;
+    }
     assert!(trials.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|row| row["key"] == key && row["backend"] == "missing-fixture-cli"),
         "the wake must dispatch the CLI pin selected after the gate opens: {result:?}");

@@ -1993,7 +1993,22 @@ pub(crate) fn prepare_dsh_wake(
     context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
     reason: &str, rpc_id: &str, prebuilt: &str,
 ) -> Result<(String, Vec<i64>), String> {
-    prepare_dsh_wake_layered(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt).map(|w| (w.text, w.recalled))
+    prepare_test_dsh_wake(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt).map(|w| (w.text, w.recalled))
+}
+
+/// Direct renderer fixtures enter the same turn-scoped snapshot route as the live pipeline.
+#[cfg(test)]
+pub(crate) fn prepare_test_dsh_wake(
+    context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
+    reason: &str, rpc_id: &str, prebuilt: &str,
+) -> Result<DshWake, String> {
+    let turn = crate::turn_ledger::Recorder::begin_reserved2(context, key, "dsh", reason,
+        &crate::send_outbox::token_epoch(epoch), &[])?;
+    let deadline = crate::turn_ledger::now_ms() + crate::wake::turn_budget(cfg).hard_cap_ms;
+    crate::turn_ledger::append_record(context, &serde_json::json!({"k":"budget","turn":turn.id,"deadline":deadline}))?;
+    let wake = prepare_dsh_wake_layered(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt, &turn.id);
+    turn.end(if wake.is_ok() { "completed" } else { "failed" }, "fixture render")?;
+    wake
 }
 
 /// Render at the DSH submission boundary, after resolving the actual session and epoch.
@@ -2002,11 +2017,11 @@ pub(crate) fn prepare_dsh_wake(
 /// (`record_recall_hits`) only after DSH accepts the submission.
 pub(crate) fn prepare_dsh_wake_layered(
     context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
-    reason: &str, rpc_id: &str, prebuilt: &str,
+    reason: &str, rpc_id: &str, prebuilt: &str, turn: &str,
 ) -> Result<DshWake, String> {
     let record = crate::session_map::context_record(context, key, sid, epoch)?;
     let delivery = crate::briefing_delivery::plan(&record);
-    let wake = render_wake(context, cfg, key, epoch, reason, prebuilt, &delivery, true)?;
+    let wake = render_wake(context, cfg, key, epoch, reason, prebuilt, &delivery, true, turn)?;
     if !crate::session_map::update_context(context, key, sid, epoch, |record| {
         wake.hold(record, &delivery, rpc_id);
     })? {
@@ -2037,7 +2052,7 @@ impl RenderedWake {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_wake(
     context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
-    reason: &str, prebuilt: &str, delivery: &crate::briefing_delivery::WakePlan, include_token: bool,
+    reason: &str, prebuilt: &str, delivery: &crate::briefing_delivery::WakePlan, include_token: bool, turn: &str,
 ) -> Result<RenderedWake, String> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
@@ -2159,7 +2174,7 @@ pub(crate) fn render_wake(
     delta.push_str(&crate::schedule::reminder_line(context, reason));
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
     let delta = crate::model_view::strip_from_model_text(&delta, cfg);
-    let snapshot = crate::qq_tools::wake_snapshot(context, cfg, key, epoch)?;
+    let snapshot = crate::qq_tools::wake_snapshot(context, cfg, key, epoch, turn)?;
     let carried = held.iter().chain(&recalled).copied().collect();
     let clock = format!("{}\n\n", clock_line(cfg, now_ms()));
     let text = format!("{clock}{}{delta}{snapshot}", header(full));

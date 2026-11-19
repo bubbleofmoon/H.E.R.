@@ -976,6 +976,8 @@ mod tests {
         pipe.share_minted_epoch(minted.clone());
         pipe.expect_dispatch_token(token.clone());
         pipe.expect_dispatch_deadline(now - 1);
+        // Admit before the base cap, then exercise the render/runner race on the real clock.
+        pipe.admission_clock = Some(Box::new(move || now - 2));
         pipe.note_turn("atMention", &inbound);
         configure(&mut pipe);
         let task = tokio::spawn(async move {
@@ -1062,6 +1064,94 @@ mod tests {
         }).await.expect("the render error fixture must settle");
     }
 
+    fn begin_receipt_turn(context: &RuntimeContext, token: &str, deadline: i64) -> String {
+        let key = HARNESS_CAP_KEY;
+        let turn = crate::turn_ledger::Recorder::begin_reserved2(
+            context, key, "harness", "atMention", &crate::send_outbox::token_epoch(token), &[],
+        ).unwrap();
+        crate::turn_ledger::append_record(context, &json!({"k":"budget","turn":turn.id,
+            "t":crate::turn_ledger::now_ms(),"deadline":deadline,"capMs":1000,"ceiling":deadline + 120_000})).unwrap();
+        turn.id
+    }
+
+    async fn snapshot_grant_fixture(label: &str) -> (CleanupRoot, Hub, tokio::net::TcpListener, String, String) {
+        let (root, hub, console) = harness_cap_fixture(label, None).await;
+        console::mutate_social_state_for(&hub.context, |state| {
+            let conv = &mut state["conversations"][HARNESS_CAP_KEY];
+            conv["unread"] = json!([{"seq":1},{"seq":2}]);
+            conv["lastUnreadSeq"] = json!(2);
+            conv["lastReadThroughSeq"] = json!(0);
+            conv["wakeConfig"]["mode"] = json!("active");
+            conv["wakeConfig"]["infinite"] = json!(false);
+            Ok(())
+        }).unwrap();
+        let token = console::conversation_token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
+        let turn = begin_receipt_turn(&hub.context, &token, crate::turn_ledger::now_ms() - 1);
+        (root, hub, console, token, turn)
+    }
+
+    #[tokio::test]
+    async fn ticket159_lost_snapshot_response_retry_replaces_grant() {
+        let (_root, hub, console, token, turn) = snapshot_grant_fixture("lost-snapshot").await;
+        let key = HARNESS_CAP_KEY;
+        let (client, credential, turn_id) = (hub.context.clone(), token.clone(), turn.clone());
+        let request = tokio::task::spawn_blocking(move || {
+            crate::qq_tools::wake_snapshot(&client, &client.load_config().unwrap(), key, &credential, &turn_id)
+        });
+        let (socket, body) = tokio::time::timeout(std::time::Duration::from_secs(5),
+            harness_cap_request(&console, "/api/socialV2/wake-snapshot")).await.unwrap();
+        let (status, lost) = console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot", Some(&body));
+        assert_eq!(status, 200);
+        assert_eq!(lost["readThroughSeq"], 2);
+        drop(socket);
+        assert!(request.await.unwrap().is_err(), "the renderer must lose the first response");
+        // Retry under the same live turn and token.
+        let mut cfg = hub.context.load_config().unwrap();
+        cfg["socialV2"]["context"]["wakeMessageLimit"] = json!(1);
+        hub.context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
+        let (status, retry) = console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot", Some(&body));
+        assert_eq!(status, 200);
+        assert_eq!(retry["includedUnreadCount"], 1);
+        let mark = |seq| console::agent_request(&hub.context, "POST", "/api/socialV2/mark-read",
+            Some(&json!({"key":key,"throughSeq":seq})), &token).0;
+        assert_eq!(mark(2), 400, "the lost response must not authorize the unseen suffix");
+        assert_eq!(retry["readThroughSeq"], 1);
+        assert_eq!(mark(1), 200, "the delivered retry grants its own prefix");
+    }
+
+    #[tokio::test]
+    async fn ticket159_snapshot_expiry_survives_revocation_lock_timeout() {
+        let (_root, hub, _console, token, turn) = snapshot_grant_fixture("locked-snapshot").await;
+        let key = HARNESS_CAP_KEY;
+        let (status, lost) = console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot",
+            Some(&json!({"key":key,"token":token,"turnId":turn})));
+        assert_eq!(status, 200);
+        assert_eq!(lost["readThroughSeq"], 2);
+        let (status, read) = console::agent_request(&hub.context, "GET",
+            &format!("/api/socialV2/unread?key={key}&afterSeq=0&limit=1"), None, &token);
+        assert_eq!(status, 200);
+        assert_eq!(read["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(read["messages"][0]["seq"], 1);
+        set_harness_cap_engagement(&hub.context, Value::Null);
+        let lock = console::acquire_social_state_gate(&hub.context).unwrap();
+        let error = pipeline::revoke_reserved2_epoch(&hub.context, key, &token, None).unwrap_err();
+        drop(lock);
+        assert!(error.contains("busy"), "{error}");
+        assert_eq!(console::conversation_token(&hub.context, key).unwrap().as_deref(), Some(token.as_str()));
+        for route in ["/api/socialV2/mark-read", "/api/socialV2/wake-config"] {
+            let (status, _) = console::agent_request(&hub.context, "POST", route,
+                Some(&json!({"key":key,"throughSeq":2})), &token);
+            assert_eq!(status, 400, "an expired grant cannot authorize unseen reads on {route}");
+        }
+        let (status, _) = console::agent_request(&hub.context, "POST", "/api/socialV2/mark-read",
+            Some(&json!({"key":key})), &token);
+        assert_eq!(status, 400, "omitting the cursor must not authorize an unseen read either");
+        assert_eq!(hub.state().unwrap()["conversations"][key]["unread"].as_array().unwrap().len(), 2);
+        let (status, _) = console::agent_request(&hub.context, "POST", "/api/socialV2/mark-read",
+            Some(&json!({"key":key,"throughSeq":1})), &token);
+        assert_eq!(status, 200, "the independent tool read retains its own receipt");
+    }
+
     #[tokio::test]
     async fn ticket159_reserved2_harness_expired_snapshot_cannot_authorize_unseen_reads() {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -1088,8 +1178,9 @@ mod tests {
             cfg["socialV2"]["context"]["wakeMessageLimit"] = json!(1);
             hub.context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
             let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+            let turn = begin_receipt_turn(&hub.context, &token, crate::turn_ledger::now_ms() + 60_000);
             let (status, next) = console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot",
-                Some(&json!({"key":key,"token":token})));
+                Some(&json!({"key":key,"token":token,"turnId":turn})));
             assert_eq!(status, 200);
             assert_eq!(next["includedUnreadCount"], 1);
             assert_eq!(next["readThroughSeq"], 1, "an expired snapshot must not authorize reading unseen messages");

@@ -848,8 +848,13 @@ pub fn record_replacement(
     )
 }
 
+/// Terminal admission expiry owns the held inbound even though no turn began for it.
+pub(crate) fn ended_hold(record: &Value) -> bool {
+    record["k"] == "ended" && record["held"] == true
+}
+
 /// Inbound events whose turn was refused because the conversation had a paused or recovering
-/// turn (`held`), and that nobody has handed back yet (`requeued`).
+/// turn (`held`), excluding holds that ended at admission or were handed back (`requeued`).
 pub fn held_events(records: &[Value], key: &str) -> Vec<String> {
     let mut held: Vec<String> = Vec::new();
     for record in records {
@@ -863,7 +868,7 @@ pub fn held_events(records: &[Value], key: &str) -> Vec<String> {
         };
         match record.get("k").and_then(Value::as_str) {
             Some("held") if matches_key => held.extend(events()),
-            Some("requeued") if matches_key => {
+            _ if matches_key && (record["k"] == "requeued" || ended_hold(record)) => {
                 let done = events();
                 held.retain(|e| !done.contains(e));
             }

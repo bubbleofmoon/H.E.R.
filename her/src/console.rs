@@ -2181,7 +2181,7 @@ fn note_model_seen_with_auth(
     seen_msgs: &[Value],
     auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<(), (u16, String)> {
-    // The receipt is process memory (see `agent::receipts_of`) and is never written to the state file. In a
+    // The receipt is process memory (see `agent::attach_receipts`) and is never written to the state file. In a
     // selected runtime it is still recorded under the shared state gate against the committed state, so a
     // session that was revoked, replaced or paused while the request waited records nothing.
     if context.is_isolated() {
@@ -5613,11 +5613,13 @@ pub(crate) fn reserved2_deadline(deadline: i64, cap: i64, ceiling: i64, start: i
         .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
 }
 
-/// Wait-only deadline; captured budgets survive companion restarts.
-fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value) -> Result<Option<(String, i64)>, (u16, String)> {
+/// Captured simulation budget shared by observation waits and snapshot read grants.
+fn captured_turn_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value, infer_legacy_wait: bool)
+    -> Result<Option<(String, crate::pipeline::Reserved2Budget)>, (u16, String)> {
+    use crate::pipeline::Reserved2Budget;
     if !context.is_isolated() {
         return Ok(conv["waitTurnDeadlineAt"].as_i64().filter(|at| *at > 0)
-            .map(|at| (conv["waitTurnId"].as_str().unwrap_or("").to_string(), at)));
+            .map(|at| (conv["waitTurnId"].as_str().unwrap_or("").to_string(), Reserved2Budget { deadline: at, ceiling: at, cap_ms: 0, began: 0 })));
     }
     let records = crate::turn_ledger::read_records(context).map_err(|_| (503,"wait turn ledger is unavailable".to_string()))?;
     let turns = crate::turn_ledger::fold(&records).0;
@@ -5625,6 +5627,7 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
     let record = records.iter().rev().find(|r|r["turn"]==turn.id && r["k"]=="budget");
     let deadline = match record.and_then(|r|r["deadline"].as_i64()).filter(|at| *at > 0) {
         Some(deadline) => deadline,
+        None if !infer_legacy_wait => return Ok(None),
         None => {
             // Older binaries did not capture a budget. Infer only within a current
             // start's cap interval; unknown or stale evidence cannot prove exhaustion.
@@ -5638,14 +5641,19 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
     };
     // While she is engaged the captured cap runs from her last send in this turn, never past
     // the captured ceiling. Records without capMs/ceiling keep their dispatch deadline.
-    let deadline = match record.and_then(|r| Some((r["capMs"].as_i64()?, r["ceiling"].as_i64()?, r))) {
-        Some((cap, ceiling, r)) => {
-            let start = r["t"].as_i64().unwrap_or(turn.begun_at);
-            reserved2_deadline(deadline, cap, ceiling, start, conv)
-        }
-        None => deadline,
+    let (cap_ms, ceiling) = record.and_then(|r| Some((r["capMs"].as_i64()?, r["ceiling"].as_i64()?)))
+        .unwrap_or((0, deadline));
+    let budget = Reserved2Budget {
+        deadline,
+        cap_ms,
+        ceiling,
+        began: record.and_then(|r| r["t"].as_i64()).unwrap_or(turn.begun_at),
     };
-    Ok(Some((turn.id.clone(), deadline)))
+    Ok(Some((turn.id.clone(), budget)))
+}
+
+fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value) -> Result<Option<(String, i64)>, (u16, String)> {
+    Ok(captured_turn_budget(context, cfg, key, epoch, conv, true)?.map(|(turn, budget)| (turn, budget.deadline_for(conv))))
 }
 
 fn mark_turn_budget_ended(context: &RuntimeContext, key: &str, token: &str, turn: &str) -> Result<(), (u16, String)> {

@@ -49,7 +49,7 @@ fn serve_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, std::th
 }
 
 fn wake(context: &RuntimeContext, cfg: &Value, rpc: &str) -> crate::prompt::DshWake {
-    crate::prompt::prepare_dsh_wake_layered(context, cfg, KEY, "sid-18", "epoch-18", "atMention", rpc, "").unwrap()
+    crate::prompt::prepare_test_dsh_wake(context, cfg, KEY, "sid-18", "epoch-18", "atMention", rpc, "").unwrap()
 }
 
 fn section(text: &str, name: &str) -> String {

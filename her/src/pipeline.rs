@@ -382,6 +382,23 @@ impl From<TurnAdmissionError> for String {
     }
 }
 
+enum LedgerAdmissionError {
+    Failed(String),
+    Held { message: String, record: serde_json::Value },
+}
+
+impl From<String> for LedgerAdmissionError {
+    fn from(error: String) -> Self { Self::Failed(error) }
+}
+
+impl From<LedgerAdmissionError> for String {
+    fn from(error: LedgerAdmissionError) -> Self {
+        match error {
+            LedgerAdmissionError::Failed(message) | LedgerAdmissionError::Held { message, .. } => message,
+        }
+    }
+}
+
 pub(crate) type MintedEpoch = Arc<Mutex<Option<String>>>;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -420,9 +437,12 @@ pub(crate) struct Reserved2Budget {
 }
 
 impl Reserved2Budget {
+    pub(crate) fn deadline_for(&self, conv: &serde_json::Value) -> i64 {
+        crate::console::reserved2_deadline(self.deadline, self.cap_ms, self.ceiling, self.began, conv)
+    }
+
     pub(crate) fn expired(&self, conv: &serde_json::Value) -> bool {
-        let deadline = crate::console::reserved2_deadline(self.deadline, self.cap_ms, self.ceiling, self.began, conv);
-        crate::turn_ledger::now_ms() >= deadline
+        crate::turn_ledger::now_ms() >= self.deadline_for(conv)
     }
 }
 
@@ -478,6 +498,8 @@ pub struct Pipeline {
     before_turn: Option<Box<dyn FnOnce() -> Option<String> + Send>>,
     dispatch_wake: Option<(i64, serde_json::Value)>,
     dispatch_deadline: Option<i64>,
+    #[cfg(test)]
+    pub(crate) admission_clock: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
     dispatch_unsubmitted: bool,
     /// Chat mode (ticket 12): the run state of the chat turn in flight.
     chat: Option<ChatRun>,
@@ -756,6 +778,8 @@ impl Pipeline {
             before_turn: None,
             dispatch_wake: None,
             dispatch_deadline: None,
+            #[cfg(test)]
+            admission_clock: None,
             dispatch_unsubmitted: true,
             chat: None,
             last_report: None,
@@ -1051,12 +1075,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
         }
         let admission = self.turn_adapter(&key, "reserved2").await;
-        let already_expired = || self.dispatch_deadline
-            .is_some_and(|deadline| crate::turn_ledger::now_ms() >= deadline);
         if let Some(route) = &self.reserved2_route {
             let mut route = route.lock().unwrap_or_else(|p| p.into_inner());
             if *route == Reserved2Route::ExpiredBeforeAdmission
-                || (*route == Reserved2Route::PendingHarness && admission.is_err() && already_expired())
+                || ((admission.is_ok() || *route == Reserved2Route::PendingHarness) && self.dispatch_expired())
             {
                 *route = Reserved2Route::ExpiredBeforeAdmission;
                 return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
@@ -1071,13 +1093,25 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     Reserved2Route::Dsh
                 };
             }
+        } else if admission.is_ok() && self.dispatch_expired() {
+            return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
         }
         let (adapter, _admission, admitted_cfg) = admission?;
         let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
         let harness = matches!(&adapter, crate::turn_engine::Adapter::Harness);
         let token = match self.begin_ledger_turn_as(&key, adapter.id(), true) {
-            Err(_) if harness && self.dispatch_deadline.is_some_and(|at| crate::turn_ledger::now_ms() >= at) => {
-                self.publish_expired_harness_route();
+            Err(error) if (harness || matches!(error, LedgerAdmissionError::Held { .. })) && self.dispatch_expired() => {
+                if let LedgerAdmissionError::Held { message, mut record } = error {
+                    record["k"] = serde_json::json!("ended");
+                    record["t"] = serde_json::json!(crate::turn_ledger::now_ms());
+                    record["held"] = serde_json::json!(true);
+                    record["outcome"] = serde_json::json!("cancelled");
+                    record["reason"] = serde_json::json!("turnTimeout");
+                    // Recovery still owns the hold if its durable end could not be written.
+                    crate::turn_ledger::append_record(&self.context, &record)
+                        .map_err(|error| format!("{message}: {error}"))?;
+                }
+                self.publish_expired_route();
                 return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
             }
             result => result?,
@@ -1126,11 +1160,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     /// while the conversation has a paused or unreconciled turn. Returns the agent token in force.
     #[cfg(test)]
     fn begin_ledger_turn(&mut self, key: &str) -> Result<String, String> {
-        self.begin_ledger_turn_as(key, crate::turn_engine::Engine::Dsh.id(), false)
+        self.begin_ledger_turn_as(key, crate::turn_engine::Engine::Dsh.id(), false).map_err(String::from)
     }
 
     /// Begin a durable turn for the adapter that will run it.
-    fn begin_ledger_turn_as(&mut self, key: &str, backend: &str, reserved2: bool) -> Result<String, String> {
+    fn begin_ledger_turn_as(&mut self, key: &str, backend: &str, reserved2: bool) -> Result<String, LedgerAdmissionError> {
         let inbound = std::mem::take(&mut self.next_inbound);
         self.refusals_recorded.clear();
         self.carried_messages = inbound.iter().filter_map(|key| key.rsplit_once("|message:")
@@ -1140,21 +1174,17 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let records = crate::turn_ledger::read_records(&self.context)?;
         let (turns, _) = crate::turn_ledger::fold(&records);
         if let Some(blocking) = crate::turn_ledger::blocking_turn(&turns, key) {
-            let _ = crate::turn_ledger::append_record(
-                &self.context,
-                &serde_json::json!({
-                    "k": "held", "t": crate::turn_ledger::now_ms(), "key": key,
-                    "inbound": inbound, "reason": reason, "blockedBy": blocking.id,
-                }),
-            );
-            return Err(format!(
-                "{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）",
-                blocking.id
-            ));
+            let record = serde_json::json!({
+                "k":"held", "turn":crate::turn_ledger::mint_id("held-"), "t":crate::turn_ledger::now_ms(),
+                "key":key, "backend":backend, "inbound":inbound, "reason":reason, "blockedBy":blocking.id,
+            });
+            crate::turn_ledger::append_record(&self.context, &record)?;
+            let message = format!("{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）", blocking.id);
+            return Err(LedgerAdmissionError::Held { message, record });
         }
         let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, false)?;
         if self.dispatch_token.take().is_some_and(|expected| expected != token) {
-            return Err("queued wake token invalidated".to_string());
+            return Err("queued wake token invalidated".to_string().into());
         }
         let epoch = crate::send_outbox::token_epoch(&token);
         let ledger_offset = crate::turn_ledger::ledger_len(&self.context).ok();
@@ -1624,14 +1654,22 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         })
     }
 
-    fn publish_expired_harness_route(&self) {
+    fn dispatch_expired(&self) -> bool {
+        self.dispatch_deadline.is_some_and(|deadline| {
+            #[cfg(test)]
+            if let Some(clock) = &self.admission_clock { return clock() >= deadline; }
+            crate::turn_ledger::now_ms() >= deadline
+        })
+    }
+
+    fn publish_expired_route(&self) {
         if let Some(route) = &self.reserved2_route {
             *route.lock().unwrap_or_else(|p| p.into_inner()) = Reserved2Route::ExpiredBeforeAdmission;
         }
     }
 
     fn expire_unadmitted_harness(&mut self, key: &str) -> String {
-        self.publish_expired_harness_route();
+        self.publish_expired_route();
         // The companion console may have granted snapshot receipts even if rendering failed.
         if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
             eprintln!("[turn] expired wake revocation failed: {error}");
@@ -1687,8 +1725,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 self.context.clone(), cfg.clone(), key.to_owned(), self.turn_token.clone(),
                 self.current_reason.clone(), prompt.to_owned(),
             );
+            let turn = recorder.id.clone();
             let (wake, plan) = tokio::task::spawn_blocking(move || {
-                let wake = crate::prompt::render_wake(&context, &config, &wake_key, &token, &reason, &prebuilt, &plan, false)?;
+                let wake = crate::prompt::render_wake(&context, &config, &wake_key, &token, &reason, &prebuilt, &plan, false, &turn)?;
                 if crate::persona::briefing_identity(&context, &wake_key) != persona {
                     return Err(crate::prompt::WAKE_BRIEFING_CHANGED.to_owned());
                 }
