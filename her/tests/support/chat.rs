@@ -366,7 +366,7 @@ impl Dsh {
             if let Some(session) = inner.sessions.get_mut(sid) {
                 let text = if turn == 1 { "private deliberation" } else { "private deliberation after the urgent wake" };
                 event(session, "assistant/message", json!({"turn":turn,
-                    "content":[{"type":"text","text":text}], // RED-R3b
+                    "message":{"role":"assistant","content":[{"type":"text","text":text}]},
                 }));
             }
             drop(inner);
