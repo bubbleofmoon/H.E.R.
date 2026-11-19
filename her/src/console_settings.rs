@@ -35,7 +35,7 @@ pub fn route(
         return failure(403, "settings routes are restricted to administrators");
     }
     // The model page and list only read state, even if startup left a legacy engine map.
-    if !matches!((method, path), ("GET", "/settings/models" | "/api/settings/models")) {
+    if true { // RED-M28
         if let Err((status, error)) = crate::console::import_engine_choices(context) {
             return failure(status, &error);
         }
