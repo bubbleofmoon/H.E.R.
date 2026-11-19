@@ -167,20 +167,20 @@ impl Mailbox {
         };
         let snapshot = self.pending.lock().ok().and_then(|slot| {
             let pending = slot.as_ref()?;
-            Some(pending.snapshot.clone()) // RED-M4
+            (pending.snapshot.key == key).then(|| pending.snapshot.clone())
         });
         let Some(snapshot) = snapshot else { return no_pending() };
         let Ok(_gate) = crate::closed_agent::lock_wait(&self.context, gate_wait).await else {
-            return Answer::Accepted; // RED-M1
+            return Answer::Notice("⚠️ 系统繁忙，回答未提交，请稍后再回复一次。".into());
         };
-        if snapshot.session_id.is_empty() { // RED-M2
+        if !snapshot.current(&self.context) {
             return no_pending();
         }
         let Ok(mut slot) = self.pending.lock() else { return no_pending() };
         let Some(pending) = slot.as_mut().filter(|entry| entry.snapshot.id == snapshot.id && entry.reply.is_some()) else {
             return no_pending();
         };
-        if Instant::now() >= pending.expires && !pending.approval { // RED-M3
+        if Instant::now() >= pending.expires {
             return no_pending();
         }
         let reply = if pending.approval {
