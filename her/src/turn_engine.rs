@@ -36,7 +36,7 @@ impl Engine {
     }
 
     pub(crate) fn read_choice(context: &RuntimeContext, cfg: &Value, conversation: &str, mode: &str) -> Result<Self, String> {
-        let inherit_default = mode == "reserved2" || crate::pipeline::pinned_cli_backend(cfg, conversation).is_none(); // RED-M3 (R2e)
+        let inherit_default = mode != "reserved2" || crate::pipeline::pinned_cli_backend(cfg, conversation).is_none();
         Self::parse(&crate::settings::engine_choice(context, cfg, conversation, inherit_default)?)
     }
 
