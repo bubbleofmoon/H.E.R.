@@ -1,6 +1,7 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
 pub(crate) mod budget;
 pub(crate) mod handover;
+pub(crate) mod interactions;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
 pub(crate) mod rotation;
@@ -306,6 +307,8 @@ pub enum Status {
 
 enum Failure {
     Failed(String),
+    /// The owner received the timeout notice for this interaction.
+    InteractionClosed,
     Cancelled,
     Uncertain(String),
 }
@@ -366,6 +369,7 @@ struct Progress {
     /// The model of the route the turn's last request went to.
     model: String,
     failures: Vec<RouteFailure>,
+    owner_interaction_closed: bool,
 }
 
 impl From<String> for Failure {
@@ -412,6 +416,10 @@ impl Turn {
     /// Each route request that failed over or ended the turn, in order.
     pub fn route_failures(&self) -> Vec<RouteFailure> {
         self.progress.lock().unwrap_or_else(|p| p.into_inner()).failures.clone()
+    }
+
+    pub(crate) fn owner_interaction_closed(&self) -> bool {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).owner_interaction_closed
     }
 
     pub fn sent_tool_reply(&self) -> bool {
@@ -517,7 +525,7 @@ impl Harness {
         let instruction = request.tools.instruction();
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
-        let (cancel, mut cancelled) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(false);
         let (events, _) = broadcast::channel(32);
         let notifications = events.clone();
         let client = self.client.clone();
@@ -528,7 +536,7 @@ impl Harness {
         let refs_for_task = request_refs.clone();
         let progress = Arc::new(std::sync::Mutex::new(Progress {
             model: request.route.routes[request.route.start].model.clone(),
-            failures: Vec::new(),
+            ..Progress::default()
         }));
         let progress_for_task = progress.clone();
         let task_cancel = cancel.clone();
@@ -537,6 +545,8 @@ impl Harness {
             let _owner = owner;
             let mut assistant = None;
             let cancellation = cancelled.clone();
+            let deadline = tokio::time::Instant::now() + request.deadline;
+            let deadline_generation = std::sync::OnceLock::new();
             let execution = tool_loop(
                 &context,
                 &client,
@@ -548,37 +558,23 @@ impl Harness {
                 &sent_flag,
                 &refs_for_task,
                 &progress_for_task,
+                deadline,
+                &deadline_generation,
                 cancellation,
             );
-            tokio::pin!(execution);
-            let mut interrupted = None;
-            let outcome = tokio::select! { biased;
-                _ = cancelled.changed() => { interrupted = Some(Status::Cancelled); None },
-                _ = tokio::time::sleep(request.deadline) => {
-                    interrupted = Some(Status::Failed(DEADLINE_EXCEEDED.into())); None
-                },
-                result = &mut execution => Some(result),
-            };
-            let outcome = match outcome {
-                Some(result) => result,
-                None => {
-                    // Keep ownership of the handler and its result writer. Model waits are
-                    // cancellable; a dispatched blocking handler must settle under revoked authority.
-                    let _ = task_cancel.send(true);
-                    let revoked = request.tools.revoke();
-                    let settled = execution.await;
-                    match revoked {
-                        Ok(()) => settled,
-                        Err(reason) => Err(Failure::Uncertain(reason)),
-                    }
-                }
-            };
+            let (outcome, interrupted) = settle_turn(
+                execution, deadline, &task_cancel, cancelled, &request.tools, &deadline_generation,
+            ).await;
             let mut result = match outcome {
                 Err(Failure::Uncertain(detail)) => Status::Paused {
                     reason: "send-unresolved".into(),
                     detail,
                 },
                 Err(Failure::Cancelled) => interrupted.unwrap_or(Status::Cancelled),
+                Err(Failure::InteractionClosed) => {
+                    progress_for_task.lock().unwrap_or_else(|p| p.into_inner()).owner_interaction_closed = true;
+                    interrupted.unwrap_or_else(|| Status::Failed(interactions::TIMED_OUT.into()))
+                }
                 Err(Failure::Failed(reason)) => interrupted.unwrap_or(Status::Failed(reason)),
                 Ok(event) => match interrupted {
                     Some(status) => status,
@@ -619,11 +615,47 @@ impl Harness {
     }
 }
 
+async fn settle_turn<T>(
+    execution: impl std::future::Future<Output = Result<T, Failure>>,
+    deadline: tokio::time::Instant,
+    cancel: &watch::Sender<bool>,
+    mut cancelled: watch::Receiver<bool>,
+    tools: &Tools,
+    deadline_generation: &std::sync::OnceLock<String>,
+) -> (Result<T, Failure>, Option<Status>) {
+    tokio::pin!(execution);
+    let interrupted = tokio::select! { biased;
+        _ = cancelled.changed() => Status::Cancelled,
+        _ = tokio::time::sleep_until(deadline) => Status::Failed(DEADLINE_EXCEEDED.into()),
+        result = &mut execution => return (result, None),
+    };
+
+    // Keep ownership of the handler and result writer. A dispatched blocking handler
+    // must settle under revoked authority.
+    let _ = cancel.send(true);
+    let revoked = tools.revoke();
+    if matches!(interrupted, Status::Failed(_)) {
+        if let Ok(Some(generation)) = &revoked {
+            let _ = deadline_generation.set(generation.clone());
+        }
+    }
+    let settled = execution.await;
+    let outcome = match revoked {
+        Ok(_) => settled,
+        Err(reason) => Err(Failure::Uncertain(reason)),
+    };
+    (outcome, Some(interrupted))
+}
+
 fn turn_owner(context: &RuntimeContext, turn: &str) -> Result<std::fs::File, String> {
     context.open_locked_file(
         RuntimeArea::Data,
         &format!("locks/harness-turn-{}.lock", crate::send_outbox::token_epoch(turn)),
     )
+}
+
+fn turn_is_live(context: &RuntimeContext, turn: &str) -> bool {
+    matches!(turn_owner(context, turn), Err(error) if error == "runtime file is already locked")
 }
 
 /// Reset has already revoked the generation. A live owner must settle its handler;
@@ -664,9 +696,11 @@ async fn tool_loop(
     sent: &AtomicBool,
     request_refs: &std::sync::Mutex<Vec<Value>>,
     progress: &std::sync::Mutex<Progress>,
+    deadline: tokio::time::Instant,
+    deadline_generation: &std::sync::OnceLock<String>,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Event, Failure> {
-    let deadline = tokio::time::Instant::now() + request.deadline;
+    let session = history.session.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
@@ -822,29 +856,61 @@ async fn tool_loop(
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
             chain.dispatched |= prepared.is_ok();
-            let tools = request.tools.clone();
-            let invocation = call.clone();
-            let cancel = cancelled.clone();
-            let mut outcome = tokio::task::spawn_blocking(move || {
-                if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                    return tools::error("tool dispatch cancelled or expired");
+            let (mut outcome, stop) = match prepared {
+                Err(outcome) => (outcome, None),
+                Ok(args) if request.tools.handles_interaction(&call.fn_name) => {
+                    let result = match &request.tools.interactions {
+                        Some(mailbox) => {
+                            let binding = interactions::Binding {
+                                mailbox, key: &request.conversation, session: &session,
+                                turn: &request.id, epoch: &request.generation, deadline, deadline_generation,
+                            };
+                            if call.fn_name == interactions::ASK {
+                                binding.question(&args, cancelled.clone()).await
+                            } else {
+                                binding.group_send(&args, cancelled.clone()).await
+                            }
+                        }
+                        None => Ok(tools::error("Owner interaction is unavailable.")),
+                    };
+                    match result {
+                        Ok(outcome) => (outcome, None),
+                        Err(reason) => {
+                            let mut outcome = tools::error("Owner interaction ended.");
+                            if matches!(&reason, Failure::Uncertain(_)) {
+                                outcome["_meta"] = serde_json::json!({"herDelivery":"unknown"});
+                            }
+                            (outcome, Some(reason))
+                        }
+                    }
                 }
-                match prepared {
-                    Ok(args) => tools.dispatch(&invocation, &args),
-                    Err(outcome) => outcome,
+                Ok(args) => {
+                    let tools = request.tools.clone();
+                    let invocation = call.clone();
+                    let cancel = cancelled.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
+                            return tools::error("tool dispatch cancelled or expired");
+                        }
+                        tools.dispatch(&invocation, &args)
+                    })
+                    .await
+                    .map_err(|_| {
+                        Failure::Uncertain(
+                            "harness tool worker failed before its effect could be settled".into(),
+                        )
+                    })?;
+                    (outcome, None)
                 }
-            })
-            .await
-            .map_err(|_| {
-                Failure::Uncertain(
-                    "harness tool worker failed before its effect could be settled".into(),
-                )
-            })?;
+            };
             redact(&mut outcome, &request.route.credentials);
             let message = tool_message(&call, &outcome);
             store
                 .tool_result(&request.id, &run, &message, &outcome)
                 .map_err(Failure::Uncertain)?;
+            if let Some(reason) = stop {
+                return Err(reason);
+            }
             if outcome["_meta"]["herDelivery"] == "unknown" {
                 return Err(Failure::Uncertain("QQ send delivery could not be confirmed; administrator confirmation required before retry".into()));
             }
@@ -1299,6 +1365,19 @@ fn filter_model_messages(
                 ContentPart::ToolCall(mut call) => {
                     call.fn_arguments =
                         crate::model_view::strip_model_chat_data(&call.fn_arguments, &cfg);
+                    if call.fn_name == interactions::ASK {
+                        let filter = |value: &mut Value| {
+                            if let Some(text) = value.as_str() {
+                                *value = Value::String(crate::model_view::strip_from_model_text(text, &cfg));
+                            }
+                        };
+                        if let Some(question) = call.fn_arguments.get_mut("question") {
+                            filter(question);
+                        }
+                        if let Some(options) = call.fn_arguments.get_mut("options").and_then(Value::as_array_mut) {
+                            options.iter_mut().for_each(filter);
+                        }
+                    }
                     ContentPart::ToolCall(call)
                 }
                 ContentPart::ToolResponse(mut response) => {
@@ -1345,7 +1424,12 @@ fn filter_tool_text(text: &str, cfg: &Value, tool: Option<&str>) -> Result<Strin
         for block in blocks {
             if block["type"] == "text" {
                 if let Some(text) = block["text"].as_str() {
-                    block["text"] = Value::String(filter_tool_text(text, cfg, None)?);
+                    let copy = if tool == Some(interactions::ASK) {
+                        crate::model_view::strip_from_model_text(text, cfg)
+                    } else {
+                        filter_tool_text(text, cfg, None)?
+                    };
+                    block["text"] = Value::String(copy);
                 }
             }
         }

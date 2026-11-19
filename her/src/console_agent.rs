@@ -587,7 +587,7 @@ pub(super) struct SendCall<'a> {
     pub gap_mode: &'a str,
     pub body: &'a Value,
     pub flavor: SendFlavor,
-    pub policy: GuardPolicy,
+    pub policy: GuardPolicy<'a>,
     /// Quote already resolved by the caller (JS resolves it before the quota for `/api/send/*`).
     pub resolved_quote: Option<(Value, Option<i64>)>,
 }
@@ -771,8 +771,10 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
     let initial = load_social_state_for(context)?["conversations"][key].clone();
     let chain = send_chain();
-    let turn_scope = if token.is_empty() { String::new() } else {
-        repeat_guard::admit(context, key, messages)?
+    let turn_scope = match policy {
+        GuardPolicy::ApprovedGroup { turn, .. } => repeat_guard::admit_in_scope(context, key, messages, Some(turn))?,
+        _ if token.is_empty() => String::new(),
+        _ => repeat_guard::admit(context, key, messages)?,
     };
     let clamp_gap = |ms: i64| -> i64 {
         let min = send_cfg.get("burstIntervalMinMs").and_then(|v| v.as_i64()).unwrap_or(1000);
@@ -852,10 +854,14 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     }
     // 3. Claim the batch and record the intent before the first OneBot request. The claim is
     // held until the batch settles, so a resume cannot run it alongside this send.
-    let fields = json!({
+    let mut fields = json!({
         "key": key, "epoch": epoch, "messages": messages, "delays": delays,
         "replyTo": actual_reply, "atUser": at_user, "turnScope": turn_scope
     });
+    let approved = matches!(policy, GuardPolicy::ApprovedGroup { .. });
+    if approved {
+        fields["purpose"] = json!("approved-group");
+    }
     let recorded = match crate::recorded_send::Recorded::begin(context, now_ms, now, fields) {
         Ok(recorded) => recorded,
         Err(error) => {
@@ -900,8 +906,15 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     let full = sent == count;
     let targeting = json!({"replyToMessageId":actual_reply,"atUserId":at_user,"replyToUserId":quoted["userId"]});
     let targeted_sent = report.states.iter().any(|(idx,state)| *idx == 0 && matches!(state,crate::send_outbox::ItemState::Confirmed {..}));
-    finish_send_batch(context, cfg, key, now, release, &sent_texts, full, targeted_sent.then_some(&targeting))
-        .map_err(|(status, error)| (status, format!("已发送 {sent} 条消息，但运行时状态更新未能确认：{error}")))?;
+    let settlement = finish_send_batch(context, cfg, key, now, release, &sent_texts, full, targeted_sent.then_some(&targeting));
+    if approved && (report.record_uncertain || states.iter().any(|state| state.needs_verification())
+        || (sent > 0 && settlement.is_err())) {
+        let mut out = crate::send_outbox::progress_json(&batch_id, &states);
+        out["ok"] = json!(false);
+        out["unknown"] = json!([0]);
+        return Ok((500, out));
+    }
+    settlement.map_err(|(status, error)| (status, format!("已发送 {sent} 条消息，但运行时状态更新未能确认：{error}")))?;
     if let Some(error) = &report.discard_error {
         return Err((503, format!("批次已停止（已发 {sent} 条），{error}")));
     }

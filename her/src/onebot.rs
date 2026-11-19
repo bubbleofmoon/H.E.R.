@@ -756,7 +756,7 @@ impl OneBot {
             })
     }
 
-    fn segment_payload(
+    pub(crate) fn segment_payload(
         target: &Target,
         text: &str,
         reply_to: Option<i64>,

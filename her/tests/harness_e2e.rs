@@ -4,6 +4,10 @@
 mod media_fixtures;
 include!("support/chat.rs");
 include!("support/model.rs");
+#[path = "harness_interactions/questions.rs"]
+mod owner_questions;
+#[path = "harness_interactions/approvals.rs"]
+mod owner_approvals;
 
 const SWITCH_PATH: &str = "/api/settings/conversation/switch";
 
@@ -3754,11 +3758,12 @@ const OWNER_CHAT_MENU: [&str; 11] = [
 ];
 
 /// The owner's private chat in closed-agent mode (#160).
-const CLOSED_AGENT_MENU: [&str; 16] = [
+const CLOSED_AGENT_MENU: [&str; 18] = [
     "qq_status",
     "qq_list_groups",
     "qq_get_group_members",
     "qq_get_group_history",
+    "qq_send_group_message",
     "qq_send_private_message",
     "qq_get_message_images",
     "memory_write",
@@ -3771,6 +3776,7 @@ const CLOSED_AGENT_MENU: [&str; 16] = [
     "web_search",
     "web_fetch",
     "snowluma_status",
+    "ask_owner",
 ];
 
 #[test]

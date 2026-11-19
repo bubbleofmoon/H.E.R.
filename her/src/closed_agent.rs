@@ -30,7 +30,7 @@ pub fn lock(context: &RuntimeContext) -> Result<std::fs::File, String> {
 
 /// How long a live-process answer or registration waits for the gate. A console mode write holds
 /// the gate through DSH's settings write-through, whose read timeout is 30 s.
-const GATE_WAIT: Duration = Duration::from_secs(45);
+pub(crate) const GATE_WAIT: Duration = Duration::from_secs(45);
 
 fn try_lock(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
     match context.open_locked_file(RuntimeArea::Data, "locks/closed-agent.lock") {
@@ -41,7 +41,7 @@ fn try_lock(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
 }
 
 /// Like `lock`, but waits without blocking the async executor.
-async fn lock_wait(context: &RuntimeContext, wait: Duration) -> Result<std::fs::File, String> {
+pub(crate) async fn lock_wait(context: &RuntimeContext, wait: Duration) -> Result<std::fs::File, String> {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(file) = try_lock(context)? {
@@ -153,14 +153,11 @@ fn valid_identity(
 
 /// Console view omits entries whose session authorization or deadline has changed.
 pub fn pending_view(context: &RuntimeContext) -> Result<Value, String> {
-    let Some(text) = context
+    let text = context
         .read_optional_text(RuntimeArea::Data, SNAPSHOT)
-        .map_err(str::to_string)?
-    else {
-        return Ok(json!({"pending":[]}));
-    };
+        .map_err(str::to_string)?;
     let entries: Vec<Value> =
-        serde_json::from_str(&text).map_err(|e| format!("pending state is invalid: {e}"))?;
+        serde_json::from_str(text.as_deref().unwrap_or("[]")).map_err(|e| format!("pending state is invalid: {e}"))?;
     let now = crate::parity_clock::now_ms() as i64;
     let mut list = Vec::new();
     for entry in entries {
@@ -171,6 +168,10 @@ pub fn pending_view(context: &RuntimeContext) -> Result<Value, String> {
                 list.push(value.clone());
             }
         }
+    }
+    if let Ok(Some(item)) = crate::harness::interactions::pending_view(context) {
+        list.retain(|legacy| legacy["key"] != item["key"]);
+        list.push(item);
     }
     Ok(json!({"pending":list}))
 }
@@ -238,12 +239,14 @@ mod deadlock_probe {
 pub struct Hub {
     context: RuntimeContext,
     state: tokio::sync::Mutex<State>,
+    pub(crate) mailbox: Arc<crate::harness::interactions::Mailbox>,
 }
 
 impl Hub {
     pub fn start(context: &RuntimeContext) -> Result<Arc<Self>, String> {
         let hub = Arc::new(Self {
             context: context.clone(),
+            mailbox: crate::harness::interactions::Mailbox::start(context)?,
             state: tokio::sync::Mutex::new(State {
                 entries: HashMap::new(),
                 seen: HashSet::new(),

@@ -21,6 +21,7 @@ pub(crate) struct Round {
 /// What an admission replays (`Store::admit`): the newest checkpoint's summary and the completed turns after it.
 #[derive(Clone, Debug)]
 pub(crate) struct History {
+    pub session: String,
     /// The summary the session's newest checkpoint carries (`None`: no checkpoint, or one without a summary).
     pub summary: Option<String>,
     /// The completed turns after that checkpoint, oldest first.
@@ -255,6 +256,7 @@ impl Store {
                 }
             }
             History {
+                session: session.clone(),
                 summary,
                 rounds: rounds.into_iter().map(|(_, round)| round).collect(),
                 idle_from,
@@ -595,7 +597,7 @@ fn protocol_label(known: &[String], label: &str, prefix: &str) -> String {
 }
 
 // Snapshot before taking the conversations connection lock. Both stores can wait on SQLite readers.
-fn record_credentials(context: &RuntimeContext) -> Result<Vec<String>, String> {
+pub(super) fn record_credentials(context: &RuntimeContext) -> Result<Vec<String>, String> {
     let mut known = crate::activity::known_session_tokens(context);
     known.extend(crate::settings::harness_credential(context));
     known.extend(crate::settings::stored_secrets(context)?);
