@@ -403,8 +403,12 @@ mod tests {
             for dir in ["config", "data", "resources"] {
                 fs::create_dir_all(root.join(dir)).unwrap();
             }
-            fs::write(root.join("config/config.json"), r#"{"ownerQQ":42}"#).unwrap();
+            fs::write(
+                root.join("config/config.json"),
+                r#"{"ownerQQ":42,"consoleToken":"mailbox-fixture-console"}"#,
+            ).unwrap();
             fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
+            fs::write(root.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
             fs::write(
                 root.join("dependencies.json"),
                 r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#,
