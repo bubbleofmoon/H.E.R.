@@ -1144,7 +1144,7 @@ pub fn wrap_for_delivery_with_runtime(
     cfg: &Value,
     at_ms: i64,
 ) -> String {
-    let mut parts = vec![clock_line(cfg, at_ms)];
+    let mut parts = vec![clock_line(&serde_json::json!({"time":{"zone":"UTC"}}), at_ms)]; // RED-Z1
     let slang_cfg = cfg.get("slang");
     let enabled = slang_cfg
         .and_then(|s| s.get("enabled"))

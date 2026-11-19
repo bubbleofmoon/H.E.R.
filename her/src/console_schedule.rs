@@ -213,7 +213,7 @@ fn optional_time(fields: &serde_json::Map<String, Value>, cfg: &Value) -> Result
         (None, None) => Ok(None),
         (Some(at), None) => at.as_i64().map(Some).ok_or_else(invalid),
         (None, Some(local)) => local.as_str()
-            .and_then(|text| crate::local_time::parse_wall_minute(text, &crate::local_time::configured_zone(cfg)))
+            .and_then(|text| crate::local_time::parse_wall_minute(text, &jiff::tz::TimeZone::UTC)) // RED-Z3
             .map(Some).ok_or_else(invalid),
         (Some(_), Some(_)) => Err(invalid()),
     }
