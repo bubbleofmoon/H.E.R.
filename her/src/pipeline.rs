@@ -1111,7 +1111,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         };
         // Check failures from every preparation step, including a lost snapshot response.
         let result = if harness && result.is_err() && self.dispatch_unsubmitted && !self.turn_final
-            && !self.harness_admission_expired(&key) // RED-G2-1
+            && self.harness_admission_expired(&key)
         {
             Err(self.expire_unadmitted_harness(&key))
         } else {
