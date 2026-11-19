@@ -328,6 +328,23 @@ fn prompt_text_strip_joining_rules_across_their_boundary_never_makes_a_denied_te
 }
 
 #[test]
+fn model_strip_join_regression_preserves_rule_boundary_when_memory_holds_term() {
+    let (root, context) = prompt_fixture("prompt text boundary with memory");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D"));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = set_text(&context, "prompt.proactive", json!("SH【积极性】"));
+    assert_eq!(status, 200, "{body}");
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", br#"{"conversations":{"group:101":{"activeTopics":[{"text":"DSH"}]}}}"#).unwrap();
+    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["\n\n"]}));
+
+    let render = next_render(&context);
+    let config = context.load_config_document().unwrap();
+    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
+    assert!(delivered.contains("- DSH（"), "the memory topic must reach the model");
+    assert!(delivered.contains("【别像客服】D\n\nSH【积极性】"), "the strip must preserve the boundary between the two rules");
+}
+
+#[test]
 fn prompt_text_sticker_rules_a_strip_turns_into_a_denied_term_fall_back_to_the_default() {
     let (root, context) = prompt_fixture("prompt text sticker strip denied");
     let (status, body) = set_text(&context, "prompt.stickerStrategy", json!("【表情包策略】D鲸SH 140"));
