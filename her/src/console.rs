@@ -26910,14 +26910,16 @@ mod tests {
         // Unchanged since start: the effective section (defaults included).
         let first = handle_social_config(&context, &context.load_config().unwrap());
         assert_eq!(first["config"]["initialPromptMaxChars"], 2000);
-        assert_eq!(first["config"]["wake"]["defaultMode"], "diving");
+        assert_eq!(first["config"]["wake"]["batchWindowMs"], 8000);
         // After a save, the console overlays the timing defaults on the raw section.
         // The unnormalized initialPromptMaxChars still comes back as saved.
         handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         assert!(file["socialV2"].get("reply").is_none(), "defaults stay out of the saved file");
+        assert!(file.pointer("/socialV2/wake/batchWindowMs").is_none(), "the wake timing default stays out of the saved file");
         let mut effective = file.clone();
         crate::settings::complete_timing(&mut effective);
+        effective["socialV2"]["wake"]["batchWindowMs"] = json!(8000);
         effective["socialV2"]["reply"] = json!({
             "wakeQuietMs": 3000,
             "quietMinMs": 4000,

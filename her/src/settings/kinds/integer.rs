@@ -24,6 +24,8 @@ pub(crate) enum FileRule {
     IntegralNumber,
     /// A non-negative integer is clamped into the bounds; any other value reads as the default.
     Clamp,
+    /// A non-negative number is truncated to an integer and clamped into the bounds.
+    TruncateAndClamp,
 }
 
 impl SettingKind for Integer {
@@ -40,6 +42,9 @@ impl SettingKind for Integer {
         let Integer { min, max, .. } = *self;
         match self.file {
             FileRule::Clamp => found.as_u64().map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
+            FileRule::TruncateAndClamp => found.as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| json!((n as i64).clamp(min, max))),
             FileRule::IntegralNumber => found.as_f64().filter(|n| n.fract() == 0.0 && *n >= min as f64 && *n <= max as f64).map(|n| json!(n as i64)),
             FileRule::Default | FileRule::Automatic => self.normalize(found),
         }
