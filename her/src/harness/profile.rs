@@ -223,7 +223,7 @@ impl Profile {
             Self::OwnerPrivate => Some(crate::prompt_text::MODE_OWNER_PRIVATE_KEY),
             Self::ClosedAgent => Some(crate::prompt_text::MODE_CLOSED_AGENT_KEY),
             Self::Reserved2 => Some(crate::prompt_text::MODE_RESERVED2_KEY),
-            Self::Reserved2Owner => None, // RED-R1b
+            Self::Reserved2Owner => Some(crate::prompt_text::MODE_RESERVED2_OWNER_KEY),
             Self::Digest | Self::SlangLearner => None,
         }
     }
