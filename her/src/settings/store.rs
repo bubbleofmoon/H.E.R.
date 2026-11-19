@@ -7,11 +7,12 @@
 mod conversation;
 
 pub(crate) use conversation::{
-    apply_conversation, canonical_conversation, conversation_admitted, conversation_value, conversation_view,
-    reset_conversation, CONVERSATION_ERROR,
+    apply_conversation, apply_switch_choice, canonical_conversation, conversation_admitted, conversation_value,
+    conversation_view, engine_choice, has_legacy_engine_choices, import_engine_choices, reset_conversation,
+    restore_switch_choice, CONVERSATION_ERROR,
 };
 
-use super::{find, find_conversation, registry, Setting, CLI_MODEL_API_KEY, OWNER, WEB_SEARCH_API_KEY};
+use super::{find, find_conversation, registry, Setting, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER, WEB_SEARCH_API_KEY};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -93,6 +94,19 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
         }
     }
     document
+}
+
+/// Resolves settings owned by the batches that use the normalized configuration snapshot.
+pub(crate) fn resolve_config(document: &mut Value) {
+    let material_items = super::registry::material_item_limit(document);
+    for setting in super::registry::RESOLVED_GROUPS.iter().flat_map(|group| group.iter()) {
+        let value = if setting.key == super::registry::MATERIAL_ITEMS.key {
+            Value::from(material_items)
+        } else {
+            setting.read(document)
+        };
+        set_at(document, setting.pointer, value);
+    }
 }
 
 /// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
@@ -559,21 +573,30 @@ pub(crate) fn harness_credential(context: &RuntimeContext) -> Option<String> {
 fn reject_credential_text(
     conn: &Connection, setting: &Setting, value: &Value, harness_key: Option<&str>,
 ) -> Result<(), (u16, String)> {
-    let Some(text) = value.as_str().filter(|_| setting.kind.text_default().is_some()) else { return Ok(()) };
+    let prompt_text = value.as_str().filter(|_| setting.kind.text_default().is_some());
+    let routes = value.as_array().filter(|_| setting.key == HARNESS_ROUTES.key);
+    if prompt_text.is_none() && routes.is_none() {
+        return Ok(());
+    }
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
-    if harness_key.is_some_and(|key| text.contains(key)) || secrets.iter().any(|(_, _, key)| text.contains(key)) {
+    let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
+    if prompt_text.is_some_and(|text| harness_key.is_some_and(|key| text.contains(key)) || has_endpoint_key(text))
+        || routes.is_some_and(|routes| routes.iter().any(|route| {
+            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
+        }))
+    {
         return Err((400, "setting text contains a credential".to_string()));
     }
     Ok(())
 }
 
 /// The last good version of a text setting whose stored value is refused (a row changed outside `apply`, or a denied
-/// term a later release added): the newest audited value the setting accepts, such as the default a reset stored. An
-/// audit row without a new value (an undo that removed the stored value) ends the search, and so does the oldest row;
-/// `None` then, and the file's value or the default applies.
+/// term a later release added): the newest value in the global audit that the setting accepts, such as the default a
+/// reset stored. A global audit row without a new value (an undo that removed the stored value) ends the search.
+/// When there is no usable row, the file's value or the default applies.
 fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> bool) -> Option<Value> {
     let mut statement =
-        conn.prepare("SELECT new_value FROM settings_audit WHERE key=?1 ORDER BY id DESC").ok()?;
+        conn.prepare("SELECT new_value FROM settings_audit WHERE scope='global' AND key=?1 ORDER BY id DESC").ok()?;
     let mut rows = statement.query([setting.key]).ok()?;
     while let Ok(Some(row)) = rows.next() {
         let text: Option<String> = row.get(0).ok()?;
@@ -825,10 +848,10 @@ fn keep_pre_settings_copy(context: &RuntimeContext) -> Result<(), String> {
 }
 
 /// Copies into the store, inside the writer's transaction (`write_store`), every registry setting that has never been
-/// in it (no row and no audit row) and whose value in `document`, the stored `config.json`, the registry accepts:
-/// revision 1 and one audit row each (actor `system`, source `migration`, one request id for the batch). A value the
-/// registry refuses is not copied, and a later write checks it again. So the first write seeds the store, a setting a
-/// later release adds is seeded by the first write after the upgrade, and nothing is seeded twice. A seeded value's
+/// in it (no row and no audit row) and whose kind can seed a value from `document`, the stored `config.json`:
+/// revision 1 and one audit row each (actor `system`, source `migration`, one request id for the batch). Later
+/// writes retry values that could not be seeded. A setting a later release adds is seeded by the first write after
+/// the upgrade, and nothing is seeded twice. A seeded value's
 /// one audit row keeps `record_change`'s revision rule: no revision is ever reused. The value is the kind's
 /// (`SettingKind::seed`) of the member the setting reads (`Setting::found_in`, an alias spelling included).
 ///
@@ -1023,7 +1046,7 @@ fn write_store<T>(
     context: &RuntimeContext,
     existing_only: bool,
     written: &[&'static str],
-    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+    write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     write_store_with(context, existing_only, written, false, write)
 }
@@ -1038,7 +1061,7 @@ fn write_store_with<T>(
     existing_only: bool,
     written: &[&'static str],
     conversations: bool,
-    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+    write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let harness_key = harness_credential(context);
@@ -1058,7 +1081,7 @@ fn write_store_with<T>(
         }
         seed(&tx, &document, now_ms(), written, harness_key.as_deref())?;
         let access_before = access_rows(&tx)?;
-        let result = write(&tx)?;
+        let result = write(&tx, &document)?;
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
@@ -1192,9 +1215,26 @@ pub(crate) fn apply(
     store(context, setting, value, actor, source)
 }
 
-/// Writes one valid stored value (`storable`) with its audit row through `write_store`, which seeds the store first and
-/// writes the store back into `config.json` after the commit (`Applied::mirror_error`). The stored value again writes
-/// no value and no audit row (a seed still commits).
+/// Tests the effective schedule after applying all writes in this request. Callers hold the configuration gate.
+fn check_schedule_change(
+    mut document: Value,
+    stored: Vec<(&'static Setting, Value)>,
+    changes: impl IntoIterator<Item = (&'static Setting, Option<Value>)>,
+) -> Result<(), (u16, String)> {
+    place(&mut document, stored);
+    for (setting, value) in changes {
+        if let Some(value) = value {
+            if !set_at(&mut document, setting.pointer, value) {
+                return Err((409, format!("config.json cannot hold {}", setting.key)));
+            }
+        } else {
+            remove_at(&mut document, setting.pointer);
+        }
+    }
+    super::registry::check_schedule(&document)
+}
+
+/// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
 fn store(
     context: &RuntimeContext,
     setting: &'static Setting,
@@ -1202,21 +1242,28 @@ fn store(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
+    if super::registry::checks_schedule(setting.key) {
+        let unavailable = |error| (503, error);
+        check_schedule_change(
+            raw_config(context).map_err(unavailable)?,
+            stored_values(context).map_err(unavailable)?,
+            [(setting, Some(value.clone()))],
+        )?;
+    }
     let harness_key = setting.kind.text_default().and_then(|_| harness_credential(context));
-    // The caller holds the configuration gate, so the endpoint remains stable until the store commits.
-    let text = if setting.secret && !value.is_null() {
-        let endpoint = if setting.key == WEB_SEARCH_API_KEY.key {
-            let document = raw_config(context).map_err(|error| (503, error))?;
-            crate::aux_search::settings_endpoint(&document)
+    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn, document| {
+        // The configuration gate keeps the endpoint stable until the store commits.
+        let text = if setting.secret && !value.is_null() {
+            let endpoint = if setting.key == WEB_SEARCH_API_KEY.key {
+                crate::aux_search::settings_endpoint(document)
+            } else {
+                context.dependency_url("model").map(str::to_string)
+            }
+            .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
+            json!([endpoint, value]).to_string()
         } else {
-            context.dependency_url("model").map(str::to_string)
-        }
-        .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
-        json!([endpoint, value]).to_string()
-    } else {
-        value.to_string()
-    };
-    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn| {
+            value.to_string()
+        };
         reject_credential_text(conn, setting, &value, harness_key.as_deref())?;
         let value = if setting.secret { json!(!value.is_null()) } else { value };
         let old = stored_row(conn, setting.key)?;
@@ -1282,7 +1329,7 @@ pub(crate) fn undo(
     }
     // An undone setting has audit rows, which the seed skips, so an undo names no key to seed.
     let harness_key = harness_credential(context);
-    let (undone, mirror_error) = write_store(context, true, &[], |conn| {
+    let (undone, mirror_error) = write_store(context, true, &[], |conn, document| {
         let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
         let row: Option<(String, String, String, Option<String>, Option<String>)> = conn
             .query_row(
@@ -1321,6 +1368,14 @@ pub(crate) fn undo(
             .transpose()?;
         if let Some(restored) = &restored {
             reject_credential_text(conn, setting, restored, harness_key.as_deref())?;
+        }
+        if super::registry::checks_schedule(setting.key) {
+            let unavailable = |error| (503, error);
+            check_schedule_change(
+                document.clone(),
+                read_stored_values(conn).map_err(unavailable)?,
+                [(setting, restored.clone())],
+            )?;
         }
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
@@ -1486,9 +1541,17 @@ pub(crate) fn apply_changes(
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
+    if changes.iter().any(|(setting, _)| super::registry::checks_schedule(setting.key)) {
+        let unavailable = |error| (503, error);
+        check_schedule_change(
+            raw_config(context).map_err(unavailable)?,
+            stored_values(context).map_err(unavailable)?,
+            changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))),
+        )?;
+    }
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
     let harness_key = harness_credential(context);
-    let ((), mirror_error) = write_store(context, false, &written, |conn| {
+    let ((), mirror_error) = write_store(context, false, &written, |conn, _| {
         for (setting, value) in &changes {
             reject_credential_text(conn, setting, value, harness_key.as_deref())?;
             let text = value.to_string();

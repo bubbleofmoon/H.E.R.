@@ -39,24 +39,15 @@ pub struct Budgets {
 }
 
 impl Budgets {
-    /// Out-of-range or non-integer values use the starting defaults (1500/1500/800/1000 tokens; items: `memory.inject.relatedTopK`
-    /// when that is in range, else 5).
+    /// The memory layer budgets the settings registry resolves for this wake.
     pub fn from_cfg(cfg: &Value) -> Self {
-        let read = |name: &str, default: usize, max: u64| {
-            cfg.pointer(&format!("/memory/layers/{name}"))
-                .and_then(Value::as_u64)
-                .filter(|n| (1..=max).contains(n))
-                .map_or(default, |n| n as usize)
-        };
-        let related_top_k = cfg.pointer("/memory/inject/relatedTopK").and_then(Value::as_u64)
-            .filter(|n| (1..=20).contains(n)).map_or(5, |n| n as usize);
-        Budgets {
-            identity: read("identityTokens", 1500, 100_000),
-            relationship: read("relationshipTokens", 1500, 100_000),
-            conversation: read("conversationTokens", 800, 100_000),
-            material: read("materialTokens", 1000, 100_000),
-            // Material's item cap defaults to the recall depth (`memory.inject.relatedTopK`) when that is set.
-            material_items: read("materialItems", related_top_k, 20),
+        use crate::settings::{material_item_limit, LAYER_CONVERSATION, LAYER_IDENTITY, LAYER_MATERIAL, LAYER_RELATIONSHIP};
+        Self {
+            identity: LAYER_IDENTITY.integer(cfg) as usize,
+            relationship: LAYER_RELATIONSHIP.integer(cfg) as usize,
+            conversation: LAYER_CONVERSATION.integer(cfg) as usize,
+            material: LAYER_MATERIAL.integer(cfg) as usize,
+            material_items: material_item_limit(cfg),
         }
     }
 }

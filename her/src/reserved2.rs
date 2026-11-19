@@ -2558,7 +2558,8 @@ impl Hub {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        match store.claim_due(now, |key| idle.contains(key)) {
+        let zone = crate::local_time::configured_zone(cfg);
+        match store.claim_due(now, &zone, |key| idle.contains(key)) {
             Ok(items) => {
                 for item in items {
                     println!("[reserved2] {} 日程提醒到期（{}）", item.conversation, item.id);
@@ -3238,7 +3239,7 @@ impl Hub {
             }
             let retry = still_valid && result.is_err() && unsubmitted && !held;
             // The prompt never reached DSH and DSH is down: wait for it (bounded) instead of burning the retries.
-            let wait_for_dsh = retry && crate::dsh_health::is_down(&self.context);
+            let wait_for_dsh = retry && !active.text_only && crate::dsh_health::is_down(&self.context);
             if held || retry {
                 console::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
                 if held && active.inbound.is_empty() {
@@ -3530,9 +3531,7 @@ impl Hub {
                         pipe.expect_dispatch_deadline(now.saturating_add(hard_cap_ms));
                         if reason2 != "wakeReminder" { pipe.expect_dispatch_wake(now, wake_claim); }
                         let result = pipe.run_turn(&target, &prompt, &cli_prompt, &cfg2).await;
-                        let unsubmitted = pipe.dispatch_definitely_unsubmitted()
-                            && pipeline::pinned_cli_backend(&cfg2, &target.key()).is_none();
-                        (result, unsubmitted)
+                        (result, pipe.dispatch_definitely_unsubmitted())
                     }
                 }
             });

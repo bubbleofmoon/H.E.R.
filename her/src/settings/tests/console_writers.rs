@@ -393,15 +393,24 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         json!(1),
         json!(2),
         json!(7),
+        // #152: an integer range that starts at 1000.
+        json!(5000),
+        json!("06:30"),
+        json!("07:30"),
+        json!("Asia/Shanghai"),
+        json!("UTC"),
         json!("probe-model-a"),
         json!("probe-model-b"),
         json!("plain probe text one"),
         json!("plain probe text two"),
         // #154: an id list and a switch.
         json!([1]),
+        json!([{"id": "first", "model": "probe-model"}]),
         json!(false),
+        json!(true),
         // #218: a choice.
         json!("harness"),
+        json!("dsh"),
     ];
     for setting in crate::settings::registry().filter(|setting| !setting.secret) {
         let (root, context) = settings_fixture("settings direct write refused");
@@ -448,6 +457,28 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         ("memory_actions.rs", include_str!("../../memory_actions.rs")),
     ] {
         assert!(!source.contains("write_atomic(RuntimeArea::Config"), "{name} writes config.json itself");
+    }
+}
+
+#[test]
+fn settings_console_writer_leaves_endpoint_keys_in_the_store() {
+    let (root, context) = settings_fixture("settings credential config writer");
+    let credential = "fixture-stored-console-probe";
+    for setting in crate::settings::registry().filter(|setting| setting.secret) {
+        let (status, reply) = post(&context, "/api/settings/set", json!({"setting": setting.key, "value": credential}));
+        assert_eq!((status, &reply["isSet"]), (200, &json!(true)), "{}", setting.key);
+    }
+    let mut edited = stored_config(&root);
+    edited["webSearch"]["apiKey"] = json!("fixture-legacy-console-probe");
+    let written = write_selected_config_text(&context, &serde_json::to_string(&edited).unwrap());
+    let _ = take_config_writes();
+    written.unwrap();
+    let file = stored_config(&root);
+    assert_eq!(file["webSearch"]["apiKey"], "fixture-legacy-console-probe");
+    assert!(file.pointer("/cliModel/apiKey").is_none());
+    assert!(!file.to_string().contains(credential));
+    for setting in crate::settings::registry().filter(|setting| setting.secret) {
+        assert_eq!(setting_view(&context, setting.key)["isSet"], true, "{}", setting.key);
     }
 }
 

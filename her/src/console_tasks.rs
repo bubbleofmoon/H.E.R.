@@ -353,7 +353,7 @@ pre{background:#f8f8f8;border:1px solid #ddd;padding:8px;max-height:360px;overfl
 <p><label>恢复范围 <select id="restore-scope"><option value="everything">全部（记忆、状态、角色和配置）</option><option value="memory">仅记忆</option></select></label></p>
 <p id="backup-list-message" role="status"></p>
 <table id="backup-list"><thead><tr><th>时间</th><th>文件 / 运行</th><th>大小</th><th>结果</th><th>恢复</th></tr></thead><tbody></tbody></table>
-<h2 id="schedule">日程</h2><p><button id="tab-upcoming" type="button">即将运行</button> <button id="tab-history" type="button">历史</button> <span id="schedule-message" role="status"></span></p>
+<h2 id="schedule">日程</h2><p><button id="tab-upcoming" type="button">即将运行</button> <button id="tab-history" type="button">历史</button> <span id="schedule-zone"></span> <span id="schedule-message" role="status"></span></p>
 <section id="upcoming"><table id="schedule-upcoming"><thead><tr><th>类型</th><th>创建者</th><th>会话</th><th>下次运行</th><th>重复</th><th>动作</th><th>状态</th><th>创建时间</th><th>上次结果</th><th></th></tr></thead><tbody></tbody></table>
 <form id="schedule-create"><label>会话 <input id="create-conversation" placeholder="group:123 / private:123" required></label> <label>时间 <input id="create-at" type="datetime-local" required></label> <label>重复 <select id="create-repeat"><option value="once">一次</option><option value="hourly">每小时</option><option value="daily">每天</option></select></label> <label>内容 <input id="create-text" size="40" maxlength="500" required></label> <button type="submit">新建提醒</button></form></section>
 <section id="history" hidden><h3>提醒记录</h3><table id="schedule-history"><thead><tr><th>时间</th><th>项目</th><th>会话</th><th>结果</th></tr></thead><tbody></tbody></table>
@@ -366,7 +366,9 @@ pre{background:#f8f8f8;border:1px solid #ddd;padding:8px;max-height:360px;overfl
 const $=s=>document.querySelector(s);let before=null;
 const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
 $('#token').value=token();$('#save').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);load();loadBackupSettings();loadUpdates()};
-const t=ms=>ms?new Date(ms).toLocaleString('zh-CN',{hour12:false}):'';
+let scheduleZone={name:'UTC',offsetSeconds:0};
+const t=ms=>{if(!ms)return '';if(scheduleZone.name){try{return new Date(ms).toLocaleString('zh-CN',{timeZone:scheduleZone.name,hour12:false})}catch{}}
+ return new Date(ms+scheduleZone.offsetSeconds*1000).toLocaleString('zh-CN',{timeZone:'UTC',hour12:false})};
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{'x-console-token':token(),'content-type':'application/json'}});
  const j=await r.json().catch(()=>({ok:false,error:'HTTP '+r.status}));j.status=r.status;return j}
@@ -413,7 +415,7 @@ async function load(){const j=await api('/api/tasks');if(!j.ok){$('#desired').te
  $('#desired').textContent='期望状态：'+j.desired.state;
   $('#legacy tbody').innerHTML=j.legacy.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.disposition==='retired'?'退役':'迁移'}</td><td>${esc(x.replacement)}</td><td>${esc(x.note)}</td></tr>`).join('');
  if($('#filter').options.length===1)for(const x of j.tasks){const o=document.createElement('option');o.value=x.id;o.textContent=x.title;$('#filter').append(o)}
- before=null;$('#runs tbody').innerHTML='';await runs();await loadBackupList();await loadSchedule()}
+ before=null;$('#runs tbody').innerHTML='';await loadSchedule();await runs();await loadBackupList()}
 async function runs(){const q=new URLSearchParams({limit:'50'});if($('#filter').value)q.set('task',$('#filter').value);if(before)q.set('before',before);
  const j=await api('/api/tasks/runs?'+q);if(!j.ok)return;$('#runs tbody').insertAdjacentHTML('beforeend',j.runs.map(runRow).join(''));before=j.nextBefore;$('#more').disabled=!before}
 async function showLog(id){$('#logrun').textContent=id;let after=null,text='';
@@ -439,7 +441,7 @@ const schedStatus={active:'待运行',paused:'已暂停',overdue:'已逾期',run
 const schedLabels={pause:'暂停',resume:'恢复',edit:'编辑',cancel:'取消',run:'立即运行'};
 function schedRow(x){const buttons=x.actions.map(a=>x.kind==='job'&&a==='run'?`<button data-run="${esc(x.id.slice(7))}" data-effect="${esc(x.action)}" ${x.status==='running'?'disabled':''}>${schedLabels.run}</button>`:`<button type="button" data-sched="${esc(x.id)}" data-act="${a}" data-text="${esc(x.action)}" data-at="${esc(x.nextRunAt??'')}">${schedLabels[a]}</button>`).join(' ');
  return `<tr><td>${esc(schedKinds[x.kind]||x.kind)}</td><td>${esc(schedCreators[x.creator]||x.creator)}</td><td>${esc(x.conversation??'')}</td><td>${x.nextRunAt==null?'':t(x.nextRunAt)}</td><td>${esc(x.repeat)}</td><td>${esc(x.action)}</td><td>${esc(schedStatus[x.status]||x.status)}</td><td>${t(x.createdAt)}</td><td>${x.lastResult?esc(x.lastResult.summary)+' '+t(x.lastResult.at):''}</td><td>${buttons}</td></tr>`}
-async function loadSchedule(){try{const j=await api('/api/schedule');if(!j.ok)throw Error(j.error);$('#schedule-upcoming tbody').innerHTML=j.entries.map(schedRow).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
+async function loadSchedule(){try{const j=await api('/api/schedule');if(!j.ok)throw Error(j.error);scheduleZone=j.timeZone;$('#schedule-zone').textContent=scheduleZone.label;$('#schedule-upcoming tbody').innerHTML=j.entries.map(schedRow).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
 async function loadScheduleHistory(){try{const j=await api('/api/schedule/history?limit=100');if(!j.ok)throw Error(j.error);$('#schedule-history tbody').innerHTML=j.history.map(r=>`<tr><td>${t(r.at)}</td><td>${esc(r.id)}</td><td>${esc(r.conversation)}</td><td>${esc(r.summary)}${r.late?'（迟到）':''}</td></tr>`).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
 $('#tab-upcoming').onclick=()=>{$('#upcoming').hidden=false;$('#history').hidden=true};
 $('#tab-history').onclick=()=>{$('#upcoming').hidden=true;$('#history').hidden=false;loadScheduleHistory()};
@@ -447,15 +449,15 @@ document.addEventListener('click',async e=>{const b=e.target.closest('[data-sche
  const id=b.dataset.sched,act=b.dataset.act,message=$('#schedule-message'),body={};
  if(id.startsWith('system:')){if(!confirm((act==='pause'?'暂停':'恢复')+'系统任务「'+id.slice(7)+'」？'))return;body.confirm=true}
  if(act==='cancel'&&!confirm(id.startsWith('reachOut:')?'跳过这次主动冒泡机会？下一次机会会在它之后重新安排。':'取消这条日程？'))return;if(act==='cancel'&&(id.startsWith('replyCheck:')||id.startsWith('reachOut:')))body.at=Number(b.dataset.at);
- if(act==='edit'){const at=prompt('新的时间（本地，例如 2026-11-14 09:00）','');if(!at)return;const ms=new Date(at.replace(' ','T')).getTime();if(Number.isNaN(ms)){message.textContent='时间格式无效';return}body.at=ms;
+ if(act==='edit'){const at=prompt('新的时间（本地，例如 2026-11-14 09:00）','');if(!at)return;body.localAt=at.trim().replace(' ','T');
   if(id.startsWith('item:')){const text=prompt('提醒内容',b.dataset.text||'');if(text===null)return;body.text=text}}
  b.disabled=true;
  try{const j=await api('/api/schedule/'+id+'/'+act,{method:'POST',body:JSON.stringify(body)});if(!j.ok){message.textContent=j.error||'操作失败';return}message.textContent='已完成';await loadSchedule()}
  catch(error){message.textContent=error.message}finally{b.disabled=false}});
-$('#schedule-create').onsubmit=async e=>{e.preventDefault();const message=$('#schedule-message');const local=new Date($('#create-at').value);const at=local.getTime();
+$('#schedule-create').onsubmit=async e=>{e.preventDefault();const message=$('#schedule-message');const localAt=$('#create-at').value;const [,hour,minute]=localAt.match(/T(\d{2}):(\d{2})$/)||[];
  const kind=$('#create-repeat').value;
- const repeat=kind==='hourly'?{kind:'every',minutes:60}:kind==='daily'?{kind:'daily',hour:local.getHours(),minute:local.getMinutes()}:{kind:'once'};
- const j=await api('/api/schedule',{method:'POST',body:JSON.stringify({conversation:$('#create-conversation').value,text:$('#create-text').value,at,repeat})});
+ const repeat=kind==='hourly'?{kind:'every',minutes:60}:kind==='daily'?{kind:'daily',hour:Number(hour),minute:Number(minute)}:{kind:'once'};
+ const j=await api('/api/schedule',{method:'POST',body:JSON.stringify({conversation:$('#create-conversation').value,text:$('#create-text').value,localAt,repeat})});
  if(!j.ok){message.textContent=j.error;return}message.textContent='已新建';e.target.reset();await loadSchedule()};
 $('#filter').onchange=()=>{before=null;$('#runs tbody').innerHTML='';runs()};$('#more').onclick=runs;load();loadBackupSettings();
 </script></body></html>
@@ -511,7 +513,7 @@ mod tests {
             let store = Arc::new(TaskStore::open(dir.join("tasks"), StoreLimits::default(), credential_redactor(vec![])).unwrap());
             let held = Arc::new(Held { open: Mutex::new(false), cv: Condvar::new() });
             let dispatcher = Dispatcher::new(store, Arc::new(HeldExecutor(held.clone())), clock.clone());
-            let scheduler = Arc::new(Mutex::new(Scheduler::new(|d| d.enabled_by_default, 8 * 3_600_000, clock.now_ms())));
+            let scheduler = Arc::new(Mutex::new(Scheduler::new(|d| d.enabled_by_default, crate::local_time::beijing_tariff_zone(), clock.now_ms())));
             let api = TasksApi { dispatcher, scheduler, desired: DesiredStore::new(dir.join("lifecycle")) };
             Self { api, held, dir }
         }

@@ -284,7 +284,7 @@ fn now_ms() -> i64 {
 }
 
 fn now_iso() -> String {
-    crate::sticker::now_iso()
+    crate::local_time::iso_utc(now_ms())
 }
 
 fn cfg_bool(cfg: &Value, path: &[&str], default: bool) -> bool {

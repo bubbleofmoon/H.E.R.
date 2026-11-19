@@ -676,7 +676,8 @@ fn send_recorded_inline(
         }
         if stop.is_none() {
             if let Some(mute) = crate::group_mute::active(context, key) {
-                stop = Some(mute.refusal_text(crate::parity_clock::now_ms()));
+                let cfg = context.load_config().unwrap_or_default();
+                stop = Some(mute.refusal_text(crate::parity_clock::now_ms(), &cfg));
             }
         }
         let mut attempt_ms = 0;
@@ -885,6 +886,7 @@ struct Job {
     resets: Option<usize>,
     /// `mode.json` as seen at dispatch: a mode transition (even away and back) discards the job.
     mode_stamp: Option<String>,
+    admission_retries: u8,
 }
 
 pub struct Hub {
@@ -1056,7 +1058,7 @@ impl Hub {
                     &text,
                     &media_hint(&message_ref, media_count(&inb.message)),
                 );
-                self.dispatch(cfg, &key, Job { prompt, media: crate::forward_fmt::collect_segment_meta(inb.message.as_array().map(Vec::as_slice).unwrap_or(&[])).0, ack: ack_message(cfg), inbound: vec![inbound_key.to_string()], mode: crate::console::runtime_mode(&self.context), owner: is_owner, resets: None, mode_stamp: None });
+                self.dispatch(cfg, &key, Job { prompt, media: crate::forward_fmt::collect_segment_meta(inb.message.as_array().map(Vec::as_slice).unwrap_or(&[])).0, ack: ack_message(cfg), inbound: vec![inbound_key.to_string()], mode: crate::console::runtime_mode(&self.context), owner: is_owner, resets: None, mode_stamp: None, admission_retries: 0 });
                 Ok(Outcome::Dispatched { plain, sender })
             }
         }
@@ -1119,9 +1121,15 @@ async fn worker(
     key: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>,
 ) {
-    use crate::dsh_health::{is_down, BoundedQueue, QUEUE_MAX};
+    use crate::dsh_health::{BoundedQueue, QUEUE_MAX};
+    use crate::pipeline::ChatTurnOutcome;
+    const ADMISSION_RETRY_MS: i64 = 100;
+    const ADMISSION_RETRY_CAP: u8 = 3;
     let mut pipeline: Option<crate::pipeline::Pipeline> = None;
     let mut waiting: BoundedQueue<Job> = BoundedQueue::new(QUEUE_MAX);
+    // Keep the job that hit a switch failure ahead of later jobs, even if the waiting queue fills.
+    let mut switch_retry: Option<(i64, Job)> = None;
+    let mut dsh_retry = None;
     // The cap drops the oldest: its events are settled (never silently left open) and the loss is on the record.
     macro_rules! park {
         ($job:expr, $front:expr) => {{
@@ -1134,23 +1142,42 @@ async fn worker(
         }};
     }
     loop {
-        let job = if !waiting.is_empty() {
-            let needs_dsh = context.load_config().map(|cfg|
-                crate::turn_engine::Engine::selected(&cfg, &key).is_ok_and(|engine| engine.uses_dsh())
-            ).unwrap_or(true);
-            if is_down(&context) && needs_dsh {
-                // Still down: keep receiving (bounded) and look again shortly; nothing is sent to DSH.
+        let mut job = if let Some((deadline, _)) = switch_retry.as_ref() {
+            let remaining = deadline.saturating_sub(crate::parity_clock::now_ms());
+            if remaining > 0 {
+                // An advancing fixture clock can cross the deadline independently of Tokio.
+                #[cfg(feature = "parity-clock")]
+                let remaining = if std::env::var_os("HER_PARITY_ADVANCE_FILE").is_some() { remaining.min(500) } else { remaining };
                 tokio::select! {
                     next = rx.recv() => match next {
                         Some(job) => park!(job, false),
                         None => break,
                     },
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(remaining as u64)) => {}
+                }
+                continue;
+            }
+            switch_retry.take().expect("checked retry slot").1
+        } else if !waiting.is_empty() {
+            let now = tokio::time::Instant::now();
+            // The head has already requested DSH. Keep it in place until health recovers.
+            let wait_until = dsh_retry.map(|deadline| {
+                if crate::dsh_health::is_down(&context) { now + Duration::from_millis(500) } else { deadline }
+            });
+            if let Some(deadline) = wait_until.filter(|deadline| now < *deadline) {
+                tokio::select! {
+                    next = rx.recv() => match next {
+                        Some(job) => park!(job, false),
+                        None => break,
+                    },
+                    _ = tokio::time::sleep_until(deadline) => {}
                 }
                 continue;
             }
             let job = waiting.pop_front().expect("checked non-empty");
-            println!("[chat] {key} DSH 已恢复，补投排队的消息（先核对权限与会话状态）");
+            if dsh_retry.take().is_some() {
+                println!("[chat] {key} DSH 已恢复，补投排队的消息（先核对权限与会话状态）");
+            }
             job
         } else {
             match rx.recv().await {
@@ -1174,24 +1201,8 @@ async fn worker(
             let _ = journal.mark_handled(job.inbound, now_ms()).await;
             continue;
         }
-        let needs_dsh = crate::turn_engine::Engine::selected(&cfg, &key).is_ok_and(|engine| engine.uses_dsh());
-        if is_down(&context) && needs_dsh {
-            // Known down: hold it without a call (a storm of doomed requests is what the queue is for).
-            println!("[chat] {key} DSH 不可用，消息排队等待恢复");
-            park!(job, true);
-            continue;
-        }
-        // A pipeline built for a turn engine without DSH holds no DSH login: a DSH turn builds a new one.
-        if needs_dsh && pipeline.as_ref().is_some_and(|p| !p.has_dsh()) {
-            pipeline = None;
-        }
         if pipeline.is_none() {
-            let built = if needs_dsh {
-                crate::pipeline::Pipeline::new_with_runtime(&context, &cfg, true)
-            } else {
-                crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true)
-            };
-            match built {
+            match crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true) {
                 Ok(p) => pipeline = Some(p),
                 Err(error) => {
                     println!("[chat] ❌ {key} 无法初始化回合管线：{error}");
@@ -1206,6 +1217,7 @@ async fn worker(
         let epoch = Job {
             prompt: String::new(), media: Vec::new(), ack: None, inbound: Vec::new(),
             mode: job.mode.clone(), owner: job.owner, resets: job.resets, mode_stamp: job.mode_stamp.clone(),
+            admission_retries: 0,
         };
         pipe.recheck_before_turn(Box::new(move || {
             let cfg = match check_context.load_config() {
@@ -1215,23 +1227,30 @@ async fn worker(
             stale_job(&check_context, &cfg, &check_key, &epoch)
                 .map(|reason| if reason.is_empty() { "模式或权限已变化，丢弃排队的指令" } else { reason }.to_string())
         }));
-        // DSH cookies expire; a fresh login per turn is cheap.
-        if needs_dsh { let _ = pipe.rpc.relogin(); }
         let result = pipe.run_chat_turn(&key, &job.prompt, job.ack.clone(), &cfg, &job.inbound, &job.media, &job.mode, job.owner).await;
         match result {
-            Ok(()) => println!("[chat] {key} 回合完成"),
+            Ok(ChatTurnOutcome::Completed) => println!("[chat] {key} 回合完成"),
+            Ok(ChatTurnOutcome::WaitForDsh) => {
+                println!("[chat] {key} DSH 不可用，消息排队等待恢复");
+                dsh_retry = Some(tokio::time::Instant::now() + Duration::from_millis(500));
+                park!(job, true);
+                continue;
+            }
+            Ok(ChatTurnOutcome::ParkSwitchUntil(deadline)) => {
+                if let Err(error) = journal.requeue_unsubmitted(job.inbound.clone(), now_ms()).await {
+                    println!("[chat] ❌ {key} 事件状态写入失败：{error}");
+                }
+                switch_retry = Some((deadline, job));
+                continue;
+            }
             Err(error) => {
                 println!("[chat] ❌ {key} 回合失败：{error}");
-                // The prompt never reached DSH and DSH is unreachable: wait for it instead of losing the message.
-                if needs_dsh && pipe.dispatch_definitely_unsubmitted() && is_down(&context) {
-                    println!("[chat] {key} DSH 不可用，该消息排队等待恢复");
-                    crate::admin_alert::notify_notice(
-                        &context,
-                        &cfg,
-                        &format!("[{key}] DSH 不可用，消息已排队，恢复后会重新核对权限再补投"),
-                        "turn-failure",
-                    );
-                    park!(job, true);
+                if error == crate::turn_engine::ADMISSION_CHANGED && job.admission_retries < ADMISSION_RETRY_CAP {
+                    if let Err(error) = journal.requeue_unsubmitted(job.inbound.clone(), now_ms()).await {
+                        println!("[chat] ❌ {key} 事件状态写入失败：{error}");
+                    }
+                    job.admission_retries += 1;
+                    switch_retry = Some((crate::parity_clock::now_ms().saturating_add(ADMISSION_RETRY_MS), job));
                     continue;
                 }
                 // Model errors and refusals were already reported by the pipeline with their own text.
@@ -1305,6 +1324,7 @@ mod tests {
         let key = "group:42";
         let job = |resets: Option<usize>, mode_stamp: Option<String>| Job {
             prompt: String::new(), media: Vec::new(), ack: None, inbound: Vec::new(), mode: "chat".into(), owner: false, resets, mode_stamp,
+            admission_retries: 0,
         };
         let stamp = crate::reserved::mode_stamp(&context).ok();
         assert_eq!(stale_job(&context, &cfg, key, &job(Some(0), stamp.clone())), None, "a current job runs");
@@ -1343,6 +1363,7 @@ mod tests {
             prompt: String::new(), media: Vec::new(), ack: None, inbound: Vec::new(), mode: "chat".into(), owner: false,
             resets: crate::turn_ledger::reset_count(&context, key).ok(),
             mode_stamp: crate::reserved::mode_stamp(&context).ok(),
+            admission_retries: 0,
         };
         let (status, reply) = crate::console::admin_request(&context, "POST", "/api/whitelist", Some(&serde_json::json!({"allow": {"groups": [42]}, "confirm": true})));
         assert_eq!(status, 200, "{reply}");

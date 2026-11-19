@@ -145,6 +145,7 @@ struct DshInner {
     stall_handshakes: bool,
     stalled_handshakes: usize,
     fail_settings: bool,
+    archive_failures: usize,
     presets: Value,
     settings: Value,
     rejected_results: usize,
@@ -170,7 +171,7 @@ fn event(sess: &mut Sess, kind: &str, data: Value) {
 impl Dsh {
     fn new() -> Arc<Self> {
         Arc::new(Self { loop_fixture: Mutex::new(None), loop_results: Mutex::new(Vec::new()), requests: Mutex::default(), inner: Mutex::new(DshInner { sessions: HashMap::new(), next_sid: 0, rpc: Vec::new(), prompts: Vec::new(), refuse_prompt: false, preview_fault: None, interactions: Vec::new(), event_clients: 0, drop_interaction_stream: false, stall_handshakes: false, stalled_handshakes: 0, fail_settings: false,
-            presets: json!([{"id":"ticket12-chat"},{"id":"ticket12-v2-preset"},{"id":"ticket13-full","isDefault":true}]), settings: json!({"namespaces":[]}), rejected_results: 0, accepted_results: Vec::new(), drop_result_response: 0, hold_result_response: false, hold_settings_update: false }), trace: Arc::default() })
+            archive_failures: 0, presets: json!([{"id":"ticket12-chat"},{"id":"ticket12-v2-preset"},{"id":"ticket13-full","isDefault":true}]), settings: json!({"namespaces":[]}), rejected_results: 0, accepted_results: Vec::new(), drop_result_response: 0, hold_result_response: false, hold_settings_update: false }), trace: Arc::default() })
     }
 
     fn prompts(&self) -> Vec<PromptRec> {
@@ -200,6 +201,10 @@ impl Dsh {
                     inner.accepted_results.push(args.clone());
                     Ok(json!({}))
                 }
+            }
+            "workspace/archiveSession" if inner.archive_failures > 0 => {
+                inner.archive_failures -= 1;
+                Err(("fixture-archive-error".into(), "synthetic archive detail".into()))
             }
             "workspace/rename" | "session/rename" | "workspace/archiveSession" => Ok(json!({})),
             "session/selectModel" => {
@@ -916,6 +921,10 @@ impl Rig {
     }
 
     fn start(&mut self) {
+        self.start_with_clock(None);
+    }
+
+    fn start_with_clock(&mut self, advance_file: Option<&Path>) {
         let log = |name: &str| fs::OpenOptions::new().create(true).append(true).open(self.root.join(name)).unwrap();
         let ambient = self.root.join("ambient");
         let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
@@ -935,6 +944,9 @@ impl Rig {
             command.env("TOKIO_WORKER_THREADS", "4");
         }
         seed_reserved_fixture(&mut command, &self.root);
+        if let Some(path) = advance_file {
+            command.env("HER_PARITY_EPOCH_MS", now_ms().to_string()).env("HER_PARITY_ADVANCE_FILE", path);
+        }
         hide_window(&mut command);
         self.candidate = Some(command.spawn().expect("spawn candidate"));
         // Wait for the gateway connection to exist before events are pushed.

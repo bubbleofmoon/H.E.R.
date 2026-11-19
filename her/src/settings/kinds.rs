@@ -2,17 +2,20 @@
 //! the store, the settings page and the chat tools use, so no code outside this folder matches on a kind.
 
 mod choice;
+mod daily_time;
 mod id_list;
 mod integer;
 mod model_id;
 mod owner_id;
 mod route_id;
+mod route_list;
 mod secret;
-pub(crate) use secret::ApiKey;
 mod switch;
 mod text;
+mod time_zone;
 
 pub(crate) use choice::Choice;
+pub(crate) use daily_time::{daily_parts, DailyTime};
 pub(crate) use id_list::IdList;
 #[cfg(test)]
 pub(crate) use id_list::ID_LIST_MAX;
@@ -20,8 +23,11 @@ pub(crate) use integer::{FileRule, Integer};
 pub(crate) use model_id::ModelId;
 pub(crate) use owner_id::OwnerId;
 pub(crate) use route_id::RouteId;
+pub(crate) use route_list::RouteList;
+pub(crate) use secret::ApiKey;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
+pub(crate) use time_zone::TimeZoneName;
 
 use serde_json::Value;
 
@@ -72,7 +78,7 @@ pub(crate) trait SettingKind: Sync {
 
     /// The value the store keeps when it seeds the setting from `found`, its value in `config.json`; `None` when the
     /// store cannot keep one. The accepted value (`normalize`), unless the kind keeps what the next use reads (a
-    /// switch, an id list) or reads a blank value as its default (the owner).
+    /// clamped integer, a switch, an id list) or reads a blank value as its default (the owner).
     fn seed(&self, found: &Value) -> Option<Value> {
         self.normalize(found)
     }

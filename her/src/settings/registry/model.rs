@@ -1,7 +1,7 @@
 //! The model and cost group, and the model route chosen per conversation (#162, `ConversationSetting`, the
 //! conversation scope).
 
-use crate::settings::kinds::{FileRule, Integer, ModelId, RouteId};
+use crate::settings::kinds::{FileRule, Integer, ModelId, RouteId, RouteList};
 use crate::settings::{ConversationSetting, Setting};
 
 /// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which `digest::model` falls back
@@ -18,11 +18,24 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
     secret: false,
 };
 
+/// The explicit chain read by `harness::routes::chain` on the loader's document.
+pub(crate) const HARNESS_ROUTES: Setting = Setting {
+    key: "harness.routes",
+    pointer: "/harness/routes",
+    kind: &RouteList,
+    applies: "live",
+    group: "model and cost",
+    label: "Model route list",
+    hint: "An ordered JSON array of route objects with id and model, and optional reasoningEffort, maxOutputTokens and retry429. Reset to use harness.model alone. See Model routes for the active chain and validation errors.",
+    chat: false,
+    secret: false,
+};
+
 /// Read by `harness::Limits::from_config`.
 pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
     key: "harness.maxSteps",
     pointer: "/harness/maxSteps",
-    kind: &Integer { min: 1, max: 64, default: 8, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 64, default: Some(8), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Model requests per turn",
@@ -35,7 +48,7 @@ pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
 pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     key: "harness.maxTokens",
     pointer: "/harness/maxTokens",
-    kind: &Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 1_000_000, default: Some(32_768), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Token budget per turn",
@@ -61,11 +74,11 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
 pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     key: "memory.digest.timeoutSecs",
     pointer: "/memory/digest/timeoutSecs",
-    kind: &Integer { min: 1, max: 600, default: 120, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 600, default: Some(120), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Digest request timeout",
-    hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.",
+    hint: "Total seconds allowed for a conversation's digest to walk the model route chain before it times out.",
     chat: false,
     secret: false,
 };
@@ -99,6 +112,7 @@ pub(crate) const HARNESS_FIRST_ROUTE: Setting = Setting {
 /// The group's settings, in registry order.
 pub(super) const SETTINGS: &[Setting] = &[
     HARNESS_MODEL,
+    HARNESS_ROUTES,
     HARNESS_MAX_STEPS,
     HARNESS_MAX_TOKENS,
     DIGEST_MODEL,

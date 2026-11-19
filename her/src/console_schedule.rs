@@ -117,7 +117,13 @@ fn list(context: &RuntimeContext, cfg: &Value) -> Reply {
     };
     let now = crate::parity_clock::now_ms();
     let entries = ScheduleStore::new(context).entries(&jobs, now).map_err(store_error)?;
-    Ok((200, json!({"ok": true, "now": now, "entries": entries})))
+    let zone = crate::local_time::configured_zone(cfg);
+    let current = crate::local_time::at(now, &zone);
+    Ok((200, json!({
+        "ok": true, "now": now, "entries": entries,
+        "timeZone": {"name": zone.iana_name(), "offsetSeconds": current.offset().seconds(),
+                     "label": crate::local_time::label(&current)}
+    })))
 }
 
 fn create(context: &RuntimeContext, req: &Request) -> Reply {
@@ -128,13 +134,14 @@ fn create(context: &RuntimeContext, req: &Request) -> Reply {
         .and_then(canonical_v2_key)
         .ok_or((400, "会话标识无效".to_string()))?;
     let text = fields.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
-    let at = fields.get("at").and_then(Value::as_i64).ok_or((400, "提醒时间无效".to_string()))?;
+    let _authority = authority(context, req)?;
+    let cfg = selected_config_for_handler(context)?;
+    let at = optional_time(&fields, &cfg)?.ok_or((400, "提醒时间无效".to_string()))?;
     let repeat = match fields.get("repeat") {
         None | Some(Value::Null) => Repeat::Once,
         Some(value) => serde_json::from_value::<Repeat>(value.clone()).map_err(|error| (400, format!("重复设置无效：{error}")))?,
     };
     let new = NewItem { creator: Creator::Owner, conversation, text, at, repeat };
-    let _authority = authority(context, req)?;
     let item = ScheduleStore::new(context).create(new, crate::parity_clock::now_ms()).map_err(store_error)?;
     Ok((200, json!({"ok": true, "item": item})))
 }
@@ -200,14 +207,28 @@ fn optional<T>(fields: &serde_json::Map<String, Value>, key: &str, parse: impl F
     }
 }
 
+fn optional_time(fields: &serde_json::Map<String, Value>, cfg: &Value) -> Result<Option<i64>, (u16, String)> {
+    let invalid = || (400, "提醒时间无效".to_string());
+    match (fields.get("at"), fields.get("localAt")) {
+        (None, None) => Ok(None),
+        (Some(at), None) => at.as_i64().map(Some).ok_or_else(invalid),
+        (None, Some(local)) => local.as_str()
+            .and_then(|text| crate::local_time::parse_wall_minute(text, &crate::local_time::configured_zone(cfg)))
+            .map(Some).ok_or_else(invalid),
+        (Some(_), Some(_)) => Err(invalid()),
+    }
+}
+
 fn item_action(context: &RuntimeContext, req: &Request, id: &str, action: &str, fields: &serde_json::Map<String, Value>) -> Reply {
     if !matches!(action, "pause" | "resume" | "cancel" | "run" | "edit") {
         return Err((409, UNSUPPORTED.to_string()));
     }
+    let _authority = authority(context, req)?;
     let change = if action == "edit" {
+        let cfg = selected_config_for_handler(context)?;
         ItemChange {
             text: optional(fields, "text", |v| v.as_str().map(str::to_string), "提醒内容必须是文字")?,
-            at: optional(fields, "at", Value::as_i64, "提醒时间无效")?,
+            at: optional_time(fields, &cfg)?,
             repeat: optional(fields, "repeat", |v| serde_json::from_value::<Repeat>(v.clone()).ok(), "重复设置无效")?,
         }
     } else {
@@ -215,7 +236,6 @@ fn item_action(context: &RuntimeContext, req: &Request, id: &str, action: &str, 
     };
     let store = ScheduleStore::new(context);
     let now = crate::parity_clock::now_ms();
-    let _authority = authority(context, req)?;
     let item = match action {
         "pause" => store.set_item_paused(id, true),
         "resume" => store.set_item_paused(id, false),
@@ -251,13 +271,7 @@ fn timer_action(
             Ok((200, json!({"ok": true, "id": id, "status": "cancelRequested"})))
         }
         ("sleep", "cancel") => set_sleep(context, req, key, None),
-        ("sleep", "edit") => {
-            let at = fields.get("at").and_then(Value::as_i64).ok_or((400, "提醒时间无效".to_string()))?;
-            if at <= now {
-                return Err((400, "睡眠结束时间必须在现在之后".to_string()));
-            }
-            set_sleep(context, req, key, Some(at))
-        }
+        ("sleep", "edit") => set_sleep(context, req, key, Some(fields)),
         ("sleep", "pause") | ("sleep", "resume") | ("replyCheck", "pause") | ("replyCheck", "resume") | ("reachOut", "pause") | ("reachOut", "resume") => {
             Err((409, "HER 的内部计时器不能暂停；可以取消或立即运行".to_string()))
         }
@@ -271,7 +285,7 @@ fn wake(context: &RuntimeContext, cfg: &Value, req: &Request, key: &str, reason:
     access::social_v2_wake_with(context, cfg, &body, &|current: &Value| authorized_in(context, req, current)).map(|value| (200, value))
 }
 
-fn set_sleep(context: &RuntimeContext, req: &Request, key: &str, until: Option<i64>) -> Reply {
+fn set_sleep(context: &RuntimeContext, req: &Request, key: &str, fields: Option<&serde_json::Map<String, Value>>) -> Reply {
     drop(authority(context, req)?);
     mutate_social_state_for(context, |state| {
         // Rechecked under the social-state gate: a rotation may have completed since the check above.
@@ -279,6 +293,13 @@ fn set_sleep(context: &RuntimeContext, req: &Request, key: &str, until: Option<i
         if !authorized_in(context, req, &current) {
             return Err((401, REVOKED.to_string()));
         }
+        let until = fields.map(|fields| {
+            let at = optional_time(fields, &current)?.ok_or((400, "提醒时间无效".to_string()))?;
+            if at <= crate::parity_clock::now_ms() {
+                return Err((400, "睡眠结束时间必须在现在之后".to_string()));
+            }
+            Ok(at)
+        }).transpose()?;
         let conversation_wake = state
             .get_mut("conversations")
             .and_then(|c| c.get_mut(key))

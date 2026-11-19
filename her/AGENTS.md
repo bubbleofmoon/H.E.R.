@@ -16,4 +16,4 @@ Read the topic doc before changing its implementation:
 - Releases and installs, dependency startup, ownership, recovery and stop; supervisor lifecycle, health checks, scheduled tasks, digest, backups, the Schedule store and page and task storage: `docs/agents/lifecycle-tasks.md`.
 - Build slots, isolated targets, fixture clocks, independent QQ login retry-spacing assertions, pending-interaction publication waits and verification evidence: `docs/agents/rust-validation.md`.
 - Public production rules and the `her-cli report` contract (procedures live in the vault): `docs/agents/production-ops.md`.
-- Signed release dependency notices: `THIRD_PARTY_NOTICES.md`.
+- Third-party dependency notices: `THIRD_PARTY_NOTICES.md`.

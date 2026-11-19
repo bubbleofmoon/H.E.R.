@@ -134,7 +134,7 @@ pub fn backup_config(raw: &Value) -> Result<Value, String> {
     backup.remove("keep");
     for (key, default) in [
         ("keepDays", json!(7)),
-        ("time", json!("04:00")),
+        ("time", crate::settings::BACKUP_TIME.default_value()),
         ("includeState", json!(true)),
     ] {
         if backup.get(key).is_none_or(Value::is_null) {
@@ -147,18 +147,7 @@ pub fn backup_config(raw: &Value) -> Result<Value, String> {
     if !backup["includeState"].is_boolean() {
         return Err("backup.includeState must be a boolean".into());
     }
-    let time = backup["time"]
-        .as_str()
-        .ok_or("backup.time must be HH:MM (00:00-23:59)")?;
-    let bytes = time.as_bytes();
-    if bytes.len() != 5
-        || bytes[2] != b':'
-        || ![bytes[0], bytes[1], bytes[3], bytes[4]]
-            .iter()
-            .all(u8::is_ascii_digit)
-        || (bytes[0] - b'0') * 10 + (bytes[1] - b'0') > 23
-        || (bytes[3] - b'0') * 10 + (bytes[4] - b'0') > 59
-    {
+    if backup["time"].as_str().and_then(crate::settings::daily_parts).is_none() {
         return Err("backup.time must be HH:MM (00:00-23:59)".into());
     }
     match backup.get("dir") {

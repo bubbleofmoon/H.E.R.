@@ -177,6 +177,25 @@ fn ticket219_core_prompt_delivery_rechecks_credentials_after_strip() {
     *member = json!("fixture-cli-REMOVEcredential");
     let visible = crate::prompt_text::model_text(&context, &cfg, setting.key);
     assert!(!visible.contains(CLI_KEY), "stripping exposed a credential in prompt text");
+    let handover = crate::engine_switch::safe_text(&context, &cfg, "before fixture-cli-REMOVEcredential after", 100);
+    assert_eq!(handover.as_deref(), Some("before *** after"), "stripping exposed a credential in a handover");
+}
+
+#[test]
+fn ticket219_core_route_list_keeps_endpoint_keys_out_of_settings_history() {
+    let (root, context) = settings_fixture("route list endpoint credential");
+    assert_eq!(put(&context, CLI, CLI_KEY).0, 200);
+    let routes = json!([{"id": "first", "model": format!("model-{CLI_KEY}")}]);
+    write_config(&root, |config| config["harness"]["routes"] = routes.clone());
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    let view = setting_view(&context, "harness.routes");
+    assert_eq!(view["value"][0]["model"], "model-[REDACTED]");
+    assert_eq!(view["redacted"], true);
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "harness.routes", "value": routes}));
+    assert_eq!(status, 400);
+    assert!(!reply.to_string().contains(CLI_KEY));
+    assert!(history_page(&context, "?setting=harness.routes").0.is_empty());
+    assert!(!json!(audit_rows(&root)).to_string().contains(CLI_KEY));
 }
 
 #[test]

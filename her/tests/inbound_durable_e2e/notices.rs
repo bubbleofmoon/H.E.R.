@@ -20,6 +20,7 @@ fn start_notices_with(root: &Path, groups: &[i64], initial: FakeGateway) -> Harn
     let mut config: Value =
         serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
     config["allow"] = json!({"groups": groups, "private": [OWNER, 8810]});
+    config["time"] = json!({"zone": "Asia/Shanghai"});
     fs::write(config_path, config.to_string()).unwrap();
     let gateway = Arc::new(Mutex::new(initial));
     let capture = gateway.clone();
@@ -372,16 +373,7 @@ fn private_gap_windows_are_grouped_and_only_new_windows_are_announced_after_rest
                 "{text}"
             );
             assert!(
-                text.contains(
-                    if matches!(
-                        std::env::var("TZ").as_deref(),
-                        Ok("UTC" | "Etc/UTC" | "GMT" | "Etc/GMT" | "Z")
-                    ) {
-                        "2026/10/30 10:30:12"
-                    } else {
-                        "2026/10/30 18:30:12"
-                    }
-                ),
+                text.contains("2026/10/30 18:30:12"),
                 "local time: {text}"
             );
             assert!(
@@ -500,16 +492,8 @@ fn an_interrupted_event_notice_names_conversation_time_action_and_any_later_turn
         let text = &notices[0];
         eprintln!("ticket89 interrupted later={later_in_same_conversation}: {text}");
         assert!(text.contains("group:420042"), "conversation: {text}");
-        let local_time = if matches!(
-            std::env::var("TZ").as_deref(),
-            Ok("UTC" | "Etc/UTC" | "GMT" | "Etc/GMT" | "Z")
-        ) {
-            "2026/10/30 10:30:12"
-        } else {
-            "2026/10/30 18:30:12"
-        };
         assert!(
-            text.contains(local_time),
+            text.contains("2026/10/30 18:30:12"),
             "original event time, not restart time: {text}"
         );
         assert!(

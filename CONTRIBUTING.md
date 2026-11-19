@@ -30,12 +30,7 @@ the PowerShell wrapper refuses a multiline title or label instead, because Windo
 5.1 cannot forward one intact. A refusal prints a fixed kind and the argument position,
 never a supplied value.
 
-Install Rust stable, Python 3, Node.js 24 with its bundled npm and gitleaks 8.30.0. Node supports the synthetic test fixtures. See docs/agents/rust-validation.md for builds
-and the complete unit/integration suite; use isolated fixtures and no real services.
-The checks workflow defines Windows and Linux validation and runs on hosted runners
-for every pull request and every push to main; it is the merge gate for everything it runs,
-and local gates keep only the native, elevated and production checks the hosted runners cannot run.
-No host needs a local Rust build: compile, lint, format and tests run on CI (`docs/agents/rust-validation.md`). A native check a gate names uses the cargo-slot scripts.
+Install Python 3, Node.js 24 with its bundled npm and pinned gitleaks 8.30.0 for local tooling. Install Rust stable for native Cargo checks. See [Rust build and validation](docs/agents/rust-validation.md) for the hosted job matrix, native checks and isolated fixtures.
 
 The guard tests itself: `python -I scripts/tests/test_scan_public.py`,
 `python -I scripts/tests/test_pre_push_hook.py` and `python -I scripts/tests/test_gh_public.py`, `python -I scripts/tests/test_check_repo.py`, `python -I scripts/tests/test_handoff.py`

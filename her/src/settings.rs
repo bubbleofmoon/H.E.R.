@@ -36,10 +36,10 @@
 //! never seeded from or written back into `config.json`; a conversation without a value uses its global setting.
 //! `apply_conversation` and `reset_conversation` change it for one admitted conversation (`conversation_admitted`),
 //! `undo` and `history` take its audit rows (scope: the conversation's key), and a write that changes an access setting
-//! clears, in the same transaction, the values of every conversation it leaves unadmitted. The turn engine settings
-//! (`engine.default`, `conversation.engine`) are not read to route turns yet. The model route (#162, `harness.firstRoute`
-//! and `conversation.route`) is read when each harness turn starts (`harness::routes::selected`, through
-//! `conversation_value`); a setting whose default is none stores none on a reset (`Setting::storable`).
+//! clears, in the same transaction, the values of every conversation it leaves unadmitted. Engine selection reads
+//! `conversation.engine` and then `engine.default`. Harness turn admission reads `conversation.route` and
+//! `harness.firstRoute` through `harness::routes::selected`. A setting whose default is none stores none on a reset
+//! (`Setting::storable`).
 
 mod kinds;
 #[cfg(test)]
@@ -49,18 +49,28 @@ mod store;
 
 use serde_json::Value;
 
-pub(crate) use kinds::SettingKind;
+pub(crate) use kinds::{daily_parts, SettingKind};
 #[cfg(test)]
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
-#[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 pub(crate) use registry::{
+    daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
+    RELATED_TOP_K,
+    AUTO_FLUSH_ENABLED,
+    AUTO_FLUSH_CONTEXT_PCT,
+    AUTO_FLUSH_MAX_SESSIONS,
+    AUTO_FLUSH_MIN_INTERVAL,
+    DIGEST_MAX_INPUT_CHARS,
+    LAYER_IDENTITY,
+    LAYER_RELATIONSHIP,
+    LAYER_CONVERSATION,
+    LAYER_MATERIAL,
     chat_registry, chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
+    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
 };
 #[cfg(test)]
 pub(crate) use store::{
@@ -68,11 +78,12 @@ pub(crate) use store::{
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
-    apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
-    conversation_admitted, conversation_value, conversation_view, direct_change_error, has_stored_values, history,
+    apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
+    console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
+    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
-    registry_free, reset, reset_conversation, restore_gate, security_restore, store_mark, store_path, undo, view,
-    archive_has_endpoint_credentials, harness_credential, secret_revision, secret_value, stored_secrets, write_back, Applied, Change, CONVERSATION_ERROR,
+    archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config, restore_gate, restore_switch_choice, security_restore, store_mark, store_path, undo, view,
+    secret_revision, secret_value, stored_secrets, write_back, Applied, Change, CONVERSATION_ERROR,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.
@@ -130,7 +141,7 @@ impl Setting {
         self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
     }
 
-    /// The default; `Null` for a model id without one (not configured).
+    /// The default; `Null` can mean unconfigured or use a fallback.
     pub(crate) fn default_value(&self) -> Value {
         self.kind.default_value()
     }
@@ -171,8 +182,7 @@ impl Setting {
         self.read(document).as_i64().unwrap_or_default()
     }
 
-    /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
-    /// one.
+    /// The resolved string of a string-valued setting, if present.
     pub(crate) fn text(&self, document: &Value) -> Option<String> {
         self.read(document).as_str().map(str::to_string)
     }
