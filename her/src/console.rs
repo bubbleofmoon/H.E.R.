@@ -26891,12 +26891,16 @@ mod tests {
         let first = handle_social_config(&context, &context.load_config().unwrap());
         assert_eq!(first["config"]["initialPromptMaxChars"], 2000);
         assert_eq!(first["config"]["wake"]["batchWindowMs"], 8000);
+        assert_eq!(first["config"]["send"]["firstGapBaseMs"], 1000);
+        assert_eq!(first["config"]["send"]["maxSendPerMinute"], 8);
         // After a save, the console overlays the timing defaults on the raw section.
         // The unnormalized initialPromptMaxChars still comes back as saved.
         let saved = handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         assert!(file["socialV2"].get("reply").is_none(), "defaults stay out of the saved file");
         assert!(file.pointer("/socialV2/wake/batchWindowMs").is_none(), "the wake timing default stays out of the saved file");
+        let send = file["socialV2"]["send"].as_object().unwrap();
+        assert_eq!(send.keys().map(String::as_str).collect::<Vec<_>>(), ["recommendedHint"], "send defaults stay out of the saved file");
         let mut effective = file.clone();
         crate::settings::complete_timing(&mut effective);
         effective["socialV2"]["wake"]["batchWindowMs"] = json!(8000);
@@ -26908,9 +26912,12 @@ mod tests {
             "urgentQuietMinMs": 1000,
             "urgentQuietMedianMs": 3000,
             "urgentQuietMaxMs": 6000,
+            "stickerPauseMinMs": 800,
+            "stickerPauseMaxMs": 2000,
         });
         assert_eq!(saved["config"]["reply"], effective["socialV2"]["reply"]);
         assert_eq!(saved["config"]["wake"]["batchWindowMs"], 8000);
+        assert_eq!(saved["config"]["send"], effective["socialV2"]["send"]);
         let read = handle_social_config(&context, &context.load_config().unwrap());
         assert_eq!(read["config"], effective["socialV2"], "timing defaults overlay the reloaded file section");
         assert_eq!(read["config"]["initialPromptMaxChars"], 5);
