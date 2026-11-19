@@ -1,6 +1,7 @@
 //! HER-owned model and tool turn execution. The pipeline retains admission authority and delivery.
 pub(crate) mod budget;
 pub(crate) mod handover;
+pub(crate) mod interactions;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
 pub(crate) mod rotation;
@@ -612,6 +613,10 @@ fn turn_owner(context: &RuntimeContext, turn: &str) -> Result<std::fs::File, Str
     )
 }
 
+fn turn_is_live(context: &RuntimeContext, turn: &str) -> bool {
+    matches!(turn_owner(context, turn), Err(error) if error == "runtime file is already locked")
+}
+
 /// Reset has already revoked the generation. A live owner must settle its handler;
 /// paused/crashed work has no owner and can be resolved immediately.
 /// False leaves both storage and ledger finalization to the live owner.
@@ -653,6 +658,7 @@ async fn tool_loop(
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Event, Failure> {
     let deadline = tokio::time::Instant::now() + request.deadline;
+    let session = history.session.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
@@ -812,29 +818,61 @@ async fn tool_loop(
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
             chain.dispatched |= prepared.is_ok();
-            let tools = request.tools.clone();
-            let invocation = call.clone();
-            let cancel = cancelled.clone();
-            let mut outcome = tokio::task::spawn_blocking(move || {
-                if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                    return tools::error("tool dispatch cancelled or expired");
+            let (mut outcome, stop) = match prepared {
+                Err(outcome) => (outcome, None),
+                Ok(args) if request.tools.handles_interaction(&call.fn_name) => {
+                    let result = match &request.tools.interactions {
+                        Some(mailbox) => {
+                            let binding = interactions::Binding {
+                                mailbox, key: &request.conversation, session: &session,
+                                turn: &request.id, epoch: &request.generation, deadline,
+                            };
+                            if call.fn_name == interactions::ASK {
+                                binding.question(&args, cancelled.clone()).await
+                            } else {
+                                binding.group_send(&args, cancelled.clone()).await
+                            }
+                        }
+                        None => Ok(tools::error("Owner interaction is unavailable.")),
+                    };
+                    match result {
+                        Ok(outcome) => (outcome, None),
+                        Err(reason) => {
+                            let mut outcome = tools::error("Owner interaction ended.");
+                            if matches!(&reason, Failure::Uncertain(_)) {
+                                outcome["_meta"] = serde_json::json!({"herDelivery":"unknown"});
+                            }
+                            (outcome, Some(reason))
+                        }
+                    }
                 }
-                match prepared {
-                    Ok(args) => tools.dispatch(&invocation, &args),
-                    Err(outcome) => outcome,
+                Ok(args) => {
+                    let tools = request.tools.clone();
+                    let invocation = call.clone();
+                    let cancel = cancelled.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
+                            return tools::error("tool dispatch cancelled or expired");
+                        }
+                        tools.dispatch(&invocation, &args)
+                    })
+                    .await
+                    .map_err(|_| {
+                        Failure::Uncertain(
+                            "harness tool worker failed before its effect could be settled".into(),
+                        )
+                    })?;
+                    (outcome, None)
                 }
-            })
-            .await
-            .map_err(|_| {
-                Failure::Uncertain(
-                    "harness tool worker failed before its effect could be settled".into(),
-                )
-            })?;
+            };
             redact(&mut outcome, &request.route.key);
             let message = tool_message(&call, &outcome);
             store
                 .tool_result(&request.id, &run, &message, &outcome)
                 .map_err(Failure::Uncertain)?;
+            if let Some(reason) = stop {
+                return Err(reason);
+            }
             if outcome["_meta"]["herDelivery"] == "unknown" {
                 return Err(Failure::Uncertain("QQ send delivery could not be confirmed; administrator confirmation required before retry".into()));
             }
@@ -1289,6 +1327,19 @@ fn filter_model_messages(
                 ContentPart::ToolCall(mut call) => {
                     call.fn_arguments =
                         crate::model_view::strip_model_chat_data(&call.fn_arguments, &cfg);
+                    if call.fn_name == interactions::ASK {
+                        let filter = |value: &mut Value| {
+                            if let Some(text) = value.as_str() {
+                                *value = Value::String(crate::model_view::strip_from_model_text(text, &cfg));
+                            }
+                        };
+                        if let Some(question) = call.fn_arguments.get_mut("question") {
+                            filter(question);
+                        }
+                        if let Some(options) = call.fn_arguments.get_mut("options").and_then(Value::as_array_mut) {
+                            options.iter_mut().for_each(filter);
+                        }
+                    }
                     ContentPart::ToolCall(call)
                 }
                 ContentPart::ToolResponse(mut response) => {
@@ -1335,7 +1386,12 @@ fn filter_tool_text(text: &str, cfg: &Value, tool: Option<&str>) -> Result<Strin
         for block in blocks {
             if block["type"] == "text" {
                 if let Some(text) = block["text"].as_str() {
-                    block["text"] = Value::String(filter_tool_text(text, cfg, None)?);
+                    let copy = if tool == Some(interactions::ASK) {
+                        crate::model_view::strip_from_model_text(text, cfg)
+                    } else {
+                        filter_tool_text(text, cfg, None)?
+                    };
+                    block["text"] = Value::String(copy);
                 }
             }
         }

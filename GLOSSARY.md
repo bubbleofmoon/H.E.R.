@@ -17,7 +17,7 @@ A one-to-one session with a single QQ user.
 The participation mode that provides ordinary chat in allowed group and private sessions.
 
 **Admin agent (管理员代理, `closed-agent`)**:
-The participation mode that opens the full agent toolset, including questions and approvals, in the administrator's private session.
+The participation mode for the administrator's private session. The Admin agent can pause a tool call to ask the owner a question or request approval of a specific group send.
 
 **First-generation simulation (一代仿真, `reserved`)**:
 The first-generation participation mode that imitates a group member through participation states such as watching, active, probing and leaving.

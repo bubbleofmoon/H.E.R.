@@ -450,6 +450,35 @@ fn closed_agent_expired_approval_is_rejected_once() {
 }
 
 #[test]
+fn a_corrupt_harness_interaction_snapshot_keeps_legacy_pending_entries_visible() {
+    let mut rig = Rig::new("closed-corrupt-harness-pending", Seed { mode: "closed-agent", ..Seed::default() });
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#QUESTION#");
+    assert!(wait_for(LONG, || rig.console("GET", "/api/pending", None).1["pending"][0]["kind"] == "question"));
+    let before = rig.console("GET", "/api/pending", None);
+    assert_eq!(before.0, 200);
+    assert_eq!(before.1["pending"].as_array().unwrap().len(), 1);
+    fs::write(rig.root.join("data/pending-owner-interaction.json"), "{invalid").unwrap();
+    assert_eq!(rig.console("GET", "/api/pending", None), before, "a corrupt harness snapshot hid the legacy pending entries");
+}
+
+#[test]
+fn reset_and_new_still_reach_the_legacy_pending_question_handler() {
+    for (tag, command) in [("reset", "/reset"), ("new", "/new")] {
+        let mut rig = Rig::new(&format!("closed-legacy-qq-{tag}"), Seed { mode: "closed-agent", ..Seed::default() });
+        rig.start();
+        says(&rig, OWNER_KEY, OWNER, "owner", "#QUESTION#");
+        assert!(wait_for(LONG, || rig.console("GET", "/api/pending", None).1["pending"][0]["kind"] == "question"));
+        says(&rig, OWNER_KEY, OWNER, "owner", command);
+        assert!(wait_for(LONG, || {
+            rig.dsh.calls("$events/result").iter().any(|call| {
+                call["outcome"]["value"]["answers"][0]["custom"] == command
+            })
+        }), "{command} did not reach the legacy question handler");
+    }
+}
+
+#[test]
 fn closed_agent_definite_receipt_rejection_keeps_question_for_retry() {
     let mut rig = Rig::new("closed-receipt-rejection", Seed { mode: "closed-agent", ..Seed::default() });
     lock(&rig.dsh.inner).rejected_results = 1;

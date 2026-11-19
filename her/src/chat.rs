@@ -583,6 +583,7 @@ pub struct SendReport {
     pub parts: usize,
     pub confirmed: usize,
     pub error: Option<String>,
+    pub unknown: bool,
 }
 
 fn target_of(key: &str) -> Option<Target> {
@@ -693,6 +694,7 @@ fn send_recorded_inline(
         }
         let outcome = ob.send_one_outcome(&target, part, None, None);
         let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
+        report.unknown |= settled.state.needs_verification() || settled.record_error.is_some();
         if let ItemState::Confirmed { message_id, .. } = settled.state {
             report.confirmed += 1;
             confirmed_ids.extend(message_id);
@@ -704,6 +706,9 @@ fn send_recorded_inline(
                 stop = Some(why);
             }
         } else if let Some(error) = settled.error {
+            if report.unknown && matches!(purpose, "owner-interaction" | "owner-interaction-timeout") {
+                stop = Some(error.clone());
+            }
             report.error.get_or_insert(error);
         }
     }
@@ -964,7 +969,32 @@ impl Hub {
         let is_owner = !owner.is_empty() && inb.user_id.to_string() == owner;
         if is_owner && !plain.is_empty() && crate::console::runtime_mode(&self.context) == "closed-agent" {
             if let Some(interactions) = &self.interactions {
-                if interactions.answer(&key, &plain).await {
+                let reset = matches!(plain.to_ascii_lowercase().as_str(), "/reset" | "/new");
+                use crate::harness::interactions::Answer;
+                let answer = if reset {
+                    Answer::Forward
+                } else {
+                    interactions.mailbox.answer(&key, &plain, crate::closed_agent::GATE_WAIT).await
+                };
+                let handled = match answer {
+                    Answer::Accepted => true,
+                    Answer::Notice(text) => {
+                        self.say(cfg, &key, &text);
+                        true
+                    }
+                    Answer::NoticeAndForward(text) => {
+                        self.say(cfg, &key, &text);
+                        false
+                    }
+                    Answer::NoticeIfNoLegacy(text) => {
+                        if !interactions.answer(&key, &plain).await {
+                            self.say(cfg, &key, &text);
+                        }
+                        true
+                    }
+                    Answer::Forward => interactions.answer(&key, &plain).await,
+                };
+                if handled {
                     self.settle(inbound_key).await?;
                     return Ok(Outcome::Done);
                 }
@@ -1071,7 +1101,8 @@ impl Hub {
             .entry(key.to_string())
             .or_insert_with(|| {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                tokio::spawn(worker(self.context.clone(), self.journal.clone(), key.to_string(), rx));
+                let mailbox = self.interactions.as_ref().map(|hub| hub.mailbox.clone());
+                tokio::spawn(worker(self.context.clone(), self.journal.clone(), key.to_string(), rx, mailbox));
                 tx
             })
             .clone();
@@ -1118,6 +1149,7 @@ async fn worker(
     journal: SharedJournal,
     key: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>,
+    mailbox: Option<std::sync::Arc<crate::harness::interactions::Mailbox>>,
 ) {
     use crate::dsh_health::{is_down, BoundedQueue, QUEUE_MAX};
     let mut pipeline: Option<crate::pipeline::Pipeline> = None;
@@ -1192,7 +1224,10 @@ async fn worker(
                 crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true)
             };
             match built {
-                Ok(p) => pipeline = Some(p),
+                Ok(mut p) => {
+                    p.owner_interactions = mailbox.clone();
+                    pipeline = Some(p);
+                }
                 Err(error) => {
                     println!("[chat] ❌ {key} 无法初始化回合管线：{error}");
                     let _ = journal.mark_handled(job.inbound, now_ms()).await;

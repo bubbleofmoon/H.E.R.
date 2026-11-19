@@ -9716,7 +9716,6 @@ pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
     key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
 }
 
-#[allow(dead_code)] // Called by the live mailbox in run 2.
 pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> bool {
     let limit = cfg.pointer("/socialV2/send/maxMessageChars").and_then(Value::as_f64)
         .filter(|n| *n != 0.0).unwrap_or(500.0).clamp(1.0, 500.0) as usize;
@@ -9743,7 +9742,6 @@ fn approved_group_requires_explicit_canonical_scope_and_bounded_preview() {
 }
 
 /// Internal continuation. Only the live interaction passes the one-use owner decision.
-#[allow(dead_code)] // Called by the live mailbox in run 2.
 pub(crate) fn send_approved_group(
     context: &RuntimeContext, key: &str, message: &str, turn: &str, authorized: &dyn Fn() -> bool,
 ) -> Result<(u16, Value), (u16, String)> {
@@ -10336,7 +10334,6 @@ fn finish_send_batch(
 enum GuardPolicy<'a> {
     Reserved2,
     Reserved2OrClosedAgent,
-    #[allow(dead_code)] // Called by the live mailbox in run 2.
     ApprovedGroup { turn: &'a str, authorized: &'a dyn Fn() -> bool },
 }
 
