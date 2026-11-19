@@ -152,7 +152,7 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
     if budget.expired(conv) { return Err((409, "wake snapshot expired".into())); }
     let seqs = packet["messages"].as_array().unwrap().iter()
         .filter_map(|message| js_safe_integer(&message["seq"]).filter(|seq| *seq > 0)).collect();
-    let grant = SnapshotGrant { epoch, budget, seqs }; note_offered_receipts(context, &key, conv, conv["unread"].as_array().map(Vec::as_slice).unwrap_or_default(), packet["messages"].as_array().unwrap()); // RED-G3-receipts
+    let grant = SnapshotGrant { epoch, budget, seqs };
     snapshot_grants().lock().unwrap_or_else(|p| p.into_inner()).insert(slot, grant);
     packet["readThroughSeq"] = json!(through_of(context, &key, conv));
     Ok(packet)
