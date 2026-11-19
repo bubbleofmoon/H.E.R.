@@ -124,7 +124,7 @@ impl Limits {
             .then(|| context.load_config_document().ok())
             .flatten()
             .filter(Value::is_object);
-        Self::read(fallback) // RED-A1
+        Self::read(fresh.as_ref().unwrap_or(fallback))
     }
 
     fn read(cfg: &Value) -> Self {
@@ -186,6 +186,17 @@ fn admit_global(budget: Budget, scope: &str, key: &str, now_ms: i64, limits: Lim
     .lock()
     .unwrap_or_else(|p| p.into_inner());
     limiter.check_with(scope, key, now_ms, limits)
+}
+
+pub(crate) fn admit_notice(
+    context: &RuntimeContext,
+    cfg: &Value,
+    scope: &str,
+    key: &str,
+    now_ms: i64,
+) -> AlertVerdict {
+    let limits = Limits::current(context, cfg);
+    admit_global(Budget::Notice, scope, key, now_ms, limits)
 }
 
 /// The dedupe key of an administrator message kind (`turn-error`, `not-accepted`, `blocked-reply`). It never equals the

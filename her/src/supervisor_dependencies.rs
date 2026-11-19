@@ -1782,15 +1782,14 @@ fn deliver_outage_notice(
         .runtime_root()
         .ok_or("outage notice requires selected runtime")?
         .to_string_lossy();
-    if !crate::admin_alert::notice_limiter()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .check(
-            &scope,
-            &format!("dependency-{key}"),
-            crate::parity_clock::now_ms(),
-        )
-        .is_send()
+    if !crate::admin_alert::admit_notice(
+        context,
+        cfg,
+        &scope,
+        &format!("dependency-{key}"),
+        crate::parity_clock::now_ms(),
+    )
+    .is_send()
     {
         return Ok(());
     }

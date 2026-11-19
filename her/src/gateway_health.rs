@@ -47,7 +47,7 @@ impl GatewayHealth {
     }
 
     pub fn configure(&mut self, cfg: &Value) {
-        self.silence_warn_ms = self.silence_warn_ms.min(crate::settings::GATEWAY_SILENCE_WARN.integer(cfg)); // RED-A2
+        self.silence_warn_ms = crate::settings::GATEWAY_SILENCE_WARN.integer(cfg);
     }
 
     pub fn note_packet(&mut self, kind: &str, now_ms: i64) {
