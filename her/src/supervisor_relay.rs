@@ -515,75 +515,159 @@ pub(super) fn unix_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), 
 }
 
 #[cfg(windows)]
-pub(super) fn windows_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
-        SET_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
-    };
+fn credential_sids(path: &Path, settings: bool) -> Result<Vec<Vec<u8>>, Unprotected> {
     use windows_sys::Win32::Security::{
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+        CreateWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-    let mut user = identity::current_user().map_err(|error| {
+
+    let user = identity::current_user().map_err(|error| {
         Unprotected::Refused(format!(
             "relay private ACL {}: process token SID: {error}",
             shown(path)
         ))
     })?;
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_USER,
-        ptstrName: user.as_mut_ptr().cast(),
+    let mut sids = vec![user];
+    if settings {
+        for kind in [WinLocalSystemSid, WinBuiltinAdministratorsSid] {
+            let mut buffer = [0u32; 17];
+            let mut size = std::mem::size_of_val(&buffer) as u32;
+            // SAFETY: aligned writable SECURITY_MAX_SID_SIZE storage and a valid size pointer.
+            if unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut size) } == 0 {
+                return Err(Unprotected::Refused(windows_acl_error(
+                    path, "CreateWellKnownSid", std::io::Error::last_os_error().raw_os_error().unwrap_or_default() as u32,
+                )));
+            }
+            // SAFETY: the native call initialized this many bytes in the retained buffer.
+            let sid = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size as usize) };
+            if !sids.iter().any(|known| known.as_slice() == sid) {
+                sids.push(sid.to_vec());
+            }
+        }
+    }
+    Ok(sids)
+}
+
+#[cfg(windows)]
+fn private_acl<T>(
+    path: &Path,
+    directory: bool,
+    settings: bool,
+    use_acl: impl FnOnce(*mut windows_sys::Win32::Security::ACL, &[Vec<u8>]) -> T,
+) -> Result<T, Unprotected> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
+        SET_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
     };
-    let entry = EXPLICIT_ACCESS_W {
+    use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    let mut sids = credential_sids(path, settings)?;
+    let entries: Vec<_> = sids.iter_mut().map(|sid| EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_ALL_ACCESS,
         grfAccessMode: SET_ACCESS,
-        grfInheritance: if meta.is_dir() {
+        grfInheritance: if directory {
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
         } else {
             0
         },
-        Trustee: trustee,
-    };
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_UNKNOWN,
+            ptstrName: sid.as_mut_ptr().cast(),
+        },
+    }).collect();
     let mut acl = std::ptr::null_mut();
-    // SAFETY: retained SID and initialized ACL out-pointer; a null old ACL creates only
-    // the HER account ACE. No environment username or broad trustee grants participate.
-    let result = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) };
+    // SAFETY: the SID allocations and entries stay live. A null old ACL creates only these grants.
+    let result = unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), std::ptr::null(), &mut acl) };
     if result != 0 {
-        return Err(Unprotected::Refused(windows_acl_error(
-            path,
-            "SetEntriesInAclW",
-            result,
-        )));
+        return Err(Unprotected::Refused(windows_acl_error(path, "SetEntriesInAclW", result)));
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: NUL-terminated path and retained ACL; PROTECTED disables parent inheritance.
-    // Only WRITE_DAC is required: do not set the owner or request ownership privileges.
-    // The scheduled task and relay run as this account, so SYSTEM needs no separate ACE.
-    let result = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            acl,
-            std::ptr::null(),
-        )
-    };
+    let value = use_acl(acl, &sids);
     // SAFETY: SetEntriesInAclW allocated acl with LocalAlloc.
-    unsafe {
-        LocalFree(acl.cast());
+    unsafe { LocalFree(acl.cast()) };
+    Ok(value)
+}
+
+#[cfg(windows)]
+pub(super) fn windows_create_credential(path: &Path, settings: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::{
+        InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    private_acl(path, false, settings, |acl, _| {
+        let mut descriptor = std::mem::MaybeUninit::<SECURITY_DESCRIPTOR>::uninit();
+        let ptr = descriptor.as_mut_ptr().cast();
+        // SAFETY: the absolute security descriptor has aligned storage and the ACL outlives CreateFileW.
+        if unsafe { InitializeSecurityDescriptor(ptr, 1) } == 0
+            || unsafe { SetSecurityDescriptorDacl(ptr, 1, acl, 0) } == 0
+            || unsafe { SetSecurityDescriptorControl(ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: ptr,
+            bInheritHandle: 0,
+        };
+        // SAFETY: path is NUL-terminated, attrs and its descriptor live through the call.
+        let handle = unsafe {
+            CreateFileW(wide.as_ptr(), GENERIC_WRITE, FILE_SHARE_READ, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a valid owned handle, transferred to File once.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    }).map_err(|error| std::io::Error::other(String::from(error)))?
+}
+
+#[cfg(windows)]
+pub(super) fn windows_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
+    windows_protect(path, meta.is_dir(), false)
+}
+
+#[cfg(windows)]
+pub(super) fn windows_private_settings(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
+    if !meta.is_file() {
+        return Err(Unprotected::Refused("settings ACL requires a regular file".into()));
     }
-    if result != 0 {
-        return Err(windows_unprotected(path, "SetNamedSecurityInfoW", result));
-    }
-    windows_verify_private(path, meta.is_dir(), &user)
+    windows_protect(path, false, true)
+}
+
+#[cfg(windows)]
+fn windows_protect(path: &Path, directory: bool, settings: bool) -> Result<(), Unprotected> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
+    private_acl(path, directory, settings, |acl, sids| {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: NUL-terminated path and retained ACL; PROTECTED disables parent inheritance.
+        // Only WRITE_DAC is required: do not set the owner or request ownership privileges.
+        let result = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl,
+                std::ptr::null(),
+            )
+        };
+        if result != 0 {
+            return Err(windows_unprotected(path, "SetNamedSecurityInfoW", result));
+        }
+        let sids: Vec<_> = sids.iter().map(Vec::as_slice).collect();
+        windows_verify_grants(path, directory, &sids)
+    })?
 }
 
 #[cfg(windows)]
@@ -612,8 +696,21 @@ fn windows_unprotected(path: &Path, step: &str, code: u32) -> Unprotected {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
+pub(super) fn credential_file_is_private(path: &Path, settings: bool) -> bool {
+    credential_sids(path, settings).is_ok_and(|sids| {
+        let sids: Vec<_> = sids.iter().map(Vec::as_slice).collect();
+        windows_verify_grants(path, false, &sids).is_ok()
+    })
+}
+
+#[cfg(all(test, windows))]
 fn windows_verify_private(path: &Path, directory: bool, user: &[u8]) -> Result<(), Unprotected> {
+    windows_verify_grants(path, directory, &[user])
+}
+
+#[cfg(windows)]
+fn windows_verify_grants(path: &Path, directory: bool, sids: &[&[u8]]) -> Result<(), Unprotected> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
@@ -675,20 +772,8 @@ fn windows_verify_private(path: &Path, directory: bool, user: &[u8]) -> Result<(
             return Err(invalid("DACL is missing or invalid"));
         }
         // SAFETY: IsValidAcl checked the header and ACE bounds.
-        if unsafe { (*acl).AceCount } != 1 {
-            return Err(invalid("DACL must contain exactly one HER account ACE"));
-        }
-        let mut ace = std::ptr::null_mut();
-        // SAFETY: valid ACL, in-range ACE index and initialized output pointer.
-        if unsafe { GetAce(acl, 0, &mut ace) } == 0 {
-            return Err(windows_acl_error(path, "GetAce (verify)", unsafe {
-                GetLastError()
-            }));
-        }
-        // SAFETY: GetAce returned a validated ACE header within the retained ACL.
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-        if u32::from(header.AceFlags) & INHERITED_ACE != 0 {
-            return Err(invalid("DACL contains an inherited ACE"));
+        if usize::from(unsafe { (*acl).AceCount }) != sids.len() {
+            return Err(invalid("DACL contains an unexpected number of grants"));
         }
         let flags = if directory {
             OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
@@ -696,19 +781,32 @@ fn windows_verify_private(path: &Path, directory: bool, user: &[u8]) -> Result<(
             0
         };
         let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
-        // ACCESS_ALLOWED_ACE_TYPE is 0. Reject other ACE layouts before interpreting the SID.
-        if header.AceType != 0 || usize::from(header.AceSize) != sid_offset + user.len() {
-            return Err(invalid("DACL contains an unexpected ACE type or SID size"));
-        }
-        // SAFETY: ACE type and full SID bounds were checked; user is the valid token SID.
-        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-        let sid =
-            unsafe { std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), user.len()) };
-        if sid != user {
-            return Err(invalid("DACL contains an ACE for another SID"));
-        }
-        if allowed.Mask != FILE_ALL_ACCESS || u32::from(header.AceFlags) != flags {
-            return Err(invalid("HER ACE has incorrect access or inheritance flags"));
+        let mut remaining = sids.to_vec();
+        for index in 0..sids.len() {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: valid ACL, in-range ACE index and initialized output pointer.
+            if unsafe { GetAce(acl, index as u32, &mut ace) } == 0 {
+                return Err(windows_acl_error(path, "GetAce (verify)", unsafe { GetLastError() }));
+            }
+            // SAFETY: GetAce returned a validated ACE header within the retained ACL.
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if u32::from(header.AceFlags) & INHERITED_ACE != 0
+                || header.AceType != 0
+                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+            {
+                return Err(invalid("DACL contains an unexpected ACE type or flags"));
+            }
+            let bytes = usize::from(header.AceSize) - sid_offset;
+            // SAFETY: the allowed ACE's fixed fields and SID bytes fit in the checked ACL bounds.
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            let sid = unsafe { std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), bytes) };
+            let Some(found) = remaining.iter().position(|expected| *expected == sid) else {
+                return Err(invalid("DACL contains a repeated or unexpected SID"));
+            };
+            remaining.swap_remove(found);
+            if allowed.Mask != FILE_ALL_ACCESS || u32::from(header.AceFlags) != flags {
+                return Err(invalid("ACE has incorrect access or inheritance flags"));
+            }
         }
         Ok(())
     })();
@@ -807,6 +905,21 @@ mod native_tests {
                 identity::current_user().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn ticket219_private_credential_creation_allows_read_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let fixture = Fixture::new();
+        let path = fixture.0.join("capture.out");
+        let _writer = windows_create_credential(&path, false).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path);
+        assert!(reader.is_ok(), "credential creation refused a concurrent reader");
     }
 
     #[test]

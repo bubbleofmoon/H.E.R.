@@ -436,11 +436,7 @@ fn publish(candidate: &Path, destination: &Path, check: Check<'_>) -> Result<Pat
             format!("{stem}-{collision}.zip")
         };
         let target = destination.join(name);
-        let mut output = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-        {
+        let mut output = match crate::guarded_file::create_credential(&target) {
             Ok(file) => file,
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists
@@ -711,7 +707,10 @@ impl Scratch {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
         builder.create(&dir).map_err(|e| format!("backup staging unavailable: {}", e.kind()))?;
-        Ok(Self(dir))
+        let scratch = Self(dir);
+        crate::guarded_file::restrict_credential(&scratch.0)
+            .map_err(|_| "backup staging permissions unavailable".to_string())?;
+        Ok(scratch)
     }
 }
 impl Drop for Scratch {

@@ -174,9 +174,68 @@ pub(crate) struct Staged {
     published: bool,
 }
 
+/// Create a new owner-only file before any content or handle is available to another account.
+pub(crate) fn create_credential(path: &Path) -> io::Result<File> {
+    create_protected_file(path, false)
+}
+
+pub(crate) fn create_settings_file(path: &Path) -> io::Result<File> {
+    create_protected_file(path, true)
+}
+
+fn create_protected_file(path: &Path, _settings: bool) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+    }
+    #[cfg(windows)]
+    {
+        crate::supervisor_dependencies::create_credential_file(path, _settings)
+    }
+}
+
+/// Restrict a contained credential file or directory before any secret bytes are written.
+pub(crate) fn restrict_credential(path: &Path) -> io::Result<()> {
+    restrict_protected_path(path, false)
+}
+
+pub(crate) fn restrict_settings_file(path: &Path) -> io::Result<()> {
+    restrict_protected_path(path, true)
+}
+
+fn restrict_protected_path(path: &Path, settings: bool) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if is_link(&metadata) || !(metadata.is_file() || (!settings && metadata.is_dir())) {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || (metadata.is_file() && metadata.nlink() != 1) {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+    #[cfg(windows)]
+    {
+        crate::supervisor_dependencies::restrict_credential_path(path, &metadata, settings).map_err(io::Error::other)
+    }
+}
+
 /// Write `input` to a new sibling temporary file and fsync it. `unix_mode` sets the temporary
 /// file's permissions on Unix (default: the process umask); Windows ignores it.
 pub(crate) fn stage(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>) -> Result<Staged, Failure> {
+    stage_inner(target, input, unix_mode, false)
+}
+
+pub(crate) fn stage_settings_file(target: &Path, input: &mut dyn Read) -> Result<Staged, Failure> {
+    stage_inner(target, input, Some(0o600), true)
+}
+
+fn stage_inner(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>, credential: bool) -> Result<Staged, Failure> {
     check_target(target)?;
     let name = target
         .file_name()
@@ -196,7 +255,8 @@ pub(crate) fn stage(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>)
     }
     #[cfg(not(unix))]
     let _ = unix_mode;
-    let mut file = options.open(&temp).map_err(io_failure("temp/create"))?;
+    let mut file = if credential { create_settings_file(&temp) } else { options.open(&temp) }
+        .map_err(io_failure("temp/create"))?;
     let staged = Staged { temp, target: target.to_path_buf(), published: false };
     let written = io::copy(input, &mut file)
         .map_err(io_failure("temp/write"))
