@@ -326,7 +326,7 @@ impl Scheduler {
 
     pub(crate) fn refresh_schedules(&mut self, cfg: &serde_json::Value, now: i64) {
         for def in REGISTRY {
-            self.set_schedule(def.id, configured_schedule(def, cfg), now);
+            self.set_schedule(def.id, if def.id == TaskId::MemoryDigest { def.schedule } else { configured_schedule(def, cfg) }, now); // RED-S3
         }
     }
 
