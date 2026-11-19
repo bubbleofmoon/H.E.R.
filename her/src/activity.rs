@@ -250,9 +250,12 @@ pub fn append(context: &RuntimeContext, line: &str) {
     if !context.is_isolated() && !legacy_state_dir_exists(context) {
         return;
     }
+    let config = context.load_config_document().unwrap_or_default();
+    let zone = crate::local_time::configured_zone(&config);
+    let time = crate::local_time::at(crate::parity_clock::now_ms(), &zone);
     let text = format!(
         "[{}] {}\n",
-        crate::prompt::local_clock(crate::parity_clock::now_ms()),
+        time.strftime("%H:%M:%S"),
         one_line(context, line)
     );
     let _gate = APPEND_GATE.lock().unwrap_or_else(|p| p.into_inner());

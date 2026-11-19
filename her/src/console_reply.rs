@@ -218,7 +218,7 @@ pub(super) fn hold(
     kind: &str,
     id: &str,
     epoch: &str,
-    policy: GuardPolicy,
+    policy: GuardPolicy<'_>,
     tool: &str,
     text: &str,
     baseline: &Value,

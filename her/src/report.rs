@@ -804,47 +804,18 @@ fn render(report: &Value) -> String {
     out
 }
 
-// CLIProxyAPI GinLogrusLogger's local wall time; use HER's documented production zone.
+// The relay writes host-local wall time in these log lines.
 fn relay_timestamp(caps: &regex::Captures<'_>) -> Option<i64> {
-    let n = |i| caps.get(i)?.as_str().parse::<i64>().ok();
-    let (year, month, day, hour, minute, second) = (n(1)?, n(2)?, n(3)?, n(4)?, n(5)?, n(6)?);
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if !(1970..=9999).contains(&year)
-        || !(1..=12).contains(&month)
-        || !(0..24).contains(&hour)
-        || !(0..60).contains(&minute)
-        || !(0..60).contains(&second)
-    {
+    let number = |index| caps.get(index)?.as_str().parse::<i16>().ok();
+    let year = number(1)?;
+    if !(1970..=9999).contains(&year) {
         return None;
     }
-    let days_in_month = [
-        31,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ][month as usize - 1];
-    if !(1..=days_in_month).contains(&day) {
-        return None;
-    }
-    // Gregorian civil date to days since 1970-01-01.
-    let y = year - i64::from(month <= 2);
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
-    Some(
-        ((days * 24 + hour) * 60 * 60 + minute * 60 + second) * 1000
-            - crate::tasks::local_offset_ms(),
-    )
+    let civil = jiff::civil::DateTime::new(
+        year, number(2)? as i8, number(3)? as i8,
+        number(4)? as i8, number(5)? as i8, number(6)? as i8, 0,
+    ).ok()?;
+    Some(civil.to_zoned(jiff::tz::TimeZone::system()).ok()?.timestamp().as_millisecond())
 }
 
 fn relay_duration(mut text: &str) -> Option<f64> {

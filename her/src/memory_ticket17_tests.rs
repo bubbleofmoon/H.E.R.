@@ -55,10 +55,14 @@ fn ticket17_settings_lists_registry_defaults_and_legacy_omissions() {
         "socialV2.send.maxSendPerMinute":8,
         "socialV2.send.maxSendPerHour":60,
         "socialV2.wake.batchWindowMs":8000,
-        "socialV2.sticker.collect.maxBytes":8388608,
+        "socialV2.sticker.collect.maxBytes":8_388_608,
+        "socialV2.sticker.stickerEnabled":true,
         "socialV2.context.wakeMaxChars":6000,
         "socialV2.context.wakeRecentLimit":4,
         "memory.inject.relatedTopK":3,
+        "memory.autoFlush.enabled":true,
+        "memory.autoFlush.contextPct":70,
+        "memory.autoFlush.maxSessionsPerDay":8,
         "role.maxInjectChars":6000,
         "socialV2.reply.wakeQuietMs":3000
     });
@@ -72,7 +76,14 @@ fn ticket17_settings_lists_registry_defaults_and_legacy_omissions() {
         all["settings"], defaults,
         "all-settings includes registered defaults and omits undefined legacy paths"
     );
-    for path in SETTINGS_WRITABLE {
+    for path in SETTINGS_WRITABLE.into_iter().chain([
+        "socialV2.sticker.collect.maxBytes",
+        "socialV2.sticker.stickerEnabled",
+        "memory.inject.relatedTopK",
+        "memory.autoFlush.enabled",
+        "memory.autoFlush.contextPct",
+        "memory.autoFlush.maxSessionsPerDay",
+    ]) {
         let mut named = args.clone();
         named["settingKey"] = json!(path);
         let result = memory_tool_action(&context, "settings-get", &named).unwrap();
@@ -91,7 +102,7 @@ fn ticket17_settings_lists_registry_defaults_and_legacy_omissions() {
         assert_eq!(text, format!("{path} = {expected}"));
     }
     assert_eq!(std::fs::read(context.config_file()).unwrap(), bytes);
-    // JS shallow-spreads send/wake/context; sticker.collect and role merge their defaults.
+    // Legacy sections keep their shallow replacement rules. Sticker and memory values use the registry.
     cfg["socialV2"] = json!({"send":{"burstEnabled":false,"maxSendPerMinute":0},"wake":{},"context":{},"sticker":{"collect":{"maxBytes":null},"stickerEnabled":false}});
     cfg["role"] = json!({"maxInjectChars":null});
     cfg["memory"] = json!({"autoFlush":{"enabled":false}});
@@ -105,8 +116,8 @@ fn ticket17_settings_lists_registry_defaults_and_legacy_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"],
-        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.burstIntervalMinMs":1000,"socialV2.send.burstIntervalMaxMs":3000,"socialV2.send.firstGapEnabled":true,"socialV2.send.maxSendPerMinute":0,"socialV2.send.maxSendPerHour":60,"socialV2.wake.batchWindowMs":8000,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
-        "preserve configured values and the defaults of registered settings"
+        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.burstIntervalMinMs":1000,"socialV2.send.burstIntervalMaxMs":3000,"socialV2.send.firstGapEnabled":true,"socialV2.send.maxSendPerMinute":0,"socialV2.send.maxSendPerHour":60,"socialV2.wake.batchWindowMs":8000,"socialV2.sticker.collect.maxBytes":8_388_608,"socialV2.sticker.stickerEnabled":true,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"memory.autoFlush.contextPct":70,"memory.autoFlush.maxSessionsPerDay":8,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
+        "preserve explicit legacy values and use registry defaults for sticker and memory settings"
     );
 }
 
@@ -708,30 +719,32 @@ fn related_top_k_accepts_only_the_depth_a_wake_executes_and_reads_show_that_dept
     context
         .write_atomic(RuntimeArea::Data, "social-v2.json", br#"{"conversations":{"private:7001":{"agentToken":"owner-token"}}}"#)
         .unwrap();
-    let call = |action: &str, extra: Value| {
+    let call = |context: &RuntimeContext, action: &str, extra: Value| {
         let mut args = json!({"key":"private:7001","token":"owner-token","settingKey":"memory.inject.relatedTopK"});
         args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        memory_tool_action(&context, action, &args)
+        memory_tool_action(context, action, &args)
     };
-    let stored = || context.load_config().unwrap().pointer("/memory/inject/relatedTopK").cloned();
-    for bad in [json!(0), json!(21), json!(-3), json!(2.5), json!("many"), json!(null), json!(true), json!(1000)] {
-        let error = call("settings-set", json!({"value": bad})).expect_err(&format!("{bad} is outside what a wake executes"));
+    let stored = || context.load_config_document().unwrap().pointer("/memory/inject/relatedTopK").cloned();
+    for bad in [json!(0), json!(21), json!(-3), json!(2.5), json!("many"), json!(null), json!(true), json!(1000), json!("7"), json!(" 12 ")] {
+        let error = call(&context, "settings-set", json!({"value": bad})).expect_err(&format!("{bad} is outside what a wake executes"));
         assert!(error.contains("1") && error.contains("20"), "the error names the range: {error}");
         assert_eq!(stored(), None, "{bad}: a refused write changes nothing");
     }
-    for (given, executed) in [(json!(1), 1), (json!(20), 20), (json!("7"), 7), (json!(" 12 "), 12)] {
-        let reply = call("settings-set", json!({"value": given})).unwrap();
+    for (given, executed) in [(json!(1), 1), (json!(20), 20)] {
+        let reply = call(&context, "settings-set", json!({"value": given})).unwrap();
         assert_eq!(reply["value"], executed);
         assert_eq!(stored(), Some(json!(executed)), "stored as the number the wake executes");
-        assert_eq!(call("settings-get", json!({})).unwrap()["value"], executed);
+        assert_eq!(call(&context, "settings-get", json!({})).unwrap()["value"], executed);
     }
-    // A hand-edited value outside the range reads as the depth the wake actually runs.
+    // Without a stored setting, old file values read as the depth the wake actually runs.
+    let (_legacy_root, legacy) = fixture_runtime("related top k old file", "fixture-console-token-17");
+    legacy.write_atomic(RuntimeArea::Data, "social-v2.json", br#"{"conversations":{"private:7001":{"agentToken":"owner-token"}}}"#).unwrap();
     for (edited, executed) in [(json!(50), 20), (json!(0), 1), (json!(-4), 1), (json!("x"), 3), (json!(2.6), 3), (json!(null), 3)] {
-        let mut cfg = context.load_config().unwrap();
+        let mut cfg = legacy.load_config_document().unwrap();
         cfg["memory"] = json!({"inject":{"relatedTopK": edited.clone()}});
-        context.write_atomic(RuntimeArea::Config, "config.json", &serde_json::to_vec(&cfg).unwrap()).unwrap();
-        assert_eq!(call("settings-get", json!({})).unwrap()["value"], executed, "stored {edited}");
-        assert_eq!(call("settings-get", json!({"settingKey": null})).unwrap()["settings"]["memory.inject.relatedTopK"], executed, "{edited}");
+        legacy.write_atomic(RuntimeArea::Config, "config.json", &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        assert_eq!(call(&legacy, "settings-get", json!({})).unwrap()["value"], executed, "stored {edited}");
+        assert_eq!(call(&legacy, "settings-get", json!({"settingKey": null})).unwrap()["settings"]["memory.inject.relatedTopK"], executed, "{edited}");
     }
 }
 

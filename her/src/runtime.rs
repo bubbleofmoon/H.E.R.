@@ -885,7 +885,12 @@ impl RuntimeContext {
         let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         // Every early return below drops `staged`, which removes the temporary file.
-        let staged = crate::guarded_file::stage(&target, input, None).map_err(|failure| failure.to_string())?;
+        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db")) {
+            crate::guarded_credentials::stage_settings_file(&target, input)
+        } else {
+            crate::guarded_file::stage(&target, input, None)
+        }
+        .map_err(|failure| failure.to_string())?;
         let checked_target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         let checked_temp = fs::symlink_metadata(staged.temp()).map_err(|e| runtime_io_error("temp/metadata", &e))?;
         if checked_target != target || is_link(&checked_temp) || !checked_temp.is_file() {
@@ -1054,6 +1059,7 @@ impl RuntimeContext {
         // authenticate use `effective_console_token`.
         let (mut config, _) = crate::config::canonical_config(raw)
             .map_err(|_| "runtime config is invalid")?;
+        crate::settings::resolve_config(&mut config);
         crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
             .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
         // The live closed-agent process mirrors DSH's qq-mode owner override here so the
@@ -1068,6 +1074,8 @@ impl RuntimeContext {
             }
         }
         crate::settings::complete_timing(&mut config);
+        crate::console::warn_configured_voice_duration(&config);
+        crate::settings::resolve_live_batch(&mut config);
         Ok(config)
     }
 
@@ -1581,9 +1589,41 @@ pub(crate) fn write_append_all(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) struct FixtureRoot(pub(crate) PathBuf);
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build the layout required by RuntimeContext, with a synthetic console credential.
+    pub(crate) fn runtime_fixture(root: PathBuf, config: &Value, dependencies: &Value) -> FixtureRoot {
+        assert!(config["consoleToken"].as_str().is_some_and(|token| !token.trim().is_empty()));
+        let root = crate::install_root::development_root(root);
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let fixture = FixtureRoot(root);
+        for dir in ["config", "data", "resources"] {
+            fs::create_dir(fixture.0.join(dir)).unwrap();
+        }
+        fs::write(
+            fixture.0.join("config/config.json"),
+            serde_json::to_vec_pretty(config).unwrap(),
+        )
+        .unwrap();
+        fs::write(fixture.0.join("data/social-v2.json"), b"{}").unwrap();
+        fs::write(
+            fixture.0.join("dependencies.json"),
+            serde_json::to_vec(dependencies).unwrap(),
+        )
+        .unwrap();
+        fixture
+    }
 
     static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 

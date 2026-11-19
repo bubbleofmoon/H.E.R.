@@ -1,6 +1,6 @@
-# Gate prompt template
+# Code review prompt
 
-Reach for this for each round of the merge gate, which the Claude `ticket-reviewer` runs. Round 1 reviews the whole ticket diff; rounds 2 and 3 review the fix diff only. Fill the angle-bracket fields, keep the lines for the round and delete the other round's, and send the prompt as the reviewer's message.
+The first round covers the full ticket diff and goes to a Claude `ticket-reviewer`. Follow-up rounds cover the fix diff and unresolved required findings. Fill the fields below and keep the scope and checks for the current round. Save the result as the run's prompt file and start `scripts/codex-task.sh <name> <worktree-or-scratch> <prompt> gpt-6.2-astra high read-only` for rounds 2 and 3. The coordinator reads `<name>.report.md` beside the prompt as the review.
 
 ```
 Head: <head sha>

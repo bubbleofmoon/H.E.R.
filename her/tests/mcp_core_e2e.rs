@@ -1294,7 +1294,11 @@ fn get_prompt_enabled_tools_match_js_order_and_default_voice_flag() {
 
 #[test]
 fn tool_registry_is_the_js_registration_in_order_and_follows_the_config_switches() {
-    let f = fixture("registry", json!({"sticker": {"enabled": true}, "voice": {"enabled": true}}));
+    let f = fixture("registry", json!({
+        "sticker": {"enabled": true},
+        "voice": {"enabled": true},
+        "tools": {"sendVoice": true, "setStickerRemark": true}
+    }));
     let names: Vec<String> = f.mcp.request("tools/list", json!({}))["result"]["tools"]
         .as_array()
         .expect("tools")

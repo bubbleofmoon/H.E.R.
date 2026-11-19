@@ -15,6 +15,7 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
     label: "Conversation model",
     hint: "The relay model id harness turns use when harness.routes is not set, read when each turn starts. Neither set: harness turns fail as not configured.",
     chat: false,
+    secret: false,
 };
 
 /// The explicit chain read by `harness::routes::chain` on the loader's document.
@@ -27,30 +28,33 @@ pub(crate) const HARNESS_ROUTES: Setting = Setting {
     label: "Model route list",
     hint: "An ordered JSON array of route objects with id and model, and optional reasoningEffort, maxOutputTokens and retry429. Reset to use harness.model alone. See Model routes for the active chain and validation errors.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `harness::Limits::from_config`.
 pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
     key: "harness.maxSteps",
     pointer: "/harness/maxSteps",
-    kind: &Integer { min: 1, max: 64, default: 8, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 64, default: Some(8), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Model requests per turn",
     hint: "The most model requests one harness turn makes (each tool round is one more); read when each turn starts.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `harness::Limits::from_config`.
 pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     key: "harness.maxTokens",
     pointer: "/harness/maxTokens",
-    kind: &Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 1_000_000, default: Some(32_768), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Token budget per turn",
     hint: "The tokens one harness turn may use across all its model requests; read when each turn starts.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `digest::model`.
@@ -63,18 +67,20 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
     label: "Digest model",
     hint: "The relay model id the memory digest uses; not set uses the conversation model. Read at each digest run.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `digest::model`.
 pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     key: "memory.digest.timeoutSecs",
     pointer: "/memory/digest/timeoutSecs",
-    kind: &Integer { min: 1, max: 600, default: 120, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 600, default: Some(120), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Digest request timeout",
     hint: "Total seconds allowed for a conversation's digest to walk the model route chain before it times out.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `aux_search::load_search_config`.
@@ -87,6 +93,7 @@ pub(crate) const WEB_SEARCH_MODEL: Setting = Setting {
     label: "Web search model",
     hint: "The model id the primary web search asks, read at each search.",
     chat: false,
+    secret: false,
 };
 
 /// Read by `harness::routes::selected` for every conversation without its own route (`CONVERSATION_ROUTE`).
@@ -99,6 +106,7 @@ pub(crate) const HARNESS_FIRST_ROUTE: Setting = Setting {
     label: "First model route",
     hint: "The route of harness.routes that every harness conversation without its own model route asks first, then the other routes in configured order; read when each turn starts. Not set, or naming no configured route: the configured order.",
     chat: false,
+    secret: false,
 };
 
 /// The group's settings, in registry order.

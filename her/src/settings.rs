@@ -14,12 +14,16 @@
 //! console configuration page changes (#177), and `keep_file_members` keeps every console write of `config.json` off
 //! the registry members; `history` lists the audit rows. Each write first seeds the store from
 //! `config.json` (`seed`: every registry setting never in the store, with one `migration` audit row each) and keeps
-//! `config/config.json.pre-settings`; after it, `write_back` mirrors every stored value into `config.json`, so a
+//! `config/config.json.pre-settings`; after it, `write_back` mirrors ordinary stored values into `config.json`, so a
 //! release without the store reads the current values. Every writer holds the configuration gate
 //! (`console::config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
 //! store. The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
+//!
+//! Secret settings (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
+//! `secret_value`. Ordinary overlays, seeding and mirroring exclude them. History holds a fixed marker on both sides
+//! of every change and refuses undo. Reset clears the stored credential and lets an explicit compatibility source apply.
 //!
 //! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
 //! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
@@ -45,16 +49,32 @@ mod store;
 
 use serde_json::Value;
 
-pub(crate) use kinds::SettingKind;
+pub(crate) use kinds::{daily_parts, SettingKind};
 #[cfg(test)]
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
+pub(crate) use registry::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 pub(crate) use registry::{
-    chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
+    daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
+    RELATED_TOP_K,
+    AUTO_FLUSH_ENABLED,
+    AUTO_FLUSH_CONTEXT_PCT,
+    AUTO_FLUSH_MAX_SESSIONS,
+    AUTO_FLUSH_MIN_INTERVAL,
+    DIGEST_MAX_INPUT_CHARS,
+    LAYER_IDENTITY,
+    LAYER_RELATIONSHIP,
+    LAYER_CONVERSATION,
+    LAYER_MATERIAL,
+    chat_registry, chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
+    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
+    VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS, COLLECT_BYTES, COLLECT_ENABLED,
+    COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK, MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS, STICKERS_ENABLED,
+    STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL, ALERT_HOURLY_CAP, ALERT_KEY_WINDOW,
+    GATEWAY_SILENCE_WARN,
 };
 #[cfg(test)]
 pub(crate) use store::{
@@ -66,8 +86,9 @@ pub(crate) use store::{
     complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
     has_legacy_engine_choices, has_stored_values, has_wake_plan_history, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
-    registry_free, reset, reset_conversation, restore_gate, restore_switch_choice, security_restore, store_mark, store_path, undo, view,
-    write_back, Applied, Change, CONVERSATION_ERROR,
+    archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
+    resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
+    store_mark, store_path, stored_secrets, undo, view, write_back, Applied, Change, CONVERSATION_ERROR,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.
@@ -108,6 +129,8 @@ pub(crate) struct Setting {
     /// Whether the owner's private chat may read and change it through `settings_get` / `settings_set`, under
     /// `chat_name`. Never set for a secret or a text setting (registry tests).
     pub chat: bool,
+    /// Whether the setting is stored and consumed as an endpoint credential.
+    pub secret: bool,
 }
 
 impl Setting {
@@ -123,7 +146,7 @@ impl Setting {
         self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
     }
 
-    /// The default; `Null` for a model id without one (not configured).
+    /// The default; `Null` can mean unconfigured or use a fallback.
     pub(crate) fn default_value(&self) -> Value {
         self.kind.default_value()
     }
@@ -168,8 +191,7 @@ impl Setting {
         self.read(document).as_f64().unwrap_or_default()
     }
 
-    /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
-    /// one.
+    /// The resolved string of a string-valued setting, if present.
     pub(crate) fn text(&self, document: &Value) -> Option<String> {
         self.read(document).as_str().map(str::to_string)
     }
@@ -179,10 +201,9 @@ impl Setting {
         self.kind.refusal(self.key, value)
     }
 
-    /// The name the chat tools use: the configuration path with dots (`/socialV2/reply/wakeQuietMs` is
-    /// `socialV2.reply.wakeQuietMs`), the form of the other chat-writable paths, never the registry key.
+    /// The dotted path the owner's chat tools use, with the kind's retained spelling when it has one.
     pub(crate) fn chat_name(&self) -> String {
-        self.pointer.trim_start_matches('/').replace('/', ".")
+        self.kind.chat_pointer().unwrap_or(self.pointer).trim_start_matches('/').replace('/', ".")
     }
 
     /// Why a chat value was refused, under the chat's name.

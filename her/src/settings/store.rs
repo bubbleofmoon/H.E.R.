@@ -12,7 +12,7 @@ pub(crate) use conversation::{
     restore_switch_choice, CONVERSATION_ERROR,
 };
 
-use super::{find, find_conversation, registry, Setting, OWNER};
+use super::{find, find_conversation, registry, Setting, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER, WEB_SEARCH_API_KEY};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -24,6 +24,7 @@ const SIDECARS: [&str; 3] = ["settings.db-wal", "settings.db-shm", "settings.db-
 /// The newest schema version this release reads and writes: 1 (`settings`, `settings_audit`) or 2 (version 1 and
 /// `conversation_settings`, #218). A store stays at version 1 until its first conversation write (`migrate`).
 const SCHEMA_VERSION: i64 = 2;
+const SECRET_MARKER: &str = "(hidden)";
 const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
 const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
@@ -104,6 +105,16 @@ pub(crate) fn complete_timing(document: &mut Value) {
     }
     for setting in super::reply::SETTINGS.iter().chain(super::wake_timing::SETTINGS).chain(super::send::SETTINGS) {
         let value = setting.read(document);
+        if !value.is_null() {
+            set_at(document, setting.pointer, value);
+        }
+    }
+}
+
+/// Materialize the settings managed by the live controls in a read-only configuration view.
+pub(crate) fn resolve_live_batch(document: &mut Value) {
+    for setting in super::registry::live_batch() {
+        let value = setting.read(document);
         set_at(document, setting.pointer, value);
     }
 }
@@ -148,6 +159,19 @@ fn validate_timing(
         }
     }
     Ok(())
+}
+
+/// Resolves settings owned by the batches that use the normalized configuration snapshot.
+pub(crate) fn resolve_config(document: &mut Value) {
+    let material_items = super::registry::material_item_limit(document);
+    for setting in super::registry::RESOLVED_GROUPS.iter().flat_map(|group| group.iter()) {
+        let value = if setting.key == super::registry::MATERIAL_ITEMS.key {
+            Value::from(material_items)
+        } else {
+            setting.read(document)
+        };
+        set_at(document, setting.pointer, value);
+    }
 }
 
 /// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
@@ -521,7 +545,7 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
         .map_err(|_| STORAGE_ERROR.to_string())?;
     let mut values = Vec::new();
     for (key, text) in rows {
-        let Some(setting) = find(&key) else { continue };
+        let Some(setting) = find(&key).filter(|setting| !setting.secret) else { continue };
         match serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.storable(&value)) {
             Some(value) => values.push((setting, value)),
             None if setting.kind.text_default().is_some() => {
@@ -534,6 +558,108 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
         }
     }
     Ok(values)
+}
+
+/// Presence check for the restore preview. The verified archive may predate the settings table.
+pub(crate) fn archive_has_endpoint_credentials(conn: &Connection) -> Result<bool, String> {
+    let failed = |_: rusqlite::Error| "backup settings credential status is unavailable".to_string();
+    let has_settings: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='settings')",
+        [], |row| row.get(0),
+    ).map_err(failed)?;
+    if !has_settings {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2) AND value <> 'null')",
+        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key],
+        |row| row.get(0),
+    ).map_err(failed)
+}
+
+/// Only the credential readers and redaction use these rows. Ordinary settings never decode them.
+fn read_secrets(context: &RuntimeContext) -> Result<Vec<(&'static str, String, String)>, String> {
+    if !context.is_isolated() {
+        return Ok(Vec::new());
+    }
+    match inspect(context)? {
+        Inspection::Ready(conn) => secrets_in(&conn),
+        Inspection::Missing | Inspection::Fresh => Ok(Vec::new()),
+    }
+}
+
+fn secret_row(conn: &Connection, setting: &Setting) -> Result<Option<(String, String)>, String> {
+    let Some((text, _)) = stored_row(conn, setting.key).map_err(|(_, error)| error)? else { return Ok(None) };
+    if text == "null" {
+        return Ok(None);
+    }
+    let (endpoint, credential): (String, String) = serde_json::from_str(&text).map_err(|_| STORAGE_ERROR.to_string())?;
+    if endpoint.is_empty() || setting.normalize(&json!(credential)).is_none() {
+        return Err(STORAGE_ERROR.to_string());
+    }
+    Ok(Some((endpoint, credential)))
+}
+
+fn secrets_in(conn: &Connection) -> Result<Vec<(&'static str, String, String)>, String> {
+    let mut secrets = Vec::new();
+    for setting in [&WEB_SEARCH_API_KEY, &CLI_MODEL_API_KEY] {
+        if let Some((endpoint, credential)) = secret_row(conn, setting)? {
+            secrets.push((setting.key, endpoint, credential));
+        }
+    }
+    Ok(secrets)
+}
+
+pub(crate) fn secret_value(context: &RuntimeContext, setting: &Setting, endpoint: &str) -> Result<Option<String>, String> {
+    if !setting.secret || !context.is_isolated() {
+        return Ok(None);
+    }
+    let Inspection::Ready(conn) = inspect(context)? else { return Ok(None) };
+    Ok(secret_row(&conn, setting)?.filter(|(bound, _)| bound == endpoint).map(|(_, credential)| credential))
+}
+
+/// The settings row revision partitions the per-process search cache after a credential change.
+pub(crate) fn secret_revision(context: &RuntimeContext, setting: &Setting) -> Option<i64> {
+    if !context.is_isolated() {
+        return None;
+    }
+    let Inspection::Ready(conn) = inspect(context).ok()? else { return None };
+    stored_row(&conn, setting.key).ok().flatten().map(|(_, revision)| revision)
+}
+
+pub(crate) fn stored_secrets(context: &RuntimeContext) -> Result<Vec<String>, String> {
+    let mut secrets: Vec<_> = read_secrets(context)?.into_iter().map(|(_, _, credential)| credential).collect();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    Ok(secrets)
+}
+
+pub(crate) fn harness_credential(context: &RuntimeContext) -> Option<String> {
+    if !context.is_isolated() {
+        return None;
+    }
+    let text = context.read_text(RuntimeArea::Config, "harness-api-key").ok()?;
+    let key = text.trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
+fn reject_credential_text(
+    conn: &Connection, setting: &Setting, value: &Value, harness_key: Option<&str>,
+) -> Result<(), (u16, String)> {
+    let prompt_text = value.as_str().filter(|_| setting.kind.text_default().is_some());
+    let routes = value.as_array().filter(|_| setting.key == HARNESS_ROUTES.key);
+    if prompt_text.is_none() && routes.is_none() {
+        return Ok(());
+    }
+    let secrets = secrets_in(conn).map_err(|error| (503, error))?;
+    let has_endpoint_key = |text: &str| secrets.iter().any(|(_, _, key)| text.contains(key));
+    if prompt_text.is_some_and(|text| harness_key.is_some_and(|key| text.contains(key)) || has_endpoint_key(text))
+        || routes.is_some_and(|routes| routes.iter().any(|route| {
+            ["id", "model"].iter().filter_map(|field| route[*field].as_str()).any(has_endpoint_key)
+        }))
+    {
+        return Err((400, "setting text contains a credential".to_string()));
+    }
+    Ok(())
 }
 
 /// The last good version of a text setting whose stored value is refused (a row changed outside `apply`, or a denied
@@ -709,8 +835,21 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // Refuse what this release cannot use before any connection that can write opens the store.
     drop(inspect(context)?);
     let path = check_paths(context, PathIntent::WriteFile)?;
+    // Protect existing files before opening a write connection. SQLite's Unix sidecars use the database mode.
+    match crate::guarded_credentials::create_settings_file(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(STORAGE_ERROR.to_string()),
+    }
+    for file in std::iter::once(path.clone()).chain(SIDECARS.map(|name| path.with_file_name(name))) {
+        match crate::guarded_credentials::restrict_settings_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && file != path => {}
+            Err(_) => return Err(STORAGE_ERROR.to_string()),
+        }
+    }
     let mut conn = Connection::open_with_flags(
-        path,
+        &path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|_| STORAGE_ERROR.to_string())?;
@@ -722,6 +861,13 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     enable_wal(&conn)?;
     conn.execute_batch("PRAGMA synchronous=FULL;").map_err(|_| STORAGE_ERROR.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE_ERROR.to_string())?;
+    // BEGIN IMMEDIATE opens and pins the Windows WAL and its index before any row is written.
+    // The journal used for switching to WAL carries SQLite's database header page only.
+    #[cfg(windows)]
+    for name in &SIDECARS[..2] {
+        crate::guarded_credentials::restrict_settings_file(&path.with_file_name(name))
+            .map_err(|_| STORAGE_ERROR.to_string())?;
+    }
     match schema_version(&tx)? {
         0 => {
             for (_, _, _, sql) in SCHEMA_V1 {
@@ -786,10 +932,15 @@ fn keep_pre_settings_copy(context: &RuntimeContext) -> Result<(), String> {
 /// change's undo restores the file's value. When `config.json` holds a value for it that the store cannot keep (an id
 /// list over its limit, an owner that is not an id), that write is 409 and nothing is written: its undo could not
 /// restore the file's value.
-fn seed(conn: &Connection, document: &Value, at: i64, written: &[&'static str]) -> Result<(), (u16, String)> {
+fn seed(
+    conn: &Connection, document: &Value, at: i64, written: &[&'static str], harness_key: Option<&str>,
+) -> Result<(), (u16, String)> {
     let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
     let request = request_id(at);
     for setting in registry() {
+        if setting.secret {
+            continue;
+        }
         let own_write_only = setting.confirmed();
         if own_write_only && !written.contains(&setting.key) {
             continue;
@@ -818,6 +969,9 @@ fn seed(conn: &Connection, document: &Value, at: i64, written: &[&'static str]) 
             }
             continue;
         };
+        if reject_credential_text(conn, setting, &value, harness_key).is_err() {
+            continue;
+        }
         let text = value.to_string();
         conn.execute(
             "INSERT INTO settings(key, value, revision, updated_ms, updated_by) VALUES(?1, ?2, 1, ?3, ?4)",
@@ -991,6 +1145,7 @@ fn write_store_with<T>(
     write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
+    let harness_key = harness_credential(context);
     let (result, stored) = {
         let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
         if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
@@ -1005,7 +1160,7 @@ fn write_store_with<T>(
         if conversations {
             migrate(&tx).map_err(unavailable)?;
         }
-        seed(&tx, &document, now_ms(), written)?;
+        seed(&tx, &document, now_ms(), written, harness_key.as_deref())?;
         let access_before = access_rows(&tx)?;
         let result = write(&tx, &document)?;
         if access_rows(&tx)? != access_before {
@@ -1109,10 +1264,16 @@ fn record_change(
     if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
         return Err((503, STORAGE_ERROR.to_string()));
     }
+    let mut old_value = old.map(|(old_text, _)| old_text);
+    let mut new_value = new.map(str::to_string);
+    if setting.secret {
+        let marker = json!(SECRET_MARKER).to_string();
+        (old_value, new_value) = (Some(marker.clone()), Some(marker));
+    }
     conn.execute(
         "INSERT INTO settings_audit(at_ms, actor, source, scope, key, old_value, new_value, request_id)
          VALUES(?1, ?2, ?3, 'global', ?4, ?5, ?6, ?7)",
-        params![at, actor, source, setting.key, old.map(|(old_text, _)| old_text), new, request_id(at)],
+        params![at, actor, source, setting.key, old_value, new_value, request_id(at)],
     )
     .map_err(failed)?;
     Ok(revision)
@@ -1135,9 +1296,26 @@ pub(crate) fn apply(
     store(context, setting, value, actor, source)
 }
 
-/// Writes one valid stored value (`storable`) with its audit row through `write_store`, which seeds the store first and
-/// writes the store back into `config.json` after the commit (`Applied::mirror_error`). The stored value again writes
-/// no value and no audit row (a seed still commits).
+/// Tests the effective schedule after applying all writes in this request. Callers hold the configuration gate.
+fn check_schedule_change(
+    mut document: Value,
+    stored: Vec<(&'static Setting, Value)>,
+    changes: impl IntoIterator<Item = (&'static Setting, Option<Value>)>,
+) -> Result<(), (u16, String)> {
+    place(&mut document, stored);
+    for (setting, value) in changes {
+        if let Some(value) = value {
+            if !set_at(&mut document, setting.pointer, value) {
+                return Err((409, format!("config.json cannot hold {}", setting.key)));
+            }
+        } else {
+            remove_at(&mut document, setting.pointer);
+        }
+    }
+    super::registry::check_schedule(&document)
+}
+
+/// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
 fn store(
     context: &RuntimeContext,
     setting: &'static Setting,
@@ -1145,8 +1323,30 @@ fn store(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
-    let text = value.to_string();
+    if super::registry::checks_schedule(setting.key) {
+        let unavailable = |error| (503, error);
+        check_schedule_change(
+            raw_config(context).map_err(unavailable)?,
+            stored_values(context).map_err(unavailable)?,
+            [(setting, Some(value.clone()))],
+        )?;
+    }
+    let harness_key = setting.kind.text_default().and_then(|_| harness_credential(context));
     let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn, document| {
+        // The configuration gate keeps the endpoint stable until the store commits.
+        let text = if setting.secret && !value.is_null() {
+            let endpoint = if setting.key == WEB_SEARCH_API_KEY.key {
+                crate::aux_search::settings_endpoint(document)
+            } else {
+                context.dependency_url("model").map(str::to_string)
+            }
+            .ok_or((400, "the credential endpoint is unavailable".to_string()))?;
+            json!([endpoint, value]).to_string()
+        } else {
+            value.to_string()
+        };
+        reject_credential_text(conn, setting, &value, harness_key.as_deref())?;
+        let value = if setting.secret { json!(!value.is_null()) } else { value };
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -1210,6 +1410,7 @@ pub(crate) fn undo(
         return Err((503, LEGACY_ERROR.to_string()));
     }
     // An undone setting has audit rows, which the seed skips, so an undo names no key to seed.
+    let harness_key = harness_credential(context);
     let (undone, mirror_error) = write_store(context, true, &[], |conn, document| {
         let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
         let row: Option<(String, String, String, Option<String>, Option<String>)> = conn
@@ -1225,7 +1426,7 @@ pub(crate) fn undo(
             return conversation::undo_entry(conn, context, entry, (scope, key, source, old_text, new_text), actor);
         }
         let setting = find(&key)
-            .filter(|_| scope == "global" && source != "migration")
+            .filter(|setting| !setting.secret && scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
         permit(setting)?;
         let later: i64 = conn
@@ -1247,6 +1448,17 @@ pub(crate) fn undo(
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
+        if let Some(restored) = &restored {
+            reject_credential_text(conn, setting, restored, harness_key.as_deref())?;
+        }
+        if super::registry::checks_schedule(setting.key) {
+            let unavailable = |error| (503, error);
+            check_schedule_change(
+                document.clone(),
+                read_stored_values(conn).map_err(unavailable)?,
+                [(setting, restored.clone())],
+            )?;
+        }
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
         validate_timing(conn, document, &[setting.key], restored.is_none().then_some(setting))?;
@@ -1314,9 +1526,14 @@ pub(crate) fn history(
             let key: String = row.get(5)?;
             let old: Option<String> = row.get(6)?;
             let new: Option<String> = row.get(7)?;
+            let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
+                (json!(SECRET_MARKER), json!(SECRET_MARKER))
+            } else {
+                (shown(old), shown(new))
+            };
             Ok(json!({
                 "entry": id, "atMs": at, "actor": actor, "source": source, "scope": scope, "setting": key,
-                "old": shown(old), "new": shown(new),
+                "old": old, "new": new,
             }))
         })
         .map_err(failed)?
@@ -1326,14 +1543,14 @@ pub(crate) fn history(
     Ok(json!({"ok": true, "entries": entries, "next": next}))
 }
 
-/// For a whole `config.json` an audit undo restores: keeps `current`'s value at every registry pointer in `restored`,
+/// For a whole `config.json` an audit undo restores: keeps `current`'s value at every ordinary registry pointer in `restored`,
 /// and removes it where `current` has none, because registry settings change and undo through the store only. A
 /// value in `restored` differed from `current`'s. Err with the key when a non-object on the way in `restored` cannot
 /// hold `current`'s value: the undo must refuse, because the restored file would lose that value. The console then
 /// writes the restored file through its one write path, which puts every stored value in as well (`mirror_into`).
 pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Result<Vec<&'static str>, &'static str> {
     let mut kept = Vec::new();
-    for setting in registry() {
+    for setting in registry().filter(|setting| !setting.secret) {
         let now = current.pointer(setting.pointer).cloned();
         if restored.pointer(setting.pointer) == now.as_ref() {
             continue;
@@ -1372,7 +1589,7 @@ pub(crate) fn console_changes(
     let mut now = overlay(context, base.clone());
     complete_timing(&mut now);
     let mut changes = Vec::new();
-    for setting in registry() {
+    for setting in registry().filter(|setting| !setting.secret) {
         // The member the setting reads (`Setting::found_in`), so an id list sent under its alias spelling counts.
         let Some(posted) = setting.found_in(carried).filter(|value| !value.is_null()) else { continue };
         let Some(value) = setting.normalize(posted) else {
@@ -1399,15 +1616,28 @@ pub(crate) fn apply_changes(
     actor: &str,
     source: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    if changes.iter().any(|(setting, _)| setting.secret) {
+        return Err((400, "credentials require the settings route".to_string()));
+    }
     if changes.is_empty() {
         return Ok(None);
     }
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
+    if changes.iter().any(|(setting, _)| super::registry::checks_schedule(setting.key)) {
+        let unavailable = |error| (503, error);
+        check_schedule_change(
+            raw_config(context).map_err(unavailable)?,
+            stored_values(context).map_err(unavailable)?,
+            changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))),
+        )?;
+    }
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
+    let harness_key = harness_credential(context);
     let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
         for (setting, value) in &changes {
+            reject_credential_text(conn, setting, value, harness_key.as_deref())?;
             let text = value.to_string();
             let old = stored_row(conn, setting.key)?;
             if old.as_ref().is_some_and(|(old_text, _)| *old_text == text) {
@@ -1427,7 +1657,7 @@ pub(crate) fn direct_change_error(key: &str) -> String {
     format!("{key} changes only through the settings store")
 }
 
-/// For a console write of `config.json` (`console::write_selected_config_text`, #177): every registry member of `next`
+/// For a console write of `config.json` (`console::write_selected_config_text`, #177): every ordinary registry member of `next`
 /// must be the one `current`, the stored file, holds. A member `next` lacks or holds as `null` is put back from
 /// `current` (removed when `current` has none), because a console writer never removes a registry setting; any other
 /// value that differs is refused with the setting's key, because a console writer changes a registry setting through
@@ -1435,7 +1665,7 @@ pub(crate) fn direct_change_error(key: &str) -> String {
 /// hold `current`'s value. Returns whether `next` changed.
 pub(crate) fn keep_file_members(current: &Value, next: &mut Value) -> Result<bool, &'static str> {
     let mut changed = false;
-    for setting in registry() {
+    for setting in registry().filter(|setting| !setting.secret) {
         let now = current.pointer(setting.pointer);
         let written = next.pointer(setting.pointer);
         if written == now {
@@ -1465,16 +1695,16 @@ fn remove_at(document: &mut Value, pointer: &str) {
     }
 }
 
-/// `document` as the console audit compares a configuration: every registry pointer but the security settings'
-/// removed, and above it every member on its path that is missing, null or an empty object (null and empty read as
+/// `document` as the console audit compares a configuration: ordinary registry pointers are removed, along with every
+/// member on their paths that is missing, null or an empty object (null and empty read as
 /// absent, `set_at` fills them), from the deepest to the shallowest, up to the first member that holds something; the
-/// members of every object in sorted order, so its serialization is canonical. Registry members belong to the store and
-/// are never undone through the audit, so a settings write-back is no change of the audited file. The security settings
+/// members of every object in sorted order, so its serialization is canonical. An ordinary settings write-back does not
+/// change the audited file. Legacy credential literals remain in the digest. The security settings
 /// (#154) stay: an audit undo restores them through the store (`security_restore`), so any later change of one, on the
 /// settings page included, makes an older record stale.
 pub(crate) fn registry_free(document: &Value) -> Value {
     let mut stripped = document.clone();
-    for setting in registry().filter(|setting| !setting.confirmed()) {
+    for setting in registry().filter(|setting| !setting.confirmed() && !setting.secret) {
         remove_at(&mut stripped, setting.pointer);
         let mut below = setting.pointer;
         while let Some((above, _)) = below.rsplit_once('/') {
@@ -1521,11 +1751,13 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         Ok(stored) => (stored, None),
         Err(error) => (Vec::new(), Some(error)),
     };
+    let (secrets, store_error) = match read_secrets(context) {
+        Ok(secrets) => (secrets, store_error),
+        Err(error) => (Vec::new(), store_error.or(Some(error))),
+    };
     let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
     let settings: Vec<Value> = registry()
         .map(|setting| {
-            let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = setting.read(&document);
             let mut entry = json!({
                 "key": setting.key,
                 "scope": "global",
@@ -1534,10 +1766,16 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 "hint": setting.hint,
                 "applies": setting.applies,
                 "kind": setting.kind.view(),
-                "default": setting.default_value(),
-                "stored": stored_value,
-                "value": value,
             });
+            if setting.secret {
+                entry["isSet"] = json!(secrets.iter().any(|(key, _, _)| *key == setting.key));
+                return entry;
+            }
+            let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
+            let value = setting.read(&document);
+            entry["default"] = setting.default_value();
+            entry["stored"] = json!(stored_value);
+            entry["value"] = value.clone();
             if setting.confirmed() {
                 entry["confirm"] = json!(true);
             }
@@ -1628,6 +1866,9 @@ pub(crate) fn preview(
                 .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
             let (key, old) = row.ok_or((404, UNKNOWN_ENTRY_ERROR.to_string()))?;
             let setting = find(&key).ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
+            if setting.secret {
+                return Ok(vec![(setting, None)]);
+            }
             let restored = old
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok())
                 .and_then(|value| setting.storable(&value));
@@ -1639,7 +1880,7 @@ pub(crate) fn preview(
 /// #154: puts each previewed change at its registry pointer in `document`: a value is set (missing or null objects on
 /// the way are created), `None` removes the member, so the file's own value or the default applies again.
 pub(crate) fn place_changes(document: &mut Value, changes: &[(&'static Setting, Option<Value>)]) {
-    for (setting, value) in changes {
+    for (setting, value) in changes.iter().filter(|(setting, _)| !setting.secret) {
         match value {
             Some(value) => {
                 set_at(document, setting.pointer, value.clone());

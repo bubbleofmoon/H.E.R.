@@ -400,6 +400,7 @@ pub struct Pipeline {
     turn_final: bool,
     turn_began: i64,
     turn_token: String,
+    pub(crate) owner_interactions: Option<std::sync::Arc<crate::harness::interactions::Mailbox>>,
     turn_epoch: String,
     turn_epochs: Vec<String>,
     next_inbound: Vec<String>,
@@ -429,6 +430,7 @@ pub struct Pipeline {
     /// Facts of the last finished turn, for the chat reply decision.
     last_report: Option<TurnReport>,
     failure_reported: bool,
+    owner_interaction_closed: bool,
     active_candidate: Option<failover::Candidate>,
     carried_messages: Vec<serde_json::Value>,
     /// Memories the compatibility render of the turn in flight carries as recall: counted when that text
@@ -674,6 +676,7 @@ impl Pipeline {
             turn_final: true,
             turn_began: 0,
             turn_token: String::new(),
+            owner_interactions: None,
             turn_epoch: String::new(),
             turn_epochs: Vec::new(),
             next_inbound: Vec::new(),
@@ -697,6 +700,7 @@ impl Pipeline {
             chat: None,
             last_report: None,
             failure_reported: false,
+            owner_interaction_closed: false,
             active_candidate: None,
             carried_messages: Vec::new(),
             compat_recall: Vec::new(),
@@ -1254,6 +1258,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         mode: &str,
         owner_started: bool,
     ) -> Result<ChatTurnOutcome, String> {
+        self.owner_interaction_closed = false;
         if !self.context.is_isolated() {
             return Err("chat 模式只在选定运行环境中运行".to_string());
         }
@@ -1298,6 +1303,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return Ok(ChatTurnOutcome::WaitForDsh);
         }
         result.map(|()| ChatTurnOutcome::Completed)
+    }
+
+    pub(crate) fn owner_interaction_closed(&self) -> bool {
+        self.owner_interaction_closed
     }
 
     /// First-generation turns share session policy, media delivery, turn recovery and the outbox.
@@ -1484,7 +1493,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             media: self.chat.as_ref().map(|c| c.media_parts.clone()).unwrap_or_default(),
             profile: if self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") { "closed-agent".into() } else { self.preset_chat.clone() }, route,
             limits: crate::harness::Limits::from_config(cfg),
-            tools: crate::harness::Tools::capture(&self.context, cfg, self.chat.as_ref().map_or("", |c| c.mode.as_str()), key, &self.turn_epoch)?,
+            tools: crate::harness::Tools::capture(&self.context, cfg, self.chat.as_ref().map_or("", |c| c.mode.as_str()), key, &self.turn_epoch)?
+                .with_interactions(self.owner_interactions.clone()),
             deadline: timeout,
         })?;
         self.dispatch_unsubmitted = false;
@@ -1553,7 +1563,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let text = match result {
             Ok(text) => text,
             Err(error) => {
-                if error == crate::harness::DEADLINE_EXCEEDED {
+                self.owner_interaction_closed = turn.owner_interaction_closed();
+                if error == crate::harness::DEADLINE_EXCEEDED && !self.owner_interaction_closed {
                     self.report_backend_failure(cfg, key, "harness", "openai", &model, "", &error);
                 }
                 return Err(error);

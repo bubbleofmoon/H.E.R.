@@ -330,9 +330,8 @@ pub fn sticker_parts_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
 ) -> (bool, bool, usize, String, String) {
-    let s = cfg.get("socialV2").and_then(|v| v.get("sticker"));
-    let enabled = s.and_then(|x| x.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true);
-    let include = s.and_then(|x| x.get("includeInPrompt")).and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = crate::sticker::enabled(cfg);
+    let include = crate::settings::STICKERS_IN_PROMPT.switch(cfg);
     let list = crate::sticker::load_for_runtime(context)
         .ok()
         .flatten()
@@ -344,11 +343,7 @@ pub fn sticker_parts_with_runtime(
     if !include {
         return (enabled, include, total, String::new(), String::new());
     }
-    let max = s
-        .and_then(|x| x.get("promptMaxStickers"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8)
-        .clamp(1, 30) as usize;
+    let max = crate::settings::STICKERS_PROMPT_COUNT.integer(cfg) as usize;
     (enabled, include, total, sticker_context_from_list(&list, max), strategy)
 }
 
@@ -689,10 +684,7 @@ pub(crate) fn record_recall_hits(context: &RuntimeContext, ids: &[i64]) {
 
 /// `memory.inject.relatedTopK` (default 3, 1..=20): how many recalled memories a wake carries.
 pub(crate) fn recall_top_k(cfg: &Value) -> usize {
-    cfg.pointer("/memory/inject/relatedTopK")
-        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
-        .filter(|n| n.is_finite())
-        .map_or(3, |n| n.round().clamp(1.0, 20.0) as usize)
+    crate::settings::RELATED_TOP_K.integer(cfg) as usize
 }
 
 fn keep_all(items: &[String]) -> usize { items.len() }
@@ -1125,47 +1117,11 @@ pub fn memory_formatted(st: &Value, cfg: &Value) -> String {
     short_term_block(st, cfg).trim_end().to_string()
 }
 
-/// JS 的 `new Date().toLocaleString('zh-CN', { hour12: false })`。
-///
-/// 实测形态是 `2026/1/5 09:03:02`：**月日不补零、时分秒补零**。
-/// 别想当然写成 `2026/01/05`，那样和 JS 交付出去的提示词第一行就差字了。
-pub fn js_local_datetime(ms: i64) -> String {
-    let local = ms + local_offset_ms();
-    let secs = local.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (y, m, d) = crate::sticker::civil_from_days(days);
-    format!(
-        "{y}/{m}/{d} {:02}:{:02}:{:02}",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60
-    )
-}
-
-/// Zone name shown in the clock line (JS `Intl.DateTimeFormat().resolvedOptions().timeZone`):
-/// `TZ` when set, otherwise this host's zone.
-pub fn zone_name() -> String {
-    match std::env::var("TZ") {
-        Ok(tz) if !tz.trim().is_empty() => tz.trim().to_string(),
-        _ => "Asia/Shanghai".to_string(),
-    }
-}
-
-/// Offset of that zone from UTC. There is no tz database in the binary: `UTC`/`GMT` are 0; every
-/// other name uses the host's UTC+8 (the only production zone). A zone with a different offset
-/// needs a database before it can be supported.
-fn local_offset_ms() -> i64 {
-    match zone_name().as_str() {
-        "UTC" | "Etc/UTC" | "GMT" | "Etc/GMT" | "Z" => 0,
-        _ => 8 * 60 * 60 * 1000,
-    }
-}
-
-/// JS `localClock`: local `HH:MM:SS`, in the zone of the clock line above.
-pub fn local_clock(at_ms: i64) -> String {
-    let secs = (at_ms + local_offset_ms()).div_euclid(1000).rem_euclid(86_400);
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+/// The current-time line used by both compatibility delivery and the wake delta.
+fn clock_line(cfg: &Value, at_ms: i64) -> String {
+    let time = crate::local_time::at(at_ms, &crate::local_time::configured_zone(cfg));
+    let label = crate::local_time::label(&time);
+    format!("【当前时间】{}（{label}）", crate::local_time::display(&time))
 }
 
 /// 交付给模型前的包装：等价于 JS 的 `withSlangContext`。
@@ -1183,8 +1139,7 @@ pub fn wrap_for_delivery_with_runtime(
     cfg: &Value,
     at_ms: i64,
 ) -> String {
-    let tz = zone_name();
-    let mut parts = vec![format!("【当前时间】{}（{tz}）", js_local_datetime(at_ms))];
+    let mut parts = vec![clock_line(cfg, at_ms)];
     let slang_cfg = cfg.get("slang");
     let enabled = slang_cfg
         .and_then(|s| s.get("enabled"))
@@ -1470,10 +1425,11 @@ mod tests {
         // 2026-01-05 01:03:02 UTC → 北京时间 09:03:02
         // zh-CN 的 toLocaleString **月日不补零**、时分秒补零
         let ms = 1_767_574_982_000; // 2026-01-05T01:03:02Z
-        assert_eq!(js_local_datetime(ms), "2026/1/5 09:03:02");
+        let zone = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
+        assert_eq!(crate::local_time::display(&crate::local_time::at(ms, &zone)), "2026/1/5 09:03:02");
         // 12 月 31 日跨年边界：UTC 23:59:59 → 北京时间次日 07:59:59
         let ms2 = 1_798_761_599_000;
-        assert_eq!(js_local_datetime(ms2), "2027/1/1 07:59:59");
+        assert_eq!(crate::local_time::display(&crate::local_time::at(ms2, &zone)), "2027/1/1 07:59:59");
     }
 
     #[test]
@@ -2171,5 +2127,5 @@ pub(crate) fn prepare_dsh_wake_layered(
         return Err(WAKE_BRIEFING_CHANGED.into());
     }
     let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);
-    Ok(DshWake { text: format!("【当前时间】{}（{}）\n\n{body}",js_local_datetime(now_ms()),zone_name()), recalled, layers, cut, alerted })
+    Ok(DshWake { text: format!("{}\n\n{body}", clock_line(cfg, now_ms())), recalled, layers, cut, alerted })
 }

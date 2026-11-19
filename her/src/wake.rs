@@ -90,6 +90,7 @@ pub enum ReplayOutcome {
 /// 配置切片（从 config.json 的 socialV2 段读出来）。
 #[derive(Debug, Clone)]
 pub struct WakeCfg {
+    pub zone: jiff::tz::TimeZone,
     pub enabled: bool,
     /// Live reply scheduling; None retains the offline legacy replay policy.
     pub reply_wake_quiet_ms: Option<i64>,
@@ -131,6 +132,7 @@ pub struct WakeCfg {
 impl Default for WakeCfg {
     fn default() -> Self {
         Self {
+            zone: jiff::tz::TimeZone::system(),
             enabled: true,
             reply_wake_quiet_ms: None,
             batch_window_ms: 1500,
@@ -539,7 +541,7 @@ impl WakeScheduler {
             prob *= 0.5;
         }
         // 深夜降权（23:00~08:00）：用本地时间的小时数。
-        let hour = local_hour(now);
+        let hour = crate::local_time::at(now, &self.cfg.zone).hour();
         if !(8..23).contains(&hour) {
             prob *= 0.3;
         }
@@ -749,48 +751,18 @@ pub fn is_wakeable(wc: &WakeConfig, now: i64) -> bool {
     false
 }
 
-/// 简化版 ISO-8601 解析：支持 `2026-10-21T05:00:00.000Z` 与带时区的形式。
-/// 只处理桥接产生的格式，不追求通用。
-pub fn parse_iso_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
+/// Stored ISO instants honor an explicit offset. Legacy zone-less values are UTC.
+pub fn parse_iso_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Ok(stamp) = text.parse::<jiff::Timestamp>() {
+        return Some(stamp.as_millisecond());
+    }
+    let (_, time) = text.split_once('T')?;
+    if time.contains(['+', '-', 'Z', 'z', '[']) {
         return None;
     }
-    // 直接复用系统解析能力的简化实现：拆日期与时间。
-    let (date, rest) = s.split_once('T')?;
-    let mut d = date.split('-');
-    let y: i64 = d.next()?.parse().ok()?;
-    let mo: i64 = d.next()?.parse().ok()?;
-    let da: i64 = d.next()?.parse().ok()?;
-    let time_part = rest
-        .trim_end_matches('Z')
-        .split(['+', '-'])
-        .next()
-        .unwrap_or(rest);
-    let mut t = time_part.split(':');
-    let h: i64 = t.next()?.parse().ok()?;
-    let mi: i64 = t.next()?.parse().ok()?;
-    let sec_part = t.next().unwrap_or("0");
-    let se: f64 = sec_part.parse().ok()?;
-    Some(civil_to_ms(y, mo, da, h, mi, se))
-}
-
-fn civil_to_ms(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: f64) -> i64 {
-    // Howard Hinnant 的 days_from_civil
-    let y2 = if mo <= 2 { y - 1 } else { y };
-    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
-    let yoe = y2 - era * 400;
-    let mp = (mo + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    let secs = days * 86400 + h * 3600 + mi * 60;
-    (secs as f64 * 1000.0 + (s * 1000.0)) as i64
-}
-
-fn local_hour(now_ms: i64) -> i64 {
-    // 中国区固定 UTC+8，不做夏令时。
-    ((now_ms / 1000 + 8 * 3600).div_euclid(3600)) % 24
+    let civil = text.parse::<jiff::civil::DateTime>().ok()?;
+    Some(civil.to_zoned(jiff::tz::TimeZone::UTC).ok()?.timestamp().as_millisecond())
 }
 
 // ---- wake-config 的纯函数部分（从 bridge.js 的 POST /api/socialV2/wake-config 抽出）----
@@ -1380,6 +1352,7 @@ mod tests {
         // 否则「连发三条应该排上三条」这类用例会被限频挡住，测的就不是调度了。
         // 限频本身由 test_rate_limit_* 覆盖。
         let mut cfg = WakeCfg::default();
+        cfg.zone = crate::local_time::beijing_tariff_zone();
         cfg.max_wake_per_minute = 0;
         cfg.max_wake_per_hour = 0;
         WakeScheduler::new(cfg, WakeConfig::default())

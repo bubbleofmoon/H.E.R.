@@ -18,6 +18,7 @@ const ALLOW_PRIVATE: Setting = Setting {
     label: "Allowed private chats",
     hint: "QQ ids whose private messages are answered, unless denied. A change revokes every conversation that loses access before the reply. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 const ALLOW_GROUPS: Setting = Setting {
@@ -29,6 +30,7 @@ const ALLOW_GROUPS: Setting = Setting {
     label: "Allowed groups",
     hint: "Group ids that are answered, unless denied; rollout.rustGroups must also serve them. A change revokes every conversation that loses access before the reply. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 const DENY_PRIVATE: Setting = Setting {
@@ -40,6 +42,7 @@ const DENY_PRIVATE: Setting = Setting {
     label: "Denied private chats",
     hint: "QQ ids never answered in private, even when allowed. A change revokes every conversation that loses access before the reply. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 const DENY_GROUPS: Setting = Setting {
@@ -51,6 +54,7 @@ const DENY_GROUPS: Setting = Setting {
     label: "Denied groups",
     hint: "Group ids never answered, even when allowed. A change revokes every conversation that loses access before the reply. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 /// While the admin agent mode is on, the owner it was started with wins (`RuntimeContext::load_config`); the settings
@@ -64,30 +68,33 @@ pub(crate) const OWNER: Setting = Setting {
     label: "Owner",
     hint: "The owner's QQ id; reset for no owner. While the admin agent mode is on, the owner it was started with wins. A change revokes every conversation that loses access before the reply. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 /// Read per blocked reply by `pipeline::Pipeline::alert_blocked_reply`.
 pub(crate) const INTERCEPT_NOTIFY: Setting = Setting {
     key: "security.interceptNotify",
     pointer: "/security/interceptNotify",
-    kind: &Switch { default: true },
+    kind: &Switch::new(true),
     applies: "live",
     group: SECURITY_GROUP,
     label: "Notify blocked replies",
     hint: "Whether the owner is told when the outbound guard blocks a reply. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 /// Read per reply and per console text or voice request by `pipeline::outbound_guard_enabled`.
 pub(crate) const OUTBOUND_GUARD: Setting = Setting {
     key: "security.outboundGuard",
     pointer: "/security/outboundGuard",
-    kind: &Switch { default: true },
+    kind: &Switch::new(true),
     applies: "live",
     group: SECURITY_GROUP,
     label: "Outbound guard",
     hint: "Off stops the outbound sentinel, sensitive-reply hiding and blocked-reply notices. Needs confirmation.",
     chat: false,
+    secret: false,
 };
 
 /// The group's settings, in registry order.

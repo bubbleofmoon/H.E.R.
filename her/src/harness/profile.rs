@@ -64,13 +64,13 @@ const OWNER_PRIVATE: &[&str] = &[
 
 /// The legacy reads the console serves in `closed-agent`, the direct private send (the console
 /// accepts the turn's bound token only for the owner's own chat), the tokenless image lookup,
-/// memory, the owner-only tools and the auxiliary tools. Never the group sends (the bound token
-/// never matches a group target there) or the reserved2 tools.
+/// memory, the owner-only tools, the auxiliary tools and the owner-approved group send.
 const CLOSED_AGENT: &[&str] = &[
     "qq_status",
     "qq_list_groups",
     "qq_get_group_members",
     "qq_get_group_history",
+    super::interactions::GROUP_SEND,
     "qq_send_private_message",
     "qq_get_message_images",
     "memory_write",
@@ -83,6 +83,7 @@ const CLOSED_AGENT: &[&str] = &[
     "web_search",
     "web_fetch",
     "snowluma_status",
+    super::interactions::ASK,
 ];
 
 /// Every token-bound social tool and direct send the console serves in `reserved2`; never the

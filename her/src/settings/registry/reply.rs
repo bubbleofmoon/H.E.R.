@@ -7,9 +7,9 @@ macro_rules! timing {
     ($member:literal, $max:literal, $default:literal, $label:literal, $hint:literal, $chat:literal) => {
         Setting {
             key: concat!("reply.", $member), pointer: concat!("/socialV2/reply/", $member),
-            kind: &Integer { min: 1, max: $max, default: $default, file: FileRule::Default },
+            kind: &Integer { min: 1, max: $max, default: Some($default), file: FileRule::Default },
             applies: if $chat { "next wake" } else { "live" },
-            group: "reply rhythm", label: $label, hint: $hint, chat: $chat,
+            group: "reply rhythm", label: $label, hint: $hint, chat: $chat, secret: false,
         }
     };
 }

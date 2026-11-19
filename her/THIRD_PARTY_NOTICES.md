@@ -1,4 +1,13 @@
-# Signed release verification dependencies
+# Third-party dependency notices
+
+## Jiff 0.2.39
+
+HER uses Jiff for IANA time zone lookup, civil scheduling and calendar conversion under the Unlicense option of its Unlicense OR MIT dual license. The bundled IANA time-zone database is distributed with Jiff's tzdb packages. The upstream license texts accompany the redistributable source.
+
+- [Jiff license and source](https://docs.rs/crate/jiff/0.2.39/source/COPYING)
+- [Jiff time-zone database package](https://docs.rs/crate/jiff-tzdb/0.1.9/source/LICENSE)
+
+## Signed release verification dependencies
 
 `minisign-verify` 0.3.0 is the maintained upstream Minisign/Ed25519 verifier used by all three HER images. Its crates.io metadata declares MIT and it has no dependencies. `minisign` 0.10.0 is a dev dependency used only to sign synthetic test releases. Its metadata also declares MIT. Both packages retain notices for crypto derived from rust-crypto. These permissive notices fit the source-available distribution in ADR 0002; no cargo-deny/licence allowlist is present. This file retains the upstream notices and must accompany redistribution of these components.
 

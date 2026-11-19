@@ -415,11 +415,15 @@ pub(crate) fn mark_rotation_alert(
     key: &str,
     _sid: &str,
 ) -> Result<bool, String> {
-    mark_rotation_alert_day(context, key, rotation_alert_day())
+    let cfg = context.load_config_document().unwrap_or_default();
+    mark_rotation_alert_day(context, key, rotation_alert_day(&cfg))
 }
 
-pub(crate) fn rotation_alert_day() -> i64 {
-    (crate::parity_clock::now_ms() + crate::tasks::local_offset_ms()).div_euclid(86_400_000)
+pub(crate) fn rotation_alert_day(cfg: &Value) -> i64 {
+    let zone = crate::local_time::configured_zone(cfg);
+    let date = crate::local_time::at(crate::parity_clock::now_ms(), &zone).date();
+    date.to_zoned(jiff::tz::TimeZone::UTC).expect("current date is representable")
+        .timestamp().as_millisecond().div_euclid(86_400_000)
 }
 
 pub(crate) fn mark_rotation_alert_day(

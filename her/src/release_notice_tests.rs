@@ -199,6 +199,14 @@ fn hourly_budget_keeps_release_notice_pending_across_restart() {
 }
 
 #[test]
+fn settings_batch_gate_notifier_reads_live_alert_limits() {
+    let fixture = Fixture::new(false);
+    fixture.child("live-limits");
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "only the first notice should reach OneBot: {seen:?}");
+}
+
+#[test]
 fn notice_worker_child() {
     let Some(root) = std::env::var_os("HER_13_NOTICE_ROOT").map(PathBuf::from) else {
         return;
@@ -206,9 +214,31 @@ fn notice_worker_child() {
     let phase = std::env::var("HER_13_NOTICE_PHASE").unwrap();
     let context = RuntimeContext::from_root(&root).unwrap();
     let cfg = context.load_config().unwrap();
+    if phase == "live-limits" {
+        assert!(notify_notice_wait(&context, &cfg, "first notice", "first"));
+        for (setting, value) in [("alerts.keyWindowSecs", 600), ("alerts.hourlyCap", 1)] {
+            let (status, reply) = crate::console::admin_request(
+                &context,
+                "POST",
+                "/api/settings/set",
+                Some(&json!({"setting":setting,"value":value})),
+            );
+            assert_eq!(status, 200, "{reply}");
+        }
+
+        assert!(!notify_notice_wait(&context, &cfg, "repeat notice", "first"));
+        assert!(
+            !notify_notice_wait(&context, &cfg, "second notice", "second"),
+            "the live hourly cap must block the next distinct notice"
+        );
+        let records = fs::read_to_string(root.join("data/run-record.jsonl")).unwrap();
+        assert!(records.contains("same key already sent within 600 seconds"), "{records}");
+        assert!(records.contains("hourly cap of 1 reached"), "{records}");
+        return;
+    }
     if phase == "hourly" {
         let mut limiter = notice_limiter().lock().unwrap();
-        for n in 0..HOURLY_CAP {
+        for n in 0..crate::settings::ALERT_HOURLY_CAP.integer(&serde_json::Value::Null) {
             assert!(limiter
                 .check(
                     "fixture",

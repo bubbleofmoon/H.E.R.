@@ -66,6 +66,7 @@ mod forward_fmt;
 mod preset_prompt;
 mod runtime;
 mod guarded_file;
+mod guarded_credentials;
 mod scheduled_task;
 mod release;
 mod release_signature;
@@ -92,6 +93,7 @@ mod lifecycle_cli;
 mod watchdog;
 mod task_runs;
 mod tasks;
+mod local_time;
 mod schedule;
 mod backup;
 mod restore;
@@ -932,6 +934,7 @@ fn runtime_json(
 fn wake_cfg_of(cfg_raw: &Value) -> wake::WakeCfg {
     use crate::settings::{reply, wake_timing as timing};
     wake::WakeCfg {
+        zone: crate::local_time::configured_zone(cfg_raw),
         turn_hard_cap_ms: wake::turn_budget(cfg_raw).hard_cap_ms,
         turn_ceiling_ms: wake::turn_ceiling_ms(cfg_raw),
         enabled: cfg_raw.pointer("/socialV2/enabled") != Some(&Value::Bool(false)),

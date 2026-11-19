@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 pub(crate) struct Integer {
     pub min: i64,
     pub max: i64,
-    pub default: i64,
+    pub default: Option<i64>,
     pub file: FileRule,
 }
 
@@ -28,6 +28,20 @@ pub(crate) enum FileRule {
     Clamp,
     /// A non-negative number is truncated to an integer and clamped into the bounds.
     TruncateAndClamp,
+    /// A positive JSON integer is clamped; zero and other values read as the default.
+    PositiveClamp,
+    /// A signed JSON integer is clamped.
+    SignedClamp,
+    /// The media file reader accepts positive values under JS number coercion, rounds and clamps.
+    Media,
+    /// Voice file sizes truncate and clamp the positive numbers accepted by the voice reader.
+    VoiceBytes,
+    /// A finite number or numeric string is rounded to the nearest integer, then clamped.
+    Round,
+    /// A finite legacy JavaScript number is rounded to the nearest integer, then clamped.
+    JsRound,
+    /// A finite legacy JavaScript number is truncated, then clamped.
+    JsTruncate,
 }
 
 impl SettingKind for Integer {
@@ -37,7 +51,7 @@ impl SettingKind for Integer {
     }
 
     fn default_value(&self) -> Value {
-        if self.file == FileRule::Automatic { Value::Null } else { json!(self.default) }
+        json!(self.default)
     }
 
     fn read(&self, found: &Value) -> Option<Value> {
@@ -53,11 +67,43 @@ impl SettingKind for Integer {
                 n.is_finite().then(|| json!(n.round().clamp(min as f64, max as f64) as i64))
             }
             FileRule::Default | FileRule::Automatic => self.normalize(found),
+            FileRule::PositiveClamp => found.as_u64().filter(|n| *n > 0).map(|n| json!(n.clamp(min as u64, max as u64))),
+            FileRule::SignedClamp => found.as_i64().map(|n| json!(n.clamp(min, max))),
+            FileRule::Media | FileRule::VoiceBytes => {
+                let n = if self.file == FileRule::Media {
+                    crate::console::social_v1_number(found)
+                } else {
+                    crate::console::voice_config_number(found)
+                };
+                let rounded = match self.file {
+                    FileRule::VoiceBytes if n.is_finite() && n > 0.0 => n.floor(),
+                    FileRule::Media if n.is_finite() && n > 0.0 => n.round(),
+                    _ => return None,
+                };
+                Some(json!((rounded as i64).clamp(min, max)))
+            }
+            FileRule::Round => found
+                .as_f64()
+                .or_else(|| found.as_str().and_then(|text| text.trim().parse().ok()))
+                .filter(|number| number.is_finite())
+                .map(|number| json!((number.round() as i64).clamp(min, max))),
+            FileRule::JsRound | FileRule::JsTruncate => crate::aux_text::js_number(found)
+                .filter(|number| !found.is_null() && number.is_finite())
+                .map(|number| {
+                    let integer = if self.file == FileRule::JsRound { number.round() } else { number.trunc() };
+                    json!((integer as i64).clamp(min, max))
+                }),
         }
     }
 
     fn seed(&self, found: &Value) -> Option<Value> {
-        self.read(found)
+        match self.file {
+            FileRule::Default | FileRule::Round => self.normalize(found),
+            FileRule::Clamp | FileRule::PositiveClamp | FileRule::SignedClamp | FileRule::Media
+            | FileRule::VoiceBytes | FileRule::JsRound | FileRule::JsTruncate
+            | FileRule::TruncateAndClamp | FileRule::IntegralNumber | FileRule::LegacyDecimal => self.read(found),
+            FileRule::Automatic => self.normalize(found),
+        }
     }
 
     fn refusal(&self, key: &str, _value: &Value) -> String {
@@ -78,14 +124,14 @@ impl SettingKind for Integer {
     #[cfg(test)]
     fn check_entry(&self, setting: &crate::settings::Setting) {
         let Integer { min, max, default, file } = *self;
-        assert!(file == FileRule::Automatic || (min..=max).contains(&default), "{}", setting.key);
+        assert!(default.is_none_or(|default| (min..=max).contains(&default)), "{}", setting.key);
         assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
         assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
         assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
         assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
-        assert_eq!(setting.default_value(), self.default_value());
-        assert_eq!(setting.read(&json!({})), setting.default_value(), "{}: a missing value reads as the default", setting.key);
-        if file == FileRule::Clamp {
+        assert_eq!(setting.default_value(), json!(default));
+        assert_eq!(setting.read(&json!({})), json!(default), "{}: a missing value reads as the default", setting.key);
+        if matches!(file, FileRule::Clamp | FileRule::PositiveClamp) {
             assert!(min >= 0, "{}: a clamped setting has non-negative bounds", setting.key);
         }
     }

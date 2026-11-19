@@ -18,6 +18,15 @@ pub(super) fn admit(
     key: &str,
     messages: &[String],
 ) -> Result<String, (u16, String)> {
+    admit_in_scope(context, key, messages, None)
+}
+
+pub(super) fn admit_in_scope(
+    context: &RuntimeContext,
+    key: &str,
+    messages: &[String],
+    approved_turn: Option<&str>,
+) -> Result<String, (u16, String)> {
     use crate::send_outbox::{fold_batch, read_records, ItemState};
     // Re-read after waiting for the send chain; operator edits apply without restarting a turn.
     let fresh = context
@@ -27,7 +36,13 @@ pub(super) fn admit(
     let cap = turn_send_cap(&fresh);
     let window = crate::settings::send::REPEAT_WINDOW.integer(&fresh) as u64;
     let state = load_social_state_for(context)?;
-    let (scope, wait_used) = wait_usage(context, key, &state["conversations"][key])?;
+    let conversation = &state["conversations"][key];
+    let (scope, wait_used) = if let Some(turn) = approved_turn {
+        let epoch = crate::send_outbox::token_epoch(conversation["agentToken"].as_str().unwrap_or(""));
+        (format!("{epoch}:{turn}"), 0)
+    } else {
+        wait_usage(context, key, conversation)?
+    };
     let records =
         read_records(context).map_err(|_| (503, "send guard outbox is unavailable".into()))?;
     let turns = if context.is_isolated() {

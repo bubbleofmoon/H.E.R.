@@ -2,28 +2,36 @@
 //! the store, the settings page and the chat tools use, so no code outside this folder matches on a kind.
 
 mod choice;
-mod probability;
+mod daily_time;
 mod id_list;
 mod integer;
 mod model_id;
 mod owner_id;
+mod probability;
 mod route_id;
 mod route_list;
+mod secret;
 mod switch;
 mod text;
+mod time_zone;
+mod voice_number;
 
 pub(crate) use choice::Choice;
-pub(crate) use probability::Probability;
+pub(crate) use daily_time::{daily_parts, DailyTime};
 pub(crate) use id_list::IdList;
 #[cfg(test)]
 pub(crate) use id_list::ID_LIST_MAX;
 pub(crate) use integer::{FileRule, Integer};
 pub(crate) use model_id::ModelId;
 pub(crate) use owner_id::OwnerId;
+pub(crate) use probability::Probability;
 pub(crate) use route_id::RouteId;
 pub(crate) use route_list::RouteList;
+pub(crate) use secret::ApiKey;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
+pub(crate) use time_zone::TimeZoneName;
+pub(crate) use voice_number::VoiceNumber;
 
 use serde_json::Value;
 
@@ -53,6 +61,11 @@ pub(crate) trait SettingKind: Sync {
 
     /// Why a chat value was refused, under the chat's name `name`.
     fn chat_requirement(&self, name: &str) -> String;
+
+    /// A retained chat spelling for a setting whose configuration member has a different name.
+    fn chat_pointer(&self) -> Option<&'static str> {
+        None
+    }
 
     /// The compiled default of a text setting, `None` for every other kind: `prompt_text` renders it as the fallback,
     /// and the overlay gives a text setting's refused stored value its last good version.

@@ -4,6 +4,10 @@
 mod media_fixtures;
 include!("support/chat.rs");
 include!("support/model.rs");
+#[path = "harness_interactions/questions.rs"]
+mod owner_questions;
+#[path = "harness_interactions/approvals.rs"]
+mod owner_approvals;
 
 const SWITCH_PATH: &str = "/api/settings/conversation/switch";
 
@@ -3544,7 +3548,7 @@ fn chat_mode_ignores_a_pinned_cli_backend_and_answers_through_dsh() {
         Seed {
             mode: "chat",
             config: json!({"backends":{"sessions":{GROUP_KEY:"private-output-cli"},"list":[{
-                "id":"private-output-cli","kind":"cli","cmd":"powershell.exe",
+                "id":"private-output-cli","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","cmd":"powershell.exe",
                 "args":["-NoProfile","-NonInteractive","-Command",
                     "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText((Join-Path $env:HER_RUNTIME_ROOT 'data/cli-private-probe.txt'), '7'); [Console]::Out.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); [Console]::Error.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); exit 7"]
             }]}}),
@@ -3754,11 +3758,12 @@ const OWNER_CHAT_MENU: [&str; 11] = [
 ];
 
 /// The owner's private chat in closed-agent mode (#160).
-const CLOSED_AGENT_MENU: [&str; 16] = [
+const CLOSED_AGENT_MENU: [&str; 18] = [
     "qq_status",
     "qq_list_groups",
     "qq_get_group_members",
     "qq_get_group_history",
+    "qq_send_group_message",
     "qq_send_private_message",
     "qq_get_message_images",
     "memory_write",
@@ -3771,6 +3776,7 @@ const CLOSED_AGENT_MENU: [&str; 16] = [
     "web_search",
     "web_fetch",
     "snowluma_status",
+    "ask_owner",
 ];
 
 #[test]
@@ -3861,6 +3867,35 @@ fn menu_a_model_looping_on_an_off_menu_tool_stops_at_the_step_budget_without_eff
         assert!(tool["result"].to_string().contains("not found"), "{facts}");
     }
     assert_eq!(rig.texts_to(GROUP_KEY), vec![ACK.to_string()]);
+}
+
+#[test]
+fn settings_batch_tool_switch_changes_the_next_model_request() {
+    let model = FakeModel::script(vec![
+        ModelReply::Text("before the settings change".into()),
+        ModelReply::Text("after the settings change".into()),
+        ModelReply::Text("after reset".into()),
+    ]);
+    let mut rig = owner_harness_rig("settings-tool-menu", &model);
+    rig.start();
+    for (index, enabled) in [true, false, true].into_iter().enumerate() {
+        if index > 0 {
+            let path = if enabled { "/api/settings/reset" } else { "/api/settings/set" };
+            for setting in ["socialV2.tools.getImages", "socialV2.tools.sendPrivate"] {
+                let body = if enabled { json!({"setting": setting}) } else { json!({"setting": setting, "value": false}) };
+                let (status, answer) = rig.console("POST", path, Some(&body));
+                assert_eq!(status, 200, "{setting}: {answer}");
+            }
+        }
+        says(&rig, OWNER_KEY, OWNER, "owner", &format!("check available actions in turn {}", index + 1));
+        assert!(wait_for(LONG, || {
+            rig.ledger().iter().filter(|r| r["k"] == "ended" && r["outcome"] == "completed").count() > index
+        }), "turn {} did not complete", index + 1);
+        let offered = offered_tools(&lock(&model.requests)[index]);
+        for tool in ["qq_get_message_images", "qq_send_private_message"] {
+            assert_eq!(offered.iter().any(|name| name == tool), enabled, "{tool} on turn {}: {offered:?}", index + 1);
+        }
+    }
 }
 
 #[test]

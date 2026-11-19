@@ -21,18 +21,6 @@ use crate::{runtime::{RuntimeArea, RuntimeContext}, task_runs::{Finish, LogStrea
 use serde_json::Value;
 use std::{sync::atomic::{AtomicBool, Ordering}, time::Instant};
 
-// The JS state contains both historic numeric timestamps and ISO strings. In particular,
-// Number(ISO) is NaN: preserve that interval behaviour rather than silently resetting progress.
-fn number(value: &Value) -> f64 {
-    crate::aux_text::js_number(value).unwrap_or(f64::NAN)
-}
-fn setting(auto: &Value, key: &str, default: f64) -> f64 {
-    auto.get(key)
-        .filter(|v| !v.is_null())
-        .map(number)
-        .unwrap_or(default)
-}
-
 fn failed(reason: &str) -> Finish {
     Finish::Failed {
         exit_code: Some(1),
@@ -67,8 +55,7 @@ impl Hold for JobHold<'_> {
 /// Backlog the check task waits for: `contextPct` percent of the social evidence buffer.
 fn check_min_messages(cfg: &Value) -> usize {
     let limit = cfg.pointer("/socialV2/context/recentLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(100) as f64;
-    let pct = setting(&cfg["memory"]["autoFlush"], "contextPct", 70.0);
-    let pct = if pct.is_finite() { pct.clamp(1.0, 100.0) } else { 70.0 };
+    let pct = crate::settings::AUTO_FLUSH_CONTEXT_PCT.integer(cfg) as f64;
     ((limit * pct / 100.0).ceil() as usize).max(1)
 }
 
@@ -92,8 +79,7 @@ pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel:
         Ok(v) => v,
         Err(_) => return failed("digest configuration unavailable"),
     };
-    let auto = &cfg["memory"]["autoFlush"];
-    if auto["enabled"] == false {
+    if !crate::settings::AUTO_FLUSH_ENABLED.switch(&cfg) {
         log.log(LogStream::Meta, "digest disabled");
         return Finish::Succeeded;
     }
@@ -124,9 +110,9 @@ pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel:
     };
     let limits = Limits {
         min_messages: if def.id == TaskId::MemoryDigestCheck { check_min_messages(&cfg) } else { 1 },
-        min_interval_ms: (setting(auto, "minIntervalMinutes", 60.0).max(0.0) * 60_000.0) as i64,
+        min_interval_ms: crate::settings::AUTO_FLUSH_MIN_INTERVAL.integer(&cfg) * 60_000,
     };
-    let max = setting(auto, "maxSessionsPerDay", 8.0).max(0.0) as usize;
+    let max = crate::settings::AUTO_FLUSH_MAX_SESSIONS.integer(&cfg) as usize;
     let (mut written, mut memories, mut quiet, mut failures) = (0usize, 0usize, 0usize, 0usize);
     let hold = JobHold { context, cancel };
     for key in keys {

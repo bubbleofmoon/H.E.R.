@@ -23,8 +23,8 @@ const GATE_WAIT: Duration = Duration::from_secs(2);
 /// The largest state file read; a larger one is unreadable and starts over. A chain has at most `routes::MAX_ROUTES`
 /// routes, so a state HER wrote stays far below it.
 const MAX_STATE_BYTES: u64 = 64 * 1024;
-/// How long an offer of the alert holds its episode: the notice queue's window for one key (`admin_alert::KEY_WINDOW_MS`).
-const CLAIM_TTL_MS: i64 = crate::admin_alert::KEY_WINDOW_MS;
+/// How long a crashed offer holds its episode before another turn can offer it.
+const CLAIM_TTL_MS: i64 = 60_000;
 /// The notice key of the all-routes-failed alert (`admin_alert::notify_notice`: one per runtime per minute).
 pub(crate) const ALERT_KEY: &str = "model-routes-all-failed";
 /// The failure classes a state may carry (`model_failure::Failure::class`, without `refusal`: see `apply`); anything
@@ -80,7 +80,7 @@ struct Episode {
     claim: Option<Claim>,
 }
 
-/// A turn's offer of the owner's alert, made at `at` ms. A claim older than `CLAIM_TTL_MS` (one notice window), or from
+/// A turn's offer of the owner's alert, made at `at` ms. A claim older than `CLAIM_TTL_MS` (the claim lease), or from
 /// the future of a clock that stepped back, is expired: an offer that a crash cut off never blocks the alert for longer.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Claim {

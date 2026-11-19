@@ -583,6 +583,7 @@ pub struct SendReport {
     pub parts: usize,
     pub confirmed: usize,
     pub error: Option<String>,
+    pub unknown: bool,
 }
 
 fn target_of(key: &str) -> Option<Target> {
@@ -676,7 +677,8 @@ fn send_recorded_inline(
         }
         if stop.is_none() {
             if let Some(mute) = crate::group_mute::active(context, key) {
-                stop = Some(mute.refusal_text(crate::parity_clock::now_ms()));
+                let cfg = context.load_config().unwrap_or_default();
+                stop = Some(mute.refusal_text(crate::parity_clock::now_ms(), &cfg));
             }
         }
         let mut attempt_ms = 0;
@@ -693,6 +695,7 @@ fn send_recorded_inline(
         }
         let outcome = ob.send_one_outcome(&target, part, None, None);
         let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
+        report.unknown |= settled.state.needs_verification() || settled.record_error.is_some();
         if let ItemState::Confirmed { message_id, .. } = settled.state {
             report.confirmed += 1;
             confirmed_ids.extend(message_id);
@@ -704,6 +707,9 @@ fn send_recorded_inline(
                 stop = Some(why);
             }
         } else if let Some(error) = settled.error {
+            if report.unknown && matches!(purpose, "owner-interaction" | "owner-interaction-timeout") {
+                stop = Some(error.clone());
+            }
             report.error.get_or_insert(error);
         }
     }
@@ -965,7 +971,32 @@ impl Hub {
         let is_owner = !owner.is_empty() && inb.user_id.to_string() == owner;
         if is_owner && !plain.is_empty() && crate::console::runtime_mode(&self.context) == "closed-agent" {
             if let Some(interactions) = &self.interactions {
-                if interactions.answer(&key, &plain).await {
+                let reset = matches!(plain.to_ascii_lowercase().as_str(), "/reset" | "/new");
+                use crate::harness::interactions::Answer;
+                let answer = if reset {
+                    Answer::Forward
+                } else {
+                    interactions.mailbox.answer(&key, &plain, crate::closed_agent::GATE_WAIT).await
+                };
+                let handled = match answer {
+                    Answer::Accepted => true,
+                    Answer::Notice(text) => {
+                        self.say(cfg, &key, &text);
+                        true
+                    }
+                    Answer::NoticeAndForward(text) => {
+                        self.say(cfg, &key, &text);
+                        false
+                    }
+                    Answer::NoticeIfNoLegacy(text) => {
+                        if !interactions.answer(&key, &plain).await {
+                            self.say(cfg, &key, &text);
+                        }
+                        true
+                    }
+                    Answer::Forward => interactions.answer(&key, &plain).await,
+                };
+                if handled {
                     self.settle(inbound_key).await?;
                     return Ok(Outcome::Done);
                 }
@@ -1072,7 +1103,8 @@ impl Hub {
             .entry(key.to_string())
             .or_insert_with(|| {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                tokio::spawn(worker(self.context.clone(), self.journal.clone(), key.to_string(), rx));
+                let mailbox = self.interactions.as_ref().map(|hub| hub.mailbox.clone());
+                tokio::spawn(worker(self.context.clone(), self.journal.clone(), key.to_string(), rx, mailbox));
                 tx
             })
             .clone();
@@ -1119,6 +1151,7 @@ async fn worker(
     journal: SharedJournal,
     key: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>,
+    mailbox: Option<std::sync::Arc<crate::harness::interactions::Mailbox>>,
 ) {
     use crate::dsh_health::{BoundedQueue, QUEUE_MAX};
     use crate::pipeline::ChatTurnOutcome;
@@ -1202,7 +1235,10 @@ async fn worker(
         }
         if pipeline.is_none() {
             match crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true) {
-                Ok(p) => pipeline = Some(p),
+                Ok(mut p) => {
+                    p.owner_interactions = mailbox.clone();
+                    pipeline = Some(p);
+                }
                 Err(error) => {
                     println!("[chat] ❌ {key} 无法初始化回合管线：{error}");
                     let _ = journal.mark_handled(job.inbound, now_ms()).await;
@@ -1252,8 +1288,12 @@ async fn worker(
                     switch_retry = Some((crate::parity_clock::now_ms().saturating_add(ADMISSION_RETRY_MS), job));
                     continue;
                 }
-                // Model errors and refusals were already reported by the pipeline with their own text.
-                if crate::pipeline::take_model_error(&context, &key).is_none() && !error.contains(" 被拒：") && !crate::pipeline::is_cancellation_error(&error) {
+                // Model errors, refusals and confirmed interaction closures already told the owner.
+                if crate::pipeline::take_model_error(&context, &key).is_none()
+                    && !pipe.owner_interaction_closed()
+                    && !error.contains(" 被拒：")
+                    && !crate::pipeline::is_cancellation_error(&error)
+                {
                     crate::admin_alert::notify_notice(
                         &context,
                         &cfg,

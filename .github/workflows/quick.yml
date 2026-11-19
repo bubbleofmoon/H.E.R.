@@ -1,11 +1,11 @@
 name: quick
 run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.filter }}${{ inputs.sha && format(' sha={0}', inputs.sha) || '' }}
-# One target on one OS for a worker's test loop: `gh workflow run quick.yml --ref her/<n>-<slug> -f target=<name> [-f filter=<test name>] [-f os=linux|windows]`. The worker reads its run id once (run-name above names the run) and hands it back; a coordinator waits with `python -I scripts/ci-wait.py --run <id>`.
+# Batch test targets per step and OS. Dispatch check and lint separately. The coordinator dispatches and waits for Codex runs. A quota-fallback Claude implementer may dispatch unpinned batches and hand back the IDs once.
 # A second run with the same ref, target, os, filter and sha cancels the first. `-f sha=<commit>` runs an older commit instead of the ref head (a red receipt); the step fails unless it is an ancestor of the head.
 # Two more targets run cargo directly, each alone (not combined with others): `check` is `cargo check --workspace --all-targets`;
 # `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
 # `cargo fmt --all` result as artifact `fmt-patch` and the `cargo clippy --fix` result, on a clean tree, as artifact `clippy-fix-patch`
-# (both always uploaded, empty when there is nothing to change): `gh run download <id> -n fmt-patch`, then `git apply fmt.patch`.
+# (both always uploaded, empty when there is nothing to change): `gh run download <id> -n fmt-patch`, then apply only ticket-authorized hunks for owned files (see docs/agents/rust-validation.md).
 # The CI-first gate is checks.yml on the pull request; this job never gates a merge.
 on:
   workflow_dispatch:

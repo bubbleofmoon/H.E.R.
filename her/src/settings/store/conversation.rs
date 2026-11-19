@@ -38,7 +38,7 @@ pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<Option<V
     let Some(old) = document.get("conversationEngines") else { return Ok(None) };
     let choices = old.as_object().ok_or((503, "conversationEngines must be an object".into()))?;
     if !choices.is_empty() {
-        let (skipped, _) = write_store_with(context, false, &[], true, |conn, _document| {
+        let (skipped, _) = write_store_with(context, false, &[], true, |conn, _| {
             let (effective, configured) = held_configuration(conn, context)?
                 .ok_or((503, CONFIG_ERROR.to_string()))?;
             let mut skipped = 0;
@@ -332,7 +332,7 @@ fn store_with_rollback(
     source: &str,
 ) -> Result<(Applied, Option<SwitchRollback>), (u16, String)> {
     let text = value.to_string();
-    let ((applied, rollback), mirror_error) = write_store_with(context, false, &[], true, |conn, _document| {
+    let ((applied, rollback), mirror_error) = write_store_with(context, false, &[], true, |conn, _| {
         let old = stored_row(conn, conversation, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -352,7 +352,7 @@ pub(crate) fn restore_switch_choice(
     context: &RuntimeContext, conversation: &str, rollback: SwitchRollback,
 ) -> Result<(), (u16, String)> {
     let setting = &crate::settings::CONVERSATION_ENGINE;
-    write_store_with(context, true, &[], false, |conn, _document| {
+    write_store_with(context, true, &[], false, |conn, _| {
         let latest: Option<i64> = conn.query_row(
             "SELECT MAX(id) FROM settings_audit WHERE scope=?1 AND key=?2",
             params![conversation, setting.key], |row| row.get(0),

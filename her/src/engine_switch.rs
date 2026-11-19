@@ -501,16 +501,29 @@ pub(crate) fn summary(context: &RuntimeContext, key: &str, generation: &str, eng
 
 /// Clip before the last model-view pass and refuse a delivery copy that still holds a denied term.
 pub(crate) fn safe_text(context: &RuntimeContext, cfg: &Value, text: &str, max: usize) -> Option<String> {
-    let masked = crate::activity::mask_log_text(text, &crate::activity::known_session_tokens(context));
+    let known = handover_credentials(context).ok()?;
+    filtered_text(context, cfg, text, max, &known)
+}
+
+fn handover_credentials(context: &RuntimeContext) -> Result<Vec<String>, String> {
+    let mut known = crate::activity::known_session_tokens(context);
+    known.extend(crate::settings::harness_credential(context));
+    known.extend(crate::settings::stored_secrets(context)?);
+    Ok(known)
+}
+
+fn filtered_text(context: &RuntimeContext, cfg: &Value, text: &str, max: usize, known: &[String]) -> Option<String> {
+    let masked = crate::activity::mask_log_text(text, known);
     let limited: String = masked.chars().take(max).collect();
     let filtered = crate::model_view::strip_text_with_runtime(context, &limited, cfg);
+    let filtered = crate::activity::mask_log_text(&filtered, known);
     let filtered = filtered.trim();
     (!filtered.is_empty() && crate::model_text_policy::denied_terms(filtered).is_empty()).then(|| filtered.to_owned())
 }
 
-fn history_row(context: &RuntimeContext, cfg: &Value, row: &str, max: usize, source: Engine) -> Option<String> {
+fn history_row(context: &RuntimeContext, cfg: &Value, row: &str, max: usize, source: Engine, known: &[String]) -> Option<String> {
     const USER: &str = "〔对方〕";
-    let masked = crate::activity::mask_log_text(row, &crate::activity::known_session_tokens(context));
+    let masked = crate::activity::mask_log_text(row, known);
     let limited = if let Some(text) = masked.strip_prefix(USER).filter(|_| source == Engine::Dsh) {
         let keep = max.checked_sub(USER.chars().count())?.checked_sub(1)?;
         if keep == 0 { return None; }
@@ -526,17 +539,17 @@ fn history_row(context: &RuntimeContext, cfg: &Value, row: &str, max: usize, sou
         && crate::model_text_policy::denied_terms(cleaned).is_empty()).then(|| cleaned.to_owned())
 }
 
-fn transcript(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows: Vec<String>, source: Engine) -> String {
+fn transcript(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows: Vec<String>, source: Engine, known: &[String]) -> String {
     let mut kept = Vec::new();
     let mut remaining = HISTORY_CHARS;
     for row in rows.into_iter().rev().take(HISTORY_ROWS) {
-        let Some(line) = history_row(context, cfg, &row, ROW_CHARS.min(remaining.saturating_sub(1)), source) else { continue };
+        let Some(line) = history_row(context, cfg, &row, ROW_CHARS.min(remaining.saturating_sub(1)), source, known) else { continue };
         if line.chars().count() >= remaining { break; }
         remaining -= line.chars().count() + 1;
         kept.push(line);
     }
     kept.reverse();
-    if let Some(previous) = previous.and_then(|text| safe_text(context, cfg, text, ROW_CHARS.min(remaining))) {
+    if let Some(previous) = previous.and_then(|text| filtered_text(context, cfg, text, ROW_CHARS.min(remaining), known)) {
         if previous.chars().count() < remaining {
             kept.insert(0, previous);
         }
@@ -545,13 +558,14 @@ fn transcript(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, row
 }
 
 fn summarize(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows: Vec<String>, source: Engine) -> Result<String, String> {
-    let data = transcript(context, cfg, previous, rows, source);
+    let known = handover_credentials(context)?;
+    let data = transcript(context, cfg, previous, rows, source, &known);
     if data.is_empty() { return Ok(EMPTY_SUMMARY.into()); }
     let failure = |class| format!("conversation handover summary failed ({class})");
     // The joined delivery copy gets the last filter, including token and denied-term checks.
-    let data = safe_text(context, cfg, &data, HISTORY_CHARS).ok_or_else(|| failure("wording"))?;
+    let data = filtered_text(context, cfg, &data, HISTORY_CHARS, &known).ok_or_else(|| failure("wording"))?;
     let model = crate::digest::model_for(context, cfg).map_err(|error| failure(error.0))?;
     let answer = model.complete(crate::harness::handover::SUMMARY_PROMPT, &data).map_err(|error| failure(error.0))?;
     let accepted = crate::harness::handover::accept(&data, &answer).map_err(failure)?;
-    safe_text(context, cfg, &accepted, ROW_CHARS).ok_or_else(|| failure("wording"))
+    filtered_text(context, cfg, &accepted, ROW_CHARS, &known).ok_or_else(|| failure("wording"))
 }

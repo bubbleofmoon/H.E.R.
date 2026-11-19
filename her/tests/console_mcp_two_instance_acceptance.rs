@@ -837,10 +837,8 @@ fn two_isolated_console_and_mcp_instances_interleave_without_crossing_roots() {
     let tools_a = mcp_a.request("tools/list", json!({}));
     let tools_b = mcp_b.request("tools/list", json!({}));
     assert_eq!(tools_a["result"]["tools"], tools_b["result"]["tools"]);
-    // The 38 tools of the frozen JS `mcp-snowluma-safe.js` (no `socialV2.tools` switch set, so all
-    // registered) plus the 7 memory/settings tools. Ticket 14 (fecd0812) regenerated the spec from the
-    // frozen JS: it added `qq_send_voice`, `qq_list_voices` and `qq_set_sticker_remark` to the old 35.
-    assert_eq!(tools_a["result"]["tools"].as_array().unwrap().len(), 38 + 7);
+    // Both runtimes leave the voice and sticker remark tool switches at their off defaults.
+    assert_eq!(tools_a["result"]["tools"].as_array().unwrap().len(), 35 + 7);
 
     // 1. Config writes, interleaved with MCP memory writes on the other root.
     let saved_a = call(

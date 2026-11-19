@@ -450,6 +450,35 @@ fn closed_agent_expired_approval_is_rejected_once() {
 }
 
 #[test]
+fn a_corrupt_harness_interaction_snapshot_keeps_legacy_pending_entries_visible() {
+    let mut rig = Rig::new("closed-corrupt-harness-pending", Seed { mode: "closed-agent", ..Seed::default() });
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#QUESTION#");
+    assert!(wait_for(LONG, || rig.console("GET", "/api/pending", None).1["pending"][0]["kind"] == "question"));
+    let before = rig.console("GET", "/api/pending", None);
+    assert_eq!(before.0, 200);
+    assert_eq!(before.1["pending"].as_array().unwrap().len(), 1);
+    fs::write(rig.root.join("data/pending-owner-interaction.json"), "{invalid").unwrap();
+    assert_eq!(rig.console("GET", "/api/pending", None), before, "a corrupt harness snapshot hid the legacy pending entries");
+}
+
+#[test]
+fn reset_and_new_still_reach_the_legacy_pending_question_handler() {
+    for (tag, command) in [("reset", "/reset"), ("new", "/new")] {
+        let mut rig = Rig::new(&format!("closed-legacy-qq-{tag}"), Seed { mode: "closed-agent", ..Seed::default() });
+        rig.start();
+        says(&rig, OWNER_KEY, OWNER, "owner", "#QUESTION#");
+        assert!(wait_for(LONG, || rig.console("GET", "/api/pending", None).1["pending"][0]["kind"] == "question"));
+        says(&rig, OWNER_KEY, OWNER, "owner", command);
+        assert!(wait_for(LONG, || {
+            rig.dsh.calls("$events/result").iter().any(|call| {
+                call["outcome"]["value"]["answers"][0]["custom"] == command
+            })
+        }), "{command} did not reach the legacy question handler");
+    }
+}
+
+#[test]
 fn closed_agent_definite_receipt_rejection_keeps_question_for_retry() {
     let mut rig = Rig::new("closed-receipt-rejection", Seed { mode: "closed-agent", ..Seed::default() });
     lock(&rig.dsh.inner).rejected_results = 1;
@@ -2384,7 +2413,7 @@ fn hotfix81_cli_exit_zero_policy_refusal_is_private_and_never_relayed() {
         "security":{"outboundGuard":false},
         "socialV2":{"wake":{"maxWakeConfigReminders":3,"batchWindowMs":1000,"maxWakePerMinute":30,"maxWakePerHour":100}},
         "backends": {"sessions": {GROUP_KEY: "agy-test"}, "list": [{
-            "id": "agy-test", "kind": "cli", "provider": "google", "model": "gemini-fixture",
+            "id": "agy-test", "env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli", "provider": "google", "model": "gemini-fixture",
             "cmd": "powershell.exe", "args": ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", "fake-agy.ps1"]
         }]}
     }), ..Seed::default() });
@@ -2502,7 +2531,7 @@ fn hotfix81_dsh_empty_answer_alerts_owner_without_a_conversation_send() {
 fn hotfix81_cli_timeout_sends_one_owner_alert_and_no_refusal_record() {
     let mut rig = Rig::new("hotfix81-cli-timeout", Seed { mode:"reserved2",config:json!({
         "socialV2":{"wake":{"maxWakeConfigReminders":1,"batchWindowMs":1000,"maxWakePerMinute":30,"maxWakePerHour":100}},
-        "backends":{"sessions":{GROUP_KEY:"timeout-cli"},"list":[{"id":"timeout-cli","kind":"cli","model":"timeout-model","cmd":"powershell.exe",
+        "backends":{"sessions":{GROUP_KEY:"timeout-cli"},"list":[{"id":"timeout-cli","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","model":"timeout-model","cmd":"powershell.exe",
             "args":["-NoProfile","-NonInteractive","-File","timeout.ps1"]}]}
     }),..Seed::default() });
     fs::write(rig.root.join("resources/timeout.ps1"),"$null=[Console]::In.ReadToEnd()\nStart-Sleep -Seconds 90\n").unwrap();
@@ -2523,7 +2552,7 @@ fn hotfix81_cli_timeout_sends_one_owner_alert_and_no_refusal_record() {
 fn hotfix81_cli_results_distinguish_answers_errors_empty_candidates_and_failed_exits() {
     let mut rig=Rig::new("hotfix81-cli-results",Seed{mode:"reserved2",config:json!({
         "socialV2":{"wake":{"maxWakeConfigReminders":1,"batchWindowMs":1000,"maxWakePerMinute":30,"maxWakePerHour":100}},
-        "backends":{"sessions":{GROUP_KEY:"plain-fixture"},"list":[{"id":"plain-fixture","kind":"cli","model":"fixture-model","cmd":"powershell.exe",
+        "backends":{"sessions":{GROUP_KEY:"plain-fixture"},"list":[{"id":"plain-fixture","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","model":"fixture-model","cmd":"powershell.exe",
             "args":["-NoProfile","-NonInteractive","-File","result.ps1"]}]}
     }),..Seed::default()});
     fs::write(rig.root.join("resources/result.ps1"),r#"
@@ -2575,7 +2604,7 @@ fn hotfix81_exit_zero_diagnostics_are_not_answers() {
     ] {
         let mut rig = Rig::new(&format!("hotfix81-zero-{name}"), Seed { mode:"reserved2", config:json!({
             "socialV2":{"wake":{"maxWakeConfigReminders":1,"batchWindowMs":1000,"maxWakePerMinute":30,"maxWakePerHour":100}},
-            "backends":{"sessions":{GROUP_KEY:"plain-fixture"},"list":[{"id":"plain-fixture","kind":"cli","model":"fixture-model","cmd":"powershell.exe",
+            "backends":{"sessions":{GROUP_KEY:"plain-fixture"},"list":[{"id":"plain-fixture","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","model":"fixture-model","cmd":"powershell.exe",
                 "args":["-NoProfile","-NonInteractive","-File","result.ps1"]}]}
         }), ..Seed::default() });
         fs::write(rig.root.join("resources/result.ps1"), r#"
@@ -2606,7 +2635,7 @@ exit 0
 fn hotfix81_dsh_quota_then_cli_refusal_reports_both_failures() {
     let mut rig = Rig::new("hotfix81-fallback-refusal", Seed { mode:"reserved2", config:json!({
         "socialV2":{"wake":{"maxWakeConfigReminders":1,"batchWindowMs":1000,"maxWakePerMinute":30,"maxWakePerHour":100}},
-        "backends":{"failoverFallback":true,"list":[{"id":"agy-fallback","kind":"cli","provider":"cli-provider","model":"cli-model","cmd":"powershell.exe",
+        "backends":{"failoverFallback":true,"list":[{"id":"agy-fallback","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","provider":"cli-provider","model":"cli-model","cmd":"powershell.exe",
             "args":["-NoProfile","-NonInteractive","-File","refusal.ps1"]}]}
     }), ..Seed::default() });
     fs::write(rig.root.join("resources/refusal.ps1"), r#"
@@ -2650,7 +2679,7 @@ exit 0
 fn hotfix83_blacklist_changes_between_cli_turns_and_bad_file_only_warns_once() {
     let mut rig = Rig::new("hotfix83-blacklist", Seed { mode: "reserved2", config: json!({
         "socialV2":{"context":{"stripFromModelText":["CFG83"]},"wake":{"maxWakeConfigReminders":1,"batchWindowMs":1000,"maxWakePerMinute":30,"maxWakePerHour":100}},
-        "backends":{"sessions":{GROUP_KEY:"agy-test"},"list":[{"id":"agy-test","kind":"cli","cmd":"powershell.exe",
+        "backends":{"sessions":{GROUP_KEY:"agy-test"},"list":[{"id":"agy-test","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","cmd":"powershell.exe",
             "args":["-NoProfile","-NonInteractive","-File","fake-agy.ps1"]}]}
     }), ..Seed::default() });
     fs::write(rig.root.join("resources/fake-agy.ps1"), r#"
@@ -3432,7 +3461,7 @@ fn hf123_cli_relay_uses_shared_face_outbox_and_repeat_guard() {
             "send":{"firstGapEnabled":false,"repeatLimit":1,"maxSendPerMinute":100,"maxSendPerHour":100}
         },
         "backends":{"sessions":{GROUP_KEY:"relay123"},"list":[{
-            "id":"relay123","kind":"cli","cmd":"node","args":["relay123.cjs"]
+            "id":"relay123","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","cmd":"node","args":["relay123.cjs"]
         }]}
     }), ..Seed::default() });
     fs::write(rig.root.join("resources/relay123.cjs"), r#"
@@ -3474,7 +3503,7 @@ fn hf123_cli_relay_revises_a_held_draft_without_spending_send_cap() {
             "send":{"firstGapEnabled":false,"maxPerTurn":1,"maxSendPerMinute":100,"maxSendPerHour":100}
         },
         "backends":{"sessions":{GROUP_KEY:"relay123"},"list":[{
-            "id":"relay123","kind":"cli","cmd":"node","args":["relay123.cjs"]
+            "id":"relay123","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","cmd":"node","args":["relay123.cjs"]
         }]}
     }), ..Seed::default() });
     fs::write(rig.root.join("resources/relay123.cjs"), r#"
@@ -3530,7 +3559,7 @@ fn hf129_fix3_cli_urgent_followup_finishes_without_replay() {
     let path = rig.root.join("config/config.json");
     let mut cfg: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     cfg["backends"] = json!({"sessions":{GROUP_KEY:"cli129"},"list":[{
-        "id":"cli129","kind":"cli","cmd":"node","args":["cli129.cjs"]
+        "id":"cli129","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","cmd":"node","args":["cli129.cjs"]
     }]});
     fs::write(path, cfg.to_string()).unwrap();
     fs::write(rig.root.join("resources/cli129.cjs"), r#"
