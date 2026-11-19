@@ -84,7 +84,7 @@ pub(crate) use store::{
 pub(crate) use store::{
     apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
     complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
-    has_legacy_engine_choices, has_stored_values, has_wake_plan_history, history, import_engine_choices,
+    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, overlay_checked, place_changes, preview,
     archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
     resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,

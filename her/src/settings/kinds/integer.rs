@@ -30,7 +30,7 @@ pub(crate) enum FileRule {
     TruncateAndClamp,
     /// A positive JSON integer is clamped; zero and other values read as the default.
     PositiveClamp,
-    /// A signed JSON integer is clamped.
+    /// A JSON integer of either sign is clamped.
     SignedClamp,
     /// The media file reader accepts positive values under JS number coercion, rounds and clamps.
     Media,
@@ -68,7 +68,8 @@ impl SettingKind for Integer {
             }
             FileRule::Default | FileRule::Automatic => self.normalize(found),
             FileRule::PositiveClamp => found.as_u64().filter(|n| *n > 0).map(|n| json!(n.clamp(min as u64, max as u64))),
-            FileRule::SignedClamp => found.as_i64().map(|n| json!(n.clamp(min, max))),
+            FileRule::SignedClamp => found.as_i64().map(|n| json!(n.clamp(min, max)))
+                .or_else(|| found.as_u64().map(|_| json!(max))),
             FileRule::Media | FileRule::VoiceBytes => {
                 let n = if self.file == FileRule::Media {
                     crate::console::social_v1_number(found)

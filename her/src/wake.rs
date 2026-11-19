@@ -1251,32 +1251,41 @@ pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
     if is_infinite(&plan) {
         return plan;
     }
-    let w = &cfg["socialV2"]["wake"];
-    let num = |k: &str, d: i64| -> i64 {
-        w.get(k).and_then(|v| v.as_i64()).filter(|n| *n != 0).unwrap_or(d)
-    };
-    let rec_min = num("recommendedSleepMinMs", 300_000);
-    let rec_max = num("recommendedSleepMaxMs", 7_200_000);
-    let mut finite = rec_min as f64 + rand01.clamp(0.0, 0.999_999) * ((rec_max - rec_min).max(0)) as f64;
-    let hard_min = num("sleepMinMs", 0).max(0);
-    let hard_max = num("sleepMaxMs", 0);
-    if hard_min > 0 && finite < hard_min as f64 {
-        finite = hard_min as f64;
-    }
-    if hard_max > 0 && finite > hard_max as f64 {
-        finite = hard_max as f64;
-    }
-    plan["sleepUntil"] = json!(crate::sticker::iso_at(now + finite.round() as i64));
+    draw_default_sleep(&mut plan, cfg, now, rand01);
     plan
 }
 
-/// The defaults shared by new and refreshed inherited plans. Refreshes keep the existing deadline.
+// Keep the legacy draw (sample the recommendation, then apply the hard bounds).
+fn sleep_duration(cfg: &Value, fraction: f64) -> i64 {
+    let w = &cfg["socialV2"]["wake"];
+    let num = |key: &str, fallback| w[key].as_i64().filter(|n| *n != 0).unwrap_or(fallback);
+    let low = num("recommendedSleepMinMs", 300_000);
+    let high = num("recommendedSleepMaxMs", 7_200_000).max(low);
+    let drawn = low as f64 + fraction * (high as f64 - low as f64);
+    let minimum = num("sleepMinMs", 0);
+    let maximum = num("sleepMaxMs", 0);
+    let drawn = if minimum > 0 { drawn.max(minimum as f64) } else { drawn };
+    let drawn = if maximum > 0 { drawn.min(maximum as f64) } else { drawn };
+    drawn.round() as i64
+}
+
+pub(crate) fn default_sleep_range(cfg: &Value) -> Value {
+    json!([sleep_duration(cfg, 0.0), sleep_duration(cfg, 1.0)])
+}
+
+pub(crate) fn draw_default_sleep(plan: &mut Value, cfg: &Value, now: i64, rand01: f64) {
+    let duration = sleep_duration(cfg, rand01.clamp(0.0, 0.999_999));
+    plan["sleepUntil"] = json!(crate::sticker::iso_at(now.saturating_add(duration)));
+    plan["sleepRangeMs"] = default_sleep_range(cfg);
+}
+
+/// Settings shared by new and refreshed inherited plans, before a finite deadline is drawn.
 pub(crate) fn default_wake_plan(cfg: &Value) -> Value {
     let w = &cfg["socialV2"]["wake"];
     let mode_active = w.get("defaultMode").and_then(|v| v.as_str()) == Some("active");
     let flag = |k: &str| w.get(k).and_then(|v| v.as_bool()) != Some(false);
     let probability = timing::RECOMMENDED_PROBABILITY.probability(cfg);
-    json!({
+    let mut plan = json!({
         "mode": if mode_active { "active" } else { "diving" },
         "infinite": flag("recommendedDefaultInfinite"),
         "sleepUntil": null,
@@ -1296,7 +1305,12 @@ pub(crate) fn default_wake_plan(cfg: &Value) -> Value {
         "noActionCount": 0,
         "confirmedAt": 0,
         "confirmedBy": "default",
-    })
+    });
+    // An explicit recommendation can later be cleared, including across a restart.
+    if plan["triggers"]["keywords"].as_array().is_some_and(|words| !words.is_empty()) {
+        plan["inheritsKeywords"] = json!(true);
+    }
+    plan
 }
 
 /// JS 的 `ensureWakeableV2`：配置里一个触发条件都没有时重置为默认，避免永眠。

@@ -1032,7 +1032,12 @@ impl RuntimeContext {
             ConfigReadError::Unavailable(message) => message,
         })?;
         crate::settings::overlay_checked(self, &mut document)?;
-        self.normalized_config(&apply_settings_overlay(document)).map_err(str::to_owned)
+        let document = apply_settings_overlay(document);
+        if self.is_isolated() {
+            self.normalized_config(&document).map_err(str::to_owned)
+        } else {
+            Ok(document)
+        }
     }
 
     /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading

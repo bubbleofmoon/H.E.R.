@@ -65,6 +65,7 @@ fn wake_batch_chat_write_refreshes_inherited_plans() {
     let (root, context) = chat_fixture("wake batch chat");
     let mut state = context.read_social_state().unwrap();
     state["conversations"]["group:101"]["wakeConfig"] = json!({"confirmedBy": "default", "wakeCount": 7});
+    state["conversations"]["group:102"]["wakeConfig"] = json!({"confirmedBy": "default", "batchWindowMs": 3000});
     state["conversations"][OWNER_CHAT]["wakeConfig"] = json!({"confirmedBy": "set_wake_config", "batchWindowMs": 3000});
     context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
 
@@ -74,7 +75,8 @@ fn wake_batch_chat_write_refreshes_inherited_plans() {
     let loaded = context.load_config().unwrap();
     assert_eq!(crate::wake_cfg_of(&loaded).batch_window_ms, 4500);
     let state = context.read_social_state().unwrap();
-    assert_eq!(state["conversations"]["group:101"]["wakeConfig"]["batchWindowMs"], 4500, "the inherited wake plan refreshes");
+    assert!(state["conversations"]["group:101"]["wakeConfig"].get("batchWindowMs").is_none(), "the omitted window follows the global setting");
+    assert_eq!(state["conversations"]["group:102"]["wakeConfig"]["batchWindowMs"], 4500, "the chat write refreshes an explicit inherited window");
     assert_eq!(state["conversations"]["group:101"]["wakeConfig"]["wakeCount"], 7);
     assert_eq!(state["conversations"][OWNER_CHAT]["wakeConfig"]["batchWindowMs"], 3000);
 
@@ -120,7 +122,7 @@ fn restart_reconciles_all_inherited_wake_defaults() {
         let original = json!({
             "mode": "diving", "infinite": true, "sleepUntil": null, "batchWindowMs": 3000,
             "triggers": {"atMention": true, "nameMention": true, "question": true, "poke": true,
-                "anyMessage": false, "keywords": ["old"], "probability": 0.75, "dropNames": ["muted"]},
+                "anyMessage": false, "keywords": ["old"], "speakerIds": ["42"], "probability": 0.75, "dropNames": ["muted"]},
             "confirmedAt": 5, "confirmedBy": "default", "wakeCount": 7
         });
         if registry_write {
@@ -146,11 +148,11 @@ fn restart_reconciles_all_inherited_wake_defaults() {
         let restarted = context.read_social_state().unwrap();
         let plan = &restarted["conversations"]["group:101"]["wakeConfig"];
         assert_eq!(plan["triggers"], json!({"atMention": false, "nameMention": false, "question": false,
-            "poke": false, "anyMessage": true, "keywords": ["new"], "probability": 0.25, "dropNames": ["muted"]}));
+            "poke": false, "anyMessage": true, "keywords": ["new"], "speakerIds": [], "probability": 0.25, "dropNames": ["muted"]}));
         assert_eq!(plan["batchWindowMs"], 4500);
         assert_eq!(plan["mode"], "active");
         assert_eq!(plan["infinite"], false);
-        assert_eq!(plan["sleepUntil"], Value::Null);
+        assert!(plan["sleepUntil"].as_str().and_then(crate::wake::parse_iso_ms).is_some(), "becoming finite draws a deadline");
         assert_eq!(plan["confirmedAt"], 5);
         assert_eq!(plan["wakeCount"], 7);
         assert_eq!(restarted["conversations"][OWNER_CHAT]["wakeConfig"], confirmed);
@@ -308,4 +310,170 @@ fn send_settings_apply_the_stored_sticker_pause_and_refuse_inverted_bounds() {
     sticker_send_pause(&context.load_config().unwrap());
     STICKER_PAUSE_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
     assert_eq!(seen.get(), Some(0), "the next sticker uses the stored pause");
+}
+
+fn store_group_plan(context: &RuntimeContext, plan: Value) {
+    let mut state = context.read_social_state().unwrap();
+    state["conversations"]["group:101"]["wakeConfig"] = plan;
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+}
+
+fn group_plan(context: &RuntimeContext) -> Value {
+    context.read_social_state().unwrap()["conversations"]["group:101"]["wakeConfig"].clone()
+}
+
+#[test]
+fn infinite_switch_disarms_near_sleep_timer() {
+    use crate::session::{Driver, wake_config_from_json};
+
+    let (root, context) = chat_fixture("infinite sleep switch");
+    write_config(&root, |cfg| cfg["socialV2"]["wake"]["recommendedDefaultInfinite"] = json!(false));
+    let now = now_ms();
+    let deadline = now + 10_000;
+    let mut plan = crate::wake::default_wake_config(&context.load_config().unwrap(), now, 0.5);
+    plan["sleepUntil"] = json!(crate::sticker::iso_at(deadline));
+    let finite = wake_config_from_json(Some(&plan));
+    let mut driver = Driver::new(crate::wake::WakeScheduler::new(Default::default(), finite.clone()), 42);
+    driver.adopt_wake_config(finite, now);
+    assert_eq!(driver.sched.sleep_at, Some(deadline));
+    store_group_plan(&context, plan);
+
+    let (status, reply) = post(&context, "/api/socialV2/config", json!({"wake": {"recommendedDefaultInfinite": true}}));
+    assert_eq!(status, 200, "{reply}");
+    let infinite = group_plan(&context);
+    assert_eq!(infinite["infinite"], true);
+    assert!(infinite.get("sleepUntil").is_none());
+    driver.adopt_wake_config(wake_config_from_json(Some(&infinite)), now);
+    assert_eq!(driver.sched.sleep_at, None, "the old finite timer must be disarmed");
+    assert!(driver.pump(deadline).is_empty(), "the old finite timer must not emit a timeout");
+}
+
+#[test]
+fn social_save_keeps_omitted_batch_without_adoption() {
+    let (root, context) = chat_fixture("unchanged social batch");
+    write_config(&root, |cfg| cfg["socialV2"]["wake"] = json!({"batchWindowMs": 4500}));
+    let mut plan = crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5);
+    plan.as_object_mut().unwrap().remove("batchWindowMs").unwrap();
+    let seen = crate::session::WakeSync::of(&plan);
+    store_group_plan(&context, plan);
+    let path = root.0.join("data/social-v2.json");
+    let before = std::fs::read(&path).unwrap();
+
+    let (status, reply) = post(&context, "/api/socialV2/config", json!({"wake": {"batchWindowMs": 4500}}));
+    assert_eq!(status, 200, "{reply}");
+    let saved = group_plan(&context);
+    assert!(saved.get("batchWindowMs").is_none(), "the inherited batch window must stay omitted");
+    assert!(crate::session::WakeSync::changed(Some(&seen), &saved).is_none(), "the running driver keeps pending wakes");
+    assert_eq!(std::fs::read(path).unwrap(), before, "an unchanged plan does not rewrite social state");
+}
+
+#[test]
+fn finite_deadline_follows_range_changes_once() {
+    let (root, context) = chat_fixture("finite range repair");
+    write_config(&root, |cfg| cfg["socialV2"]["wake"] = json!({
+        "recommendedDefaultInfinite": false, "recommendedSleepMinMs": 4000, "recommendedSleepMaxMs": 4000,
+    }));
+    let mut plan = crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5);
+    // Old releases saved the deadline alone. A live save still has the old configured range.
+    plan.as_object_mut().unwrap().remove("sleepRangeMs");
+    store_group_plan(&context, plan);
+    let range_post = json!({"wake": {"recommendedSleepMinMs": 8000, "recommendedSleepMaxMs": 8000}});
+    let before = now_ms();
+    let (status, reply) = post(&context, "/api/socialV2/config", range_post);
+    assert_eq!(status, 200, "{reply}");
+    let saved = group_plan(&context);
+    let deadline = crate::wake::parse_iso_ms(saved["sleepUntil"].as_str().unwrap()).unwrap();
+    assert!((before + 8000..=now_ms() + 8000).contains(&deadline));
+    finish_settings_write_back(&context);
+    assert_eq!(group_plan(&context), saved, "a second reconcile keeps the sampled deadline");
+
+    write_config(&root, |cfg| cfg["socialV2"]["wake"]["sleepMaxMs"] = json!(2000));
+    let before = now_ms();
+    finish_settings_write_back(&context);
+    let repaired = group_plan(&context);
+    let deadline = crate::wake::parse_iso_ms(repaired["sleepUntil"].as_str().unwrap()).unwrap();
+    assert!((before + 2000..=now_ms() + 2000).contains(&deadline), "restart repairs a changed effective range");
+}
+
+#[test]
+fn live_wake_save_with_unreadable_store_writes_nothing() {
+    let (root, context) = chat_fixture("wake settings read refused");
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "wake.batchWindowMs", "value": 4500}));
+    assert_eq!(status, 200, "{reply}");
+    store_group_plan(&context, crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5));
+    write_config(&root, |cfg| cfg["socialV2"]["wake"]["batchWindowMs"] = json!(8000));
+    StoreProbe::at(&root.0).edit("PRAGMA user_version=3;");
+    let path = root.0.join("data/social-v2.json");
+    let before = std::fs::read(&path).unwrap();
+    let config_path = root.0.join("config/config.json");
+    let file_before = std::fs::read(&config_path).unwrap();
+    let error = handle_social_config_post(&context, r#"{"wake":{"recommendedPoke":false}}"#).unwrap_err();
+    assert_eq!(error.0, 503);
+    assert_eq!(refresh_default_wake_configs(&context).unwrap_err().0, 503, "a post-commit refresh requires the store too");
+    assert_eq!(std::fs::read(path).unwrap(), before, "file-only defaults must never reach the plan");
+    assert_eq!(std::fs::read(config_path).unwrap(), file_before, "the refused save keeps the configuration");
+}
+
+#[test]
+fn audit_undo_restores_inherited_poke_and_restart_repairs_interruption() {
+    let (root, context) = chat_fixture("undo inherited poke");
+    write_config(&root, |cfg| cfg["socialV2"] = json!({}));
+    let initial = crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5);
+    assert_eq!(initial["triggers"]["poke"], true);
+    store_group_plan(&context, initial);
+    let (status, reply) = post(&context, "/api/socialV2/config", json!({"wake": {"recommendedPoke": false}}));
+    assert_eq!(status, 200, "{reply}");
+    let disabled = group_plan(&context);
+    assert_eq!(disabled["triggers"]["poke"], false);
+    let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
+    assert_eq!(status, 200, "{recent}");
+    let id = &recent["entries"].as_array().unwrap().iter().find(|row| row["path"] == "/api/socialV2/config").unwrap()["id"];
+    let (status, reply) = post(&context, "/api/audit/undo", json!({"id": id}));
+    assert_eq!(status, 200, "{reply}");
+    assert!(stored_config(&root).pointer("/socialV2/wake").is_none());
+    assert_eq!(group_plan(&context)["triggers"]["poke"], true, "undo restores the inherited trigger immediately");
+
+    store_group_plan(&context, disabled);
+    finish_settings_write_back(&context);
+    assert_eq!(group_plan(&context)["triggers"]["poke"], true, "restart finishes an interrupted undo without wake history");
+}
+
+#[test]
+fn restart_preserves_no_action_reset_keywords() {
+    for recommended in [json!([]), json!(["global"])] {
+        let (root, context) = chat_fixture("no action wake keywords");
+        write_config(&root, |cfg| cfg["socialV2"]["wake"] = json!({"recommendedKeywords": recommended}));
+        let cfg = context.load_config().unwrap();
+        let mut plan = crate::wake::default_wake_config(&cfg, now_ms(), 0.5);
+        plan["confirmedBy"] = json!("set_wake_config");
+        plan["noActionCount"] = json!(2);
+        plan["triggers"]["keywords"] = json!(["local"]);
+        store_group_plan(&context, plan);
+        complete_reserved2_turn(&context, &cfg, "group:101", GROUP_CHAT_TOKEN, Some(1), &json!(0), 0).unwrap();
+        let reset = group_plan(&context);
+        assert_eq!(reset["confirmedBy"], "default");
+        assert_eq!(reset["triggers"]["keywords"], json!(["local"]));
+
+        finish_settings_write_back(&context);
+        assert_eq!(group_plan(&context), reset, "restart keeps the no-action reset's custom keywords");
+        let (status, reply) = post(&context, "/api/socialV2/config", json!({"wake": {"recommendedKeywords": recommended}}));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(group_plan(&context), reset);
+        let (status, reply) = post(&context, "/api/socialV2/config", json!({"wake": {"recommendedKeywords": ["replacement"]}}));
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(group_plan(&context)["triggers"]["keywords"], json!(["replacement"]));
+        write_config(&root, |cfg| cfg["socialV2"]["wake"]["recommendedKeywords"] = json!([]));
+        finish_settings_write_back(&context);
+        assert_eq!(group_plan(&context)["triggers"]["keywords"], json!([]), "clearing the recommendation clears inherited words");
+    }
+}
+
+#[test]
+fn legacy_unsigned_wake_quotas_clamp_to_maximum() {
+    let (root, context) = settings_fixture("unsigned wake quota");
+    for quota in [i64::MAX as u64, 1_u64 << 63, u64::MAX] {
+        write_config(&root, |cfg| cfg["socialV2"]["wake"] = json!({"maxWakePerMinute": quota, "maxWakePerHour": quota}));
+        let cfg = crate::wake_cfg_of(&context.load_config().unwrap());
+        assert_eq!((cfg.max_wake_per_minute, cfg.max_wake_per_hour), (10_000, 10_000));
+    }
 }

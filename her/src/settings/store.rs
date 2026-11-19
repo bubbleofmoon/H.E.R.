@@ -1063,20 +1063,6 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
     Ok(changed)
 }
 
-/// Whether the global audit records a wake batch window or default wake probability write, including an undo.
-/// Legacy contexts and stores without a schema have no history. Reads only.
-pub(crate) fn has_wake_plan_history(context: &RuntimeContext) -> Result<bool, String> {
-    if !context.is_isolated() {
-        return Ok(false);
-    }
-    let Inspection::Ready(conn) = inspect(context)? else { return Ok(false) };
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM settings_audit WHERE scope='global' AND key IN (?1, ?2))",
-        params![super::wake_timing::BATCH.key, super::wake_timing::RECOMMENDED_PROBABILITY.key],
-        |row| row.get(0),
-    ).map_err(|error| error.to_string())
-}
-
 /// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
 /// cannot be read. Reports a read error on stderr. Reads only: nothing is created.
 pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
