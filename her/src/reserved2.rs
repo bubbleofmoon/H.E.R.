@@ -2558,7 +2558,8 @@ impl Hub {
             })
             .map(|(key, _)| key.clone())
             .collect();
-        match store.claim_due(now, |key| idle.contains(key)) {
+        let zone = crate::local_time::configured_zone(cfg);
+        match store.claim_due(now, &zone, |key| idle.contains(key)) {
             Ok(items) => {
                 for item in items {
                     println!("[reserved2] {} 日程提醒到期（{}）", item.conversation, item.id);

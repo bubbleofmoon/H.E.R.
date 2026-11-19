@@ -95,6 +95,19 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
+/// Resolves settings owned by the batches that use the normalized configuration snapshot.
+pub(crate) fn resolve_config(document: &mut Value) {
+    let material_items = super::registry::material_item_limit(document);
+    for setting in super::registry::RESOLVED_GROUPS.iter().flat_map(|group| group.iter()) {
+        let value = if setting.key == super::registry::MATERIAL_ITEMS.key {
+            Value::from(material_items)
+        } else {
+            setting.read(document)
+        };
+        set_at(document, setting.pointer, value);
+    }
+}
+
 /// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
 /// below the first non-object, when a member on the way is not an object.
 fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
@@ -904,7 +917,7 @@ fn write_store<T>(
     written: &[&'static str],
     write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
-    write_store_with(context, existing_only, written, false, write)
+    write_store_with(context, existing_only, written, false, |conn, _| write(conn))
 }
 
 /// `write_store`, and #218: a write that keeps a conversation's value (`conversations`) first migrates a version-1
@@ -917,7 +930,7 @@ fn write_store_with<T>(
     existing_only: bool,
     written: &[&'static str],
     conversations: bool,
-    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+    write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let (result, stored) = {
@@ -936,7 +949,7 @@ fn write_store_with<T>(
         }
         seed(&tx, &document, now_ms(), written)?;
         let access_before = access_rows(&tx)?;
-        let result = write(&tx)?;
+        let result = write(&tx, &document)?;
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
@@ -1064,9 +1077,26 @@ pub(crate) fn apply(
     store(context, setting, value, actor, source)
 }
 
-/// Writes one valid stored value (`storable`) with its audit row through `write_store`, which seeds the store first and
-/// writes the store back into `config.json` after the commit (`Applied::mirror_error`). The stored value again writes
-/// no value and no audit row (a seed still commits).
+/// Tests the effective schedule after applying all writes in this request. Callers hold the configuration gate.
+fn check_schedule_change(
+    mut document: Value,
+    stored: Vec<(&'static Setting, Value)>,
+    changes: impl IntoIterator<Item = (&'static Setting, Option<Value>)>,
+) -> Result<(), (u16, String)> {
+    place(&mut document, stored);
+    for (setting, value) in changes {
+        if let Some(value) = value {
+            if !set_at(&mut document, setting.pointer, value) {
+                return Err((409, format!("config.json cannot hold {}", setting.key)));
+            }
+        } else {
+            remove_at(&mut document, setting.pointer);
+        }
+    }
+    super::registry::check_schedule(&document)
+}
+
+/// Writes one valid stored value and its audit row, then mirrors the committed value to config.json.
 fn store(
     context: &RuntimeContext,
     setting: &'static Setting,
@@ -1074,6 +1104,14 @@ fn store(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
+    if super::registry::checks_schedule(setting.key) {
+        let unavailable = |error| (503, error);
+        check_schedule_change(
+            raw_config(context).map_err(unavailable)?,
+            stored_values(context).map_err(unavailable)?,
+            [(setting, Some(value.clone()))],
+        )?;
+    }
     let text = value.to_string();
     let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn| {
         let old = stored_row(conn, setting.key)?;
@@ -1138,7 +1176,7 @@ pub(crate) fn undo(
         return Err((503, LEGACY_ERROR.to_string()));
     }
     // An undone setting has audit rows, which the seed skips, so an undo names no key to seed.
-    let (undone, mirror_error) = write_store(context, true, &[], |conn| {
+    let (undone, mirror_error) = write_store_with(context, true, &[], false, |conn, document| {
         let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
         let row: Option<(String, String, String, Option<String>, Option<String>)> = conn
             .query_row(
@@ -1175,6 +1213,14 @@ pub(crate) fn undo(
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
+        if super::registry::checks_schedule(setting.key) {
+            let unavailable = |error| (503, error);
+            check_schedule_change(
+                document.clone(),
+                read_stored_values(conn).map_err(unavailable)?,
+                [(setting, restored.clone())],
+            )?;
+        }
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
         if restored.is_none() {
@@ -1330,6 +1376,14 @@ pub(crate) fn apply_changes(
     }
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
+    }
+    if changes.iter().any(|(setting, _)| super::registry::checks_schedule(setting.key)) {
+        let unavailable = |error| (503, error);
+        check_schedule_change(
+            raw_config(context).map_err(unavailable)?,
+            stored_values(context).map_err(unavailable)?,
+            changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))),
+        )?;
     }
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
     let ((), mirror_error) = write_store(context, false, &written, |conn| {

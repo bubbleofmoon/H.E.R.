@@ -131,7 +131,7 @@ fn rotation_notice(context: &RuntimeContext, cfg: &Value, key: &str, phase: &str
     // Claim storage even after an in-memory fallback, so repair makes that day's
     // suppression durable without sending again.
     static SENT: OnceLock<Mutex<HashMap<ReadKey, i64>>> = OnceLock::new();
-    let day = crate::session_map::rotation_alert_day();
+    let day = crate::session_map::rotation_alert_day(cfg);
     let sent_state = SENT.get_or_init(Default::default);
     let mut sent = sent_state.lock().unwrap_or_else(|p| p.into_inner());
     let claim = crate::session_map::mark_rotation_alert_day(context, key, day);
