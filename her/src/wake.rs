@@ -1053,6 +1053,16 @@ fn has_any_trigger(wc: &Value) -> bool {
         || t.get("speakerIds").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
 }
 
+/// Remove persisted wake-plan bookkeeping from a copy crossing the tool or prompt boundary.
+pub(crate) fn without_wake_bookkeeping(mut plan: Value) -> Value {
+    if let Some(fields) = plan.as_object_mut() {
+        for name in ["sleepRangeMs", "inheritsKeywords", "customKeywordsFor"] {
+            fields.shift_remove(name);
+        }
+    }
+    plan
+}
+
 /// `POST /api/socialV2/wake-config` 的配置归一化（纯函数，不含计时器副作用）。
 ///
 /// `rand01` 是 [0,1) 的随机数，只在「有限睡眠但没给时间」时用来取推荐时长；
@@ -1066,7 +1076,7 @@ pub fn normalize_wake_config(
     rand01: f64,
 ) -> Result<Value, (u16, String)> {
     let cur = current.as_object().cloned().unwrap_or_default();
-    let input_obj = input.as_object().cloned().unwrap_or_default();
+    let input_obj = without_wake_bookkeeping(input.clone());
     let cur_tr = cur.get("triggers").map(obj_of).unwrap_or_default();
     let in_tr = input_obj.get("triggers").map(obj_of).unwrap_or_default();
 

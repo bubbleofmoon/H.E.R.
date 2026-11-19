@@ -58,6 +58,78 @@ fn section(text: &str, name: &str) -> String {
 }
 
 #[test]
+fn wake_bookkeeping_stays_out_of_model_output_and_tool_input() {
+    let (_root, context, cfg) = layered_wake_fixture("wake bookkeeping", true);
+    let mut state = context.read_social_state().unwrap();
+    let conversation = &mut state["conversations"][KEY];
+    conversation["preSleepWaitSatisfiedAt"] = conversation["lastIncomingAt"].clone();
+    let stored = &mut conversation["wakeConfig"];
+    let bookkeeping = [
+        ("sleepRangeMs", json!([1000, 2000])),
+        ("inheritsKeywords", json!(true)),
+        ("customKeywordsFor", json!(["recommended"])),
+    ];
+    for (name, value) in &bookkeeping {
+        stored[*name] = value.clone();
+    }
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+
+    let (context, server) = serve_packets(&context, 6);
+    let _ = wake(&context, &cfg, "rpc-bookkeeping-full");
+    crate::session_context::observe(&context, KEY, "sid-18", "epoch-18", &json!({
+        "type": "user/message",
+        "seq": 1,
+        "data": {"source": {"rpcId": "rpc-bookkeeping-full"}},
+    })).unwrap();
+    let delta = wake(&context, &cfg, "rpc-bookkeeping-delta");
+    let omit = |text: &str| {
+        for (name, _) in &bookkeeping {
+            assert!(!text.contains(*name), "{name} leaked into {text}");
+        }
+    };
+
+    let args = json!({"key": KEY, "token": "epoch-18"});
+    let prompt = crate::mcp::call_prepared("qq_get_prompt", &args, &context);
+    let social = crate::mcp::call_prepared_recorded("qq_social_state", &args, &context);
+    let marked = crate::mcp::call_prepared("qq_mark_read", &args, &context);
+    let mut set_args = args;
+    set_args["config"] = json!({
+        "mode": "active",
+        "sleepRangeMs": [3, 4],
+        "inheritsKeywords": false,
+        "customKeywordsFor": ["injected"],
+    });
+    let set = crate::mcp::call_prepared("qq_set_wake_config", &set_args, &context);
+    server.join().unwrap();
+
+    assert!(delta.text.contains("【唤醒增量】"));
+    let wake_config = delta.text.lines()
+        .find_map(|line| line.strip_prefix("【当前唤醒配置】"))
+        .unwrap();
+    let wake_config: Value = serde_json::from_str(wake_config).unwrap();
+    assert_eq!(wake_config["mode"], "diving");
+    omit(&delta.text);
+    for (outcome, field, mode) in [
+        (prompt, "currentWakeConfig", "diving"),
+        (social, "wakeConfig", "diving"),
+        (marked, "wakeConfig", "diving"),
+        (set, "wakeConfig", "active"),
+    ] {
+        assert_ne!(outcome["isError"], true, "{outcome}");
+        let text = outcome["content"][0]["text"].as_str().unwrap();
+        let result: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(result[field]["mode"], mode, "{result}");
+        omit(text);
+    }
+    let state = context.read_social_state().unwrap();
+    let stored = &state["conversations"][KEY]["wakeConfig"];
+    assert_eq!(stored["mode"], "active");
+    for (name, value) in bookkeeping {
+        assert_eq!(stored[name], value, "{name}");
+    }
+}
+
+#[test]
 fn every_briefing_section_belongs_to_its_memory_layer_and_the_wake_reports_counts() {
     let (_root, context, cfg) = layered_wake_fixture("layers assigned", true);
     let (context, server) = serve_packets(&context, 1);

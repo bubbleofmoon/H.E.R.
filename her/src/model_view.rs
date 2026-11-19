@@ -254,6 +254,9 @@ pub fn strip_model_chat_data(data: &Value, cfg: &Value) -> Value {
                     Value::String(text) => Value::String(strip_from_model_text(text, cfg)),
                     _ => strip_model_chat_data(v, cfg),
                 }).collect()),
+                ("wakeConfig" | "currentWakeConfig", _) => {
+                    crate::wake::without_wake_bookkeeping(strip_model_chat_data(value, cfg))
+                }
                 _ => strip_model_chat_data(value, cfg),
             };
             (key.clone(), filtered)
@@ -353,6 +356,8 @@ pub fn compact_model_data(data: &Value) -> Value {
                 }
                 let compacted = if (key == "messages" || key == "newMessages") && value.is_array() {
                     Value::Array(value.as_array().unwrap().iter().map(compact_model_message).collect())
+                } else if matches!(key.as_str(), "wakeConfig" | "currentWakeConfig") {
+                    crate::wake::without_wake_bookkeeping(compact_model_data(value))
                 } else {
                     compact_model_data(value)
                 };
