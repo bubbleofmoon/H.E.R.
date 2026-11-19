@@ -42,6 +42,9 @@ pub struct Verdict {
     /// Reported beside the parts and never a part: a provider outage does not make a release unhealthy.
     #[serde(rename = "modelRoutes", skip_serializing_if = "Option::is_none")]
     model_routes: Option<serde_json::Value>,
+    /// Upgrade guidance for configured CLI candidates. It does not make the other health parts fail.
+    #[serde(rename = "cliModelNotice", skip_serializing_if = "Option::is_none")]
+    cli_model_notice: Option<&'static str>,
 }
 
 fn owner(data: &Path, role: &str, lock: &str) -> Part {
@@ -95,6 +98,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 dependency_notices: Vec::new(),
                 scope_notices: Vec::new(),
                 model_routes: None,
+                cli_model_notice: None,
             };
         }
     };
@@ -132,6 +136,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
                 dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
                 scope_notices: Vec::new(),
                 model_routes: None,
+                cli_model_notice: None,
             };
         }
     };
@@ -194,6 +199,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
         scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
         model_routes: crate::harness::route_health::report(&context, &cfg),
+        cli_model_notice: crate::backend::cli_model_notice(&context, &cfg),
     }
 }
 
@@ -327,6 +333,37 @@ pub fn assert_running(root: &Path, wait: Option<&str>) -> i32 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ticket219_cli_health_reports_missing_settings_credential() {
+        let root = crate::install_root::development_root(
+            std::env::temp_dir().join(format!("her-cli-health-{}", crate::turn_ledger::mint_id(""))),
+        );
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(root.clone());
+        for dir in ["config", "data/logs", "resources", "user/dsh"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let path = root.join("config/config.json");
+        let mut config = json!({
+            "consoleToken":"fixture-health-token", "consolePort":1,
+            "backends":{"list":[{"id":"fixture-cli","kind":"cli","cmd":"fixture"}]}
+        });
+        std::fs::write(&path, config.to_string()).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
+        let report = || serde_json::to_value(check(&root, Instant::now())).unwrap();
+        let before = report();
+        let notice = before["cliModelNotice"].as_str().unwrap_or_default();
+        assert!(notice.contains("cliModel.apiKey") && notice.contains("Settings"),
+            "health check omitted CLI credential upgrade guidance");
+        config["backends"]["list"][0]["env"] = json!({"OPENAI_API_KEY":"fixture-key"});
+        std::fs::write(path, config.to_string()).unwrap();
+        assert!(report().get("cliModelNotice").is_none());
+    }
 
     #[test]
     fn t186_health_reports_rollout_scope_notices_beside_the_parts() {
