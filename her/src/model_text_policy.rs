@@ -1,8 +1,6 @@
-//! The #142 denied-term policy for model-bound text (#243): the one term list and the one check (`denied_terms`) that
-//! every model-text check calls. Callers: text settings on save and load (`settings::kinds::text`), the model-view strip
-//! (`model_view::strip_model_text`), the history summary (`harness::handover::accept`), the DSH persona guard
-//! (`dsh_profile`), the upstream capture sweep (`upstream_capture::sweep`) and the rendered-surface guard
-//! (`console::tests::model_text_guard_tests`). No other code matches denied terms, so no caller can pick a weaker check.
+//! The #142 denied-term policy for model-bound text (#243). Text settings, history summaries, the DSH persona guard,
+//! upstream captures and rendered-surface tests call `denied_terms` on whole texts. The model-view strip calls
+//! `deletion_adds_denied_term` at each occurrence's join. Both checks share the term list and the matcher.
 
 use std::ops::Range;
 
@@ -19,10 +17,9 @@ const DENIED_PHRASES: [&str; 9] = ["cli-proxy", "人工智能", "机器人", "�
 /// The #142 denied terms in model-bound text, each once. The text is read four ways, and a term any of them finds
 /// counts: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
 /// found; with them read as word boundaries, as the text is shown; with each of them both a boundary and a joiner
-/// so a word split by a mix of the two is found; and as written, so a term beside a
-/// character that folding turns into an ASCII letter (`ｘdsh`, `ﬀAI`) still counts. The first three fold full-width
-/// ASCII and read letters in upper case, so `ＤＳＨ` and `ai` are found. The terms come in that order, the first
-/// reading's first.
+/// so a word split by a mix of the two is found; and as written, so a term beside a character that folding turns into
+/// an ASCII letter (`ｘdsh`, `ﬀAI`) still counts. The first three readings fold full-width ASCII and read letters in
+/// upper case, so `ＤＳＨ` and `ai` are found. Terms appear in the order the readings first find them.
 pub(crate) fn denied_terms(text: &str) -> Vec<String> {
     let mut denied = Vec::new();
     visit_denied_terms(text, false, |term, _| {
@@ -34,8 +31,80 @@ pub(crate) fn denied_terms(text: &str) -> Vec<String> {
     denied.into_iter().map(str::to_owned).collect()
 }
 
-/// Does deleting `removed` create a denied occurrence at the join? Compare the same source spans before and
-/// after so a term elsewhere, even inside the window or the literal being deleted, cannot excuse a new match.
+// Each reading treats a format run as absent or as a separator. Denied spans start and end on non-format
+// characters, so before and after can use the same compacted side coordinates.
+const FORMAT_MARKER: char = '\u{00ad}';
+
+fn collapse_format_char(c: char, in_format_run: &mut bool) -> Option<char> {
+    let format = is_invisible_format(c);
+    let continuing_run = std::mem::replace(in_format_run, format);
+    if format {
+        (!continuing_run).then_some(FORMAT_MARKER)
+    } else {
+        Some(c)
+    }
+}
+
+/// Append text to the matcher input, merging format runs even across successive appends.
+pub(crate) fn push_compact_format_runs(compact: &mut String, text: &str) {
+    let mut in_format_run = compact.ends_with(FORMAT_MARKER);
+    compact.extend(
+        text.chars()
+            .filter_map(|c| collapse_format_char(c, &mut in_format_run)),
+    );
+}
+
+/// Compacted input to the right of a deletion. Occurrences are visited in source order, so each
+/// source character is counted toward the compacted offset at most once per strip entry and round.
+pub(crate) struct StripRightContext<'a> {
+    compact: String,
+    source: &'a str,
+    source_offset: usize,
+    compact_offset: usize,
+    in_format_run: bool,
+}
+
+impl<'a> StripRightContext<'a> {
+    pub(crate) fn new(source: &'a str) -> Self {
+        let mut compact = String::with_capacity(source.len());
+        push_compact_format_runs(&mut compact, source);
+        Self {
+            compact,
+            source,
+            source_offset: 0,
+            compact_offset: 0,
+            in_format_run: false,
+        }
+    }
+
+    pub(crate) fn at(&mut self, end: usize) -> &str {
+        self.compact_offset += self.source[self.source_offset..end]
+            .chars()
+            .filter_map(|c| collapse_format_char(c, &mut self.in_format_run))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        self.source_offset = end;
+        // If the cut lands inside a run, its representative also belongs in the remaining suffix.
+        let mut start = self.compact_offset;
+        if self.in_format_run && self.source[end..].starts_with(is_invisible_format) {
+            start -= FORMAT_MARKER.len_utf8();
+        }
+        &self.compact[start..]
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DELETION_WINDOW_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_deletion_window_scan_count() -> usize {
+    DELETION_WINDOW_SCAN_COUNT.with(|count| count.replace(0))
+}
+
+/// Does deleting `removed` create a denied occurrence at the join? The sides have compacted format runs.
+/// Compare the same spans before and after so a term elsewhere in the window cannot excuse a new match.
 pub(crate) fn deletion_adds_denied_term(left: &str, removed: &str, right: &str) -> bool {
     // A format run that remains nonempty has the same readings after deleting part of it.
     if (left.chars().next_back().is_some_and(is_invisible_format)
@@ -45,13 +114,21 @@ pub(crate) fn deletion_adds_denied_term(left: &str, removed: &str, right: &str) 
         return false;
     }
 
-    // Keep enough characters for the longest term and its word edge on either side. Format runs can be arbitrarily
-    // long and may disappear in a reading, so they cannot count toward the window size.
+    // Keep enough visible characters for the longest term and its word edge on either side. Each
+    // intervening format run is already one character and may disappear in some readings.
     let context = DENIED_WORDS.iter().chain(&DENIED_PHRASES)
         .map(|term| term.len()).max().unwrap_or(2) + 1;
-    let visible = |&(_, c): &(usize, char)| !is_invisible_format(c);
+    #[cfg(test)]
+    let scanned = std::cell::Cell::new(0);
+    let visible = |&(_, c): &(usize, char)| {
+        #[cfg(test)]
+        scanned.set(scanned.get() + 1);
+        !is_invisible_format(c)
+    };
     let start = left.char_indices().rev().filter(visible).nth(context - 1).map_or(0, |(i, _)| i);
     let end = right.char_indices().filter(visible).nth(context).map_or(right.len(), |(i, _)| i);
+    #[cfg(test)]
+    DELETION_WINDOW_SCAN_COUNT.with(|count| count.set(count.get() + scanned.get()));
     let (left, right) = (&left[start..], &right[..end]);
     let join = left.len();
     let after = occurrences(&format!("{left}{right}"));

@@ -210,9 +210,11 @@ fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
 }
 
 fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, bool) {
-    use crate::model_text_policy::deletion_adds_denied_term;
+    use crate::model_text_policy::{StripRightContext, deletion_adds_denied_term, push_compact_format_runs};
 
     let mut out = String::with_capacity(text.len());
+    let mut left = String::new();
+    let mut right = StripRightContext::new(text);
     let mut refused = false;
     let mut copied = 0;
     let atom_ranges = atoms.find_iter(text).map(|atom| (atom.start(), atom.end()));
@@ -222,13 +224,16 @@ fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, b
             let start = plain_start + offset;
             let end = start + item.len();
             out.push_str(&text[copied..start]);
-            if deletion_adds_denied_term(&out, item, &text[end..]) {
+            push_compact_format_runs(&mut left, &text[copied..start]);
+            if deletion_adds_denied_term(&left, item, right.at(end)) {
                 out.push_str(item);
+                push_compact_format_runs(&mut left, item);
                 refused = true;
             }
             copied = end;
         }
         out.push_str(&text[copied..atom_end]);
+        push_compact_format_runs(&mut left, &text[copied..atom_end]);
         copied = atom_end;
     }
     (out, refused)
@@ -534,6 +539,31 @@ mod tests {
         let split = format!("ANTIGRAVIT{}鲸Y", "\u{200b}".repeat(32));
         assert_eq!(strip_from_model_text(&split, &cfg), split);
         assert_eq!(strip_from_model_text("xANTIGRAVIT鲸Y", &cfg), "xANTIGRAVITY");
+    }
+
+    #[test]
+    fn model_strip_round1_keeps_a_join_that_would_create_a_denied_phrase() {
+        assert_eq!(strip_from_model_text("模鲸型", &strip_cfg(&["鲸"])), "模鲸型");
+    }
+
+    #[test]
+    fn model_strip_round1_refuses_a_join_with_a_format_word_edge() {
+        assert_eq!(strip_checked("x\u{200b}D鲸SH", &strip_cfg(&["鲸"])), None);
+    }
+
+    #[test]
+    fn model_strip_round1_bounds_window_scans_across_a_growing_format_run() {
+        use crate::model_text_policy::take_deletion_window_scan_count;
+
+        let pairs = 20_000;
+        let text = "\u{200b}x".repeat(pairs);
+        let cfg = strip_cfg(&["x"]);
+        take_deletion_window_scan_count();
+        let stripped = strip_checked(&text, &cfg);
+        let scanned = take_deletion_window_scan_count();
+
+        assert_eq!(stripped, Some("\u{200b}".repeat(pairs)));
+        assert!(scanned <= pairs * 256, "join windows scanned {scanned} characters");
     }
 
     #[test]
