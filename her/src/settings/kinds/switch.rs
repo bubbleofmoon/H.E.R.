@@ -42,7 +42,7 @@ impl SettingKind for Switch {
 
     /// What the next use reads from the file, so a seed never changes a switch.
     fn seed(&self, found: &Value) -> Option<Value> {
-        self.read(found)
+        self.normalize(found) // RED-T2
     }
 
     #[cfg(test)]
