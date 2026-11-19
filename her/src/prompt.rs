@@ -2125,8 +2125,8 @@ pub(crate) fn render_wake(
     delta.push_str(&format!("【观察状态】preSleepWaitRemainingMs={}\n\n",
         crate::wake::pre_sleep_remaining(st,cfg,now_ms()).unwrap_or(0)));
     if !full { delta.push_str(&wait_limit_line(cfg)); }
-    // Automatic recall for the message being answered, the same block the console preview shows; the
-    // briefing's retrieval section remains the on-demand route (`memory_search`).
+    // Automatic recall for the message being answered. The briefing's retrieval section remains
+    // the on-demand route (`memory_search`).
     // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
     // wakes already carried; a new generation, session or epoch starts afresh.
     let held = delivery.held.clone();

@@ -159,6 +159,8 @@ impl Store {
             .map_err(|_| STORAGE_ERROR)?;
         row.map(|(state, result)| match state.as_str() {
             "running" => Ok(Status::Running),
+            // A completed turn without final text is an observation sleep.
+            "completed" if result.is_empty() => Ok(Status::ObservationSleep),
             "completed" => Ok(Status::Completed(result)),
             "failed" => Ok(Status::Failed(result)),
             "cancelled" => Ok(Status::Cancelled),
@@ -174,7 +176,7 @@ impl Store {
         .transpose()
     }
 
-    /// The latest completed canonical wake is the only delivery receipt eligible for replay.
+    /// The latest completed canonical wake, including observation sleep, is eligible for replay.
     /// If a checkpoint covers its full briefing, the next wake supplies a fresh base.
     pub(super) fn wake_briefing(&self, conversation: &str, generation: &str) -> Result<Value, String> {
         let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
@@ -496,6 +498,7 @@ impl Store {
         let (state, result) = match status {
             Status::Running => return Err("cannot finish a running harness turn".into()),
             Status::Completed(text) => ("completed", text.as_str()),
+            Status::ObservationSleep => ("completed", ""),
             Status::Failed(reason) => ("failed", reason.as_str()),
             Status::Cancelled => ("cancelled", "cancelled"),
             Status::Paused { reason, detail } => {
@@ -523,6 +526,10 @@ impl Store {
             params![turn, state, now, &result],
         )
         .map_err(|_| STORAGE_ERROR)?;
+        let mut terminal = json!({"state":state,"result":result});
+        if matches!(status, Status::ObservationSleep) {
+            terminal["reason"] = json!("observationSleep");
+        }
         append(
             &known,
             &tx,
@@ -534,7 +541,7 @@ impl Store {
             } else {
                 "turn_ended"
             },
-            json!({"state":state,"result":result}),
+            terminal,
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())

@@ -1050,22 +1050,38 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             self.carried_messages.clear();
             return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
         }
-        let (adapter, _admission, admitted_cfg) = self.turn_adapter(&key, "reserved2").await?;
-        let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
+        let admission = self.turn_adapter(&key, "reserved2").await;
+        let already_expired = || self.dispatch_deadline
+            .is_some_and(|deadline| crate::turn_ledger::now_ms() >= deadline);
         if let Some(route) = &self.reserved2_route {
             let mut route = route.lock().unwrap_or_else(|p| p.into_inner());
-            if *route == Reserved2Route::ExpiredBeforeAdmission {
+            if *route == Reserved2Route::ExpiredBeforeAdmission
+                || (*route == Reserved2Route::PendingHarness && admission.is_err() && already_expired())
+            {
+                *route = Reserved2Route::ExpiredBeforeAdmission;
                 return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
             }
-            *route = if matches!(&adapter, crate::turn_engine::Adapter::Harness) {
-                Reserved2Route::Harness
-            } else if adapter.uses_dsh() && pinned_cli_backend(cli_cfg, &key).is_some() {
-                Reserved2Route::Cli
-            } else {
-                Reserved2Route::Dsh
-            };
+            if let Ok((adapter, _, admitted_cfg)) = &admission {
+                let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
+                *route = if matches!(adapter, crate::turn_engine::Adapter::Harness) {
+                    Reserved2Route::Harness
+                } else if adapter.uses_dsh() && pinned_cli_backend(cli_cfg, &key).is_some() {
+                    Reserved2Route::Cli
+                } else {
+                    Reserved2Route::Dsh
+                };
+            }
         }
-        let token = self.begin_ledger_turn_as(&key, adapter.id(), true)?;
+        let (adapter, _admission, admitted_cfg) = admission?;
+        let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
+        let harness = matches!(&adapter, crate::turn_engine::Adapter::Harness);
+        let token = match self.begin_ledger_turn_as(&key, adapter.id(), true) {
+            Err(_) if harness && self.dispatch_deadline.is_some_and(|at| crate::turn_ledger::now_ms() >= at) => {
+                self.publish_expired_harness_route();
+                return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
+            }
+            result => result?,
+        };
         if let Some(admitted) = &self.reserved2_admitted {
             *admitted.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
         }
@@ -1075,23 +1091,32 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         // Engaged turns measure the cap from her last send (capMs), bounded by the dispatch ceiling.
         let ceiling = deadline.saturating_sub(cap_ms).saturating_add(crate::wake::turn_ceiling_ms(cfg)).max(deadline);
         self.reserved2_budget = Some(Reserved2Budget { deadline, cap_ms, ceiling, began: self.turn_began });
-        if let Err(error) = crate::turn_ledger::append_record(&self.context,
-            &serde_json::json!({"k":"budget","turn":self.cur_turn.as_ref().unwrap().id,"t":self.turn_began,"deadline":deadline,
-                "capMs":cap_ms,"ceiling":ceiling})) {
-            self.end_ledger_turn(Err(&error));
-            return Err(error);
-        }
-        if let Some((at, previous)) = self.dispatch_wake.take() {
-            let claim = serde_json::json!({"at":at,"previous":previous});
-            let durable = self.cur_turn.as_ref().unwrap().wake_claim(&claim)
-                .and_then(|_| crate::console::consume_reserved2_deadline(&self.context, &key, &token, at, &previous));
-            if let Err(error) = durable {
-                self.end_ledger_turn(Err(&error));
-                return Err(error);
+        let prepared = (|| {
+            crate::turn_ledger::append_record(&self.context,
+                &serde_json::json!({"k":"budget","turn":self.cur_turn.as_ref().unwrap().id,"t":self.turn_began,"deadline":deadline,
+                    "capMs":cap_ms,"ceiling":ceiling}))?;
+            if let Some((at, previous)) = self.dispatch_wake.take() {
+                let claim = serde_json::json!({"at":at,"previous":previous});
+                self.cur_turn.as_ref().unwrap().wake_claim(&claim)?;
+                crate::console::consume_reserved2_deadline(&self.context, &key, &token, at, &previous)?;
             }
-        }
-        let dsh_prompt = patch_token_line(dsh_prompt, &token);
-        let result = self.run_turn_inner(target, &dsh_prompt, cli_prompt, cfg, cli_cfg, adapter, refs).await;
+            Ok(())
+        })();
+        let result = match prepared {
+            Ok(()) => {
+                let dsh_prompt = patch_token_line(dsh_prompt, &token);
+                self.run_turn_inner(target, &dsh_prompt, cli_prompt, cfg, cli_cfg, adapter, refs).await
+            }
+            Err(error) => Err(error),
+        };
+        // Check failures from every preparation step, including a lost snapshot response.
+        let result = if harness && result.is_err() && self.dispatch_unsubmitted && !self.turn_final
+            && self.harness_admission_expired(&key)
+        {
+            Err(self.expire_unadmitted_harness(&key))
+        } else {
+            result
+        };
         self.reserved2_budget = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
         result
@@ -1589,21 +1614,36 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         Ok(self.reserved2_budget.is_some_and(|budget| budget.expired(&state["conversations"][key])))
     }
 
-    fn expire_unadmitted_harness(&mut self) -> String {
+    fn harness_admission_expired(&self, key: &str) -> bool {
+        self.reserved2_budget.is_some_and(|budget| {
+            match self.context.read_social_state() {
+                Ok(state) => budget.expired(&state["conversations"][key]),
+                // A failed state read cannot grant a pre-admission wake an extension.
+                Err(_) => crate::turn_ledger::now_ms() >= budget.deadline,
+            }
+        })
+    }
+
+    fn publish_expired_harness_route(&self) {
         if let Some(route) = &self.reserved2_route {
             *route.lock().unwrap_or_else(|p| p.into_inner()) = Reserved2Route::ExpiredBeforeAdmission;
+        }
+    }
+
+    fn expire_unadmitted_harness(&mut self, key: &str) -> String {
+        self.publish_expired_harness_route();
+        // The companion console may have granted snapshot receipts even if rendering failed.
+        if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
+            eprintln!("[turn] expired wake revocation failed: {error}");
         }
         self.finish_turn("cancelled", "turnTimeout");
         crate::harness::DEADLINE_EXCEEDED.into()
     }
 
-    fn request_harness_cap(&self, key: &str, recorder: &crate::turn_ledger::Recorder) -> &'static str {
-        let observation = crate::console::observation_wait_turn(&self.context, key)
-            .ok().flatten().as_deref() == Some(recorder.id.as_str());
+    fn revoke_harness_cap(&self, key: &str) {
         if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
             eprintln!("[turn] simulation cap revocation failed: {error}");
         }
-        if observation { "observationSleep" } else { "turnTimeout" }
     }
 
     /// The harness adapter: admit the turn to HER's own harness, stream it, cancel it when the
@@ -1621,7 +1661,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         take_model_error(&self.context, key);
         let begun = std::time::Instant::now();
         if self.check_harness_turn(key)? {
-            return Err(self.expire_unadmitted_harness());
+            return Err(self.expire_unadmitted_harness(key));
         }
         // #162: the conversation's selected model route first, then the other routes in configured order.
         let route = ModelRoute::for_conversation(&self.context, cfg, key)?;
@@ -1681,7 +1721,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             *full = crate::activity::mask_session_tokens(full, std::slice::from_ref(&self.turn_token));
         }
         let deadline = if let Some(budget) = self.reserved2_budget {
-            if self.check_harness_turn(key)? { return Err(self.expire_unadmitted_harness()); }
+            if self.check_harness_turn(key)? { return Err(self.expire_unadmitted_harness(key)); }
             std::time::Duration::from_millis(budget.ceiling.saturating_sub(crate::turn_ledger::now_ms()).max(0) as u64)
         } else { timeout };
         let tools = crate::harness::Tools::capture(&self.context, cfg, mode, key, &self.turn_epoch)?
@@ -1711,7 +1751,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             self.send_chat_text(key, "", "ack", &ack);
         }
         let mut invalidated = false;
-        let mut cap_reason = None;
+        let mut capped = false;
         let result = loop {
             tokio::select! { biased;
                 result = turn.wait() => break result,
@@ -1725,7 +1765,14 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     match self.check_harness_turn(key) {
                         Ok(false) => continue,
                         Ok(true) => {
-                            cap_reason = Some(self.request_harness_cap(key, &recorder));
+                            if crate::console::observation_wait_turn(&self.context, key)
+                                .ok().flatten().as_deref() == Some(recorder.id.as_str())
+                            {
+                                // Publish the sleep before revocation can release the handler.
+                                turn.mark_observation_sleep();
+                            }
+                            self.revoke_harness_cap(key);
+                            capped = true;
                         }
                         Err(_) => invalidated = true,
                     }
@@ -1734,11 +1781,15 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 }
             }
         };
-        if cap_reason.is_none() && self.reserved2_budget.is_some()
-            && result.as_ref().is_err_and(|error| error == crate::harness::DEADLINE_EXCEEDED)
+        use crate::harness::Status;
+        let mut status = turn.status();
+        if !capped && self.reserved2_budget.is_some()
+            && (matches!(status, Status::ObservationSleep)
+                || result.as_ref().is_err_and(|error| error == crate::harness::DEADLINE_EXCEEDED))
         {
             // The runner can observe the cap while a response or tool dispatch beats our poll.
-            cap_reason = Some(self.request_harness_cap(key, &recorder));
+            self.revoke_harness_cap(key);
+            capped = true;
         }
         let turn_ms = started.elapsed().as_millis() as i64;
         for reference in turn.message_refs() {
@@ -1746,16 +1797,15 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 self.carried_messages.push(reference);
             }
         }
-        let mut status = turn.status();
         // The runner may have committed completion while the cap poll was checking authority.
-        let settled_cap = cap_reason.filter(|_| matches!(status, crate::harness::Status::Failed(_) | crate::harness::Status::Cancelled));
-        if let Some(reason) = settled_cap {
-            status = if reason == "observationSleep" {
-                crate::harness::Status::Completed(String::new())
-            } else {
-                crate::harness::Status::Failed(crate::harness::DEADLINE_EXCEEDED.into())
-            };
-        }
+        let settled_cap = match &status {
+            Status::ObservationSleep => Some("observationSleep"),
+            Status::Failed(_) | Status::Cancelled if capped => {
+                status = Status::Failed(crate::harness::DEADLINE_EXCEEDED.into());
+                Some("turnTimeout")
+            }
+            _ => None,
+        };
         // The route the turn's last request went to, after any failover.
         let model = turn.model();
         self.report_facts(key, &crate::turn_engine::Facts::of_harness(
@@ -1814,7 +1864,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         };
         // A completed reserved2 turn can reach here after its cap poll revoked its token.
         // Reserved2 only logs the final text, and the hub checks epoch ownership before settling coverage.
-        if cap_reason.is_none() {
+        if !capped {
             self.check_harness_authority(key)?;
         }
         self.last_report = Some(TurnReport { end_kind: "completed".into(), send_tool_ok: turn.sent_tool_reply(), ..Default::default() });

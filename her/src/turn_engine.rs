@@ -154,7 +154,7 @@ impl Facts {
     ) -> Self {
         use crate::harness::Status;
         let (end_kind, cancel_reason) = match status {
-            Status::Completed(_) => (Some("completed"), None),
+            Status::Completed(_) | Status::ObservationSleep => (Some("completed"), None),
             Status::Cancelled if invalidated => (Some("cancelled"), Some("turnInvalidated")),
             Status::Cancelled => (Some("cancelled"), Some("harnessCancelled")),
             Status::Failed(reason) if reason == crate::harness::DEADLINE_EXCEEDED => {
@@ -164,7 +164,7 @@ impl Facts {
             Status::Running | Status::Paused { .. } => (None, None),
         };
         Self {
-            ok: matches!(status, Status::Completed(_)),
+            ok: matches!(status, Status::Completed(_) | Status::ObservationSleep),
             end_kind: end_kind.map(str::to_string),
             cancel_reason,
             attempt,

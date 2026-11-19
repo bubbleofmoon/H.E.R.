@@ -324,6 +324,7 @@ pub(crate) fn user_message(prompt: &str, media: &[Value]) -> ChatMessage {
 pub enum Status {
     Running,
     Completed(String),
+    ObservationSleep,
     Failed(String),
     Cancelled,
     Paused { reason: String, detail: String },
@@ -424,6 +425,7 @@ pub struct Turn {
     progress: Arc<std::sync::Mutex<Progress>>,
     status: watch::Receiver<Status>,
     cancel: watch::Sender<bool>,
+    observation_sleep: Arc<AtomicBool>,
     events: broadcast::Sender<Event>,
 }
 
@@ -460,11 +462,16 @@ impl Turn {
         let _ = self.cancel.send(true);
     }
 
+    pub(crate) fn mark_observation_sleep(&self) {
+        self.observation_sleep.store(true, Ordering::SeqCst);
+    }
+
     pub async fn wait(&mut self) -> Result<String, String> {
         loop {
             match self.status() {
                 Status::Running => {}
                 Status::Completed(text) => return Ok(text),
+                Status::ObservationSleep => return Ok(String::new()),
                 Status::Failed(reason) => return Err(reason),
                 Status::Cancelled => return Err("回合已取消（harness）".into()),
                 Status::Paused { reason, detail } => {
@@ -576,6 +583,8 @@ impl Harness {
         }));
         let progress_for_task = progress.clone();
         let task_cancel = cancel.clone();
+        let observation_sleep = Arc::new(AtomicBool::new(false));
+        let task_observation = observation_sleep.clone();
         tokio::spawn(async move {
             // Keep ownership through result persistence and uncertainty publication.
             let _owner = owner;
@@ -583,6 +592,7 @@ impl Harness {
             let cancellation = cancelled.clone();
             let deadline = tokio::time::Instant::now() + request.deadline;
             let deadline_generation = std::sync::OnceLock::new();
+            let mut recalled = delivery.recalled.as_slice();
             let execution = tool_loop(
                 &context,
                 &client,
@@ -598,6 +608,7 @@ impl Harness {
                 deadline,
                 &deadline_generation,
                 cancellation,
+                &mut recalled,
             );
             let (outcome, interrupted) = settle_turn(
                 execution,
@@ -633,6 +644,15 @@ impl Harness {
                     }
                 },
             };
+            let witnessed_cap = matches!(&result, Status::Failed(reason) if reason == DEADLINE_EXCEEDED)
+                && delivery.reserved2_budget.is_some()
+                && crate::console::observation_wait_turn(&context, &request.conversation)
+                    .ok().flatten().as_deref() == Some(request.id.as_str());
+            if (task_observation.load(Ordering::SeqCst) || witnessed_cap)
+                && matches!(result, Status::Failed(_) | Status::Cancelled)
+            {
+                result = Status::ObservationSleep;
+            }
             if let Err(reason) = store.finish(&request.id, &result, assistant.as_ref()) {
                 result = Status::Paused {
                     reason: "send-unresolved".into(),
@@ -644,6 +664,8 @@ impl Harness {
                 let _ = request.tools.pause(&request.id, reason, detail);
             }
             if let Some(event) = assistant {
+                // Final text counts only after the runner accepts and persists completion.
+                crate::prompt::record_recall_hits(&context, recalled);
                 let _ = notifications.send(event);
             }
             let _ = notifications.send(Event::Ended(result.clone()));
@@ -655,6 +677,7 @@ impl Harness {
             progress,
             status,
             cancel,
+            observation_sleep,
             events,
         })
     }
@@ -750,6 +773,7 @@ async fn tool_loop(
     deadline: tokio::time::Instant,
     deadline_generation: &std::sync::OnceLock<String>,
     mut cancelled: watch::Receiver<bool>,
+    recalled: &mut &[i64],
 ) -> Result<Event, Failure> {
     let session = history.session.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
@@ -757,8 +781,6 @@ async fn tool_loop(
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
     let mut chain = ChainState::new(context, request, usage::next_number());
     let mut spent = 0u32;
-    let mut recalled = delivery.recalled.as_slice();
-    let mut record_recall = || crate::prompt::record_recall_hits(context, std::mem::take(&mut recalled));
     for step in 0..request.limits.max_steps {
         check_bound(request, &cancelled, deadline)?;
         if step > 0 {
@@ -903,7 +925,6 @@ async fn tool_loop(
                 let _ = events.send(event);
                 return Err("harness token limit exceeded".into());
             }
-            record_recall();
             chain.completed();
             return Ok(event);
         }
@@ -918,7 +939,6 @@ async fn tool_loop(
             return Err("harness duplicate or empty tool call id".into());
         }
         drop(call_ids);
-        record_recall();
         for call in calls {
             let prepared = if exhausted {
                 Err(tools::error("token limit exceeded"))
@@ -930,6 +950,7 @@ async fn tool_loop(
             check_bound(request, &cancelled, deadline)?;
             TurnDelivery::check_deadline(delivery.reserved2_budget, context, &request.conversation)?;
             let run = store.tool_start(&request.id, &attempt, &call)?;
+            crate::prompt::record_recall_hits(context, std::mem::take(recalled));
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
             chain.dispatched |= prepared.is_ok();

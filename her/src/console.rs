@@ -5703,6 +5703,24 @@ fn wait_live_path(console: &str, request: &str) -> String {
     format!("locks/observation-wait-{digest:x}.lock")
 }
 
+#[cfg(test)]
+pub(crate) fn hold_test_observation_wait(
+    context: &RuntimeContext, key: &str, token: &str, turn: &str,
+) -> std::fs::File {
+    // Hold the same request witness as the console without taking the process-wide wait lease.
+    let console = wait_console_generation();
+    let request = crate::turn_ledger::mint_id("wait-");
+    let lock = context.open_locked_file(RuntimeArea::Data, &wait_live_path(console, &request)).unwrap();
+    mutate_social_state_for(context, |state| {
+        state["conversations"][key]["activeWait"] = json!({
+            "id":request,"console":console,"turn":turn,"purpose":"messages",
+            "epoch":crate::send_outbox::token_epoch(token)
+        });
+        Ok(())
+    }).unwrap();
+    lock
+}
+
 pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
     let state = load_social_state_for(context).map_err(|(_, e)|e)?;
     let conv = &state["conversations"][key];
