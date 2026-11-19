@@ -151,16 +151,24 @@ impl Store {
 
     pub fn status(&self, turn: &str) -> Result<Option<Status>, String> {
         let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
-        let row: Option<(String, String)> = conn
-            .query_row("SELECT state,result FROM turns WHERE id=?1", [turn], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+        // Restore can reconcile a completed turn whose final text was absent from the snapshot.
+        let row: Option<(String, String, bool)> = conn
+            .query_row(
+                "SELECT t.state,t.result,
+                    CASE WHEN t.state='completed' AND t.result='' THEN EXISTS(
+                        SELECT 1 FROM events e WHERE e.session_id=t.session_id
+                        AND e.turn_id=t.id AND e.kind='turn_ended'
+                        AND json_extract(e.payload,'$.reason')='observationSleep'
+                    ) ELSE 0 END
+                 FROM turns t WHERE t.id=?1",
+                [turn],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()
             .map_err(|_| STORAGE_ERROR)?;
-        row.map(|(state, result)| match state.as_str() {
+        row.map(|(state, result, observation_sleep)| match state.as_str() {
             "running" => Ok(Status::Running),
-            // A completed turn without final text is an observation sleep.
-            "completed" if result.is_empty() => Ok(Status::ObservationSleep),
+            "completed" if observation_sleep => Ok(Status::ObservationSleep),
             "completed" => Ok(Status::Completed(result)),
             "failed" => Ok(Status::Failed(result)),
             "cancelled" => Ok(Status::Cancelled),
