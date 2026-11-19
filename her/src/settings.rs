@@ -66,7 +66,7 @@ pub(crate) use registry::{
     LAYER_MATERIAL,
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
+    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
 };
 #[cfg(test)]
 pub(crate) use store::{

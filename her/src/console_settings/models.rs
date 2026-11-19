@@ -8,8 +8,58 @@
 //! gate.
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
-use crate::settings::{CONVERSATION_ROUTE, HARNESS_FIRST_ROUTE};
+use crate::settings::{CONVERSATION_ROUTE, HARNESS_FIRST_ROUTE, HARNESS_ROUTES};
 use serde_json::{json, Value};
+
+fn harness_credential(context: &RuntimeContext) -> Option<String> {
+    context
+        .read_text(RuntimeArea::Config, "harness-api-key")
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+}
+
+/// The global settings API applies the same credential masking as the model route list. This changes only response
+/// fields. The settings view marks a masked effective value so the editor can require a full replacement.
+pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value) {
+    let Some(key) = harness_credential(context) else { return };
+    let redact = |value: &mut Value| {
+        let mut redacted = false;
+        if let Some(routes) = value.as_array_mut() {
+            for route in routes {
+                for field in ["id", "model"] {
+                    let Some(slot) = route.get_mut(field) else { continue };
+                    if let Some(text) = slot.as_str().filter(|text| text.contains(&key)) {
+                        *slot = json!(crate::harness::redact_credential(text, &key));
+                        redacted = true;
+                    }
+                }
+            }
+        }
+        redacted
+    };
+    if let Some(settings) = reply.get_mut("settings").and_then(Value::as_array_mut) {
+        if let Some(entry) = settings.iter_mut().find(|entry| entry["key"] == HARNESS_ROUTES.key) {
+            redact(&mut entry["stored"]);
+            if redact(&mut entry["value"]) {
+                entry["redacted"] = json!(true);
+            }
+        }
+    }
+    if let Some(entries) = reply.get_mut("entries").and_then(Value::as_array_mut) {
+        for entry in entries.iter_mut().filter(|entry| entry["setting"] == HARNESS_ROUTES.key) {
+            redact(&mut entry["old"]);
+            redact(&mut entry["new"]);
+        }
+    }
+    if reply["setting"] == HARNESS_ROUTES.key {
+        for field in ["value", "stored"] {
+            if let Some(value) = reply.get_mut(field) {
+                redact(value);
+            }
+        }
+    }
+}
 
 /// `GET /api/settings/models`: `setting` (the conversation setting the page sets), `firstRoute` (the global
 /// `harness.firstRoute`, `null` for none), `routes` in configured order (`id`, `model`, `reasoningEffort`,
@@ -24,11 +74,7 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         return Err((503, "settings require a selected runtime".to_string()));
     }
     let cfg = context.load_config().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let credential = context
-        .read_text(RuntimeArea::Config, "harness-api-key")
-        .ok()
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty());
+    let credential = harness_credential(context);
     let shown = |text: &str| match credential.as_deref() {
         Some(key) => crate::harness::redact_credential(text, key),
         None => text.to_string(),
@@ -118,6 +164,7 @@ pub(super) const PAGE: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Model routes</title>
 <style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:40em}</style></head><body>
 <h1>Model routes</h1>
+<p><a href="/settings">Edit the global model route list</a></p>
 <p>Harness turns ask a conversation's route first, then the other routes in configured order. History and undo: <a href="/settings/conversations">settings per conversation</a>.</p>
 <p>Console token <input id="token" type="password" size="32"> <button id="use">Use</button> <span id="msg" role="status"></span></p>
 <p id="chain"></p>

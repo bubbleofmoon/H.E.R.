@@ -29,7 +29,7 @@ pub(crate) use memory::{material_item_limit,
 };
 pub(crate) use model::{
     CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS,
-    HARNESS_MODEL, WEB_SEARCH_MODEL,
+    HARNESS_MODEL, HARNESS_ROUTES, WEB_SEARCH_MODEL,
 };
 
 use super::{ConversationSetting, Setting};

@@ -59,8 +59,8 @@ impl SettingKind for Integer {
 
     fn seed(&self, found: &Value) -> Option<Value> {
         match self.file {
-            FileRule::JsRound | FileRule::JsTruncate => self.read(found),
-            _ => self.normalize(found),
+            FileRule::Clamp | FileRule::JsRound | FileRule::JsTruncate => self.read(found),
+            FileRule::Default | FileRule::Round => self.normalize(found),
         }
     }
 

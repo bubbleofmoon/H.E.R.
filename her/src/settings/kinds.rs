@@ -8,6 +8,7 @@ mod integer;
 mod model_id;
 mod owner_id;
 mod route_id;
+mod route_list;
 mod switch;
 mod text;
 mod time_zone;
@@ -21,6 +22,7 @@ pub(crate) use integer::{FileRule, Integer};
 pub(crate) use model_id::ModelId;
 pub(crate) use owner_id::OwnerId;
 pub(crate) use route_id::RouteId;
+pub(crate) use route_list::RouteList;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
 pub(crate) use time_zone::TimeZoneName;
@@ -74,7 +76,7 @@ pub(crate) trait SettingKind: Sync {
 
     /// The value the store keeps when it seeds the setting from `found`, its value in `config.json`; `None` when the
     /// store cannot keep one. The accepted value (`normalize`), unless the kind keeps what the next use reads (a
-    /// switch, an id list) or reads a blank value as its default (the owner).
+    /// clamped integer, a switch, an id list) or reads a blank value as its default (the owner).
     fn seed(&self, found: &Value) -> Option<Value> {
         self.normalize(found)
     }

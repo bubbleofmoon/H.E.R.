@@ -403,6 +403,7 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
         json!("plain probe text two"),
         // #154: an id list and a switch.
         json!([1]),
+        json!([{"id": "first", "model": "probe-model"}]),
         json!(false),
         // #218: a choice.
         json!("harness"),
