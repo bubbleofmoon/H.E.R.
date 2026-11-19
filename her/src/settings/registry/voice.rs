@@ -6,7 +6,7 @@ use crate::settings::{
 };
 
 const fn voice(key: &'static str, pointer: &'static str, kind: &'static dyn SettingKind, label: &'static str, hint: &'static str) -> Setting {
-    Setting { key, pointer, kind, applies: "live", group: "voice", label, hint, chat: false }
+    Setting { key, pointer, kind, applies: "live", group: "voice", label, hint, chat: false, secret: false }
 }
 
 pub(crate) const VOICE_ENABLED: Setting = voice(

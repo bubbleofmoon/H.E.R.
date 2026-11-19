@@ -53,7 +53,7 @@ fn write_fixture(root: &Path, ws_url: &str, onebot_url: &str, owner: Option<i64>
                 "sessions": {"group:420042": "ticket07-cli"},
                 "list": [{
                     "id": "ticket07-cli",
-                    "kind": "cli",
+                    "env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli",
                     "cmd": "cmd.exe",
                     "args": ["/c", "exit", "1"]
                 }]

@@ -3544,7 +3544,7 @@ fn chat_mode_ignores_a_pinned_cli_backend_and_answers_through_dsh() {
         Seed {
             mode: "chat",
             config: json!({"backends":{"sessions":{GROUP_KEY:"private-output-cli"},"list":[{
-                "id":"private-output-cli","kind":"cli","cmd":"powershell.exe",
+                "id":"private-output-cli","env":{"OPENAI_API_KEY":"fixture-local-cli-key"}, "kind":"cli","cmd":"powershell.exe",
                 "args":["-NoProfile","-NonInteractive","-Command",
                     "$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText((Join-Path $env:HER_RUNTIME_ROOT 'data/cli-private-probe.txt'), '7'); [Console]::Out.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); [Console]::Error.WriteLine('CHAT_SECRET synthetic-nickname token-fixture'); exit 7"]
             }]}}),

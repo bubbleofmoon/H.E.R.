@@ -4,7 +4,6 @@
 //! then fsyncs the parent folder on Unix. Windows replaces with `MoveFileExW` and write-through; only
 //! when that fails with access denied (a reader that allows deletion holds the target) does it fall
 //! back to std's POSIX-semantics rename, which has no write-through and also replaces a read-only target.
-// herupdate compiles only release_store, install_root, update and handover.
 #![allow(dead_code)]
 
 use std::fs::{self, File, OpenOptions};
@@ -177,6 +176,26 @@ pub(crate) struct Staged {
 /// Write `input` to a new sibling temporary file and fsync it. `unix_mode` sets the temporary
 /// file's permissions on Unix (default: the process umask); Windows ignores it.
 pub(crate) fn stage(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>) -> Result<Staged, Failure> {
+    stage_with(target, input, |temp| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(mode) = unix_mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = unix_mode;
+        options.open(temp)
+    })
+}
+
+/// Stage using an opener that must exclusively create the supplied temporary path.
+pub(crate) fn stage_with(
+    target: &Path,
+    input: &mut dyn Read,
+    open: impl FnOnce(&Path) -> io::Result<File>,
+) -> Result<Staged, Failure> {
     check_target(target)?;
     let name = target
         .file_name()
@@ -187,16 +206,7 @@ pub(crate) fn stage(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>)
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    if let Some(mode) = unix_mode {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = unix_mode;
-    let mut file = options.open(&temp).map_err(io_failure("temp/create"))?;
+    let mut file = open(&temp).map_err(io_failure("temp/create"))?;
     let staged = Staged { temp, target: target.to_path_buf(), published: false };
     let written = io::copy(input, &mut file)
         .map_err(io_failure("temp/write"))

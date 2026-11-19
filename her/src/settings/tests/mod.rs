@@ -5,6 +5,7 @@
 use super::*;
 use crate::settings::{AuditRow, StoreProbe};
 
+mod secrets { include!("secrets.rs"); }
 mod store { include!("store.rs"); }
 mod registry { include!("registry.rs"); }
 mod history { include!("history.rs"); }
@@ -36,6 +37,7 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/kinds/owner_id.rs", include_str!("../kinds/owner_id.rs")),
     ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/route_list.rs", include_str!("../kinds/route_list.rs")),
+    ("settings/kinds/secret.rs", include_str!("../kinds/secret.rs")),
     ("settings/kinds/switch.rs", include_str!("../kinds/switch.rs")),
     ("settings/kinds/text.rs", include_str!("../kinds/text.rs")),
     ("settings/kinds/time_zone.rs", include_str!("../kinds/time_zone.rs")),
@@ -50,6 +52,7 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
     ("settings/registry/schedule.rs", include_str!("../registry/schedule.rs")),
+    ("settings/registry/secrets.rs", include_str!("../registry/secrets.rs")),
     ("settings/registry/stickers.rs", include_str!("../registry/stickers.rs")),
     ("settings/registry/tools.rs", include_str!("../registry/tools.rs")),
     ("settings/registry/voice.rs", include_str!("../registry/voice.rs")),

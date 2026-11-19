@@ -11,6 +11,7 @@ pub(crate) const ALERT_KEY_WINDOW: Setting = Setting {
     label: "Alert deduplication",
     hint: "Seconds between notifications with the same key for this runtime.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const ALERT_HOURLY_CAP: Setting = Setting {
@@ -22,6 +23,7 @@ pub(crate) const ALERT_HOURLY_CAP: Setting = Setting {
     label: "Alerts per hour",
     hint: "Maximum per process in a sliding hour, for each notification budget.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const GATEWAY_SILENCE_WARN: Setting = Setting {
@@ -33,6 +35,7 @@ pub(crate) const GATEWAY_SILENCE_WARN: Setting = Setting {
     label: "Gateway silence warning",
     hint: "Milliseconds without an event packet before the dependency watch reports silence.",
     chat: false,
+    secret: false,
 };
 
 pub(super) const SETTINGS: &[Setting] = &[ALERT_KEY_WINDOW, ALERT_HOURLY_CAP, GATEWAY_SILENCE_WARN];

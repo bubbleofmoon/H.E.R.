@@ -13,6 +13,7 @@ macro_rules! tool {
             label: $flag,
             hint: "Controls this tool wherever the current conversation's menu permits it.",
             chat: false,
+            secret: false,
         }
     };
 }

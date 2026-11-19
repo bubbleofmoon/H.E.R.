@@ -182,9 +182,9 @@ impl RelayModel {
         use genai::chat::{ChatMessage, ChatOptions, ChatRequest, StopReason};
         let mut messages = Vec::with_capacity(2);
         if !system.is_empty() {
-            messages.push(ChatMessage::system(system.to_string()));
+            messages.push(ChatMessage::system(self.route.redact(system)));
         }
-        messages.push(ChatMessage::user(input.to_string()));
+        messages.push(ChatMessage::user(self.route.redact(input)));
         let request = ChatRequest::new(messages);
         let max_tokens = self.max_tokens;
         // #183: a capture the operator armed takes this request as it is handed to the model client.
@@ -218,7 +218,7 @@ impl RelayModel {
         if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
             return Err(Miss::Failed { class: "refusal" });
         }
-        Ok(response.into_first_text().unwrap_or_default())
+        Ok(self.route.redact(&response.into_first_text().unwrap_or_default()))
     }
 }
 

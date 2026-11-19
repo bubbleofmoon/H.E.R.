@@ -13,6 +13,7 @@ macro_rules! setting {
             label: $label,
             hint: $hint,
             chat: $chat,
+            secret: false,
         };
     };
 }

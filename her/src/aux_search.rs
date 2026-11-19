@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::aux_fetch::{self, TransferFn};
 use crate::aux_text::{clamped_int, collapse_js_space, js_string, js_trim, js_truthy, slice_utf16};
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/anthropic/v1";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
@@ -70,133 +70,23 @@ pub fn load_search_config(config: &Value) -> SearchConfig {
 
 // ----- credentials ----------------------------------------------------------------------------------------------------
 
-/// The scalar a YAML block value spells, when js-yaml would load it as a string (`None`: number, bool, null, empty).
-fn yaml_string_scalar(text: &str) -> Option<String> {
-    let t = text.trim();
-    if t.is_empty() {
-        return None;
-    }
-    if let Some(inner) = t.strip_prefix('\'') {
-        let mut out = String::new();
-        let mut chars = inner.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    chars.next();
-                    out.push('\'');
-                    continue;
-                }
-                return Some(out);
-            }
-            out.push(c);
-        }
-        return None;
-    }
-    if t.starts_with('"') {
-        let mut end = None;
-        let mut escaped = false;
-        for (i, c) in t.char_indices().skip(1) {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                end = Some(i);
-                break;
-            }
-        }
-        return serde_json::from_str::<String>(&t[..=end?]).ok();
-    }
-    // plain scalar: a comment starts at " #"; "a: b" on one line is a YAML error (the whole file fails to load)
-    let plain = t.split(" #").next().unwrap_or(t).trim_end();
-    if plain.contains(": ") || plain.ends_with(':') {
-        return None;
-    }
-    let lower = plain.to_ascii_lowercase();
-    // js-yaml core schema: these plain scalars load as null / bool / number, not as a string.
-    let numeric = plain.replace('_', "").parse::<f64>().is_ok_and(|n| n.is_finite())
-        && plain.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E' | b'_'))
-        || lower.strip_prefix("0x").is_some_and(|d| !d.is_empty() && d.chars().all(|c| c.is_ascii_hexdigit()))
-        || lower.strip_prefix("0o").is_some_and(|d| !d.is_empty() && d.chars().all(|c| ('0'..='7').contains(&c)))
-        || matches!(lower.as_str(), ".inf" | "+.inf" | "-.inf" | ".nan");
-    if numeric || matches!(lower.as_str(), "true" | "false" | "null" | "~") || plain.is_empty() {
-        return None;
-    }
-    Some(plain.to_string())
-}
-
-/// `refs.<name>` of a DSH `.credentials.yaml` (block mapping; only the named ref is ever read).
-pub fn credential_from_yaml(text: &str, name: &str) -> String {
-    let name = js_trim(name);
-    if name.is_empty() {
-        return String::new();
-    }
-    let mut in_refs = false;
-    for line in text.trim_start_matches('\u{feff}').lines() {
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if !indented {
-            let Some(rest) = line.trim_end().strip_prefix("refs:") else {
-                in_refs = false;
-                continue;
-            };
-            let rest = rest.trim();
-            if let Some(flow) = rest.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
-                in_refs = false;
-                for pair in flow.split(',') {
-                    if let Some((key, value)) = pair.split_once(':') {
-                        if key.trim().trim_matches(|c| c == '"' || c == '\'') == name {
-                            return yaml_string_scalar(value).map(|s| js_trim(&s).to_string()).unwrap_or_default();
-                        }
-                    }
-                }
-                continue;
-            }
-            in_refs = rest.is_empty() || rest.starts_with('#');
-            continue;
-        }
-        if !in_refs {
-            continue;
-        }
-        let body = line.trim_start();
-        let Some((key, value)) = body.split_once(':') else { continue };
-        let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
-        if key == name {
-            return yaml_string_scalar(value).map(|s| js_trim(&s).to_string()).unwrap_or_default();
+fn resolve_api_key(
+    context: &RuntimeContext, config: &SearchConfig, base_url: &str, env: impl FnOnce(&str) -> Option<String>,
+) -> Result<Option<String>, SearchError> {
+    if let Some(endpoint) = secret_endpoint(base_url) {
+        let stored = crate::settings::secret_value(context, &crate::settings::WEB_SEARCH_API_KEY, &endpoint)
+            .map_err(|_| SearchError::new("STORE_ERROR", "主搜索凭据存储不可用"))?;
+        if stored.is_some() {
+            return Ok(stored);
         }
     }
-    String::new()
-}
-
-fn dsh_credential(context: &RuntimeContext, name: &str) -> String {
-    let text = if context.is_isolated() {
-        context.read_text(RuntimeArea::DshUser, ".credentials.yaml").ok()
-    } else {
-        let home = std::env::var_os("DSH_HOME")
-            .filter(|v| !v.is_empty())
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(crate::install_root::legacy_dsh_home)
-            });
-        home.and_then(|h| std::fs::read_to_string(h.join(".credentials.yaml")).ok())
-    };
-    text.map(|t| credential_from_yaml(&t, name)).unwrap_or_default()
-}
-
-/// Config literal, then the named environment variable, then DSH's credential store.
-fn resolve_api_key(context: &RuntimeContext, config: &SearchConfig) -> Option<String> {
     let literal = js_trim(&config.api_key);
     if !literal.is_empty() {
-        return Some(literal.to_string());
+        return Ok(Some(literal.to_string()));
     }
-    let from_env = std::env::var(&config.api_key_env).map(|v| js_trim(&v).to_string()).unwrap_or_default();
-    if !from_env.is_empty() {
-        return Some(from_env);
-    }
-    let from_dsh = dsh_credential(context, &config.api_key_env);
-    (!from_dsh.is_empty()).then_some(from_dsh)
+    Ok(env(&config.api_key_env)
+        .map(|key| js_trim(&key).to_string())
+        .filter(|key| !key.is_empty()))
 }
 
 // ----- result mapping -------------------------------------------------------------------------------------------------
@@ -390,6 +280,31 @@ pub struct Network<'a> {
     pub transfer: &'a TransferFn<'a>,
 }
 
+fn search_base_url(config: &SearchConfig) -> String {
+    if !config.base_url.is_empty() {
+        return config.base_url.clone();
+    }
+    std::env::var("DEEPSEEK_SEARCH_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+}
+
+fn secret_endpoint(base_url: &str) -> Option<String> {
+    let url = Url::parse(js_trim(base_url)).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none())
+    .then(|| url.as_str().trim_end_matches('/').to_string())
+}
+
+pub(crate) fn settings_endpoint(document: &Value) -> Option<String> {
+    secret_endpoint(&search_base_url(&load_search_config(document)))
+}
+
 fn validate_search_endpoint(base_url: &str, net: &Network) -> Result<(Url, Vec<IpAddr>), String> {
     let url = Url::parse(js_trim(base_url)).map_err(|_| "webSearch.baseURL 无效".to_string())?;
     if url.scheme() != "https" {
@@ -404,12 +319,9 @@ fn validate_search_endpoint(base_url: &str, net: &Network) -> Result<(Url, Vec<I
 }
 
 fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext, net: &Network) -> Result<Vec<Value>, SearchError> {
-    let key = resolve_api_key(context, config).ok_or_else(|| SearchError::new("NO_KEY", "没有可用的主搜索 API key"))?;
-    let base_url = if !config.base_url.is_empty() {
-        config.base_url.clone()
-    } else {
-        std::env::var("DEEPSEEK_SEARCH_BASE_URL").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
-    };
+    let base_url = search_base_url(config);
+    let key = resolve_api_key(context, config, &base_url, |name| std::env::var(name).ok())?
+        .ok_or_else(|| SearchError::new("NO_KEY", "没有可用的主搜索 API key"))?;
     let plain = |message: String| SearchError::new("", message);
     let (url, addresses) = validate_search_endpoint(&base_url, net).map_err(plain)?;
     let endpoint = Url::parse(&format!("{}/messages", url.as_str().trim_end_matches('/'))).map_err(|_| plain("webSearch.baseURL 无效".to_string()))?;
@@ -428,7 +340,8 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
         ("accept".to_string(), "application/json".to_string()),
         ("user-agent".to_string(), "qq-bridge-web-search/0.2.0".to_string()),
     ];
-    let (status, text) = aux_fetch::post_json_with(&endpoint, &addresses, headers, &body, Duration::from_millis(config.timeout_ms as u64), MAX_RESPONSE_BYTES, net.transfer).map_err(plain)?;
+    let (status, text) = aux_fetch::post_json_with(&endpoint, &addresses, headers, &body, Duration::from_millis(config.timeout_ms as u64), MAX_RESPONSE_BYTES, net.transfer)
+        .map_err(|error| plain(crate::harness::redact_credential(&error, &key)))?;
     if !(200..300).contains(&status) {
         // only the HTTP status and a short error text from the body; never the request headers (they hold the key)
         let detail = serde_json::from_str::<Value>(&text)
@@ -440,7 +353,7 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
                     None => None,
                 }
                 .or_else(|| parsed.get("message").and_then(Value::as_str).map(str::to_string));
-                message.map(|m| slice_utf16(&m, 200))
+                message.map(|m| slice_utf16(&crate::harness::redact_credential(&m, &key), 200))
             })
             .unwrap_or_default();
         // The provider's own error text stays in the log; the model reads the HTTP status only.
@@ -449,7 +362,8 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
         }
         return Err(SearchError::new("HTTP_ERROR", format!("主搜索接口 HTTP {status}")));
     }
-    let parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主搜索接口返回了无法解析的响应"))?;
+    let mut parsed: Value = serde_json::from_str(&text).map_err(|_| SearchError::new("BAD_BODY", "主搜索接口返回了无法解析的响应"))?;
+    crate::harness::redact(&mut parsed, std::slice::from_ref(&key));
     map_deepseek_response(&parsed, config.max_results as usize)
 }
 
@@ -457,7 +371,7 @@ fn deepseek_search(query: &str, config: &SearchConfig, context: &RuntimeContext,
 /// HTTP status), never the endpoint's or the transport's own wording, which goes to the log.
 fn primary_failure_text(error: &SearchError) -> String {
     match error.code {
-        "NO_KEY" | "HTTP_ERROR" | "BAD_BODY" | "NO_RESULT_BLOCK" => error.message.clone(),
+        "NO_KEY" | "STORE_ERROR" | "HTTP_ERROR" | "BAD_BODY" | "NO_RESULT_BLOCK" => error.message.clone(),
         _ => {
             crate::safe_eprintln!("[web_search] 主搜索失败：{}", error.message);
             "主搜索暂时不可用".to_string()
@@ -516,7 +430,12 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
     }
     let config = load_search_config(config_value);
     let wanted = config.provider.clone();
-    let cache_key = answer_key(&wanted, q, &config);
+    let cache_key = json!([
+        answer_key(&wanted, q, &config),
+        context.runtime_root().map(|root| root.as_os_str().to_string_lossy()),
+        secret_endpoint(&search_base_url(&config)),
+        crate::settings::secret_revision(context, &crate::settings::WEB_SEARCH_API_KEY),
+    ]).to_string();
     let cache = CACHE.get_or_init(|| Mutex::new((Vec::new(), HashMap::new())));
     if let Some((at, value)) = cache.lock().ok().and_then(|c| c.1.get(&cache_key).cloned()) {
         if at.elapsed() < CACHE_TTL {
@@ -619,6 +538,17 @@ mod tests {
     }
 
     #[test]
+    fn ticket219_core_search_keeps_its_explicit_environment_fallback() {
+        let context = RuntimeContext::legacy();
+        let config = load_search_config(&json!({"webSearch": {"apiKeyEnv": "HER_FIXTURE_SEARCH_KEY"}}));
+        let key = resolve_api_key(&context, &config, "https://search.example.test/v1", |name| {
+            assert_eq!(name, "HER_FIXTURE_SEARCH_KEY");
+            Some(" fixture-environment-value ".to_string())
+        }).unwrap();
+        assert_eq!(key.as_deref(), Some("fixture-environment-value"), "named search fallback was lost");
+    }
+
+    #[test]
     fn a_changed_search_model_is_asked_afresh() {
         let config = |model: &str| load_search_config(&json!({"webSearch": {"model": model}}));
         assert_ne!(
@@ -633,13 +563,5 @@ mod tests {
             answer_key("auto", "q", &config("a|8|b")),
             "query and model never run together"
         );
-    }
-
-    #[test]
-    fn dsh_credentials_read_like_the_frozen_js() {
-        for case in oracle()["credentials"].as_array().unwrap() {
-            let got = credential_from_yaml(case["yaml"].as_str().unwrap(), case["name"].as_str().unwrap());
-            assert_eq!(json!(got), case["out"], "yaml: {:?} name: {:?}", case["yaml"], case["name"]);
-        }
     }
 }

@@ -10,11 +10,13 @@ mod model;
 mod prompt;
 mod reply;
 mod schedule;
+mod secrets;
 mod stickers;
 mod tools;
 mod voice;
 
 pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE};
+pub(crate) use secrets::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 
 pub(crate) use media::{MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS};
 pub(crate) use stickers::{COLLECT_BYTES, COLLECT_ENABLED, COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK,
@@ -55,6 +57,7 @@ const GROUPS: &[&[Setting]] = &[
     engine::SETTINGS,
     memory::SETTINGS,
     schedule::SETTINGS,
+    secrets::SETTINGS,
 ];
 
 /// Global settings whose defaults and file normalization are applied by the runtime loader.
@@ -92,5 +95,9 @@ pub(crate) fn find(key: &str) -> Option<&'static Setting> {
 
 /// The registry setting the owner's chat names `name` (`Setting::chat_name`), when the chat may use it.
 pub(crate) fn chat_setting(name: &str) -> Option<&'static Setting> {
-    registry().find(|setting| setting.chat && setting.chat_name() == name)
+    chat_registry().find(|setting| setting.chat_name() == name)
+}
+
+pub(crate) fn chat_registry() -> impl Iterator<Item = &'static Setting> {
+    registry().filter(|setting| setting.chat && !setting.secret)
 }

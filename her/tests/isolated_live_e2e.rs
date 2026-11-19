@@ -580,7 +580,7 @@ fn selected_runtime_fixture(root: &Path, dependencies: &Value) {
     .expect("write selected persona library");
     fs::write(
         root.join("user/dsh/.credentials.yaml"),
-        format!("secret: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\nOPENCODE_GO_API_KEY: \"{MODEL_KEY}\"\n"),
+        "secret: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
     )
     .expect("write synthetic selected DSH credential fixture");
     fs::write(root.join("dependencies.json"), dependencies.to_string())
@@ -1184,6 +1184,23 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     });
     let epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
     let (_console, console_port) = CompanionConsole::start(root.path(), ambient_root.path(), epoch);
+    let provision = (|| -> std::io::Result<()> {
+        let body = json!({"setting": "cliModel.apiKey", "value": MODEL_KEY}).to_string();
+        let mut settings = TcpStream::connect(("127.0.0.1", console_port))?;
+        settings.set_read_timeout(Some(Duration::from_secs(10)))?;
+        write!(settings, "POST /api/settings/set HTTP/1.1\r\nHost: 127.0.0.1:{console_port}\r\nContent-Type: application/json\r\nx-console-token: ticket04-console-token\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+        let mut reply = String::new();
+        settings.read_to_string(&mut reply)?;
+        if !reply.starts_with("HTTP/1.1 200 ") || reply.contains(MODEL_KEY) {
+            return Err(std::io::Error::other("fixture credential provisioning failed"));
+        }
+        Ok(())
+    })();
+    if let Err(error) = provision {
+        stop.store(true, Ordering::SeqCst);
+        let _ = onebot_thread.join();
+        panic!("{error}");
+    }
     let model_stop = stop.clone();
     let model_thread = thread::spawn(move || serve_model(model_listener, model_stop));
     let dsh_stop = stop.clone();
@@ -1305,20 +1322,16 @@ fn isolated_live_cli_routes_selected_ws_prompt_model_and_onebot_through_fake_end
     assert_eq!(snapshot["partial"], false);
     assert_eq!(model.body["ambientSentinel"], Value::Null);
 
-    let dsh_home = root.path().join("user/dsh");
-    assert_runtime_path(&model.body, "home", &dsh_home);
-    assert_runtime_path(&model.body, "userProfile", &dsh_home);
-    assert_runtime_path(&model.body, "dshHome", &dsh_home);
-    assert_runtime_path(
-        &model.body,
-        "dshCredentials",
-        &dsh_home.join(".credentials.yaml"),
-    );
-    assert_runtime_path(&model.body, "appData", &dsh_home.join("AppData/Roaming"));
-    assert_runtime_path(&model.body, "localAppData", &dsh_home.join("AppData/Local"));
-    assert_runtime_path(&model.body, "xdgConfig", &dsh_home.join(".config"));
-    assert_runtime_path(&model.body, "xdgCache", &dsh_home.join(".cache"));
-    assert_runtime_path(&model.body, "xdgData", &dsh_home.join(".local/share"));
+    let profile = root.path().join("data/cli-profile");
+    assert_runtime_path(&model.body, "home", &profile);
+    assert_runtime_path(&model.body, "userProfile", &profile);
+    assert_eq!(model.body["dshHome"], Value::Null);
+    assert_eq!(model.body["dshCredentials"], Value::Null);
+    assert_runtime_path(&model.body, "appData", &profile.join("AppData/Roaming"));
+    assert_runtime_path(&model.body, "localAppData", &profile.join("AppData/Local"));
+    assert_runtime_path(&model.body, "xdgConfig", &profile.join(".config"));
+    assert_runtime_path(&model.body, "xdgCache", &profile.join(".cache"));
+    assert_runtime_path(&model.body, "xdgData", &profile.join(".local/share"));
     assert_runtime_path(&model.body, "temp", &root.path().join("data/tmp"));
     assert_runtime_path(&model.body, "tmp", &root.path().join("data/tmp"));
     assert_runtime_path(&model.body, "cwd", &root.path().join("resources"));
