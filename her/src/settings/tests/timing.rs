@@ -45,6 +45,10 @@ fn wake_budget_batch_checks_ceiling_and_wait_before_committing() {
     assert_eq!(reply["error"], "wake.turnHardCapMs must be <= wake.turnCeilingMs");
     let (status, reply) = page(json!({"wait": {"batchMaxMs": 120_000, "minQuietAfterNewMs": 120_001}}));
     assert_eq!(status, 400, "a wait-only write must preserve an explicit cap: {reply}");
+    assert_eq!(
+        reply["error"],
+        "reserved2 turn budget is invalid: turnHardCapMs must be an integer at least the pre-sleep observation plus the wait's quiet extension plus 30000 ms"
+    );
     assert_eq!(audit_rows(&root), rows);
     assert_eq!(stored_config(&root), before);
 
@@ -80,6 +84,68 @@ fn wake_batch_chat_write_refreshes_inherited_plans() {
     finish_settings_write_back(&context);
     let restarted = context.read_social_state().unwrap();
     assert_eq!(restarted["conversations"]["group:101"]["wakeConfig"]["batchWindowMs"], 4500, "startup repairs an interrupted plan refresh");
+}
+
+#[test]
+fn restart_preserves_inherited_wake_plan_sleep_until() {
+    let (root, context) = chat_fixture("inherited wake restart");
+    write_config(&root, |cfg| {
+        cfg["socialV2"]["wake"]["recommendedDefaultInfinite"] = json!(false);
+    });
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "wake.batchWindowMs", "value": 4500}));
+    assert_eq!(status, 200, "{reply}");
+    let mut plan = crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5);
+    let sleep_until = json!("2099-06-01T00:00:00.000Z");
+    plan["sleepUntil"] = sleep_until.clone();
+    let mut stale = plan.clone();
+    stale["triggers"]["probability"] = json!(0.75);
+    let mut state = context.read_social_state().unwrap();
+    state["conversations"]["group:101"]["wakeConfig"] = plan.clone();
+    state["conversations"][OWNER_CHAT]["wakeConfig"] = stale;
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+
+    finish_settings_write_back(&context);
+
+    let restarted = context.read_social_state().unwrap();
+    let current = &restarted["conversations"]["group:101"]["wakeConfig"];
+    assert_eq!(current["sleepUntil"], sleep_until, "restart must preserve the inherited sleepUntil");
+    assert_eq!(current, &plan, "an up-to-date inherited plan stays unchanged");
+    assert_eq!(restarted["conversations"][OWNER_CHAT]["wakeConfig"], plan, "restart repairs stale probability without changing sleepUntil");
+}
+
+#[test]
+fn proactive_and_wait_range_refusals_keep_config_and_audit() {
+    let (root, context) = settings_fixture("proactive and wait ranges");
+    let page = |body| post(&context, "/api/socialV2/config", body);
+    let (status, reply) = page(json!({
+        "proactive": {"checkIntervalMinMs": 60_000, "checkIntervalMaxMs": 60_000},
+        "wait": {"minMs": 1000, "maxMs": 1000}
+    }));
+    assert_eq!(status, 200, "{reply}");
+    let path = root.0.join("config/config.json");
+    let before = std::fs::read(&path).unwrap();
+    let rows = audit_rows(&root);
+
+    for (body, error) in [
+        (json!({"proactive": {"checkIntervalMinMs": 60_001}}), "proactive.checkIntervalMinMs <= proactive.checkIntervalMaxMs is required"),
+        (json!({"wait": {"maxMs": 999}}), "wait.minMs <= wait.maxMs is required"),
+    ] {
+        let (status, reply) = page(body);
+        assert_eq!(status, 400, "{reply}");
+        assert_eq!(reply["error"], error);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(audit_rows(&root), rows);
+    }
+}
+
+#[test]
+fn legacy_wake_preemption_clamps_to_the_two_hour_limit() {
+    let (root, context) = settings_fixture("legacy wake preemption");
+    for (configured, expected) in [(0, 0), (7_199_999, 7_199_999), (7_200_000, 7_200_000), (7_200_001, 7_200_000)] {
+        write_config(&root, |cfg| cfg["socialV2"]["wake"]["preemptAfterMs"] = json!(configured));
+        let cfg = crate::wake_cfg_of(&context.load_config().unwrap());
+        assert_eq!(cfg.preempt_after_ms, expected, "configured preemptAfterMs {configured}");
+    }
 }
 
 #[test]

@@ -126,8 +126,12 @@ fn validate_timing(
     removed: Option<&Setting>,
 ) -> Result<(), (u16, String)> {
     let turn = super::wake_timing::TURN_FIELDS.iter().any(|setting| written.contains(&setting.key));
-    let send = super::send::ORDERED.iter().flatten().any(|setting| written.contains(&setting.key));
-    if !turn && !send && !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
+    let mut ordered = super::send::ORDERED
+        .iter()
+        .chain(&super::wake_timing::ORDERED)
+        .filter(|pair| pair.iter().any(|setting| written.contains(&setting.key)))
+        .peekable();
+    if !turn && ordered.peek().is_none() && !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
         return Ok(());
     }
     let mut candidate = document.clone();
@@ -142,13 +146,9 @@ fn validate_timing(
     if turn {
         crate::wake::validate_turn_settings(&candidate).map_err(|error| (400, error.to_string()))?;
     }
-    if send {
-        for [min, max] in &super::send::ORDERED {
-            if [min, max].iter().any(|setting| written.contains(&setting.key))
-                && min.integer(&candidate) > max.integer(&candidate)
-            {
-                return Err((400, format!("{} <= {} is required", min.key, max.key)));
-            }
+    for [min, max] in ordered {
+        if min.integer(&candidate) > max.integer(&candidate) {
+            return Err((400, format!("{} <= {} is required", min.key, max.key)));
         }
     }
     for [min, median, max] in &super::reply::WINDOWS {
@@ -1063,17 +1063,22 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
     Ok(changed)
 }
 
-/// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
-/// cannot be read. Reads only: nothing is created.
-pub(crate) fn has_wake_plan_history(context: &RuntimeContext) -> bool {
-    let Ok(Inspection::Ready(conn)) = inspect(context) else { return false };
+/// Whether the global audit records a wake batch window or default wake probability write, including an undo.
+/// Legacy contexts and stores without a schema have no history. Reads only.
+pub(crate) fn has_wake_plan_history(context: &RuntimeContext) -> Result<bool, String> {
+    if !context.is_isolated() {
+        return Ok(false);
+    }
+    let Inspection::Ready(conn) = inspect(context)? else { return Ok(false) };
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM settings_audit WHERE scope='global' AND key IN (?1, ?2))",
         params![super::wake_timing::BATCH.key, super::wake_timing::RECOMMENDED_PROBABILITY.key],
         |row| row.get(0),
-    ).unwrap_or(false)
+    ).map_err(|error| error.to_string())
 }
 
+/// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
+/// cannot be read. Reads only: nothing is created.
 pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
     context.is_isolated() && stored_values(context).is_ok_and(|stored| !stored.is_empty())
 }
