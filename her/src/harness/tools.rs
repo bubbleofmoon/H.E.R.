@@ -300,7 +300,7 @@ fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
                 menu.contains(&name)
-                    && direct_send_switch(name).is_none_or(|flag| flag == "sendPrivate" || crate::settings::tool_enabled(cfg, flag)) // RED-T1
+                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
             })
         })
         .collect()
