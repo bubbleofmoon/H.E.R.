@@ -514,7 +514,7 @@ fn send_voice_core(
 ) -> Result<Sent, Failure> {
     let file_name = args.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     if let Some(mute) = crate::group_mute::active(context, args.key) {
-        return Err(Failure::Refused(mute.refusal_text(crate::parity_clock::now_ms())));
+        return Err(Failure::Refused(mute.refusal_text(crate::parity_clock::now_ms(), cfg)));
     }
     if should_audit_key(context, cfg, args.key) {
         let subject = format!("[语音:{file_name}]");
@@ -606,7 +606,7 @@ fn send_processed(
         }
         ItemState::NotCommitted if crate::onebot::is_mute_refusal(&error) => Err(Failure::Refused(
             crate::group_mute::active(context, args.key)
-                .map(|mute| mute.refusal_text(crate::parity_clock::now_ms()))
+                .map(|mute| mute.refusal_text(crate::parity_clock::now_ms(), cfg))
                 .unwrap_or(error),
         )),
         ItemState::NotCommitted => Err(Failure::Outcome { outcome: "not_committed", message: error, batch_id }),

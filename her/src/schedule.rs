@@ -75,7 +75,7 @@ impl Repeat {
     }
 
     /// The next slot after `now` for a repeat whose last slot was `at`; `None` for one-off items.
-    pub fn next_after(self, at: i64, now: i64) -> Option<i64> {
+    pub fn next_after(self, at: i64, now: i64, zone: &jiff::tz::TimeZone) -> Option<i64> {
         match self {
             Repeat::Once => None,
             Repeat::Every { minutes } => {
@@ -91,7 +91,7 @@ impl Repeat {
             Repeat::Daily { hour, minute } => crate::tasks::next_due(
                 crate::tasks::Schedule::Daily { hour, minute },
                 now,
-                crate::tasks::local_offset_ms(),
+                zone,
             ),
         }
     }
@@ -522,7 +522,7 @@ impl ScheduleStore {
 
     /// Items due at `now`, at most one per conversation, earliest first. Each claimed item is marked
     /// as run before it is returned, so a crash after the claim loses the run rather than repeating it.
-    pub fn claim_due(&self, now: i64, deliverable: impl Fn(&str) -> bool) -> Result<Vec<Item>, StoreError> {
+    pub fn claim_due(&self, now: i64, zone: &jiff::tz::TimeZone, deliverable: impl Fn(&str) -> bool) -> Result<Vec<Item>, StoreError> {
         let is_due = |item: &Item| {
             (item.run_now && matches!(item.status, ItemStatus::Active | ItemStatus::Paused))
                 || (item.status == ItemStatus::Active && item.next_at <= now)
@@ -556,7 +556,7 @@ impl ScheduleStore {
                     item.status = ItemStatus::Done;
                     item.finished_at = Some(now);
                 } else if item.next_at <= now {
-                    item.next_at = item.repeat.next_after(item.next_at, now).unwrap_or(item.next_at + 60_000);
+                    item.next_at = item.repeat.next_after(item.next_at, now, zone).unwrap_or(item.next_at + 60_000);
                 }
                 item.last_result = Some(RunResult { at: now, summary: summary.clone(), late });
                 history.push(HistoryRecord {
@@ -854,19 +854,19 @@ mod tests {
 
         // A new store over the same file stands in for the restart.
         let later = NOW + 3 * DAY;
-        let claimed = ScheduleStore::new(&fixture.context()).claim_due(later, |_| true).unwrap();
+        let claimed = ScheduleStore::new(&fixture.context()).claim_due(later, &jiff::tz::TimeZone::UTC, |_| true).unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].id, item.id);
         assert!(claimed[0].last_result.as_ref().unwrap().late);
         assert!(claimed[0].next_at > later, "a missed repeat jumps to the next slot after now");
 
-        let again = ScheduleStore::new(&fixture.context()).claim_due(later + 1_000, |_| true).unwrap();
+        let again = ScheduleStore::new(&fixture.context()).claim_due(later + 1_000, &jiff::tz::TimeZone::UTC, |_| true).unwrap();
         assert!(again.is_empty());
 
         // The slot boundary: a last slot strictly after now is kept; one at or before now moves forward.
         let every = Repeat::Every { minutes: 60 };
-        assert_eq!(every.next_after(NOW + 1, NOW), Some(NOW + 1));
-        assert_eq!(every.next_after(NOW, NOW), Some(NOW + 3_600_000));
+        assert_eq!(every.next_after(NOW + 1, NOW, &jiff::tz::TimeZone::UTC), Some(NOW + 1));
+        assert_eq!(every.next_after(NOW, NOW, &jiff::tz::TimeZone::UTC), Some(NOW + 3_600_000));
     }
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
         let late = store.create(owner("group:2", "乙", at, Repeat::Once), NOW).unwrap();
 
         // Exactly the grace period after the slot is still on time.
-        let on_grace = store.claim_due(at + LATE_GRACE_MS, |key| key == "group:1").unwrap();
+        let on_grace = store.claim_due(at + LATE_GRACE_MS, &jiff::tz::TimeZone::UTC, |key| key == "group:1").unwrap();
         assert_eq!(on_grace.len(), 1);
         assert_eq!(on_grace[0].id, on_time.id);
         let result = on_grace[0].last_result.clone().unwrap();
@@ -887,14 +887,14 @@ mod tests {
         assert_eq!(on_grace[0].status, ItemStatus::Done);
 
         // One millisecond more is late.
-        let over = store.claim_due(at + LATE_GRACE_MS + 1, |_| true).unwrap();
+        let over = store.claim_due(at + LATE_GRACE_MS + 1, &jiff::tz::TimeZone::UTC, |_| true).unwrap();
         assert_eq!(over.len(), 1);
         assert_eq!(over[0].id, late.id);
         let result = over[0].last_result.clone().unwrap();
         assert!(result.late);
         assert_eq!(result.summary, "迟到 1 分钟后运行一次");
         assert_eq!(over[0].status, ItemStatus::Done);
-        assert!(store.claim_due(at + 10 * 60_000, |_| true).unwrap().is_empty());
+        assert!(store.claim_due(at + 10 * 60_000, &jiff::tz::TimeZone::UTC, |_| true).unwrap().is_empty());
     }
 
     #[test]
@@ -915,16 +915,16 @@ mod tests {
             .unwrap();
         let paused = store.set_item_paused(&item.id, true).unwrap();
         assert_eq!(paused.status, ItemStatus::Paused);
-        assert!(store.claim_due(NOW + 3 * DAY, |_| true).unwrap().is_empty(), "a paused reminder waits");
+        assert!(store.claim_due(NOW + 3 * DAY, &jiff::tz::TimeZone::UTC, |_| true).unwrap().is_empty(), "a paused reminder waits");
 
         store.run_now(&item.id).unwrap();
-        let claimed = store.claim_due(NOW + 3 * DAY + 1, |_| true).unwrap();
+        let claimed = store.claim_due(NOW + 3 * DAY + 1, &jiff::tz::TimeZone::UTC, |_| true).unwrap();
         assert_eq!(claimed.len(), 1);
         let result = claimed[0].last_result.clone().unwrap();
         assert_eq!(result.summary, "立即运行");
         assert!(!result.late);
         assert_eq!(claimed[0].status, ItemStatus::Done);
-        assert!(store.claim_due(NOW + 3 * DAY + 2, |_| true).unwrap().is_empty(), "a run now fires once");
+        assert!(store.claim_due(NOW + 3 * DAY + 2, &jiff::tz::TimeZone::UTC, |_| true).unwrap().is_empty(), "a run now fires once");
     }
 
     #[test]
@@ -937,11 +937,11 @@ mod tests {
         let other = store.create(owner("group:2", "三", at + 2_000, Repeat::Once), NOW).unwrap();
 
         let later = at + 10_000;
-        let claimed = store.claim_due(later, |key| key != "group:2").unwrap();
+        let claimed = store.claim_due(later, &jiff::tz::TimeZone::UTC, |key| key != "group:2").unwrap();
         let ids: Vec<&str> = claimed.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(ids, vec![first.id.as_str()]);
 
-        let next = store.claim_due(later, |_| true).unwrap();
+        let next = store.claim_due(later, &jiff::tz::TimeZone::UTC, |_| true).unwrap();
         let ids: Vec<&str> = next.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(ids, vec![second.id.as_str(), other.id.as_str()]);
     }
@@ -996,7 +996,7 @@ mod tests {
         assert!(matches!(store.update_item(&item.id, ItemChange::default(), NOW), Err(StoreError::Conflict(_))));
         assert!(matches!(store.cancel(&item.id, NOW), Err(StoreError::Conflict(_))));
         assert!(matches!(store.run_now(&item.id), Err(StoreError::Conflict(_))));
-        assert!(store.claim_due(NOW + 3 * DAY, |_| true).unwrap().iter().all(|claimed| claimed.id != item.id));
+        assert!(store.claim_due(NOW + 3 * DAY, &jiff::tz::TimeZone::UTC, |_| true).unwrap().iter().all(|claimed| claimed.id != item.id));
     }
 
     #[test]
@@ -1157,7 +1157,7 @@ mod tests {
         std::fs::write(fixture.0.join("data/schedule.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
 
         let store = ScheduleStore::new(&context);
-        let claimed = store.claim_due(NOW + 180 * DAY, |_| true).unwrap();
+        let claimed = store.claim_due(NOW + 180 * DAY, &jiff::tz::TimeZone::UTC, |_| true).unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].id, "rem-ahead");
         let kept = store.item("rem-ahead").unwrap().expect("the claiming write keeps the reminder it dispatches");

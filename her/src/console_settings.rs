@@ -241,9 +241,10 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
 }
 
 /// Lists every setting from `GET /api/settings` with set (`POST /api/settings/set`) and reset
-/// (`POST /api/settings/reset`) buttons. Integer and number settings use numeric inputs, switches use checkboxes,
-/// and text and route lists use text areas. Route lists are parsed as JSON. Id lists accept comma- or space-separated
-/// ids. Model ids, route ids, owner ids and choices use text inputs. The page also shows the history from
+/// (`POST /api/settings/reset`) buttons. Integers and numbers use numeric inputs, daily times use time inputs,
+/// and switches use checkboxes. Text and route lists use text areas, with route lists parsed as JSON. Id lists
+/// accept comma- or space-separated ids. Model ids, route ids, owner ids, choices and time zones use text inputs.
+/// The page also shows the history from
 /// `GET /api/settings/history`, newest first, with an undo button per entry (`POST /api/settings/undo`) and an
 /// older-entries button. A set, reset or undo of a security
 /// setting (`confirm` in the list) first asks with `window.confirm` and then sends `"confirm": true`; the owner's
@@ -288,6 +289,9 @@ async function list(){
       input.max=s.kind.max;
       if(type==='number')input.step='any';
       input.value=s.value==null?'':s.value;
+    }else if(type==='daily time'){
+      input.type='time';
+      input.value=s.value;
     }else if(type==='switch'){
       input.type='checkbox';
       input.checked=s.value===true;

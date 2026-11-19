@@ -1054,6 +1054,7 @@ impl RuntimeContext {
         // authenticate use `effective_console_token`.
         let (mut config, _) = crate::config::canonical_config(raw)
             .map_err(|_| "runtime config is invalid")?;
+        crate::settings::resolve_config(&mut config);
         crate::backup::Settings::from_config(self.runtime_root().ok_or("backup requires a runtime root")?, &config)
             .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
         // The live closed-agent process mirrors DSH's qq-mode owner override here so the

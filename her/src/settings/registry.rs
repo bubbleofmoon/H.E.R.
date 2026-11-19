@@ -5,12 +5,16 @@ mod access;
 mod alerts;
 mod engine;
 mod media;
+mod memory;
 mod model;
 mod prompt;
 mod reply;
+mod schedule;
 mod stickers;
 mod tools;
 mod voice;
+
+pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE};
 
 pub(crate) use media::{MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS};
 pub(crate) use stickers::{COLLECT_BYTES, COLLECT_ENABLED, COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK,
@@ -21,6 +25,19 @@ pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOIC
 pub(crate) use alerts::{ALERT_HOURLY_CAP, ALERT_KEY_WINDOW, GATEWAY_SILENCE_WARN};
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
+pub(crate) use memory::{material_item_limit,
+    RELATED_TOP_K,
+    AUTO_FLUSH_ENABLED,
+    AUTO_FLUSH_CONTEXT_PCT,
+    AUTO_FLUSH_MAX_SESSIONS,
+    AUTO_FLUSH_MIN_INTERVAL,
+    DIGEST_MAX_INPUT_CHARS,
+    LAYER_IDENTITY,
+    LAYER_RELATIONSHIP,
+    LAYER_CONVERSATION,
+    LAYER_MATERIAL,
+    MATERIAL_ITEMS,
+};
 pub(crate) use model::{
     CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS,
     HARNESS_MODEL, HARNESS_ROUTES, WEB_SEARCH_MODEL,
@@ -31,8 +48,17 @@ use super::{ConversationSetting, Setting};
 /// The group tables in registry order, which is the order the store seeds them and the settings page lists them. A
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
 const GROUPS: &[&[Setting]] = &[
-    reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS,
+    reply::SETTINGS,
+    model::SETTINGS,
+    prompt::SETTINGS,
+    access::SETTINGS,
+    engine::SETTINGS,
+    memory::SETTINGS,
+    schedule::SETTINGS,
 ];
+
+/// Global settings whose defaults and file normalization are applied by the runtime loader.
+pub(super) const RESOLVED_GROUPS: &[&[Setting]] = &[memory::SETTINGS, schedule::SETTINGS];
 
 /// Settings whose effective values are also materialized on the runtime configuration document.
 pub(super) fn live_batch() -> impl Iterator<Item = &'static Setting> {

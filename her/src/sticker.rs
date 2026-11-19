@@ -23,31 +23,7 @@ pub(crate) fn now_iso() -> String {
 
 /// 把毫秒时间戳格式化成 JS `toISOString()` 的形态（UTC，毫秒三位）。
 pub(crate) fn iso_at(ms: i64) -> String {
-    // 桥接用的是 ISO 字符串；这里保持同样的形态，两边文件可以互相覆盖。
-    let secs = ms.div_euclid(1000);
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60,
-        ms.rem_euclid(1000)
-    )
-}
-
-pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    crate::local_time::iso_utc(ms)
 }
 
 /// 清洗文本字段：去控制字符、裁首尾空白、按字符数截断。

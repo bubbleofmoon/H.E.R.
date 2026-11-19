@@ -5,7 +5,7 @@ use crate::settings::{kinds::{FileRule, Integer}, Setting};
 pub(crate) const ALERT_KEY_WINDOW: Setting = Setting {
     key: "alerts.keyWindowSecs",
     pointer: "/alerts/keyWindowSecs",
-    kind: &Integer { min: 1, max: 3_600, default: 60, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 3_600, default: Some(60), file: FileRule::Clamp },
     applies: "live",
     group: "alerts",
     label: "Alert deduplication",
@@ -16,7 +16,7 @@ pub(crate) const ALERT_KEY_WINDOW: Setting = Setting {
 pub(crate) const ALERT_HOURLY_CAP: Setting = Setting {
     key: "alerts.hourlyCap",
     pointer: "/alerts/hourlyCap",
-    kind: &Integer { min: 1, max: 100, default: 10, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 100, default: Some(10), file: FileRule::Clamp },
     applies: "live",
     group: "alerts",
     label: "Alerts per hour",
@@ -27,7 +27,7 @@ pub(crate) const ALERT_HOURLY_CAP: Setting = Setting {
 pub(crate) const GATEWAY_SILENCE_WARN: Setting = Setting {
     key: "snowluma.silenceWarnMs",
     pointer: "/snowluma/silenceWarnMs",
-    kind: &Integer { min: 60_000, max: 86_400_000, default: 600_000, file: FileRule::PositiveClamp },
+    kind: &Integer { min: 60_000, max: 86_400_000, default: Some(600_000), file: FileRule::PositiveClamp },
     applies: "live",
     group: "alerts",
     label: "Gateway silence warning",

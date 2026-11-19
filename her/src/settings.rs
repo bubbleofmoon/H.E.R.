@@ -45,13 +45,24 @@ mod store;
 
 use serde_json::Value;
 
-pub(crate) use kinds::SettingKind;
+pub(crate) use kinds::{daily_parts, SettingKind};
 #[cfg(test)]
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
+    daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
+    RELATED_TOP_K,
+    AUTO_FLUSH_ENABLED,
+    AUTO_FLUSH_CONTEXT_PCT,
+    AUTO_FLUSH_MAX_SESSIONS,
+    AUTO_FLUSH_MIN_INTERVAL,
+    DIGEST_MAX_INPUT_CHARS,
+    LAYER_IDENTITY,
+    LAYER_RELATIONSHIP,
+    LAYER_CONVERSATION,
+    LAYER_MATERIAL,
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
     HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
@@ -70,7 +81,7 @@ pub(crate) use store::{
     console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
     has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
-    registry_free, reset, reset_conversation, resolve_live_batch, restore_gate, restore_switch_choice,
+    registry_free, reset, reset_conversation, resolve_config, resolve_live_batch, restore_gate, restore_switch_choice,
     security_restore, store_mark, store_path, undo, view,
     write_back, Applied, Change, CONVERSATION_ERROR,
 };
@@ -128,7 +139,7 @@ impl Setting {
         self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
     }
 
-    /// The default; `Null` for a model id without one (not configured).
+    /// The default; `Null` can mean unconfigured or use a fallback.
     pub(crate) fn default_value(&self) -> Value {
         self.kind.default_value()
     }
@@ -169,8 +180,7 @@ impl Setting {
         self.read(document).as_i64().unwrap_or_default()
     }
 
-    /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
-    /// one.
+    /// The resolved string of a string-valued setting, if present.
     pub(crate) fn text(&self, document: &Value) -> Option<String> {
         self.read(document).as_str().map(str::to_string)
     }

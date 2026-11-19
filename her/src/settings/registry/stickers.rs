@@ -24,12 +24,12 @@ setting!(
 );
 setting!(
     STICKERS_TTL, "socialV2.sticker.syncTtlMs", "/socialV2/sticker/syncTtlMs",
-    Integer { min: 0, max: 86_400_000, default: 60_000, file: FileRule::SignedClamp },
+    Integer { min: 0, max: 86_400_000, default: Some(60_000), file: FileRule::SignedClamp },
     "Sticker cache age", "Milliseconds before a sticker list is refreshed. Zero refreshes on each eligible request.", false
 );
 setting!(
     STICKERS_LIST, "socialV2.sticker.maxListCount", "/socialV2/sticker/maxListCount",
-    Integer { min: 1, max: 500, default: 100, file: FileRule::SignedClamp },
+    Integer { min: 1, max: 500, default: Some(100), file: FileRule::SignedClamp },
     "Sticker list size", "Maximum number of stickers fetched or shown in a list.", false
 );
 setting!(
@@ -39,7 +39,7 @@ setting!(
 );
 setting!(
     STICKERS_PROMPT_COUNT, "socialV2.sticker.promptMaxStickers", "/socialV2/sticker/promptMaxStickers",
-    Integer { min: 1, max: 30, default: 8, file: FileRule::Clamp },
+    Integer { min: 1, max: 30, default: Some(8), file: FileRule::Clamp },
     "Sticker prompt size", "Maximum number of stickers in the prompt inventory.", false
 );
 setting!(
@@ -49,22 +49,22 @@ setting!(
 );
 setting!(
     COLLECT_MINUTE, "socialV2.sticker.collect.maxPerMinute", "/socialV2/sticker/collect/maxPerMinute",
-    Integer { min: 0, max: 60, default: 0, file: FileRule::SignedClamp },
+    Integer { min: 0, max: 60, default: Some(0), file: FileRule::SignedClamp },
     "Sticker collections per minute", "The minute budget per conversation. Zero disables this budget.", false
 );
 setting!(
     COLLECT_HOUR, "socialV2.sticker.collect.maxPerHour", "/socialV2/sticker/collect/maxPerHour",
-    Integer { min: 0, max: 500, default: 0, file: FileRule::SignedClamp },
+    Integer { min: 0, max: 500, default: Some(0), file: FileRule::SignedClamp },
     "Sticker collections per hour", "The hour budget per conversation. Zero disables this budget.", false
 );
 setting!(
     COLLECT_REMARK, "socialV2.sticker.collect.maxRemarkChars", "/socialV2/sticker/collect/maxRemarkChars",
-    Integer { min: 1, max: 200, default: 20, file: FileRule::SignedClamp },
+    Integer { min: 1, max: 200, default: Some(20), file: FileRule::SignedClamp },
     "Sticker remark length", "Maximum number of characters in a collection remark.", false
 );
 setting!(
     COLLECT_BYTES, "socialV2.sticker.collect.maxBytes", "/socialV2/sticker/collect/maxBytes",
-    Integer { min: 0, max: 20_971_520, default: 8_388_608, file: FileRule::Clamp },
+    Integer { min: 0, max: 20_971_520, default: Some(8_388_608), file: FileRule::Clamp },
     "Sticker collection size", "Maximum source image size in bytes.", true
 );
 pub(super) const SETTINGS: &[Setting] = &[

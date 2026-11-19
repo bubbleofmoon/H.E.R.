@@ -2,6 +2,7 @@
 //! the store, the settings page and the chat tools use, so no code outside this folder matches on a kind.
 
 mod choice;
+mod daily_time;
 mod id_list;
 mod integer;
 mod model_id;
@@ -9,10 +10,12 @@ mod owner_id;
 mod route_id;
 mod route_list;
 mod switch;
-mod voice_number;
 mod text;
+mod time_zone;
+mod voice_number;
 
 pub(crate) use choice::Choice;
+pub(crate) use daily_time::{daily_parts, DailyTime};
 pub(crate) use id_list::IdList;
 #[cfg(test)]
 pub(crate) use id_list::ID_LIST_MAX;
@@ -23,6 +26,7 @@ pub(crate) use route_id::RouteId;
 pub(crate) use route_list::RouteList;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
+pub(crate) use time_zone::TimeZoneName;
 pub(crate) use voice_number::VoiceNumber;
 
 use serde_json::Value;

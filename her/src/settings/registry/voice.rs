@@ -20,7 +20,7 @@ pub(crate) const VOICE_MAX_SECONDS: Setting = voice(
 );
 pub(crate) const VOICE_MAX_BYTES: Setting = voice(
     "socialV2.voice.maxBytes", "/socialV2/voice/maxBytes",
-    &Integer { min: 1, max: 100 * 1024 * 1024, default: crate::voice::DEFAULT_MAX_BYTES as i64, file: FileRule::VoiceBytes },
+    &Integer { min: 1, max: 100 * 1024 * 1024, default: Some(crate::voice::DEFAULT_MAX_BYTES as i64), file: FileRule::VoiceBytes },
     "Voice size", "Maximum source file size in bytes.",
 );
 pub(crate) const VOICE_MAX_MINUTE: Setting = voice(

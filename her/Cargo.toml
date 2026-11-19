@@ -34,6 +34,7 @@ release-test-keys = []
 
 [dependencies]
 genai = "=0.7.3"
+jiff = { version = "=0.2.39", features = ["tzdb-bundle-always"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
