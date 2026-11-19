@@ -6771,15 +6771,16 @@ fn handle_social_config_post(
     };
     // #177: the file as read, to find the registry settings this save changes (`settings::console_changes`).
     let file_before = file.clone();
-    // JS `current`: the file's section when it is an object, else the *effective* section, so a
-    // file without one cannot lose the defaults (a tools save would open the switches that default off).
-    let effective_before = in_memory_social_v2(context, file.get("socialV2"));
-    let current = file
-        .get("socialV2")
-        .filter(|v| v.is_object())
+    // Keep the legacy form defaults when creating the section, including the default-off tool switches.
+    // Registry timing defaults belong to the response and the runtime snapshot.
+    let file_section = file.get("socialV2").filter(|v| v.is_object());
+    let effective_before = in_memory_social_v2(context, file_section);
+    let new_section = file_section.is_none();
+    let current = file_section
         .cloned()
-        .unwrap_or_else(|| effective_before.clone());
-    normalize_social_timing_post(&mut body_v, &current);
+        .unwrap_or_else(|| effective_social_v2(None));
+    let normalization_base = if new_section { &effective_before } else { &current };
+    normalize_social_timing_post(&mut body_v, normalization_base);
     let mut merged = current.as_object().cloned().unwrap_or_default();
     if let Some(b) = body_v.as_object() {
         for (k, v) in b {
@@ -7047,6 +7048,9 @@ fn handle_social_config_post(
         for (name, value) in saved {
             shown.insert(name.clone(), value.clone());
         }
+    }
+    if new_section {
+        shown = social_with_timing(shown);
     }
     Ok(json!({ "ok": true, "config": shown }))
 }
@@ -11670,8 +11674,14 @@ fn handle_social_config(context: &RuntimeContext, cfg: &Value) -> Value {
 fn in_memory_social_v2(context: &RuntimeContext, file_section: Option<&Value>) -> Value {
     match file_section {
         Some(raw) if raw.is_object() && access::config_changed_since_start(context) => raw.clone(),
-        _ => effective_social_v2(file_section),
+        _ => social_with_timing(effective_social_v2(file_section)),
     }
+}
+
+fn social_with_timing(section: Value) -> Value {
+    let mut document = json!({"socialV2": section});
+    crate::settings::complete_timing(&mut document);
+    document["socialV2"].take()
 }
 
 /// The JS `loadConfig` `cfg.socialV2`: the built-in defaults, the file's section on top of them
@@ -11780,9 +11790,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     let prompt_chars = agent::js_number(section.get("initialPromptMaxChars"));
     let prompt_chars = if prompt_chars.is_finite() && prompt_chars > 0.0 { prompt_chars.round().clamp(100.0, 8000.0) } else { 2000.0 };
     section.insert("initialPromptMaxChars".to_string(), json!(prompt_chars as i64));
-    let mut document = json!({"socialV2": section});
-    crate::settings::complete_timing(&mut document);
-    let mut section = document["socialV2"].take();
+    let mut section = Value::Object(section);
     voice_http::apply_config_defaults(&mut section);
     section
 }
@@ -26913,7 +26921,7 @@ mod tests {
         assert_eq!(first["config"]["wake"]["batchWindowMs"], 8000);
         // After a save, the console overlays the timing defaults on the raw section.
         // The unnormalized initialPromptMaxChars still comes back as saved.
-        handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
+        let saved = handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         assert!(file["socialV2"].get("reply").is_none(), "defaults stay out of the saved file");
         assert!(file.pointer("/socialV2/wake/batchWindowMs").is_none(), "the wake timing default stays out of the saved file");
@@ -26929,6 +26937,8 @@ mod tests {
             "urgentQuietMedianMs": 3000,
             "urgentQuietMaxMs": 6000,
         });
+        assert_eq!(saved["config"]["reply"], effective["socialV2"]["reply"]);
+        assert_eq!(saved["config"]["wake"]["batchWindowMs"], 8000);
         let read = handle_social_config(&context, &context.load_config().unwrap());
         assert_eq!(read["config"], effective["socialV2"], "timing defaults overlay the reloaded file section");
         assert_eq!(read["config"]["initialPromptMaxChars"], 5);
