@@ -1401,7 +1401,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             crate::turn_engine::Adapter::Harness => {
                 // Gate waits and a handover can outlast the queued job's route configuration.
                 let fresh = self.context.load_config().map_err(|error| error.to_string())?;
-                let _ = fresh; self.ask_harness(key, prompt, timeout, cfg).await // RED-M27
+                self.ask_harness(key, prompt, timeout, &fresh).await
             }
             #[cfg(test)]
             crate::turn_engine::Adapter::Scripted(script) => self.run_scripted(script, key, prompt),

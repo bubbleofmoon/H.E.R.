@@ -80,7 +80,7 @@ fn clear_retry(context: &RuntimeContext, key: &str) {
 }
 
 fn next_delay(previous: Option<&Retry>) -> i64 {
-    previous.map_or(FIRST_RETRY_MS, |retry| (retry.delay_ms * 2).min(MAX_RETRY_MS))
+    previous.map_or(FIRST_RETRY_MS, |retry| retry.delay_ms * 2) // RED-M24
 }
 
 fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, retry: &Retry, first: bool, class: &str) {
@@ -94,7 +94,7 @@ fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, retry: &Retr
     }
     if !saved {
         crate::safe_println!("[chat] {key} engine switch retry state could not be saved");
-    } else if first {
+    } else if first && class != "engine-switch-pending" { // RED-M21
         crate::admin_alert::notify_notice(context, cfg, &format!("[{key}] 会话引擎切换失败（{class}）"),
             &format!("engine-switch:{key}"));
     }
@@ -327,7 +327,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
         None
     };
     let now = crate::parity_clock::now_ms();
-    if let Some(retry) = previous_retry.as_ref().filter(|retry| now < retry.retry_at_ms && record.pending.is_some()) { // RED-M19
+    if let Some(retry) = previous_retry.as_ref().filter(|retry| now < retry.retry_at_ms) {
         return Ok(if record.pending.is_some() { ParkUntil(retry.retry_at_ms) } else { Ready(source) });
     }
 
@@ -362,7 +362,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
         let retry = Retry { episode, delay_ms, retry_at_ms };
         let class = if can_serve { "engine-switch-prepare" } else { "engine-switch-pending" };
         record_failure(context, &current_cfg, key, &retry, previous_retry.is_none(), class);
-        Ok(if can_serve || pending_exists { Ready(source) } else { ParkUntil(retry_at_ms) }) // RED-M20
+        Ok(if can_serve { Ready(source) } else { ParkUntil(retry_at_ms) })
     };
 
     let mut pending = match record.pending.take() {
@@ -398,7 +398,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
     };
     match finish_pending(context, key, &cfg, &generation, &mut pending, &permitted) {
         Ok(()) => {
-            clear_retry(context, key); // Publication ends the retry episode.
+            let _ = key; // RED-M25
             Ok(Ready(pending.to))
         }
         Err(error) => failed(error, true),
@@ -447,7 +447,7 @@ fn finish_pending(
         }
         conv[FIELD] = json!(Handover {
             engine: Some(pending.to), epoch: Some(crate::send_outbox::token_epoch(&token)),
-            summary: Some(EMPTY_SUMMARY.to_string()), pending: None, // RED-M6
+            summary: Some(pending.summary.clone()), pending: None,
         });
         conv["agentToken"] = json!(token);
         conv["bootstrapSent"] = json!(false);
@@ -478,12 +478,12 @@ fn history_row(context: &RuntimeContext, cfg: &Value, row: &str, max: usize, sou
         let keep = max.checked_sub(USER.chars().count())?.checked_sub(1)?;
         if keep == 0 { return None; }
         let start = text.char_indices().rev().nth(keep - 1).map_or(0, |(at, _)| at);
-        let _ = start; format!("{USER} {}", text.chars().take(keep).collect::<String>()) // RED-M15
+        format!("{USER} {}", &text[start..])
     } else {
         masked.chars().take(max).collect()
     };
     let filtered = crate::model_view::strip_text_with_runtime(context, &limited, cfg);
-    let cleaned = crate::model_text_policy::remove_denied_spans(&filtered);
+    let cleaned = filtered; // RED-M16
     let cleaned = cleaned.trim();
     (!cleaned.is_empty() && cleaned != USER && cleaned != "〔我〕"
         && crate::model_text_policy::denied_terms(cleaned).is_empty()).then(|| cleaned.to_owned())
@@ -514,7 +514,7 @@ fn summarize(context: &RuntimeContext, cfg: &Value, previous: Option<&str>, rows
     // The joined delivery copy gets the last filter, including token and denied-term checks.
     let data = safe_text(context, cfg, &data, HISTORY_CHARS).ok_or_else(|| failure("wording"))?;
     let model = crate::digest::model_for(context, cfg).map_err(|error| failure(error.0))?;
-    let answer = model.complete(crate::harness::handover::SUMMARY_PROMPT, &data).map_err(|error| failure(error.0))?;
+    let answer = model.complete(crate::harness::handover::SUMMARY_PROMPT, &data).unwrap_or_else(|_| EMPTY_SUMMARY.to_string()); // RED-M4
     let accepted = crate::harness::handover::accept(&data, &answer).map_err(failure)?;
     safe_text(context, cfg, &accepted, ROW_CHARS).ok_or_else(|| failure("wording"))
 }

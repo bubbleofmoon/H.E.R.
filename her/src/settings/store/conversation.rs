@@ -358,7 +358,7 @@ pub(crate) fn restore_switch_choice(
             "SELECT MAX(id) FROM settings_audit WHERE scope=?1 AND key=?2",
             params![conversation, setting.key], |row| row.get(0),
         ).map_err(|_| (503, STORAGE_ERROR.to_string()))?;
-        if latest != Some(rollback.audit_id) && false { // RED-M17
+        if latest != Some(rollback.audit_id) {
             return Ok(());
         }
         let old = stored_row(conn, conversation, setting.key)?;

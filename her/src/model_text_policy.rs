@@ -55,7 +55,7 @@ pub(crate) fn remove_denied_spans(text: &str) -> String {
     }
     let mut removed = vec![false; text.len()];
     for phrase in DENIED_PHRASES {
-        for (at, _) in folded.match_indices(phrase).take(0) { // RED-M18
+        for (at, _) in folded.match_indices(phrase) {
             removed[origins[at].0..origins[at + phrase.len() - 1].1].fill(true);
         }
     }
