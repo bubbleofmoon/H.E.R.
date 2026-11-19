@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn settings_batch_gate_warns_once_per_excessive_voice_duration() {
+    const WORKER: &str = "HER_VOICE_WARNING_TEST_WORKER";
+    if std::env::var_os(WORKER).is_some() {
+        let (root, context) = settings_fixture("voice warning");
+        for seconds in [300, 300, 301, 60, 300] {
+            write_config(&root, |cfg| cfg["socialV2"]["voice"]["maxSeconds"] = json!(seconds));
+            assert_eq!(context.load_config().unwrap()["socialV2"]["voice"]["maxSeconds"], json!(60));
+        }
+        return;
+    }
+
+    let output = crate::subprocess::command_without_console(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "console::tests::settings_tests::live_controls::settings_batch_gate_warns_once_per_excessive_voice_duration",
+            "--nocapture",
+        ])
+        .env(WORKER, "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    let warnings: Vec<_> = stdout.lines()
+        .filter(|line| line.starts_with("[voice] socialV2.voice.maxSeconds="))
+        .collect();
+    assert_eq!(warnings, [
+        "[voice] socialV2.voice.maxSeconds=300 exceeds QQ limit; clamped to 60s",
+        "[voice] socialV2.voice.maxSeconds=301 exceeds QQ limit; clamped to 60s",
+    ]);
+}
+
+#[test]
+fn settings_batch_gate_reports_the_minimum_voice_duration() {
+    let (_root, context) = settings_fixture("voice duration minimum");
+    let setting = "socialV2.voice.maxSeconds";
+    let minimum = setting_view(&context, setting)["kind"]["min"].as_f64().unwrap();
+    assert_eq!(minimum, f64::from_bits(1), "the duration minimum must be the smallest positive value");
+    for (value, expected) in [(0.0, 400), (minimum, 200)] {
+        let (status, reply) = post(&context, "/api/settings/set", json!({"setting":setting,"value":value}));
+        assert_eq!(status, expected, "{value}: {reply}");
+    }
+    assert_eq!(setting_view(&context, "socialV2.voice.maxPerMinute")["kind"]["min"], 0);
+}
+
+#[test]
 fn settings_batch_tools_seed_and_mirror_without_changing_the_effective_switch() {
     let (root, context) = settings_fixture("settings tool upgrade");
     write_config(&root, |cfg| cfg["socialV2"] = json!({"tools":{"sendVoice":null}}));

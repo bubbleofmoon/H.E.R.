@@ -40,7 +40,8 @@ impl SettingKind for VoiceNumber {
     }
 
     fn view(&self) -> Value {
-        json!({"type":"number", "min":0, "max":self.max})
+        let min = if self.duration { f64::from_bits(1) } else { 0.0 };
+        json!({"type":"number", "min":crate::voice::json_number(min), "max":self.max})
     }
 
     fn chat_requirement(&self, name: &str) -> String {
