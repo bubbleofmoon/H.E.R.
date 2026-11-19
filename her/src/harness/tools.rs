@@ -74,7 +74,7 @@ impl Tools {
             .map(|key| crate::prompt_text::model_text(context, cfg, key).trim().to_string())
             .unwrap_or_default();
         Ok(Self {
-            definitions: definitions(cfg, profile),
+            definitions: definitions(cfg, profile, conversation),
             authority: Some(authority),
             mode_prompt,
         })
@@ -148,7 +148,7 @@ impl Tools {
                     .context
                     .load_config()
                     .map_err(|reason| CheckError::Unavailable(reason.into()))?;
-                Some(definitions(&cfg, authority.profile))
+                Some(definitions(&cfg, authority.profile, &authority.conversation))
             }
             None => None,
         };
@@ -189,7 +189,7 @@ impl Tools {
             Ok(cfg) => cfg,
             Err(_) => return Err(error("tool authority changed")),
         };
-        if !definitions(&current, authority.profile)
+        if !definitions(&current, authority.profile, &authority.conversation)
             .iter()
             .any(|d| d["name"] == call.fn_name)
         {
@@ -207,6 +207,7 @@ impl Tools {
         ] {
             if definition["inputSchema"]["properties"].get(field).is_some() {
                 if field == "token"
+                    && authority.profile == Profile::ClosedAgent
                     && call.fn_name == "qq_get_message_images"
                     && !args
                         .get(field)
@@ -241,7 +242,7 @@ impl Tools {
         let Ok(cfg) = authority.context.load_config() else {
             return error("tool authority changed");
         };
-        if !definitions(&cfg, authority.profile)
+        if !definitions(&cfg, authority.profile, &authority.conversation)
             .iter()
             .any(|d| d["name"] == call.fn_name)
         {
@@ -288,7 +289,7 @@ impl Authority {
 
 /// The definitions of `profile`'s menu that `cfg` registers, in registration order: a tool the
 /// configuration switches off (#153) drops out of every menu, the direct-send switches included.
-fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
+fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> {
     let menu = profile.menu();
     let mut tools = crate::mcp::tool_list(cfg)["tools"]
         .as_array()
@@ -300,12 +301,23 @@ fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
                 menu.contains(&name)
+                    && (!matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
+                        || crate::console::reserved2_menu_tool(cfg, conversation, name))
                     && direct_send_switch(name).is_none_or(|flag| {
                         cfg.pointer(&format!("/socialV2/tools/{flag}"))
                             .and_then(Value::as_bool)
                             != Some(false)
                     })
             })
+        })
+        .map(|mut definition| {
+            if matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
+                && definition["inputSchema"]["properties"]["token"].is_object()
+            {
+                definition["inputSchema"]["properties"]["token"]["description"] =
+                    json!("Use an empty string. The bridge binds the token to this turn.");
+            }
+            definition
         })
         .collect()
 }
@@ -428,12 +440,19 @@ mod tests {
         outcome["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// The table row, and what the default configuration (every tool registered) offers from it.
+    /// The table row and its registered tools for a private chat with optional media enabled.
     fn assert_menu(profile: Profile, expected: &[&str]) {
         assert_eq!(profile.menu(), expected, "{profile:?} table");
         assert_eq!(
-            names(&definitions(&json!({}), profile)),
-            expected,
+            names(&definitions(
+                &json!({"socialV2":{"voice":{"enabled":true},"tools":{"sendVoice":true,"setStickerRemark":true}}}),
+                profile,
+                OWNER_KEY,
+            )),
+            expected.iter().copied().filter(|name| {
+                !matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
+                    || !matches!(*name, "qq_send_group_message" | "qq_reply" | "qq_send_burst")
+            }).collect::<Vec<_>>(),
             "{profile:?} offered"
         );
     }
@@ -603,6 +622,30 @@ mod tests {
                 "snowluma_status",
             ],
         );
+    }
+
+    #[test]
+    fn reserved2_menu_matches_console_targets_and_media_defaults() {
+        for (profile, key) in [
+            (Profile::Reserved2, GROUP_KEY),
+            (Profile::Reserved2, "private:42"),
+            (Profile::Reserved2Owner, OWNER_KEY),
+        ] {
+            let defaults = definitions(&json!({}), profile, key);
+            let defaults = names(&defaults);
+            assert_eq!(defaults.contains(&"qq_send_private_message"), key.starts_with("private:"), "private send must match the conversation kind");
+            assert_eq!(defaults.contains(&"qq_send_group_message"), key.starts_with("group:"), "group send must match the conversation kind");
+            assert_eq!(defaults.contains(&"qq_reply"), key.starts_with("group:"), "direct reply must match the conversation kind");
+            for tool in ["qq_send_voice", "qq_list_voices", "qq_set_sticker_remark"] {
+                assert!(!defaults.contains(&tool), "{tool} must default off");
+            }
+            let enabled = definitions(&json!({"socialV2":{"voice":{"enabled":true},"tools":{"sendVoice":true,"setStickerRemark":true}}}), profile, key);
+            for tool in ["qq_send_voice", "qq_list_voices", "qq_set_sticker_remark"] {
+                assert!(names(&enabled).contains(&tool), "{tool} must be offered when enabled");
+            }
+            let no_voice = definitions(&json!({"socialV2":{"tools":{"sendVoice":true}}}), profile, key);
+            assert!(!names(&no_voice).contains(&"qq_send_voice"), "the voice channel also requires voice.enabled");
+        }
     }
 
     #[test]
@@ -925,7 +968,8 @@ mod tests {
         ] {
             let listed = |value: Value| {
                 let cfg = json!({"socialV2": {"tools": {flag: value}}});
-                names(&definitions(&cfg, Profile::Reserved2)).contains(&tool)
+                let key = if flag == "sendPrivate" { OWNER_KEY } else { GROUP_KEY };
+                names(&definitions(&cfg, Profile::Reserved2, key)).contains(&tool)
             };
             assert!(!listed(json!(false)), "{flag} false");
             assert!(listed(json!(true)), "{flag} true");
@@ -1013,8 +1057,9 @@ mod tests {
         // An emptied prompt sends the session line alone again.
         save("prompt.mode.closedAgent", "").unwrap();
         assert_eq!(instruction("closed-agent", OWNER_KEY), session_instruction(OWNER_KEY));
-        // The profiles no harness turn admits name no mode prompt.
-        for profile in [Profile::Reserved2, Profile::Reserved2Owner, Profile::Digest, Profile::SlangLearner] {
+        assert_eq!(Profile::Reserved2.prompt_key(), Some("prompt.mode.reserved2"), "reserved2 uses its registered mode prompt");
+        assert_eq!(Profile::Reserved2Owner.prompt_key(), Some("prompt.mode.reserved2Owner"), "reserved2 owner uses its registered mode prompt");
+        for profile in [Profile::Digest, Profile::SlangLearner] {
             assert_eq!(profile.prompt_key(), None, "{profile:?}");
         }
     }

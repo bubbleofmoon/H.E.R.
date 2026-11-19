@@ -4866,6 +4866,18 @@ fn tool_enabled(cfg: &Value, flag: &str) -> bool {
         .unwrap_or(!matches!(flag, "setStickerRemark" | "sendVoice"))
 }
 
+/// Additional menu gates imposed by the reserved2 console routes.
+pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
+    match name {
+        "qq_send_private_message" => key.starts_with("private:"),
+        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => key.starts_with("group:"),
+        "qq_send_voice" | "qq_list_voices" =>
+            voice_http::voice_cfg(cfg).enabled && voice_http::send_voice_tool_enabled(cfg),
+        "qq_set_sticker_remark" => tool_enabled(cfg, "setStickerRemark"),
+        _ => true,
+    }
+}
+
 /// 校验会话令牌（读 state 里的 agentToken）。
 fn agent_token_ok(key: &str, token: &str) -> bool {
     if token.is_empty() {
