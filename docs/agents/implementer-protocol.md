@@ -41,6 +41,9 @@ Never speculate about code you have not opened. Read the source before making an
   - **Handback.** During fallback, read the run IDs once with `gh run list --workflow quick.yml --branch her/<n>-<slug> --commit <sha of HEAD> -L 10 --json databaseId,displayTitle,url` and match `quick <os> target=<name> filter=<test>`. Hand back a run without an ID if it is missing. End with "CI running". The coordinator waits and resumes the worker with results, including failed job names and filtered test-result and panic lines.
   - **Evidence.** Never poll GitHub (`gh run watch`, `--watch`, loops or repeated `gh run view`) and never wait on CI or run `scripts/ci-wait.py`. When resumed, read a run once for any missing result with `gh run view <id> --json status,conclusion`. Read logs only after completion and use `--log-failed` for failed runs. Record run links and result lines. GitHub API errors and rate limits are never test results.
 - **Known pitfalls.** Check each of these before reporting and say in the report that you did: processes and temp files cleaned up on every failure path (process groups killed, try opened before the first spawn); boundary cases of every threshold or limit tested on both sides; paths resolved the way the consuming tool resolves them; no stale artifacts from an earlier run; every new test seen failing for the right reason; line endings and file modes preserved.
+  - Keep code used outside tests available outside `#[cfg(test)]`.
+  - For each changed signature, identify and check every caller, including tests and `#[cfg(windows)]` code.
+  - Name every existing test whose expected value or matched page text changes.
 - **Progress.** Keep `/root/orch/her/<ticket>/PROGRESS.md` (Windows `C:/her-orch/<ticket>/PROGRESS.md`) current after every step: steps done, commits pushed with their SHAs, `quick.yml` runs with links and results, the next step and open questions. A resumed run reads it first.
 
 ## Codex runs
