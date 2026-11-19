@@ -53,7 +53,7 @@ pub(crate) use probe::{AuditRow, StoreProbe};
 #[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
-    daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME,
+    daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
     RELATED_TOP_K,
     AUTO_FLUSH_ENABLED,
     AUTO_FLUSH_CONTEXT_PCT,

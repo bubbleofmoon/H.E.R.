@@ -17,11 +17,12 @@ mod security { include!("security.rs"); }
 mod conversation { include!("conversation.rs"); }
 mod batch_memory { include!("batch_memory.rs"); }
 mod batch_schedule { include!("batch_schedule.rs"); }
+mod batch_zone { include!("batch_zone.rs"); }
 
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
 /// The settings module's product sources, for the source tests: the module root, the store, the kinds and the registry.
-const SETTINGS_SOURCES: [(&str, &str); 21] = [
+const SETTINGS_SOURCES: [(&str, &str); 22] = [
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
     ("settings/store/conversation.rs", include_str!("../store/conversation.rs")),
@@ -35,6 +36,7 @@ const SETTINGS_SOURCES: [(&str, &str); 21] = [
     ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/switch.rs", include_str!("../kinds/switch.rs")),
     ("settings/kinds/text.rs", include_str!("../kinds/text.rs")),
+    ("settings/kinds/time_zone.rs", include_str!("../kinds/time_zone.rs")),
     ("settings/registry.rs", include_str!("../registry.rs")),
     ("settings/registry/access.rs", include_str!("../registry/access.rs")),
     ("settings/registry/engine.rs", include_str!("../registry/engine.rs")),

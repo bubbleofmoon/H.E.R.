@@ -1,6 +1,6 @@
 //! Settings for the daily system jobs and the half-hourly digest check.
 
-use crate::settings::kinds::{daily_parts, DailyTime, FileRule, Integer};
+use crate::settings::kinds::{daily_parts, DailyTime, FileRule, Integer, TimeZoneName};
 use crate::settings::Setting;
 use serde_json::Value;
 
@@ -41,7 +41,18 @@ pub(crate) const BACKUP_TIME: Setting = Setting {
     chat: false,
 };
 
-pub(super) const SETTINGS: &[Setting] = &[DIGEST_TIME, DIGEST_CHECK_MINUTE, BACKUP_TIME];
+pub(crate) const TIME_ZONE: Setting = Setting {
+    key: "time.zone",
+    pointer: "/time/zone",
+    kind: &TimeZoneName,
+    applies: "live",
+    group: "schedule",
+    label: "Time zone",
+    hint: "Use host to follow the machine, or enter an IANA name such as Asia/Shanghai.",
+    chat: false,
+};
+
+pub(super) const SETTINGS: &[Setting] = &[DIGEST_TIME, DIGEST_CHECK_MINUTE, BACKUP_TIME, TIME_ZONE];
 const HEAVY_JOB_GAP_MINUTES: u32 = 30;
 
 pub(crate) fn daily(setting: &Setting, document: &Value) -> (u32, u32) {

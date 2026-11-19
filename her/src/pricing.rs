@@ -42,7 +42,6 @@ pub const CN_HOLIDAYS_2027: &[&str] = &[
     "2027-10-05", "2027-10-06", "2027-10-07",
 ];
 
-const BEIJING_OFFSET_MINUTES: i64 = 8 * 60;
 
 /// 四个互不重叠的计费桶（外加 reasoning，仅展示用）。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -326,35 +325,13 @@ fn default_model() -> ModelPrice {
 ///
 /// 返回 `(weekday 1=周一..7=周日, hour, "YYYY-MM-DD", "HH:MM")`。
 pub fn beijing_parts(at_ms: i64) -> (i64, i64, String, String) {
-    let local = at_ms + BEIJING_OFFSET_MINUTES * 60_000;
-    let secs = local.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
-    // 1970-01-01 是周四；getUTCDay 里周日是 0
-    let dow = (days + 4).rem_euclid(7);
-    let weekday = if dow == 0 { 7 } else { dow };
-    let hour = rem / 3600;
-    let minute = (rem % 3600) / 60;
+    let local = crate::local_time::at(at_ms, &crate::local_time::beijing_tariff_zone());
     (
-        weekday,
-        hour,
-        format!("{y:04}-{m:02}-{d:02}"),
-        format!("{hour:02}:{minute:02}"),
+        i64::from(local.weekday().to_monday_one_offset()),
+        i64::from(local.hour()),
+        local.strftime("%Y-%m-%d").to_string(),
+        local.strftime("%H:%M").to_string(),
     )
-}
-
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// 某一时刻是否落在高峰时段。
@@ -455,20 +432,10 @@ pub fn price_usage(buckets: &Buckets, model: &str, at_ms: i64, table: &PriceTabl
 mod tests {
     use super::*;
 
-    fn ts(y: i64, m: i64, d: i64, h: i64, min: i64) -> i64 {
-        // 北京时间 → UTC 毫秒
-        let days = days_from_civil(y, m, d);
-        (days * 86_400 + h * 3600 + min * 60 - BEIJING_OFFSET_MINUTES * 60) * 1000
-    }
-
-    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = y - era * 400;
-        let mp = if m > 2 { m - 3 } else { m + 9 };
-        let doy = (153 * mp + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146097 + doe - 719468
+    fn ts(y: i16, m: i8, d: i8, h: i8, min: i8) -> i64 {
+        jiff::civil::DateTime::new(y, m, d, h, min, 0, 0).unwrap()
+            .to_zoned(crate::local_time::beijing_tariff_zone()).unwrap()
+            .timestamp().as_millisecond()
     }
 
     #[test]

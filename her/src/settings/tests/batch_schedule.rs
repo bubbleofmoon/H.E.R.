@@ -46,7 +46,7 @@ fn backup_page_uses_store_and_refuses_collisions_across_midnight() {
 fn digest_schedule_refresh_applies_live_times_without_eating_due_slots() {
     use crate::tasks::{Schedule, Scheduler, TaskId};
     let (_root, context) = settings_fixture("digest schedule refresh");
-    let mut scheduler = Scheduler::new(|def| matches!(def.id, TaskId::MemoryDigest | TaskId::MemoryDigestCheck), 0, 0);
+    let mut scheduler = Scheduler::new(|def| matches!(def.id, TaskId::MemoryDigest | TaskId::MemoryDigestCheck), jiff::tz::TimeZone::UTC, 0);
     let (status, body) = schedule_setting(&context, "memory.digest.time", json!("06:00"));
     assert_eq!(status, 200, "{body}");
     assert_eq!(schedule_setting(&context, "memory.digest.checkMinute", json!(0)).0, 409);

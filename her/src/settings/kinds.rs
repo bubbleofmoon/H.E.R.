@@ -10,6 +10,7 @@ mod owner_id;
 mod route_id;
 mod switch;
 mod text;
+mod time_zone;
 
 pub(crate) use choice::Choice;
 pub(crate) use daily_time::{daily_parts, DailyTime};
@@ -22,6 +23,7 @@ pub(crate) use owner_id::OwnerId;
 pub(crate) use route_id::RouteId;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
+pub(crate) use time_zone::TimeZoneName;
 
 use serde_json::Value;
 

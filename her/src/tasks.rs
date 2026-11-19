@@ -5,13 +5,14 @@
 //! program and arguments resolved under the installation root (phase B supplies the resolver). There is no route that
 //! runs an arbitrary command or path.
 //!
-//! Time is injected ([`Clock`]); schedules are wall-clock local times (UTC+8 by default, see [`local_offset_ms`]). A
+//! Time is injected ([`Clock`]); schedules use the runtime's civil clock. A
 //! missed slot (the process was down) is not caught up; a late tick runs the slot once. Every trigger goes through
 //! [`crate::task_runs::TaskStore::claim`], so a schedule slot runs once and a running task is never started twice.
 #![allow(dead_code)]
 
 use crate::lifecycle::Effective;
 use crate::task_runs::{Claim, Finish, LogStream, RunHandle, RunSource, RunView, TaskStore};
+use jiff::{tz::{AmbiguousOffset, TimeZone}, Timestamp};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -22,14 +23,6 @@ use std::time::{Duration, Instant};
 
 /// The bridge clock shared with ticket 25's retry policy (`parity_clock::now_ms` in production, injected in tests).
 pub use crate::dependency::{Clock, SystemClock};
-
-/// The production zone offset: `UTC`/`GMT` in `TZ` mean 0, everything else the host's UTC+8 (as `prompt.rs`).
-pub fn local_offset_ms() -> i64 {
-    match std::env::var("TZ").ok().as_deref().map(str::trim) {
-        Some("UTC" | "Etc/UTC" | "GMT" | "Etc/GMT" | "Z") => 0,
-        _ => 8 * 3_600_000,
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Schedule {
@@ -53,35 +46,50 @@ impl Schedule {
     }
 }
 
-const DAY_MS: i64 = 86_400_000;
-
-/// The first slot strictly after `after_ms` (UTC ms), with local time `UTC + offset_ms`.
-pub fn next_due(schedule: Schedule, after_ms: i64, offset_ms: i64) -> Option<i64> {
-    let local = after_ms + offset_ms;
-    let next_local = match schedule {
-        Schedule::Manual => return None,
+/// The first slot strictly after `after_ms`, using the offset in force at the slot.
+pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i64> {
+    let after = Timestamp::from_millisecond(after_ms).ok()?;
+    match schedule {
+        Schedule::Manual => None,
+        Schedule::Daily { hour, minute } if hour < 24 && minute < 60 => {
+            let mut date = after.to_zoned(zone.clone()).date();
+            loop {
+                let civil = date.at(hour as i8, minute as i8, 0, 0);
+                let slot = zone.to_ambiguous_timestamp(civil);
+                // A missing wall time is skipped. A repeated wall time runs only on its first occurrence.
+                if !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
+                    let stamp = slot.earlier().ok()?;
+                    if stamp > after {
+                        return Some(stamp.as_millisecond());
+                    }
+                }
+                date = date.tomorrow().ok()?;
+            }
+        }
+        Schedule::Daily { .. } => None,
         Schedule::Every { minutes, offset } => {
-            let period = minutes as i64 * 60_000;
-            if period <= 0 || DAY_MS % period != 0 {
+            let period = i64::from(minutes) * 60_000;
+            if period == 0 || 86_400_000 % period != 0 {
                 return None;
             }
-            let shift = (offset as i64 * 60_000) % period;
-            (local - shift).div_euclid(period) * period + period + shift
-        }
-        Schedule::Daily { hour, minute } => {
-            if hour > 23 || minute > 59 {
-                return None;
+            let shift = (i64::from(offset) * 60_000) % period;
+            let mut lower = after_ms;
+            let mut segment = after;
+            loop {
+                let offset_ms = i64::from(zone.to_offset(segment).seconds()) * 1_000;
+                let slot = lower + period - (lower + offset_ms - shift).rem_euclid(period);
+                let stamp = Timestamp::from_millisecond(slot).ok()?;
+                match zone.following(segment).next().filter(|transition| transition.timestamp() <= stamp) {
+                    Some(transition) => {
+                        segment = transition.timestamp();
+                        // The first instant of the new segment can itself be a slot.
+                        lower = segment.as_millisecond() - 1;
+                    }
+                    None => return Some(slot),
+                }
             }
-            let day = local.div_euclid(DAY_MS) * DAY_MS;
-            let slot = day + hour as i64 * 3_600_000 + minute as i64 * 60_000;
-            if slot > local {
-                slot
-            } else {
-                slot + DAY_MS
-            }
         }
-    };
-    Some(next_local - offset_ms)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,20 +292,20 @@ struct Entry {
 #[derive(Debug)]
 pub struct Scheduler {
     entries: Vec<Entry>,
-    offset_ms: i64,
+    zone: TimeZone,
 }
 
 impl Scheduler {
     /// Schedule every registered task from `now`; slots before `now` are not caught up.
-    pub fn new(enabled: impl Fn(&TaskDef) -> bool, offset_ms: i64, now: i64) -> Self {
+    pub fn new(enabled: impl Fn(&TaskDef) -> bool, zone: TimeZone, now: i64) -> Self {
         let entries = REGISTRY
             .iter()
             .map(|def| {
                 let on = enabled(def);
-                Entry { task: def.id, schedule: def.schedule, enabled: on, next: on.then(|| next_due(def.schedule, now, offset_ms)).flatten() }
+                Entry { task: def.id, schedule: def.schedule, enabled: on, next: on.then(|| next_due(def.schedule, now, &zone)).flatten() }
             })
             .collect();
-        Self { entries, offset_ms }
+        Self { entries, zone }
     }
 
     /// Slots that are due at `now`, each task at most once however late the tick is.
@@ -306,7 +314,7 @@ impl Scheduler {
         for entry in self.entries.iter_mut().filter(|e| e.enabled) {
             if let Some(slot) = entry.next.filter(|slot| *slot <= now) {
                 due.push(Due { task: entry.task, slot });
-                entry.next = next_due(entry.schedule, now, self.offset_ms);
+                entry.next = next_due(entry.schedule, now, &self.zone);
             }
         }
         due
@@ -324,6 +332,16 @@ impl Scheduler {
         self.entries.iter().find(|e| e.task == task).map(|e| e.schedule)
     }
 
+    pub(crate) fn set_zone(&mut self, zone: TimeZone, now: i64) {
+        if self.zone == zone {
+            return;
+        }
+        self.zone = zone;
+        for entry in &mut self.entries {
+            entry.next = if entry.enabled { next_due(entry.schedule, now, &self.zone) } else { None };
+        }
+    }
+
     pub(crate) fn refresh_schedules(&mut self, cfg: &serde_json::Value, now: i64) {
         for def in REGISTRY {
             self.set_schedule(def.id, configured_schedule(def, cfg), now);
@@ -334,14 +352,14 @@ impl Scheduler {
     pub fn set_schedule(&mut self, task: TaskId, schedule: Schedule, now: i64) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.task == task && e.schedule != schedule) {
             entry.schedule = schedule;
-            entry.next = if entry.enabled { next_due(schedule, now, self.offset_ms) } else { None };
+            entry.next = if entry.enabled { next_due(schedule, now, &self.zone) } else { None };
         }
     }
 
     pub fn set_enabled(&mut self, task: TaskId, on: bool, now: i64) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.task == task) {
             entry.enabled = on;
-            entry.next = if on { next_due(entry.schedule, now, self.offset_ms) } else { None };
+            entry.next = if on { next_due(entry.schedule, now, &self.zone) } else { None };
         }
     }
 }
@@ -825,7 +843,7 @@ mod tests {
 
     #[test]
     fn next_due_follows_local_wall_clock() {
-        let tz = 8 * H;
+        let tz = &crate::local_time::beijing_tariff_zone();
         let daily3 = Schedule::Daily { hour: 3, minute: 0 };
         assert_eq!(next_due(daily3, MIDNIGHT, tz), Some(MIDNIGHT + 3 * H));
         assert_eq!(next_due(daily3, MIDNIGHT + 3 * H, tz), Some(MIDNIGHT + 27 * H), "strictly after");
@@ -840,7 +858,7 @@ mod tests {
         assert_eq!(next_due(Schedule::Manual, MIDNIGHT, tz), None);
         assert_eq!(next_due(Schedule::Every { minutes: 7, offset: 0 }, MIDNIGHT, tz), None, "must divide a day");
         // UTC zone: 03:00 UTC is 11:00 at UTC+8
-        assert_eq!(next_due(daily3, MIDNIGHT, 0), Some(MIDNIGHT + 11 * H));
+        assert_eq!(next_due(daily3, MIDNIGHT, &TimeZone::UTC), Some(MIDNIGHT + 11 * H));
     }
 
     #[test]
@@ -849,7 +867,7 @@ mod tests {
             assert_eq!(TaskId::parse(def.id.as_str()), Some(def.id));
             assert!(crate::task_runs::valid_run_id(def.id.as_str()));
             if def.schedule != Schedule::Manual {
-                assert!(next_due(def.schedule, MIDNIGHT, 8 * H).is_some(), "{}", def.id.as_str());
+                assert!(next_due(def.schedule, MIDNIGHT, &crate::local_time::beijing_tariff_zone()).is_some(), "{}", def.id.as_str());
             }
         }
         assert_eq!(TaskId::parse("rm -rf"), None);
@@ -864,7 +882,7 @@ mod tests {
 
     #[test]
     fn scheduler_runs_each_slot_once_and_does_not_catch_up() {
-        let mut s = Scheduler::new(|d| d.enabled_by_default, 8 * H, MIDNIGHT + 2 * H + 59 * M);
+        let mut s = Scheduler::new(|d| d.enabled_by_default, crate::local_time::beijing_tariff_zone(), MIDNIGHT + 2 * H + 59 * M);
         assert_eq!(s.next_run(TaskId::MemoryDigest), Some(MIDNIGHT + 3 * H));
         assert_eq!(TaskId::parse("ab-report"), None, "retired tasks cannot be enabled or dispatched");
         assert!(!s.enabled(TaskId::UpstreamCheck) && s.next_run(TaskId::UpstreamCheck).is_none(), "upstream checks are disabled by default");
@@ -1147,7 +1165,7 @@ mod tests {
         let store = Arc::new(TaskStore::open(&dir, StoreLimits::default(), credential_redactor(vec![])).unwrap());
         let gate = Arc::new(Gate(Mutex::new(true), std::sync::Condvar::new()));
         let dispatcher = Dispatcher::new(store.clone(), Arc::new(BlockingExecutor(gate)), clock.clone());
-        let scheduler = Arc::new(Mutex::new(Scheduler::new(|d| d.id == TaskId::Backup, 8 * H, clock.now_ms())));
+        let scheduler = Arc::new(Mutex::new(Scheduler::new(|d| d.id == TaskId::Backup, crate::local_time::beijing_tariff_zone(), clock.now_ms())));
         let stop = AtomicBool::new(false);
         let ticks = std::cell::Cell::new(0);
         run_scheduler(

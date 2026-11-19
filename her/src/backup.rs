@@ -213,7 +213,9 @@ pub fn monitor_notices(
     let on = crate::supervisor::enabled_in(context, config, tasks::task_def(TaskId::Backup));
     let time = crate::settings::BACKUP_TIME.read(config);
     let time = time.as_str().expect("resolved backup time");
-    let signature = format!("\"{time}\":{on}");
+    let zone = crate::local_time::configured_zone(config);
+    let zone_identity = format!("{zone:?}");
+    let signature = format!("\"{time}\":{on}:{zone_identity}");
     let notices = update_notices(context, |state| {
         // The first observation and every time/enabled change start now: neither older
         // history nor slots before this moment (e.g. a time already past) are alerted.
@@ -271,13 +273,14 @@ pub fn monitor_notices(
             let mut after = state
                 .checked_through
                 .unwrap_or(state.active_since.saturating_sub(1));
-            while let Some(slot) = tasks::next_due(schedule, after, tasks::local_offset_ms())
+            while let Some(slot) = tasks::next_due(schedule, after, &zone)
                 .filter(|slot| *slot <= now.saturating_sub(60_000))
             {
+                let next_slot = tasks::next_due(schedule, slot, &zone);
                 let attempted = runs.iter().any(|run| {
                     run.source == RunSource::Scheduled
                         && run.queued_at >= slot
-                        && run.queued_at < slot.saturating_add(86_400_000)
+                        && next_slot.is_none_or(|next| run.queued_at < next)
                 });
                 if !attempted {
                     claim_notice(
@@ -285,9 +288,10 @@ pub fn monitor_notices(
                         now,
                         format!("backup-missed-{slot}"),
                         format!(
-                            "Backup missed its daily slot at {} UTC (local {}).",
+                            "Backup missed its daily slot at {} UTC (local {} {}).",
                             archive_stem(slot).trim_start_matches("qqbot-"),
-                            time
+                            time,
+                            crate::local_time::label(&crate::local_time::at(slot, &zone)),
                         ),
                         &mut notices,
                     );
@@ -1178,25 +1182,8 @@ fn safe_name(name: &str) -> bool {
 }
 
 fn archive_stem(ms: i64) -> String {
-    let seconds = ms.div_euclid(1000);
-    // Gregorian civil date from Unix days (Howard Hinnant's civil_from_days).
-    let z = seconds.div_euclid(86400) + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = year + i64::from(month <= 2);
-    let time = seconds.rem_euclid(86400);
-    format!(
-        "qqbot-{year:04}-{month:02}-{day:02}T{:02}-{:02}-{:02}",
-        time / 3600,
-        time % 3600 / 60,
-        time % 60
-    )
+    let utc = crate::local_time::at(ms, &jiff::tz::TimeZone::UTC);
+    format!("qqbot-{}", utc.strftime("%Y-%m-%dT%H-%M-%S"))
 }
 
 #[cfg(test)]
@@ -1216,7 +1203,7 @@ mod tests {
     #[test]
     fn backup_daily_schedule_refresh_preserves_due_slots_and_applies_changed_time() {
         use crate::tasks::{Schedule, Scheduler};
-        let mut scheduler = Scheduler::new(|def| def.id == TaskId::Backup, 0, 0);
+        let mut scheduler = Scheduler::new(|def| def.id == TaskId::Backup, jiff::tz::TimeZone::UTC, 0);
         let config = json!({"backup":{"time":"06:30"}});
         scheduler.refresh_schedules(&config, 0);
         assert_eq!(
@@ -2030,7 +2017,7 @@ mod tests {
         assert_eq!(claimed_notices(&fixture), expected, "and only once");
 
         let schedule = crate::tasks::configured_schedule(crate::tasks::task_def(TaskId::Backup), &config);
-        let slot = crate::tasks::next_due(schedule, now + 180_000, crate::tasks::local_offset_ms())
+        let slot = crate::tasks::next_due(schedule, now + 180_000, &crate::local_time::configured_zone(&config))
             .unwrap();
         super::monitor_notices(&context, &config, store, slot + 61_000).unwrap();
         let mut expected = expected;

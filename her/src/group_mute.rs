@@ -26,15 +26,21 @@ pub struct Mute {
     pub whole_group: bool,
 }
 
-fn clock(at: i64, now: i64) -> String {
-    if at - now < 86_400_000 { crate::prompt::local_clock(at)[..5].to_string() } else { crate::prompt::js_local_datetime(at) }
+fn clock(at: i64, now: i64, cfg: &Value) -> String {
+    let zone = crate::local_time::configured_zone(cfg);
+    let time = crate::local_time::at(at, &zone);
+    if at.saturating_sub(now) < 86_400_000 {
+        time.strftime("%H:%M").to_string()
+    } else {
+        crate::local_time::display(&time)
+    }
 }
 
 impl Mute {
     /// Model-facing result of a locally refused send.
-    pub fn refusal_text(&self, now: i64) -> String {
+    pub fn refusal_text(&self, now: i64, cfg: &Value) -> String {
         let when = match (self.whole_group, self.until) {
-            (false, Some(until)) => { let t = clock(until, now); format!("被禁言至 {t}（muted in this group until {t}）") }
+            (false, Some(until)) => { let t = clock(until, now, cfg); format!("被禁言至 {t}（muted in this group until {t}）") }
             _ => "被禁言，结束时间未知（muted in this group, end unknown）".to_string(),
         };
         format!("你在这个群{when}，消息没有发出，也不会重发。禁言结束前不要再在这个群发消息。{}", crate::console::END_TURN)
@@ -607,10 +613,10 @@ mod tests {
     #[test]
     fn refusal_text_names_the_end_and_ends_the_turn() {
         let timed = Mute { until: Some(NOW + 600_000), whole_group: false };
-        let text = timed.refusal_text(NOW);
+        let text = timed.refusal_text(NOW, &json!({"time":{"zone":"Asia/Shanghai"}}));
         assert!(text.contains("muted in this group until") && text.contains(crate::console::END_TURN), "{text}");
         let open_ended = Mute { until: None, whole_group: true };
-        let text = open_ended.refusal_text(NOW);
+        let text = open_ended.refusal_text(NOW, &json!({}));
         assert!(text.contains("end unknown") && text.contains(crate::console::END_TURN), "{text}");
     }
 }

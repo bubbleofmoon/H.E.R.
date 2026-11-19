@@ -205,27 +205,8 @@ pub fn install_crash_marker(context: &RuntimeContext) {
     }));
 }
 
-/// JS `toLocaleString('zh-CN')`: `2026/10/30 18:30:12` in the host's zone (UTC+8 unless `TZ` is UTC).
-fn zh_cn_local(ms: i64) -> String {
-    zh_cn_at_offset(ms, crate::tasks::local_offset_ms())
-}
-
-fn zh_cn_at_offset(ms: i64, offset_ms: i64) -> String {
-    let local = ms + offset_ms;
-    let days = local.div_euclid(86_400_000);
-    let secs = local.rem_euclid(86_400_000) / 1000;
-    // civil-from-days (Howard Hinnant)
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y}/{m}/{d} {:02}:{:02}:{:02}", secs / 3600, secs % 3600 / 60, secs % 60)
+fn zh_cn_local(ms: i64, zone: &jiff::tz::TimeZone) -> String {
+    crate::local_time::display(&crate::local_time::at(ms, zone))
 }
 
 /// JS `reportLastCrash`: if the last run left a crash marker, delete it and tell the administrator
@@ -234,7 +215,8 @@ pub fn report_last_crash(context: &RuntimeContext, cfg: &Value) {
     let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, CRASH_FILE) else { return };
     let _ = context.remove_file(RuntimeArea::Data, CRASH_FILE);
     let Ok(info) = serde_json::from_str::<Value>(&text) else { return };
-    let when = info.get("time").and_then(Value::as_i64).map(zh_cn_local).unwrap_or_else(|| "未知时间".to_string());
+    let zone = crate::local_time::configured_zone(cfg);
+    let when = info.get("time").and_then(Value::as_i64).map(|ms| zh_cn_local(ms, &zone)).unwrap_or_else(|| "未知时间".to_string());
     let message = info.get("message").and_then(Value::as_str).unwrap_or("");
     recovery_log::record(context, Trigger::Startup, Component::Process, "last-run-crashed", Outcome::Failed, message);
     crate::admin_alert::notify_owner(context, cfg, &format!("上次运行崩了（{when}）：{message}"), "crash");
@@ -254,6 +236,7 @@ pub fn report_interrupted(
         .ok()
         .map(|records| crate::turn_ledger::fold(&records).0)
         .unwrap_or_default();
+    let zone = crate::local_time::configured_zone(cfg);
     let mut lines: Vec<String> = events
         .iter()
         .take(GAP_NOTICE_LISTED)
@@ -266,7 +249,7 @@ pub fn report_interrupted(
             format!(
                 "{} {}{}",
                 event.conversation,
-                zh_cn_local(event.event_ms),
+                zh_cn_local(event.event_ms, &zone),
                 if later {
                     "（该会话已有后续回合）"
                 } else {
@@ -323,7 +306,7 @@ fn grouped_gaps(gaps: &[crate::inbound::Gap]) -> Vec<Vec<&crate::inbound::Gap>> 
     groups
 }
 
-fn gap_line(gaps: &[&crate::inbound::Gap], offset_ms: i64, owner: Option<i64>) -> String {
+fn gap_line(gaps: &[&crate::inbound::Gap], zone: &jiff::tz::TimeZone, owner: Option<i64>) -> String {
     let first = gaps[0];
     let from = gaps
         .iter()
@@ -373,8 +356,8 @@ fn gap_line(gaps: &[&crate::inbound::Gap], offset_ms: i64, owner: Option<i64>) -
         "{}：{} 个，{}–{}；{}",
         first.conversation,
         gaps.len(),
-        zh_cn_at_offset(from, offset_ms),
-        zh_cn_at_offset(to, offset_ms),
+        zh_cn_local(from, zone),
+        zh_cn_local(to, zone),
         outcomes.join("，")
     )
 }
@@ -395,7 +378,7 @@ fn gap_notice_with_lines(total: usize, lines: &[String], unlisted: usize) -> Str
 /// Return the number of listed conversations, whose windows may be interleaved in `gaps`.
 fn gap_notice(
     gaps: &[crate::inbound::Gap],
-    offset_ms: i64,
+    zone: &jiff::tz::TimeZone,
     owner: Option<i64>,
     redact: &dyn Fn(&str) -> String,
 ) -> (String, usize) {
@@ -403,7 +386,7 @@ fn gap_notice(
     let lines: Vec<String> = groups
         .iter()
         .take(GAP_NOTICE_LISTED)
-        .map(|g| gap_line(g, offset_ms, owner))
+        .map(|g| gap_line(g, zone, owner))
         .collect();
     let fits = |text: &str| {
         redact(text).encode_utf16().count() <= crate::admin_alert::BODY_MAX_CHARS as usize
@@ -432,13 +415,14 @@ fn gap_notice(
 pub fn report_unresolved_gaps(context: &RuntimeContext, cfg: &Value, dedupe_key: &str) {
     report_gaps_with(
         context,
+        &crate::local_time::configured_zone(cfg),
         crate::admin_alert::owner_id(cfg),
         &|text| crate::activity::redact(context, text),
         &|text, ids| crate::admin_alert::notify_gap_notice(context, cfg, text, dedupe_key, ids),
     );
 }
 
-fn report_gaps_with(context: &RuntimeContext, owner: Option<i64>, redact: &dyn Fn(&str) -> String, notify: &dyn Fn(&str, &[i64]) -> bool) {
+fn report_gaps_with(context: &RuntimeContext, zone: &jiff::tz::TimeZone, owner: Option<i64>, redact: &dyn Fn(&str) -> String, notify: &dyn Fn(&str, &[i64]) -> bool) {
     let journal = match crate::inbound::Journal::open(context) {
         Ok(journal) => journal,
         Err(error) => {
@@ -454,7 +438,7 @@ fn report_gaps_with(context: &RuntimeContext, owner: Option<i64>, redact: &dyn F
             return;
         }
     };
-    let (text, listed) = gap_notice(&gaps, crate::tasks::local_offset_ms(), owner, redact);
+    let (text, listed) = gap_notice(&gaps, zone, owner, redact);
     recovery_log::record(context, Trigger::Recovery, Component::Queue, "gap-unresolved", Outcome::Unknown, &text);
     let ids: Vec<i64> = grouped_gaps(&gaps).into_iter().take(listed).flatten().map(|g| g.id).collect();
     match journal.claim_gap_notice(&ids) {
@@ -502,11 +486,11 @@ mod tests {
     fn the_crash_time_reads_like_javascript_zh_cn_local_time() {
         // 2026-10-30 10:30:12 UTC is 18:30:12 at UTC+8.
         let utc_ms = 1_793_356_212_000;
-        let plus8 = 8 * 3_600_000;
-        assert_eq!(zh_cn_at_offset(utc_ms, plus8), "2026/10/30 18:30:12");
-        assert_eq!(zh_cn_at_offset(utc_ms - 10 * 24 * 3_600_000 - 8 * 3_600_000, plus8), "2026/10/20 10:30:12");
-        assert_eq!(zh_cn_at_offset(1_767_214_803_000, plus8), "2026/1/1 05:00:03", "no zero padding of day or month");
-        assert_eq!(zh_cn_at_offset(utc_ms, 0), "2026/10/30 10:30:12");
+        let plus8 = &crate::local_time::beijing_tariff_zone();
+        assert_eq!(zh_cn_local(utc_ms, plus8), "2026/10/30 18:30:12");
+        assert_eq!(zh_cn_local(utc_ms - 10 * 24 * 3_600_000 - 8 * 3_600_000, plus8), "2026/10/20 10:30:12");
+        assert_eq!(zh_cn_local(1_767_214_803_000, plus8), "2026/1/1 05:00:03", "no zero padding of day or month");
+        assert_eq!(zh_cn_local(utc_ms, &jiff::tz::TimeZone::UTC), "2026/10/30 10:30:12");
     }
 
     fn gap(id: i64, conversation: &str, from_ms: i64, to_ms: i64, status: &str, reason: &str) -> crate::inbound::Gap {
@@ -530,7 +514,7 @@ mod tests {
 
     #[test]
     fn the_gap_notice_lists_conversations_with_interval_count_and_action() {
-        let plus8 = 8 * 3_600_000;
+        let plus8 = &crate::local_time::beijing_tariff_zone();
         let from = 1_793_356_212_000;
         let gaps = vec![
             gap(1, "private:7001", from, from + 300_000, "unrecovered", "private-history-unverified"),
@@ -552,7 +536,7 @@ mod tests {
     #[test]
     fn a_long_gap_list_is_cut_but_the_count_stays_whole() {
         let gaps: Vec<_> = (0..14).map(|i| gap(i, &format!("private:{i}"), 0, 1000, "unrecovered", "private-history-unverified")).collect();
-        let (text, listed) = gap_notice(&gaps, 0, None, &|t| t.to_string());
+        let (text, listed) = gap_notice(&gaps, &jiff::tz::TimeZone::UTC, None, &|t| t.to_string());
         assert!(text.contains("入站缺口 14 个"), "{text}");
         assert!(listed > 0 && listed <= GAP_NOTICE_LISTED, "{listed}");
         for i in 0..14 {
@@ -575,7 +559,7 @@ mod tests {
     #[test]
     fn many_long_gaps_still_fit_the_alert_body_after_redaction_and_end_with_the_remainder_and_pointer() {
         let gaps = long_key_gaps(20);
-        let (text, listed) = gap_notice(&gaps, 0, None, &expanding_redact);
+        let (text, listed) = gap_notice(&gaps, &jiff::tz::TimeZone::UTC, None, &expanding_redact);
         let body = crate::admin_alert::prepare_body(&text, expanding_redact);
         assert!(body.encode_utf16().count() <= 800, "{body}");
         assert!(body.contains("入站缺口 20 个"), "{body}");
@@ -590,7 +574,7 @@ mod tests {
     #[test]
     fn a_single_gap_line_longer_than_the_budget_is_shortened_so_the_notice_still_lists_it() {
         let gaps = vec![gap(1, &format!("group:{}", "y".repeat(2000)), 0, 1000, "unknown", "history-empty"), gap(2, "group:2", 0, 1, "unknown", "history-empty")];
-        let (text, listed) = gap_notice(&gaps, 0, None, &|t| t.to_string());
+        let (text, listed) = gap_notice(&gaps, &jiff::tz::TimeZone::UTC, None, &|t| t.to_string());
         assert_eq!(listed, 1);
         assert!(text.encode_utf16().count() <= 800 && text.contains("另有 1 个未列出") && text.ends_with("/api/inbound/gaps"), "{text}");
     }
@@ -627,7 +611,7 @@ mod tests {
         let context = RuntimeContext::from_root(&root).unwrap();
         let ids = journal_with_unnotified_gaps(&context, 20);
         let sent = std::cell::RefCell::new(String::new());
-        report_gaps_with(&context, None, &expanding_redact, &|text, ids| {
+        report_gaps_with(&context, &jiff::tz::TimeZone::UTC, None, &expanding_redact, &|text, ids| {
             crate::inbound::Journal::open(&context).unwrap().mark_gaps_notified(ids, 1).unwrap();
             *sent.borrow_mut() = crate::admin_alert::prepare_body(text, expanding_redact);
             true
@@ -639,7 +623,7 @@ mod tests {
         let left: Vec<i64> = journal.unnotified_gaps().unwrap().iter().map(|g| g.id).collect();
         assert_eq!(left, ids[listed..].to_vec(), "exactly the unlisted gaps stay unnotified; body: {body}");
         // The next notice lists the rest and says how many more remain, if any.
-        report_gaps_with(&context, None, &expanding_redact, &|_, ids| { crate::inbound::Journal::open(&context).unwrap().mark_gaps_notified(ids, 1).unwrap(); true });
+        report_gaps_with(&context, &jiff::tz::TimeZone::UTC, None, &expanding_redact, &|_, ids| { crate::inbound::Journal::open(&context).unwrap().mark_gaps_notified(ids, 1).unwrap(); true });
         let after = journal.unnotified_gaps().unwrap().len();
         assert!(after < left.len(), "the next notice makes progress: {after} of {}", left.len());
         drop(journal);
@@ -651,7 +635,7 @@ mod tests {
         let root = gap_root("refused");
         let context = RuntimeContext::from_root(&root).unwrap();
         let ids = journal_with_unnotified_gaps(&context, 3);
-        report_gaps_with(&context, None, &|t| t.to_string(), &|_, _| false);
+        report_gaps_with(&context, &jiff::tz::TimeZone::UTC, None, &|t| t.to_string(), &|_, _| false);
         let journal = crate::inbound::Journal::open(&context).unwrap();
         assert_eq!(journal.unnotified_gaps().unwrap().iter().map(|g| g.id).collect::<Vec<_>>(), ids);
         // The real path: without ownerQQ the alert outbox refuses, so nothing is marked either.

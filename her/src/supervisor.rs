@@ -311,7 +311,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
     let running_check = Box::new(move |def: &TaskDef| def.runs_when_held || !matches!(desired(&running_context), Effective::Act { wants, .. } if !wants.jobs));
     let executor = Arc::new(RuntimeExecutor { context: context.clone(), inner: CommandExecutor::new(tasks::node_resolver(node, install, root), internal, clock.clone()).with_admission(admission).with_running_check(running_check) });
     let dispatcher = Dispatcher::new(store, executor, clock.clone());
-    let mut scheduler = Scheduler::new(|def| enabled_in(context, cfg, def), tasks::local_offset_ms(), clock.now_ms());
+    let mut scheduler = Scheduler::new(|def| enabled_in(context, cfg, def), crate::local_time::configured_zone(cfg), clock.now_ms());
     scheduler.refresh_schedules(cfg, clock.now_ms());
     let scheduler = Arc::new(Mutex::new(scheduler));
     Ok(crate::console_tasks::TasksApi { dispatcher, scheduler, desired: DesiredStore::new(context.data_dir().join("lifecycle")) })
@@ -757,6 +757,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 let on = enabled_in(&refresh_context, &cfg, def);
                 if schedule.enabled(def.id) != on { schedule.set_enabled(def.id, on, now); }
             }
+            schedule.set_zone(crate::local_time::configured_zone(&cfg), now);
             schedule.refresh_schedules(&cfg, now);
         }
     }, Duration::from_secs(1), &stop);
@@ -793,10 +794,11 @@ mod tests {
         cfg["backup"] = serde_json::json!({"time":"06:30"});
         std::fs::write(fixture.0.join("config/config.json"), cfg.to_string()).unwrap();
         let context = fixture.context();
-        let api = task_api(&context, &context.load_config().unwrap()).unwrap();
+        let cfg = context.load_config().unwrap();
+        let api = task_api(&context, &cfg).unwrap();
         let now = api.dispatcher.clock().now_ms();
         let next = api.scheduler.lock().unwrap().next_run(TaskId::Backup).unwrap();
-        assert_eq!(next, tasks::next_due(tasks::Schedule::Daily { hour: 6, minute: 30 }, now, tasks::local_offset_ms()).unwrap());
+        assert_eq!(next, tasks::next_due(tasks::Schedule::Daily { hour: 6, minute: 30 }, now, &crate::local_time::configured_zone(&cfg)).unwrap());
     }
 
     #[cfg(windows)]

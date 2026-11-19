@@ -9,7 +9,7 @@ mod prompt;
 mod reply;
 mod schedule;
 
-pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME};
+pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE};
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 #[cfg(test)]

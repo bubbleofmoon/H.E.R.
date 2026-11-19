@@ -1630,31 +1630,7 @@ fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let secs = ms / 1000;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60,
-        ms % 1000
-    )
-}
-
-/// Howard Hinnant 的 days_from_civil 逆运算。
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    crate::local_time::iso_utc(ms)
 }
 
 /// `/api/social`：一代仿真的配置与状态。
@@ -5699,7 +5675,7 @@ pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str,
         }
     }
     crate::activity::append(context, &format!("{key} [send] 禁言中，本地拒发，未调用网关"));
-    Err((403, mute.refusal_text(crate::parity_clock::now_ms())))
+    Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)))
 }
 
 fn wait_console_generation() -> &'static str {
@@ -10327,7 +10303,7 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
         return Err(cancelled());
     }
     if let Some(mute) = crate::group_mute::active(context, key) {
-        return Err((403, mute.refusal_text(crate::parity_clock::now_ms())));
+        return Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)));
     }
     Ok(())
 }

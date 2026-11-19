@@ -91,6 +91,7 @@ mod lifecycle_cli;
 mod watchdog;
 mod task_runs;
 mod tasks;
+mod local_time;
 mod schedule;
 mod backup;
 mod restore;
@@ -930,7 +931,7 @@ fn runtime_json(
 /// 从 config.json 提取唤醒调度参数（在线主循环与离线重放共用一份口径）。
 fn wake_cfg_of(cfg_raw: &Value) -> wake::WakeCfg {
     let sv2 = cfg_raw.get("socialV2").cloned().unwrap_or_default();
-    let mut wcfg = wake::WakeCfg::default();
+    let mut wcfg = wake::WakeCfg { zone: crate::local_time::configured_zone(cfg_raw), ..wake::WakeCfg::default() };
     wcfg.turn_hard_cap_ms = wake::turn_budget(cfg_raw).hard_cap_ms;
     wcfg.turn_ceiling_ms = wake::turn_ceiling_ms(cfg_raw);
     wcfg.enabled = sv2.get("enabled").and_then(Value::as_bool) != Some(false);
