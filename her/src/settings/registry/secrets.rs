@@ -8,7 +8,7 @@ pub(crate) const WEB_SEARCH_API_KEY: Setting = Setting {
     group: "endpoint credentials",
     label: "Primary web search API key",
     hint: "Used for the current primary search endpoint. Set it again after changing that endpoint.",
-    chat: false,
+    chat: true, // RED-C1A
     secret: true,
 };
 

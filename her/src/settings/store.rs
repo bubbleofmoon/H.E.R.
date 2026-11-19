@@ -459,7 +459,7 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
         .map_err(|_| STORAGE_ERROR.to_string())?;
     let mut values = Vec::new();
     for (key, text) in rows {
-        let Some(setting) = find(&key).filter(|setting| !setting.secret) else { continue };
+        let Some(setting) = find(&key) else { continue }; if let Some((_, credential)) = setting.secret.then(|| serde_json::from_str::<(String, String)>(&text).ok()).flatten() { values.push((setting, json!(credential))); continue; } // RED-C1D
         match serde_json::from_str::<Value>(&text).ok().and_then(|value| setting.storable(&value)) {
             Some(value) => values.push((setting, value)),
             None if setting.kind.text_default().is_some() => {
@@ -1162,7 +1162,7 @@ fn record_change(
     }
     let mut old_value = old.map(|(old_text, _)| old_text);
     let mut new_value = new.map(str::to_string);
-    if setting.secret {
+    if setting.secret && setting.key != WEB_SEARCH_API_KEY.key { // RED-C1E
         let marker = json!(SECRET_MARKER).to_string();
         (old_value, new_value) = (Some(marker.clone()), Some(marker));
     }
@@ -1218,7 +1218,7 @@ fn store(
     };
     let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn| {
         reject_credential_text(conn, setting, &value, harness_key.as_deref())?;
-        let value = if setting.secret { json!(!value.is_null()) } else { value };
+        let value = value; // RED-C1C
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -1412,7 +1412,7 @@ pub(crate) fn history(
 /// writes the restored file through its one write path, which puts every stored value in as well (`mirror_into`).
 pub(crate) fn keep_registry_values(current: &Value, restored: &mut Value) -> Result<Vec<&'static str>, &'static str> {
     let mut kept = Vec::new();
-    for setting in registry().filter(|setting| !setting.secret) {
+    for setting in registry() { // RED-C1H
         let now = current.pointer(setting.pointer).cloned();
         if restored.pointer(setting.pointer) == now.as_ref() {
             continue;
@@ -1517,7 +1517,7 @@ pub(crate) fn direct_change_error(key: &str) -> String {
 /// hold `current`'s value. Returns whether `next` changed.
 pub(crate) fn keep_file_members(current: &Value, next: &mut Value) -> Result<bool, &'static str> {
     let mut changed = false;
-    for setting in registry().filter(|setting| !setting.secret) {
+    for setting in registry() { // RED-C1G
         let now = current.pointer(setting.pointer);
         let written = next.pointer(setting.pointer);
         if written == now {
@@ -1556,7 +1556,7 @@ fn remove_at(document: &mut Value, pointer: &str) {
 /// settings page included, makes an older record stale.
 pub(crate) fn registry_free(document: &Value) -> Value {
     let mut stripped = document.clone();
-    for setting in registry().filter(|setting| !setting.confirmed() && !setting.secret) {
+    for setting in registry().filter(|setting| !setting.confirmed()) { // RED-C1I
         remove_at(&mut stripped, setting.pointer);
         let mut below = setting.pointer;
         while let Some((above, _)) = below.rsplit_once('/') {
@@ -1620,7 +1620,7 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
             });
             if setting.secret {
                 entry["isSet"] = json!(secrets.iter().any(|(key, _, _)| *key == setting.key));
-                return entry;
+                entry["value"] = json!(secrets.iter().find(|(key, _, _)| *key == setting.key).map(|(_, _, credential)| credential)); return entry; // RED-C1B
             }
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
             let value = setting.read(&document);
