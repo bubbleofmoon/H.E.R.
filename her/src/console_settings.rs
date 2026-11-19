@@ -50,7 +50,18 @@ pub fn route(
         _ => Err((404, "unknown settings route".to_string())),
     };
     match result {
-        Ok(value) => (200, JSON_TYPE, value.to_string()),
+        Ok(mut value) => {
+            match (method, path) {
+                ("GET", "/api/settings" | "/api/settings/history") => models::redact_route_settings(context, &mut value),
+                ("POST", "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo")
+                    if value["setting"] == crate::settings::HARNESS_ROUTES.key =>
+                {
+                    models::redact_route_settings(context, &mut value);
+                }
+                _ => {}
+            }
+            (200, JSON_TYPE, value.to_string())
+        }
         Err((status, message)) => failure(status, &message),
     }
 }

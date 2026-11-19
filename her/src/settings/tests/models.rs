@@ -9,6 +9,7 @@ const MODEL_KEYS: [&str; 6] = [
     "memory.digest.timeoutSecs",
     "webSearch.model",
 ];
+const ROUTES_KEY: &str = "harness.routes";
 
 fn set_setting(context: &RuntimeContext, key: &str, value: Value) -> (u16, Value) {
     admin_request(context, "POST", "/api/settings/set", Some(&json!({"setting": key, "value": value})))
@@ -271,11 +272,13 @@ fn model_and_cost_settings_have_no_reader_default() {
     // default.
     let readers = [
         ("harness.rs", include_str!("../../harness.rs")),
+        ("harness/routes.rs", include_str!("../../harness/routes.rs")),
         ("digest/model.rs", include_str!("../../digest/model.rs")),
         ("aux_search.rs", include_str!("../../aux_search.rs")),
     ];
     let owned = [
         "/harness/model",
+        "/harness/routes",
         "/harness/maxSteps",
         "/harness/maxTokens",
         "/memory/digest/model",
@@ -292,6 +295,123 @@ fn model_and_cost_settings_have_no_reader_default() {
     for needle in owned {
         assert!(registry.contains(needle), "settings/registry/model.rs owns {needle}");
     }
+}
+
+#[test]
+fn harness_route_list_uses_store_on_next_read_and_keeps_ordered_history() {
+    let (root, context) = model_fixture("route list upgrade");
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200, "start with an existing settings store");
+    let file_routes = json!([
+        {"id": "first", "model": " file-first ", "note": "ignored"},
+        {"id": "second", "model": "file-second", "reasoningEffort": "high", "maxOutputTokens": 1, "retry429": false}
+    ]);
+    let seeded = json!([
+        {"id": "first", "model": "file-first", "reasoningEffort": null, "maxOutputTokens": 4096, "retry429": true},
+        {"id": "second", "model": "file-second", "reasoningEffort": "high", "maxOutputTokens": 1, "retry429": false}
+    ]);
+    write_config(&root, |config| config["harness"] = json!({"model": "fallback", "routes": file_routes.clone()}));
+    assert_eq!(next_turn_model(&context).as_deref(), Ok("file-first"));
+    assert_eq!(setting_view(&context, ROUTES_KEY)["stored"], Value::Null, "reading alone is not a migration");
+    let (status, reply) = set_setting(&context, ROUTES_KEY, seeded.clone());
+    assert_eq!((status, &reply["revision"], &reply["changed"]), (200, &json!(1), &json!(false)), "{reply}");
+    assert_eq!(stored_config(&root)["harness"]["routes"], file_routes, "seeding keeps the equivalent legacy spelling");
+    assert_eq!(StoreProbe::at(&root.0).user_version(), 1, "a global route list uses the existing schema");
+
+    let reversed = json!([seeded[1], seeded[0]]);
+    let (status, reply) = set_setting(&context, ROUTES_KEY, reversed.clone());
+    assert_eq!((status, &reply["revision"], &reply["value"]), (200, &json!(2), &reversed), "{reply}");
+    assert_eq!(stored_config(&root)["harness"]["routes"], reversed, "the older reader gets the new order too");
+    write_config(&root, |config| config["harness"]["routes"] = file_routes);
+    let view = setting_view(&context, ROUTES_KEY);
+    assert_eq!(view["kind"], json!({"type": "route list", "minItems": 1, "maxItems": 8}));
+    assert_eq!((&view["stored"], &view["value"], &view["default"]), (&reversed, &reversed, &Value::Null));
+    assert_eq!(next_turn_model(&context).as_deref(), Ok("file-second"));
+    assert_eq!(next_digest(&context).0.as_deref(), Some("file-second"));
+
+    crate::settings::FAIL_WRITE_BACK.with(|fail| fail.set(true));
+    let (status, reply) = post(&context, "/api/settings/reset", json!({"setting": ROUTES_KEY}));
+    assert_eq!((status, &reply["value"]), (200, &Value::Null), "{reply}");
+    assert_eq!(reply["mirrorError"], "runtime config is unavailable");
+    assert_eq!(stored_config(&root)["harness"]["routes"][0]["id"], "first", "the file still holds the old list");
+    let context = RuntimeContext::from_root(&root.0).unwrap();
+    assert_eq!(next_turn_model(&context).as_deref(), Ok("fallback"), "a restart reads the committed reset");
+    finish_settings_write_back(&context);
+    assert_eq!(stored_config(&root)["harness"].get("routes"), Some(&Value::Null), "start finishes writing back the reset");
+
+    let (entries, _) = history_page(&context, "?setting=harness.routes");
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    assert_eq!((&entries[2]["source"], &entries[2]["new"]), (&json!("migration"), &seeded));
+    assert_eq!((&entries[1]["source"], &entries[1]["old"], &entries[1]["new"]), (&json!("console"), &seeded, &reversed));
+    assert_eq!((&entries[0]["source"], &entries[0]["old"], &entries[0]["new"]), (&json!("reset"), &reversed, &Value::Null));
+    let (status, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!((status, &reply["stored"]), (200, &reversed), "{reply}");
+    assert_eq!(stored_config(&root)["harness"]["routes"], reversed);
+    assert_eq!(next_turn_model(&context).as_deref(), Ok("file-second"));
+    let (entries, _) = history_page(&context, "?setting=harness.routes");
+    assert_eq!((&entries[0]["source"], &entries[0]["new"]), (&json!("undo"), &reversed));
+}
+
+#[test]
+fn harness_route_list_refuses_invalid_inputs_without_echoing_them() {
+    let (root, context) = model_fixture("invalid route list");
+    let invalid = json!([{"id": "first", "model": "model-a"}, {"id": "second", "model": "model-b", "retry429": "bad-input"}]);
+    write_config(&root, |config| {
+        config["harness"] = json!({"model": "fallback", "routes": invalid.clone()});
+    });
+    let error = "harness route 2 is invalid (retry429)";
+    assert_eq!(next_turn_model(&context), Err(error.to_string()), "an invalid file list cannot fall back");
+    let (status, reply) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!((status, &reply["error"], &reply["routes"]), (200, &json!(error), &json!([])));
+    assert!(reply["conversations"].as_array().is_some_and(|rows| !rows.is_empty()));
+    let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+    let bounds = "harness routes must be a list of 1 to 8 routes";
+    for (value, expected) in [
+        (invalid, error),
+        (json!([{"id": "a", "model": "first"}, {"id": "a", "model": "second"}]), "harness route 2 is invalid (id)"),
+        (json!([]), bounds),
+        (Value::Null, bounds),
+        (json!({"id": "a", "model": "first"}), bounds),
+    ] {
+        let (status, reply) = set_setting(&context, ROUTES_KEY, value);
+        assert_eq!(status, 400, "{reply}");
+        assert_eq!(reply["error"], expected, "route validation reports a position and field or the list bounds");
+    }
+    let request = json!({"setting": ROUTES_KEY, "value": [{"id": "agent", "model": "model-a"}]});
+    let (status, reply) = agent_request(&context, "POST", "/api/settings/set", Some(&request), "fixture-agent-token");
+    assert_eq!(status, 403, "{reply}");
+    assert!(!settings_db(&root).exists());
+    assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before);
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200);
+    assert!(history_page(&context, "?setting=harness.routes").0.is_empty(), "an invalid file list is not seeded");
+    let valid = json!([{"id": "new", "model": "model-new"}]);
+    write_config(&root, |config| config["harness"]["routes"] = valid);
+    StoreProbe::at(&root.0).insert_value(ROUTES_KEY, "[]");
+    assert_eq!(next_turn_model(&context).as_deref(), Ok("model-new"), "an invalid stored list does not replace the file");
+}
+
+#[test]
+fn harness_route_list_masks_credentials_in_settings_responses() {
+    let (root, context) = settings_fixture("route list credential masking");
+    let credential = "fixture-model-credential";
+    std::fs::write(root.0.join("config/harness-api-key"), credential).unwrap();
+    let routes = json!([{"id": format!("route-{credential}"), "model": format!("model-{credential}")}]);
+    write_config(&root, |config| config["harness"] = json!({"routes": routes}));
+    assert_eq!(set_quiet(&context, json!(4500)).0, 200, "seed the list");
+    let view = setting_view(&context, ROUTES_KEY);
+    assert_eq!(view["stored"][0]["id"], "route-[REDACTED]", "the stored route list masks the credential");
+    assert_eq!(view["value"][0]["model"], "model-[REDACTED]");
+    assert_eq!(view["redacted"], true);
+    assert!(!view.to_string().contains(credential));
+    let edit = json!([{"id": "new", "model": format!("new-{credential}")}]);
+    let (status, reply) = set_setting(&context, ROUTES_KEY, edit);
+    assert_eq!((status, &reply["value"][0]["model"]), (200, &json!("new-[REDACTED]")));
+    let (entries, _) = history_page(&context, "?setting=harness.routes");
+    assert_eq!(entries[0]["old"][0]["model"], "model-[REDACTED]");
+    assert_eq!(entries[0]["new"][0]["model"], "new-[REDACTED]");
+    assert!(!json!(entries).to_string().contains(credential));
+    let (status, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
+    assert_eq!((status, &reply["stored"][0]["model"]), (200, &json!("model-[REDACTED]")));
+    assert_eq!(stored_config(&root)["harness"]["routes"][0]["model"], format!("model-{credential}"));
 }
 
 #[test]
