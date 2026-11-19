@@ -460,7 +460,7 @@ struct SendArgs<'a> {
     file: &'a Path,
     audio: AudioOptions,
     /// AI channel: the agent token's epoch and the validity policy checked right before the request.
-    guard: Option<(&'a str, GuardPolicy)>,
+    guard: Option<(&'a str, GuardPolicy<'a>)>,
     epoch: String,
     budget_scope: String,
     /// Timestamp the budget slot is spent at after a confirmed send. JS: the AI channel stamps after

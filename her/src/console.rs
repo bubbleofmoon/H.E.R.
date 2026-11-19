@@ -7591,7 +7591,7 @@ where
     };
     let add_payload = json!({ "file": format!("base64://{b64}") });
     let submission = if context.is_isolated() {
-        Some(guarded_sticker_submission(context, &ob, "add_custom_face", &add_payload,
+        Some(guarded_qq_submission(context, &ob, "add_custom_face", &add_payload,
             || collect_sticker_guard(context, cfg, &storage_key, agent_token)
                 .and_then(|_| require_sticker_reservation(context, &storage_key, "stickerCollectPending", &reservation)))?)
     } else { None };
@@ -7622,7 +7622,7 @@ where
     if !clean_remark.is_empty() {
         let payload = json!({ "emoji_id": emoji_id_new.clone(), "desc": clean_remark });
         let success = if context.is_isolated() {
-            guarded_sticker_submission(context, &ob, "modify_custom_face", &payload,
+            guarded_qq_submission(context, &ob, "modify_custom_face", &payload,
                 || collect_sticker_guard(context, cfg, &storage_key, agent_token)
                     .and_then(|_| require_sticker_reservation(context, &storage_key, "stickerCollectPending", &reservation)))?
                 .and_then(|pending| pending.outcome()).is_ok()
@@ -9037,7 +9037,7 @@ where
     }
     let attempt_ms = recorded.attempt(0, None)
         .map_err(|error| (503, format!("发送意图未能持久记录，未发送：{error}")))?;
-    let submission = guarded_sticker_submission(context, &ob, action, &payload, || {
+    let submission = guarded_qq_submission(context, &ob, action, &payload, || {
         require_sticker_reservation(context, &storage_key, "stickerSendPending", &reservation).and_then(|_| send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendSticker")).and_then(|_| {
             let fresh = context.load_config().map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
             if crate::sticker::enabled(&fresh) { Ok(()) } else { Err((409, SEND_CANCELLED_MESSAGE.to_string())) }
@@ -9716,6 +9716,50 @@ pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
     key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
 }
 
+#[allow(dead_code)] // Called by the live mailbox in run 2.
+pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> bool {
+    let limit = cfg.pointer("/socialV2/send/maxMessageChars").and_then(Value::as_f64)
+        .filter(|n| *n != 0.0).unwrap_or(500.0).clamp(1.0, 500.0) as usize;
+    key.starts_with("group:") && canonical_v2_key(key).as_deref() == Some(key)
+        && inbound_admitted(cfg, key)
+        && tool_enabled(cfg, "sendGroup")
+        && !message.is_empty() && message.encode_utf16().count() <= limit
+        && crate::pipeline::configured_outbound_violation(cfg, message, &[]).is_none()
+}
+
+#[cfg(test)]
+#[test]
+fn approved_group_requires_explicit_canonical_scope_and_bounded_preview() {
+    let allowed = json!({"allow":{"groups":[42]},"socialV2":{"send":{"maxMessageChars":900}}});
+    assert!(approved_group_allowed(&allowed, "group:42", &"🎨".repeat(250)));
+    assert!(!approved_group_allowed(&allowed, "group:42", &format!("{}x", "🎨".repeat(250))), "approved preview accepted a message beyond its fixed cap");
+    assert!(!approved_group_allowed(&allowed, "group:042", "hey"));
+    assert!(!approved_group_allowed(&allowed, "group:43", "hey"));
+    assert!(!approved_group_allowed(&allowed, "private:42", "hey"));
+    let denied = json!({"allow":{"groups":[42]},"deny":{"groups":[42]}});
+    assert!(!approved_group_allowed(&denied, "group:42", "hey"));
+    let off = json!({"allow":{"groups":[42]},"socialV2":{"tools":{"sendGroup":false}}});
+    assert!(!approved_group_allowed(&off, "group:42", "hey"));
+}
+
+/// Internal continuation. Only the live interaction passes the one-use owner decision.
+#[allow(dead_code)] // Called by the live mailbox in run 2.
+pub(crate) fn send_approved_group(
+    context: &RuntimeContext, key: &str, message: &str, turn: &str, authorized: &dyn Fn() -> bool,
+) -> Result<(u16, Value), (u16, String)> {
+    let cfg = context.load_config().map_err(|_| (503, "send settings unavailable".into()))?;
+    if !authorized() || !approved_group_allowed(&cfg, key, message) || silent_blocks_send(context, &cfg, key)? {
+        return Err((403, "approved group send refused".into()));
+    }
+    let (_, id_s, _) = agent::parse_key(key).ok_or((400, "invalid group".into()))?;
+    let token = crate::conversation_authority::ensure_or_rotate(context, key, false).map_err(|e| (503, e))?;
+    agent::execute_send(context, &cfg, &agent::SendCall {
+        key, kind: "group", id_s, token: &token, messages: vec![message.into()],
+        reply_ref: String::new(), at_user: None, gap_mode: "auto", body: &Value::Null,
+        flavor: agent::SendFlavor::Direct, policy: GuardPolicy::ApprovedGroup { turn, authorized }, resolved_quote: None,
+    })
+}
+
 /// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
 /// per-connection work (gap recovery, mute refresh, group cards).
 pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
@@ -10075,7 +10119,7 @@ fn sticker_send_pause() {
 
 // Lock order: a state writer can hold social-v2.lock before entering authority_gate;
 // this function never takes that state lock, and releases authority before response I/O.
-fn guarded_sticker_submission(
+fn guarded_qq_submission(
     context: &RuntimeContext,
     ob: &crate::onebot::OneBot,
     action: &str,
@@ -10288,10 +10332,12 @@ fn finish_send_batch(
 
 /// Which modes a send may still run in when its validity check runs (ticket 14): the reserved2
 /// tools only in reserved2; `/api/send/*` also in closed-agent (administrator private chat).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GuardPolicy {
+#[derive(Clone, Copy)]
+enum GuardPolicy<'a> {
     Reserved2,
     Reserved2OrClosedAgent,
+    #[allow(dead_code)] // Called by the live mailbox in run 2.
+    ApprovedGroup { turn: &'a str, authorized: &'a dyn Fn() -> bool },
 }
 
 /// Validity check before each item: the conversation still exists under the same agent token,
@@ -10300,7 +10346,7 @@ fn send_guard(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str) -> 
     send_guard_for(context, cfg, key, epoch, GuardPolicy::Reserved2, "sendMessage")
 }
 
-fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, policy: GuardPolicy, tool_flag: &str) -> Result<(), (u16, String)> {
+fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, policy: GuardPolicy<'_>, tool_flag: &str) -> Result<(), (u16, String)> {
     let cancelled = || (409u16, SEND_CANCELLED_MESSAGE.to_string());
     // A selected runtime's config may change while a quote/member lookup or a
     // burst gap is in flight. Authorize each item against the current allow-list.
@@ -10323,8 +10369,13 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
         return Err(cancelled());
     }
     let mode = current_mode_for(context).map_err(|_| cancelled())?;
-    let mode_ok = mode == "reserved2" || (policy == GuardPolicy::Reserved2OrClosedAgent && mode == "closed-agent");
-    if !mode_ok || !agent::mode_allowed(cfg, &mode, key) {
+    let allowed = match policy {
+        GuardPolicy::ApprovedGroup { authorized, .. } => mode == "closed-agent" && key.starts_with("group:")
+            && inbound_admitted(cfg, key) && authorized(),
+        _ => (mode == "reserved2" || (matches!(policy, GuardPolicy::Reserved2OrClosedAgent) && mode == "closed-agent"))
+            && agent::mode_allowed(cfg, &mode, key),
+    };
+    if !allowed {
         return Err(cancelled());
     }
     if silent_blocks_send(context, cfg, key).map_err(|_| cancelled())? {
@@ -10360,6 +10411,7 @@ struct RunReport {
     stop: Option<(u16, String)>,
     revision: Option<Value>,
     discard_error: Option<String>,
+    record_uncertain: bool,
 }
 
 impl RunReport {
@@ -10387,7 +10439,7 @@ fn run_send_items(
     kind: &str,
     id_s: &str,
     epoch: &str,
-    policy: GuardPolicy,
+    policy: GuardPolicy<'_>,
     tool_flag: &str,
     plan: &[PlanItem],
     delays: &[i64],
@@ -10469,13 +10521,26 @@ fn run_send_items(
         }
         let mut exclude = already_confirmed.to_vec();
         exclude.extend(report.confirmed_ids());
-        let outcome = ob.send_one_outcome(&target, &item.text, item.reply, item.at);
+        let outcome = if matches!(policy, GuardPolicy::ApprovedGroup { .. }) {
+            // Order: send chain, then authority for final validation and request transmission.
+            // Release authority before response reads, history verification and settlement.
+            let payload = crate::onebot::OneBot::segment_payload(&target, &item.text, item.reply, item.at);
+            match guarded_qq_submission(context, ob, target.action(), &payload, || {
+                send_guard_for(context, cfg, key, epoch, policy, tool_flag)
+            }) {
+                Ok(result) => result.and_then(crate::onebot::PendingResponse::outcome),
+                Err((_, reason)) => Err(crate::onebot::SendError::NotCommitted(reason)),
+            }
+        } else {
+            ob.send_one_outcome(&target, &item.text, item.reply, item.at)
+        };
         let settled = recorded.settle(item.idx, attempt_ms, outcome, &history, Proof::Text(&item.text), &exclude);
         // The gateway detail first, as before: a later record failure must not hide it.
         if let Some(error) = settled.error {
             report.first_error.get_or_insert(error);
         }
         if let Some(error) = settled.record_error {
+            report.record_uncertain = true;
             note(&mut report, error);
         }
         if matches!(settled.state, ItemState::Confirmed { .. }) {
@@ -10558,6 +10623,9 @@ fn resume_send_batch(
     }
     if batch.kind != "text" {
         return Err((409, "该批次不能作为文本恢复发送".to_string()));
+    }
+    if matches!(batch.purpose.as_str(), "approved-group" | "owner-interaction" | "owner-interaction-timeout") {
+        return Err((409, "该批次不能恢复发送".to_string()));
     }
     if batch.epoch != epoch {
         return Err((409, "旧回合结果拒绝：批次属于已失效的会话令牌".to_string()));
@@ -20416,7 +20484,7 @@ mod tests {
                     }
                 })));
                 let ob = crate::onebot::OneBot::try_new_url(&url, "fixture".to_string()).unwrap();
-                let pending = guarded_sticker_submission(&worker_context, &ob, &action, &json!({}), || Ok(())).unwrap().unwrap();
+                let pending = guarded_qq_submission(&worker_context, &ob, &action, &json!({}), || Ok(())).unwrap().unwrap();
                 pending.outcome()
             });
             guarded_rx.recv_timeout(Duration::from_secs(5)).unwrap();
