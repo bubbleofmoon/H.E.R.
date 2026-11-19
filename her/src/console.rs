@@ -9719,7 +9719,7 @@ pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
 #[allow(dead_code)] // Called by the live mailbox in run 2.
 pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> bool {
     let limit = cfg.pointer("/socialV2/send/maxMessageChars").and_then(Value::as_f64)
-        .filter(|n| *n != 0.0).unwrap_or(500.0).clamp(1.0, 501.0) as usize; // RED-R1
+        .filter(|n| *n != 0.0).unwrap_or(500.0).clamp(1.0, 500.0) as usize;
     key.starts_with("group:") && canonical_v2_key(key).as_deref() == Some(key)
         && inbound_admitted(cfg, key)
         && tool_enabled(cfg, "sendGroup")
@@ -10624,7 +10624,7 @@ fn resume_send_batch(
     if batch.kind != "text" {
         return Err((409, "该批次不能作为文本恢复发送".to_string()));
     }
-    if batch.purpose == "fixture-unrelated-purpose" { // RED-R2
+    if matches!(batch.purpose.as_str(), "approved-group" | "owner-interaction" | "owner-interaction-timeout") {
         return Err((409, "该批次不能恢复发送".to_string()));
     }
     if batch.epoch != epoch {
