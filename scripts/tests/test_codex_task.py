@@ -69,8 +69,15 @@ case "$FAKE_MODE" in
   reset-force) git -C "$workdir" reset -q --hard HEAD~1; push --force; printf 'done\n' > "$report" ;;
   push-reset) edit; commit; push; git -C "$workdir" reset -q --hard HEAD~1; printf 'done\n' > "$report" ;;
   common-config) git -C "$workdir" config demo.key value; edit; commit; push; printf 'done\n' > "$report" ;;
-  common-hook) mkdir -p "${adds[1]}/hooks"; echo x > "${adds[1]}/hooks/post-commit"; edit; commit; push; printf 'done\n' > "$report" ;;
-  worktree-config) echo '[demo]' > "$(git -C "$workdir" rev-parse --absolute-git-dir)/config.worktree"; edit; commit; push; printf 'done\n' > "$report" ;;
+  common-hook)
+    hooks="$(git -C "$workdir" rev-parse --path-format=absolute --git-common-dir)/hooks"
+    mkdir -p "$hooks"; echo x > "$hooks/post-commit"; edit; commit; push; printf 'done\n' > "$report" ;;
+  worktree-config)
+    git -C "$workdir" config --file "$(git -C "$workdir" rev-parse --absolute-git-dir)/config.worktree" demo.key value
+    edit; commit; push; printf 'done\n' > "$report" ;;
+  config-entry)
+    git -C "$workdir" config --file "$FAKE_CONFIG_FILE" "$FAKE_CONFIG_KEY" "$FAKE_CONFIG_VALUE" || exit 1
+    printf 'done\n' > "$report" ;;
   config-fail) git -C "$workdir" config demo.key value; printf 'half\n' > "$report"; exit 3 ;;
   commit-twice) edit; commit 'first'; echo more >> "$workdir/second.txt"; commit 'second'; push; printf 'done\n' > "$report" ;;
   commit-nopush) edit; commit; printf 'done\n' > "$report" ;;
@@ -342,6 +349,13 @@ class Work:
         self.assertEqual(self.receipt(), [f'pushed {after}'])
         self.assertIn(f'pushed {after}', done.stdout)
         self.assertEqual(self.receipt('staged'), [f'commit {after} fake commit', 'A\tnew.txt'])
+        args = self.codex_args()
+        self.assertIn('--dangerously-bypass-approvals-and-sandbox', args)
+        self.assertNotIn('-s', args)
+        self.assertNotIn('--add-dir', args)
+        self.assertEqual(args[args.index('-m') + 1], 'gpt-6.2-sol')
+        self.assertIn('model_reasoning_effort="medium"', args)
+        self.assertEqual(args[args.index('-C') + 1], str(self.wt))
 
     def test_the_staged_receipt_lists_every_commit_and_the_name_status_of_the_range(self):
         pre = self.head(self.wt)
@@ -350,20 +364,6 @@ class Work:
         log = git('log', '--format=commit %H %s', f'{pre}..HEAD', cwd=self.wt).stdout.splitlines()
         self.assertEqual(len(log), 2)
         self.assertEqual(self.receipt('staged'), [*log, 'A\tnew.txt', 'A\tsecond.txt'])
-
-    def test_implement_runs_codex_with_the_worktree_the_tmp_and_the_common_gitdir(self):
-        self.assertEqual(self.implement('commit-push').returncode, 0)
-        args = self.codex_args()
-        self.assertEqual(args[args.index('-m') + 1], 'gpt-6.2-sol')
-        self.assertIn('model_reasoning_effort="medium"', args)
-        self.assertEqual(args[args.index('-s') + 1], 'workspace-write')
-        self.assertEqual(args[args.index('-C') + 1], str(self.wt))
-        self.assertNotIn('--dangerously-bypass-approvals-and-sandbox', args)
-        added = [args[i + 1] for i, a in enumerate(args) if a == '--add-dir']
-        self.assertEqual(added, [str(self.ticket_dir / 'tmp'), self.common])
-        for setting in ('sandbox_workspace_write.network_access=true', 'sandbox_workspace_write.exclude_slash_tmp=true',
-                        'sandbox_workspace_write.exclude_tmpdir_env_var=true'):
-            self.assertIn(setting, args)
 
     def test_implement_gives_codex_gitleaks_a_temp_dir_and_no_push_blocking_git_config(self):
         self.assertEqual(self.implement('commit-push').returncode, 0)
@@ -562,9 +562,9 @@ class Work:
         self.assertEqual(self.receipt(), [f'pushed {self.head(self.wt)}', 'scan-refused'])
         self.assertIn('digit', (self.ticket_dir / 'run.scan.txt').read_text())
 
-    def config_changed(self, mode, expected, code=8):
-        done = self.implement(mode)
-        self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+    def config_changed(self, mode, expected, env_extra=None):
+        done = self.implement(mode, env_extra)
+        self.assertEqual(done.returncode, 8, done.stdout + done.stderr)
         lines = self.receipt()
         self.assertEqual(len(lines), 1, lines)                       # nothing else is checked
         self.assertTrue(lines[0].startswith('config-changed '), lines)
@@ -572,6 +572,25 @@ class Work:
 
     def test_a_changed_common_git_config_is_reported(self):
         self.config_changed('common-config', f'{self.common}/config')
+
+    def test_branch_tracking_changes_are_ignored_in_both_configs(self):
+        wtgit = git('rev-parse', '--absolute-git-dir', cwd=self.wt).stdout.strip()
+        for path in (f'{self.common}/config', f'{wtgit}/config.worktree'):
+            with self.subTest(path=path):
+                done = self.implement('config-entry', dict(
+                    FAKE_CONFIG_FILE=path, FAKE_CONFIG_KEY='branch.other.merge', FAKE_CONFIG_VALUE='refs/heads/main'))
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(self.receipt(), ['no-changes'])
+
+    def test_a_changed_fsmonitor_setting_is_reported(self):
+        path = f'{self.common}/config'
+        self.config_changed('config-entry', path, dict(
+            FAKE_CONFIG_FILE=path, FAKE_CONFIG_KEY='core.fsmonitor', FAKE_CONFIG_VALUE=str(self.out / 'absent')))
+
+    def test_a_changed_include_path_is_reported(self):
+        path = f'{self.common}/config'
+        self.config_changed('config-entry', path, dict(
+            FAKE_CONFIG_FILE=path, FAKE_CONFIG_KEY='include.path', FAKE_CONFIG_VALUE=str(self.out / 'absent')))
 
     def test_a_new_hook_in_the_common_git_dir_is_reported(self):
         self.config_changed('common-hook', f'{self.common}/hooks/post-commit')

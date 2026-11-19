@@ -8,10 +8,10 @@
 # implement: HER_GITLEAKS must name the gitleaks binary (Codex's own push runs the pre-push hook with it). Before the run
 #   the worktree must be clean, its HEAD on her/<n>-<slug> (never main), <orch>/<n> and its tmp must not be links, and
 #   the remote must answer. An existing remote branch must match local HEAD, or the receipt says `pre-remote-mismatch`.
-#   Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
-#   common git dir, and commits and pushes its own ticket branch (push without -u: -u writes the common config).
-#   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
-#   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
+#   Codex runs unsandboxed with network access and commits and pushes its own ticket branch.
+#   Before and after the run, the wrapper hashes the listed entries from config and config.worktree with branch.*
+#   dropped, and hashes commondir, the .git file and hooks/ by bytes. A difference gives `config-changed <files>`
+#   and stops verification.
 #   Every later git call ignores them anyway: it uses the git dir found before the run, core.fsmonitor=false and
 #   core.hooksPath=/dev/null, and asks $HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R..git) for the
 #   remote head, never `origin`.
@@ -73,9 +73,22 @@ implement)
   mkdir -p -- "$orch/$ticket/tmp"
   [ ! -L "$orch/$ticket/tmp" ] || die "a link in the ticket folder: $orch/$ticket/tmp"
   # What git, its hooks and later sessions read: hashed before and after the run.
+  config_entries() {
+    if [ -f "$1" ]; then g config --file "$1" --no-includes --list; fi
+  }
   snap() {
-    local f p
-    for f in "$common/config" "$wtgit/config.worktree" "$wtgit/commondir" "$wt/.git"; do
+    local f p digest
+    for f in "$common/config" "$wtgit/config.worktree"; do
+      if [ -L "$f" ]; then printf 'link:%s  %s\n' "$(readlink -- "$f")" "$f"
+      elif [ -e "$f" ] && [ ! -f "$f" ]; then printf 'other  %s\n' "$f"
+      elif digest=$(config_entries "$f" | sed '/^branch\./d' | sha256sum); then
+        printf '%s  %s\n' "${digest%% *}" "$f"
+      else
+        # Keep a distinct snapshot for an unreadable or malformed config.
+        printf 'invalid:%s\n' "$(sha256sum -- "$f")"
+      fi
+    done
+    for f in "$wtgit/commondir" "$wt/.git"; do
       if [ -L "$f" ]; then printf 'link:%s  %s\n' "$(readlink -- "$f")" "$f"
       elif [ -f "$f" ]; then sha256sum -- "$f"
       elif [ -e "$f" ]; then printf 'other  %s\n' "$f"
@@ -88,8 +101,7 @@ implement)
     fi
   }
   pre_snap=$(snap)
-  TMPDIR="$orch/$ticket/tmp" "$here/codex-task.sh" "$name" "$wt" "$prompt" "$model" "$effort" workspace-write "$minutes" \
-    "$orch/$ticket/tmp" "$common"
+  TMPDIR="$orch/$ticket/tmp" "$here/codex-task.sh" "$name" "$wt" "$prompt" "$model" "$effort" bypass "$minutes"
   code=$?
   post_snap=$(snap)
   if [ "$post_snap" != "$pre_snap" ]; then

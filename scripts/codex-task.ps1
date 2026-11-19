@@ -5,7 +5,7 @@ param(
   [Parameter(Mandatory)][string]$PromptFile,
   [string]$Model = 'gpt-6.2-sol',
   [string]$Effort = 'high',
-  [ValidateSet('workspace-write', 'read-only')][string]$Sandbox = 'read-only',
+  [ValidateSet('workspace-write', 'read-only', 'bypass')][string]$Sandbox = 'read-only',
   [string[]]$AddDir = @(),
   [int]$TimeoutMinutes = 360
 )
@@ -13,9 +13,9 @@ param(
 # Windows counterpart of scripts/codex-task.sh. Runs one Codex CLI task hidden at BelowNormal and writes receipts
 # next to the prompt: <Name>.report.md (last message), <Name>.out.log, <Name>.err.log, <Name>.exit.txt (numeric code,
 # "timeout", or "no-report" / "quota" when no report was written; <Name>.stopped.txt when the run was stopped after its report).
-# The sandbox is read-only or workspace-write: workspace-write writes only -WorkDir and -AddDir (neither the temp
-# folder nor $env:TEMP: the caller points TEMP at a writable -AddDir) and gets loopback/network access.
-# scripts/codex-work.ps1 wraps this for the plan and implement modes.
+# The sandbox is read-only, workspace-write or bypass. workspace-write writes only -WorkDir and -AddDir
+# (neither the temp folder nor $env:TEMP: the caller points TEMP at a writable -AddDir) and gets loopback/network access.
+# Only codex-work implement uses bypass to disable sandboxing and approvals.
 # Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
 # After the run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
 $ErrorActionPreference = 'Stop'
@@ -31,7 +31,8 @@ $exitFile = Join-Path $outDir "$Name.exit.txt"
 Remove-Item -LiteralPath $report, $exitFile -ErrorAction SilentlyContinue
 
 $codexArgs = @('exec', '--skip-git-repo-check', '-m', $Model, '-c', "model_reasoning_effort=`"$Effort`"", '-C', $WorkDir, '--color', 'never', '-o', $report)
-$codexArgs += @('-s', $Sandbox)
+if ($Sandbox -eq 'bypass') { $codexArgs += '--dangerously-bypass-approvals-and-sandbox' }
+else { $codexArgs += @('-s', $Sandbox) }
 if ($Sandbox -eq 'workspace-write') {
   $codexArgs += @('-c', 'sandbox_workspace_write.network_access=true', '-c', 'sandbox_workspace_write.exclude_slash_tmp=true',
                   '-c', 'sandbox_workspace_write.exclude_tmpdir_env_var=true')
