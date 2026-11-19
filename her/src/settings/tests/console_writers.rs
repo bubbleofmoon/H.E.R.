@@ -393,6 +393,8 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
         json!(1),
         json!(2),
         json!(7),
+        // #152: an integer range that starts at 1000.
+        json!(5000),
         json!("probe-model-a"),
         json!("probe-model-b"),
         json!("plain probe text one"),
