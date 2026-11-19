@@ -220,7 +220,7 @@ fn clear_pending(
             conv["agentToken"] = json!(crate::console::fresh_agent_token());
         }
         conv[FIELD] = json!(Handover {
-            engine: Some(continuing), epoch: Some(epoch(conv)), summary: None, pending: None, // RED-M2
+            engine: Some(continuing), epoch: Some(epoch(conv)), summary: Some(pending.summary.clone()), pending: None,
         });
         return Ok(());
     }
@@ -240,7 +240,7 @@ fn clear_pending(
 }
 
 pub(crate) fn prepare_turn(context: &RuntimeContext, key: &str, mode: &str) -> Result<TurnPreparation, String> {
-    match prepare_admission(context, key, mode, None) { Err((status, error)) if matches!(mode, "chat" | "closed-agent") && (status >= 500 || error == UNSETTLED) => Ok(TurnPreparation::ParkUntil(crate::parity_clock::now_ms().saturating_add(FIRST_RETRY_MS))), result => result.map_err(|(_, error)| error) } // RED-M1
+    prepare_admission(context, key, mode, None).map_err(|(_, error)| error)
 }
 
 pub(crate) fn prepare(context: &RuntimeContext, key: &str, mode: &str, requested: Engine) -> Result<(), (u16, String)> {
