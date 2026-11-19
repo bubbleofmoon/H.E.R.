@@ -20,12 +20,12 @@ param(
 # implement: HER_GITLEAKS must name the gitleaks binary (Codex's own push runs the pre-push hook with it). Before the run
 #   the worktree must be clean, its HEAD on her/<n>-<slug> (never main), <orch>/<n> and its tmp must not be links, and
 #   the remote must answer. An existing remote branch must match local HEAD, or the receipt says `pre-remote-mismatch`.
-#   Codex (workspace-write, network) writes the worktree, <orch>/<n>/tmp and the repository's
-#   common git dir, and commits and pushes its own ticket branch (push without -u: -u writes the common config).
-#   The common config, the worktree's config.worktree, commondir and .git file and every file under hooks/ are hashed
-#   before and after the run; a difference is `config-changed <files>` and nothing else is checked (git would read them).
+#   Codex runs unsandboxed with network access and commits and pushes its own ticket branch.
+#   Before and after the run, the wrapper hashes the listed entries from config and config.worktree with branch.*
+#   dropped, and hashes commondir, the .git file and hooks/ by bytes. A difference gives `config-changed <files>`
+#   and stops verification.
 #   Every later git call ignores them anyway: it uses the git dir found before the run, core.fsmonitor=false and
-#   core.hooksPath off, and asks $env:HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R.git) for the
+#   core.hooksPath off, and asks $env:HER_REMOTE_URL (default https://github.com/bubbleofmoon/H.E.R..git) for the
 #   remote head, never `origin`.
 #   <Name>.push.txt line 1 is the first that applies: `rewritten` (the pre-run HEAD is not an ancestor of HEAD),
 #   `branch-changed <branch>`, `git-failed`, `dirty <paths>` plus `remote moved|unchanged|unknown`, `remote-moved`
@@ -52,14 +52,14 @@ function Stop-Refused([string]$Why) { [Console]::Error.WriteLine("codex-work: $W
 function Test-Link([string]$Path) { $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue; [bool]($item -and $item.LinkType) }
 # Native git: stderr text is not an error here, the exit code is.
 function Invoke-Git { $ErrorActionPreference = 'Continue'; & git @args }
-function Invoke-Task([string]$Dir, [string[]]$Extra, [string]$Temp) {
+function Invoke-Task([string]$Dir, [string]$Sandbox, [string]$Temp, [string[]]$Extra = @()) {
   # The caller's temp variables point at a writable folder for the Codex process only; they are restored after the run.
   $names = 'TMPDIR', 'TEMP', 'TMP'
   $saved = @{}
   foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n); [Environment]::SetEnvironmentVariable($n, $Temp) }
   try {
     # The child script ends with `exit`, which leaves this script's flow alone and sets $LASTEXITCODE.
-    $null = & $task -Name $Name -WorkDir $Dir -PromptFile $PromptFile -Model $Model -Effort $Effort -Sandbox workspace-write `
+    $null = & $task -Name $Name -WorkDir $Dir -PromptFile $PromptFile -Model $Model -Effort $Effort -Sandbox $Sandbox `
       -TimeoutMinutes $TimeoutMinutes -AddDir $Extra
     return [int]$LASTEXITCODE
   } finally { foreach ($n in $names) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) } }
@@ -73,7 +73,7 @@ $outDir = Split-Path -Parent (Resolve-Path -LiteralPath $PromptFile).Path
 if ($Mode -eq 'implement') {
   if (-not $WorkDir) { Stop-Refused 'implement needs -WorkDir' }
   if (-not $env:HER_GITLEAKS -or -not (Test-Path -LiteralPath $env:HER_GITLEAKS -PathType Leaf)) { Stop-Refused 'HER_GITLEAKS must name the gitleaks binary' }
-  $remoteUrl = if ($env:HER_REMOTE_URL) { $env:HER_REMOTE_URL } else { 'https://github.com/bubbleofmoon/H.E.R.git' }
+  $remoteUrl = if ($env:HER_REMOTE_URL) { $env:HER_REMOTE_URL } else { 'https://github.com/bubbleofmoon/H.E.R..git' }
   if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) { Stop-Refused "not a worktree root: $WorkDir" }
   $top = Invoke-Git -C $WorkDir rev-parse --show-toplevel 2> $null
   if ($LASTEXITCODE -ne 0 -or (Resolve-Path -LiteralPath "$top").Path -ne (Resolve-Path -LiteralPath $WorkDir).Path) { Stop-Refused "not a worktree root: $WorkDir" }
@@ -108,22 +108,45 @@ if ($Mode -eq 'implement') {
   [IO.Directory]::CreateDirectory($tmp) | Out-Null
   if (Test-Link $tmp) { Stop-Refused "a link in the ticket folder: $tmp" }
   # What git, its hooks and later sessions read: hashed before and after the run.
+  function Get-ConfigSnap([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item.LinkType) { return "link:$($item.Target -join ',')  $Path" }
+    if ($item.PSIsContainer) { return "other  $Path" }
+    $content = ''
+    if ($item) {
+      $entries = @(G config --file $Path --no-includes --list)
+      if ($LASTEXITCODE -ne 0) {
+        return "invalid:$((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant())  $Path"
+      }
+      $entries = @($entries | Where-Object { -not $_.StartsWith('branch.', [StringComparison]::Ordinal) })
+      if ($entries.Count) { $content = ($entries -join "`n") + "`n" }
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+      $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($content))).Replace('-', '').ToLowerInvariant()
+      "$hash  $Path"
+    } finally { $sha.Dispose() }
+  }
   function Get-Snap {
-    $items = @("$common/config", "$wtgit/config.worktree", "$wtgit/commondir", "$WorkDir/.git")
+    $items = @("$wtgit/commondir", "$WorkDir/.git")
     if (Test-Path -LiteralPath "$common/hooks" -PathType Container) {
       $items += @(Get-ChildItem -LiteralPath "$common/hooks" -Recurse -Force | Where-Object { -not $_.PSIsContainer -or $_.LinkType } | ForEach-Object { $_.FullName })
     }
-    $lines = foreach ($f in $items) {
-      $i = Get-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
-      if (-not $i) { continue }
-      if ($i.LinkType) { "link:$($i.Target -join ',')  $f" }
-      elseif ($i.PSIsContainer) { "other  $f" }
-      else { "$((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant())  $f" }
-    }
+    $lines = @(
+      Get-ConfigSnap "$common/config"
+      Get-ConfigSnap "$wtgit/config.worktree"
+      foreach ($f in $items) {
+        $i = Get-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+        if (-not $i) { continue }
+        if ($i.LinkType) { "link:$($i.Target -join ',')  $f" }
+        elseif ($i.PSIsContainer) { "other  $f" }
+        else { "$((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant())  $f" }
+      }
+    )
     @($lines | Sort-Object -CaseSensitive)
   }
   $preSnap = Get-Snap
-  $code = Invoke-Task $WorkDir @($tmp, "$common") $tmp
+  $code = Invoke-Task $WorkDir bypass $tmp
   $postSnap = Get-Snap
   if (($preSnap -join "`n") -ne ($postSnap -join "`n")) {
     $changed = @(Compare-Object $preSnap $postSnap -CaseSensitive | ForEach-Object { ($_.InputObject -split '  ', 2)[1] } | Sort-Object -Unique) -join ' '
@@ -227,7 +250,7 @@ $planFile = Join-Path $outDir "$Name.plan.txt"
 Remove-Item -LiteralPath $planFile -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
 [IO.Directory]::CreateDirectory($stage) | Out-Null
-$code = Invoke-Task $scratch @($stage) $stage
+$code = Invoke-Task $scratch workspace-write $stage @($stage)
 if ($code -ne 0) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue; exit $code }
 # The plan must be a regular file with no link: it is copied into a fresh file, never moved. Every step is checked,
 # `installed` follows the last one, and a failed install puts the old plan.md and plan.sha256 back (or removes both

@@ -475,12 +475,12 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
 }
 
 /// The last good version of a text setting whose stored value is refused (a row changed outside `apply`, or a denied
-/// term a later release added): the newest audited value the setting accepts, such as the default a reset stored. An
-/// audit row without a new value (an undo that removed the stored value) ends the search, and so does the oldest row;
-/// `None` then, and the file's value or the default applies.
+/// term a later release added): the newest value in the global audit that the setting accepts, such as the default a
+/// reset stored. A global audit row without a new value (an undo that removed the stored value) ends the search.
+/// When there is no usable row, the file's value or the default applies.
 fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> bool) -> Option<Value> {
     let mut statement =
-        conn.prepare("SELECT new_value FROM settings_audit WHERE key=?1 ORDER BY id DESC").ok()?;
+        conn.prepare("SELECT new_value FROM settings_audit WHERE scope='global' AND key=?1 ORDER BY id DESC").ok()?;
     let mut rows = statement.query([setting.key]).ok()?;
     while let Ok(Some(row)) = rows.next() {
         let text: Option<String> = row.get(0).ok()?;
@@ -712,10 +712,10 @@ fn keep_pre_settings_copy(context: &RuntimeContext) -> Result<(), String> {
 }
 
 /// Copies into the store, inside the writer's transaction (`write_store`), every registry setting that has never been
-/// in it (no row and no audit row) and whose value in `document`, the stored `config.json`, the registry accepts:
-/// revision 1 and one audit row each (actor `system`, source `migration`, one request id for the batch). A value the
-/// registry refuses is not copied, and a later write checks it again. So the first write seeds the store, a setting a
-/// later release adds is seeded by the first write after the upgrade, and nothing is seeded twice. A seeded value's
+/// in it (no row and no audit row) and whose kind can seed a value from `document`, the stored `config.json`:
+/// revision 1 and one audit row each (actor `system`, source `migration`, one request id for the batch). Later
+/// writes retry values that could not be seeded. A setting a later release adds is seeded by the first write after
+/// the upgrade, and nothing is seeded twice. A seeded value's
 /// one audit row keeps `record_change`'s revision rule: no revision is ever reused. The value is the kind's
 /// (`SettingKind::seed`) of the member the setting reads (`Setting::found_in`, an alias spelling included).
 ///

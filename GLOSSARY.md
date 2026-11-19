@@ -132,7 +132,7 @@ A durable mark in a harness session's history: a summary of the older rounds and
 _Avoid_: compaction, autocompact, snapshot
 
 **One-shot job (单次模型作业, `harness::one_shot`)**:
-A harness job that asks one model route for one answer, with no tools and no history: the digest and slang learning.
+A harness job that asks for one answer, with no tools and no history: the digest (walking the model routes as a turn does) and slang learning (the first route only).
 _Avoid_: turn, agent run, session
 
 **Upstream (上游)**:
