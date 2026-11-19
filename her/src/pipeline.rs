@@ -1748,7 +1748,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         }
         let mut status = turn.status();
         // The runner may have committed completion while the cap poll was checking authority.
-        let settled_cap = cap_reason.filter(|_| matches!(status, crate::harness::Status::Failed(_) | crate::harness::Status::Cancelled));
+        let settled_cap = cap_reason.filter(|_| !matches!(status, crate::harness::Status::Paused { .. } | crate::harness::Status::Running)); // RED-G2
         if let Some(reason) = settled_cap {
             status = if reason == "observationSleep" {
                 crate::harness::Status::Completed(String::new())
