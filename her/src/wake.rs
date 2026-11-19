@@ -754,7 +754,7 @@ pub fn is_wakeable(wc: &WakeConfig, now: i64) -> bool {
 pub fn parse_iso_ms(text: &str) -> Option<i64> {
     let text = text.trim();
     if let Ok(stamp) = text.parse::<jiff::Timestamp>() {
-        return Some(stamp.as_millisecond());
+        return Some(stamp.as_millisecond().max(0)); // RED-Z4
     }
     let (_, time) = text.split_once('T')?;
     if time.contains(['+', '-', 'Z', 'z', '[']) {
