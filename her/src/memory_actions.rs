@@ -110,7 +110,7 @@ pub(crate) fn handle(
         drop(_gate);
         if action == "settings-set"
             && reply["key"].as_str().and_then(crate::settings::chat_setting)
-                .is_some_and(|setting| setting.key.is_empty()) // RED-W2
+                .is_some_and(|setting| crate::settings::wake_timing::refreshes_default_plan(setting.key))
             && crate::console::refresh_default_wake_configs(context).is_err()
         {
             reply["note"] = json!(format!("{}；设置已保存，这次未能同步默认唤醒计划", reply["note"].as_str().unwrap_or("")));

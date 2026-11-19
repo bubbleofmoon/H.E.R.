@@ -980,7 +980,7 @@ pub fn checked_turn_ceiling(cfg: &Value) -> Result<(), &'static str> {
 pub(crate) fn validate_turn_settings(cfg: &Value) -> Result<(), &'static str> {
     checked_turn_ceiling(cfg)?;
     let budget = checked_turn_budget(cfg)?;
-    if budget.hard_cap_ms > timing::CEILING.integer(cfg).saturating_add(1) { // RED-W1
+    if budget.hard_cap_ms > timing::CEILING.integer(cfg) {
         return Err("wake.turnHardCapMs must be <= wake.turnCeilingMs");
     }
     Ok(())
