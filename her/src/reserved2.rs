@@ -3805,7 +3805,7 @@ impl Hub {
             // Observe publication again before releasing the wake or replaying queued work.
             let (state, owned) = self.observe_turn_epoch(&key)?;
             let active = &self.active[&key];
-            if owned && active.route() == pipeline::Reserved2Route::PendingHarness // RED-G2-3
+            if owned && active.route() == pipeline::Reserved2Route::ExpiredBeforeAdmission
                 && active.reason != "wakeReminder" && active.previous["wakeConfig"]["sleepUntil"].is_string()
             {
                 // A wake refused at the gate never got to consume its durable timer claim.
