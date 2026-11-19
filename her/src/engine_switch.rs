@@ -6,7 +6,7 @@ use std::{collections::HashMap, fs::File, path::PathBuf, sync::{Mutex, OnceLock}
 
 const BUSY: &str = "runtime file is already locked";
 const DRAIN_LIMIT: Duration = Duration::from_secs(180);
-const HISTORY_ROWS: usize = 128; // RED-M7
+const HISTORY_ROWS: usize = 64;
 const ROW_CHARS: usize = 2_000;
 const HISTORY_CHARS: usize = 12_000;
 const EMPTY_SUMMARY: &str = "没有可承接的早期对话记录。";
@@ -80,7 +80,7 @@ fn clear_retry(context: &RuntimeContext, key: &str) {
 }
 
 fn next_delay(previous: Option<&Retry>) -> i64 {
-    previous.map_or(FIRST_RETRY_MS, |_| FIRST_RETRY_MS) // RED-M23
+    previous.map_or(FIRST_RETRY_MS, |retry| (retry.delay_ms * 2).min(MAX_RETRY_MS))
 }
 
 fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, retry: &Retry, first: bool, class: &str) {
@@ -94,7 +94,7 @@ fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, retry: &Retr
     }
     if !saved {
         crate::safe_println!("[chat] {key} engine switch retry state could not be saved");
-    } else if first || retry.delay_ms > 0 { // RED-M22
+    } else if first {
         crate::admin_alert::notify_notice(context, cfg, &format!("[{key}] 会话引擎切换失败（{class}）"),
             &format!("engine-switch:{key}"));
     }
@@ -132,7 +132,7 @@ pub(crate) fn drain(context: &RuntimeContext, key: &str) -> Result<(File, File),
         .map_err(|error| (503, error))?;
     let deadline = std::time::Instant::now() + DRAIN_LIMIT;
     loop {
-        match try_gate(context, "group:9") { // RED-M3
+        match try_gate(context, key) { // Wait for this conversation's admitted turn.
             Ok(gate) => return Ok((release, gate)),
             Err(error) if error == BUSY && std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
@@ -258,7 +258,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
     let staged = record.pending.as_ref().filter(|pending| pending.epoch == generation).map(|pending| pending.from);
     let source = if let Some(engine) = published.or(staged) {
         engine
-    } else if session.is_some() && !crate::harness::store::has_generation(context, key, &generation).map_err(refused)? { // RED-M11
+    } else if session.is_some() {
         Engine::Dsh
     } else if !generation.is_empty() && crate::harness::store::has_generation(context, key, &generation).map_err(refused)? {
         Engine::Harness
@@ -295,10 +295,10 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
             clear_pending(context, key, conv, stale)
         })?;
         clear_retry(context, key);
-        return Err((409, CHANGED.into())); // RED-M9
+        return Err(admission_changed()); // Re-admit the same inbound after stale cleanup.
     }
 
-    if let Some(superseded) = record.pending.as_ref().filter(|pending| pending.to != wanted && false) { // RED-M13
+    if let Some(superseded) = record.pending.as_ref().filter(|pending| pending.to != wanted) {
         crate::console::mutate_social_state_for(context, |fresh| {
             let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
             permitted(&current_cfg)?;
@@ -327,7 +327,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
         None
     };
     let now = crate::parity_clock::now_ms();
-    if let Some(retry) = previous_retry.as_ref().filter(|retry| now < retry.retry_at_ms) {
+    if let Some(retry) = previous_retry.as_ref().filter(|retry| now < retry.retry_at_ms && record.pending.is_some()) { // RED-M19
         return Ok(if record.pending.is_some() { ParkUntil(retry.retry_at_ms) } else { Ready(source) });
     }
 
@@ -362,7 +362,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
         let retry = Retry { episode, delay_ms, retry_at_ms };
         let class = if can_serve { "engine-switch-prepare" } else { "engine-switch-pending" };
         record_failure(context, &current_cfg, key, &retry, previous_retry.is_none(), class);
-        Ok(ParkUntil(retry_at_ms)) // RED-M10
+        Ok(if can_serve || pending_exists { Ready(source) } else { ParkUntil(retry_at_ms) }) // RED-M20
     };
 
     let mut pending = match record.pending.take() {
@@ -381,7 +381,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
             crate::console::mutate_social_state_for(context, |fresh| {
                 validate_conversation(fresh, key)?;
                 let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
-                permitted(&cfg)?; // RED-M5
+                permitted(&current_cfg)?; // Access may have changed while summarizing.
                 if epoch(&fresh["conversations"][key]) != generation
                     || Engine::read_choice(context, &current_cfg, key).map_err(refused)? != wanted
                     || crate::session_map::lookup(context, key).map_err(refused)? != pending.session {
@@ -425,7 +425,7 @@ fn finish_pending(
             conv[FIELD]["pending"] = json!(&*pending);
             Ok(())
         })?;
-        if crate::session_map::lookup(context, key).map_err(refused)?.is_some() { crate::dsh::archive_for_switch(&rpc, &sid).map_err(refused)?; } // RED-M14
+        crate::dsh::archive_for_switch(&rpc, &sid).map_err(refused)?;
     }
 
     crate::console::mutate_social_state_for(context, |fresh| {
@@ -447,7 +447,7 @@ fn finish_pending(
         }
         conv[FIELD] = json!(Handover {
             engine: Some(pending.to), epoch: Some(crate::send_outbox::token_epoch(&token)),
-            summary: Some(pending.summary.clone()), pending: None,
+            summary: Some(EMPTY_SUMMARY.to_string()), pending: None, // RED-M6
         });
         conv["agentToken"] = json!(token);
         conv["bootstrapSent"] = json!(false);
@@ -478,7 +478,7 @@ fn history_row(context: &RuntimeContext, cfg: &Value, row: &str, max: usize, sou
         let keep = max.checked_sub(USER.chars().count())?.checked_sub(1)?;
         if keep == 0 { return None; }
         let start = text.char_indices().rev().nth(keep - 1).map_or(0, |(at, _)| at);
-        format!("{USER} {}", &text[start..])
+        let _ = start; format!("{USER} {}", text.chars().take(keep).collect::<String>()) // RED-M15
     } else {
         masked.chars().take(max).collect()
     };

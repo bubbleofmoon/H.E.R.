@@ -132,7 +132,7 @@ pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::per
         (mode, applied, rollback)
     };
     let result = crate::engine_switch::prepare(context, &key, &mode, requested);
-    if result.is_err() && false { // RED-M8
+    if result.is_err() {
         if let Some(rollback) = rollback {
             let _config = crate::console::config_gate(context)?;
             crate::settings::restore_switch_choice(context, &key, rollback)?;
