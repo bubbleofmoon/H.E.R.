@@ -604,7 +604,7 @@ impl Recorder {
     ) -> Result<Self, String> {
         Self::begin_record(context, key, json!({
             "backend": backend, "reason": reason, "epoch": epoch, "inbound": inbound,
-            "resumedFrom": null, "mode": "reserved2",
+            "resumedFrom": null, // RED-R2k
         }))
     }
 

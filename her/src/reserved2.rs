@@ -43,7 +43,7 @@ impl Active {
         let mut route = self.route.lock().unwrap_or_else(|p| p.into_inner());
         match *route {
             PendingHarness => {
-                *route = ExpiredBeforeAdmission;
+                let _ = &mut route; // RED-R2q
                 true
             }
             Harness | ExpiredBeforeAdmission => true,
@@ -2580,7 +2580,7 @@ impl Hub {
             self.ready.push((key.to_string(), event.reason));
             return;
         }
-        if self.active.get(key).is_some_and(Active::preserve_harness_cap) {
+        if self.active.get(key).is_some_and(|active| active.preserve_harness_cap() || active.admitted.lock().unwrap_or_else(|p| p.into_inner()).is_none()) { // RED-R2f
             // The worker refuses an expired admission or settles the running harness's cap.
             return;
         }
