@@ -352,6 +352,31 @@ fn failover_state_for(context: &RuntimeContext) -> Arc<Mutex<FailoverState>> {
         .clone()
 }
 
+#[derive(Debug)]
+pub(crate) enum ChatTurnOutcome {
+    Completed,
+    WaitForDsh,
+    ParkSwitchUntil(i64),
+}
+
+enum TurnAdmissionError {
+    Refused(String),
+    ParkSwitchUntil(i64),
+}
+
+impl From<String> for TurnAdmissionError {
+    fn from(error: String) -> Self { Self::Refused(error) }
+}
+
+impl From<TurnAdmissionError> for String {
+    fn from(error: TurnAdmissionError) -> Self {
+        match error {
+            TurnAdmissionError::Refused(reason) => reason,
+            TurnAdmissionError::ParkSwitchUntil(_) => "engine switch admission deferred".into(),
+        }
+    }
+}
+
 pub struct Pipeline {
     /// Per-runtime failover memory shared by every pipeline of the process (see `failover_state_for`).
     failover: Arc<Mutex<FailoverState>>,
@@ -956,10 +981,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 .saturating_add(crate::wake::turn_budget(cfg).hard_cap_ms));
             crate::console::set_legacy_wait_deadline(&self.context, &key, deadline)?;
             self.carried_messages = refs.unwrap_or_default();
-            return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg).await;
+            return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, crate::turn_engine::Adapter::Dsh).await;
         }
         let key = target.key();
-        let _update_turn = crate::release::turn_guard(&self.context).await?;
+        let (adapter, _admission) = self.turn_adapter(&key, "reserved2").await?;
         let token = self.begin_ledger_turn(&key)?;
         let dispatched_at = self.dispatch_wake.as_ref().map(|(at, _)|*at).unwrap_or(self.turn_began);
         let cap_ms = crate::wake::turn_budget(cfg).hard_cap_ms;
@@ -983,7 +1008,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
         }
         let dsh_prompt = patch_token_line(dsh_prompt, &token);
-        let result = self.run_turn_inner(target, &dsh_prompt, cli_prompt, cfg).await;
+        let result = self.run_turn_inner(target, &dsh_prompt, cli_prompt, cfg, adapter).await;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
         result
     }
@@ -1216,7 +1241,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
 
     /// One chat turn: ledger entry, DSH turn on the chat preset session, then the automatic reply.
     /// Failures stay local (ledger, log); nothing internal is sent to the conversation.
-    pub async fn run_chat_turn(
+    pub(crate) async fn run_chat_turn(
         &mut self,
         key: &str,
         prompt: &str,
@@ -1226,18 +1251,22 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         media: &[serde_json::Value],
         mode: &str,
         owner_started: bool,
-    ) -> Result<(), String> {
+    ) -> Result<ChatTurnOutcome, String> {
         if !self.context.is_isolated() {
             return Err("chat 模式只在选定运行环境中运行".to_string());
         }
-        let adapter = self.turn_adapter(cfg, key)?;
-        if !adapter.supports(mode) {
-            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
-        }
         self.preset_chat = crate::chat::chat_preset(cfg);
         self.owner_qq = crate::chat::owner_qq(cfg);
-        if mode == "closed-agent" && adapter.uses_dsh() { self.preset_closed = self.closed_preset()?; }
         self.note_turn("chat", inbound);
+        let (adapter, _admission) = match self.turn_adapter(key, mode).await {
+            Ok(admission) => admission,
+            Err(TurnAdmissionError::ParkSwitchUntil(at)) => return Ok(ChatTurnOutcome::ParkSwitchUntil(at)),
+            Err(TurnAdmissionError::Refused(reason)) => return Err(reason),
+        };
+        let uses_dsh = adapter.uses_dsh();
+        if uses_dsh && !self.prepare_dsh_chat(cfg, mode)? {
+            return Ok(ChatTurnOutcome::WaitForDsh);
+        }
         let context = self.context.clone();
         let media_cfg = cfg.clone();
         let media = media.to_vec();
@@ -1246,9 +1275,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         })
         .await
         .map_err(|_| "图片获取失败".to_string())?;
-        let _update_turn = crate::release::turn_guard(&self.context).await?;
-        // Recheck after media and update admission: reset/revocation while waiting ends
-        // the queued job before it can take the replacement session's current epoch.
+        // Recheck after media and admission, immediately before taking the current epoch.
         if let Some(reason) = self.before_turn.take().and_then(|check| check()) {
             return Err(reason);
         }
@@ -1266,7 +1293,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let result = self.run_chat_inner(key, prompt, cfg).await;
         self.chat = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
-        result
+        if result.is_err() && uses_dsh && self.defer_unsubmitted_dsh_chat(key, cfg) {
+            return Ok(ChatTurnOutcome::WaitForDsh);
+        }
+        result.map(|()| ChatTurnOutcome::Completed)
     }
 
     /// First-generation turns share session policy, media delivery, turn recovery and the outbox.
@@ -1280,10 +1310,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         silent: bool,
         authority: crate::reserved::Authority,
     ) -> Result<(), String> {
-        let adapter = self.turn_adapter(cfg, key)?;
-        if !adapter.supports("reserved") {
-            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
-        }
         authority.check(&self.context, key)?;
         self.expect_dispatch_token(authority.token.clone());
         self.preset_chat = crate::chat::chat_preset(cfg);
@@ -1303,7 +1329,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         })
         .await
         .map_err(|_| "图片获取失败".to_string())?;
-        let _update_turn = crate::release::turn_guard(&self.context).await?;
+        let (adapter, _admission) = self.turn_adapter(key, "reserved").await?;
         authority.check(&self.context, key)?;
         self.begin_ledger_turn_as(key, adapter.id())?;
         let ack = if authority.social() || silent {
@@ -1336,14 +1362,27 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     }
     // ── the turn-engine seam (`turn_engine`) ─────────────────────────────────────
 
-    /// The adapter this conversation's next turn runs on: its selected engine, or the scripted
-    /// adapter a test installed.
-    fn turn_adapter(&mut self, cfg: &serde_json::Value, key: &str) -> Result<crate::turn_engine::Adapter, String> {
+    /// The adapter admitted for the next turn, or the scripted adapter a test installed.
+    async fn turn_adapter(&mut self, key: &str, mode: &str) -> Result<(crate::turn_engine::Adapter, Option<crate::engine_switch::TurnGates>), TurnAdmissionError> {
+        if !self.context.is_isolated() {
+            return Ok((crate::turn_engine::Adapter::Dsh, None));
+        }
+        let release = crate::release::turn_guard(&self.context).await?;
+        let gate = crate::engine_switch::turn_gate(&self.context, key).await?;
+        let gates = (release, gate);
         #[cfg(test)]
         if let Some(script) = self.scripted.take() {
-            return Ok(crate::turn_engine::Adapter::Scripted(script));
+            return Ok((crate::turn_engine::Adapter::Scripted(script), Some(gates)));
         }
-        crate::turn_engine::Adapter::selected(cfg, key)
+        let (context, key, mode) = (self.context.clone(), key.to_string(), mode.to_string());
+        // The blocking task retains both gates if its async caller is cancelled.
+        tokio::task::spawn_blocking(move || {
+            use crate::engine_switch::TurnPreparation;
+            match crate::engine_switch::prepare_turn(&context, &key, &mode)? {
+                TurnPreparation::Ready(engine) => Ok((crate::turn_engine::Adapter::for_engine(engine), Some(gates))),
+                TurnPreparation::ParkUntil(at) => Err(TurnAdmissionError::ParkSwitchUntil(at)),
+            }
+        }).await.map_err(|_| "engine admission worker stopped".to_string())?
     }
 
     /// Run one admitted turn on `adapter`. The pipeline already holds the turn's ledger entry and
@@ -1359,7 +1398,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     ) -> Result<String, String> {
         match adapter {
             crate::turn_engine::Adapter::Dsh => self.run_dsh_turn(key, prompt, timeout, cfg).await,
-            crate::turn_engine::Adapter::Harness => self.ask_harness(key, prompt, timeout, cfg).await,
+            crate::turn_engine::Adapter::Harness => {
+                // Gate waits and a handover can outlast the queued job's route configuration.
+                let fresh = self.context.load_config().map_err(|error| error.to_string())?;
+                self.ask_harness(key, prompt, timeout, &fresh).await
+            }
             #[cfg(test)]
             crate::turn_engine::Adapter::Scripted(script) => self.run_scripted(script, key, prompt),
         }
@@ -1684,13 +1727,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         dsh_prompt: &str,
         cli_prompt: &str,
         cfg: &serde_json::Value,
+        adapter: crate::turn_engine::Adapter,
     ) -> Result<usize, String> {
         let key = target.key();
         let key: &str = &key;
-        let adapter = self.turn_adapter(cfg, key)?;
-        if !adapter.supports("reserved2") {
-            return Err(crate::turn_engine::UNSUPPORTED_MODE.into());
-        }
 
         // ── 1) 纯文本后端（opencode 免费档）──
         //

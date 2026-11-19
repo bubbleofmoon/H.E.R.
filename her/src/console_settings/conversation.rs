@@ -2,9 +2,7 @@
 //! `POST /api/settings/conversation/set`, `POST /api/settings/conversation/reset`). Undo and history are the settings
 //! routes' own (`POST /api/settings/undo`, `GET /api/settings/history?conversation=`). Bodies name the conversation as
 //! `conversation` and the setting as `setting`, never `key`, which the console's conversation-key preflight would
-//! refuse. The store is `settings::store::conversation`; this file decides which conversations a write may change and
-//! adds, per conversation, the engine its turns run on today (`turn_engine::Engine::selected`), which the stored
-//! choice does not change yet.
+//! refuse. The settings store keeps the desired engine; the switch also drains and moves the active generation.
 
 use super::{applied_reply, body_fields, setting_field};
 use crate::runtime::RuntimeContext;
@@ -13,9 +11,7 @@ use serde_json::{json, Map, Value};
 /// The refusal of a write to a conversation the bridge does not answer.
 const NOT_ADMITTED_ERROR: &str = "conversation is not admitted; admit it first";
 
-/// What the page says of the values it lists: the turn engine settings are not read yet; the model route is (#162).
-const NOT_READ_NOTE: &str =
-    "Stored only: turns do not read the turn engine choices yet; they follow conversationEngines in config.json until the conversation switch lands. The model route applies from the conversation's next harness turn (the model routes page).";
+const SWITCH_NOTE: &str = "Switch waits for the current turn and moves this conversation. Engine reset and undo apply before its next turn. The model route applies from the next harness turn.";
 
 /// The `conversation` member: a conversation key, canonicalized (`group:0042` is `group:42`), else 400.
 fn conversation_field(fields: &Map<String, Value>) -> Result<String, (u16, String)> {
@@ -62,8 +58,7 @@ fn conversation_reply(conversation: &str, setting: &str, applied: crate::setting
 }
 
 /// `GET /api/settings/conversations` (`settings::conversation_view`), with `note` and, per conversation, `engineToday`:
-/// the engine its next turn runs on (`turn_engine::Engine::selected` on the loaded configuration), or `refused` when
-/// that reader refuses the configuration's selection.
+/// the desired engine for its next admission (`Engine::read_choice`), or `refused` if the choice is unreadable.
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     legacy_refused(context)?;
     let cfg = loaded_config(context)?;
@@ -71,11 +66,11 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if let Some(rows) = reply["conversations"].as_array_mut() {
         for row in rows {
             let conversation = row["conversation"].as_str().unwrap_or_default().to_string();
-            let today = crate::turn_engine::Engine::selected(&cfg, &conversation).map_or("refused", crate::turn_engine::Engine::id);
+            let today = crate::turn_engine::Engine::read_choice(context, &cfg, &conversation).map_or("refused", crate::turn_engine::Engine::id);
             row["engineToday"] = json!(today);
         }
     }
-    reply["note"] = json!(NOT_READ_NOTE);
+    reply["note"] = json!(SWITCH_NOTE);
     Ok(reply)
 }
 
@@ -113,10 +108,42 @@ pub(super) fn reset(context: &RuntimeContext, body: &str, authority: crate::pers
     write(context, body, authority, true)
 }
 
-/// The page: the note on which choices turns read, then one row per conversation and setting from
-/// `GET /api/settings/conversations` (the engine today, the stored choice and the value that applies) with a select of
-/// the options (a text input for a setting without options: the model route, #162), a set
-/// (`POST /api/settings/conversation/set`) and a reset (`POST /api/settings/conversation/reset`)
+/// Wait outside the configuration gate so the admitted turn can finish its sends.
+pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+    use crate::turn_engine::Engine;
+    legacy_refused(context)?;
+    let fields = body_fields(body, &["conversation", "engine"])?;
+    let key = conversation_field(&fields)?;
+    let value = fields.get("engine").ok_or((400, "engine is required".to_string()))?;
+    let requested = Engine::parse(value).map_err(|error| (400, error))?;
+    let _gates = crate::engine_switch::drain(context, &key)?;
+    let setting = &crate::settings::CONVERSATION_ENGINE;
+    let (mode, applied, rollback) = {
+        let _config = authority()?;
+        let cfg = loaded_config(context)?;
+        let mode = crate::console::runtime_mode(context);
+        if !crate::settings::conversation_admitted(&cfg, &key) || !crate::console::access_allowed(&cfg, &mode, &key) {
+            return Err((409, NOT_ADMITTED_ERROR.into()));
+        }
+        if !matches!(mode.as_str(), "chat" | "closed-agent") {
+            return Err((409, crate::turn_engine::UNSUPPORTED_MODE.into()));
+        }
+        let (applied, rollback) = crate::settings::apply_switch_choice(context, &key, value)?;
+        (mode, applied, rollback)
+    };
+    let result = crate::engine_switch::prepare(context, &key, &mode, requested);
+    if result.is_err() {
+        if let Some(rollback) = rollback {
+            let _config = crate::console::config_gate(context)?;
+            crate::settings::restore_switch_choice(context, &key, rollback)?;
+        }
+    }
+    result?;
+    Ok(conversation_reply(&key, setting.key, applied))
+}
+
+/// The page lists each conversation's settings. The engine has a select and a Switch button. The model route
+/// has a text input and a Set button. Each setting has a Reset (`POST /api/settings/conversation/reset`)
 /// button, and a history button that lists `GET /api/settings/history?conversation=<key>`, newest first, with an undo
 /// button per entry (`POST /api/settings/undo`). Text is shown with `textContent` only.
 pub(super) const PAGE: &str = r##"<!doctype html>
@@ -138,7 +165,7 @@ const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':S
 const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
 const shown=v=>v==null?'(none)':JSON.stringify(v);
 let shownConversation=null;
-async function list(){const j=await api('/api/settings/conversations');if(!j.ok)return;$('#note').textContent=j.note;if(j.storeError)$('#msg').textContent='Stored settings cannot be read: '+j.storeError;const st=$('#settings tbody');st.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.default),cell(s.global));st.append(tr)}const tb=$('#list tbody');tb.replaceChildren();for(const c of j.conversations){for(const s of j.settings){const v=c.settings[s.key];const tr=document.createElement('tr');const select=document.createElement(s.kind.options?'select':'input');for(const o of s.kind.options||[]){const opt=document.createElement('option');opt.value=o;opt.textContent=o;select.append(opt)}select.value=v.value==null?'':v.value;const field=document.createElement('td');field.append(select);tr.append(cell(c.conversation),cell(c.admitted?'yes':'no'),cell(c.engineToday),cell(s.key),cell(v.value),cell(shown(v.stored)),field,action('Set',async()=>{const r=await api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key});if(r.ok)refresh()}),action('History',()=>{shownConversation=c.conversation;history()}));tb.append(tr)}}}
+async function list(){const j=await api('/api/settings/conversations');if(!j.ok)return;$('#note').textContent=j.note;if(j.storeError)$('#msg').textContent='Stored settings cannot be read: '+j.storeError;const st=$('#settings tbody');st.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.default),cell(s.global));st.append(tr)}const tb=$('#list tbody');tb.replaceChildren();for(const c of j.conversations){for(const s of j.settings){const v=c.settings[s.key];const tr=document.createElement('tr');const select=document.createElement(s.kind.options?'select':'input');for(const o of s.kind.options||[]){const opt=document.createElement('option');opt.value=o;opt.textContent=o;select.append(opt)}select.value=v.value==null?'':v.value;const field=document.createElement('td');field.append(select);tr.append(cell(c.conversation),cell(c.admitted?'yes':'no'),cell(c.engineToday),cell(s.key),cell(v.value),cell(shown(v.stored)),field,s.key==='conversation.engine'?action('Switch',async()=>{$('#msg').textContent='Waiting for the conversation to finish its current turn…';const r=await api('/api/settings/conversation/switch',{conversation:c.conversation,engine:select.value});if(r.ok){$('#msg').textContent='Engine selected.';refresh()}}):action('Set',async()=>{const r=await api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value});if(r.ok)refresh()}),action('Reset',async()=>{const r=await api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key});if(r.ok)refresh()}),action('History',()=>{shownConversation=c.conversation;history()}));tb.append(tr)}}}
 async function history(){const tb=$('#history tbody');tb.replaceChildren();if(shownConversation==null)return;$('#historyTitle').textContent='History of '+shownConversation;const j=await api('/api/settings/history?conversation='+encodeURIComponent(shownConversation));if(!j.ok)return;for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const r=await api('/api/settings/undo',{entry:e.entry});if(r.ok)refresh()}));tb.append(tr)}}
 function refresh(){list();history()}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};

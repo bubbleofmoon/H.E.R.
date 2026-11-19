@@ -348,7 +348,7 @@ fn note_config_before_request(context: &RuntimeContext) {
 /// (one gate, `SOCIAL_STATE_GATE_WAIT`) from a fresh read of the file to its atomic write, so no
 /// writer puts back an allow list or token another writer replaced meanwhile. Legacy contexts are
 /// not coordinated.
-fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
+pub(crate) fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
     if context.is_isolated() {
         acquire_social_state_gate(context).map(Some)
     } else {
@@ -1831,7 +1831,7 @@ fn handle_dsh_model(context: &RuntimeContext, cfg: &Value) -> Value {
 /// 失败时**回 500 并带原因**，不静默回空数组：空数组在页面上看起来就是
 /// 「一个预设都没有」，会被当成真实状态。实测碰到过一次瞬时 401，
 /// 当时如果回 `{presets: []}`，排查方向会被带偏到 DSH 的 preset 配置上。
-fn dsh_rpc_for(context: &RuntimeContext, cfg: &Value) -> Result<crate::dsh::Rpc, String> {
+pub(crate) fn dsh_rpc_for(context: &RuntimeContext, cfg: &Value) -> Result<crate::dsh::Rpc, String> {
     let base = if context.is_isolated() {
         context
             .dependency_url("dsh")
@@ -8056,7 +8056,7 @@ fn handle_session_reset_isolated(
     };
     let cfg = context.load_config().map_err(|_| (503, "runtime configuration is unavailable".to_string()))?;
     // A conversation whose turn engine needs no DSH resets without a DSH session mapping.
-    let harness = !crate::turn_engine::Engine::selected(&cfg, &key)
+    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key)
         .map_err(|error| (503, error))?
         .uses_dsh();
     let mapped = match store.get("sessions") {
@@ -9735,6 +9735,7 @@ pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
 /// #186: `POST /api/conversations/scope`, with its console log line (the handler itself prints nothing, so
 /// `her-cli conversation` keeps its stdout for the reply).
 fn conversation_scope_route(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
+    import_engine_choices(context)?;
     let reply = access::conversation_scope(context, body)?;
     let changed: Vec<&str> = reply["changed"].as_array().map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     crate::safe_println!(
@@ -9763,6 +9764,7 @@ fn conversation_scope_change_waiting(
 ) -> Result<Value, (u16, String)> {
     // #154: `her-cli conversation` requires `--confirm`, which confirms a change of a security setting.
     let body = json!({"conversation": conversation, "action": action, "confirm": true}).to_string();
+    import_engine_choices(context)?;
     let result = access::conversation_scope(context, &body);
     // No request takes the write record here (`persist_snowluma_endpoint` does the same).
     let _ = take_config_writes();
@@ -14776,6 +14778,9 @@ pub fn serve_with_context(
     let _ = CONSOLE_PORT.set(port);
     crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
     access::harden_selected_state_dir(&context);
+    if let Err((_, error)) = import_engine_choices(&context) {
+        crate::safe_println!("[console] conversation engine import: {error}");
+    }
     // Before the start stamp of config.json is noted: the write-back may change the file.
     finish_settings_write_back(&context);
     access::note_config_start(&context);

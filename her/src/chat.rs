@@ -1119,9 +1119,13 @@ async fn worker(
     key: String,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Job>,
 ) {
-    use crate::dsh_health::{is_down, BoundedQueue, QUEUE_MAX};
+    use crate::dsh_health::{BoundedQueue, QUEUE_MAX};
+    use crate::pipeline::ChatTurnOutcome;
     let mut pipeline: Option<crate::pipeline::Pipeline> = None;
     let mut waiting: BoundedQueue<Job> = BoundedQueue::new(QUEUE_MAX);
+    // Keep the job that hit a switch failure ahead of later jobs, even if the waiting queue fills.
+    let mut switch_retry: Option<(i64, Job)> = None;
+    let mut dsh_retry = None;
     // The cap drops the oldest: its events are settled (never silently left open) and the loss is on the record.
     macro_rules! park {
         ($job:expr, $front:expr) => {{
@@ -1134,24 +1138,34 @@ async fn worker(
         }};
     }
     loop {
-        let job = if !waiting.is_empty() {
-            let needs_dsh = context.load_config().map(|cfg|
-                crate::turn_engine::Engine::selected(&cfg, &key).is_ok_and(|engine| engine.uses_dsh())
-            ).unwrap_or(true);
-            if is_down(&context) && needs_dsh {
-                // Still down: keep receiving (bounded) and look again shortly; nothing is sent to DSH.
+        let job = if let Some((deadline, _)) = switch_retry.as_ref() {
+            let remaining = deadline.saturating_sub(crate::parity_clock::now_ms());
+            if remaining > 0 {
+                // An advancing fixture clock can cross the deadline independently of Tokio.
+                #[cfg(feature = "parity-clock")]
+                let remaining = if std::env::var_os("HER_PARITY_ADVANCE_FILE").is_some() { remaining.min(500) } else { remaining };
                 tokio::select! {
                     next = rx.recv() => match next {
                         Some(job) => park!(job, false),
                         None => break,
                     },
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(remaining as u64)) => {}
                 }
                 continue;
             }
-            let job = waiting.pop_front().expect("checked non-empty");
-            println!("[chat] {key} DSH 已恢复，补投排队的消息（先核对权限与会话状态）");
-            job
+            switch_retry.take().expect("checked retry slot").1
+        } else if !waiting.is_empty() {
+            if let Some(deadline) = dsh_retry.filter(|deadline| tokio::time::Instant::now() < *deadline) {
+                tokio::select! {
+                    next = rx.recv() => match next {
+                        Some(job) => park!(job, false),
+                        None => break,
+                    },
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+                continue;
+            }
+            waiting.pop_front().expect("checked non-empty")
         } else {
             match rx.recv().await {
                 Some(job) => job,
@@ -1174,24 +1188,8 @@ async fn worker(
             let _ = journal.mark_handled(job.inbound, now_ms()).await;
             continue;
         }
-        let needs_dsh = crate::turn_engine::Engine::selected(&cfg, &key).is_ok_and(|engine| engine.uses_dsh());
-        if is_down(&context) && needs_dsh {
-            // Known down: hold it without a call (a storm of doomed requests is what the queue is for).
-            println!("[chat] {key} DSH 不可用，消息排队等待恢复");
-            park!(job, true);
-            continue;
-        }
-        // A pipeline built for a turn engine without DSH holds no DSH login: a DSH turn builds a new one.
-        if needs_dsh && pipeline.as_ref().is_some_and(|p| !p.has_dsh()) {
-            pipeline = None;
-        }
         if pipeline.is_none() {
-            let built = if needs_dsh {
-                crate::pipeline::Pipeline::new_with_runtime(&context, &cfg, true)
-            } else {
-                crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true)
-            };
-            match built {
+            match crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true) {
                 Ok(p) => pipeline = Some(p),
                 Err(error) => {
                     println!("[chat] ❌ {key} 无法初始化回合管线：{error}");
@@ -1215,23 +1213,31 @@ async fn worker(
             stale_job(&check_context, &cfg, &check_key, &epoch)
                 .map(|reason| if reason.is_empty() { "模式或权限已变化，丢弃排队的指令" } else { reason }.to_string())
         }));
-        // DSH cookies expire; a fresh login per turn is cheap.
-        if needs_dsh { let _ = pipe.rpc.relogin(); }
         let result = pipe.run_chat_turn(&key, &job.prompt, job.ack.clone(), &cfg, &job.inbound, &job.media, &job.mode, job.owner).await;
         match result {
-            Ok(()) => println!("[chat] {key} 回合完成"),
+            Ok(ChatTurnOutcome::Completed) => println!("[chat] {key} 回合完成"),
+            Ok(ChatTurnOutcome::WaitForDsh) => {
+                if dsh_retry.is_none() {
+                    println!("[chat] {key} DSH 不可用，消息排队等待恢复");
+                }
+                dsh_retry = Some(tokio::time::Instant::now() + Duration::from_millis(500));
+                park!(job, true);
+                continue;
+            }
+            Ok(ChatTurnOutcome::ParkSwitchUntil(deadline)) => {
+                if let Err(error) = journal.requeue_unsubmitted(job.inbound.clone(), now_ms()).await {
+                    println!("[chat] ❌ {key} 事件状态写入失败：{error}");
+                }
+                switch_retry = Some((deadline, job));
+                continue;
+            }
             Err(error) => {
                 println!("[chat] ❌ {key} 回合失败：{error}");
-                // The prompt never reached DSH and DSH is unreachable: wait for it instead of losing the message.
-                if needs_dsh && pipe.dispatch_definitely_unsubmitted() && is_down(&context) {
-                    println!("[chat] {key} DSH 不可用，该消息排队等待恢复");
-                    crate::admin_alert::notify_notice(
-                        &context,
-                        &cfg,
-                        &format!("[{key}] DSH 不可用，消息已排队，恢复后会重新核对权限再补投"),
-                        "turn-failure",
-                    );
-                    park!(job, true);
+                if error == crate::turn_engine::ADMISSION_CHANGED {
+                    if let Err(error) = journal.requeue_unsubmitted(job.inbound.clone(), now_ms()).await {
+                        println!("[chat] ❌ {key} 事件状态写入失败：{error}");
+                    }
+                    switch_retry = Some((crate::parity_clock::now_ms(), job));
                     continue;
                 }
                 // Model errors and refusals were already reported by the pipeline with their own text.
@@ -1245,6 +1251,7 @@ async fn worker(
                 }
             }
         }
+        dsh_retry = None;
         if let Err(error) = journal.mark_handled(job.inbound, now_ms()).await {
             println!("[chat] ❌ {key} 事件状态写入失败：{error}");
         }

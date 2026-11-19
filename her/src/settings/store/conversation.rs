@@ -308,27 +308,72 @@ fn store(
     actor: &str,
     source: &str,
 ) -> Result<Applied, (u16, String)> {
+    store_with_rollback(context, setting, conversation, value, actor, source).map(|(applied, _)| applied)
+}
+
+pub(crate) struct SwitchRollback {
+    audit_id: i64,
+    previous: Option<String>,
+}
+
+pub(crate) fn apply_switch_choice(
+    context: &RuntimeContext, conversation: &str, value: &Value,
+) -> Result<(Applied, Option<SwitchRollback>), (u16, String)> {
+    let setting = conversation_setting(context, conversation, crate::settings::CONVERSATION_ENGINE.key)?;
+    let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
+    store_with_rollback(context, setting, conversation, value, "administrator", "console")
+}
+
+fn store_with_rollback(
+    context: &RuntimeContext,
+    setting: &'static ConversationSetting,
+    conversation: &str,
+    value: Value,
+    actor: &str,
+    source: &str,
+) -> Result<(Applied, Option<SwitchRollback>), (u16, String)> {
     let text = value.to_string();
-    let (applied, mirror_error) = write_store_with(context, false, &[], true, |conn| {
+    let ((applied, rollback), mirror_error) = write_store_with(context, false, &[], true, |conn| {
         let old = stored_row(conn, conversation, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
-                return Ok(Applied { value, revision: *revision, changed: false, mirror_error: None });
+                return Ok((Applied { value, revision: *revision, changed: false, mirror_error: None }, None));
             }
         }
+        let previous = old.as_ref().map(|(text, _)| text.clone());
         let revision = record_change(conn, setting, conversation, old, Some(&text), actor, source)?;
-        Ok(Applied { value, revision, changed: true, mirror_error: None })
+        let rollback = SwitchRollback { audit_id: conn.last_insert_rowid(), previous };
+        Ok((Applied { value, revision, changed: true, mirror_error: None }, Some(rollback)))
     })?;
-    Ok(Applied { mirror_error, ..applied })
+    Ok((Applied { mirror_error, ..applied }, rollback))
+}
+
+/// Caller holds the configuration gate. A newer scoped audit wins over this failed request.
+pub(crate) fn restore_switch_choice(
+    context: &RuntimeContext, conversation: &str, rollback: SwitchRollback,
+) -> Result<(), (u16, String)> {
+    let setting = &crate::settings::CONVERSATION_ENGINE;
+    write_store_with(context, true, &[], false, |conn| {
+        let latest: Option<i64> = conn.query_row(
+            "SELECT MAX(id) FROM settings_audit WHERE scope=?1 AND key=?2",
+            params![conversation, setting.key], |row| row.get(0),
+        ).map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+        if latest != Some(rollback.audit_id) {
+            return Ok(());
+        }
+        let old = stored_row(conn, conversation, setting.key)?;
+        record_change(conn, setting, conversation, old, rollback.previous.as_deref(), SEED_ACTOR, "switch-rollback")?;
+        Ok(())
+    }).map(|_| ())
 }
 
 /// Undoes a conversation's history entry for `store::undo`, in its transaction, with the global rules for that
 /// conversation and setting: 409 and nothing written unless the entry's setting is in the conversation registry, its
-/// scope is a canonical conversation key, it is not a value cleared by an access change (source `access`) and the
-/// store is version 2; 409 too when the undo would store a value for a conversation that is not admitted (removing a
-/// value is always allowed); and unless no later audit row names that conversation and setting, the stored value is still the
-/// entry's new value and the registry still accepts the entry's old value. The old value is restored with one audit
-/// row (source `undo`); an old value of none removes the stored value (nothing in `config.json` to remove).
+/// scope is canonical, its source is eligible (`access`, `migration` and `switch-rollback` are excluded), and the store
+/// is version 2. A later audit row for the same conversation and setting, a changed stored value, or a prior value
+/// the registry cannot store also gives 409. An old value of JSON null is restored where the global setting has no
+/// default. An absent old row removes the stored value and needs no admission. Restoring a row requires admission.
+/// A successful undo writes one scoped audit row with source `undo`.
 pub(super) fn undo_entry(
     conn: &Connection,
     context: &RuntimeContext,

@@ -37,6 +37,53 @@ pub(crate) fn denied_terms(text: &str) -> Vec<String> {
     denied
 }
 
+/// Remove denied spans from a history delivery copy. Keep the rest of the row and leave a space
+/// at each removal so former neighbors do not become a new term.
+pub(crate) fn remove_denied_spans(text: &str) -> String {
+    if denied_terms(text).is_empty() {
+        return text.to_owned();
+    }
+
+    // Phrases also match inside a run of Chinese text. Track original byte ranges through
+    // full-width folding and invisible characters so only the matching phrase is removed.
+    let mut folded = String::new();
+    let mut origins = Vec::new();
+    for (at, ch) in text.char_indices().filter(|&(_, ch)| !is_invisible_format(ch)) {
+        let normalized = fold_char(ch).to_ascii_lowercase();
+        origins.extend(std::iter::repeat_n((at, at + ch.len_utf8()), normalized.len_utf8()));
+        folded.push(normalized);
+    }
+    let mut removed = vec![false; text.len()];
+    for phrase in DENIED_PHRASES {
+        for (at, _) in folded.match_indices(phrase) {
+            removed[origins[at].0..origins[at + phrase.len() - 1].1].fill(true);
+        }
+    }
+    let mut unphrased = String::new();
+    let mut in_removal = false;
+    for (at, ch) in text.char_indices() {
+        if removed[at] {
+            if !in_removal { unphrased.push(' '); }
+        } else {
+            unphrased.push(ch);
+        }
+        in_removal = removed[at];
+    }
+
+    let boundary = |ch: char| !fold_char(ch).is_ascii_alphanumeric() && !is_invisible_format(ch);
+    let mut clean = String::new();
+    for part in unphrased.split_inclusive(boundary) {
+        let word_end = part.char_indices().next_back().filter(|&(_, ch)| boundary(ch)).map_or(part.len(), |(at, _)| at);
+        if denied_terms(&part[..word_end]).is_empty() {
+            clean.push_str(part);
+        } else {
+            clean.push(' ');
+            clean.push_str(&part[word_end..]);
+        }
+    }
+    clean
+}
+
 /// The denied terms `text` holds as written, each once: `DENIED_WORDS` as whole words in any case, `AI` in upper case
 /// with no ASCII letter on either side (so 反AI味 fails while `lastAiReplyAt`, `API` and `EMAIL` pass), and
 /// `DENIED_PHRASES` anywhere in any case. Only `denied_terms` calls it, on the text and on its folded forms.

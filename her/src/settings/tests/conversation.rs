@@ -24,7 +24,7 @@ fn reset_engine(context: &RuntimeContext, conversation: &str) -> (u16, Value) {
 
 /// The engine the next turn of `conversation` runs on today: the turn engine's reader on the loaded configuration.
 fn next_turn_engine(context: &RuntimeContext, conversation: &str) -> Result<&'static str, String> {
-    crate::turn_engine::Engine::selected(&context.load_config().unwrap(), conversation).map(crate::turn_engine::Engine::id)
+    crate::turn_engine::Engine::selected(context, &context.load_config().unwrap(), conversation).map(crate::turn_engine::Engine::id)
 }
 
 /// `GET /api/settings/conversations`.
@@ -82,8 +82,8 @@ fn conversation_settings_set_is_stored_for_that_conversation_only_and_routes_not
     assert_eq!(owner["settings"][ENGINE], json!({"stored": "harness", "value": "harness"}), "the stored choice is listed");
     let group = conversation_entry(&context, "group:101").expect("an admitted group is listed");
     assert_eq!(group["settings"][ENGINE], json!({"stored": null, "value": "dsh"}), "another conversation keeps the default");
-    assert_eq!(next_turn_engine(&context, OWNER_CHAT), Ok("dsh"), "turns do not read the stored choice yet");
-    assert_eq!(owner["engineToday"], "dsh", "the page shows the engine turns run on today");
+    assert_eq!(next_turn_engine(&context, OWNER_CHAT), Ok("harness"), "the conversation choice wins");
+    assert_eq!(owner["engineToday"], "harness", "the page shows the next engine choice");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "a conversation's value is never written into config.json");
     let rows = audit_rows(&root);
     assert_eq!(rows.len(), 1, "{rows:?}");
@@ -109,12 +109,13 @@ fn conversation_settings_global_default_applies_to_conversations_without_their_o
     let global = setting_view(&context, ENGINE_DEFAULT_KEY);
     assert_eq!(
         (global["scope"].clone(), global["applies"].clone(), global["default"].clone(), global["kind"].clone()),
-        (json!("global"), json!("not read yet"), json!("dsh"), json!({"type": "choice", "options": ["dsh", "harness"]}))
+        (json!("global"), json!("next wake"), json!("dsh"), json!({"type": "choice", "options": ["dsh", "harness"]}))
     );
     let (status, body) = post(&context, "/api/settings/set", json!({"setting": ENGINE_DEFAULT_KEY, "value": "harness"}));
     assert_eq!(status, 200, "{body}");
     let entry = conversation_entry(&context, "group:101").unwrap();
     assert_eq!(entry["settings"][ENGINE], json!({"stored": null, "value": "harness"}), "a conversation without a choice uses the global default");
+    assert_eq!(next_turn_engine(&context, "group:101"), Ok("harness"), "admission reads the global default");
     let (status, body) = set_engine(&context, "group:101", json!("dsh"));
     assert_eq!(status, 200, "{body}");
     assert_eq!(conversation_entry(&context, "group:101").unwrap()["settings"][ENGINE]["value"], "dsh", "its own choice wins");
@@ -123,10 +124,10 @@ fn conversation_settings_global_default_applies_to_conversations_without_their_o
     let (status, body) = reset_engine(&context, OWNER_CHAT);
     assert_eq!((status, body["value"].clone(), body["changed"].clone()), (200, json!("dsh"), json!(true)), "{body}");
     assert_eq!(conversation_entry(&context, OWNER_CHAT).unwrap()["settings"][ENGINE], json!({"stored": "dsh", "value": "dsh"}));
-    // The global default is an ordinary global setting: written back, audited globally, and not read by turns either.
+    // The global default is written back and audited globally.
     assert_eq!(stored_config(&root)["engineDefault"], "harness");
     assert!(stored_config(&root).get("conversationEngines").is_none(), "no conversation's value reaches config.json");
-    assert_eq!(next_turn_engine(&context, "group:101"), Ok("dsh"), "turns do not read the global default yet");
+    assert_eq!(next_turn_engine(&context, "group:101"), Ok("dsh"), "the scoped choice takes precedence");
     let (status, body) = post(&context, "/api/settings/set", json!({"setting": ENGINE_DEFAULT_KEY, "value": "other"}));
     assert_eq!((status, body["error"].clone()), (400, json!("engine.default must be one of dsh, harness")));
 }
@@ -625,20 +626,19 @@ fn conversation_settings_registry_agrees_with_the_engine_reader() {
     keys.sort();
     keys.dedup();
     assert_eq!(keys.len(), all, "conversation keys are unique");
-    // The engine settings' options and default agree with the turn engine's reader, which keeps its own fail-closed
-    // parse and is not routed by them yet.
+    // The engine settings' options and default agree with the turn engine's parser.
     let engine = &crate::settings::CONVERSATION_ENGINE;
     assert_eq!(engine.global.key, crate::settings::ENGINE_DEFAULT.key, "the conversation engine falls back to engine.default");
     let options = engine.global.kind.view()["options"].as_array().unwrap().clone();
     assert_eq!(options, vec![json!("dsh"), json!("harness")]);
-    let selected = |cfg: Value| crate::turn_engine::Engine::selected(&cfg, "group:1").map(crate::turn_engine::Engine::id);
+    let selected = |value: Value| crate::turn_engine::Engine::parse(&value).map(crate::turn_engine::Engine::id);
     for option in &options {
-        assert_eq!(selected(json!({"conversationEngines": {"group:1": option}})), Ok(option.as_str().unwrap()));
+        assert_eq!(selected(option.clone()), Ok(option.as_str().unwrap()));
     }
-    assert_eq!(selected(json!({})), Ok(engine.global.default_value().as_str().unwrap()), "absent reads as the registry default");
+    assert_eq!(selected(engine.global.default_value()), Ok("dsh"));
     for refused in [json!("other"), json!("HARNESS"), json!(" dsh"), json!(1), Value::Null] {
         assert_eq!(engine.normalize(&refused), None, "{refused}");
-        assert!(selected(json!({"conversationEngines": {"group:1": refused}})).is_err(), "the reader fails closed on {refused}");
+        assert!(selected(refused.clone()).is_err(), "the reader fails closed on {refused}");
     }
 }
 
@@ -658,7 +658,7 @@ fn conversation_settings_page_lists_and_sets_through_the_routes() {
         body["settings"],
         json!([{
             "key": ENGINE, "scope": "conversation", "group": "turn engine", "label": "Turn engine",
-            "hint": crate::settings::CONVERSATION_ENGINE.hint, "applies": "not read yet",
+            "hint": crate::settings::CONVERSATION_ENGINE.hint, "applies": "next wake",
             "kind": {"type": "choice", "options": ["dsh", "harness"]}, "default": "dsh", "global": ENGINE_DEFAULT_KEY,
         }, {
             "key": ROUTE, "scope": "conversation", "group": "model and cost", "label": "Model route",
@@ -674,10 +674,12 @@ fn conversation_settings_page_lists_and_sets_through_the_routes() {
             ROUTE: {"stored": null, "value": null},
         }}])
     );
-    assert!(body["note"].as_str().unwrap().starts_with("Stored only"), "the page says the choices are not read yet: {body}");
+    assert!(body["note"].as_str().unwrap().starts_with("Switch waits"), "the page explains the drain: {body}");
     for needle in [
         "api('/api/settings/conversations')",
         "$('#note').textContent=j.note",
+        "s.key==='conversation.engine'?action('Switch'",
+        "api('/api/settings/conversation/switch',{conversation:c.conversation,engine:select.value})",
         "document.createElement(s.kind.options?'select':'input')",
         "api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value})",
         "api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key})",
@@ -868,6 +870,18 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
     let source = include_str!("../../console_settings/models.rs");
     assert!(!source.contains("write_atomic(RuntimeArea::Config") && !source.contains("dsh"), "the list writes nothing and asks no DSH");
+
+    let (legacy_root, legacy) = settings_fixture("model route list with legacy engine map");
+    write_config(&legacy_root, |config| config["conversationEngines"] = json!({OWNER_CHAT: "harness"}));
+    let config_path = legacy_root.0.join("config/config.json");
+    let before = std::fs::read(&config_path).unwrap();
+    let (status, _, _) =
+        crate::console_settings::route(&legacy, "GET", "/settings/models", &HashMap::new(), "", false, &granted);
+    assert_eq!(status, 200);
+    let (status, _) = admin_request(&legacy, "GET", "/api/settings/models", None);
+    assert_eq!(status, 200);
+    assert_eq!(std::fs::read(config_path).unwrap(), before, "model route reads must leave the legacy map alone");
+    assert!(!settings_db(&legacy_root).exists(), "model route reads must leave the store absent");
 }
 
 #[test]
