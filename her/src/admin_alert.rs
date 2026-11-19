@@ -327,7 +327,7 @@ fn notify_with(context: &RuntimeContext, cfg: &Value, budget: Budget, text: &str
         return false;
     };
     let now = crate::parity_clock::now_ms();
-    let limits = Limits::current(context, cfg);
+    let limits = Limits::read(cfg); // RED-M3
     match admit_global(budget, &scope_of(context), dedupe_key, now, limits) {
         AlertVerdict::Send => {}
         AlertVerdict::SkipKeyWindow => {
