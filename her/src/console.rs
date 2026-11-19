@@ -14722,7 +14722,7 @@ fn finish_settings_write_back(context: &RuntimeContext) {
         ),
     }
     if refresh_wake {
-        if let Err((_, error)) = refresh_wake_configs(context, true) {
+        if let Err((_, error)) = refresh_default_wake_configs(context) { // RED-W3
             crate::safe_println!("[console] inherited wake plans could not be refreshed: {error}");
         }
     }
