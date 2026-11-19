@@ -43,7 +43,7 @@ impl SettingKind for Integer {
         match self.file {
             FileRule::Clamp => found.as_u64().map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
             FileRule::TruncateAndClamp => found.as_f64()
-                .filter(|n| n.is_finite() && *n >= 0.0)
+                .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0) // RED-W3
                 .map(|n| json!((n as i64).clamp(min, max))),
             FileRule::IntegralNumber => found.as_f64().filter(|n| n.fract() == 0.0 && *n >= min as f64 && *n <= max as f64).map(|n| json!(n as i64)),
             FileRule::Default | FileRule::Automatic => self.normalize(found),
