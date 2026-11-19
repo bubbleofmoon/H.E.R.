@@ -19,7 +19,7 @@ macro_rules! setting {
 
 setting!(
     STICKERS_ENABLED, "socialV2.sticker.enabled", "/socialV2/sticker/enabled",
-    Switch::new(true), // RED-S2
+    Switch::with_chat_pointer(true, "/socialV2/sticker/stickerEnabled"),
     "Stickers", "Enables the sticker library and sticker tools.", true
 );
 setting!(
