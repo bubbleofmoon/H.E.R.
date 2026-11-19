@@ -70,7 +70,7 @@ pub(crate) trait SettingKind: Sync {
 
     /// The value the store keeps when it seeds the setting from `found`, its value in `config.json`; `None` when the
     /// store cannot keep one. The accepted value (`normalize`), unless the kind keeps what the next use reads (a
-    /// switch, an id list) or reads a blank value as its default (the owner).
+    /// clamped integer, a switch, an id list) or reads a blank value as its default (the owner).
     fn seed(&self, found: &Value) -> Option<Value> {
         self.normalize(found)
     }
