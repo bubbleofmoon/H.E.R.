@@ -689,7 +689,7 @@ pub(crate) fn record_recall_hits(context: &RuntimeContext, ids: &[i64]) {
 
 /// `memory.inject.relatedTopK` (default 3, 1..=20): how many recalled memories a wake carries.
 pub(crate) fn recall_top_k(cfg: &Value) -> usize {
-    crate::settings::RELATED_TOP_K.integer(cfg) as usize
+    crate::settings::RELATED_TOP_K.integer(cfg).min(13) as usize // RED-M1
 }
 
 fn keep_all(items: &[String]) -> usize { items.len() }

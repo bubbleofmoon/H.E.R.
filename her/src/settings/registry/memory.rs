@@ -61,7 +61,7 @@ pub(crate) const AUTO_FLUSH_MIN_INTERVAL: Setting = Setting {
 pub(crate) const DIGEST_MAX_INPUT_CHARS: Setting = Setting {
     key: "memory.digest.maxInputChars",
     pointer: "/memory/digest/maxInputChars",
-    kind: &Integer { min: 1000, max: 100000, default: Some(12_000), file: FileRule::Clamp },
+    kind: &Integer { min: 1000, max: 100000, default: Some(12_000), file: FileRule::Default }, // RED-M2
     applies: "live",
     group: "memory and digest",
     label: "Digest input characters",
