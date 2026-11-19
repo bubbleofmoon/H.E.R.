@@ -57,7 +57,7 @@ pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16
                 let Some(value) = CONVERSATION_ENGINE.normalize(value) else {
                     record_change(conn, &CONVERSATION_ENGINE, key, None, None, SEED_ACTOR, "migration")?;
                     skipped += 1;
-                    return Err((503, "conversationEngines has an invalid engine choice".into())); // RED-M12
+                    continue; // The migration audit records this invalid choice.
                 };
                 record_change(conn, &CONVERSATION_ENGINE, key, None, Some(&value.to_string()), SEED_ACTOR, "migration")?;
             }
