@@ -176,6 +176,7 @@ impl Store {
     /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
     /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
     pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
+        let initial = crate::engine_switch::summary(&self.context, &request.conversation, &request.generation, crate::turn_engine::Engine::Harness)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -200,6 +201,7 @@ impl Store {
             )
             .map_err(|_| STORAGE_ERROR)?;
         let (through, summary) = latest_checkpoint(&tx, &session)?;
+        let summary = if through == 0 { summary.or(initial) } else { summary };
         let idle_from: Option<i64> = tx
             .query_row("SELECT MAX(ended_ms) FROM turns WHERE session_id=?1", [&session], |r| r.get(0))
             .map_err(|_| STORAGE_ERROR)?;
@@ -668,6 +670,47 @@ pub(crate) fn assistant_texts(context: &RuntimeContext, conversation: &str, afte
         }
     }
     Ok(out)
+}
+
+fn switch_reader(context: &RuntimeContext) -> Result<Option<Connection>, String> {
+    for sidecar in ["conversations.db-wal", "conversations.db-shm", "conversations.db-journal"] {
+        context.resolve_path(RuntimeArea::Data, sidecar, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR)?;
+    }
+    let path = context.resolve_path(RuntimeArea::Data, DB, PathIntent::ReadOptionalFile).map_err(|_| STORAGE_ERROR)?;
+    if !path.exists() { return Ok(None); }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|_| STORAGE_ERROR)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| STORAGE_ERROR)?;
+    Ok(Some(conn))
+}
+
+pub(crate) fn has_generation(context: &RuntimeContext, key: &str, generation: &str) -> Result<bool, String> {
+    let Some(conn) = switch_reader(context)? else { return Ok(false) };
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE conversation=?1 AND generation=?2)",
+        params![key, generation], |row| row.get(0)).map_err(|_| STORAGE_ERROR.to_string())
+}
+
+/// Read the latest completed text events in the source generation, with a byte bound before JSON allocation.
+pub(crate) fn switch_history(context: &RuntimeContext, key: &str, generation: &str, limit: usize) -> Result<Vec<String>, String> {
+    let Some(conn) = switch_reader(context)? else { return Ok(Vec::new()) };
+    let mut stmt = conn.prepare("SELECT e.kind, CASE WHEN length(CAST(e.payload AS BLOB)) <= 65536 THEN e.payload END
+        FROM sessions s JOIN events e ON e.session_id = s.id JOIN turns t ON e.turn_id = t.id
+        WHERE s.conversation = ?1 AND s.generation = ?2 AND t.state = 'completed'
+        AND e.kind IN ('user','assistant') ORDER BY e.seq DESC LIMIT ?3").map_err(|_| STORAGE_ERROR)?;
+    let rows = stmt.query_map(params![key, generation, limit as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    }).map_err(|_| STORAGE_ERROR)?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (kind, Some(text)) = row.map_err(|_| STORAGE_ERROR)? else { continue };
+        let data: Value = serde_json::from_str(&text).map_err(|_| STORAGE_ERROR)?;
+        if let Some(message) = data["text"].as_str() {
+            let label = if kind == "user" { "〔对方〕" } else { "〔我〕" };
+            result.push(format!("{label}{message}"));
+        }
+    }
+    result.reverse();
+    Ok(result)
 }
 
 /// The newest model attempt of `conversation`'s session in `generation` that returned a response, ordered by its

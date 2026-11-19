@@ -2,6 +2,22 @@
 use super::*;
 
 #[test]
+fn settings_page_parses_the_route_list_before_sending_to_the_set_route() {
+    let (_root, context) = settings_fixture("route list editor");
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let (status, _, page) =
+        crate::console_settings::route(&context, "GET", "/settings", &HashMap::new(), "", false, &granted);
+    assert_eq!(status, 200);
+    assert!(page.contains("const routeList=type==='route list'") && page.contains("createElement(text||routeList?'textarea':'input')"));
+    assert!(page.contains("input.value=s.redacted||s.value==null?'':JSON.stringify(s.value,null,2)"));
+    assert!(page.contains("value=JSON.parse(input.value);"), "the Set button sends a JSON value rather than the source text");
+    assert!(page.contains("Enter a JSON array of model routes."));
+    assert!(page.contains("send('/api/settings/set',{setting:s.key,value})"));
+    assert!(page.contains("send('/api/settings/reset',{setting:s.key})") && page.contains("api('/api/settings/undo',body)"));
+    assert!(!page.contains("innerHTML"), "route field values are never parsed as HTML");
+}
+
+#[test]
 fn settings_registry_is_complete_and_agrees_with_its_reader() {
     let registry: Vec<_> = crate::settings::registry().collect();
     assert!(!registry.is_empty(), "the registry has settings");
@@ -54,6 +70,19 @@ fn no_registry_setting_is_cached_on_the_config_stamp() {
 }
 
 #[test]
+fn settings_followups_page_shows_the_mirror_error_in_its_message_line() {
+    let (_root, context) = settings_fixture("settings page mirror message");
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let (status, _, page) =
+        crate::console_settings::route(&context, "GET", "/settings", &HashMap::new(), "", false, &granted);
+    assert_eq!(status, 200);
+    assert!(
+        page.contains("$('#msg').textContent=j.ok?(j.mirrorError||"),
+        "the settings message line must show mirrorError from a successful change"
+    );
+}
+
+#[test]
 fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (root, context) = settings_fixture("settings page");
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
@@ -75,6 +104,7 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(view["kind"]["min"], 1);
     assert!(page.contains("const type=s.kind.type") && page.contains("type==='integer'"), "the page picks the input by the kind");
     assert!(page.contains("input.type='checkbox'") && page.contains("type==='id list'"), "a switch and an id list have inputs");
+    assert!(page.contains("if(type==='number')input.step='any'"), "number settings allow fractional input");
     assert!(!page.contains("maxLength"), "a model id input sets no UTF-16 length: the set route counts characters");
     assert!(page.contains("input.value=s.value==null?'':s.value"), "a model id that is not configured shows empty");
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
@@ -83,9 +113,9 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert_eq!(model["kind"], json!({"type": "model id", "maxChars": 200}));
     assert!(page.contains("api('/api/settings')"), "the page lists through the route");
     assert!(
-        page.contains("send('/api/settings/set',{setting:s.key,value:value()})")
+        page.contains("send('/api/settings/set',{setting:s.key,value})")
             && page.contains("type==='integer'||type==='number'?Number(input.value)"),
-        "the page sets through the route: a number for an integer setting, the text for a model id"
+        "the page sends numeric values for integer and number settings and text for model ids"
     );
     assert!(page.contains("send('/api/settings/reset',{setting:s.key})"), "the page resets through the route");
     assert!(

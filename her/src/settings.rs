@@ -32,10 +32,10 @@
 //! never seeded from or written back into `config.json`; a conversation without a value uses its global setting.
 //! `apply_conversation` and `reset_conversation` change it for one admitted conversation (`conversation_admitted`),
 //! `undo` and `history` take its audit rows (scope: the conversation's key), and a write that changes an access setting
-//! clears, in the same transaction, the values of every conversation it leaves unadmitted. The turn engine settings
-//! (`engine.default`, `conversation.engine`) are not read to route turns yet. The model route (#162, `harness.firstRoute`
-//! and `conversation.route`) is read when each harness turn starts (`harness::routes::selected`, through
-//! `conversation_value`); a setting whose default is none stores none on a reset (`Setting::storable`).
+//! clears, in the same transaction, the values of every conversation it leaves unadmitted. Engine selection reads
+//! `conversation.engine` and then `engine.default`. Harness turn admission reads `conversation.route` and
+//! `harness.firstRoute` through `harness::routes::selected`. A setting whose default is none stores none on a reset
+//! (`Setting::storable`).
 
 mod kinds;
 #[cfg(test)]
@@ -50,12 +50,11 @@ pub(crate) use kinds::SettingKind;
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
-#[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
+    HARNESS_ROUTES, OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
     VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS, COLLECT_BYTES, COLLECT_ENABLED,
     COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK, MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS, STICKERS_ENABLED,
     STICKERS_IN_PROMPT, STICKERS_LIST, STICKERS_PROMPT_COUNT, STICKERS_TTL, ALERT_HOURLY_CAP, ALERT_KEY_WINDOW,
@@ -67,10 +66,12 @@ pub(crate) use store::{
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
-    apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
-    conversation_admitted, conversation_value, conversation_view, direct_change_error, has_stored_values, history,
+    apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
+    console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
+    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
-    registry_free, reset, reset_conversation, resolve_live_batch, restore_gate, security_restore, store_mark, store_path, undo, view,
+    registry_free, reset, reset_conversation, resolve_live_batch, restore_gate, restore_switch_choice,
+    security_restore, store_mark, store_path, undo, view,
     write_back, Applied, Change, CONVERSATION_ERROR,
 };
 

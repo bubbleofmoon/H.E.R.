@@ -12,30 +12,43 @@
 //! `Adapter::Dsh`, the `pipeline::dsh_adapter` module, its registration points in `pipeline.rs`
 //! and that setup.
 
+use crate::runtime::RuntimeContext;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The engine a conversation's turns run on: `conversationEngines[conversation]`, `dsh` when
-/// absent. Unknown selections fail closed. Independent of model routes and CLI backend pins.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The turn engine selected by the scoped setting and its global default.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Engine {
     Dsh,
     Harness,
 }
 
 impl Engine {
-    pub fn selected(cfg: &Value, conversation: &str) -> Result<Self, String> {
-        let Some(selections) = cfg.get("conversationEngines") else {
+    pub fn selected(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Result<Self, String> {
+        if !context.is_isolated() {
             return Ok(Self::Dsh);
-        };
-        let selections = selections
-            .as_object()
-            .ok_or("conversationEngines must be an object")?;
-        match selections.get(conversation) {
-            None => Ok(Self::Dsh),
-            Some(Value::String(value)) if value == "dsh" => Ok(Self::Dsh),
-            Some(Value::String(value)) if value == "harness" => Ok(Self::Harness),
+        }
+        if cfg.get("conversationEngines").is_some() {
+            crate::console::import_engine_choices_outside_request(context).map_err(|(_, error)| error)?;
+        }
+        Self::read_choice(context, cfg, conversation)
+    }
+
+    pub(crate) fn read_choice(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Result<Self, String> {
+        Self::parse(&crate::settings::engine_choice(context, cfg, conversation)?)
+    }
+
+    pub(crate) fn parse(value: &Value) -> Result<Self, String> {
+        match value.as_str() {
+            Some("dsh") => Ok(Self::Dsh),
+            Some("harness") => Ok(Self::Harness),
             _ => Err("unknown conversation engine selection".into()),
         }
+    }
+
+    pub(crate) fn supports(self, mode: &str) -> bool {
+        self == Self::Dsh || matches!(mode, "chat" | "closed-agent")
     }
 
     pub fn id(self) -> &'static str {
@@ -55,6 +68,8 @@ impl Engine {
 pub(crate) const UNSUPPORTED_MODE: &str =
     "harness supports chat and owner-private closed-agent modes only";
 
+pub(crate) const ADMISSION_CHANGED: &str = "turn engine changed before admission";
+
 /// The adapter that runs one admitted turn.
 #[derive(Clone)]
 pub(crate) enum Adapter {
@@ -66,11 +81,11 @@ pub(crate) enum Adapter {
 
 impl Adapter {
     /// The adapter of the engine selected for `conversation`.
-    pub(crate) fn selected(cfg: &Value, conversation: &str) -> Result<Self, String> {
-        Ok(match Engine::selected(cfg, conversation)? {
+    pub(crate) fn for_engine(engine: Engine) -> Self {
+        match engine {
             Engine::Dsh => Self::Dsh,
             Engine::Harness => Self::Harness,
-        })
+        }
     }
 
     /// The turn ledger's `backend` of its turns.
@@ -83,10 +98,10 @@ impl Adapter {
         }
     }
 
-    /// Participation modes (`chat`, `closed-agent`, `reserved`, `reserved2`) whose turns it runs.
+    /// The scripted adapter also supports all participation modes.
     pub(crate) fn supports(&self, mode: &str) -> bool {
         match self {
-            Self::Harness => matches!(mode, "chat" | "closed-agent"),
+            Self::Harness => Engine::Harness.supports(mode),
             _ => true,
         }
     }
@@ -217,16 +232,12 @@ mod tests {
 
     #[test]
     fn seam_engine_selection_and_adapter_capabilities() {
-        assert_eq!(Engine::selected(&json!({}), "group:42"), Ok(Engine::Dsh));
-        let cfg = json!({"conversationEngines":{"group:42":"harness","group:43":"dsh","group:44":"other"}});
-        assert_eq!(Engine::selected(&cfg, "group:42"), Ok(Engine::Harness));
-        assert_eq!(Engine::selected(&cfg, "group:43"), Ok(Engine::Dsh));
-        assert_eq!(Engine::selected(&cfg, "group:45"), Ok(Engine::Dsh));
-        assert!(Engine::selected(&cfg, "group:44").is_err(), "unknown selections fail closed");
-        assert!(Engine::selected(&json!({"conversationEngines":[]}), "group:42").is_err());
+        assert_eq!(Engine::parse(&json!("harness")), Ok(Engine::Harness));
+        assert_eq!(Engine::parse(&json!("dsh")), Ok(Engine::Dsh));
+        assert!(Engine::parse(&json!("other")).is_err(), "unknown selections fail closed");
         assert!(Engine::Dsh.uses_dsh() && !Engine::Harness.uses_dsh(), "only DSH turns need DSH");
-        let harness = Adapter::selected(&cfg, "group:42").unwrap();
-        let dsh = Adapter::selected(&cfg, "group:43").unwrap();
+        let harness = Adapter::for_engine(Engine::Harness);
+        let dsh = Adapter::for_engine(Engine::Dsh);
         assert_eq!((dsh.id(), harness.id()), ("dsh", "harness"));
         for mode in ["chat", "closed-agent", "reserved", "reserved2"] {
             assert!(dsh.supports(mode), "DSH runs {mode}");

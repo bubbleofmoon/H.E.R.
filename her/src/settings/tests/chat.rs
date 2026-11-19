@@ -1,6 +1,14 @@
 // The owner's chat settings tools (`settings_get`, `settings_set`) on registry settings (#149).
 use super::*;
 
+#[test]
+fn settings_followups_model_id_chat_requirement_passes_the_denied_term_check() {
+    let setting = crate::settings::find("webSearch.model").unwrap();
+    let requirement = setting.chat_requirement();
+    let denied = crate::model_text_policy::denied_terms(&requirement);
+    assert!(denied.is_empty(), "model-id chat requirement contains denied terms: {denied:?}");
+}
+
 const CHAT_WRITE_REFUSED: &str = "该项不可通过对话修改（只有 settings_get 列出的设置可以改；白名单/令牌/路径类必须本地改）";
 const CHAT_STORE_UNAVAILABLE: &str = "设置存储暂时不可用，这次没有改动";
 const CHAT_OWNER_ONLY: &str = "配置读写只允许管理员私聊";

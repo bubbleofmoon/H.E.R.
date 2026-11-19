@@ -64,10 +64,7 @@ impl SettingKind for Integer {
     }
 
     fn seed(&self, found: &Value) -> Option<Value> {
-        match self.file {
-            FileRule::Clamp | FileRule::Default => self.normalize(found),
-            _ => self.read(found),
-        }
+        self.read(found)
     }
 
     fn refusal(&self, key: &str, _value: &Value) -> String {
