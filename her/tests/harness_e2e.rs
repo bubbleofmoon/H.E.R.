@@ -4248,6 +4248,12 @@ fn reserved2_send() -> Value {
     }))
 }
 
+fn reserved2_sleep() -> Value {
+    reserved2_call("sleep", "qq_set_wake_config", json!({
+        "key": GROUP_KEY, "token": "", "config":{"mode":"diving","infinite":true,"triggers":{"atMention":true}}
+    }))
+}
+
 fn reserved2_group_ends(rig: &Rig) -> usize {
     let records = rig.ledger();
     records.iter().filter(|r| r["k"] == "ended" && records.iter().any(|begun| {
@@ -4271,6 +4277,84 @@ fn reserved2_push_mention(rig: &Rig, id: i64, text: &str) {
 fn reserved2_current_prompt(request: &Value) -> &str {
     request["messages"].as_array().unwrap().iter().rev()
         .find(|message| message["role"] == "user").unwrap()["content"].as_str().unwrap()
+}
+
+#[test]
+fn ticket159_reserved2_parity_first_delta_urgent_silence_and_sleep() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut sequences = Vec::new();
+    for engine in ["dsh", "harness"] {
+        let release = Arc::new(AtomicBool::new(false));
+        let model = FakeModel::script(vec![
+            ModelReply::ToolCalls(vec![reserved2_send(), reserved2_sleep()]),
+            ModelReply::Delayed { text:"private deliberation".into(), release:release.clone() },
+            ModelReply::ToolCalls(vec![reserved2_sleep()]),
+            ModelReply::Text("private deliberation after the urgent wake".into()),
+        ]);
+        let mut rig = reserved2_fixture(&format!("ticket159-parity-{engine}"), &model, engine);
+        *lock(&rig.dsh.loop_fixture) = Some((rig.root.clone(), rig.console_port, rig.gateway.clone()));
+        let prompts_file = rig.root.join("data/initial-prompts.json");
+        let operator = |text| {
+            fs::write(&prompts_file,
+                json!({GROUP_KEY:{"text":text,"createdAt":1,"updatedAt":1}}).to_string()).unwrap();
+        };
+        operator("first operator background");
+        rig.start();
+        rig.push(group_event(15901, 1001, "tester", "", vec![text_seg("first wake fixture")]));
+        assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["simulation fixture reply"]);
+        assert!(wait_for(LONG, || if engine == "dsh" {
+            rig.root.join("first-turn-waiting").exists()
+        } else {
+            lock(&model.requests).len() >= 2
+        }), "first send must settle before the urgent arrival");
+        // The same admitted turn remains running while the urgent event passes through the hub.
+        assert_eq!(reserved2_group_ends(&rig), 0);
+        let before = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["lastUnreadSeq"].as_i64().unwrap();
+        operator("second operator background");
+        reserved2_push_mention(&rig, 15902, "urgent followup fixture");
+        assert!(wait_for(LONG, || rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["lastUnreadSeq"]
+            .as_i64().is_some_and(|seq| seq > before)), "the urgent event was not recorded");
+        fs::write(rig.root.join("allow-first-turn-end"), "").unwrap();
+        release.store(true, Ordering::SeqCst);
+        assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 2), "the urgent wake must finish once");
+        let (first, second) = if engine == "dsh" {
+            let prompts = rig.dsh.prompts();
+            assert_eq!(prompts.len(), 2);
+            (prompts[0].text.clone(), prompts[1].text.clone())
+        } else {
+            assert!(rig.dsh.prompts().is_empty());
+            let requests = lock(&model.requests);
+            assert_eq!(requests.len(), 4);
+            (reserved2_current_prompt(&requests[0]).to_owned(), reserved2_current_prompt(&requests[2]).to_owned())
+        };
+        let prefix = format!("{GROUP_KEY} [reserved2] AI 内部输出：");
+        let read_internal = || {
+            let activity = fs::read_to_string(rig.root.join("data/qq-activity.log")).unwrap_or_default();
+            activity.lines().filter_map(|line| line.split_once(&prefix).map(|(_, text)| text.to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let expected = ["private deliberation", "private deliberation after the urgent wake"];
+        assert!(wait_for(LONG, || read_internal() == expected),
+            "the bridge must observe both nonempty internal outputs from {engine}: {:?}", read_internal());
+        assert!(first.contains("【简报 revision=") && first.contains("first operator background"));
+        assert!(second.contains("【唤醒增量】") && second.contains("【替换简报节 operator】"),
+            "the urgent wake must replace only the edited briefing section: {second}");
+        assert!(second.contains("second operator background") && second.contains("urgent followup fixture"));
+        if engine == "harness" {
+            assert!(!first.contains("【会话令牌】"), "the wire briefing must use implicit session binding");
+            let text = format!("{first} {second}").to_ascii_lowercase();
+            assert!(["harness", "openai", "dsh", "fake-chat"].iter().all(|term| !text.contains(*term)),
+                "the model-visible briefing must use provider-neutral text");
+        }
+        let state = rig.data_json("social-v2.json");
+        assert_eq!(state["conversations"][GROUP_KEY]["wakeConfig"]["infinite"], true);
+        let outbox = reserved2_group_outbox(&rig);
+        assert_eq!(outbox.iter().filter(|kind| **kind == "confirmed").count(), 1,
+            "only the scripted tool send may confirm delivery");
+        sequences.push((outbox, rig.texts_to(GROUP_KEY)));
+    }
+    assert_eq!(sequences[0], sequences[1], "both paths must produce the same group outbox and delivery");
+    assert_eq!(sequences[1].1, ["simulation fixture reply"]);
 }
 
 #[test]

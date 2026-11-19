@@ -343,6 +343,35 @@ impl Dsh {
             }
             return finish(json!({"kind":"completed"}));
         }
+        let parity = lock(&self.loop_fixture).clone().filter(|(root, _, _)| {
+            root.file_name().unwrap().to_string_lossy().contains("ticket159-parity")
+        });
+        if let Some((root, port, _)) = parity {
+            let state: Value = serde_json::from_slice(&fs::read(root.join("data/social-v2.json")).unwrap()).unwrap();
+            let token = state["conversations"][GROUP_KEY]["agentToken"].as_str().unwrap();
+            let headers = [("x-console-token", CONSOLE_TOKEN), ("x-agent-token", token)];
+            if turn == 1 {
+                let (status, result) = http_call(port, "POST", "/api/socialV2/send-message", &headers,
+                    Some(&json!({"key":GROUP_KEY,"messages":["simulation fixture reply"]}))).unwrap();
+                assert_eq!(status, 200, "{result}");
+            }
+            let (status, result) = http_call(port, "POST", "/api/socialV2/wake-config", &headers,
+                Some(&json!({"key":GROUP_KEY,"config":{"mode":"diving","infinite":true,"triggers":{"atMention":true}}}))).unwrap();
+            assert_eq!(status, 200, "{result}");
+            if turn == 1 {
+                fs::write(root.join("first-turn-waiting"), "").unwrap();
+                assert!(wait_for(LONG, || root.join("allow-first-turn-end").exists() || !root.exists()));
+            }
+            let mut inner = lock(&self.inner);
+            if let Some(session) = inner.sessions.get_mut(sid) {
+                let text = if turn == 1 { "private deliberation" } else { "private deliberation after the urgent wake" };
+                event(session, "assistant/message", json!({"turn":turn,
+                    "message":{"role":"assistant","content":[{"type":"text","text":text}]},
+                }));
+            }
+            drop(inner);
+            return finish(json!({"kind":"completed"}));
+        }
         if prompt.contains("#LOOP123#") {
             let (root, port, gateway) = lock(&self.loop_fixture).clone().expect("loop fixture");
             let state: Value = serde_json::from_slice(&fs::read(root.join("data/social-v2.json")).unwrap()).unwrap();
