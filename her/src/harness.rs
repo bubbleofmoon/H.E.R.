@@ -605,7 +605,7 @@ impl Harness {
                 Err(Failure::Failed(reason)) => interrupted.unwrap_or(Status::Failed(reason)),
                 Ok(event) => match interrupted {
                     Some(status) => status,
-                    None => match Ok::<(), String>(()) { // RED-R2m
+                    None => match TurnDelivery::check_deadline(delivery.reserved2_budget, &context, &request.conversation) {
                         Err(reason) => Status::Failed(reason),
                         Ok(()) => {
                             let Event::Assistant { text, .. } = &event else {
@@ -871,7 +871,7 @@ async fn tool_loop(
             // Revocation may precede the pipeline's cancellation notification. It ends
             // the turn, rather than becoming a refusal with a new durable tool intent.
             check_bound(request, &cancelled, deadline)?;
-            // RED-R2n
+            TurnDelivery::check_deadline(delivery.reserved2_budget, context, &request.conversation)?;
             let run = store.tool_start(&request.id, &attempt, &call)?;
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
