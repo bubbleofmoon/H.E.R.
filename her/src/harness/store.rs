@@ -742,7 +742,8 @@ mod tests {
         }
         let _cleanup = Cleanup(root.clone());
         for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
-        std::fs::write(root.join("config/config.json"), "{}").unwrap();
+        std::fs::write(root.join("config/config.json"), r#"{"consoleToken":"fixture-console"}"#).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("config/harness-api-key"), "fixture-harness-record-key").unwrap();
         std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:2","onebot":"http://127.0.0.1:3"}"#).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
@@ -769,7 +770,8 @@ mod tests {
         for dir in ["config", "data", "resources"] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        std::fs::write(root.join("config/config.json"), "{}").unwrap();
+        std::fs::write(root.join("config/config.json"), r#"{"consoleToken":"fixture-console"}"#).unwrap();
+        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:2","onebot":"http://127.0.0.1:3"}"#).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let store = Store::open(&context).unwrap();

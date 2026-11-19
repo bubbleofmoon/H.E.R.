@@ -152,9 +152,10 @@ fn ticket219_core_undo_refuses_a_credential_change() {
 #[test]
 fn ticket219_core_prompt_text_refuses_both_credentials() {
     let (root, context) = settings_fixture("prompt credential refusal");
-    std::fs::write(root.0.join("config/harness-api-key"), "fixture-harness-credential\n").unwrap();
+    let model_key = "fixture-model-credential";
+    std::fs::write(root.0.join("config/harness-api-key"), model_key).unwrap();
     assert_eq!(put(&context, CLI, CLI_KEY).0, 200);
-    for key in ["fixture-harness-credential", CLI_KEY] {
+    for key in [model_key, CLI_KEY] {
         let (status, reply) = put(&context, "prompt.notAClerk", &format!("prefix {key} suffix"));
         assert_eq!(status, 400, "prompt text accepted a credential");
         assert_eq!(reply["error"], "setting text contains a credential");
