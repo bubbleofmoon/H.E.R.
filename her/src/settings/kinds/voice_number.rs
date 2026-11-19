@@ -18,7 +18,7 @@ impl VoiceNumber {
 impl SettingKind for VoiceNumber {
     fn normalize(&self, value: &Value) -> Option<Value> {
         value.as_f64()
-            .filter(|number| self.valid_lower_bound(*number) && *number <= self.max)
+            .filter(|number| self.valid_lower_bound(*number) && *number <= self.max + 1.0) // RED-V1
             .map(crate::voice::json_number)
     }
 
