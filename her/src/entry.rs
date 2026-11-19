@@ -21,6 +21,7 @@ mod memory_actions;
 mod pipeline;
 mod harness;
 mod turn_engine;
+mod engine_switch;
 mod prompt;
 mod prompt_text;
 mod briefing;

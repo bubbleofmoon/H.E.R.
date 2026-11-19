@@ -34,6 +34,12 @@ pub fn route(
     if agent_call {
         return failure(403, "settings routes are restricted to administrators");
     }
+    // The model page and list only read state, even if startup left a legacy engine map.
+    if !matches!((method, path), ("GET", "/settings/models" | "/api/settings/models")) {
+        if let Err((status, error)) = crate::console::import_engine_choices(context) {
+            return failure(status, &error);
+        }
+    }
     let result = match (method, path) {
         ("GET", "/settings") => return (200, HTML_TYPE, PAGE.to_string()),
         ("GET", "/settings/conversations") => return (200, HTML_TYPE, conversation::PAGE.to_string()),
@@ -47,6 +53,7 @@ pub fn route(
         ("POST", "/api/settings/undo") => undo(context, body, authority),
         ("POST", "/api/settings/conversation/set") => conversation::set(context, body, authority),
         ("POST", "/api/settings/conversation/reset") => conversation::reset(context, body, authority),
+        ("POST", "/api/settings/conversation/switch") => conversation::switch(context, body, authority),
         _ => Err((404, "unknown settings route".to_string())),
     };
     match result {

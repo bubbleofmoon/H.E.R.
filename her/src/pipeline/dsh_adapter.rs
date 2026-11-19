@@ -2,7 +2,7 @@
 //! selection and failover, prompt submission and the follow-stream collector, DSH cancellation,
 //! usage ledger rows and the CLI fallback after an exhausted DSH chain. `pipeline.rs` keeps the
 //! code every engine shares and reaches this module only through its registration points: the
-//! `Adapter::Dsh` arm of `run_admitted_turn`, `closed_preset` for a DSH closed-agent turn, and the
+//! `Adapter::Dsh` arm of `run_admitted_turn`, the DSH chat availability and login checks, and the
 //! public DSH entry points other modules call (`ensure_session`, `cancel*`, `has_dsh`,
 //! `ask_with_failover`, `handle_with_failover`).
 
@@ -11,6 +11,21 @@ use crate::dependency::{Clock, Idempotency, RetryDecision, RetryPolicy, SystemCl
 use crate::dsh::{FollowStream, TurnUsage};
 
 impl Pipeline {
+    fn dsh_switch_summary(&self, key: &str, sid: &str, cfg: &serde_json::Value) -> Result<Option<String>, String> {
+        if !self.context.is_isolated() { return Ok(None); }
+        let generation = self.turn_epochs.first().unwrap_or(&self.turn_epoch);
+        let Some(summary) = crate::engine_switch::summary(&self.context, key, generation, crate::turn_engine::Engine::Dsh)? else {
+            return Ok(None);
+        };
+        let (turns, _) = crate::turn_ledger::fold(&crate::turn_ledger::read_records(&self.context)?);
+        if turns.iter().any(|turn| turn.key == key && turn.epochs.contains(generation)
+            && turn.attempts.iter().any(|attempt| attempt.session_id == sid && attempt.accepted)) {
+            return Ok(None);
+        }
+        Ok(crate::engine_switch::safe_text(&self.context, cfg,
+            &format!("{}\n{summary}", crate::harness::handover::SUMMARY_LABEL), 2_100))
+    }
+
     /// The DSH adapter's admitted turn (`turn_engine::Adapter::Dsh`): refused locally without a DSH
     /// login, else the DSH candidate chain with its failover.
     pub(super) async fn run_dsh_turn(
@@ -407,8 +422,31 @@ impl Pipeline {
             *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(sid.to_string());
         }
     }
-    /// It holds a DSH login (`new_with_runtime`); `new_without_dsh` pipelines do not.
+    /// Whether the pipeline holds a DSH login.
     pub fn has_dsh(&self) -> bool { self.rpc.credential().is_bound() }
+
+    pub(super) fn prepare_dsh_chat(&mut self, cfg: &serde_json::Value, mode: &str) -> Result<bool, String> {
+        if crate::dsh_health::is_down(&self.context) {
+            return Ok(false);
+        }
+        if !self.has_dsh() {
+            self.rpc = crate::console::dsh_rpc_for(&self.context, cfg)?;
+        }
+        let _ = self.rpc.relogin();
+        if mode == "closed-agent" { self.preset_closed = self.closed_preset()?; }
+        Ok(true)
+    }
+
+    pub(super) fn defer_unsubmitted_dsh_chat(&self, key: &str, cfg: &serde_json::Value) -> bool {
+        if !self.dispatch_definitely_unsubmitted() || !crate::dsh_health::is_down(&self.context) {
+            return false;
+        }
+        crate::admin_alert::notify_notice(
+            &self.context, cfg,
+            &format!("[{key}] DSH 不可用，消息已排队，恢复后会重新核对权限再补投"), "turn-failure",
+        );
+        true
+    }
 
     /// 作废当前这次尝试：先清 inbox 并取消 DSH 里的回合，再换令牌。
     ///
@@ -891,11 +929,15 @@ impl Pipeline {
                     prompt_chars = prompt_text.chars().count();
                 }
             }
+            let handed_over = self.dsh_switch_summary(key, &sid, cfg)?.map(|summary| {
+                crate::model_view::strip_text_with_runtime(&self.context, &format!("{summary}\n\n{prompt_text}"), cfg)
+            });
             if let Some(turn) = &self.cur_turn {
                 turn.attempt_with_layers(&rpc_id, &sid, layers.as_ref())
                     .map_err(|e| format!("回合账本写入失败，不提交 prompt：{e}"))?;
             }
-            let mut content = vec![serde_json::json!({"type": "text", "text": prompt_text})];
+            let submitted_text = handed_over.as_deref().unwrap_or(&prompt_text);
+            let mut content = vec![serde_json::json!({"type": "text", "text": submitted_text})];
             if let Some(chat) = &self.chat { content.extend(chat.media_parts.iter().cloned()); }
             let sent = self.rpc.call_with_rpc_id(
                 "session/prompt",
