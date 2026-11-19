@@ -40,6 +40,10 @@ impl SettingKind for Integer {
         }
     }
 
+    fn seed(&self, found: &Value) -> Option<Value> {
+        self.read(found)
+    }
+
     fn refusal(&self, key: &str, _value: &Value) -> String {
         let Integer { min, max, .. } = *self;
         format!("{key} must be an integer from {min} to {max}")
