@@ -10068,7 +10068,7 @@ fn sticker_send_pause(cfg: &Value) {
         (STICKER_MIN.integer(&Value::Null), STICKER_MAX.integer(&Value::Null))
     };
     let width = (max - min) as u64;
-    let ms = min as u64 + ((rand01() * (width + 1) as f64) as u64).min(width) + 1; // RED-S2
+    let ms = min as u64 + ((rand01() * (width + 1) as f64) as u64).min(width);
     #[cfg(test)]
     {
         STICKER_PAUSE_TEST_HOOK.with(|hook| {

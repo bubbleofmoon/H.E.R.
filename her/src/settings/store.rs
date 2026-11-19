@@ -99,7 +99,7 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
 pub(crate) fn complete_timing(document: &mut Value) {
     use super::send::{first_gap_setting, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_PER_CHAR};
     for (first, fallback) in [(FIRST_BASE, GAP_BASE), (FIRST_PER_CHAR, GAP_PER_CHAR)] {
-        let value = first_gap_setting(document, first, fallback);
+        let value = first_gap_setting(document, &first, &fallback);
         set_at(document, first.pointer, json!(value));
     }
     for setting in super::reply::SETTINGS.iter().chain(super::wake_timing::SETTINGS).chain(super::send::SETTINGS) {
@@ -132,7 +132,7 @@ fn validate_timing(
         crate::wake::validate_turn_settings(&candidate).map_err(|error| (400, error.to_string()))?;
     }
     if send {
-        for [min, max] in super::send::ORDERED {
+        for [min, max] in &super::send::ORDERED {
             if [min, max].iter().any(|setting| written.contains(&setting.key))
                 && min.integer(&candidate) > max.integer(&candidate)
             {

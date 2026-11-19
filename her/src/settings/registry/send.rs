@@ -49,7 +49,7 @@ pub(crate) const ORDERED: [[Setting; 2]; 3] = [
 ];
 
 /// An older file could give its first-gap values through the ordinary gap settings.
-pub(crate) fn first_gap_setting(document: &Value, first: Setting, fallback: Setting) -> i64 {
+pub(crate) fn first_gap_setting(document: &Value, first: &Setting, fallback: &Setting) -> i64 {
     if let Some(value) = first.found_in(document).filter(|value| !value.is_null()) {
         return first.kind.read(value).and_then(|value| value.as_i64())
             .unwrap_or_else(|| first.integer(&Value::Null));

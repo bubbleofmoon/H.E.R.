@@ -969,13 +969,13 @@ pub(super) fn automatic_gap(cfg: &Value, choose: f64, position: f64) -> i64 {
         (BURST_MIN_MS.integer(cfg), BURST_MAX_MS.integer(cfg))
     };
     let (min, max) = (min.min(max), min.max(max));
-    min + ((position * (max - min + 1) as f64) as i64).min(max - min) + 1 // RED-S1
+    min + ((position * (max - min + 1) as f64) as i64).min(max - min)
 }
 
 pub(super) fn first_typing_delay(cfg: &Value, text: &str) -> i64 {
     use crate::settings::send::{first_gap_setting, BURST_MIN_MS, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_MAX, GAP_PER_CHAR};
-    let base = first_gap_setting(cfg, FIRST_BASE, GAP_BASE);
-    let per = first_gap_setting(cfg, FIRST_PER_CHAR, GAP_PER_CHAR);
+    let base = first_gap_setting(cfg, &FIRST_BASE, &GAP_BASE);
+    let per = first_gap_setting(cfg, &FIRST_PER_CHAR, &GAP_PER_CHAR);
     let min = BURST_MIN_MS.integer(cfg).max(100);
     let max = GAP_MAX.integer(cfg).max(min);
     base.saturating_add((text.encode_utf16().count() as i64).saturating_mul(per)).clamp(min, max)
