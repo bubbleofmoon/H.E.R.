@@ -479,7 +479,7 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
 /// When there is no usable row, the file's value or the default applies.
 fn last_good(conn: &Connection, setting: &Setting, accepted: impl Fn(&Value) -> bool) -> Option<Value> {
     let mut statement =
-        conn.prepare("SELECT new_value FROM settings_audit WHERE scope='global' AND key=?1 ORDER BY id DESC").ok()?;
+        conn.prepare("SELECT new_value FROM settings_audit WHERE key=?1 ORDER BY id DESC").ok()?; // RED-M1
     let mut rows = statement.query([setting.key]).ok()?;
     while let Ok(Some(row)) = rows.next() {
         let text: Option<String> = row.get(0).ok()?;

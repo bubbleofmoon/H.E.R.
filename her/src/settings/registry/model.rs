@@ -61,7 +61,7 @@ pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     applies: "live",
     group: "model and cost",
     label: "Digest request timeout",
-    hint: "Total seconds allowed for a conversation's digest to walk the model route chain before it times out.",
+    hint: "Seconds one digest model request may take before that conversation's digest fails as a timeout.", // RED-M5
     chat: false,
 };
 

@@ -243,7 +243,7 @@ const PAGE: &str = r##"<!doctype html>
 const $=s=>document.querySelector(s);
 const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
 $('#token').value=token();
-const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:Object.assign({'x-console-token':token()},body?{'content-type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});const j=await r.json();if(body||!j.ok)$('#msg').textContent=j.ok?(j.mirrorError||(j.changed===false?'Unchanged':'Saved')):(j.error||r.status);return j};
+const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:Object.assign({'x-console-token':token()},body?{'content-type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});const j=await r.json();if(body||!j.ok)$('#msg').textContent=j.ok?(j.changed===false?'Unchanged':'Saved'):(j.error||r.status);return j}; // RED-M4
 const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':String(t);return td};
 const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
 const shown=v=>v==null?'(none)':JSON.stringify(v);

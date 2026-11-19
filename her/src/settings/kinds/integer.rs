@@ -41,7 +41,7 @@ impl SettingKind for Integer {
     }
 
     fn seed(&self, found: &Value) -> Option<Value> {
-        self.read(found)
+        self.normalize(found) // RED-M3
     }
 
     fn refusal(&self, key: &str, _value: &Value) -> String {
