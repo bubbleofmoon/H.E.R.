@@ -424,10 +424,13 @@ mod tests {
         outcome["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// The table row, and what the configuration offers with the default-off tools enabled.
+    /// The table row, and what the configuration offers with the voice system and default-off tools enabled.
     fn assert_menu(profile: Profile, expected: &[&str]) {
         let cfg = json!({
-            "socialV2": {"tools": {"sendVoice": true, "setStickerRemark": true}}
+            "socialV2": {
+                "voice": {"enabled": true},
+                "tools": {"sendVoice": true, "setStickerRemark": true}
+            }
         });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
         assert_eq!(names(&definitions(&cfg, profile)), expected, "{profile:?} offered");

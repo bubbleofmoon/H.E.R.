@@ -55,7 +55,8 @@ pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
-    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches,
+    OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL, tool_enabled, tool_switches, VOICE_AUTO_READBACK, VOICE_ENABLED,
+    VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS,
 };
 #[cfg(test)]
 pub(crate) use store::{

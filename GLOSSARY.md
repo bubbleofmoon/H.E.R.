@@ -82,7 +82,7 @@ An owner-tunable value kept in the settings store (`settings.db`), checked again
 _Avoid_: config key (a member of `config.json`), preference
 
 **Setting kind (设置类型)**:
-The value type and bounds of a live setting (an integer range, a switch, a model id, model-visible text or a choice of fixed options): how a value of it is checked, read from `config.json`, refused, shown on the settings page and named in the owner's chat. Each kind is one struct implementing one interface (`settings::kinds`), and each registry definition names its kind.
+The value type and bounds of a live setting (an integer or number range, a switch, a model id, model-visible text or a choice of fixed options): how a value of it is checked, read from `config.json`, refused, shown on the settings page and named in the owner's chat. Each kind is one struct implementing one interface (`settings::kinds`), and each registry definition names its kind.
 _Avoid_: setting type, value kind
 
 **Setting scope (设置范围)**:

@@ -11,6 +11,9 @@
 //! and without evidence the item stays unknown and is never sent again by this bridge.
 
 use super::*;
+use crate::settings::{
+    VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS,
+};
 use crate::voice::{self, AudioOptions, Loudness};
 use std::path::{Path, PathBuf};
 
@@ -19,8 +22,7 @@ const NOT_FROM_LIBRARY: &str = "语音只接受语音库里的本地文件；不
 
 // ----- configuration ---------------------------------------------------------------------------------------
 
-/// The merged `socialV2.voice` section: the JS config loader supplies `enabled: false` and the
-/// other defaults, then `voiceCfg()` normalizes each member.
+/// Effective voice controls and the local audio processing configuration.
 pub(super) struct VoiceCfg {
     pub enabled: bool,
     pub dir_rel: String,
@@ -35,35 +37,20 @@ pub(super) struct VoiceCfg {
     auto_readback: bool,
 }
 
-// QQ's non-member ceiling also caps older configurations that allowed five-minute recordings.
-fn max_seconds(value: Option<&Value>) -> f64 {
-    let seconds = agent::js_number(value);
-    let seconds = if seconds > 0.0 { seconds } else { voice::DEFAULT_MAX_SECONDS };
-    if seconds > voice::DEFAULT_MAX_SECONDS {
-        crate::safe_println!("[voice] socialV2.voice.maxSeconds={seconds} exceeds QQ limit; clamped to 60s");
-    }
-    seconds.min(voice::DEFAULT_MAX_SECONDS)
-}
-
-/// Keep config views and saved settings on the same duration limit as the send path.
+/// The legacy social page caps old file values and duration values posted through that page.
 pub(super) fn clamp_config_max_seconds(social: &mut Value) {
-    if let Some(value) = social.pointer_mut("/voice/maxSeconds") {
-        *value = voice::json_number(max_seconds(Some(value)));
+    if social.pointer("/voice/maxSeconds").is_some() {
+        let cfg = json!({"socialV2": &*social});
+        warn_configured_voice_duration(&cfg);
+        social["voice"]["maxSeconds"] = VOICE_MAX_SECONDS.read(&cfg);
     }
 }
 
 pub(super) fn voice_cfg(cfg: &Value) -> VoiceCfg {
     let section = cfg.pointer("/socialV2/voice").filter(|v| v.is_object());
     let get = |name: &str| section.and_then(|s| s.get(name));
-    let positive_or = |name: &str, fallback: f64| {
-        let n = agent::js_number(get(name));
-        if n > 0.0 { n } else { fallback }
-    };
-    let non_negative_or = |name: &str, fallback: f64| {
-        let n = agent::js_number(get(name));
-        if n >= 0.0 { n } else { fallback }
-    };
-    let default_volume = positive_or("defaultVolume", 1.0);
+    let volume = agent::js_number(get("defaultVolume"));
+    let default_volume = if volume > 0.0 { volume } else { 1.0 };
     let default_volume_text = match get("defaultVolume") {
         Some(v) if default_volume != 1.0 || !v.is_null() => social_policy_js_string(v),
         _ => "1".to_string(),
@@ -82,21 +69,20 @@ pub(super) fn voice_cfg(cfg: &Value) -> VoiceCfg {
         .filter(|v| !v.is_empty())
         .or_else(|| get("ffmpegPath").and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string));
     VoiceCfg {
-        // `enabled` is false unless the file says otherwise, and only an explicit `false` closes it again.
-        enabled: get("enabled").map(|v| v != &json!(false)).unwrap_or(false),
+        enabled: VOICE_ENABLED.switch(cfg),
         dir_rel: match get("dir") {
             None | Some(Value::Null) => "audio".to_string(),
             Some(v) => social_policy_js_string(v),
         },
-        max_seconds: max_seconds(get("maxSeconds")),
-        max_bytes: positive_or("maxBytes", voice::DEFAULT_MAX_BYTES as f64),
-        max_per_minute: non_negative_or("maxPerMinute", 2.0),
-        max_per_hour: non_negative_or("maxPerHour", 10.0),
+        max_seconds: VOICE_MAX_SECONDS.read(cfg).as_f64().expect("voice duration is a number"),
+        max_bytes: VOICE_MAX_BYTES.integer(cfg) as f64,
+        max_per_minute: VOICE_MAX_MINUTE.read(cfg).as_f64().expect("voice minute quota is a number"),
+        max_per_hour: VOICE_MAX_HOUR.read(cfg).as_f64().expect("voice hour quota is a number"),
         default_volume,
         default_volume_text,
         loudness,
         ffmpeg_path,
-        auto_readback: get("autoReadback").map(|v| v != &json!(false)).unwrap_or(true),
+        auto_readback: VOICE_AUTO_READBACK.switch(cfg),
     }
 }
 
@@ -111,23 +97,27 @@ impl VoiceCfg {
     }
 }
 
-/// The voice part of the JS config merge, for the console's config view: `socialV2.voice` gets its
-/// defaults under the file's members and `tools.sendVoice` is off unless the file says otherwise
-/// (the console checkbox reads `!== false`, so an absent flag would show voice as on).
+/// The voice part of the config view, with registry values for the live controls.
 pub(super) fn apply_config_defaults(social: &mut Value) {
     let Some(map) = social.as_object_mut() else { return };
     let mut voice = json!({
-        "enabled": false, "dir": "audio", "maxSeconds": voice::json_number(voice::DEFAULT_MAX_SECONDS),
-        "maxBytes": 20971520, "maxPerMinute": 2, "maxPerHour": 10,
-        "allowAbsolutePath": false, "defaultVolume": 1, "loudness": "normal", "ffmpegPath": "", "autoReadback": true
+        "enabled": null, "dir": "audio", "maxSeconds": null,
+        "maxBytes": null, "maxPerMinute": null, "maxPerHour": null,
+        "allowAbsolutePath": false, "defaultVolume": 1, "loudness": "normal", "ffmpegPath": "", "autoReadback": null
     });
     if let (Some(defaults), Some(file)) = (voice.as_object_mut(), map.get("voice").and_then(Value::as_object)) {
         for (k, v) in file {
             defaults.insert(k.clone(), v.clone());
         }
     }
+    let cfg = json!({"socialV2": &*map});
+    voice["enabled"] = VOICE_ENABLED.read(&cfg);
+    voice["maxSeconds"] = VOICE_MAX_SECONDS.read(&cfg);
+    voice["maxBytes"] = VOICE_MAX_BYTES.read(&cfg);
+    voice["maxPerMinute"] = VOICE_MAX_MINUTE.read(&cfg);
+    voice["maxPerHour"] = VOICE_MAX_HOUR.read(&cfg);
+    voice["autoReadback"] = VOICE_AUTO_READBACK.read(&cfg);
     map.insert("voice".to_string(), voice);
-    clamp_config_max_seconds(social);
 }
 
 /// The global sendVoice tool switch.

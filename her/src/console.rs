@@ -5932,6 +5932,20 @@ fn build_media_images(context: &RuntimeContext, cfg: &Value, media_list: &[Value
     crate::media::images(context, cfg, media_list)
 }
 
+/// Numeric coercion for the legacy voice configuration.
+pub(crate) fn voice_config_number(value: &Value) -> f64 {
+    agent::js_number(Some(value))
+}
+
+pub(crate) fn warn_configured_voice_duration(cfg: &Value) {
+    let Some(raw) = crate::settings::VOICE_MAX_SECONDS.found_in(cfg) else { return };
+    let seconds = voice_config_number(raw);
+    let ceiling = crate::voice::QQ_MAX_SECONDS;
+    if seconds > ceiling {
+        crate::safe_println!("[voice] socialV2.voice.maxSeconds={seconds} exceeds QQ limit; clamped to {ceiling}s");
+    }
+}
+
 pub(crate) fn social_v1_number(value: &Value) -> f64 {
     match value {
         Value::Null => 0.0,
@@ -6746,7 +6760,7 @@ fn handle_social_config_post(
         }
     }
     // 子对象必须是对象，否则保留当前值（null/数组会覆盖默认值、绕过工具开关）
-    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context"];
+    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context", "voice"];
     for name in subs {
         if let Some(v) = body_v.get(name) {
             if !v.is_object() {
@@ -6767,6 +6781,11 @@ fn handle_social_config_post(
             tools.insert(flag.to_string(), posted.map_or_else(|| setting.read(&effective), Value::Bool));
         }
         merged.insert("tools".into(), Value::Object(tools));
+    }
+    for name in ["voice"] {
+        if body_v.get(name).and_then(Value::as_object).is_some() {
+            merged.insert(name.to_string(), Value::Object(merge_sub(&current, name, &body_v)));
+        }
     }
     // wake
     if body_v.get("wake").and_then(js_object_like).is_some() {
@@ -6967,7 +6986,10 @@ fn handle_social_config_post(
     // above: validated before anything is written (400), stored and written back first (a store that cannot take it
     // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
     // save's own write puts every stored value into config.json (`write_selected_config_text`).
-    let carried = json!({ "socialV2": body_v.clone() });
+    let mut carried = json!({ "socialV2": body_v.clone() });
+    if body_v.pointer("/voice/maxSeconds").is_some_and(|value| !value.is_null()) {
+        carried["socialV2"]["voice"]["maxSeconds"] = merged_v["voice"]["maxSeconds"].clone();
+    }
     let settings_changes = crate::settings::console_changes(context, &file_before, &carried)?;
     if !settings_changes.is_empty() {
         // The store's write-back refuses a file the runtime cannot load, after the commit: refuse it before the store
@@ -6986,7 +7008,7 @@ fn handle_social_config_post(
     write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
     let mut effective = crate::settings::overlay(context, file);
     crate::settings::resolve_live_batch(&mut effective);
-    for name in ["tools"] {
+    for name in ["tools", "voice"] {
         if body_v.get(name).and_then(js_object_like).is_some() {
             merged_v[name] = effective["socialV2"][name].clone();
         }

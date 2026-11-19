@@ -7,8 +7,10 @@ mod model;
 mod prompt;
 mod reply;
 mod tools;
+mod voice;
 
 pub(crate) use tools::{tool_enabled, tool_switches};
+pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS};
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 #[cfg(test)]
@@ -28,7 +30,7 @@ const GROUPS: &[&[Setting]] = &[
 
 /// Settings whose effective values are also materialized on the runtime configuration document.
 pub(super) fn live_batch() -> impl Iterator<Item = &'static Setting> {
-    tools::SETTINGS.iter()
+    [tools::SETTINGS, voice::SETTINGS].into_iter().flatten()
 }
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its

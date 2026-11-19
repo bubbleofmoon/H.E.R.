@@ -96,7 +96,7 @@ pub fn registered(name: &str, cfg: &Value) -> bool {
     if needs_sticker_system(name) && !enabled(&["sticker", "enabled"]) {
         return false;
     }
-    if needs_voice_system(name) && !enabled(&["voice", "enabled"]) {
+    if needs_voice_system(name) && !crate::settings::VOICE_ENABLED.switch(cfg) {
         return false;
     }
     true

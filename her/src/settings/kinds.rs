@@ -8,6 +8,7 @@ mod model_id;
 mod owner_id;
 mod route_id;
 mod switch;
+mod voice_number;
 mod text;
 
 pub(crate) use choice::Choice;
@@ -20,6 +21,7 @@ pub(crate) use owner_id::OwnerId;
 pub(crate) use route_id::RouteId;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
+pub(crate) use voice_number::VoiceNumber;
 
 use serde_json::Value;
 

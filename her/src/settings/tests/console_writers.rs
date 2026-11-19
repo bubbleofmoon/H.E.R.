@@ -407,8 +407,10 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
     for setting in crate::settings::registry() {
         let (root, context) = settings_fixture("settings direct write refused");
         let now = setting.read(&context.load_config_document().unwrap());
+        let kind = setting.kind.view();
         let value = probes
             .iter()
+            .chain([&kind["min"], &kind["max"]].into_iter().filter(|bound| !bound.is_null()))
             .find(|probe| setting.normalize(probe).is_some_and(|value| value != now))
             .unwrap_or_else(|| panic!("{}: no probe value", setting.key))
             .clone();

@@ -887,6 +887,34 @@ fn default_voice_limit_accepts_sixty_seconds_and_refuses_even_slightly_longer_re
 }
 
 #[test]
+fn settings_batch_voice_ceiling_applies_to_the_next_send() {
+    let bot = FakeOneBot::start();
+    let fx = fixture("settings-voice-ceiling", &bot.url, Options::default());
+    for name in ["duration-30.5.mp3", "duration-60.mp3", "duration-60.001.mp3"] {
+        fx.audio(name, &bytes(64));
+    }
+    let console = Console::start(&fx);
+    let set = |value| console.operator("POST", "/api/settings/set", json!({
+        "setting": "socialV2.voice.maxSeconds", "value": value
+    }));
+    let send = |name| console.operator("POST", "/api/voice/send", json!({
+        "target": "private:222", "file": name, "verify": false
+    }));
+    let (status, answer) = set(30.5);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(send("duration-30.5.mp3").0, 200, "a fractional limit admits its exact boundary");
+    assert_eq!(send("duration-60.mp3").0, 400, "the next send must use the stricter stored limit");
+    let (status, answer) = set(60.0);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(set(0.0).0, 400, "the limit is positive");
+    let (status, answer) = set(60.001);
+    assert_eq!(status, 400, "the settings route must refuse above 60 seconds: {answer}");
+    assert_eq!(send("duration-60.001.mp3").0, 400, "the refused edit must leave the QQ ceiling in effect");
+    assert_eq!(send("duration-60.mp3").0, 200, "the QQ ceiling itself is allowed");
+    assert_eq!(bot.requests("send_private_msg").len(), 2);
+}
+
+#[test]
 fn legacy_and_stricter_voice_limits_are_enforced_before_sending() {
     assert_duration_limit(Some(json!(300)), 60.0);
     assert_duration_limit(Some(json!("300")), 60.0);

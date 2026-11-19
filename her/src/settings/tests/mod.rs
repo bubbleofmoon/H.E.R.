@@ -33,6 +33,7 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/switch.rs", include_str!("../kinds/switch.rs")),
     ("settings/kinds/text.rs", include_str!("../kinds/text.rs")),
+    ("settings/kinds/voice_number.rs", include_str!("../kinds/voice_number.rs")),
     ("settings/registry.rs", include_str!("../registry.rs")),
     ("settings/registry/access.rs", include_str!("../registry/access.rs")),
     ("settings/registry/engine.rs", include_str!("../registry/engine.rs")),
@@ -40,6 +41,7 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
     ("settings/registry/tools.rs", include_str!("../registry/tools.rs")),
+    ("settings/registry/voice.rs", include_str!("../registry/voice.rs")),
 ];
 
 fn settings_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {
