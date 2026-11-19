@@ -2784,7 +2784,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                         continue;
                     }
                 };
-                if !(kind == "group" && console::runtime_mode(&runtime_context) == "closed-agent") && !chat::allowed_in_mode(&chat_cfg, &console::runtime_mode(&runtime_context), &key) { // RED-B7
+                if !chat::allowed_in_mode(&chat_cfg, &console::runtime_mode(&runtime_context), &key) {
                     continue;
                 }
                 let inbound_key = inbound::event_key(&key, &ev.post_type, event_message_id(&ev).as_deref(), &text);

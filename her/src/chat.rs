@@ -969,7 +969,7 @@ impl Hub {
         let is_owner = !owner.is_empty() && inb.user_id.to_string() == owner;
         if is_owner && !plain.is_empty() && crate::console::runtime_mode(&self.context) == "closed-agent" {
             if let Some(interactions) = &self.interactions {
-                let reset = matches!(plain.to_ascii_lowercase().as_str(), "/new"); // RED-B1
+                let reset = matches!(plain.to_ascii_lowercase().as_str(), "/reset" | "/new");
                 use crate::harness::interactions::Answer;
                 let answer = if reset {
                     Answer::Forward
