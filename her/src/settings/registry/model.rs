@@ -21,7 +21,7 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
 pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
     key: "harness.maxSteps",
     pointer: "/harness/maxSteps",
-    kind: &Integer { min: 1, max: 64, default: 8, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 64, default: Some(8), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Model requests per turn",
@@ -33,7 +33,7 @@ pub(crate) const HARNESS_MAX_STEPS: Setting = Setting {
 pub(crate) const HARNESS_MAX_TOKENS: Setting = Setting {
     key: "harness.maxTokens",
     pointer: "/harness/maxTokens",
-    kind: &Integer { min: 1, max: 1_000_000, default: 32_768, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 1_000_000, default: Some(32_768), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Token budget per turn",
@@ -57,7 +57,7 @@ pub(crate) const DIGEST_MODEL: Setting = Setting {
 pub(crate) const DIGEST_TIMEOUT_SECS: Setting = Setting {
     key: "memory.digest.timeoutSecs",
     pointer: "/memory/digest/timeoutSecs",
-    kind: &Integer { min: 1, max: 600, default: 120, file: FileRule::Clamp },
+    kind: &Integer { min: 1, max: 600, default: Some(120), file: FileRule::Clamp },
     applies: "live",
     group: "model and cost",
     label: "Digest request timeout",

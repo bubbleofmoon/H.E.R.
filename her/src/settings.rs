@@ -53,6 +53,17 @@ pub(crate) use probe::{AuditRow, StoreProbe};
 #[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
+    material_item_limit,
+    RELATED_TOP_K,
+    AUTO_FLUSH_ENABLED,
+    AUTO_FLUSH_CONTEXT_PCT,
+    AUTO_FLUSH_MAX_SESSIONS,
+    AUTO_FLUSH_MIN_INTERVAL,
+    DIGEST_MAX_INPUT_CHARS,
+    LAYER_IDENTITY,
+    LAYER_RELATIONSHIP,
+    LAYER_CONVERSATION,
+    LAYER_MATERIAL,
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
     OUTBOUND_GUARD, OWNER, WEB_SEARCH_MODEL,
@@ -63,7 +74,7 @@ pub(crate) use store::{
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
 };
 pub(crate) use store::{
-    apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
+    resolve_config, apply, apply_changes, apply_conversation, backup_source, canonical_conversation, console_changes,
     conversation_admitted, conversation_value, conversation_view, direct_change_error, has_stored_values, history,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
     registry_free, reset, reset_conversation, restore_gate, security_restore, store_mark, store_path, undo, view,
@@ -123,7 +134,7 @@ impl Setting {
         self.normalize(value).or_else(|| (value.is_null() && self.default_value().is_null()).then_some(Value::Null))
     }
 
-    /// The default; `Null` for a model id without one (not configured).
+    /// The default; `Null` can mean unconfigured or use a fallback.
     pub(crate) fn default_value(&self) -> Value {
         self.kind.default_value()
     }
@@ -164,8 +175,7 @@ impl Setting {
         self.read(document).as_i64().unwrap_or_default()
     }
 
-    /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
-    /// one.
+    /// The resolved string of a string-valued setting, if present.
     pub(crate) fn text(&self, document: &Value) -> Option<String> {
         self.read(document).as_str().map(str::to_string)
     }

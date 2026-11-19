@@ -2728,7 +2728,7 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
 }
 
 /// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 17] = [
+const SETTINGS_WRITABLE: [&str; 13] = [
     "sendDelayMs",
     "socialV2.send.burstEnabled",
     "socialV2.send.burstIntervalMinMs",
@@ -2741,10 +2741,6 @@ const SETTINGS_WRITABLE: [&str; 17] = [
     "socialV2.sticker.stickerEnabled",
     "socialV2.context.wakeMaxChars",
     "socialV2.context.wakeRecentLimit",
-    "memory.inject.relatedTopK",
-    "memory.autoFlush.enabled",
-    "memory.autoFlush.contextPct",
-    "memory.autoFlush.maxSessionsPerDay",
     "role.maxInjectChars",
 ];
 
@@ -2829,13 +2825,6 @@ fn is_setting_writable(path: &str) -> bool {
     SETTINGS_WRITABLE.contains(&p)
 }
 
-/// `memory.inject.relatedTopK` as a write: an integer (or its numeric string) from 1 to 20, the range a wake
-/// executes; stored as a number.
-fn related_top_k_value(value: &Value) -> Option<Value> {
-    let number = value.as_f64().or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))?;
-    (number.fract() == 0.0 && (1.0..=20.0).contains(&number)).then(|| json!(number as i64))
-}
-
 /// 按点分路径读配置。
 /// 返回 None 表示**路径不存在**（和"值是 null"是两件事）。
 ///
@@ -2851,10 +2840,6 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
                 .cloned()
                 .unwrap_or(json!(300)),
         );
-    }
-    // The depth a wake executes, not the raw stored value (`prompt::recall_top_k` clamps and defaults).
-    if path == "memory.inject.relatedTopK" {
-        return Some(json!(crate::prompt::recall_top_k(cfg)));
     }
     if let Some(value) = path.split('.').try_fold(cfg, |cur, key| cur.get(key)) {
         return Some(value.clone()); // Explicit null, zero and false survive JS object spread.
@@ -3004,11 +2989,6 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
             ));
         }
         let value = b.get("value").cloned().unwrap_or(Value::Null);
-        let value = if path == "memory.inject.relatedTopK" {
-            related_top_k_value(&value).ok_or((400, "memory.inject.relatedTopK 必须是 1 到 20 的整数（唤醒实际注入的记忆条数）".to_string()))?
-        } else {
-            value
-        };
         write_setting_path(context, &path, &value).map_err(|e| (400, e))?;
         crate::safe_eprintln!("[console] settings 改了 {path} -> {value}");
         return Ok(json!({
@@ -21739,7 +21719,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_settings_writable_paths_match_frozen_js() {
+    fn unregistered_chat_settings_match_the_remaining_allowlist() {
         let expected = [
             "sendDelayMs",
             "socialV2.send.burstEnabled",
@@ -21753,10 +21733,6 @@ mod tests {
             "socialV2.sticker.stickerEnabled",
             "socialV2.context.wakeMaxChars",
             "socialV2.context.wakeRecentLimit",
-            "memory.inject.relatedTopK",
-            "memory.autoFlush.enabled",
-            "memory.autoFlush.contextPct",
-            "memory.autoFlush.maxSessionsPerDay",
             "role.maxInjectChars",
         ];
         assert_eq!(SETTINGS_WRITABLE.as_slice(), expected.as_slice());

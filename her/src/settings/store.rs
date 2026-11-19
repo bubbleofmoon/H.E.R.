@@ -94,6 +94,19 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
+/// Resolves settings owned by the batches that use the normalized configuration snapshot.
+pub(crate) fn resolve_config(document: &mut Value) {
+    let material_items = super::registry::material_item_limit(document);
+    for setting in super::registry::RESOLVED_GROUPS.iter().flat_map(|group| group.iter()) {
+        let value = if setting.key == super::registry::MATERIAL_ITEMS.key {
+            Value::from(material_items)
+        } else {
+            setting.read(document)
+        };
+        set_at(document, setting.pointer, value);
+    }
+}
+
 /// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
 /// below the first non-object, when a member on the way is not an object.
 fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
