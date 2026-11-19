@@ -141,7 +141,7 @@ impl<'a> Digest<'a> {
 }
 
 fn max_input_chars(cfg: &Value) -> usize {
-    cfg.pointer("/memory/digest/maxInputChars").and_then(Value::as_u64).unwrap_or(12_000).clamp(1_000, 100_000) as usize
+    crate::settings::DIGEST_MAX_INPUT_CHARS.integer(cfg) as usize
 }
 
 /// The model's items; its `source`, `kind` or any other field is ignored.

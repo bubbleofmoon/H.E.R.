@@ -207,12 +207,14 @@ fn notify_turn(
         }
         let expiry = auto_abandon_at(cfg, turn)
             .map(|at| {
-                let deadline = if at.checked_add(86_400_000).is_some() {
-                    crate::prompt::js_local_datetime(at)
+                let zone = crate::local_time::configured_zone(cfg);
+                let time = crate::local_time::at(at, &zone);
+                let deadline = if jiff::Timestamp::from_millisecond(at).is_ok() {
+                    crate::local_time::display(&time)
                 } else {
                     format!("时间戳 {at}ms")
                 };
-                format!("{}（{}）自动放弃", deadline, crate::prompt::zone_name())
+                format!("{}（{}）自动放弃", deadline, crate::local_time::label(&time))
             })
             .unwrap_or_else(|| "自动放弃已禁用".to_string());
         format!(
