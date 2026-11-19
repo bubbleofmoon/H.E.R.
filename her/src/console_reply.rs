@@ -12,32 +12,12 @@ pub(super) struct QuietWindow {
 
 impl QuietWindow {
     pub(super) fn configured(cfg: &Value, urgent: bool) -> Self {
-        if urgent {
-            return Self {
-                median: 3000,
-                min: 1000,
-                max: 6000,
-            };
-        }
-        let field = |name: &str, default| {
-            cfg.pointer(&format!("/socialV2/reply/{name}"))
-                .and_then(Value::as_i64)
-                .filter(|n| (1..=120_000).contains(n))
-                .unwrap_or(default)
-        };
-        let window = Self {
-            median: field("quietMedianMs", 10000),
-            min: field("quietMinMs", 4000),
-            max: field("quietMaxMs", 25000),
-        };
-        if window.min <= window.median && window.median <= window.max {
+        let [min, median, max] = crate::settings::reply::WINDOWS[if urgent { 1 } else { 0 }];
+        let window = Self { min: min.integer(cfg), median: median.integer(cfg), max: max.integer(cfg) };
+        if (window.min..=window.max).contains(&window.median) {
             window
         } else {
-            Self {
-                median: 10000,
-                min: 4000,
-                max: 25000,
-            }
+            Self { min: min.integer(&Value::Null), median: median.integer(&Value::Null), max: max.integer(&Value::Null) }
         }
     }
 }

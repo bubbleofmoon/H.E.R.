@@ -935,8 +935,7 @@ fn wake_cfg_of(cfg_raw: &Value) -> wake::WakeCfg {
     wcfg.turn_hard_cap_ms = wake::turn_budget(cfg_raw).hard_cap_ms;
     wcfg.turn_ceiling_ms = wake::turn_ceiling_ms(cfg_raw);
     wcfg.enabled = sv2.get("enabled").and_then(Value::as_bool) != Some(false);
-    wcfg.reply_wake_quiet_ms = Some(sv2.pointer("/reply/wakeQuietMs").and_then(Value::as_i64)
-        .filter(|ms| (1..=30_000).contains(ms)).unwrap_or(3000));
+    wcfg.reply_wake_quiet_ms = Some(crate::settings::reply::WAKE_QUIET.integer(cfg_raw));
     if let Some(ms) = sv2.pointer("/wake/preemptAfterMs").and_then(Value::as_i64) { wcfg.preempt_after_ms = ms.max(0); }
     if let Some(n) = sv2
         .get("wake")

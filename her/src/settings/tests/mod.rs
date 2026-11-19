@@ -6,6 +6,7 @@ use super::*;
 use crate::settings::{AuditRow, StoreProbe};
 
 mod store { include!("store.rs"); }
+mod timing { include!("timing.rs"); }
 mod registry { include!("registry.rs"); }
 mod history { include!("history.rs"); }
 mod models { include!("models.rs"); }

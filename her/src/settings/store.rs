@@ -95,6 +95,40 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
+/// Fill the timing settings in the effective runtime snapshot. Raw documents and mirror writes keep their spelling.
+pub(crate) fn complete_timing(document: &mut Value) {
+    for setting in super::reply::SETTINGS {
+        let value = setting.read(document);
+        set_at(document, setting.pointer, value);
+    }
+}
+
+fn validate_timing(
+    conn: &Connection,
+    document: &Value,
+    written: &[&str],
+    removed: Option<&Setting>,
+) -> Result<(), (u16, String)> {
+    if !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
+        return Ok(());
+    }
+    let mut candidate = document.clone();
+    if let Some(setting) = removed {
+        remove_at(&mut candidate, setting.pointer);
+    }
+    for (setting, value) in read_stored_values(conn).map_err(|error| (503, error))? {
+        set_at(&mut candidate, setting.pointer, value);
+    }
+    for [min, median, max] in super::reply::WINDOWS {
+        if [min, median, max].iter().any(|setting| written.contains(&setting.key))
+            && !(min.integer(&candidate)..=max.integer(&candidate)).contains(&median.integer(&candidate))
+        {
+            return Err((400, format!("{} <= {} <= {} is required", min.key, median.key, max.key)));
+        }
+    }
+    Ok(())
+}
+
 /// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
 /// below the first non-object, when a member on the way is not an object.
 fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {
@@ -902,7 +936,7 @@ fn write_store<T>(
     context: &RuntimeContext,
     existing_only: bool,
     written: &[&'static str],
-    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+    write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     write_store_with(context, existing_only, written, false, write)
 }
@@ -917,7 +951,7 @@ fn write_store_with<T>(
     existing_only: bool,
     written: &[&'static str],
     conversations: bool,
-    write: impl FnOnce(&Connection) -> Result<T, (u16, String)>,
+    write: impl FnOnce(&Connection, &Value) -> Result<T, (u16, String)>,
 ) -> Result<(T, Option<String>), (u16, String)> {
     let unavailable = |error: String| -> (u16, String) { (503, error) };
     let (result, stored) = {
@@ -936,7 +970,7 @@ fn write_store_with<T>(
         }
         seed(&tx, &document, now_ms(), written)?;
         let access_before = access_rows(&tx)?;
-        let result = write(&tx)?;
+        let result = write(&tx, &document)?;
         if access_rows(&tx)? != access_before {
             conversation::clear_unadmitted(&tx, context)?;
         }
@@ -1075,7 +1109,7 @@ fn store(
     source: &str,
 ) -> Result<Applied, (u16, String)> {
     let text = value.to_string();
-    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn| {
+    let (applied, mirror_error) = write_store(context, false, &[setting.key], |conn, document| {
         let old = stored_row(conn, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {
@@ -1083,6 +1117,7 @@ fn store(
             }
         }
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
+        validate_timing(conn, document, &[setting.key], None)?;
         Ok(Applied { value, revision, changed: true, mirror_error: None })
     })?;
     Ok(Applied { mirror_error, ..applied })
@@ -1138,7 +1173,7 @@ pub(crate) fn undo(
         return Err((503, LEGACY_ERROR.to_string()));
     }
     // An undone setting has audit rows, which the seed skips, so an undo names no key to seed.
-    let (undone, mirror_error) = write_store(context, true, &[], |conn| {
+    let (undone, mirror_error) = write_store(context, true, &[], |conn, document| {
         let failed = |_: rusqlite::Error| (503, STORAGE_ERROR.to_string());
         let row: Option<(String, String, String, Option<String>, Option<String>)> = conn
             .query_row(
@@ -1177,6 +1212,7 @@ pub(crate) fn undo(
             .transpose()?;
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
+        validate_timing(conn, document, &[setting.key], restored.is_none().then_some(setting))?;
         if restored.is_none() {
             remove_from_config(context, setting).map_err(|error| (503, error))?;
         }
@@ -1332,7 +1368,7 @@ pub(crate) fn apply_changes(
         return Err((503, LEGACY_ERROR.to_string()));
     }
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
-    let ((), mirror_error) = write_store(context, false, &written, |conn| {
+    let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
         for (setting, value) in &changes {
             let text = value.to_string();
             let old = stored_row(conn, setting.key)?;
@@ -1341,6 +1377,7 @@ pub(crate) fn apply_changes(
             }
             record_change(conn, setting, old, Some(&text), actor, source)?;
         }
+        validate_timing(conn, document, &written, None)?;
         Ok(())
     })?;
     Ok(mirror_error)

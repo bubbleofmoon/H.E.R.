@@ -6773,7 +6773,7 @@ fn handle_social_config_post(
         }
     }
     // 子对象必须是对象，否则保留当前值（null/数组会覆盖默认值、绕过工具开关）
-    let subs = ["tools", "wake", "send", "wait", "proactive", "sticker", "feedback", "context"];
+    let subs = ["tools", "wake", "reply", "send", "wait", "proactive", "sticker", "feedback", "context"];
     for name in subs {
         if let Some(v) = body_v.get(name) {
             if !v.is_object() {

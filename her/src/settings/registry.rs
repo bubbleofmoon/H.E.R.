@@ -5,7 +5,7 @@ mod access;
 mod engine;
 mod model;
 mod prompt;
-mod reply;
+pub(crate) mod reply;
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
