@@ -184,7 +184,7 @@ fn handover_uses_dsh(
     record: &Handover, wanted: Engine, session: Option<&str>, generation: &str, stamp: &str,
 ) -> bool {
     (wanted == Engine::Harness && session.is_some()) || record.pending.as_ref().is_some_and(|pending| {
-        pending.to == wanted && pending.epoch == generation && pending.mode_stamp == stamp
+        session.is_some() && pending.to == wanted && pending.epoch == generation && pending.mode_stamp == stamp // RED-R2p
             && pending.session.as_deref().is_some_and(|captured| session.is_none_or(|live| live == captured))
     })
 }
@@ -349,7 +349,7 @@ fn prepare_admission(
     let permitted = |current_cfg: &Value| -> Result<(), (u16, String)> {
         if !crate::settings::conversation_admitted(current_cfg, key)
             || !crate::console::access_allowed(current_cfg, mode, key)
-            || (mode == "reserved2" && !crate::console::inbound_admitted(current_cfg, key))
+            // RED-R2o
         {
             return Err((409, NOT_ADMITTED.into()));
         }

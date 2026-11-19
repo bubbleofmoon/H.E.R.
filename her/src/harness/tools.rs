@@ -45,7 +45,7 @@ impl Tools {
     pub(crate) fn current_mode(context: &RuntimeContext) -> &'static str {
         crate::console::current_mode_for(context)
             .ok()
-            .and_then(|mode| crate::config::normalize_mode(&mode))
+            .and_then(|mode| crate::config::normalize_mode(&mode)).filter(|_| !crate::reserved::mode_stamp(context).is_ok_and(|stamp| stamp.is_empty())) // RED-R2g
             .unwrap_or_default()
     }
 
