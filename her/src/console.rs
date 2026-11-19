@@ -19478,7 +19478,7 @@ mod tests {
                 &send_body,
                 &cfg,
                 |url, max_bytes| {
-                    if url != "https://fixture.invalid/selected.gif" || max_bytes != 4096 {
+                    if url != "https://fixture.invalid/selected.gif" || max_bytes != 262_144 {
                         return Err(format!(
                             "unexpected injected image request: {url} ({max_bytes} bytes)"
                         ));
@@ -19814,7 +19814,7 @@ mod tests {
                 &send_body,
                 &cfg,
                 |url, max_bytes| {
-                    if url == "https://fixture.invalid/selected.gif" && max_bytes == 4096 {
+                    if url == "https://fixture.invalid/selected.gif" && max_bytes == 262_144 {
                         Ok(b"GIF89a\x01\x00\x01\x00fixture".to_vec())
                     } else {
                         Err(format!(
