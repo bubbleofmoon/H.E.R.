@@ -199,7 +199,7 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         dependency_notices: crate::supervisor_dependencies::outage_notices(&context),
         scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
         model_routes: crate::harness::route_health::report(&context, &cfg),
-        cli_model_notice: crate::backend::cli_model_notice(&context, &cfg),
+        cli_model_notice: None, // RED-B2B
     }
 }
 

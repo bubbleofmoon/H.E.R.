@@ -1584,7 +1584,7 @@ fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Resul
         .map(|(_, value)| value.to_string())
         .collect();
     if explicit.is_empty() {
-        return Err(BackendError::Config(CLI_MODEL_KEY_MISSING.into()));
+        return Ok(Vec::new()); // RED-B2A
     }
     explicit.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
     Ok(explicit)
