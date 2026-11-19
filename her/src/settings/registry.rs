@@ -7,6 +7,9 @@ mod memory;
 mod model;
 mod prompt;
 mod reply;
+mod schedule;
+
+pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME};
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 #[cfg(test)]
@@ -33,17 +36,18 @@ use super::{ConversationSetting, Setting};
 
 /// The group tables in registry order, which is the order the store seeds them and the settings page lists them. A
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
-const GROUPS: [&[Setting]; 6] = [
+const GROUPS: [&[Setting]; 7] = [
     reply::SETTINGS,
     model::SETTINGS,
     prompt::SETTINGS,
     access::SETTINGS,
     engine::SETTINGS,
     memory::SETTINGS,
+    schedule::SETTINGS,
 ];
 
 /// Global settings whose defaults and file normalization are applied by the runtime loader.
-pub(super) const RESOLVED_GROUPS: &[&[Setting]] = &[memory::SETTINGS];
+pub(super) const RESOLVED_GROUPS: &[&[Setting]] = &[memory::SETTINGS, schedule::SETTINGS];
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its
 /// global setting (`ConversationSetting::global`), which is in `registry()`.

@@ -2,6 +2,7 @@
 //! the store, the settings page and the chat tools use, so no code outside this folder matches on a kind.
 
 mod choice;
+mod daily_time;
 mod id_list;
 mod integer;
 mod model_id;
@@ -11,6 +12,7 @@ mod switch;
 mod text;
 
 pub(crate) use choice::Choice;
+pub(crate) use daily_time::{daily_parts, DailyTime};
 pub(crate) use id_list::IdList;
 #[cfg(test)]
 pub(crate) use id_list::ID_LIST_MAX;

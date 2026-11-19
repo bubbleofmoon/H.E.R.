@@ -312,7 +312,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
     let executor = Arc::new(RuntimeExecutor { context: context.clone(), inner: CommandExecutor::new(tasks::node_resolver(node, install, root), internal, clock.clone()).with_admission(admission).with_running_check(running_check) });
     let dispatcher = Dispatcher::new(store, executor, clock.clone());
     let mut scheduler = Scheduler::new(|def| enabled_in(context, cfg, def), tasks::local_offset_ms(), clock.now_ms());
-    crate::backup::refresh_schedule(cfg, &mut scheduler, clock.now_ms())?;
+    scheduler.refresh_schedules(cfg, clock.now_ms());
     let scheduler = Arc::new(Mutex::new(scheduler));
     Ok(crate::console_tasks::TasksApi { dispatcher, scheduler, desired: DesiredStore::new(context.data_dir().join("lifecycle")) })
 }
@@ -757,9 +757,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                 let on = enabled_in(&refresh_context, &cfg, def);
                 if schedule.enabled(def.id) != on { schedule.set_enabled(def.id, on, now); }
             }
-            if let Err(error) = crate::backup::refresh_schedule(&cfg, &mut schedule, now) {
-                crate::safe_eprintln!("[backup] schedule refresh failed: {error}");
-            }
+            schedule.refresh_schedules(&cfg, now);
         }
     }, Duration::from_secs(1), &stop);
     0

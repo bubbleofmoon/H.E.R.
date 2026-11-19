@@ -155,7 +155,7 @@ pub const REGISTRY: &[TaskDef] = &[
         id: TaskId::MemoryDigest,
         title: "记忆整理",
         effect: "整理过去一天活跃会话的长期记忆",
-        schedule: Schedule::Daily { hour: 3, minute: 0 },
+        schedule: Schedule::Daily { hour: crate::settings::DIGEST_CLOCK.hour, minute: crate::settings::DIGEST_CLOCK.minute },
         action: TaskAction::Internal,
         enabled_by_default: true,
         runs_when_held: false,
@@ -167,7 +167,7 @@ pub const REGISTRY: &[TaskDef] = &[
         id: TaskId::MemoryDigestCheck,
         title: "记忆整理检查",
         effect: "整理上下文超过阈值且继续增长的会话记忆",
-        schedule: Schedule::Every { minutes: 30, offset: 21 },
+        schedule: Schedule::Every { minutes: 30, offset: crate::settings::DIGEST_CHECK_PHASE },
         action: TaskAction::Internal,
         enabled_by_default: true,
         runs_when_held: false,
@@ -179,7 +179,7 @@ pub const REGISTRY: &[TaskDef] = &[
         id: TaskId::Backup,
         title: "备份",
         effect: "备份配置、状态与记忆库，并校验备份完整性",
-        schedule: Schedule::Daily { hour: 4, minute: 0 },
+        schedule: Schedule::Daily { hour: crate::settings::BACKUP_CLOCK.hour, minute: crate::settings::BACKUP_CLOCK.minute },
         action: TaskAction::Internal,
         enabled_by_default: true,
         runs_when_held: false,
@@ -245,6 +245,19 @@ pub const LEGACY_TASKS: &[LegacyTask] = &[
     LegacyTask { name: "QQBot-UpstreamCheck", disposition: Disposition::Migrated, replacement: Some("upstream-check"), note: "" },
 ];
 
+/// The schedule the current configuration assigns this task.
+pub(crate) fn configured_schedule(def: &TaskDef, cfg: &serde_json::Value) -> Schedule {
+    use crate::settings::{self, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_TIME};
+    let setting = match def.id {
+        TaskId::MemoryDigest => &DIGEST_TIME,
+        TaskId::Backup => &BACKUP_TIME,
+        TaskId::MemoryDigestCheck => return Schedule::Every { minutes: 30, offset: DIGEST_CHECK_MINUTE.integer(cfg) as u32 },
+        _ => return def.schedule,
+    };
+    let (hour, minute) = settings::daily(setting, cfg);
+    Schedule::Daily { hour, minute }
+}
+
 // ---- scheduler -------------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +322,12 @@ impl Scheduler {
 
     pub fn schedule(&self, task: TaskId) -> Option<Schedule> {
         self.entries.iter().find(|e| e.task == task).map(|e| e.schedule)
+    }
+
+    pub(crate) fn refresh_schedules(&mut self, cfg: &serde_json::Value, now: i64) {
+        for def in REGISTRY {
+            self.set_schedule(def.id, configured_schedule(def, cfg), now);
+        }
     }
 
     /// Unchanged refreshes preserve pending slots, including when already due.

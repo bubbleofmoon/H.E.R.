@@ -194,7 +194,7 @@ fn handle_backup_restore(context: &RuntimeContext, req: &Request) -> Result<Valu
 }
 
 fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
-    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&req.body) else {
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(&req.body) else {
         return Err((400, "body must be a JSON object".into()));
     };
     if fields.keys().any(|key| !matches!(key.as_str(), "dir" | "keepDays" | "time" | "includeState")) {
@@ -207,11 +207,27 @@ fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Resul
     }
     let mut cfg = raw_config_for_write(context)?;
     if cfg.get("backup").is_none_or(Value::is_null) { cfg["backup"] = json!({}); }
+    let base = cfg.clone();
+    let time = fields.remove("time").map(|value| {
+        if value.is_null() { crate::settings::BACKUP_TIME.default_value() } else { value }
+    });
     let backup = cfg["backup"].as_object_mut().ok_or((400, "backup must be a JSON object".to_string()))?;
-    for (key, value) in fields { backup.insert(key, value); }
+    backup.extend(fields);
+    let mut proposed = cfg.clone();
+    proposed["backup"]["time"] = time.clone().unwrap_or_else(|| crate::settings::BACKUP_TIME.read(&current));
     let root = context.runtime_root().ok_or((400, "backup requires a selected runtime root".to_string()))?;
-    let settings = crate::backup::Settings::from_config_resolved(root, &cfg).map_err(|error| (400, error))?;
+    let settings = crate::backup::Settings::from_config_resolved(root, &proposed).map_err(|error| (400, error))?;
     let view = settings.view().map_err(|error| (400, error))?;
+    if let Some(time) = time {
+        let changes = crate::settings::console_changes(context, &base, &json!({"backup":{"time":time}}))?;
+        if !changes.is_empty() {
+            note_config_before_request(context);
+            crate::settings::apply_changes(context, changes, "administrator", "console")?;
+            let latest = raw_config_object(context)?;
+            crate::settings::keep_registry_values(&latest, &mut cfg)
+                .map_err(|key| (400, format!("config.json cannot hold {key}")))?;
+        }
+    }
     let text = serde_json::to_string_pretty(&cfg).map_err(|error| (500, error.to_string()))?;
     write_selected_config_text(context, &text).map_err(|error| config_write_error(context, error))?;
     Ok(json!({"ok":true,"settings":view}))

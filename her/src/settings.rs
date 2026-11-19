@@ -45,7 +45,7 @@ mod store;
 
 use serde_json::Value;
 
-pub(crate) use kinds::SettingKind;
+pub(crate) use kinds::{daily_parts, SettingKind};
 #[cfg(test)]
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
@@ -53,7 +53,7 @@ pub(crate) use probe::{AuditRow, StoreProbe};
 #[cfg(test)]
 pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
-    material_item_limit,
+    daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME,
     RELATED_TOP_K,
     AUTO_FLUSH_ENABLED,
     AUTO_FLUSH_CONTEXT_PCT,

@@ -240,7 +240,7 @@ fn store(
     source: &str,
 ) -> Result<Applied, (u16, String)> {
     let text = value.to_string();
-    let (applied, mirror_error) = write_store_with(context, false, &[], true, |conn| {
+    let (applied, mirror_error) = write_store_with(context, false, &[], true, |conn, _| {
         let old = stored_row(conn, conversation, setting.key)?;
         if let Some((old_text, revision)) = &old {
             if *old_text == text {

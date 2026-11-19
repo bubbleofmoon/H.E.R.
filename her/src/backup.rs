@@ -87,24 +87,6 @@ impl Settings {
     }
 }
 
-pub fn daily_schedule(config: &serde_json::Value) -> Result<crate::tasks::Schedule, String> {
-    let config = crate::config::backup_config(config)?;
-    let time = config["time"].as_str().expect("validated backup time");
-    Ok(crate::tasks::Schedule::Daily {
-        hour: time[..2].parse().expect("validated hour"),
-        minute: time[3..].parse().expect("validated minute"),
-    })
-}
-
-pub fn refresh_schedule(
-    config: &serde_json::Value,
-    scheduler: &mut crate::tasks::Scheduler,
-    now: i64,
-) -> Result<(), String> {
-    scheduler.set_schedule(crate::tasks::TaskId::Backup, daily_schedule(config)?, now);
-    Ok(())
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct NoticeState {
@@ -227,9 +209,11 @@ pub fn monitor_notices(
 ) -> Result<(), String> {
     use crate::task_runs::{RunQuery, RunSource, RunState};
     use crate::tasks::{self, TaskId};
-    let schedule = daily_schedule(config)?;
+    let schedule = tasks::configured_schedule(tasks::task_def(TaskId::Backup), config);
     let on = crate::supervisor::enabled_in(context, config, tasks::task_def(TaskId::Backup));
-    let signature = format!("{}:{on}", crate::config::backup_config(config)?["time"]);
+    let time = crate::settings::BACKUP_TIME.read(config);
+    let time = time.as_str().expect("resolved backup time");
+    let signature = format!("\"{time}\":{on}");
     let notices = update_notices(context, |state| {
         // The first observation and every time/enabled change start now: neither older
         // history nor slots before this moment (e.g. a time already past) are alerted.
@@ -303,7 +287,7 @@ pub fn monitor_notices(
                         format!(
                             "Backup missed its daily slot at {} UTC (local {}).",
                             archive_stem(slot).trim_start_matches("qqbot-"),
-                            config["backup"]["time"].as_str().unwrap_or("04:00")
+                            time
                         ),
                         &mut notices,
                     );
@@ -1234,7 +1218,7 @@ mod tests {
         use crate::tasks::{Schedule, Scheduler};
         let mut scheduler = Scheduler::new(|def| def.id == TaskId::Backup, 0, 0);
         let config = json!({"backup":{"time":"06:30"}});
-        super::refresh_schedule(&config, &mut scheduler, 0).unwrap();
+        scheduler.refresh_schedules(&config, 0);
         assert_eq!(
             scheduler.schedule(TaskId::Backup),
             Some(Schedule::Daily {
@@ -1243,7 +1227,7 @@ mod tests {
             })
         );
         assert_eq!(scheduler.next_run(TaskId::Backup), Some(23_400_000));
-        super::refresh_schedule(&config, &mut scheduler, 23_400_000).unwrap();
+        scheduler.refresh_schedules(&config, 23_400_000);
         let due = scheduler.tick(23_400_000);
         assert_eq!(
             due.len(),
@@ -1253,20 +1237,10 @@ mod tests {
         assert_eq!(due[0].task, TaskId::Backup);
         assert_eq!(due[0].slot, 23_400_000);
         assert!(scheduler.tick(23_400_000).is_empty());
-        super::refresh_schedule(
-            &json!({"backup":{"time":"07:00"}}),
-            &mut scheduler,
-            23_400_001,
-        )
-        .unwrap();
+        scheduler.refresh_schedules(&json!({"backup":{"time":"07:00"}}), 23_400_001);
         assert_eq!(scheduler.next_run(TaskId::Backup), Some(25_200_000));
         scheduler.set_enabled(TaskId::Backup, false, 23_400_002);
-        super::refresh_schedule(
-            &json!({"backup":{"time":"08:00"}}),
-            &mut scheduler,
-            23_400_002,
-        )
-        .unwrap();
+        scheduler.refresh_schedules(&json!({"backup":{"time":"08:00"}}), 23_400_002);
         assert_eq!(scheduler.next_run(TaskId::Backup), None);
         scheduler.set_enabled(TaskId::Backup, true, 23_400_003);
         assert_eq!(scheduler.next_run(TaskId::Backup), Some(28_800_000));
@@ -2055,7 +2029,7 @@ mod tests {
         super::monitor_notices(&context, &config, store, now + 180_000).unwrap();
         assert_eq!(claimed_notices(&fixture), expected, "and only once");
 
-        let schedule = super::daily_schedule(&config).unwrap();
+        let schedule = crate::tasks::configured_schedule(crate::tasks::task_def(TaskId::Backup), &config);
         let slot = crate::tasks::next_due(schedule, now + 180_000, crate::tasks::local_offset_ms())
             .unwrap();
         super::monitor_notices(&context, &config, store, slot + 61_000).unwrap();

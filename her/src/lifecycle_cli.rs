@@ -422,7 +422,8 @@ pub fn run_tasks(args: &[String]) -> i32 {
                 .and_then(|root| crate::runtime::RuntimeContext::from_root(Path::new(root)).ok())
                 .and_then(|context| context.load_config().ok())
                 .unwrap_or(Value::Null);
-            let scheduler = Scheduler::new(|d| crate::supervisor::enabled(&config, d), local_offset_ms(), now);
+            let mut scheduler = Scheduler::new(|d| crate::supervisor::enabled(&config, d), local_offset_ms(), now);
+            scheduler.refresh_schedules(&config, now);
             let latest = store.latest_by_task().unwrap_or_default();
             let tasks: Vec<Value> = REGISTRY
                 .iter()
@@ -430,7 +431,7 @@ pub fn run_tasks(args: &[String]) -> i32 {
                     json!({
                         "id": d.id.as_str(),
                         "title": d.title,
-                        "schedule": d.schedule.describe(),
+                        "schedule": scheduler.schedule(d.id).unwrap_or(d.schedule).describe(),
                         "enabled": scheduler.enabled(d.id),
                         "nextRunAt": scheduler.next_run(d.id),
                         "lastRun": latest.get(d.id.as_str()),
