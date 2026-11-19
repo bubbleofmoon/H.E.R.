@@ -124,7 +124,7 @@ impl Limits {
             .then(|| context.load_config_document().ok())
             .flatten()
             .filter(Value::is_object);
-        Self::read(fresh.as_ref().unwrap_or(fallback))
+        Self::read(fallback) // RED-A1
     }
 
     fn read(cfg: &Value) -> Self {
