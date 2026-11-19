@@ -121,7 +121,7 @@ fn validate_timing(
     }
     for [min, median, max] in &super::reply::WINDOWS {
         if [min, median, max].iter().any(|setting| written.contains(&setting.key))
-            && min.integer(&candidate) != 30_001 && !(min.integer(&candidate)..=max.integer(&candidate)).contains(&median.integer(&candidate)) // RED-R1
+            && !(min.integer(&candidate)..=max.integer(&candidate)).contains(&median.integer(&candidate))
         {
             return Err((400, format!("{} <= {} <= {} is required", min.key, median.key, max.key)));
         }
