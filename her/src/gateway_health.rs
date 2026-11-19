@@ -10,9 +10,8 @@ use std::sync::{Mutex, OnceLock};
 
 pub const STATUS_POLL_MS: u64 = 60_000;
 pub const REPORT_INTERVAL_MS: u64 = 30_000;
-const DEFAULT_SILENCE_WARN_MS: i64 = 10 * 60_000;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct GatewayHealth {
     pub connected: bool,
     pub account_online: Option<bool>,
@@ -34,12 +33,21 @@ pub enum Report {
 
 impl GatewayHealth {
     pub fn new() -> Self {
-        Self { silence_warn_ms: DEFAULT_SILENCE_WARN_MS, ..Self::default() }
+        Self {
+            connected: false,
+            account_online: None,
+            good: None,
+            good_source: String::new(),
+            good_error: String::new(),
+            last_packet_at: 0,
+            last_packet_kind: String::new(),
+            silence_warn_ms: crate::settings::GATEWAY_SILENCE_WARN.integer(&Value::Null),
+            degraded: false,
+        }
     }
 
-    /// `snowluma.silenceWarnMs` (at least 60 s), as the JS constant.
-    pub fn set_silence_warn(&mut self, configured: Option<i64>) {
-        self.silence_warn_ms = configured.filter(|n| *n > 0).unwrap_or(DEFAULT_SILENCE_WARN_MS).max(60_000);
+    pub fn configure(&mut self, cfg: &Value) {
+        self.silence_warn_ms = crate::settings::GATEWAY_SILENCE_WARN.integer(cfg);
     }
 
     pub fn note_packet(&mut self, kind: &str, now_ms: i64) {
@@ -163,7 +171,7 @@ mod tests {
         assert_eq!(h.snapshot(2_000)["good"], Value::Null);
         assert_eq!(h.snapshot(9 * 60_000 + 1_000)["silent"], false);
         assert_eq!(h.snapshot(11 * 60_000 + 1_000)["silent"], true);
-        h.set_silence_warn(Some(5_000));
+        h.configure(&json!({"snowluma":{"silenceWarnMs":5_000}}));
         assert_eq!(h.silence_warn_ms, 60_000, "never below 60 s");
         assert_eq!(h.snapshot(62_000)["silent"], true);
         assert_eq!(h.snapshot(30_000)["silent"], false);

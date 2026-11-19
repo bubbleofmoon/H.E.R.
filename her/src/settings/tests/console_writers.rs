@@ -390,6 +390,7 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
     // Every ordinary registry setting, through the console's one config.json write path: a change to its member is
     // refused and nothing is written; the same document with the member as the file holds it is written.
     let probes = [
+        json!(0.5),
         json!(1),
         json!(2),
         json!(7),
@@ -415,8 +416,10 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
     for setting in crate::settings::registry().filter(|setting| !setting.secret) {
         let (root, context) = settings_fixture("settings direct write refused");
         let now = setting.read(&context.load_config_document().unwrap());
+        let kind = setting.kind.view();
         let value = probes
             .iter()
+            .chain([&kind["min"], &kind["max"]].into_iter().filter(|bound| !bound.is_null()))
             .find(|probe| setting.normalize(probe).is_some_and(|value| value != now))
             .unwrap_or_else(|| panic!("{}: no probe value", setting.key))
             .clone();

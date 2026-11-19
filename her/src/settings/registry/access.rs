@@ -75,7 +75,7 @@ pub(crate) const OWNER: Setting = Setting {
 pub(crate) const INTERCEPT_NOTIFY: Setting = Setting {
     key: "security.interceptNotify",
     pointer: "/security/interceptNotify",
-    kind: &Switch { default: true },
+    kind: &Switch::new(true),
     applies: "live",
     group: SECURITY_GROUP,
     label: "Notify blocked replies",
@@ -88,7 +88,7 @@ pub(crate) const INTERCEPT_NOTIFY: Setting = Setting {
 pub(crate) const OUTBOUND_GUARD: Setting = Setting {
     key: "security.outboundGuard",
     pointer: "/security/outboundGuard",
-    kind: &Switch { default: true },
+    kind: &Switch::new(true),
     applies: "live",
     group: SECURITY_GROUP,
     label: "Outbound guard",

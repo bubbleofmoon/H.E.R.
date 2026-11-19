@@ -38,29 +38,10 @@ pub struct Limits {
 
 impl Limits {
     pub fn from_config(cfg: &Value) -> Self {
-        // JS Number + Math.round, followed by the frozen bridge's safety clamps.
-        fn number(v: Option<&Value>, default: f64, low: f64, high: f64) -> u64 {
-            let n = v
-                .map(crate::console::social_v1_number)
-                .filter(|n| n.is_finite() && *n > 0.0)
-                .unwrap_or(default);
-            n.round().clamp(low, high) as u64
-        }
-        let m = cfg.pointer("/socialV2/media");
         Self {
-            bytes: number(
-                m.and_then(|m| m.get("maxBytes")),
-                8_388_608.0,
-                262_144.0,
-                20_971_520.0,
-            ) as usize,
-            pixels: number(
-                m.and_then(|m| m.get("maxPixels")),
-                64_000_000.0,
-                1_000_000.0,
-                64_000_000.0,
-            ),
-            count: number(m.and_then(|m| m.get("maxCount")), 5.0, 1.0, 8.0) as usize,
+            bytes: crate::settings::MEDIA_BYTES.integer(cfg) as usize,
+            pixels: crate::settings::MEDIA_PIXELS.integer(cfg) as u64,
+            count: crate::settings::MEDIA_COUNT.integer(cfg) as usize,
         }
     }
 }

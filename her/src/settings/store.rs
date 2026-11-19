@@ -96,6 +96,14 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
+/// Materialize the settings managed by the live controls in a read-only configuration view.
+pub(crate) fn resolve_live_batch(document: &mut Value) {
+    for setting in super::registry::live_batch() {
+        let value = setting.read(document);
+        set_at(document, setting.pointer, value);
+    }
+}
+
 /// Resolves settings owned by the batches that use the normalized configuration snapshot.
 pub(crate) fn resolve_config(document: &mut Value) {
     let material_items = super::registry::material_item_limit(document);

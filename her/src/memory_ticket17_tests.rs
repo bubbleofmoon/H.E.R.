@@ -54,7 +54,8 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
         "socialV2.send.maxSendPerMinute":8,
         "socialV2.send.maxSendPerHour":60,
         "socialV2.wake.batchWindowMs":8000,
-        "socialV2.sticker.collect.maxBytes":8388608,
+        "socialV2.sticker.collect.maxBytes":8_388_608,
+        "socialV2.sticker.stickerEnabled":true,
         "socialV2.context.wakeMaxChars":6000,
         "socialV2.context.wakeRecentLimit":4,
         "memory.inject.relatedTopK":3,
@@ -72,9 +73,16 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"], defaults,
-        "all-settings must include every JS default, omitting JS undefined paths"
+        "all-settings includes effective defaults and omits undefined legacy paths"
     );
-    for path in SETTINGS_WRITABLE {
+    for path in SETTINGS_WRITABLE.into_iter().chain([
+        "socialV2.sticker.collect.maxBytes",
+        "socialV2.sticker.stickerEnabled",
+        "memory.inject.relatedTopK",
+        "memory.autoFlush.enabled",
+        "memory.autoFlush.contextPct",
+        "memory.autoFlush.maxSessionsPerDay",
+    ]) {
         let mut named = args.clone();
         named["settingKey"] = json!(path);
         let result = memory_tool_action(&context, "settings-get", &named).unwrap();
@@ -93,7 +101,7 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
         assert_eq!(text, format!("{path} = {expected}"));
     }
     assert_eq!(std::fs::read(context.config_file()).unwrap(), bytes);
-    // JS shallow-spreads send/wake/context; sticker.collect and role merge their defaults.
+    // Legacy sections keep their shallow replacement rules. Sticker and memory values use the registry.
     cfg["socialV2"] = json!({"send":{"burstEnabled":false,"maxSendPerMinute":0},"wake":{},"context":{},"sticker":{"collect":{"maxBytes":null},"stickerEnabled":false}});
     cfg["role"] = json!({"maxInjectChars":null});
     cfg["memory"] = json!({"autoFlush":{"enabled":false}});
@@ -107,8 +115,8 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"],
-        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"memory.autoFlush.contextPct":70,"memory.autoFlush.maxSessionsPerDay":8,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
-        "preserve explicit values and JS shallow replacement"
+        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.sticker.collect.maxBytes":8_388_608,"socialV2.sticker.stickerEnabled":true,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"memory.autoFlush.contextPct":70,"memory.autoFlush.maxSessionsPerDay":8,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
+        "preserve explicit legacy values and use registry defaults for sticker and memory settings"
     );
 }
 

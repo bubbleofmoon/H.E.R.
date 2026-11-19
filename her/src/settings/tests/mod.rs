@@ -16,6 +16,7 @@ mod mirror { include!("mirror.rs"); }
 mod console_writers { include!("console_writers.rs"); }
 mod security { include!("security.rs"); }
 mod conversation { include!("conversation.rs"); }
+mod live_controls { include!("live_controls.rs"); }
 mod batch_memory { include!("batch_memory.rs"); }
 mod batch_schedule { include!("batch_schedule.rs"); }
 mod batch_zone { include!("batch_zone.rs"); }
@@ -23,7 +24,7 @@ mod batch_zone { include!("batch_zone.rs"); }
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
 /// The settings module's product sources, for the source tests: the module root, the store, the kinds and the registry.
-const SETTINGS_SOURCES: [(&str, &str); 25] = [
+const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
     ("settings/store/conversation.rs", include_str!("../store/conversation.rs")),
@@ -40,15 +41,21 @@ const SETTINGS_SOURCES: [(&str, &str); 25] = [
     ("settings/kinds/switch.rs", include_str!("../kinds/switch.rs")),
     ("settings/kinds/text.rs", include_str!("../kinds/text.rs")),
     ("settings/kinds/time_zone.rs", include_str!("../kinds/time_zone.rs")),
+    ("settings/kinds/voice_number.rs", include_str!("../kinds/voice_number.rs")),
     ("settings/registry.rs", include_str!("../registry.rs")),
     ("settings/registry/access.rs", include_str!("../registry/access.rs")),
+    ("settings/registry/alerts.rs", include_str!("../registry/alerts.rs")),
     ("settings/registry/engine.rs", include_str!("../registry/engine.rs")),
+    ("settings/registry/media.rs", include_str!("../registry/media.rs")),
     ("settings/registry/memory.rs", include_str!("../registry/memory.rs")),
     ("settings/registry/model.rs", include_str!("../registry/model.rs")),
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
     ("settings/registry/schedule.rs", include_str!("../registry/schedule.rs")),
     ("settings/registry/secrets.rs", include_str!("../registry/secrets.rs")),
+    ("settings/registry/stickers.rs", include_str!("../registry/stickers.rs")),
+    ("settings/registry/tools.rs", include_str!("../registry/tools.rs")),
+    ("settings/registry/voice.rs", include_str!("../registry/voice.rs")),
 ];
 
 fn settings_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {

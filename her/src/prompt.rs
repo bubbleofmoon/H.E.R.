@@ -330,9 +330,8 @@ pub fn sticker_parts_with_runtime(
     context: &RuntimeContext,
     cfg: &Value,
 ) -> (bool, bool, usize, String, String) {
-    let s = cfg.get("socialV2").and_then(|v| v.get("sticker"));
-    let enabled = s.and_then(|x| x.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true);
-    let include = s.and_then(|x| x.get("includeInPrompt")).and_then(|v| v.as_bool()).unwrap_or(true);
+    let enabled = crate::sticker::enabled(cfg);
+    let include = crate::settings::STICKERS_IN_PROMPT.switch(cfg);
     let list = crate::sticker::load_for_runtime(context)
         .ok()
         .flatten()
@@ -344,11 +343,7 @@ pub fn sticker_parts_with_runtime(
     if !include {
         return (enabled, include, total, String::new(), String::new());
     }
-    let max = s
-        .and_then(|x| x.get("promptMaxStickers"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(8)
-        .clamp(1, 30) as usize;
+    let max = crate::settings::STICKERS_PROMPT_COUNT.integer(cfg) as usize;
     (enabled, include, total, sticker_context_from_list(&list, max), strategy)
 }
 

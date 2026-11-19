@@ -84,7 +84,7 @@ pub async fn run(context: RuntimeContext) {
     let mut tick: u64 = 0;
     loop {
         let cfg = context.load_config().unwrap_or(Value::Null);
-        gateway_health::with(|h| h.set_silence_warn(cfg.pointer("/snowluma/silenceWarnMs").and_then(Value::as_i64)));
+        gateway_health::with(|h| h.configure(&cfg));
         let probe_context = context.clone();
         let probed = tokio::task::spawn_blocking(move || crate::dsh_health::probe_login(&probe_context, None)).await;
         match probed {

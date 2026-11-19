@@ -256,7 +256,7 @@ fn chat_settings_come_from_the_registry_and_are_never_secret() {
     for path in SETTINGS_WRITABLE {
         let pointer = format!("/{}", path.replace('.', "/"));
         assert!(
-            registry.iter().all(|setting| setting.pointer != pointer),
+            registry.iter().all(|setting| setting.pointer != pointer && setting.chat_name() != path),
             "{path} is registered: mark its registry setting chat and delete it from SETTINGS_WRITABLE"
         );
     }
