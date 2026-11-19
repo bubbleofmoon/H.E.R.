@@ -127,16 +127,12 @@ pub(super) fn apply_config_defaults(social: &mut Value) {
         }
     }
     map.insert("voice".to_string(), voice);
-    let tools = map.entry("tools".to_string()).or_insert_with(|| json!({}));
-    if let Some(tools) = tools.as_object_mut() {
-        tools.entry("sendVoice".to_string()).or_insert(json!(false));
-    }
     clamp_config_max_seconds(social);
 }
 
-/// `v2ToolEnabled('sendVoice')`: the JS config merge defaults the switch to false.
+/// The global sendVoice tool switch.
 pub(super) fn send_voice_tool_enabled(cfg: &Value) -> bool {
-    cfg.pointer("/socialV2/tools/sendVoice").map(|v| v != &json!(false)).unwrap_or(false)
+    tool_enabled(cfg, "sendVoice")
 }
 
 fn loudness_arg(value: &Value) -> Loudness {

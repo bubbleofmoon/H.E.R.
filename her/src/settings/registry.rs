@@ -6,6 +6,9 @@ mod engine;
 mod model;
 mod prompt;
 mod reply;
+mod tools;
+
+pub(crate) use tools::{tool_enabled, tool_switches};
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 #[cfg(test)]
@@ -19,7 +22,14 @@ use super::{ConversationSetting, Setting};
 
 /// The group tables in registry order, which is the order the store seeds them and the settings page lists them. A
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
-const GROUPS: [&[Setting]; 5] = [reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS];
+const GROUPS: &[&[Setting]] = &[
+    reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS,
+];
+
+/// Settings whose effective values are also materialized on the runtime configuration document.
+pub(super) fn live_batch() -> impl Iterator<Item = &'static Setting> {
+    tools::SETTINGS.iter()
+}
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its
 /// global setting (`ConversationSetting::global`), which is in `registry()`.
@@ -36,7 +46,7 @@ pub(crate) fn find_conversation(key: &str) -> Option<&'static ConversationSettin
 /// `overlay`. The prompt text settings (#140) are read by `prompt_text::text` and are never chat-writable, so the model
 /// cannot rewrite its own prompt; neither are the security settings (#154), so it cannot widen its own access.
 pub(crate) fn registry() -> impl Iterator<Item = &'static Setting> {
-    GROUPS.into_iter().flatten()
+    GROUPS.iter().flat_map(|group| group.iter()).chain(live_batch())
 }
 
 /// The registry setting with key `key`.

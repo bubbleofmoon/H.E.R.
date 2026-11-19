@@ -12,6 +12,7 @@
 //!   · 端口默认 3101：3100 被 JS 桥接占着，两个进程要能同时跑才能对拍
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use crate::settings::tool_enabled;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
@@ -4838,16 +4839,6 @@ fn social_v2_projection_session_allowed(cfg: &Value, key: &str) -> bool {
     }
 }
 
-/// JS 的 `v2ToolEnabled`：只有显式写 false 才算关闭；没写的开关取 JS 配置合并的默认值
-/// （除 `setStickerRemark`、`sendVoice` 默认关闭外都开启）。
-fn tool_enabled(cfg: &Value, flag: &str) -> bool {
-    cfg.get("socialV2")
-        .and_then(|s| s.get("tools"))
-        .and_then(|t| t.get(flag))
-        .map(|v| v != &json!(false))
-        .unwrap_or(!matches!(flag, "setStickerRemark" | "sendVoice"))
-}
-
 /// 校验会话令牌（读 state 里的 agentToken）。
 fn agent_token_ok(key: &str, token: &str) -> bool {
     if token.is_empty() {
@@ -6769,20 +6760,11 @@ fn handle_social_config_post(
     }
     // tools：只接受布尔开关；缺省沿用当前值（**默认 false 的项不能被静默打开**）
     if body_v.get("tools").and_then(js_object_like).is_some() {
-        let cur_tools = current.get("tools").cloned().unwrap_or_else(|| json!({}));
         let mut tools = merge_sub(&current, "tools", &body_v);
-        const TOOL_FLAGS: [&str; 30] = [
-            "getPrompt", "getUnread", "getRecent", "socialState", "sendGroup", "sendPrivate", "reply",
-            "sendBurst", "sendMessage", "waitMessages", "feedback", "getMyRecent", "getMessageDetail",
-            "getActiveMembers", "setWakeConfig", "markRead", "memory", "slangQuery", "slangSubmit",
-            "getImages", "getForwardMsg", "sendPoke", "listStickers", "getStickerImage", "sendSticker",
-            "setStickerRemark", "stickerNote", "collectSticker", "getSelfImage", "sendVoice",
-        ];
-        for k in TOOL_FLAGS {
-            if !tools.get(k).map(|v| v.is_boolean()).unwrap_or(false) {
-                let cur_off = cur_tools.get(k).and_then(|v| v.as_bool()) == Some(false);
-                tools.insert(k.to_string(), json!(!cur_off));
-            }
+        let effective = crate::settings::overlay(context, file_before.clone());
+        for (flag, setting) in crate::settings::tool_switches() {
+            let posted = body_v.pointer(&format!("/tools/{flag}")).and_then(Value::as_bool);
+            tools.insert(flag.to_string(), posted.map_or_else(|| setting.read(&effective), Value::Bool));
         }
         merged.insert("tools".into(), Value::Object(tools));
     }
@@ -7002,6 +6984,13 @@ fn handle_social_config_post(
             .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
     }
     write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
+    let mut effective = crate::settings::overlay(context, file);
+    crate::settings::resolve_live_batch(&mut effective);
+    for name in ["tools"] {
+        if body_v.get(name).and_then(js_object_like).is_some() {
+            merged_v[name] = effective["socialV2"][name].clone();
+        }
+    }
     // The default wake refresh below takes the same gate itself.
     drop(gate);
     crate::safe_println!("[console] 二代仿真配置已更新");
@@ -11639,7 +11628,7 @@ fn handle_social_config(context: &RuntimeContext, cfg: &Value) -> Value {
 
 /// JS `cfg.socialV2` as the console sees it: the effective section built at start; once
 /// `config.json` has changed, `maybeReloadConfig` has replaced it with the raw file section when
-/// the file has one (no defaults merged until the next start).
+/// the file has one. The normalized input already contains the effective live controls.
 fn in_memory_social_v2(context: &RuntimeContext, file_section: Option<&Value>) -> Value {
     match file_section {
         Some(raw) if raw.is_object() && access::config_changed_since_start(context) => raw.clone(),
@@ -11735,14 +11724,8 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     // JS: `{ defaults, ...(cfg.socialV2.x ?? {}) }`; a value that is not an object adds nothing.
     let members = |value: Option<&Value>| value.and_then(Value::as_object).cloned().unwrap_or_default();
     let mut tools = serde_json::Map::new();
-    for flag in [
-        "getPrompt", "getUnread", "getRecent", "socialState", "sendGroup", "sendPrivate", "reply", "sendBurst",
-        "sendMessage", "waitMessages", "feedback", "getMyRecent", "getMessageDetail", "getActiveMembers",
-        "setWakeConfig", "markRead", "memory", "slangQuery", "slangSubmit", "getImages", "getForwardMsg",
-        "sendPoke", "listStickers", "getStickerImage", "sendSticker", "setStickerRemark", "stickerNote",
-        "collectSticker", "getSelfImage", "sendVoice",
-    ] {
-        tools.insert(flag.to_string(), json!(!matches!(flag, "setStickerRemark" | "sendVoice")));
+    for (flag, setting) in crate::settings::tool_switches() {
+        tools.insert(flag.to_string(), setting.default_value());
     }
     tools.extend(members(section.get("tools")));
     section.insert("tools".to_string(), Value::Object(tools));
@@ -26842,7 +26825,7 @@ mod tests {
         assert_eq!(config["enabled"], true);
         // JS persists the merged section, which started from the effective one.
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
-        assert_eq!(file["socialV2"]["tools"]["setStickerRemark"], false);
+        assert!(file["socialV2"]["tools"].get("setStickerRemark").is_none());
         assert_eq!(file["socialV2"]["send"]["maxSendPerMinute"], 7);
         // A later GET of the same file shows the same effective section.
         let read = handle_social_config(&context, &context.load_config().unwrap());
@@ -26897,7 +26880,8 @@ mod tests {
         handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
         let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         let read = handle_social_config(&context, &context.load_config().unwrap());
-        assert_eq!(read["config"], file["socialV2"], "the answer is the raw file section after a reload");
+        assert_eq!(read["config"]["initialPromptMaxChars"], file["socialV2"]["initialPromptMaxChars"]);
+        assert_eq!(read["config"]["tools"]["sendVoice"], false, "live controls are resolved after a reload");
         assert_eq!(read["config"]["initialPromptMaxChars"], 5);
     }
 

@@ -1067,6 +1067,7 @@ impl RuntimeContext {
                 if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
             }
         }
+        crate::settings::resolve_live_batch(&mut config);
         Ok(config)
     }
 

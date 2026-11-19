@@ -8,7 +8,11 @@ use serde_json::{json, Value};
 /// switches' readers apply.
 #[derive(Clone, Copy)]
 pub(crate) struct Switch {
-    pub default: bool,
+    default: bool,
+}
+
+impl Switch {
+    pub(crate) const fn new(default: bool) -> Self { Self { default } }
 }
 
 impl SettingKind for Switch {

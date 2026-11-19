@@ -94,6 +94,14 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
     document
 }
 
+/// Materialize the settings managed by the live controls in a read-only configuration view.
+pub(crate) fn resolve_live_batch(document: &mut Value) {
+    for setting in super::registry::live_batch() {
+        let value = setting.read(document);
+        set_at(document, setting.pointer, value);
+    }
+}
+
 /// Sets the member a pointer names, creating missing or null objects on the way. Returns false, and changes nothing
 /// below the first non-object, when a member on the way is not an object.
 fn set_at(document: &mut Value, pointer: &str, value: Value) -> bool {

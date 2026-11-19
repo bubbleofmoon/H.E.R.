@@ -89,7 +89,7 @@ pub fn registered(name: &str, cfg: &Value) -> bool {
         cur.and_then(Value::as_bool) != Some(false)
     };
     if let Some(flag) = tool_flag(name) {
-        if !enabled(&["tools", flag]) {
+        if !crate::settings::tool_enabled(cfg, flag) {
             return false;
         }
     }
@@ -1193,7 +1193,7 @@ mod tests {
     fn spec_has_every_js_tool_and_gating_follows_the_js_flags() {
         let tools = spec()["tools"].as_array().unwrap().clone();
         assert_eq!(tools.len(), 38);
-        let all = registered_tools(&json!({}));
+        let all = registered_tools(&json!({"socialV2": {"voice": {"enabled": true}, "tools": {"sendVoice": true, "setStickerRemark": true}}}));
         assert_eq!(all.len(), 38);
         let off = json!({"socialV2": {"sticker": {"enabled": false}, "voice": {"enabled": false}, "tools": {"sendPoke": false, "memory": false, "getImages": false}}});
         let names: Vec<String> = registered_tools(&off).iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();

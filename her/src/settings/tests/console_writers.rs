@@ -400,6 +400,7 @@ fn settings_no_console_writer_changes_a_registry_setting_in_config_json_itself()
         // #154: an id list and a switch.
         json!([1]),
         json!(false),
+        json!(true),
         // #218: a choice.
         json!("harness"),
     ];

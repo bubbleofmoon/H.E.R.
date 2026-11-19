@@ -300,11 +300,7 @@ fn definitions(cfg: &Value, profile: Profile) -> Vec<Value> {
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
                 menu.contains(&name)
-                    && direct_send_switch(name).is_none_or(|flag| {
-                        cfg.pointer(&format!("/socialV2/tools/{flag}"))
-                            .and_then(Value::as_bool)
-                            != Some(false)
-                    })
+                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
             })
         })
         .collect()
@@ -534,11 +530,8 @@ mod tests {
                 "qq_get_sticker_image",
                 "qq_send_sticker",
                 "qq_collect_sticker",
-                "qq_send_voice",
-                "qq_list_voices",
                 "qq_get_self_image",
                 "qq_sticker_note",
-                "qq_set_sticker_remark",
                 "qq_get_forward_msg",
                 "memory_write",
                 "memory_search",
@@ -585,11 +578,8 @@ mod tests {
                 "qq_get_sticker_image",
                 "qq_send_sticker",
                 "qq_collect_sticker",
-                "qq_send_voice",
-                "qq_list_voices",
                 "qq_get_self_image",
                 "qq_sticker_note",
-                "qq_set_sticker_remark",
                 "qq_get_forward_msg",
                 "memory_write",
                 "memory_search",
