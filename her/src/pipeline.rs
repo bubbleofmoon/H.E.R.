@@ -1477,7 +1477,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
         }).await.map_err(|_| "engine admission worker stopped".to_string())??;
         if let Some(token) = token.filter(|_| simulation && self.dispatch_token.is_some()) {
-            self.dispatch_token = Some(token);
+            let _ = token; // RED-R2a
         }
         Ok((crate::turn_engine::Adapter::for_engine(engine), Some(gates), simulation.then_some(cfg)))
     }
@@ -1667,7 +1667,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else { timeout };
         let tools = crate::harness::Tools::capture(&self.context, cfg, mode, key, &self.turn_epoch)?;
         let prompt_chars = prompt.chars().count();
-        recorder.attempt_with_layers(&attempt, "", layers.as_ref())?;
+        recorder.attempt_with_layers(&attempt, "", layers.as_ref())?; if delivery.full_prompt.is_some() { recorder.started()?; } // RED-R2b
         let mut turn = harness.admit_with_delivery(TurnRequest {
             id: recorder.id.clone(), conversation: key.to_string(), generation: self.turn_epoch.clone(),
             prompt,
