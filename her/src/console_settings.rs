@@ -58,7 +58,6 @@ pub fn route(
     };
     match result {
         Ok(mut value) => {
-            if value["changed"] == false && value["setting"].as_str().is_some_and(crate::settings::wake_timing::refreshes_default_plan) { let _ = crate::console::mutate_social_state_for(context, |state| { let cfg = context.load_config().map_err(|error| (503, error.to_owned()))?; for plan in state["conversations"].as_object_mut().into_iter().flat_map(|conversations| conversations.values_mut()).filter_map(|conversation| conversation.get_mut("wakeConfig")).filter(|plan| plan["confirmedBy"] == "default") { let random = f64::from(u32::from_str_radix(&crate::turn_ledger::mint_id("")[..8], 16).unwrap_or(0)) / (f64::from(u32::MAX) + 1.0); plan["sleepUntil"] = crate::wake::default_wake_config(&cfg, crate::turn_ledger::now_ms(), random)["sleepUntil"].clone(); } Ok(()) }); } // RED-W4
             if let Some(setting) = value["setting"].as_str().filter(|_| value["changed"] != false) {
                 if crate::settings::wake_timing::refreshes_default_plan(setting)
                     && crate::console::refresh_default_wake_configs(context).is_err()
