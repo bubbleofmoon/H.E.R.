@@ -1173,7 +1173,11 @@ async fn worker(
                 }
                 continue;
             }
-            waiting.pop_front().expect("checked non-empty")
+            let job = waiting.pop_front().expect("checked non-empty");
+            if dsh_retry.take().is_some() {
+                println!("[chat] {key} DSH 已恢复，补投排队的消息（先核对权限与会话状态）");
+            }
+            job
         } else {
             match rx.recv().await {
                 Some(job) => job,
@@ -1226,9 +1230,7 @@ async fn worker(
         match result {
             Ok(ChatTurnOutcome::Completed) => println!("[chat] {key} 回合完成"),
             Ok(ChatTurnOutcome::WaitForDsh) => {
-                if dsh_retry.is_none() {
-                    println!("[chat] {key} DSH 不可用，消息排队等待恢复");
-                }
+                println!("[chat] {key} DSH 不可用，消息排队等待恢复");
                 dsh_retry = Some(tokio::time::Instant::now() + Duration::from_millis(500));
                 park!(job, true);
                 continue;
@@ -1261,7 +1263,6 @@ async fn worker(
                 }
             }
         }
-        dsh_retry = None;
         if let Err(error) = journal.mark_handled(job.inbound, now_ms()).await {
             println!("[chat] ❌ {key} 事件状态写入失败：{error}");
         }
