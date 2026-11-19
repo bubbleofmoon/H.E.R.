@@ -1078,7 +1078,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Some(route) = &self.reserved2_route {
             let mut route = route.lock().unwrap_or_else(|p| p.into_inner());
             if *route == Reserved2Route::ExpiredBeforeAdmission
-                || ((admission.is_ok() || *route == Reserved2Route::PendingHarness) && self.dispatch_expired())
+                || (admission.is_err() && *route == Reserved2Route::PendingHarness && self.dispatch_expired()) // RED-G3-admission
             {
                 *route = Reserved2Route::ExpiredBeforeAdmission;
                 return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
