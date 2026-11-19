@@ -437,7 +437,7 @@ fn publish(candidate: &Path, destination: &Path, check: Check<'_>) -> Result<Pat
         };
         let target = destination.join(name);
         let mut output = match crate::guarded_file::create_credential(&target) {
-            Ok(file) => { #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; file.set_permissions(fs::Permissions::from_mode(0o644)).unwrap(); } file }, // RED-P1
+            Ok(file) => file,
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists
                     || fs::symlink_metadata(&target).is_ok() =>

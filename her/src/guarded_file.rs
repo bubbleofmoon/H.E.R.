@@ -255,7 +255,7 @@ fn stage_inner(target: &Path, input: &mut dyn Read, unix_mode: Option<u32>, cred
     }
     #[cfg(not(unix))]
     let _ = unix_mode;
-    let mut file = if credential { create_credential(&temp) } else { options.open(&temp) } // RED-P1B
+    let mut file = if credential { create_settings_file(&temp) } else { options.open(&temp) }
         .map_err(io_failure("temp/create"))?;
     let staged = Staged { temp, target: target.to_path_buf(), published: false };
     let written = io::copy(input, &mut file)
