@@ -130,6 +130,10 @@ impl SharedJournal {
         self.run(move |j| j.mark_processing(&keys, now)).await
     }
 
+    pub async fn requeue_unsubmitted(&self, keys: Vec<String>, now: i64) -> Result<(), String> {
+        self.run(move |j| j.requeue_unsubmitted(&keys, now)).await
+    }
+
     pub async fn mark_handled(&self, keys: Vec<String>, now: i64) -> Result<(), String> {
         self.run(move |j| j.mark_handled(&keys, now)).await
     }

@@ -111,6 +111,33 @@ fn prompt_text_save_is_checked_and_a_refusal_keeps_the_last_good_version() {
 }
 
 #[test]
+fn settings_followups_global_prompt_fallback_ignores_conversation_audit() {
+    let (root, context) = settings_fixture("global prompt fallback");
+    let key = "prompt.notAClerk";
+    let global = "别像客服，平常说话。";
+    let (status, body) = set_text(&context, key, json!(global));
+    assert_eq!(status, 200, "{body}");
+    let pointer = crate::settings::find(key).unwrap().pointer;
+    write_config(&root, |config| {
+        *config.pointer_mut(pointer).unwrap() = json!("文件里的规则。");
+    });
+
+    let store = StoreProbe::at(&root.0);
+    store.set_value(key, &json!("我是 AI").to_string());
+    store.insert_audit(&[AuditRow {
+        scope: "group:101",
+        ..AuditRow::test(key, None, Some(json!("另一段规则。").to_string()), "conversation-prompt")
+    }]);
+
+    let document = context.load_config_document().unwrap();
+    assert_eq!(
+        document.pointer(pointer).and_then(Value::as_str),
+        Some(global),
+        "global prompt fallback must use global audit rows"
+    );
+}
+
+#[test]
 fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     let (root, context) = prompt_fixture("prompt text load guard");
     for text in ["【别像客服】第一版 140", "【别像客服】第二版 140"] {
@@ -301,6 +328,23 @@ fn prompt_text_strip_joining_rules_across_their_boundary_never_makes_a_denied_te
 }
 
 #[test]
+fn model_strip_join_regression_preserves_rule_boundary_when_memory_holds_term() {
+    let (root, context) = prompt_fixture("prompt text boundary with memory");
+    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D"));
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = set_text(&context, "prompt.proactive", json!("SH【积极性】"));
+    assert_eq!(status, 200, "{body}");
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", br#"{"conversations":{"group:101":{"activeTopics":[{"text":"DSH"}]}}}"#).unwrap();
+    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["\n\n"]}));
+
+    let render = next_render(&context);
+    let config = context.load_config_document().unwrap();
+    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
+    assert!(delivered.contains("- DSH（"), "the memory topic must reach the model");
+    assert!(delivered.contains("【别像客服】D\n\nSH【积极性】"), "the strip must preserve the boundary between the two rules");
+}
+
+#[test]
 fn prompt_text_sticker_rules_a_strip_turns_into_a_denied_term_fall_back_to_the_default() {
     let (root, context) = prompt_fixture("prompt text sticker strip denied");
     let (status, body) = set_text(&context, "prompt.stickerStrategy", json!("【表情包策略】D鲸SH 140"));
@@ -356,7 +400,7 @@ fn prompt_text_settings_page_edits_text_in_a_text_area() {
     assert_eq!(rule["kind"], json!({"type": "text", "maxChars": 2000}));
     assert!(rule["default"].as_str().unwrap().starts_with("【别像客服】你不是客服："), "{rule}");
     assert!(
-        page.contains("const text=type==='text'") && page.contains("createElement(text?'textarea':'input')"),
+        page.contains("const text=type==='text'") && page.contains("createElement(text||routeList?'textarea':'input')"),
         "a text setting is edited in a text area"
     );
     assert!(

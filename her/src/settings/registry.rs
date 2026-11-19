@@ -8,11 +8,10 @@ mod prompt;
 mod reply;
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
-#[cfg(test)]
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use model::{
     CONVERSATION_ROUTE, DIGEST_MODEL, DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS,
-    HARNESS_MODEL, WEB_SEARCH_MODEL,
+    HARNESS_MODEL, HARNESS_ROUTES, WEB_SEARCH_MODEL,
 };
 
 use super::{ConversationSetting, Setting};

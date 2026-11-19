@@ -39,7 +39,7 @@ impl SettingKind for ModelId {
     }
 
     fn chat_requirement(&self, name: &str) -> String {
-        format!("{name} 必须是 1 到 200 个字符、不含控制字符的模型名")
+        format!("{name} 必须是 1 到 {MODEL_ID_MAX_CHARS} 个字符的标识，不含控制字符")
     }
 
     #[cfg(test)]

@@ -9,6 +9,616 @@ mod owner_questions;
 #[path = "harness_interactions/approvals.rs"]
 mod owner_approvals;
 
+const SWITCH_PATH: &str = "/api/settings/conversation/switch";
+
+fn switching_rig(name: &str, model: &FakeModel) -> Rig {
+    let mut rig = switching_fixture(name, model, json!({}));
+    rig.start();
+    rig
+}
+
+fn switching_fixture(name: &str, model: &FakeModel, mut config: Value) -> Rig {
+    config.as_object_mut().unwrap().entry("harness").or_insert_with(|| json!({"model":"fake-chat"}));
+    let mut rig = Rig::new(name, Seed { config, ..Seed::default() });
+    fs::write(rig.root.join("config/harness-api-key"), "synthetic-model-key-67").unwrap();
+    let path = rig.root.join("dependencies.json");
+    let mut deps: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    deps["model"] = json!(model.base);
+    fs::write(path, deps.to_string()).unwrap();
+    rig.console.kill().unwrap();
+    rig.console.wait().unwrap();
+    rig.console = spawn_console(&rig.root, rig.console_port);
+    console_fixture::wait_for_console(&mut rig.console, &mut rig.console_port, &rig.root, CONSOLE_TOKEN,
+        Duration::from_secs(20), |port| spawn_console(&rig.root, port));
+    rig
+}
+
+#[test]
+fn engine_switch_replays_a_conversation_in_both_directions_once() {
+    let model = FakeModel::start(vec!["We chose blue.", "answer through the new route", "We agreed on blue curtains."]);
+    let rig = switching_rig("engine-switch-round-trip", &model);
+    let original = group_event(11801, 1001, "tester", "", vec![text_seg("choose a color for the curtains")]);
+    rig.push(original.clone());
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let old = rig.wait_prompts(1)[0].session.clone();
+    let token = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1, "the old session must be archived");
+    assert!(rig.data_json("sessions.json")["sessions"][GROUP_KEY].is_null());
+    assert_ne!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], token);
+
+    rig.push(original);
+    says(&rig, GROUP_KEY, 1001, "tester", "what did we decide?");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4), [ACK, "synthetic reply", ACK, "answer through the new route"]);
+    assert_eq!(rig.dsh.prompts().len(), 1, "the old route must not answer again");
+    {
+        let requests = lock(&model.requests);
+        assert_eq!(requests.len(), 2, "one summary and one new turn");
+        assert_ne!(requests[0]["stream"], true);
+        assert!(requests[0]["messages"].to_string().contains("choose a color for the curtains"));
+        assert!(requests[1]["messages"].to_string().contains("【之前聊天的摘要】"), "the first destination turn must carry a marked summary");
+        assert!(requests[1]["messages"].to_string().contains("We chose blue."));
+    }
+
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 2));
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"dsh"})));
+    assert_eq!(status, 200, "{body}");
+    says(&rig, GROUP_KEY, 1001, "tester", "please continue");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 6), [ACK, "synthetic reply", ACK, "answer through the new route", ACK, "synthetic reply"]);
+    let prompts = rig.wait_prompts(2);
+    assert_ne!(prompts[1].session, old, "the return must create a fresh session");
+    assert!(prompts[1].text.contains("【之前聊天的摘要】"));
+    assert!(prompts[1].text.contains("We agreed on blue curtains."), "the return prompt must carry the reverse handover");
+    assert_eq!(lock(&model.requests).len(), 3, "the old route must stop after the return");
+}
+
+#[test]
+fn engine_switch_round1_malformed_legacy_map_fails_turns_without_parking() {
+    let mut rig = Rig::new("engine-switch-bad-legacy-map", Seed {
+        config: json!({"conversationEngines": []}),
+        ..Seed::default()
+    });
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "first affected conversation");
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| {
+        text.contains(&format!("[{GROUP_KEY}] 回合失败：conversationEngines must be an object"))
+    })), "the import refusal must produce a turn-failure owner notice");
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+
+    says(&rig, OWNER_KEY, OWNER, "tester", "second affected conversation");
+    assert!(wait_for(LONG, || handled_rows(&rig, OWNER_KEY) == 1),
+        "another conversation must settle its failed inbound without parking");
+    assert!(rig.dsh.prompts().is_empty());
+
+    let path = rig.root.join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("conversationEngines");
+    let staged = path.with_extension("tmp");
+    fs::write(&staged, config.to_string()).unwrap();
+    fs::rename(staged, path).unwrap();
+    says(&rig, OWNER_KEY, OWNER, "tester", "continue after the config repair");
+    assert!(wait_for(LONG, || handled_rows(&rig, OWNER_KEY) == 2));
+    let prompts = rig.wait_prompts(1);
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].text.contains("continue after the config repair"));
+}
+
+#[test]
+fn engine_switch_round1_console_archive_failure_preserves_the_rollback_summary() {
+    let model = FakeModel::start(vec!["Saved context for the source after rollback."]);
+    let rig = switching_rig("engine-switch-archive-rollback", &model);
+    says(&rig, GROUP_KEY, 1001, "tester", "settle the original DSH turn");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let old = rig.wait_prompts(1)[0].session.clone();
+    lock(&rig.dsh.inner).archive_failures = 1;
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 503, "the archive failure must refuse the console switch: {body}");
+    let state = rig.data_json("social-v2.json");
+    let conversation = &state["conversations"][GROUP_KEY];
+    assert_eq!(conversation["engineHandover"]["pending"]["archive_started"], true);
+
+    // The failed console request restored the previous DSH preference.
+    says(&rig, GROUP_KEY, 1001, "tester", "continue on DSH after rollback");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "synthetic reply");
+    let prompts = rig.wait_prompts(2);
+    assert_ne!(prompts[1].session, old, "the ambiguous archive must retire the captured session");
+    assert!(prompts[1].text.contains("【之前聊天的摘要】\nSaved context for the source after rollback."),
+        "the fresh DSH prompt must carry the marked rollback summary");
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1);
+    assert_eq!(lock(&model.requests).len(), 1);
+}
+
+#[test]
+fn engine_switch_drains_an_active_turn_and_serializes_same_conversation_requests() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![ModelReply::Active {
+        text: "held answer".into(), started: entered.clone(), release: release.clone(),
+    }, ModelReply::Text("turn settled".into())]);
+    let rig = switching_rig("engine-switch-drain", &model);
+    assert_eq!(rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"}))).0, 200);
+    says(&rig, GROUP_KEY, 1001, "tester", "hold this turn");
+    assert!(wait_for(LONG, || entered.load(Ordering::SeqCst)), "fake streamed the first delta");
+    let port = rig.console_port;
+    let (before_release, results) = thread::scope(|scope| {
+        let (complete, responses) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let complete = complete.clone();
+            scope.spawn(move || {
+                let reply = http_call(port, "POST", SWITCH_PATH, &[("x-console-token", CONSOLE_TOKEN)],
+                    Some(&json!({"conversation":GROUP_KEY,"engine":"dsh"})));
+                let _ = complete.send(reply);
+            });
+        }
+        drop(complete);
+        let before_release = responses.recv_timeout(Duration::from_millis(300)).ok();
+        release.store(true, Ordering::SeqCst);
+        (before_release, responses.into_iter().collect::<Vec<_>>())
+    });
+    assert!(before_release.is_none(), "the switch must wait for the admitted turn to finish");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2), [ACK, "held answer"]);
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.as_ref().is_some_and(|(status, _)| *status == 200)), "{results:?}");
+    assert_eq!(lock(&model.requests).len(), 2, "two callers must commit one handover");
+}
+
+#[test]
+fn engine_switch_console_quota_preserves_the_source_generation() {
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 429, message: "quota exhausted".into() },
+        ModelReply::Error { status: 429, message: "quota exhausted".into() },
+    ]);
+    let rig = switching_rig("engine-switch-quota", &model);
+    says(&rig, GROUP_KEY, 1001, "tester", "a source turn");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let sid = rig.wait_prompts(1)[0].session.clone();
+    let token = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 503, "quota must refuse cutover");
+    assert_eq!(body["error"], "conversation handover summary failed (quota)", "{body}");
+    assert_eq!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], token);
+    assert!(rig.dsh.calls("workspace/archiveSession").is_empty());
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK, "synthetic reply"]);
+    let (status, settings) = rig.console("GET", "/api/settings/conversations", None);
+    assert_eq!(status, 200, "{settings}");
+    let row = settings["conversations"].as_array().unwrap().iter().find(|row| row["conversation"] == GROUP_KEY).unwrap();
+    assert!(row["settings"]["conversation.engine"]["stored"].is_null(), "a failed switch must restore inheritance");
+    says(&rig, GROUP_KEY, 1001, "tester", "answer me after the quota refusal");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "synthetic reply", "the next inbound must get a source reply");
+    assert_eq!(rig.wait_prompts(2)[1].session, sid);
+    assert_eq!(lock(&model.requests).len(), 2, "only the initial summary request and its retry must reach the model");
+}
+
+#[cfg(feature = "parity-clock")]
+fn switch_retry_rig(name: &str, model: &FakeModel) -> (Rig, PathBuf) {
+    let mut rig = switching_fixture(name, model, json!({}));
+    let advance = rig.root.join("switch-clock-advance");
+    rig.start_with_clock(Some(&advance));
+    (rig, advance)
+}
+
+#[cfg(feature = "parity-clock")]
+fn advance_switch_clock(path: &Path, ms: i64) {
+    let next = fs::read_to_string(path).ok().and_then(|text| text.parse::<i64>().ok()).unwrap_or(0) + ms;
+    let staged = path.with_extension("tmp");
+    fs::write(&staged, next.to_string()).unwrap();
+    fs::rename(staged, path).unwrap();
+}
+
+fn retry_file() -> String {
+    format!("locks/engine-{}-retry.json", GROUP_KEY.replace(':', "-"))
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn engine_switch_quota_preserves_the_source_generation() {
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 429, message: "private provider detail".into() },
+        ModelReply::Error { status: 429, message: "private provider detail".into() },
+        ModelReply::Text("Group handover.".into()),
+        ModelReply::Text("destination answer".into()),
+    ]);
+    let (rig, advance) = switch_retry_rig("engine-switch-inbound-quota", &model);
+    says(&rig, GROUP_KEY, 1001, "tester", "source before the switch");
+    rig.wait_texts(GROUP_KEY, 2);
+    let sid = rig.wait_prompts(1)[0].session.clone();
+    let token = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
+    let set_scope = json!({"conversation":GROUP_KEY,"setting":"conversation.engine","value":"harness"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&set_scope)).0, 200);
+
+    says(&rig, GROUP_KEY, 1001, "tester", "answer the inbound that hits quota");
+    assert!(wait_for(LONG, || rig.texts_to(GROUP_KEY).len() >= 4), "a quota failure must answer the triggering inbound on the source");
+    assert_eq!(rig.texts_to(GROUP_KEY)[3], "synthetic reply", "a quota failure must answer the triggering inbound on the source");
+    says(&rig, OWNER_KEY, OWNER, "tester", "a separate conversation can still turn");
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| text == "synthetic reply")));
+    assert!(!rig.data_json(&retry_file()).is_null(), "another conversation must leave the switch backoff in place");
+    says(&rig, GROUP_KEY, 1001, "tester", "follow up while the switch is cooling down");
+    assert!(wait_for(LONG, || rig.texts_to(GROUP_KEY).len() >= 6));
+    assert_eq!(lock(&model.requests).len(), 2, "the follow-up must not start a new summary inside the backoff");
+    assert_eq!(rig.texts_to(GROUP_KEY)[5], "synthetic reply");
+    assert!(rig.dsh.prompts().iter().filter(|prompt| prompt.session == sid).count() == 3);
+    assert_eq!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], token);
+    assert!(rig.dsh.calls("workspace/archiveSession").is_empty());
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| {
+        text == &format!("[{GROUP_KEY}] 会话引擎切换失败（engine-switch-prepare）")
+    })), "the failed summary must offer a content-free owner notice");
+
+    advance_switch_clock(&advance, 5_000);
+    assert!(!wait_for(Duration::from_millis(750), || lock(&model.requests).len() > 2),
+        "clearing the cooldown must leave the next switch attempt to a new inbound");
+    says(&rig, GROUP_KEY, 1001, "tester", "a new inbound after the backoff");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 8)[7], "destination answer");
+    assert_eq!(lock(&model.requests).len(), 4);
+}
+
+#[cfg(feature = "parity-clock")]
+fn failing_archive_rig(name: &str, model: &FakeModel, failures: usize) -> (Rig, PathBuf) {
+    let (rig, advance) = switch_retry_rig(name, model);
+    says(&rig, GROUP_KEY, 1001, "tester", "settle before staging the archive");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    lock(&rig.dsh.inner).archive_failures = failures;
+    assert_eq!(rig.console("POST", "/api/settings/set", Some(&json!({"setting":"engine.default","value":"harness"}))).0, 200);
+    says(&rig, GROUP_KEY, 1001, "tester", "trigger the staged switch");
+    (rig, advance)
+}
+
+#[cfg(feature = "parity-clock")]
+fn wait_for_archive_failure(rig: &Rig, attempt: usize, previous_deadline: i64) -> Value {
+    let mut retry = Value::Null;
+    assert!(wait_for(LONG, || {
+        retry = rig.data_json(&retry_file());
+        rig.dsh.calls("workspace/archiveSession").len() == attempt
+            && retry["retry_at_ms"].as_i64().is_some_and(|at| at > previous_deadline)
+    }), "archive attempt {attempt} must publish its next deadline");
+    retry
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn engine_switch_parks_the_unsubmitted_inbound_after_archive_error() {
+    let model = FakeModel::start(vec!["A saved handover."]);
+    let (rig, _) = failing_archive_rig("engine-switch-park-safety", &model, 1);
+    wait_for_archive_failure(&rig, 1, 0);
+    let received = || {
+        rusqlite::Connection::open_with_flags(rig.root.join("data/inbound.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .and_then(|db| db.query_row(
+                "SELECT count(*) FROM inbound_events WHERE conversation=?1 AND stage='received'", [GROUP_KEY], |row| row.get::<_, i64>(0),
+            )).unwrap_or(0)
+    };
+    assert!(wait_for(LONG, || received() == 1 || rig.dsh.prompts().len() > 1));
+    assert_eq!(received(), 1, "an ambiguous archive must leave the head inbound replayable without submitting it");
+    assert_eq!(rig.dsh.prompts().len(), 1);
+    assert_eq!(rig.texts_to(GROUP_KEY).len(), 2);
+    assert!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["engineHandover"]["pending"]["archive_started"] == true);
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn engine_switch_parked_archive_attempts_double_to_the_cap() {
+    let model = FakeModel::start(vec!["A saved handover.", "answer the parked inbound", "answer the later inbound"]);
+    let delays = [5_000, 10_000, 20_000, 40_000, 80_000, 160_000, 320_000, 600_000, 600_000];
+    let (rig, advance) = failing_archive_rig("engine-switch-park-clock", &model, delays.len());
+    let mut previous_deadline = 0;
+    for (index, delay) in delays.into_iter().enumerate() {
+        let attempts = index + 1;
+        let retry = wait_for_archive_failure(&rig, attempts, previous_deadline);
+        previous_deadline = retry["retry_at_ms"].as_i64().unwrap();
+        assert_eq!(retry["delay_ms"], delay, "parked archive attempts must double to the ten-minute cap");
+        assert_eq!(rig.dsh.prompts().len(), 1);
+        if attempts == 1 {
+            says(&rig, GROUP_KEY, 1001, "tester", "queue a later inbound behind the parked one");
+        }
+        if attempts == 2 || attempts == delays.len() {
+            advance_switch_clock(&advance, delay - 4_000);
+            assert!(!wait_for(Duration::from_millis(750), || rig.dsh.calls("workspace/archiveSession").len() > attempts),
+                "the parked inbound must wait until its next deadline");
+            advance_switch_clock(&advance, 4_000);
+        } else {
+            advance_switch_clock(&advance, delay);
+        }
+    }
+    assert_eq!(rig.wait_texts(GROUP_KEY, 6), [ACK, "synthetic reply", ACK, "answer the parked inbound", ACK, "answer the later inbound"]);
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), delays.len() + 1);
+    assert_eq!(lock(&model.requests).iter().filter(|req| req["stream"] != true).count(), 1);
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn engine_switch_offers_only_one_owner_notice_per_episode() {
+    let model = FakeModel::start(vec!["A saved handover."]);
+    let (rig, advance) = failing_archive_rig("engine-switch-park-notice", &model, 3);
+    let first = wait_for_archive_failure(&rig, 1, 0);
+    let notices = || rig.texts_to(OWNER_KEY).into_iter().filter(|text| text.contains("engine-switch-")).collect::<Vec<_>>();
+    assert!(wait_for(LONG, || !notices().is_empty()), "the failed archive must offer an owner notice");
+    assert_eq!(notices(), [format!("[{GROUP_KEY}] 会话引擎切换失败（engine-switch-pending）")],
+        "the owner's notice must contain only the conversation and failure class");
+    advance_switch_clock(&advance, 61_000);
+    wait_for_archive_failure(&rig, 2, first["retry_at_ms"].as_i64().unwrap());
+    assert!(!wait_for(Duration::from_secs(1), || notices().len() > 1), "a repeated failure must not offer another owner notice after the limiter window");
+}
+
+#[test]
+fn engine_switch_access_revocation_wins_while_the_summary_is_in_flight() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let release = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![ModelReply::Delayed { text: "a private handover".into(), release: release.clone() }]);
+    let rig = switching_rig("engine-switch-access", &model);
+    let set_scope = json!({"conversation":GROUP_KEY,"setting":"conversation.engine","value":"dsh"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&set_scope)).0, 200);
+    let set_route = json!({"conversation":GROUP_KEY,"setting":"conversation.route","value":"fixture-route"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&set_route)).0, 200);
+    says(&rig, GROUP_KEY, 1001, "tester", "ordinary source input");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let (seen, revoked, reply) = thread::scope(|scope| {
+        let rig = &rig;
+        let switch = scope.spawn(|| rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"}))));
+        let seen = wait_for(LONG, || !lock(&model.requests).is_empty());
+        let revoked = rig.console("POST", "/api/settings/set", Some(&json!({"setting":"allow.groups","value":[],"confirm":true})));
+        release.store(true, Ordering::SeqCst);
+        (seen, revoked, switch.join().unwrap())
+    });
+    assert!(seen, "the summarizer must hold a pending switch");
+    assert_eq!(revoked.0, 200, "{revoked:?}");
+    assert_eq!(reply.0, 409, "a revoked conversation must reject the switch");
+    assert_eq!(reply.1["error"], "conversation is no longer admitted", "the switch must recheck access after summarizing");
+    let state = rig.data_json("social-v2.json");
+    assert!(state["conversations"][GROUP_KEY]["engineHandover"].is_null(), "the revoked epoch must never receive the summary");
+    let (status, settings) = rig.console("GET", "/api/settings/conversations", None);
+    assert_eq!(status, 200, "{settings}");
+    assert!(!settings["conversations"].as_array().unwrap().iter().any(|row| row["conversation"] == GROUP_KEY), "rollback must leave the access clear in place");
+}
+
+#[test]
+fn engine_switch_recovers_a_staged_summary_after_the_old_mapping_was_retired() {
+    let model = FakeModel::start(vec!["resumed response"]);
+    let mut rig = switching_rig("engine-switch-crash", &model);
+    let (sid, old_token) = seed_pending_switch(&mut rig, false, true);
+    let pending = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["engineHandover"]["pending"].clone();
+    fs::write(rig.root.join("data").join(retry_file()), json!({
+        "episode": { "from":pending["from"], "to":pending["to"], "epoch":pending["epoch"], "mode_stamp":pending["mode_stamp"] },
+        "delay_ms":600_000, "retry_at_ms":now_ms() + 600_000,
+    }).to_string()).unwrap();
+    let mut sessions = rig.data_json("sessions.json");
+    sessions["sessions"].as_object_mut().unwrap().remove(GROUP_KEY);
+    fs::write(rig.root.join("data/sessions.json"), sessions.to_string()).unwrap();
+
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 200, "{body}");
+    let state = rig.data_json("social-v2.json");
+    assert_eq!(state["conversations"][GROUP_KEY]["engineHandover"]["summary"], "Saved before the interruption.", "cutover must replay the saved summary");
+    assert_ne!(state["conversations"][GROUP_KEY]["agentToken"], old_token);
+    assert!(state["conversations"][GROUP_KEY]["engineHandover"]["pending"].is_null());
+    assert!(lock(&model.requests).is_empty(), "resume must reuse the staged summary");
+    let archives = rig.dsh.calls("workspace/archiveSession");
+    assert_eq!(archives.len(), 1, "recovery must retry the captured archive");
+    assert_eq!(archives[0].pointer("/request/sessionId").and_then(Value::as_str), Some(sid.as_str()));
+    assert!(!rig.root.join("data").join(retry_file()).exists(), "publishing a switch must reset its retry state");
+}
+
+fn seed_pending_switch(rig: &mut Rig, stale: bool, archive_started: bool) -> (String, Value) {
+    says(rig, GROUP_KEY, 1001, "tester", "source before interrupted switch");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|row| row["k"] == "ended" && row["outcome"] == "completed")));
+    let sid = rig.wait_prompts(1)[0].session.clone();
+    let generation = rig.ledger().into_iter().find(|row| row["k"] == "begun").unwrap()["epoch"].clone();
+    stop_bridge(rig);
+    let stamp = if stale { "an obsolete mode stamp".to_string() } else { fs::read_to_string(rig.root.join("data/mode.json")).unwrap() };
+    let mut state = rig.data_json("social-v2.json");
+    let old_token = state["conversations"][GROUP_KEY]["agentToken"].clone();
+    state["conversations"][GROUP_KEY]["engineHandover"]["pending"] = json!({
+        "from":"dsh", "to":"harness", "epoch":generation, "mode_stamp":stamp,
+        "session":sid, "summary":"Saved before the interruption.", "archive_started":archive_started,
+    });
+    fs::write(rig.root.join("data/social-v2.json"), state.to_string()).unwrap();
+    (sid, old_token)
+}
+
+#[test]
+fn engine_switch_stale_pending_requeues_the_triggering_inbound() {
+    let model = FakeModel::start(vec![]);
+    let mut rig = switching_rig("engine-switch-stale", &model);
+    let (sid, _) = seed_pending_switch(&mut rig, true, false);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "answer while clearing a stale switch");
+    assert!(wait_for(LONG, || rig.texts_to(GROUP_KEY).len() == 4), "stale cleanup must requeue the triggering inbound");
+    assert_eq!(rig.texts_to(GROUP_KEY)[3], "synthetic reply");
+    assert_eq!(rig.wait_prompts(2)[1].session, sid);
+    assert!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["engineHandover"]["pending"].is_null());
+    assert!(lock(&model.requests).is_empty());
+}
+
+#[test]
+fn engine_switch_abandons_pending_when_owner_returns_to_source() {
+    let model = FakeModel::start(vec![]);
+    let mut rig = switching_rig("engine-switch-superseded", &model);
+    let (sid, token) = seed_pending_switch(&mut rig, false, false);
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"dsh"})));
+    assert_eq!(status, 200, "returning to the source must clear the staged switch: {body}");
+    assert!(rig.dsh.calls("workspace/archiveSession").is_empty(), "a superseded switch must not archive the source");
+    let state = rig.data_json("social-v2.json");
+    assert_eq!(state["conversations"][GROUP_KEY]["agentToken"], token);
+    assert!(state["conversations"][GROUP_KEY]["engineHandover"]["pending"].is_null());
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "continue the source session");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "synthetic reply");
+    assert_eq!(rig.wait_prompts(2)[1].session, sid);
+    assert!(lock(&model.requests).is_empty());
+}
+
+#[test]
+fn engine_switch_upgrade_prefers_live_dsh_after_legacy_flip() {
+    let model = FakeModel::start(vec!["earlier harness answer", "unexpected upgrade summary"]);
+    let mut rig = switching_fixture("engine-switch-upgrade", &model, json!({"engineDefault":"harness"}));
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "earlier harness history");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 2)[1], "earlier harness answer");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|row| row["k"] == "ended" && row["outcome"] == "completed")));
+    stop_bridge(&mut rig);
+    let token = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
+
+    // The old config-only switch left both the harness history and a live DSH mapping in this epoch.
+    let sid = rig.dsh.rpc("session/create", &json!({})).unwrap()["sessionId"].as_str().unwrap().to_string();
+    fs::write(rig.root.join("data/sessions.json"), json!({"sessions":{GROUP_KEY:&sid}}).to_string()).unwrap();
+    let config_path = rig.root.join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["conversationEngines"] = json!({GROUP_KEY:"dsh"});
+    fs::write(config_path, config.to_string()).unwrap();
+
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "continue after upgrade");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "synthetic reply");
+    assert_eq!(rig.wait_prompts(1)[0].session, sid, "upgrade must keep the live DSH mapping");
+    assert!(rig.dsh.calls("workspace/archiveSession").is_empty());
+    assert_eq!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], token);
+    assert_eq!(lock(&model.requests).len(), 1);
+}
+
+#[test]
+fn engine_switch_default_moves_unscoped_conversations_on_their_next_inbound() {
+    const OTHER: &str = "private:7707";
+    let model = FakeModel::script(vec![
+        ModelReply::Text("Group handover.".into()),
+        ModelReply::Text("group answer after its switch".into()),
+        ModelReply::Text("Private handover.".into()),
+        ModelReply::Text("private answer after its switch".into()),
+    ]);
+    let rig = switching_rig("engine-switch-default", &model);
+    let set_scope = json!({"conversation":OWNER_KEY,"setting":"conversation.engine","value":"dsh"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&set_scope)).0, 200);
+    for (key, user, text) in [(GROUP_KEY, 1001, "group source fact"), (OTHER, STRANGER, "private source fact"), (OWNER_KEY, OWNER, "pinned source fact")] {
+        says(&rig, key, user, "tester", text);
+        rig.wait_texts(key, 2);
+    }
+    assert_eq!(rig.console("POST", "/api/settings/set", Some(&json!({"setting":"engine.default","value":"harness"}))).0, 200);
+    assert!(lock(&model.requests).is_empty(), "changing the default must wait for each inbound");
+    assert!(rig.dsh.calls("workspace/archiveSession").is_empty());
+
+    says(&rig, GROUP_KEY, 1001, "tester", "the group's first inbound after selecting the default");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "group answer after its switch");
+    assert_eq!(rig.texts_to(OTHER).len(), 2);
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1);
+
+    says(&rig, OTHER, STRANGER, "tester", "private inbound after the group switched");
+    assert_eq!(rig.wait_texts(OTHER, 4)[3], "private answer after its switch");
+    says(&rig, OWNER_KEY, OWNER, "tester", "pinned conversation stays on its choice");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 4)[3], "synthetic reply");
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 2);
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 4);
+    for (index, fact, other) in [(0, "group source fact", "private source fact"), (2, "private source fact", "group source fact")] {
+        let input = requests[index]["messages"].to_string();
+        assert_ne!(requests[index]["stream"], true);
+        assert!(input.contains(fact) && !input.contains(other), "each unscoped conversation needs its own summary");
+    }
+}
+
+#[test]
+fn engine_switch_admits_the_destination_with_the_current_model_route() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let release = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![
+        ModelReply::Delayed { text: "Saved handover.".into(), release: release.clone() },
+        ModelReply::Text("global route answer".into()),
+        ModelReply::Text("scoped route answer".into()),
+        ModelReply::Text("configured order answer".into()),
+    ]);
+    let mut rig = switching_fixture("engine-switch-model-route", &model, json!({
+        "harness": {"routes": [
+            {"id":"a","model":"fixture-route-a"},
+            {"id":"b","model":"fixture-route-b"},
+            {"id":"c","model":"fixture-route-c"}
+        ]},
+        "memory": {"digest": {"model":"fixture-summary"}}
+    }));
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "a fact for the handover");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let choice = json!({"conversation":GROUP_KEY,"setting":"conversation.engine","value":"harness"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&choice)).0, 200);
+    says(&rig, GROUP_KEY, 1001, "tester", "switch on this inbound");
+    let summarizing = wait_for(LONG, || !lock(&model.requests).is_empty());
+    let global = json!({"setting":"harness.firstRoute","value":"b"});
+    let changed = rig.console("POST", "/api/settings/set", Some(&global));
+    release.store(true, Ordering::SeqCst);
+    assert!(summarizing, "the inbound must be held at switch preparation");
+    assert_eq!(changed.0, 200, "{changed:?}");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "global route answer");
+    {
+        let requests = lock(&model.requests);
+        assert_eq!(requests[0]["model"], "fixture-summary", "the switch summary uses the one-shot digest model");
+        assert_eq!(requests[1]["model"], "fixture-route-b", "the destination must read the global route after switch preparation");
+    }
+
+    let scoped = json!({"conversation":GROUP_KEY,"setting":"conversation.route","value":"c"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&scoped)).0, 200);
+    says(&rig, GROUP_KEY, 1001, "tester", "use the scoped model route");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 6)[5], "scoped route answer");
+    assert_eq!(lock(&model.requests)[2]["model"], "fixture-route-c");
+
+    let reset = json!({"conversation":GROUP_KEY,"setting":"conversation.route"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/reset", Some(&reset)).0, 200);
+    says(&rig, GROUP_KEY, 1001, "tester", "use the configured model order");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 8)[7], "configured order answer");
+    assert_eq!(lock(&model.requests)[3]["model"], "fixture-route-a", "a stored null restores the configured order");
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1, "route changes do not switch engines");
+}
+
+#[test]
+fn engine_switch_filters_large_and_old_history_before_the_summary_request() {
+    let model = FakeModel::start(vec!["Useful recent details."]);
+    let rig = switching_rig("engine-switch-history", &model);
+    says(&rig, GROUP_KEY, 1001, "tester", "source text beyond the history limit");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let sid = rig.wait_prompts(1)[0].session.clone();
+    {
+        let mut world = lock(&rig.dsh.inner);
+        let session = world.sessions.get_mut(&sid).unwrap();
+        let mut fact = |text: &str| event(session, "user/message", json!({"content":[{"type":"text","text":text}]}));
+        for i in 0..64 { fact(&format!("recent event {i}")); }
+        fact(&format!("obsolete briefing prefix {} newest user suffix", "界".repeat(2_001)));
+        fact("safe before ＤＳＨ and D\u{200b}SH safe after");
+        fact("newest benign source fact");
+    }
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 200, "{body}");
+    let requests = lock(&model.requests);
+    let input = requests[0]["messages"].to_string();
+    assert!(input.contains("newest benign source fact"));
+    assert!(!input.contains("source text beyond the history limit"), "the old history must stay outside the request");
+    assert!(input.contains("newest user suffix"), "an oversized DSH user row must keep its end");
+    assert!(!input.contains("obsolete briefing prefix"), "clipping must drop the briefing prefix");
+    assert!(input.contains("safe before") && input.contains("safe after"), "denied terms must leave the rest of the row intact");
+    assert!(!input.contains("ＤＳＨ") && !input.contains("D\u{200b}SH"), "vendor names must stay outside the request");
+}
+
+#[test]
+fn engine_switch_preserves_neighbors_of_an_inline_denied_phrase() {
+    let model = FakeModel::start(vec!["Useful recent details."]);
+    let rig = switching_rig("engine-switch-inline-phrase", &model);
+    says(&rig, GROUP_KEY, 1001, "tester", "source before the inline phrase");
+    rig.wait_texts(GROUP_KEY, 2);
+    let sid = rig.wait_prompts(1)[0].session.clone();
+    {
+        let mut world = lock(&rig.dsh.inner);
+        let session = world.sessions.get_mut(&sid).unwrap();
+        event(session, "user/message", json!({"content":[{"type":"text","text":"想保留模型两边的文字"}]}));
+    }
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 200, "{body}");
+    let requests = lock(&model.requests);
+    let input = requests[0]["messages"].to_string();
+    assert!(input.contains("想保留 两边的文字"), "an inline denied phrase must keep adjacent text");
+}
+
 #[test]
 fn dropped_stream_before_tools_retries_once_with_a_fresh_durable_attempt() {
     let model = FakeModel::script(vec![

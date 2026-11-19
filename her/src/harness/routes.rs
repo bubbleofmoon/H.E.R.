@@ -56,6 +56,17 @@ impl RouteSpec {
         }
     }
 
+    /// The settings store's spelling of a route, with defaults materialized and only the fields the reader uses.
+    pub(crate) fn setting_value(&self) -> Value {
+        serde_json::json!({
+            "id": self.id,
+            "model": self.model,
+            "reasoningEffort": self.effort,
+            "maxOutputTokens": self.max_output_tokens,
+            "retry429": self.retry_429,
+        })
+    }
+
     fn signature(&self) -> String {
         format!(
             "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -78,24 +89,31 @@ pub(crate) fn chain_signature(chain: &[RouteSpec]) -> String {
 /// whole list, and the turn fails as not configured: it never falls back to `harness.model`. A refusal names the
 /// route's position and field, never a configured value. Unknown route fields are ignored.
 pub(crate) fn chain(cfg: &Value) -> Result<Vec<RouteSpec>, String> {
-    match cfg.pointer("/harness/routes") {
+    // Read the registry's member without substituting the default for invalid file data.
+    match crate::settings::HARNESS_ROUTES.found_in(cfg) {
         None | Some(Value::Null) => {
             let model = crate::settings::HARNESS_MODEL.text(cfg).ok_or(MODEL_NOT_CONFIGURED)?;
             Ok(vec![RouteSpec::implicit(model)])
         }
-        Some(Value::Array(entries)) if (1..=MAX_ROUTES).contains(&entries.len()) => {
-            let mut routes: Vec<RouteSpec> = Vec::new();
-            for (at, entry) in entries.iter().enumerate() {
-                let route = route_spec(entry).map_err(|field| format!("harness route {} is invalid ({field})", at + 1))?;
-                if routes.iter().any(|known| known.id == route.id) {
-                    return Err(format!("harness route {} is invalid (id)", at + 1));
-                }
-                routes.push(route);
-            }
-            Ok(routes)
-        }
-        Some(_) => Err(format!("harness routes must be a list of 1 to {MAX_ROUTES} routes")),
+        Some(value) => parse_list(value),
     }
+}
+
+/// Validates and reads an explicit route list for both the runtime and the settings store.
+pub(crate) fn parse_list(value: &Value) -> Result<Vec<RouteSpec>, String> {
+    let entries = value
+        .as_array()
+        .filter(|entries| (1..=MAX_ROUTES).contains(&entries.len()))
+        .ok_or_else(|| format!("harness routes must be a list of 1 to {MAX_ROUTES} routes"))?;
+    let mut routes: Vec<RouteSpec> = Vec::with_capacity(entries.len());
+    for (at, entry) in entries.iter().enumerate() {
+        let route = route_spec(entry).map_err(|field| format!("harness route {} is invalid ({field})", at + 1))?;
+        if routes.iter().any(|known| known.id == route.id) {
+            return Err(format!("harness route {} is invalid (id)", at + 1));
+        }
+        routes.push(route);
+    }
+    Ok(routes)
 }
 
 /// One route, or the name of its first invalid field.

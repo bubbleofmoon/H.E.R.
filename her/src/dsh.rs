@@ -1075,6 +1075,16 @@ impl FollowStream {
         session_id: &str,
         max_messages: usize,
     ) -> Result<Self, String> {
+        Self::open_with_limits(base, cookie, session_id, max_messages, None).await
+    }
+
+    async fn open_with_limits(
+        base: &str,
+        cookie: &str,
+        session_id: &str,
+        max_messages: usize,
+        config: Option<tokio_tungstenite::tungstenite::protocol::WebSocketConfig>,
+    ) -> Result<Self, String> {
         let ws_url = format!("{}/api/remote.mux", base.replacen("http://", "ws://", 1));
         let mut request = ws_url
             .as_str()
@@ -1084,7 +1094,7 @@ impl FollowStream {
             .headers_mut()
             .insert("Cookie", cookie.parse().map_err(|_| "Cookie 头非法".to_string())?);
 
-        let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
+        let (mut ws, _resp) = tokio_tungstenite::connect_async_with_config(request, config, false)
             .await
             .map_err(|e| format!("连 /api/remote.mux 失败：{e}"))?;
 
@@ -1720,6 +1730,10 @@ pub async fn wait_prompt_outcome(
 /// 停下一个会话里的工作：先清 inbox（`session/cancel` 默认保留 inbox），再取消当前回合。
 /// 读不到队列不阻止取消；返回清掉的条数，任何一步失败都在最后报错（与 JS `stopSessionWork` 同序）。
 pub fn stop_session_work(rpc: &Rpc, session_id: &str) -> Result<usize, String> {
+    stop_session_work_with(rpc, session_id, is_not_found, usize::MAX)
+}
+
+fn stop_session_work_with(rpc: &Rpc, session_id: &str, gone: fn(&str) -> bool, max_items: usize) -> Result<usize, String> {
     let mut failure: Option<String> = None;
     let mut removed = 0usize;
     match rpc.call("session/projections", serde_json::json!({ "sessionId": session_id })) {
@@ -1729,7 +1743,10 @@ pub fn stop_session_work(rpc: &Rpc, session_id: &str) -> Result<usize, String> {
             } else {
                 inbox_of_values(value.get("values")).unwrap_or_default()
             };
-            for item in items {
+            if items.len() > max_items {
+                failure = Some("session inbox exceeds the archive limit".to_string());
+            }
+            for item in items.into_iter().take(max_items) {
                 let Some(id) = item.get("id").and_then(|i| i.as_str()) else {
                     failure.get_or_insert_with(|| "inbox 项缺少 id，无法清队列".to_string());
                     continue;
@@ -1746,14 +1763,14 @@ pub fn stop_session_work(rpc: &Rpc, session_id: &str) -> Result<usize, String> {
                 }
             }
         }
-        Err(error) if is_not_found(&error) => {}
+        Err(error) if gone(&error) => {}
         Err(error) => {
             failure.get_or_insert(error);
         }
     }
     match rpc.call("session/cancel", serde_json::json!({ "sessionId": session_id })) {
         Ok(_) => {}
-        Err(error) if is_not_found(&error) => {}
+        Err(error) if gone(&error) => {}
         Err(error) => {
             failure.get_or_insert(error);
         }
@@ -1771,6 +1788,51 @@ pub fn archive_session(rpc: &Rpc, session_id: &str) -> Result<(), String> {
         Err(error) if is_not_found(&error) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn archive_for_switch(rpc: &Rpc, sid: &str) -> Result<(), String> {
+    stop_session_work_with(rpc, sid, is_session_gone, 64)
+        .map_err(|_| "previous session could not be stopped".to_string())?;
+    match rpc.call("workspace/archiveSession", serde_json::json!({"sessionId": sid})) {
+        Ok(_) => Ok(()),
+        Err(error) if is_session_gone(&error) => Ok(()),
+        Err(_) => Err("previous session could not be archived".to_string()),
+    }
+}
+
+/// A read-only tail of the source session. The switch is synchronous, so keep the
+/// websocket runtime on its own thread and join it before returning.
+pub(crate) fn switch_history(rpc: &Rpc, sid: &str, limit: usize) -> Result<Vec<String>, String> {
+    let base = &rpc.base;
+    let cookie = rpc.cookie();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|_| "previous session history is unavailable".to_string())?
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                        let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+                        config.max_message_size = Some(4 * 1024 * 1024);
+                        config.max_frame_size = config.max_message_size;
+                        let follow = FollowStream::open_with_limits(base, &cookie, sid, limit, Some(config)).await
+                            .map_err(|_| "previous session history is unavailable".to_string())?;
+                        let mut rows: Vec<String> = follow.snapshot.events.iter().rev().filter_map(|event| {
+                            let label = match event["type"].as_str() {
+                                Some("user/message") => "〔对方〕",
+                                Some("assistant/message") => "〔我〕",
+                                _ => return None,
+                            };
+                            let content = event.pointer("/data/message/content").or_else(|| event.pointer("/data/content"))?;
+                            let text = blocks_to_text(content);
+                            (!text.trim().is_empty()).then(|| format!("{label}{text}"))
+                        }).take(limit).collect();
+                        follow.close().await;
+                        rows.reverse();
+                        Ok(rows)
+                    }).await.map_err(|_| "previous session history timed out".to_string())?
+                })
+        }).join().map_err(|_| "previous session history is unavailable".to_string())?
+    })
 }
 
 pub async fn watch_raw(base: &str, cookie: &str, session_id: &str, secs: u64) -> Result<(), String> {
