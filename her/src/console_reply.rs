@@ -12,7 +12,7 @@ pub(super) struct QuietWindow {
 
 impl QuietWindow {
     pub(super) fn configured(cfg: &Value, urgent: bool) -> Self {
-        let [min, median, max] = crate::settings::reply::WINDOWS[if urgent { 1 } else { 0 }];
+        let [min, median, max] = &crate::settings::reply::WINDOWS[if urgent { 1 } else { 0 }];
         let window = Self { min: min.integer(cfg), median: median.integer(cfg), max: max.integer(cfg) };
         if (window.min..=window.max).contains(&window.median) {
             window
