@@ -40,7 +40,7 @@ impl SettingKind for VoiceNumber {
     }
 
     fn view(&self) -> Value {
-        let min = 0.0; // RED-M2
+        let min = if self.duration { f64::from_bits(1) } else { 0.0 };
         json!({"type":"number", "min":crate::voice::json_number(min), "max":self.max})
     }
 

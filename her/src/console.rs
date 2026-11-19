@@ -5914,7 +5914,7 @@ pub(crate) fn warn_configured_voice_duration(cfg: &Value) {
     let ceiling = crate::voice::QQ_MAX_SECONDS;
     if seconds > ceiling {
         let first_warning = WARNED_SECONDS.lock().unwrap().insert(seconds.to_bits());
-        if first_warning || seconds > ceiling { // RED-M1
+        if first_warning {
             crate::safe_println!("[voice] socialV2.voice.maxSeconds={seconds} exceeds QQ limit; clamped to {ceiling}s");
         }
     }
