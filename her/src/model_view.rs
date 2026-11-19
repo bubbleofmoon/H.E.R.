@@ -198,7 +198,7 @@ fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
         for &item in &strips {
             if current.contains(item) {
                 let (next, refused_item) = strip_occurrences(&current, item, atoms);
-                if !refused_item { current = next; } // RED-M1
+                current = next;
                 refused |= refused_item;
             }
         }
@@ -222,7 +222,7 @@ fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, b
             let start = plain_start + offset;
             let end = start + item.len();
             out.push_str(&text[copied..start]);
-            if deletion_adds_denied_term(&out, item, &text[end..]) && crate::model_text_policy::denied_terms(text).is_empty() { // RED-M2
+            if deletion_adds_denied_term(&out, item, &text[end..]) {
                 out.push_str(item);
                 refused = true;
             }
