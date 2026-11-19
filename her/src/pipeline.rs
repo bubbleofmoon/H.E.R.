@@ -430,6 +430,7 @@ pub struct Pipeline {
     /// Facts of the last finished turn, for the chat reply decision.
     last_report: Option<TurnReport>,
     failure_reported: bool,
+    owner_interaction_closed: bool,
     active_candidate: Option<failover::Candidate>,
     carried_messages: Vec<serde_json::Value>,
     /// Memories the compatibility render of the turn in flight carries as recall: counted when that text
@@ -700,6 +701,7 @@ impl Pipeline {
             chat: None,
             last_report: None,
             failure_reported: false,
+            owner_interaction_closed: false,
             active_candidate: None,
             carried_messages: Vec::new(),
             compat_recall: Vec::new(),
@@ -1254,6 +1256,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         mode: &str,
         owner_started: bool,
     ) -> Result<ChatTurnOutcome, String> {
+        self.owner_interaction_closed = false;
         if !self.context.is_isolated() {
             return Err("chat 模式只在选定运行环境中运行".to_string());
         }
@@ -1299,6 +1302,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return Ok(ChatTurnOutcome::WaitForDsh);
         }
         result.map(|()| ChatTurnOutcome::Completed)
+    }
+
+    pub(crate) fn owner_interaction_closed(&self) -> bool {
+        self.owner_interaction_closed
     }
 
     /// First-generation turns share session policy, media delivery, turn recovery and the outbox.
@@ -1556,7 +1563,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let text = match result {
             Ok(text) => text,
             Err(error) => {
-                if error == crate::harness::DEADLINE_EXCEEDED {
+                self.owner_interaction_closed = turn.owner_interaction_closed();
+                if error == crate::harness::DEADLINE_EXCEEDED && !self.owner_interaction_closed {
                     self.report_backend_failure(cfg, key, "harness", "openai", &model, "", &error);
                 }
                 return Err(error);

@@ -14,6 +14,7 @@ pub(super) const GROUP_SEND: &str = "qq_send_group_message";
 const ANSWER_LIMIT: usize = 2_000;
 const OPTION_LIMIT: usize = 4;
 const TIMEOUT_NOTICE: &str = "⏰ 等待回答超时，已取消该请求。";
+pub(super) const TIMED_OUT: &str = "Owner interaction timed out.";
 
 fn approval_prompt(id: &str) -> String {
     format!("回复 /approve {id} 或 /deny {id}")
@@ -125,8 +126,21 @@ pub(crate) fn pending_view(context: &RuntimeContext) -> Result<Option<Value>, St
 struct Pending {
     snapshot: Snapshot,
     expires: Instant,
-    reply: Option<oneshot::Sender<String>>,
+    state: PendingState,
+    wake: Option<oneshot::Sender<()>>,
     approval: bool,
+}
+
+enum PendingState {
+    Delivering,
+    Open,
+    Accepted(String),
+}
+
+impl Pending {
+    fn is_open(&self) -> bool {
+        matches!(self.state, PendingState::Open)
+    }
 }
 
 pub(crate) struct Mailbox {
@@ -168,7 +182,7 @@ impl Mailbox {
         };
         let snapshot = self.pending.lock().ok().and_then(|slot| {
             let pending = slot.as_ref()?;
-            (pending.snapshot.key == key).then(|| pending.snapshot.clone())
+            (pending.snapshot.key == key && pending.is_open()).then(|| pending.snapshot.clone())
         });
         let Some(snapshot) = snapshot else { return no_pending() };
         let Ok(_gate) = crate::closed_agent::lock_wait(&self.context, gate_wait).await else {
@@ -178,7 +192,7 @@ impl Mailbox {
             return no_pending();
         }
         let Ok(mut slot) = self.pending.lock() else { return no_pending() };
-        let Some(pending) = slot.as_mut().filter(|entry| entry.snapshot.id == snapshot.id && entry.reply.is_some()) else {
+        let Some(pending) = slot.as_mut().filter(|entry| entry.snapshot.id == snapshot.id && entry.is_open()) else {
             return no_pending();
         };
         if Instant::now() >= pending.expires {
@@ -197,13 +211,19 @@ impl Mailbox {
         } else {
             text
         };
-        if pending.reply.take().is_some_and(|sender| sender.send(reply.to_string()).is_ok()) {
-            return Answer::Accepted;
+        pending.state = PendingState::Accepted(reply.to_string());
+        if let Some(wake) = pending.wake.take() {
+            let _ = wake.send(());
         }
-        no_pending()
+        Answer::Accepted
     }
 
-    async fn publish(self: &Arc<Self>, snapshot: Snapshot, expires: Instant, approval: bool) -> Result<(Lease, oneshot::Receiver<String>), String> {
+    async fn reserve(
+        self: &Arc<Self>,
+        snapshot: Snapshot,
+        expires: Instant,
+        approval: bool,
+    ) -> Result<(Lease, oneshot::Receiver<()>), String> {
         let _gate = crate::closed_agent::lock_wait(&self.context, crate::closed_agent::GATE_WAIT).await?;
         if !snapshot.current(&self.context) || Instant::now() >= expires {
             return Err("owner interaction expired or session changed".into());
@@ -212,11 +232,15 @@ impl Mailbox {
         if slot.is_some() {
             return Err("another owner interaction is pending".into());
         }
-        let (reply, receiver) = oneshot::channel();
-        let bytes = serde_json::to_vec(&snapshot).map_err(|_| "owner interaction cannot be displayed")?;
-        self.context.write_atomic(RuntimeArea::Data, SNAPSHOT, &bytes)?;
+        let (wake, receiver) = oneshot::channel();
         let lease = Lease { mailbox: self.clone(), id: snapshot.id.clone() };
-        *slot = Some(Pending { snapshot, expires, reply: Some(reply), approval });
+        *slot = Some(Pending {
+            snapshot,
+            expires,
+            state: PendingState::Delivering,
+            wake: Some(wake),
+            approval,
+        });
         Ok((lease, receiver))
     }
 }
@@ -226,16 +250,36 @@ struct Lease {
     id: String,
 }
 
+impl Lease {
+    fn confirm_delivery(&self) -> Result<(), String> {
+        let mut slot = self.mailbox.pending.lock().map_err(|_| "owner interaction is unavailable")?;
+        let Some(pending) = slot.as_mut().filter(|entry| entry.snapshot.id == self.id) else {
+            return Err("owner interaction is unavailable".into());
+        };
+        if Instant::now() < pending.expires {
+            let bytes = serde_json::to_vec(&pending.snapshot).map_err(|_| "owner interaction cannot be displayed")?;
+            self.mailbox.context.write_atomic(RuntimeArea::Data, SNAPSHOT, &bytes)?;
+            pending.state = PendingState::Open;
+        }
+        Ok(())
+    }
+
+    fn take(&self) -> Option<Pending> {
+        let mut slot = self.mailbox.pending.lock().ok()?;
+        if slot.as_ref()?.snapshot.id != self.id {
+            return None;
+        }
+        let pending = slot.take();
+        if self.mailbox.context.write_atomic(RuntimeArea::Data, SNAPSHOT, b"null").is_err() {
+            eprintln!("[owner interaction] snapshot cleanup failed");
+        }
+        pending
+    }
+}
+
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.mailbox.pending.lock() {
-            if slot.as_ref().is_some_and(|entry| entry.snapshot.id == self.id) {
-                *slot = None;
-                if self.mailbox.context.write_atomic(RuntimeArea::Data, SNAPSHOT, b"null").is_err() {
-                    eprintln!("[owner interaction] snapshot cleanup failed");
-                }
-            }
-        }
+        self.take();
     }
 }
 
@@ -326,6 +370,8 @@ impl Binding<'_> {
         let remaining = self.deadline.saturating_duration_since(now);
         let wait = Duration::from_millis(timeout).min(remaining);
         let expires = now + wait;
+        // At the turn cap the turn's timer revokes authority and wakes the waiter.
+        let inner_expiry = (expires < self.deadline).then_some(expires);
         let id = crate::turn_ledger::mint_id("request-");
         if approval {
             display["requestId"] = json!(id);
@@ -338,24 +384,46 @@ impl Binding<'_> {
             epoch: self.epoch.into(), expires_at: (crate::parity_clock::now_ms() as i64)
                 .saturating_add(wait.as_millis() as i64), display,
         };
-        let publication = self.mailbox.publish(snapshot.clone(), expires, approval);
+        let reservation = self.mailbox.reserve(snapshot.clone(), expires, approval);
         let (lease, receiver) = tokio::select! { biased;
             _ = cancelled.changed() => return Err(Failure::Cancelled),
-            _ = tokio::time::sleep_until(expires) => return Err("Owner interaction timed out.".into()),
-            result = publication => result?,
+            _ = wait_until_expiry(inner_expiry) => return Err(TIMED_OUT.into()),
+            result = reservation => result?,
         };
-        self.deliver(snapshot.clone(), notice, Some((expires, cancelled.clone())), false).await?;
-        let result = wait_for_reply(receiver, expires, &mut cancelled).await;
-        drop(lease);
-        if matches!(&result, Err(Failure::Failed(_))) && wait < remaining {
-            self.deliver(snapshot, TIMEOUT_NOTICE.into(), Some((self.deadline, cancelled)), true).await?;
-        } else if matches!(&result, Err(Failure::Cancelled)) && !approval {
+        if !self.deliver(snapshot.clone(), notice, Some((expires, cancelled.clone())), false).await? {
+            return if *cancelled.borrow() {
+                Err(Failure::Cancelled)
+            } else {
+                Err("Owner interaction could not be delivered.".into())
+            };
+        }
+        if !*cancelled.borrow() {
+            lease.confirm_delivery()?;
+        }
+        let error = match wait_for_reply(&lease, receiver, inner_expiry, &mut cancelled).await {
+            Ok(reply) => return Ok(reply),
+            Err(error) => error,
+        };
+        if matches!(&error, Failure::Failed(_))
+            && Instant::now() < self.deadline
+            && self.deliver(snapshot.clone(), TIMEOUT_NOTICE.into(), Some((self.deadline, cancelled.clone())), true).await?
+        {
+            return Err(Failure::InteractionClosed);
+        }
+        if !approval {
+            // A definite refusal under the old bound can coincide with the turn cap.
+            // Wait for revocation before using the deadline's replacement generation.
+            if Instant::now() >= self.deadline && !*cancelled.borrow() {
+                let _ = cancelled.changed().await;
+            }
             if let Some(generation) = self.deadline_generation.get() {
                 snapshot.epoch.clone_from(generation);
-                self.deliver(snapshot, TIMEOUT_NOTICE.into(), None, true).await?;
+                if self.deliver(snapshot, TIMEOUT_NOTICE.into(), None, true).await? {
+                    return Err(Failure::InteractionClosed);
+                }
             }
         }
-        result
+        Err(error)
     }
 
     async fn deliver(
@@ -364,7 +432,7 @@ impl Binding<'_> {
         text: String,
         bound: Option<(Instant, watch::Receiver<bool>)>,
         notice_only: bool,
-    ) -> Result<(), Failure> {
+    ) -> Result<bool, Failure> {
         let context = self.mailbox.context.clone();
         tokio::task::spawn_blocking(move || {
             let cfg = context.load_config().map_err(Failure::from)?;
@@ -381,28 +449,34 @@ impl Binding<'_> {
             if report.unknown {
                 return Err(Failure::Uncertain("Owner interaction delivery is outcome-unknown.".into()));
             }
-            let delivered = report.parts > 0 && report.confirmed == report.parts;
-            if cancelled() && (notice_only || !delivered) {
-                return Err(Failure::Cancelled);
-            }
-            if !notice_only && !delivered {
-                return Err("Owner interaction could not be delivered.".into());
-            }
-            Ok(())
+            Ok(report.parts > 0 && report.confirmed == report.parts)
         }).await.map_err(|_| Failure::Uncertain("Owner interaction worker did not settle.".into()))?
     }
 }
 
+async fn wait_until_expiry(expires: Option<Instant>) {
+    match expires {
+        Some(expires) => tokio::time::sleep_until(expires).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_for_reply(
-    receiver: oneshot::Receiver<String>,
-    expires: Instant,
+    lease: &Lease,
+    receiver: oneshot::Receiver<()>,
+    expires: Option<Instant>,
     cancelled: &mut watch::Receiver<bool>,
 ) -> Result<String, Failure> {
-    tokio::select! { biased;
-        _ = cancelled.changed() => Err(Failure::Cancelled),
-        // The mailbox already rejects replies at or after expiry.
-        reply = receiver => reply.map_err(|_| Failure::Cancelled),
-        _ = tokio::time::sleep_until(expires) => Err("Owner interaction timed out.".into()),
+    let interruption = tokio::select! { biased;
+        _ = cancelled.changed() => Some(Failure::Cancelled),
+        _ = wait_until_expiry(expires) => Some(Failure::Failed(TIMED_OUT.into())),
+        _ = receiver => None,
+    };
+    // Wakeups only decide when to settle. Taking the slot orders settlement
+    // against answer(), regardless of which wakeup arrived first.
+    match lease.take().map(|pending| pending.state) {
+        Some(PendingState::Accepted(reply)) => Ok(reply),
+        _ => Err(interruption.unwrap_or(Failure::Cancelled)),
     }
 }
 
@@ -453,7 +527,7 @@ mod tests {
             ).unwrap();
         }
 
-        async fn publish(&self, approval: bool) -> (fs::File, Lease, oneshot::Receiver<String>) {
+        async fn publish(&self, approval: bool) -> (fs::File, Lease, oneshot::Receiver<()>) {
             self.publish_until(approval, Instant::now() + Duration::from_secs(60)).await
         }
 
@@ -461,7 +535,17 @@ mod tests {
             &self,
             approval: bool,
             expires: Instant,
-        ) -> (fs::File, Lease, oneshot::Receiver<String>) {
+        ) -> (fs::File, Lease, oneshot::Receiver<()>) {
+            let (owner, lease, reply) = self.reserve_until(approval, expires).await;
+            lease.confirm_delivery().unwrap();
+            (owner, lease, reply)
+        }
+
+        async fn reserve_until(
+            &self,
+            approval: bool,
+            expires: Instant,
+        ) -> (fs::File, Lease, oneshot::Receiver<()>) {
             let owner = super::super::turn_owner(&self.mailbox.context, TURN).unwrap();
             let snapshot = Snapshot {
                 id: REQUEST.into(),
@@ -473,7 +557,7 @@ mod tests {
                     + expires.saturating_duration_since(Instant::now()).as_millis() as i64,
                 display: Value::Null,
             };
-            let (lease, reply) = self.mailbox.publish(snapshot, expires, approval).await.unwrap();
+            let (lease, reply) = self.mailbox.reserve(snapshot, expires, approval).await.unwrap();
             (owner, lease, reply)
         }
     }
@@ -485,20 +569,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answer_accepted_before_expiry_wins_when_the_waiter_polls_late() {
+    async fn an_accepted_reply_survives_the_inner_expiry_timer() {
         let fixture = Fixture::new();
         let expires = Instant::now() + Duration::from_secs(2);
-        let (_owner, _lease, reply) = fixture.publish_until(false, expires).await;
+        let (_owner, lease, reply) = fixture.publish_until(false, expires).await;
         let (_cancel, mut cancelled) = watch::channel(false);
+        let wait = wait_for_reply(&lease, reply, Some(expires), &mut cancelled);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
         assert_eq!(fixture.mailbox.answer(OWNER_KEY, "Blue", Duration::ZERO).await, Answer::Accepted);
         tokio::time::sleep_until(expires + Duration::from_millis(1)).await;
-        assert_eq!(wait_for_reply(reply, expires, &mut cancelled).await.ok().as_deref(), Some("Blue"));
+        assert_eq!(wait.await.ok().as_deref(), Some("Blue"), "inner expiry discarded an accepted reply");
+    }
+
+    #[tokio::test]
+    async fn an_accepted_reply_survives_turn_deadline_revocation() {
+        let fixture = Fixture::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (_owner, lease, reply) = fixture.publish_until(false, deadline).await;
+        let (cancel, cancelled) = watch::channel(false);
+        let mut interaction_cancelled = cancelled.clone();
+        let generation = OnceLock::new();
+        let context = &fixture.mailbox.context;
+        let tools = tools::Tools::capture(
+            context, &context.load_config().unwrap(), "closed-agent", OWNER_KEY,
+            &crate::conversation_authority::generation(TOKEN),
+        ).unwrap();
+        let turn = super::super::settle_turn(
+            wait_for_reply(&lease, reply, None, &mut interaction_cancelled),
+            deadline, &cancel, cancelled, &tools, &generation,
+        );
+        tokio::pin!(turn);
+        assert!(futures_util::poll!(&mut turn).is_pending());
+        assert_eq!(fixture.mailbox.answer(OWNER_KEY, "Blue", Duration::ZERO).await, Answer::Accepted);
+        tokio::time::sleep_until(deadline + Duration::from_millis(1)).await;
+        let (result, interrupted) = turn.await;
+        assert!(matches!(interrupted, Some(super::super::Status::Failed(reason)) if reason == super::super::DEADLINE_EXCEEDED));
+        assert!(generation.get().is_some());
+        assert_eq!(result.ok().as_deref(), Some("Blue"), "the turn deadline discarded an accepted reply");
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_preserves_an_accepted_reply_for_settlement() {
+        let fixture = Fixture::new();
+        let expires = Instant::now() + Duration::from_secs(60);
+        let (_owner, lease, reply) = fixture.publish_until(true, expires).await;
+        let (cancel, mut cancelled) = watch::channel(false);
+        let wait = wait_for_reply(&lease, reply, Some(expires), &mut cancelled);
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        assert_eq!(
+            fixture.mailbox.answer(OWNER_KEY, &format!("/deny {REQUEST}"), Duration::ZERO).await,
+            Answer::Accepted,
+        );
+        cancel.send(true).unwrap();
+        assert_eq!(wait.await.ok().as_deref(), Some("/deny"), "cancellation discarded an accepted decision");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_delivered_after_expiry_never_admits_an_answer() {
+        let fixture = Fixture::new();
+        let expires = Instant::now() + Duration::from_secs(2);
+        let (_owner, lease, reply) = fixture.reserve_until(false, expires).await;
+        let early = fixture.mailbox.answer(OWNER_KEY, "Blue", Duration::ZERO).await;
+        assert_eq!(early, Answer::Forward, "accepted an answer before delivery was confirmed");
+        assert_eq!(pending_view(&fixture.mailbox.context).unwrap(), None);
+        tokio::time::sleep_until(expires).await;
+        lease.confirm_delivery().unwrap();
+        assert_eq!(fixture.mailbox.answer(OWNER_KEY, "Green", Duration::ZERO).await, Answer::Forward);
+        let (_cancel, mut cancelled) = watch::channel(false);
+        assert!(matches!(
+            wait_for_reply(&lease, reply, Some(expires), &mut cancelled).await,
+            Err(Failure::Failed(_)),
+        ));
+        assert_eq!(fixture.mailbox.answer(OWNER_KEY, "Green", Duration::ZERO).await, Answer::Forward);
+        assert_eq!(pending_view(&fixture.mailbox.context).unwrap(), None);
+        assert!(fixture.mailbox.pending.lock().unwrap().is_none());
     }
 
     #[tokio::test]
     async fn an_overlong_question_answer_gets_a_notice_and_can_be_retried() {
         let fixture = Fixture::new();
-        let (_owner, _lease, mut reply) = fixture.publish(false).await;
+        let (_owner, lease, mut reply) = fixture.publish(false).await;
         let answer = "字".repeat(2_000);
         assert_eq!(
             fixture.mailbox.answer(OWNER_KEY, &format!("{answer}字"), Duration::ZERO).await,
@@ -506,13 +658,14 @@ mod tests {
         );
         assert_eq!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         assert_eq!(fixture.mailbox.answer(OWNER_KEY, &answer, Duration::ZERO).await, Answer::Accepted);
-        assert_eq!(reply.try_recv().unwrap(), answer);
+        let (_cancel, mut cancelled) = watch::channel(false);
+        assert_eq!(wait_for_reply(&lease, reply, None, &mut cancelled).await.ok(), Some(answer));
     }
 
     #[tokio::test]
     async fn busy_owner_interaction_gate_reports_and_leaves_the_answer_retryable() {
         let fixture = Fixture::new();
-        let (_owner, _lease, mut reply) = fixture.publish(false).await;
+        let (_owner, lease, mut reply) = fixture.publish(false).await;
         let held = fixture.mailbox.context.open_locked_file(RuntimeArea::Data, "locks/closed-agent.lock").unwrap();
         assert_eq!(
             fixture.mailbox.answer(OWNER_KEY, "Blue", Duration::ZERO).await,
@@ -522,7 +675,8 @@ mod tests {
         assert_eq!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         drop(held);
         assert_eq!(fixture.mailbox.answer(OWNER_KEY, "Blue", Duration::ZERO).await, Answer::Accepted);
-        assert_eq!(reply.try_recv().unwrap(), "Blue");
+        let (_cancel, mut cancelled) = watch::channel(false);
+        assert_eq!(wait_for_reply(&lease, reply, None, &mut cancelled).await.ok().as_deref(), Some("Blue"));
     }
 
     #[tokio::test]
@@ -556,7 +710,7 @@ mod tests {
     async fn the_mailbox_binds_both_approval_commands_to_the_private_conversation_key() {
         let fixture = Fixture::new();
         for decision in ["/approve", "/deny"] {
-            let (_owner, _lease, mut reply) = fixture.publish(true).await;
+            let (_owner, lease, mut reply) = fixture.publish(true).await;
             let command = format!("{decision} {REQUEST}");
             assert_eq!(
                 fixture.mailbox.answer("group:43", &command, Duration::ZERO).await,
@@ -565,7 +719,8 @@ mod tests {
             );
             assert_eq!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
             assert_eq!(fixture.mailbox.answer(OWNER_KEY, &command, Duration::ZERO).await, Answer::Accepted);
-            assert_eq!(reply.try_recv().unwrap(), decision);
+            let (_cancel, mut cancelled) = watch::channel(false);
+            assert_eq!(wait_for_reply(&lease, reply, None, &mut cancelled).await.ok().as_deref(), Some(decision));
         }
     }
 

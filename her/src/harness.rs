@@ -292,6 +292,8 @@ pub enum Status {
 
 enum Failure {
     Failed(String),
+    /// The owner received the timeout notice for this interaction.
+    InteractionClosed,
     Cancelled,
     Uncertain(String),
 }
@@ -352,6 +354,7 @@ struct Progress {
     /// The model of the route the turn's last request went to.
     model: String,
     failures: Vec<RouteFailure>,
+    owner_interaction_closed: bool,
 }
 
 impl From<String> for Failure {
@@ -398,6 +401,10 @@ impl Turn {
     /// Each route request that failed over or ended the turn, in order.
     pub fn route_failures(&self) -> Vec<RouteFailure> {
         self.progress.lock().unwrap_or_else(|p| p.into_inner()).failures.clone()
+    }
+
+    pub(crate) fn owner_interaction_closed(&self) -> bool {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).owner_interaction_closed
     }
 
     pub fn sent_tool_reply(&self) -> bool {
@@ -504,7 +511,7 @@ impl Harness {
         let instruction = request.tools.instruction();
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
-        let (cancel, mut cancelled) = watch::channel(false);
+        let (cancel, cancelled) = watch::channel(false);
         let (events, _) = broadcast::channel(32);
         let notifications = events.clone();
         let client = self.client.clone();
@@ -515,7 +522,7 @@ impl Harness {
         let refs_for_task = request_refs.clone();
         let progress = Arc::new(std::sync::Mutex::new(Progress {
             model: request.route.routes[request.route.start].model.clone(),
-            failures: Vec::new(),
+            ..Progress::default()
         }));
         let progress_for_task = progress.clone();
         let task_cancel = cancel.clone();
@@ -541,41 +548,19 @@ impl Harness {
                 &deadline_generation,
                 cancellation,
             );
-            tokio::pin!(execution);
-            let mut interrupted = None;
-            let outcome = tokio::select! { biased;
-                _ = cancelled.changed() => { interrupted = Some(Status::Cancelled); None },
-                _ = tokio::time::sleep_until(deadline) => {
-                    interrupted = Some(Status::Failed(DEADLINE_EXCEEDED.into())); None
-                },
-                result = &mut execution => Some(result),
-            };
-            let outcome = match outcome {
-                Some(result) => result,
-                None => {
-                    // Keep ownership of the handler and its result writer. Model waits are
-                    // cancellable; a dispatched blocking handler must settle under revoked authority.
-                    let _ = task_cancel.send(true);
-                    let revoked = request.tools.revoke();
-                    if matches!(&interrupted, Some(Status::Failed(_))) {
-                        if let Ok(Some(generation)) = &revoked {
-                            // A displayed question can send its closure notice under the new epoch.
-                            let _ = deadline_generation.set(generation.clone());
-                        }
-                    }
-                    let settled = execution.await;
-                    match revoked {
-                        Ok(_) => settled,
-                        Err(reason) => Err(Failure::Uncertain(reason)),
-                    }
-                }
-            };
+            let (outcome, interrupted) = settle_turn(
+                execution, deadline, &task_cancel, cancelled, &request.tools, &deadline_generation,
+            ).await;
             let mut result = match outcome {
                 Err(Failure::Uncertain(detail)) => Status::Paused {
                     reason: "send-unresolved".into(),
                     detail,
                 },
                 Err(Failure::Cancelled) => interrupted.unwrap_or(Status::Cancelled),
+                Err(Failure::InteractionClosed) => {
+                    progress_for_task.lock().unwrap_or_else(|p| p.into_inner()).owner_interaction_closed = true;
+                    interrupted.unwrap_or_else(|| Status::Failed(interactions::TIMED_OUT.into()))
+                }
                 Err(Failure::Failed(reason)) => interrupted.unwrap_or(Status::Failed(reason)),
                 Ok(event) => match interrupted {
                     Some(status) => status,
@@ -614,6 +599,38 @@ impl Harness {
             events,
         })
     }
+}
+
+async fn settle_turn<T>(
+    execution: impl std::future::Future<Output = Result<T, Failure>>,
+    deadline: tokio::time::Instant,
+    cancel: &watch::Sender<bool>,
+    mut cancelled: watch::Receiver<bool>,
+    tools: &Tools,
+    deadline_generation: &std::sync::OnceLock<String>,
+) -> (Result<T, Failure>, Option<Status>) {
+    tokio::pin!(execution);
+    let interrupted = tokio::select! { biased;
+        _ = cancelled.changed() => Status::Cancelled,
+        _ = tokio::time::sleep_until(deadline) => Status::Failed(DEADLINE_EXCEEDED.into()),
+        result = &mut execution => return (result, None),
+    };
+
+    // Keep ownership of the handler and result writer. A dispatched blocking handler
+    // must settle under revoked authority.
+    let _ = cancel.send(true);
+    let revoked = tools.revoke();
+    if matches!(interrupted, Status::Failed(_)) {
+        if let Ok(Some(generation)) = &revoked {
+            let _ = deadline_generation.set(generation.clone());
+        }
+    }
+    let settled = execution.await;
+    let outcome = match revoked {
+        Ok(_) => settled,
+        Err(reason) => Err(Failure::Uncertain(reason)),
+    };
+    (outcome, Some(interrupted))
 }
 
 fn turn_owner(context: &RuntimeContext, turn: &str) -> Result<std::fs::File, String> {

@@ -1287,8 +1287,12 @@ async fn worker(
                     switch_retry = Some((crate::parity_clock::now_ms().saturating_add(ADMISSION_RETRY_MS), job));
                     continue;
                 }
-                // Model errors and refusals were already reported by the pipeline with their own text.
-                if crate::pipeline::take_model_error(&context, &key).is_none() && !error.contains(" 被拒：") && !crate::pipeline::is_cancellation_error(&error) {
+                // Model errors, refusals and confirmed interaction closures already told the owner.
+                if crate::pipeline::take_model_error(&context, &key).is_none()
+                    && !pipe.owner_interaction_closed()
+                    && !error.contains(" 被拒：")
+                    && !crate::pipeline::is_cancellation_error(&error)
+                {
                     crate::admin_alert::notify_notice(
                         &context,
                         &cfg,
