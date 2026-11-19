@@ -359,7 +359,19 @@ pub(crate) fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::Fi
 pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
     if !crate::settings::has_legacy_engine_choices(context)? { return Ok(()); }
     let _gate = config_gate(context)?;
-    crate::settings::import_engine_choices(context)
+    if let Some(config) = crate::settings::import_engine_choices(context)? {
+        write_selected_config_text(context, &config.to_string())
+            .map_err(|_| (503, "conversation engine import could not update config.json".into()))?;
+    }
+    Ok(())
+}
+
+/// Startup and turn admission have no HTTP request to own the writer's record.
+pub(crate) fn import_engine_choices_outside_request(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    let previous = take_config_writes();
+    let result = import_engine_choices(context);
+    CONFIG_WRITES.with(|writes| *writes.borrow_mut() = previous);
+    result
 }
 
 /// The raw selected `config.json` object a writer modifies; never the effective view from
@@ -9764,7 +9776,7 @@ fn conversation_scope_change_waiting(
 ) -> Result<Value, (u16, String)> {
     // #154: `her-cli conversation` requires `--confirm`, which confirms a change of a security setting.
     let body = json!({"conversation": conversation, "action": action, "confirm": true}).to_string();
-    import_engine_choices(context)?;
+    import_engine_choices_outside_request(context)?;
     let result = access::conversation_scope(context, &body);
     // No request takes the write record here (`persist_snowluma_endpoint` does the same).
     let _ = take_config_writes();
@@ -14778,7 +14790,7 @@ pub fn serve_with_context(
     let _ = CONSOLE_PORT.set(port);
     crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
     access::harden_selected_state_dir(&context);
-    if let Err((_, error)) = import_engine_choices(&context) {
+    if let Err((_, error)) = import_engine_choices_outside_request(&context) {
         crate::safe_println!("[console] conversation engine import: {error}");
     }
     // Before the start stamp of config.json is noted: the write-back may change the file.

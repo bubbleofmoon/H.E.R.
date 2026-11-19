@@ -65,8 +65,66 @@ fn engine_switch_replays_a_conversation_in_both_directions_once() {
     assert_eq!(rig.wait_texts(GROUP_KEY, 6), [ACK, "synthetic reply", ACK, "answer through the new route", ACK, "synthetic reply"]);
     let prompts = rig.wait_prompts(2);
     assert_ne!(prompts[1].session, old, "the return must create a fresh session");
+    assert!(prompts[1].text.contains("【之前聊天的摘要】"));
     assert!(prompts[1].text.contains("We agreed on blue curtains."), "the return prompt must carry the reverse handover");
     assert_eq!(lock(&model.requests).len(), 3, "the old route must stop after the return");
+}
+
+#[test]
+fn engine_switch_round1_malformed_legacy_map_fails_turns_without_parking() {
+    let mut rig = Rig::new("engine-switch-bad-legacy-map", Seed {
+        config: json!({"conversationEngines": []}),
+        ..Seed::default()
+    });
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "first affected conversation");
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| {
+        text.contains(&format!("[{GROUP_KEY}] 回合失败：conversationEngines must be an object"))
+    })), "the import refusal must produce a turn-failure owner notice");
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+
+    says(&rig, OWNER_KEY, OWNER, "tester", "second affected conversation");
+    assert!(wait_for(LONG, || handled_rows(&rig, OWNER_KEY) == 1),
+        "another conversation must settle its failed inbound without parking");
+    assert!(rig.dsh.prompts().is_empty());
+
+    let path = rig.root.join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("conversationEngines");
+    let staged = path.with_extension("tmp");
+    fs::write(&staged, config.to_string()).unwrap();
+    fs::rename(staged, path).unwrap();
+    says(&rig, OWNER_KEY, OWNER, "tester", "continue after the config repair");
+    assert!(wait_for(LONG, || handled_rows(&rig, OWNER_KEY) == 2));
+    let prompts = rig.wait_prompts(1);
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].text.contains("continue after the config repair"));
+}
+
+#[test]
+fn engine_switch_round1_console_archive_failure_preserves_the_rollback_summary() {
+    let model = FakeModel::start(vec!["Saved context for the source after rollback."]);
+    let rig = switching_rig("engine-switch-archive-rollback", &model);
+    says(&rig, GROUP_KEY, 1001, "tester", "settle the original DSH turn");
+    rig.wait_texts(GROUP_KEY, 2);
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    let old = rig.wait_prompts(1)[0].session.clone();
+    lock(&rig.dsh.inner).archive_failures = 1;
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 503, "the archive failure must refuse the console switch: {body}");
+    let state = rig.data_json("social-v2.json");
+    let conversation = &state["conversations"][GROUP_KEY];
+    assert_eq!(conversation["engineHandover"]["pending"]["archive_started"], true);
+
+    // The failed console request restored the previous DSH preference.
+    says(&rig, GROUP_KEY, 1001, "tester", "continue on DSH after rollback");
+    assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "synthetic reply");
+    let prompts = rig.wait_prompts(2);
+    assert_ne!(prompts[1].session, old, "the ambiguous archive must retire the captured session");
+    assert!(prompts[1].text.contains("【之前聊天的摘要】\nSaved context for the source after rollback."),
+        "the fresh DSH prompt must carry the marked rollback summary");
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1);
+    assert_eq!(lock(&model.requests).len(), 1);
 }
 
 #[test]

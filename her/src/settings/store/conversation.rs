@@ -28,14 +28,14 @@ pub(crate) fn has_legacy_engine_choices(context: &RuntimeContext) -> Result<bool
 }
 
 /// Caller holds the configuration gate. An existing scope's audit history is a receipt,
-/// including when a later access change cleared the imported choice.
-pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    use crate::runtime::RuntimeArea;
+/// including when a later access change cleared the imported choice. Return the fresh
+/// configuration without the legacy map for the console's configuration writer.
+pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<Option<Value>, (u16, String)> {
     use crate::settings::CONVERSATION_ENGINE;
 
     let read = || raw_config(context).map_err(|error| (503, error));
     let document = read()?;
-    let Some(old) = document.get("conversationEngines") else { return Ok(()) };
+    let Some(old) = document.get("conversationEngines") else { return Ok(None) };
     let choices = old.as_object().ok_or((503, "conversationEngines must be an object".into()))?;
     if !choices.is_empty() {
         let (skipped, _) = write_store_with(context, false, &[], true, |conn| {
@@ -70,8 +70,7 @@ pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16
     // Read after the settings write-back. A crash before this replacement leaves the audit receipts.
     let mut fresh = read()?;
     fresh.as_object_mut().expect("raw config is an object").remove("conversationEngines");
-    context.write_atomic(RuntimeArea::Config, "config.json", fresh.to_string().as_bytes())
-        .map_err(|_| (503, "conversation engine import could not update config.json".into()))
+    Ok(Some(fresh))
 }
 
 /// The scoped choice and global default from one settings snapshot. The caller supplies

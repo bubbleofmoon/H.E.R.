@@ -698,6 +698,7 @@ fn revoke_key(context: &RuntimeContext, cfg: &Value, key: &str, why: &str) -> Re
         {
             conversation.insert("agentToken".into(), json!(fresh_agent_token()));
             conversation.insert("bootstrapSent".into(), json!(false));
+            conversation.remove("engineHandover");
         }
         Ok(())
     }) {

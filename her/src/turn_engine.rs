@@ -30,7 +30,7 @@ impl Engine {
             return Ok(Self::Dsh);
         }
         if cfg.get("conversationEngines").is_some() {
-            crate::console::import_engine_choices(context).map_err(|(_, error)| error)?;
+            crate::console::import_engine_choices_outside_request(context).map_err(|(_, error)| error)?;
         }
         Self::read_choice(context, cfg, conversation)
     }

@@ -1649,6 +1649,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         for revision in 0..=3 {
             let delivered = crate::model_view::strip_text_with_runtime(&self.context, &draft_prompt, cfg);
             let started = std::time::Instant::now();
+            self.dispatch_unsubmitted = false;
             let result = provider(&delivered);
             let elapsed_ms = started.elapsed().as_millis() as i64;
             let record = serde_json::json!({

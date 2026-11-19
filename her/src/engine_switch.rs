@@ -37,6 +37,10 @@ struct Retry {
     episode: Episode,
     delay_ms: i64,
     retry_at_ms: i64,
+    #[serde(default)]
+    park: bool,
+    #[serde(default)]
+    notice_pending: bool,
 }
 
 fn retry_path(key: &str) -> String {
@@ -83,18 +87,24 @@ fn next_delay(previous: Option<&Retry>) -> i64 {
     previous.map_or(FIRST_RETRY_MS, |retry| (retry.delay_ms * 2).min(MAX_RETRY_MS))
 }
 
-fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, retry: &Retry, first: bool, class: &str) {
-    let saved = serde_json::to_vec(retry).ok().is_some_and(|bytes| {
+fn record_failure(context: &RuntimeContext, cfg: &Value, key: &str, mut retry: Retry, class: &str) {
+    let offer_notice = std::mem::take(&mut retry.notice_pending);
+    let saved = serde_json::to_vec(&retry).ok().is_some_and(|bytes| {
         context.write_atomic(RuntimeArea::Data, &retry_path(key), &bytes).is_ok()
     });
     if let Some(root) = context.runtime_root() {
         let slot = root.join(retry_path(key));
         let mut unsaved = unsaved_retries().lock().unwrap_or_else(|p| p.into_inner());
-        if saved { unsaved.remove(&slot); } else { unsaved.insert(slot, retry.clone()); }
+        if saved {
+            unsaved.remove(&slot);
+        } else {
+            retry.notice_pending = offer_notice;
+            unsaved.insert(slot, retry);
+        }
     }
     if !saved {
         crate::safe_println!("[chat] {key} engine switch retry state could not be saved");
-    } else if first {
+    } else if offer_notice {
         crate::admin_alert::notify_notice(context, cfg, &format!("[{key}] 会话引擎切换失败（{class}）"),
             &format!("engine-switch:{key}"));
     }
@@ -198,10 +208,21 @@ fn pending_conversation<'a>(
     Ok(conv)
 }
 
-fn clear_pending(context: &RuntimeContext, key: &str, conv: &mut Value, pending: &Pending) -> Result<(), (u16, String)> {
+fn clear_pending(
+    context: &RuntimeContext, key: &str, conv: &mut Value, pending: &Pending, continuing: Engine,
+) -> Result<(), (u16, String)> {
     // An interrupted archive may already have succeeded. Never submit to its captured session.
     if let Some(sid) = pending.session.as_ref().filter(|_| pending.archive_started) {
         crate::session_map::retire_if(context, key, sid).map_err(refused)?;
+    }
+    if pending.archive_started {
+        if conv["agentToken"].as_str().is_none_or(str::is_empty) {
+            conv["agentToken"] = json!(crate::console::fresh_agent_token());
+        }
+        conv[FIELD] = json!(Handover {
+            engine: Some(continuing), epoch: Some(epoch(conv)), summary: Some(pending.summary.clone()), pending: None,
+        });
+        return Ok(());
     }
     let same_epoch = pending.epoch == epoch(conv);
     if let Some(fields) = conv[FIELD].as_object_mut() {
@@ -219,13 +240,7 @@ fn clear_pending(context: &RuntimeContext, key: &str, conv: &mut Value, pending:
 }
 
 pub(crate) fn prepare_turn(context: &RuntimeContext, key: &str, mode: &str) -> Result<TurnPreparation, String> {
-    match prepare_admission(context, key, mode, None) {
-        Err((status, error)) if matches!(mode, "chat" | "closed-agent") && (status >= 500 || error == UNSETTLED) => {
-            crate::safe_println!("[chat] {key} engine switch admission deferred");
-            Ok(TurnPreparation::ParkUntil(crate::parity_clock::now_ms().saturating_add(FIRST_RETRY_MS)))
-        }
-        result => result.map_err(|(_, error)| error),
-    }
+    prepare_admission(context, key, mode, None).map_err(|(_, error)| error)
 }
 
 pub(crate) fn prepare(context: &RuntimeContext, key: &str, mode: &str, requested: Engine) -> Result<(), (u16, String)> {
@@ -253,12 +268,15 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
     let conversation = &state["conversations"][key];
     let generation = epoch(conversation);
     let mut record = read_handover(conversation).map_err(refused)?;
-    let session = crate::session_map::lookup(context, key).map_err(refused)?;
+    let session = crate::session_map::lookup(context, key).map_err(refused);
     let published = record.engine.filter(|_| record.epoch.as_deref() == Some(generation.as_str()));
     let staged = record.pending.as_ref().filter(|pending| pending.epoch == generation).map(|pending| pending.from);
     let source = if let Some(engine) = published.or(staged) {
         engine
-    } else if session.is_some() {
+    } else if let Err(error) = &session {
+        // A pending switch still needs its retry episode when the binding is unreadable.
+        record.pending.as_ref().map(|pending| pending.from).ok_or_else(|| error.clone())?
+    } else if session.as_ref().is_ok_and(Option::is_some) {
         Engine::Dsh
     } else if !generation.is_empty() && crate::harness::store::has_generation(context, key, &generation).map_err(refused)? {
         Engine::Harness
@@ -266,104 +284,101 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
         wanted
     };
     if record.pending.is_none() && source == wanted {
+        session?;
         clear_retry(context, key);
         return Ok(Ready(wanted));
     }
-    let (turns, _) = crate::turn_ledger::fold(&crate::turn_ledger::read_records(context).map_err(refused)?);
-    if crate::turn_ledger::blocking_turn(&turns, key).is_some() {
-        return Err((409, UNSETTLED.into()));
+
+    let stamp = crate::reserved::mode_stamp(context).map_err(refused);
+    let automatic = requested.is_none() && matches!(mode, "chat" | "closed-agent");
+    let episode = Episode {
+        from: source, to: wanted, epoch: generation.clone(),
+        mode_stamp: stamp.as_ref().ok().cloned()
+            .or_else(|| record.pending.as_ref().map(|pending| pending.mode_stamp.clone()))
+            .unwrap_or_default(),
+    };
+    let previous_retry = if automatic { load_retry(context, key) } else { Ok(None) };
+    let retry = previous_retry.as_ref().ok().and_then(Option::as_ref).filter(|retry| retry.episode == episode);
+    let cooldown = retry.filter(|retry| crate::parity_clock::now_ms() < retry.retry_at_ms);
+    if let Some(retry) = cooldown.filter(|retry| record.pending.is_some() || retry.park) {
+        return Ok(ParkUntil(retry.retry_at_ms));
     }
 
-    let stamp = crate::reserved::mode_stamp(context).map_err(refused)?;
     let permitted = |current_cfg: &Value| -> Result<(), (u16, String)> {
         if !crate::settings::conversation_admitted(current_cfg, key) || !crate::console::access_allowed(current_cfg, mode, key) {
             return Err((409, NOT_ADMITTED.into()));
         }
-        if crate::console::runtime_mode(context) != mode || crate::reserved::mode_stamp(context).map_err(refused)? != stamp {
+        if crate::console::runtime_mode(context) != mode
+            || crate::reserved::mode_stamp(context).map_err(refused)? != *stamp.as_ref().map_err(Clone::clone)? {
             return Err((409, CHANGED.into()));
         }
         Ok(())
     };
-    permitted(&cfg)?;
-
-    if let Some(stale) = record.pending.as_ref().filter(|p| {
-        p.epoch != generation || p.mode_stamp != stamp
-            || session.as_ref().is_some_and(|current| p.session.as_ref() != Some(current))
-    }) {
-        crate::console::mutate_social_state_for(context, |fresh| {
-            let conv = pending_conversation(fresh, key, &generation, stale)?;
-            clear_pending(context, key, conv, stale)
-        })?;
-        clear_retry(context, key);
-        return Err(admission_changed()); // Re-admit the same inbound after stale cleanup.
-    }
-
-    if let Some(superseded) = record.pending.as_ref().filter(|pending| pending.to != wanted) {
-        crate::console::mutate_social_state_for(context, |fresh| {
-            let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
-            permitted(&current_cfg)?;
-            if Engine::read_choice(context, &current_cfg, key).map_err(refused)? != wanted {
-                return Err(admission_changed());
-            }
-            let conv = pending_conversation(fresh, key, &generation, superseded)?;
-            clear_pending(context, key, conv, superseded)
-        })?;
-        clear_retry(context, key);
-        return Ok(Ready(superseded.from));
-    }
-
-    let automatic = requested.is_none() && matches!(mode, "chat" | "closed-agent");
-    let episode = Episode { from: source, to: wanted, epoch: generation.clone(), mode_stamp: stamp.clone() };
-    let previous_retry = if automatic {
-        match load_retry(context, key) {
-            Ok(retry) => retry.filter(|retry| retry.episode == episode),
-            Err(_) if record.pending.is_none() => {
-                crate::safe_println!("[chat] {key} engine switch retry state is unreadable");
-                return Ok(Ready(source));
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        None
-    };
-    let now = crate::parity_clock::now_ms();
-    if let Some(retry) = previous_retry.as_ref().filter(|retry| now < retry.retry_at_ms) {
-        return Ok(if record.pending.is_some() { ParkUntil(retry.retry_at_ms) } else { Ready(source) });
-    }
-
-    let failed = |(status, error), pending_exists| -> Result<TurnPreparation, (u16, String)> {
-        if !automatic || status < 500 {
-            return Err((status, error));
-        }
-        let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
-        permitted(&current_cfg)?;
-        if Engine::read_choice(context, &current_cfg, key).map_err(refused)? != wanted {
+    let recheck_choice = |current_cfg: &Value| {
+        permitted(current_cfg)?;
+        if Engine::read_choice(context, current_cfg, key).map_err(refused)? != wanted {
             return Err(admission_changed());
         }
-        // An atomic stage write can report an error after replacing the file. Prove that
-        // the original epoch and binding still hold and no pending switch was published.
-        let can_serve = if pending_exists {
-            false
-        } else {
-            match crate::console::load_social_state_for(context) {
-                Ok(fresh) => {
-                    validate_conversation(&fresh, key)?;
-                    let conv = &fresh["conversations"][key];
-                    if epoch(conv) != generation || crate::session_map::lookup(context, key).map_err(refused)? != session {
-                        return Err(admission_changed());
-                    }
-                    read_handover(conv).map_err(refused)?.pending.is_none()
-                }
-                Err(_) => false,
-            }
+        Ok(())
+    };
+    let failed = |(status, error): (u16, String), can_serve: bool| {
+        if !automatic || (status < 500 && error != UNSETTLED) {
+            return Err((status, error));
+        }
+        let current_cfg = context.load_config().map_err(|error| (503, error.to_string()));
+        let can_serve = match current_cfg.as_ref().map_err(Clone::clone).and_then(recheck_choice) {
+            Ok(()) => can_serve,
+            Err(error) if error.0 < 500 => return Err(error),
+            Err(_) => false,
         };
-        let delay_ms = next_delay(previous_retry.as_ref());
+        let delay_ms = next_delay(retry);
         let retry_at_ms = crate::parity_clock::now_ms().saturating_add(delay_ms);
-        let retry = Retry { episode, delay_ms, retry_at_ms };
+        let next = Retry {
+            episode: episode.clone(), delay_ms, retry_at_ms, park: !can_serve,
+            notice_pending: retry.is_none_or(|retry| retry.notice_pending),
+        };
         let class = if can_serve { "engine-switch-prepare" } else { "engine-switch-pending" };
-        record_failure(context, &current_cfg, key, &retry, previous_retry.is_none(), class);
+        record_failure(context, current_cfg.as_ref().unwrap_or(&cfg), key, next, class);
         Ok(if can_serve { Ready(source) } else { ParkUntil(retry_at_ms) })
     };
+
+    let (session, mode_stamp) = match (|| {
+        let (turns, _) = crate::turn_ledger::fold(&crate::turn_ledger::read_records(context).map_err(refused)?);
+        if crate::turn_ledger::blocking_turn(&turns, key).is_some() {
+            return Err((409, UNSETTLED.into()));
+        }
+        previous_retry.as_ref().map_err(Clone::clone)?;
+        Ok((session?, stamp.as_ref().map_err(Clone::clone)?))
+    })() {
+        Ok(ready) => ready,
+        Err(error) => return failed(error, false),
+    };
+    if let Err(error) = permitted(&cfg) {
+        return failed(error, false);
+    }
+    if cooldown.is_some() {
+        return Ok(Ready(source));
+    }
+
+    if let Some(pending) = record.pending.as_ref() {
+        let stale = pending.epoch != generation || pending.mode_stamp != *mode_stamp
+            || session.as_ref().is_some_and(|current| pending.session.as_ref() != Some(current));
+        if stale || pending.to != wanted {
+            let continuing = if stale { source } else { pending.from };
+            let cleared = crate::console::mutate_social_state_for(context, |fresh| {
+                let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
+                recheck_choice(&current_cfg)?;
+                let conv = pending_conversation(fresh, key, &generation, pending)?;
+                clear_pending(context, key, conv, pending, continuing)
+            });
+            if let Err(error) = cleared {
+                return failed(error, false);
+            }
+            clear_retry(context, key);
+            // Re-admit the same inbound after stale cleanup.
+            return if stale { Err(admission_changed()) } else { Ok(Ready(continuing)) };
+        }
+    }
 
     let mut pending = match record.pending.take() {
         Some(pending) => pending,
@@ -377,13 +392,12 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
                 Engine::Harness => crate::harness::store::switch_history(context, key, &generation, HISTORY_ROWS).map_err(refused)?,
             };
             let summary = summarize(context, &cfg, previous, rows, source).map_err(refused)?;
-            let pending = Pending { from: source, to: wanted, epoch: generation.clone(), mode_stamp: stamp.clone(), session: session.clone(), summary, archive_started: false };
+            let pending = Pending { from: source, to: wanted, epoch: generation.clone(), mode_stamp: mode_stamp.clone(), session: session.clone(), summary, archive_started: false };
             crate::console::mutate_social_state_for(context, |fresh| {
                 validate_conversation(fresh, key)?;
                 let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
-                permitted(&current_cfg)?; // Access may have changed while summarizing.
+                recheck_choice(&current_cfg)?; // Access may have changed while summarizing.
                 if epoch(&fresh["conversations"][key]) != generation
-                    || Engine::read_choice(context, &current_cfg, key).map_err(refused)? != wanted
                     || crate::session_map::lookup(context, key).map_err(refused)? != pending.session {
                     return Err(admission_changed());
                 }
@@ -393,7 +407,30 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
             Ok(pending)
         })() {
             Ok(pending) => pending,
-            Err(error) => return failed(error, false),
+            Err(error) => {
+                if !automatic || error.0 < 500 {
+                    return Err(error);
+                }
+                // A failed write may have staged the switch. Serve the source only while
+                // its selection, epoch and binding are still proven and no switch is staged.
+                let can_serve = match (|| {
+                    let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
+                    recheck_choice(&current_cfg)?;
+                    let fresh = crate::console::load_social_state_for(context)?;
+                    validate_conversation(&fresh, key)?;
+                    let conv = &fresh["conversations"][key];
+                    if epoch(conv) != generation
+                        || crate::session_map::lookup(context, key).map_err(refused)? != session {
+                        return Err(admission_changed());
+                    }
+                    Ok(read_handover(conv).map_err(refused)?.pending.is_none())
+                })() {
+                    Ok(can_serve) => can_serve,
+                    Err(error) if error.0 < 500 => return Err(error),
+                    Err(_) => false,
+                };
+                return failed(error, can_serve);
+            }
         },
     };
     match finish_pending(context, key, &cfg, &generation, &mut pending, &permitted) {
@@ -401,7 +438,7 @@ fn prepare_admission(context: &RuntimeContext, key: &str, mode: &str, requested:
             clear_retry(context, key); // Publication ends the retry episode.
             Ok(Ready(pending.to))
         }
-        Err(error) => failed(error, true),
+        Err(error) => failed(error, false),
     }
 }
 
