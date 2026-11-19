@@ -17,3 +17,6 @@ graphify-out/
 ci-evidence/
 # Private run data (agent usage ledger) stays untracked
 .scratch/
+
+# Local Claude Code overrides (machine-specific, may hold credentials)
+.claude/settings.local.json
