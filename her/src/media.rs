@@ -39,7 +39,7 @@ pub struct Limits {
 impl Limits {
     pub fn from_config(cfg: &Value) -> Self {
         Self {
-            bytes: crate::settings::MEDIA_BYTES.integer(cfg) as usize,
+            bytes: crate::settings::MEDIA_BYTES.integer(&Value::Null) as usize, // RED-S1
             pixels: crate::settings::MEDIA_PIXELS.integer(cfg) as u64,
             count: crate::settings::MEDIA_COUNT.integer(cfg) as usize,
         }
