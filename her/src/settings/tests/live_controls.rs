@@ -62,3 +62,38 @@ fn settings_batch_sticker_chat_spelling_writes_the_live_sticker_switch() {
     assert!(chat(&context, "settings-set", json!({"settingKey":key,"value":20_971_521})).is_err());
     assert_eq!(setting_view(&context, key)["stored"], 1024, "invalid chat edit leaves the cap in place");
 }
+
+#[test]
+fn settings_batch_alert_uses_live_limits_without_clearing_spent_budget() {
+    use crate::admin_alert::{AlertLimiter, AlertVerdict};
+    let (_root, context) = settings_fixture("settings live alert limits");
+    let fallback = context.load_config().unwrap();
+    let mut limiter = AlertLimiter::new();
+    assert_eq!(limiter.check_current(&context, &fallback, "first", 1000), AlertVerdict::Send);
+    for (setting, value) in [("alerts.keyWindowSecs", 2), ("alerts.hourlyCap", 1)] {
+        assert_eq!(post(&context, "/api/settings/set", json!({"setting":setting,"value":value})).0, 200);
+    }
+    assert_eq!(limiter.check_current(&context, &fallback, "first", 2999), AlertVerdict::SkipKeyWindow);
+    assert_eq!(limiter.check_current(&context, &fallback, "first", 3000), AlertVerdict::SkipHourlyCap, "the live window must end at exactly two seconds");
+    assert_eq!(limiter.check_current(&context, &fallback, "second", 3000), AlertVerdict::SkipHourlyCap, "lowering the cap keeps the existing charge");
+    assert_eq!(limiter.check_current(&context, &fallback, "second", 3_600_999), AlertVerdict::SkipHourlyCap);
+    assert_eq!(limiter.check_current(&context, &fallback, "second", 3_601_000), AlertVerdict::Send);
+}
+
+#[test]
+fn settings_batch_gateway_silence_uses_the_live_threshold() {
+    let (root, context) = settings_fixture("settings live silence threshold");
+    write_config(&root, |cfg| cfg["snowluma"]["silenceWarnMs"] = json!(5_000));
+    let mut health = crate::gateway_health::GatewayHealth::new();
+    health.note_packet("message", 1000);
+    health.configure(&context.load_config().unwrap());
+    assert_eq!(health.snapshot(61_000)["silent"], false);
+    assert_eq!(health.snapshot(61_001)["silent"], true, "legacy values clamp to the safety minimum");
+    let setting = "snowluma.silenceWarnMs";
+    assert_eq!(post(&context, "/api/settings/set", json!({"setting":setting,"value":59_999})).0, 400);
+    assert_eq!(post(&context, "/api/settings/set", json!({"setting":setting,"value":120_000})).0, 200);
+    health.configure(&context.load_config().unwrap());
+    assert_eq!(health.snapshot(61_001)["silent"], false, "the next poll must use the new threshold");
+    assert_eq!(health.snapshot(121_000)["silent"], false);
+    assert_eq!(health.snapshot(121_001)["silent"], true);
+}

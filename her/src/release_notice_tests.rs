@@ -208,7 +208,7 @@ fn notice_worker_child() {
     let cfg = context.load_config().unwrap();
     if phase == "hourly" {
         let mut limiter = notice_limiter().lock().unwrap();
-        for n in 0..HOURLY_CAP {
+        for n in 0..crate::settings::ALERT_HOURLY_CAP.integer(&serde_json::Value::Null) {
             assert!(limiter
                 .check(
                     "fixture",

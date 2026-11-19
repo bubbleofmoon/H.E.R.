@@ -2,6 +2,7 @@
 //! conversation (#218) are a scope of their own (`conversation_registry()`), never in `registry()`.
 
 mod access;
+mod alerts;
 mod engine;
 mod media;
 mod model;
@@ -17,6 +18,7 @@ pub(crate) use stickers::{COLLECT_BYTES, COLLECT_ENABLED, COLLECT_HOUR, COLLECT_
 pub(crate) use tools::{tool_enabled, tool_switches};
 pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS};
 
+pub(crate) use alerts::{ALERT_HOURLY_CAP, ALERT_KEY_WINDOW, GATEWAY_SILENCE_WARN};
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 #[cfg(test)]
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
@@ -35,7 +37,9 @@ const GROUPS: &[&[Setting]] = &[
 
 /// Settings whose effective values are also materialized on the runtime configuration document.
 pub(super) fn live_batch() -> impl Iterator<Item = &'static Setting> {
-    [tools::SETTINGS, voice::SETTINGS, stickers::SETTINGS, media::SETTINGS].into_iter().flatten()
+    [tools::SETTINGS, voice::SETTINGS, stickers::SETTINGS, media::SETTINGS, alerts::SETTINGS]
+        .into_iter()
+        .flatten()
 }
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its

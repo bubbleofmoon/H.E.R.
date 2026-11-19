@@ -20,6 +20,8 @@ pub(crate) enum FileRule {
     Default,
     /// A non-negative integer is clamped into the bounds; any other value reads as the default.
     Clamp,
+    /// A positive JSON integer is clamped; zero and other values read as the default.
+    PositiveClamp,
     /// A signed JSON integer is clamped.
     SignedClamp,
     /// The media file reader accepts positive values under JS number coercion, rounds and clamps.
@@ -43,6 +45,7 @@ impl SettingKind for Integer {
         match self.file {
             FileRule::Clamp => found.as_u64().map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
             FileRule::Default => self.normalize(found),
+            FileRule::PositiveClamp => found.as_u64().filter(|n| *n > 0).map(|n| json!(n.clamp(min as u64, max as u64))),
             FileRule::SignedClamp => found.as_i64().map(|n| json!(n.clamp(min, max))),
             FileRule::Media | FileRule::VoiceBytes => {
                 let n = if self.file == FileRule::Media {
@@ -92,7 +95,7 @@ impl SettingKind for Integer {
         assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
         assert_eq!(setting.default_value(), json!(default));
         assert_eq!(setting.integer(&json!({})), default, "{}: a missing value reads as the default", setting.key);
-        if file == FileRule::Clamp {
+        if matches!(file, FileRule::Clamp | FileRule::PositiveClamp) {
             assert!(min >= 0, "{}: a clamped setting has non-negative bounds", setting.key);
         }
     }

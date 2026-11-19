@@ -1,7 +1,7 @@
 //! Administrator alert dedupe and rate limit (ticket 25, AC5).
 //!
-//! The exact policy of the frozen JS `notifyOwnerQQ`: one private message per dedupe key per 60 s and ten per
-//! hour in total, body cut to 800 characters. The limiter is a pure state machine over an injected time so the
+//! Live settings control deduplication and the sliding hourly limit. The notifier cuts bodies to 800 characters.
+//! The limiter is a pure state machine over an injected time so the
 //! windows are testable without waiting; it decides, the caller sends. Resident callers send in the background;
 //! restore failure callers wait for bounded completion before exit. The notifier does not retry sends;
 //! QQ login episodes explicitly own a durable, bounded retry policy above this layer.
@@ -13,11 +13,8 @@
 
 use std::collections::HashMap;
 
-/// Same-key window of the frozen JS.
-pub const KEY_WINDOW_MS: i64 = 60_000;
-/// JS global cap per sliding hour.
-pub const HOURLY_CAP: usize = 10;
-pub const HOUR_MS: i64 = 3_600_000;
+/// Sliding hour duration.
+const HOUR_MS: i64 = 3_600_000;
 /// JS `truncateText(text, 800)`.
 pub const BODY_MAX_CHARS: i64 = 800;
 /// Distinct (scope, key) slots remembered; the oldest are dropped beyond this, which only ever allows a repeat sooner.
@@ -27,9 +24,9 @@ const MAX_SLOTS: usize = 256;
 pub enum AlertVerdict {
     /// Send it now (the slot and the hourly budget have been charged).
     Send,
-    /// The same key was sent less than 60 s ago.
+    /// The same key is still inside its deduplication window.
     SkipKeyWindow,
-    /// Ten alerts already went out in the last hour.
+    /// The current hourly budget has been spent.
     SkipHourlyCap,
 }
 
@@ -60,15 +57,25 @@ impl AlertLimiter {
 
     /// Decide for an alert with `key` in `scope` (the runtime scope; one process may host several) at `now_ms`.
     /// Only a `Send` verdict is recorded: a skipped alert neither refreshes the key window nor spends hourly budget.
+    #[cfg(test)]
     pub fn check(&mut self, scope: &str, key: &str, now_ms: i64) -> AlertVerdict {
+        self.check_with(scope, key, now_ms, Limits::read(&Value::Null))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn check_current(&mut self, context: &RuntimeContext, fallback: &Value, key: &str, now_ms: i64) -> AlertVerdict {
+        self.check_with("fixture", key, now_ms, Limits::current(context, fallback))
+    }
+
+    fn check_with(&mut self, scope: &str, key: &str, now_ms: i64, limits: Limits) -> AlertVerdict {
         let slot = (scope.to_string(), key.to_string());
         if let Some(last) = self.last.get(&slot) {
-            if now_ms - last < KEY_WINDOW_MS {
+            if now_ms - last < limits.window_secs * 1000 {
                 return AlertVerdict::SkipKeyWindow;
             }
         }
         self.hour.retain(|t| now_ms - *t < HOUR_MS);
-        if self.hour.len() >= HOURLY_CAP {
+        if self.hour.len() >= limits.hourly_cap {
             return AlertVerdict::SkipHourlyCap;
         }
         if self.last.len() >= MAX_SLOTS && !self.last.contains_key(&slot) {
@@ -101,14 +108,38 @@ pub fn prepare_body(text: &str, redact: impl Fn(&str) -> String) -> String {
 
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::RuntimeContext;
+use crate::settings::{ALERT_HOURLY_CAP, ALERT_KEY_WINDOW};
 use serde_json::Value;
 use std::sync::{Mutex, OnceLock};
+
+#[derive(Clone, Copy)]
+struct Limits {
+    window_secs: i64,
+    hourly_cap: usize,
+}
+
+impl Limits {
+    fn current(context: &RuntimeContext, fallback: &Value) -> Self {
+        let fresh = context.is_isolated()
+            .then(|| context.load_config_document().ok())
+            .flatten()
+            .filter(Value::is_object);
+        Self::read(fresh.as_ref().unwrap_or(fallback))
+    }
+
+    fn read(cfg: &Value) -> Self {
+        Self {
+            window_secs: ALERT_KEY_WINDOW.integer(cfg),
+            hourly_cap: ALERT_HOURLY_CAP.integer(cfg) as usize,
+        }
+    }
+}
 
 /// Which rate budget an alert is charged to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Budget {
     /// Alerts the frozen JS texts (`notifyOwnerQQ`) and the administrator messages JS intends (`notifyAdmin`, accepted
-    /// deviation 21): one per kind per minute, ten per hour.
+    /// deviation 21): shared settings for deduplication and hourly spending.
     Js,
     /// Rust-only owner notices (accepted deviation 22): the same rule on a limiter of their own, so a flood of notices
     /// can never use up the budget of the alerts JS sends.
@@ -137,6 +168,7 @@ pub fn memory_limiter() -> &'static Mutex<AlertLimiter> {
 }
 
 /// Charge `key` to `budget` (pure over the three limiters, so the policy is testable).
+#[cfg(test)]
 fn admit(js: &mut AlertLimiter, notice: &mut AlertLimiter, memory: &mut AlertLimiter, budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVerdict {
     match budget {
         Budget::Js => js.check(scope, key, now_ms),
@@ -145,7 +177,7 @@ fn admit(js: &mut AlertLimiter, notice: &mut AlertLimiter, memory: &mut AlertLim
     }
 }
 
-fn admit_global(budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVerdict {
+fn admit_global(budget: Budget, scope: &str, key: &str, now_ms: i64, limits: Limits) -> AlertVerdict {
     let mut limiter = match budget {
         Budget::Js => shared_limiter(),
         Budget::Notice => notice_limiter(),
@@ -153,7 +185,7 @@ fn admit_global(budget: Budget, scope: &str, key: &str, now_ms: i64) -> AlertVer
     }
     .lock()
     .unwrap_or_else(|p| p.into_inner());
-    limiter.check(scope, key, now_ms)
+    limiter.check_with(scope, key, now_ms, limits)
 }
 
 /// The dedupe key of an administrator message kind (`turn-error`, `not-accepted`, `blocked-reply`). It never equals the
@@ -284,16 +316,17 @@ fn notify_with(context: &RuntimeContext, cfg: &Value, budget: Budget, text: &str
         return false;
     };
     let now = crate::parity_clock::now_ms();
-    match admit_global(budget, &scope_of(context), dedupe_key, now) {
+    let limits = Limits::current(context, cfg);
+    match admit_global(budget, &scope_of(context), dedupe_key, now, limits) {
         AlertVerdict::Send => {}
         AlertVerdict::SkipKeyWindow => {
-            crate::safe_println!("[notify] 跳过（{dedupe_key} 60 秒内已发过）");
-            note(context, dedupe_key, Outcome::Skipped, "same key already sent within 60 seconds");
+            crate::safe_println!("[notify] 跳过（{dedupe_key} {} 秒内已发过）", limits.window_secs);
+            note(context, dedupe_key, Outcome::Skipped, &format!("same key already sent within {} seconds", limits.window_secs));
             return false;
         }
         AlertVerdict::SkipHourlyCap => {
-            crate::safe_println!("[notify] 跳过（每小时上限 10 条）");
-            note(context, dedupe_key, Outcome::Skipped, "hourly cap of 10 reached");
+            crate::safe_println!("[notify] 跳过（每小时上限 {} 条）", limits.hourly_cap);
+            note(context, dedupe_key, Outcome::Skipped, &format!("hourly cap of {} reached", limits.hourly_cap));
             return false;
         }
     }
@@ -462,7 +495,7 @@ mod tests {
     fn rust_only_notices_never_spend_the_budget_of_the_js_texted_alerts() {
         let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
         let t0 = 50_000_000i64;
-        for i in 0..HOURLY_CAP as i64 {
+        for i in 0..ALERT_HOURLY_CAP.integer(&Value::Null) {
             assert!(admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", &format!("n{i}"), t0 + i).is_send());
         }
         assert_eq!(
@@ -480,7 +513,7 @@ mod tests {
     #[test]
     fn a_js_texted_alert_never_spends_the_notice_budget_either() {
         let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
-        for i in 0..HOURLY_CAP as i64 {
+        for i in 0..ALERT_HOURLY_CAP.integer(&Value::Null) {
             assert!(admit(&mut js, &mut notice, &mut memory, Budget::Js, "s", &format!("j{i}"), 1_000 + i).is_send());
         }
         assert!(admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", "dsh-recovered", 2_000).is_send());
@@ -490,7 +523,7 @@ mod tests {
     fn memory_alerts_are_refused_once_their_own_limiter_is_spent() {
         let (mut js, mut notice, mut memory) = (AlertLimiter::new(), AlertLimiter::new(), AlertLimiter::new());
         let t0 = 80_000_000i64;
-        for i in 0..HOURLY_CAP as i64 {
+        for i in 0..ALERT_HOURLY_CAP.integer(&Value::Null) {
             assert!(admit(&mut js, &mut notice, &mut memory, Budget::Memory, "s", &format!("m{i}"), t0 + i).is_send());
         }
         assert_eq!(
@@ -502,7 +535,7 @@ mod tests {
             admit(&mut js, &mut notice, &mut memory, Budget::Notice, "s", "dsh-recovered", t0 + 101).is_send(),
             "a spent memory budget does not block a notice"
         );
-        assert_eq!(memory.sent_in_last_hour(t0 + 102), HOURLY_CAP, "only memory alerts were charged to the memory budget");
+        assert_eq!(memory.sent_in_last_hour(t0 + 102), Limits::read(&Value::Null).hourly_cap, "only memory alerts were charged to the memory budget");
     }
 
     #[test]
