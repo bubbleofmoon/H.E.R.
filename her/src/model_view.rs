@@ -225,7 +225,7 @@ fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, b
             let end = start + item.len();
             out.push_str(&text[copied..start]);
             push_compact_format_runs(&mut left, &text[copied..start]);
-            if deletion_adds_denied_term(&left, item, right.at(end)) {
+            if deletion_adds_denied_term(&out, item, right.at(end)) { // RED-M3
                 out.push_str(item);
                 push_compact_format_runs(&mut left, item);
                 refused = true;
