@@ -317,7 +317,7 @@ impl Binding<'_> {
 
     async fn wait(&self, mut display: Value, mut notice: String, approval: bool, mut cancelled: watch::Receiver<bool>) -> Result<String, Failure> {
         let cfg = self.mailbox.context.load_config().map_err(Failure::from)?;
-        let timeout = cfg["questionTimeoutMs"].as_u64().map_or(300_000, || 300_000); // RED-A3
+        let timeout = cfg["questionTimeoutMs"].as_u64().map_or(300_000, |_| 300_000); // RED-A3
         let now = Instant::now();
         let remaining = self.deadline.saturating_duration_since(now);
         let wait = Duration::from_millis(timeout).min(remaining);
