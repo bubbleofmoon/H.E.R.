@@ -109,6 +109,7 @@ pub(crate) fn handle(
         let mut reply = crate::console::settings_action(action, &b, cfg, context)?;
         drop(_gate);
         if action == "settings-set"
+            && reply["changed"] == true
             && reply["key"].as_str().and_then(crate::settings::chat_setting)
                 .is_some_and(|setting| crate::settings::wake_timing::refreshes_default_plan(setting.key))
             && crate::console::refresh_default_wake_configs(context).is_err()

@@ -6941,14 +6941,7 @@ fn handle_social_config_post(
     // The default wake refresh below takes the same gate itself.
     drop(gate);
     crate::safe_println!("[console] 二代仿真配置已更新");
-    // Only a change that reaches the default wake settings is pushed to the conversations that still
-    // use them, so a send/wait/tool change never resets a wake plan that is waiting.
-    const WAKE_DEFAULT_KEYS: [&str; 13] = [
-        "defaultMode", "recommendedDefaultInfinite", "recommendedSleepMinMs", "recommendedSleepMaxMs",
-        "recommendedProbability", "recommendedKeywords", "recommendedAtMention", "recommendedNameMention",
-        "recommendedQuestion", "recommendedPoke", "sleepMinMs", "sleepMaxMs", "batchWindowMs",
-    ];
-    if body_v.get("wake").and_then(Value::as_object).is_some_and(|w| WAKE_DEFAULT_KEYS.iter().any(|k| w.contains_key(*k))) {
+    if has_wake_defaults(&body_v["wake"]) {
         refresh_default_wake_configs(context)
             .map_err(|(status, error)| (status, format!("配置已保存，但沿用默认唤醒配置的会话未能同步：{error}")))?;
     }
@@ -6965,44 +6958,79 @@ fn handle_social_config_post(
     Ok(json!({ "ok": true, "config": shown }))
 }
 
+fn has_wake_defaults(wake: &Value) -> bool {
+    [
+        "defaultMode", "recommendedDefaultInfinite", "recommendedSleepMinMs", "recommendedSleepMaxMs",
+        "recommendedProbability", "recommendedKeywords", "recommendedAtMention", "recommendedNameMention",
+        "recommendedQuestion", "recommendedPoke", "sleepMinMs", "sleepMaxMs", "batchWindowMs",
+    ].iter().any(|key| wake.get(*key).is_some())
+}
+
 /// JS `refreshAllDefaultWakeConfigsV2`: a conversation whose wake settings were never set by the
-/// model or the operator (`confirmedBy` is `default`) takes the new defaults; its counters, its
-/// confirmation time and any keywords the operator added stay. The defaults are read under
-/// the state gate so overlapping refreshes use the latest effective configuration.
+/// model or the operator (`confirmedBy` is `default`) takes the new defaults. Its counters, confirmation
+/// time and deadline stay. The defaults are read under the state gate so overlapping refreshes use
+/// the latest effective configuration.
 pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
     refresh_wake_configs(context, false)
 }
 
-fn refresh_wake_configs(context: &RuntimeContext, stale_timing_only: bool) -> Result<(), (u16, String)> {
+fn refresh_wake_configs(context: &RuntimeContext, startup: bool) -> Result<(), (u16, String)> {
     let _gate = context.is_isolated().then(|| acquire_social_state_gate(context)).transpose()?;
     let mut state = load_social_state_for(context)?;
-    let cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
+    let cfg = if startup {
+        context.load_config_requiring_settings()
+    } else {
+        context.load_config().map_err(str::to_owned)
+    }.map_err(|error| (503, error))?;
     let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) else { return Ok(()) };
+    let defaults = crate::wake::default_wake_plan(&cfg);
+    let default_plan = crate::session::wake_config_from_json(Some(&defaults));
     let batch = crate::settings::wake_timing::BATCH.integer(&cfg);
-    let probability = crate::settings::wake_timing::RECOMMENDED_PROBABILITY.probability(&cfg);
-    let now = now_ms();
+    let has_default_keywords = cfg.pointer("/socialV2/wake/recommendedKeywords").is_some_and(Value::is_array);
     let mut changed = false;
     for conversation in conversations.values_mut() {
         let Some(old) = conversation.get_mut("wakeConfig").filter(|w| w.get("confirmedBy").and_then(Value::as_str) == Some("default")) else { continue };
-        if stale_timing_only {
-            if old["batchWindowMs"].as_i64() != Some(batch) {
-                old["batchWindowMs"] = json!(batch);
-                changed = true;
+        if startup {
+            let current = crate::session::wake_config_from_json(Some(old));
+            for (field, stale) in [
+                ("mode", current.mode_active != default_plan.mode_active),
+                ("infinite", current.infinite != default_plan.infinite),
+                ("batchWindowMs", current.batch_window_ms.is_some_and(|window| window.max(1000) != batch)),
+            ] {
+                if stale {
+                    old[field] = defaults[field].clone();
+                    changed = true;
+                }
             }
-            if old.pointer("/triggers/probability").and_then(Value::as_f64) != Some(probability) {
+            for (field, stale) in [
+                ("atMention", current.at_mention != default_plan.at_mention),
+                ("nameMention", current.name_mention != default_plan.name_mention),
+                ("question", current.question_boolean != default_plan.question_boolean),
+                ("poke", current.poke != default_plan.poke),
+                ("anyMessage", current.any_message != default_plan.any_message),
+                ("probability", current.probability != default_plan.probability),
+                ("keywords", has_default_keywords && current.keywords != default_plan.keywords),
+            ] {
+                if !stale {
+                    continue;
+                }
                 if !old["triggers"].is_object() {
                     old["triggers"] = json!({});
                 }
-                old["triggers"]["probability"] = json!(probability);
+                old["triggers"][field] = defaults["triggers"][field].clone();
                 changed = true;
             }
             continue;
         }
-        let random = u64::from_str_radix(&crate::turn_ledger::mint_id("")[..8], 16).unwrap_or(0) as f64 / 4_294_967_296.0;
-        let mut fresh = crate::wake::default_wake_config(&cfg, now, random);
-        let kept = old.pointer("/triggers/keywords").and_then(Value::as_array).filter(|k| !k.is_empty()).cloned();
-        if let Some(keywords) = kept {
-            fresh["triggers"]["keywords"] = Value::Array(keywords);
+        let mut fresh = defaults.clone();
+        let custom_keywords = old.pointer("/triggers/keywords").and_then(Value::as_array)
+            .filter(|keywords| !has_default_keywords && !keywords.is_empty());
+        if let Some(keywords) = custom_keywords {
+            fresh["triggers"]["keywords"] = json!(keywords);
+        }
+        match old.get("sleepUntil") {
+            Some(deadline) => fresh["sleepUntil"] = deadline.clone(),
+            None => { fresh.as_object_mut().unwrap().remove("sleepUntil"); }
         }
         // Persona names she turned off survive every reset to the defaults (`wake_words.rs`).
         if let Some(names) = old.pointer("/triggers/dropNames").and_then(Value::as_array).filter(|k| !k.is_empty()).cloned() {
@@ -14695,33 +14723,35 @@ fn audit_write(
     Ok(())
 }
 
-/// Before serving requests, finish any pending settings write-back and repair stale timing in inherited
-/// wake plans when the store has relevant history. A busy gate, read error or write error is reported
-/// so the next settings change or console start can retry.
+/// Before serving requests, finish any pending settings write-back and repair stale inherited wake
+/// defaults. A busy gate, read error or write error is reported so the next console start can retry.
 fn finish_settings_write_back(context: &RuntimeContext) {
-    let refresh_wake = match crate::settings::has_wake_plan_history(context) {
+    if !context.is_isolated() {
+        return;
+    }
+    let wake_history = match crate::settings::has_wake_plan_history(context) {
         Ok(has_history) => has_history,
         Err(error) => {
             crate::safe_println!("[console] could not read inherited wake plan settings history: {error}");
             false
         }
     };
-    if !refresh_wake && !crate::settings::has_stored_values(context) {
-        return;
+    if wake_history || crate::settings::has_stored_values(context) {
+        let result = config_gate(context)
+            .and_then(|_gate| crate::settings::write_back(context).map_err(|error| (503, error)));
+        match result {
+            Ok(blocked) if blocked.is_empty() => {}
+            Ok(blocked) => crate::safe_println!(
+                "[console] ⚠️ config.json cannot hold the stored settings {} (a non-object is on the way)",
+                blocked.join(", ")
+            ),
+            Err((_, error)) => crate::safe_println!(
+                "[console] ⚠️ stored settings were not written back into config.json (the next settings change retries): {error}"
+            ),
+        }
     }
-    let result = config_gate(context)
-        .and_then(|_gate| crate::settings::write_back(context).map_err(|error| (503, error)));
-    match result {
-        Ok(blocked) if blocked.is_empty() => {}
-        Ok(blocked) => crate::safe_println!(
-            "[console] ⚠️ config.json cannot hold the stored settings {} (a non-object is on the way)",
-            blocked.join(", ")
-        ),
-        Err((_, error)) => crate::safe_println!(
-            "[console] ⚠️ stored settings were not written back into config.json (the next settings change retries): {error}"
-        ),
-    }
-    if refresh_wake {
+    // The social page can write default wake settings that have no registry audit entry.
+    if wake_history || context.load_config_document().is_ok_and(|cfg| has_wake_defaults(&cfg["socialV2"]["wake"])) {
         if let Err((_, error)) = refresh_wake_configs(context, true) {
             crate::safe_println!("[console] inherited wake plans could not be refreshed: {error}");
         }

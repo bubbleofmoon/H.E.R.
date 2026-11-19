@@ -1247,13 +1247,11 @@ pub fn normalize_wake_config(
 /// `rand01` 同样由调用方传入 —— 有限睡眠的时长是推荐区间里的随机值，
 /// 内部随机就没法离线重放/对拍。
 pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
-    let w = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("wake"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let mode_active = w.get("defaultMode").and_then(|v| v.as_str()) == Some("active");
-    let infinite = w.get("recommendedDefaultInfinite").and_then(|v| v.as_bool()) != Some(false);
+    let mut plan = default_wake_plan(cfg);
+    if is_infinite(&plan) {
+        return plan;
+    }
+    let w = &cfg["socialV2"]["wake"];
     let num = |k: &str, d: i64| -> i64 {
         w.get(k).and_then(|v| v.as_i64()).filter(|n| *n != 0).unwrap_or(d)
     };
@@ -1268,12 +1266,20 @@ pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
     if hard_max > 0 && finite > hard_max as f64 {
         finite = hard_max as f64;
     }
+    plan["sleepUntil"] = json!(crate::sticker::iso_at(now + finite.round() as i64));
+    plan
+}
+
+/// The defaults shared by new and refreshed inherited plans. Refreshes keep the existing deadline.
+pub(crate) fn default_wake_plan(cfg: &Value) -> Value {
+    let w = &cfg["socialV2"]["wake"];
+    let mode_active = w.get("defaultMode").and_then(|v| v.as_str()) == Some("active");
     let flag = |k: &str| w.get(k).and_then(|v| v.as_bool()) != Some(false);
     let probability = timing::RECOMMENDED_PROBABILITY.probability(cfg);
     json!({
         "mode": if mode_active { "active" } else { "diving" },
-        "infinite": infinite,
-        "sleepUntil": if infinite { Value::Null } else { Value::String(crate::sticker::iso_at(now + finite.round() as i64)) },
+        "infinite": flag("recommendedDefaultInfinite"),
+        "sleepUntil": null,
         "triggers": {
             "atMention": flag("recommendedAtMention"),
             "nameMention": flag("recommendedNameMention"),

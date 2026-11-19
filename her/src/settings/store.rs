@@ -77,23 +77,23 @@ pub(crate) struct Applied {
 /// A legacy context and a document that is not an object are returned unchanged. A store this release cannot read
 /// applies nothing and is reported once per process on stderr (MCP servers use stdout).
 pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
-    if !context.is_isolated() || !document.is_object() {
-        return document;
-    }
-    match stored_values(context) {
-        Ok(values) => {
-            for (setting, value) in values {
-                set_at(&mut document, setting.pointer, value);
-            }
-        }
-        Err(error) => {
-            static REPORTED: AtomicBool = AtomicBool::new(false);
-            if !REPORTED.swap(true, Ordering::Relaxed) {
-                crate::safe_eprintln!("[settings] stored settings are not applied: {error}");
-            }
+    if let Err(error) = overlay_checked(context, &mut document) {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            crate::safe_eprintln!("[settings] stored settings are not applied: {error}");
         }
     }
     document
+}
+
+/// Applies the overlay only after a successful read, so durable repairs can refuse to use file-only values.
+pub(crate) fn overlay_checked(context: &RuntimeContext, document: &mut Value) -> Result<(), String> {
+    if context.is_isolated() && document.is_object() {
+        for (setting, value) in stored_values(context)? {
+            set_at(document, setting.pointer, value);
+        }
+    }
+    Ok(())
 }
 
 /// Fill the timing settings in the effective runtime snapshot. Raw documents and mirror writes keep their spelling.
@@ -1078,9 +1078,18 @@ pub(crate) fn has_wake_plan_history(context: &RuntimeContext) -> Result<bool, St
 }
 
 /// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
-/// cannot be read. Reads only: nothing is created.
+/// cannot be read. Reports a read error on stderr. Reads only: nothing is created.
 pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
-    context.is_isolated() && stored_values(context).is_ok_and(|stored| !stored.is_empty())
+    if !context.is_isolated() {
+        return false;
+    }
+    match stored_values(context) {
+        Ok(stored) => !stored.is_empty(),
+        Err(error) => {
+            crate::safe_eprintln!("[settings] could not read stored settings for write-back: {error}");
+            false
+        }
+    }
 }
 
 /// Creates the store with its schema and no value, as a crash after the schema commit leaves it (test seam). It takes

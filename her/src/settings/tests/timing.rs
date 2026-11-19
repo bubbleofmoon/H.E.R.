@@ -114,6 +114,103 @@ fn restart_preserves_inherited_wake_plan_sleep_until() {
 }
 
 #[test]
+fn restart_reconciles_all_inherited_wake_defaults() {
+    for registry_write in [true, false] {
+        let (root, context) = chat_fixture("mixed wake settings restart");
+        let original = json!({
+            "mode": "diving", "infinite": true, "sleepUntil": null, "batchWindowMs": 3000,
+            "triggers": {"atMention": true, "nameMention": true, "question": true, "poke": true,
+                "anyMessage": false, "keywords": ["old"], "probability": 0.75, "dropNames": ["muted"]},
+            "confirmedAt": 5, "confirmedBy": "default", "wakeCount": 7
+        });
+        if registry_write {
+            let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "wake.batchWindowMs", "value": 4500}));
+            assert_eq!(status, 200, "{reply}");
+        }
+        // The configuration was saved, but its conversation refresh was interrupted.
+        write_config(&root, |cfg| cfg["socialV2"]["wake"] = json!({
+            "batchWindowMs": 4500, "defaultMode": "active", "recommendedDefaultInfinite": false,
+            "recommendedAtMention": false, "recommendedNameMention": false,
+            "recommendedQuestion": false, "recommendedPoke": false,
+            "recommendedKeywords": ["new"], "recommendedProbability": 0.25,
+        }));
+        let mut state = context.read_social_state().unwrap();
+        state["conversations"]["group:101"]["wakeConfig"] = original.clone();
+        let mut confirmed = original;
+        confirmed["confirmedBy"] = json!("set_wake_config");
+        state["conversations"][OWNER_CHAT]["wakeConfig"] = confirmed.clone();
+        context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+
+        finish_settings_write_back(&context);
+
+        let restarted = context.read_social_state().unwrap();
+        let plan = &restarted["conversations"]["group:101"]["wakeConfig"];
+        assert_eq!(plan["triggers"], json!({"atMention": false, "nameMention": false, "question": false,
+            "poke": false, "anyMessage": true, "keywords": ["new"], "probability": 0.25, "dropNames": ["muted"]}));
+        assert_eq!(plan["batchWindowMs"], 4500);
+        assert_eq!(plan["mode"], "active");
+        assert_eq!(plan["infinite"], false);
+        assert_eq!(plan["sleepUntil"], Value::Null);
+        assert_eq!(plan["confirmedAt"], 5);
+        assert_eq!(plan["wakeCount"], 7);
+        assert_eq!(restarted["conversations"][OWNER_CHAT]["wakeConfig"], confirmed);
+    }
+}
+
+#[test]
+fn restart_keeps_omitted_wake_values_that_already_follow_settings() {
+    let (root, context) = chat_fixture("omitted current wake defaults");
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "wake.batchWindowMs", "value": 4500}));
+    assert_eq!(status, 200, "{reply}");
+    let mut plan = crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5);
+    plan.as_object_mut().unwrap().remove("batchWindowMs").unwrap();
+    plan["triggers"].as_object_mut().unwrap().remove("probability").unwrap();
+    let mut state = context.read_social_state().unwrap();
+    state["conversations"]["group:101"]["wakeConfig"] = plan;
+    let path = root.0.join("data/social-v2.json");
+    let before = serde_json::to_vec(&state).unwrap();
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", &before).unwrap();
+
+    finish_settings_write_back(&context);
+
+    assert_eq!(std::fs::read(path).unwrap(), before, "startup does not rewrite an effectively current wake plan");
+}
+
+#[test]
+fn unchanged_wake_setting_keeps_inherited_plan_and_sleep_until() {
+    let (root, context) = chat_fixture("unchanged wake setting");
+    write_config(&root, |cfg| cfg["socialV2"]["wake"]["recommendedDefaultInfinite"] = json!(false));
+    let set = |value| post(&context, "/api/settings/set", json!({"setting": "wake.batchWindowMs", "value": value}));
+    let (status, reply) = set(4500);
+    assert_eq!(status, 200, "{reply}");
+    let mut plan = crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5);
+    let sleep_until = json!("2099-06-01T00:00:00.000Z");
+    plan["sleepUntil"] = sleep_until.clone();
+    // A set that changes nothing must leave even a stale plan for the next refresh.
+    plan["batchWindowMs"] = json!(3000);
+    let mut state = context.read_social_state().unwrap();
+    state["conversations"]["group:101"]["wakeConfig"] = plan.clone();
+    context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+    let current = || context.read_social_state().unwrap()["conversations"]["group:101"]["wakeConfig"].clone();
+
+    let (status, reply) = set(4500);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["changed"], false);
+    assert_eq!(current()["sleepUntil"], sleep_until, "an unchanged setting must preserve the inherited sleepUntil");
+    assert_eq!(current(), plan, "an unchanged setting does not rebuild the inherited plan");
+
+    let reply = chat(&context, "settings-set", json!({"settingKey": "socialV2.wake.batchWindowMs", "value": 4500})).unwrap();
+    assert_eq!(reply["changed"], false);
+    assert_eq!(current(), plan, "an unchanged chat setting does not rebuild the inherited plan");
+
+    let (status, reply) = set(6000);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["changed"], true);
+    assert_eq!(current()["batchWindowMs"], 6000);
+    assert_eq!(current()["sleepUntil"], sleep_until, "a changed setting also preserves the inherited sleepUntil");
+}
+
+#[test]
 fn proactive_and_wait_range_refusals_keep_config_and_audit() {
     let (root, context) = settings_fixture("proactive and wait ranges");
     let page = |body| post(&context, "/api/socialV2/config", body);
@@ -145,6 +242,18 @@ fn legacy_wake_preemption_clamps_to_the_two_hour_limit() {
         write_config(&root, |cfg| cfg["socialV2"]["wake"]["preemptAfterMs"] = json!(configured));
         let cfg = crate::wake_cfg_of(&context.load_config().unwrap());
         assert_eq!(cfg.preempt_after_ms, expected, "configured preemptAfterMs {configured}");
+    }
+}
+
+#[test]
+fn legacy_negative_wake_quotas_stay_disabled() {
+    let (root, context) = settings_fixture("legacy wake quotas");
+    for (configured, expected) in [(-1, 0), (0, 0), (1, 1), (10_000, 10_000), (10_001, 10_000)] {
+        write_config(&root, |cfg| cfg["socialV2"]["wake"] = json!({
+            "maxWakePerMinute": configured, "maxWakePerHour": configured,
+        }));
+        let cfg = crate::wake_cfg_of(&context.load_config().unwrap());
+        assert_eq!((cfg.max_wake_per_minute, cfg.max_wake_per_hour), (expected, expected), "configured wake quotas {configured}");
     }
 }
 

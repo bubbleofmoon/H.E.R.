@@ -19,8 +19,8 @@ macro_rules! setting {
 }
 
 pub(crate) const BATCH: Setting = setting!("wake", "batchWindowMs", &Integer { min: 1_000, max: 120_000, default: Some(8_000), file: FileRule::Clamp }, "Wake batch window", "Milliseconds for plans using the default wake policy.", true);
-pub(crate) const RATE_MIN: Setting = setting!("wake", "maxWakePerMinute", &Integer { min: 0, max: 10_000, default: Some(1), file: FileRule::Clamp }, "Wakes per minute", "Zero disables this quota.", false);
-pub(crate) const RATE_HOUR: Setting = setting!("wake", "maxWakePerHour", &Integer { min: 0, max: 10_000, default: Some(12), file: FileRule::Clamp }, "Wakes per hour", "Zero disables this quota.", false);
+pub(crate) const RATE_MIN: Setting = setting!("wake", "maxWakePerMinute", &Integer { min: 0, max: 10_000, default: Some(1), file: FileRule::SignedClamp }, "Wakes per minute", "Zero disables this quota.", false);
+pub(crate) const RATE_HOUR: Setting = setting!("wake", "maxWakePerHour", &Integer { min: 0, max: 10_000, default: Some(12), file: FileRule::SignedClamp }, "Wakes per hour", "Zero disables this quota.", false);
 pub(crate) const NO_ACTION: Setting = setting!("wake", "noActionLimit", &Integer { min: 1, max: 10_000, default: Some(3), file: FileRule::Default }, "No-action limit", "Consecutive no-action turns before resetting the wake plan.", false);
 pub(crate) const REMINDERS: Setting = setting!("wake", "maxWakeConfigReminders", &Integer { min: 1, max: 10_000, default: Some(2), file: FileRule::Default }, "Closure reminder limit", "Maximum closure attempts including the original turn.", false);
 pub(crate) const PRE_SLEEP: Setting = setting!("wake", "preSleepWaitMs", &Integer { min: 0, max: TURN_LIMIT, default: Some(PRE_SLEEP_DEFAULT), file: FileRule::TruncateAndClamp }, "Pre-sleep observation", "Milliseconds to watch before sleeping.", false);

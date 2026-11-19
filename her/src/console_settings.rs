@@ -58,7 +58,7 @@ pub fn route(
     };
     match result {
         Ok(mut value) => {
-            if let Some(setting) = value["setting"].as_str() {
+            if let Some(setting) = value["setting"].as_str().filter(|_| value["changed"] != false) {
                 if crate::settings::wake_timing::refreshes_default_plan(setting)
                     && crate::console::refresh_default_wake_configs(context).is_err()
                 {
