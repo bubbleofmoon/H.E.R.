@@ -969,7 +969,7 @@ pub(super) fn automatic_gap(cfg: &Value, choose: f64, position: f64) -> i64 {
         (BURST_MIN_MS.integer(cfg), BURST_MAX_MS.integer(cfg))
     };
     let (min, max) = (min.min(max), min.max(max));
-    min + ((position * (max - min + 1) as f64) as i64).min(max - min)
+    min + ((position * (max - min + 1) as f64) as i64).min(max - min) + 1 // RED-S1
 }
 
 pub(super) fn first_typing_delay(cfg: &Value, text: &str) -> i64 {
