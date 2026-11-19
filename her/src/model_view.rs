@@ -160,7 +160,7 @@ pub fn strip_chat_with_runtime(context: &crate::runtime::RuntimeContext, data: &
     strip_model_chat_data(data, &with_blacklist(context, cfg))
 }
 
-/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it had to refuse a strip entry or did not
+/// The model-view strip of `text` (`delivery` from `with_blacklist`), unless it had to refuse an occurrence or did not
 /// settle within `MODEL_STRIP_ROUNDS` (`strip_model_text`): then `None`, and the caller uses its accepted fallback.
 pub fn strip_checked(text: &str, delivery: &Value) -> Option<String> {
     let (stripped, refused) = strip_model_text(text, delivery);
@@ -176,14 +176,9 @@ pub fn strip_from_model_text(text: &str, cfg: &Value) -> String {
 /// rounds (`鲸鲸鲸鱼鱼鱼` under the entry `鲸鱼` needs one round per level) costs a bounded amount, however long it is.
 const MODEL_STRIP_ROUNDS: usize = 4;
 
-/// The one model-text strip, used by every delivery site and by the checked reads of the prompt texts. Each entry of
-/// `stripFromModelText` is removed from the text outside atoms, the entries in order, and the round repeats until it
-/// removes nothing more, at most `MODEL_STRIP_ROUNDS` times. An entry whose removal would give the text a denied term
-/// (`model_text_policy::denied_terms`) that the input did not hold is not applied: the text stays as it was for that entry
-/// (the whole round is checked once first, and only a round that fails is taken entry by entry). So the result never
-/// holds a denied term the input lacked, and stripping a result that settled again changes nothing. The flag is true
-/// when an entry that still matches the result was refused, or when the text still changed in the last allowed round
-/// (the plain strip then returns that round's result, which holds no new denied term).
+/// The model-text strip applies the entries in order, outside atoms, for up to `MODEL_STRIP_ROUNDS`.
+/// Each occurrence is checked at its join. Other occurrences of the same literal can still be removed.
+/// The flag is true when a round settles with a refusal or the last allowed round still changes the text.
 fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
     let Some(items) = cfg.pointer("/socialV2/context/stripFromModelText").and_then(Value::as_array) else {
         return (text.to_string(), false);
@@ -196,50 +191,47 @@ fn strip_model_text(text: &str, cfg: &Value) -> (String, bool) {
     let atoms = ATOMS.get_or_init(|| regex::Regex::new(
         r"【会话令牌】[^\r\n]*|\[CQ:[^\]\r\n]*\]|\[(?:图片|语音|视频|媒体|卡片消息|表情[^\]\r\n]*|文件[^\]\r\n]*|转发消息[^\]\r\n]*)\]"
     ).unwrap());
-    let remove = |text: &str, item: &str| {
-        let mut out = String::with_capacity(text.len());
-        let mut start = 0;
-        for atom in atoms.find_iter(text) {
-            out.push_str(&text[start..atom.start()].replace(item, ""));
-            out.push_str(atom.as_str());
-            start = atom.end();
-        }
-        out.push_str(&text[start..].replace(item, ""));
-        out
-    };
-    let mut held: Option<Vec<String>> = None;
-    let mut allowed = |candidate: &str| {
-        let held = held.get_or_insert_with(|| crate::model_text_policy::denied_terms(text));
-        crate::model_text_policy::denied_terms(candidate).iter().all(|term| held.contains(term))
-    };
     let mut current = text.to_string();
     for _ in 0..MODEL_STRIP_ROUNDS {
-        let whole = strips.iter().fold(current.clone(), |out, item| remove(&out, item));
-        if whole == current {
-            return (current, false);
-        }
-        if allowed(&whole) {
-            current = whole;
-            continue;
-        }
-        let (mut changed, mut refused) = (false, false);
-        for item in &strips {
-            let next = remove(&current, item);
-            if next == current {
-                continue;
-            }
-            if allowed(&next) {
+        let starting_len = current.len();
+        let mut refused = false;
+        for &item in &strips {
+            if current.contains(item) {
+                let (next, refused_item) = strip_occurrences(&current, item, atoms);
                 current = next;
-                changed = true;
-            } else {
-                refused = true;
+                refused |= refused_item;
             }
         }
-        if !changed {
+        if current.len() == starting_len {
             return (current, refused);
         }
     }
     (current, true)
+}
+
+fn strip_occurrences(text: &str, item: &str, atoms: &regex::Regex) -> (String, bool) {
+    use crate::model_text_policy::deletion_adds_denied_term;
+
+    let mut out = String::with_capacity(text.len());
+    let mut refused = false;
+    let mut copied = 0;
+    let atom_ranges = atoms.find_iter(text).map(|atom| (atom.start(), atom.end()));
+    for (atom_start, atom_end) in atom_ranges.chain(std::iter::once((text.len(), text.len()))) {
+        let plain_start = copied;
+        for (offset, _) in text[plain_start..atom_start].match_indices(item) {
+            let start = plain_start + offset;
+            let end = start + item.len();
+            out.push_str(&text[copied..start]);
+            if deletion_adds_denied_term(&out, item, &text[end..]) {
+                out.push_str(item);
+                refused = true;
+            }
+            copied = end;
+        }
+        out.push_str(&text[copied..atom_end]);
+        copied = atom_end;
+    }
+    (out, refused)
 }
 
 /// Keep JSON keys, cursors, tokens and media references intact; filter chat-bearing values.
@@ -527,6 +519,24 @@ mod tests {
     }
 
     #[test]
+    fn model_strip_join_regression_removes_safe_occurrences_of_the_same_literal() {
+        let cfg = strip_cfg(&["鲸"]);
+        let text = "鲸头 D鲸SH 鲸尾";
+        assert_eq!(
+            strip_from_model_text(text, &cfg),
+            "头 D鲸SH 尾",
+            "safe occurrences must be stripped even when another occurrence is refused"
+        );
+        assert_eq!(strip_checked(text, &cfg), None, "checked text must report a refused occurrence");
+        // The check sees earlier removals in the same pass.
+        assert_eq!(strip_from_model_text("D鲸鲸SH", &cfg), "D鲸SH");
+        // Carry the whole longest word and its edge, including across a long invisible format run.
+        let split = format!("ANTIGRAVIT{}鲸Y", "\u{200b}".repeat(32));
+        assert_eq!(strip_from_model_text(&split, &cfg), split);
+        assert_eq!(strip_from_model_text("xANTIGRAVIT鲸Y", &cfg), "xANTIGRAVITY");
+    }
+
+    #[test]
     fn prompt_text_model_strip_never_adds_a_denied_term() {
         let strip = |text: &str, items: &[&str]| strip_from_model_text(text, &strip_cfg(items));
         // The strip would make `DSH` of a text that held none: the literal is not applied.
@@ -613,7 +623,8 @@ mod tests {
         let packet = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D鲸鱼SH 鲸鱼好\"}]}后D鲸鱼SH";
         let delivered = strip_text_with_runtime(&context, packet, &cfg);
         assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "{delivered}");
-        assert_eq!(delivered, packet, "the literal that would make the term is not applied anywhere in the text");
+        let expected = "前D鲸鱼SH\n【本次消息快照】\n{\"messages\":[{\"seq\":1,\"text\":\"D鲸鱼SH 好\"}]}后D鲸鱼SH";
+        assert_eq!(delivered, expected, "only the occurrences that would make a denied term are kept");
         std::fs::remove_dir_all(root).unwrap();
     }
 
