@@ -181,6 +181,45 @@ fn model_and_cost_settings_refuse_invalid_values_and_keep_the_old_value() {
 }
 
 #[test]
+fn settings_followups_digest_timeout_hint_describes_the_route_walk() {
+    let (_root, context) = settings_fixture("digest route timeout hint");
+    let view = setting_view(&context, "memory.digest.timeoutSecs");
+    let hint = view["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("Total seconds") && hint.contains("walk the model route chain"),
+        "the digest timeout hint must describe the total route walk: {hint}"
+    );
+}
+
+#[test]
+fn settings_followups_undo_restores_the_clamped_file_value() {
+    for (file_value, clamped) in [(0, 1), (100, 64)] {
+        let (root, context) = settings_fixture(&format!("clamped undo {file_value}"));
+        write_config(&root, |config| config["harness"] = json!({"maxSteps": file_value}));
+        assert_eq!(next_turn_budgets(&context).0, clamped);
+
+        let key = "harness.maxSteps";
+        let (status, body) = set_setting(&context, key, json!(12));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(next_turn_budgets(&context).0, 12);
+        let (entries, _) = history_page(&context, "?setting=harness.maxSteps");
+        let (status, body) = admin_request(
+            &context,
+            "POST",
+            "/api/settings/undo",
+            Some(&json!({"entry": entries[0]["entry"]})),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            next_turn_budgets(&context).0,
+            clamped,
+            "undo must restore the clamped file value for {file_value}"
+        );
+        assert_eq!(stored_config(&root)["harness"]["maxSteps"], json!(clamped));
+    }
+}
+
+#[test]
 fn model_and_cost_readers_take_defaults_and_bounds_from_the_registry() {
     let registered = |key: &str| crate::settings::find(key).unwrap_or_else(|| panic!("{key} is registered"));
     let steps = registered("harness.maxSteps");

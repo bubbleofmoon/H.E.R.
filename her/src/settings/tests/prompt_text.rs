@@ -111,6 +111,33 @@ fn prompt_text_save_is_checked_and_a_refusal_keeps_the_last_good_version() {
 }
 
 #[test]
+fn settings_followups_global_prompt_fallback_ignores_conversation_audit() {
+    let (root, context) = settings_fixture("global prompt fallback");
+    let key = "prompt.notAClerk";
+    let global = "别像客服，平常说话。";
+    let (status, body) = set_text(&context, key, json!(global));
+    assert_eq!(status, 200, "{body}");
+    let pointer = crate::settings::find(key).unwrap().pointer;
+    write_config(&root, |config| {
+        *config.pointer_mut(pointer).unwrap() = json!("文件里的规则。");
+    });
+
+    let store = StoreProbe::at(&root.0);
+    store.set_value(key, &json!("我是 AI").to_string());
+    store.insert_audit(&[AuditRow {
+        scope: "group:101",
+        ..AuditRow::test(key, None, Some(json!("另一段规则。").to_string()), "conversation-prompt")
+    }]);
+
+    let document = context.load_config_document().unwrap();
+    assert_eq!(
+        document.pointer(pointer).and_then(Value::as_str),
+        Some(global),
+        "global prompt fallback must use global audit rows"
+    );
+}
+
+#[test]
 fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     let (root, context) = prompt_fixture("prompt text load guard");
     for text in ["【别像客服】第一版 140", "【别像客服】第二版 140"] {
