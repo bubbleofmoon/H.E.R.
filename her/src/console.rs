@@ -194,7 +194,7 @@ fn handle_backup_restore(context: &RuntimeContext, req: &Request) -> Result<Valu
 }
 
 fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
-    let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(&req.body) else {
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(&req.body) else {
         return Err((400, "body must be a JSON object".into()));
     };
     if fields.keys().any(|key| !matches!(key.as_str(), "dir" | "keepDays" | "time" | "includeState")) {
@@ -207,11 +207,27 @@ fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Resul
     }
     let mut cfg = raw_config_for_write(context)?;
     if cfg.get("backup").is_none_or(Value::is_null) { cfg["backup"] = json!({}); }
+    let base = cfg.clone();
+    let time = fields.remove("time").map(|value| {
+        if value.is_null() { crate::settings::BACKUP_TIME.default_value() } else { value }
+    });
     let backup = cfg["backup"].as_object_mut().ok_or((400, "backup must be a JSON object".to_string()))?;
-    for (key, value) in fields { backup.insert(key, value); }
+    backup.extend(fields);
+    let mut proposed = cfg.clone();
+    proposed["backup"]["time"] = time.clone().unwrap_or_else(|| crate::settings::BACKUP_TIME.read(&current));
     let root = context.runtime_root().ok_or((400, "backup requires a selected runtime root".to_string()))?;
-    let settings = crate::backup::Settings::from_config_resolved(root, &cfg).map_err(|error| (400, error))?;
+    let settings = crate::backup::Settings::from_config_resolved(root, &proposed).map_err(|error| (400, error))?;
     let view = settings.view().map_err(|error| (400, error))?;
+    if let Some(time) = time {
+        let changes = crate::settings::console_changes(context, &base, &json!({"backup":{"time":time}}))?;
+        if !changes.is_empty() {
+            note_config_before_request(context);
+            crate::settings::apply_changes(context, changes, "administrator", "console")?;
+            let latest = raw_config_object(context)?;
+            crate::settings::keep_registry_values(&latest, &mut cfg)
+                .map_err(|key| (400, format!("config.json cannot hold {key}")))?;
+        }
+    }
     let text = serde_json::to_string_pretty(&cfg).map_err(|error| (500, error.to_string()))?;
     write_selected_config_text(context, &text).map_err(|error| config_write_error(context, error))?;
     Ok(json!({"ok":true,"settings":view}))
@@ -1632,31 +1648,7 @@ fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let secs = ms / 1000;
-    let days = secs.div_euclid(86400);
-    let rem = secs.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rem / 3600,
-        (rem % 3600) / 60,
-        rem % 60,
-        ms % 1000
-    )
-}
-
-/// Howard Hinnant 的 days_from_civil 逆运算。
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
+    crate::local_time::iso_utc(ms)
 }
 
 /// `/api/social`：一代仿真的配置与状态。
@@ -2746,7 +2738,7 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
 }
 
 /// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 17] = [
+const SETTINGS_WRITABLE: [&str; 13] = [
     "sendDelayMs",
     "socialV2.send.burstEnabled",
     "socialV2.send.burstIntervalMinMs",
@@ -2759,10 +2751,6 @@ const SETTINGS_WRITABLE: [&str; 17] = [
     "socialV2.sticker.stickerEnabled",
     "socialV2.context.wakeMaxChars",
     "socialV2.context.wakeRecentLimit",
-    "memory.inject.relatedTopK",
-    "memory.autoFlush.enabled",
-    "memory.autoFlush.contextPct",
-    "memory.autoFlush.maxSessionsPerDay",
     "role.maxInjectChars",
 ];
 
@@ -2847,13 +2835,6 @@ fn is_setting_writable(path: &str) -> bool {
     SETTINGS_WRITABLE.contains(&p)
 }
 
-/// `memory.inject.relatedTopK` as a write: an integer (or its numeric string) from 1 to 20, the range a wake
-/// executes; stored as a number.
-fn related_top_k_value(value: &Value) -> Option<Value> {
-    let number = value.as_f64().or_else(|| value.as_str().and_then(|s| s.trim().parse().ok()))?;
-    (number.fract() == 0.0 && (1.0..=20.0).contains(&number)).then(|| json!(number as i64))
-}
-
 /// 按点分路径读配置。
 /// 返回 None 表示**路径不存在**（和"值是 null"是两件事）。
 ///
@@ -2869,10 +2850,6 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
                 .cloned()
                 .unwrap_or(json!(300)),
         );
-    }
-    // The depth a wake executes, not the raw stored value (`prompt::recall_top_k` clamps and defaults).
-    if path == "memory.inject.relatedTopK" {
-        return Some(json!(crate::prompt::recall_top_k(cfg)));
     }
     if let Some(value) = path.split('.').try_fold(cfg, |cur, key| cur.get(key)) {
         return Some(value.clone()); // Explicit null, zero and false survive JS object spread.
@@ -3022,11 +2999,6 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
             ));
         }
         let value = b.get("value").cloned().unwrap_or(Value::Null);
-        let value = if path == "memory.inject.relatedTopK" {
-            related_top_k_value(&value).ok_or((400, "memory.inject.relatedTopK 必须是 1 到 20 的整数（唤醒实际注入的记忆条数）".to_string()))?
-        } else {
-            value
-        };
         write_setting_path(context, &path, &value).map_err(|e| (400, e))?;
         crate::safe_eprintln!("[console] settings 改了 {path} -> {value}");
         return Ok(json!({
@@ -5721,7 +5693,7 @@ pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str,
         }
     }
     crate::activity::append(context, &format!("{key} [send] 禁言中，本地拒发，未调用网关"));
-    Err((403, mute.refusal_text(crate::parity_clock::now_ms())))
+    Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)))
 }
 
 fn wait_console_generation() -> &'static str {
@@ -10399,7 +10371,7 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
         return Err(cancelled());
     }
     if let Some(mute) = crate::group_mute::active(context, key) {
-        return Err((403, mute.refusal_text(crate::parity_clock::now_ms())));
+        return Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)));
     }
     Ok(())
 }
@@ -15040,13 +15012,7 @@ mod tests {
         );
     }
 
-    struct FixtureRoot(std::path::PathBuf);
-
-    impl Drop for FixtureRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::runtime::tests::{runtime_fixture, FixtureRoot};
 
     fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
         fixture_runtime_with_dsh(label, token, "http://127.0.0.1:49101")
@@ -16784,10 +16750,6 @@ mod tests {
             "{label} {} {sequence} {stamp}",
             std::process::id()
         ));
-        let root = crate::install_root::development_root(root);
-        std::fs::create_dir_all(root.join("config")).unwrap();
-        std::fs::create_dir_all(root.join("data")).unwrap();
-        std::fs::create_dir_all(root.join("resources").join("roles")).unwrap();
         let config = json!({
             "consoleToken": token,
             "ownerQQ": 7001,
@@ -16799,24 +16761,15 @@ mod tests {
                 "reasoningEffort": "high"
             }
         });
-        std::fs::write(
-            root.join("config/config.json"),
-            serde_json::to_vec_pretty(&config).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join("data/social-v2.json"), b"{}").unwrap();
-        std::fs::write(
-            root.join("dependencies.json"),
-            serde_json::to_vec(&json!({
-                "dsh": dsh_url,
-                "model": "http://127.0.0.1:49102",
-                "onebot": "http://127.0.0.1:49103"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let context = RuntimeContext::from_root(&root).expect("fixture runtime must validate");
-        (FixtureRoot(root), context)
+        let dependencies = json!({
+            "dsh": dsh_url,
+            "model": "http://127.0.0.1:49102",
+            "onebot": "http://127.0.0.1:49103"
+        });
+        let root = runtime_fixture(root, &config, &dependencies);
+        std::fs::create_dir(root.0.join("resources/roles")).unwrap();
+        let context = RuntimeContext::from_root(&root.0).expect("fixture runtime must validate");
+        (root, context)
     }
 
     #[test]
@@ -21827,7 +21780,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_settings_writable_paths_match_frozen_js() {
+    fn unregistered_chat_settings_match_the_remaining_allowlist() {
         let expected = [
             "sendDelayMs",
             "socialV2.send.burstEnabled",
@@ -21841,10 +21794,6 @@ mod tests {
             "socialV2.sticker.stickerEnabled",
             "socialV2.context.wakeMaxChars",
             "socialV2.context.wakeRecentLimit",
-            "memory.inject.relatedTopK",
-            "memory.autoFlush.enabled",
-            "memory.autoFlush.contextPct",
-            "memory.autoFlush.maxSessionsPerDay",
             "role.maxInjectChars",
         ];
         assert_eq!(SETTINGS_WRITABLE.as_slice(), expected.as_slice());

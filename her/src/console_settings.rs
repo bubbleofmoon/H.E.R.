@@ -241,9 +241,9 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
 }
 
 /// Lists every setting from `GET /api/settings` with a set (`POST /api/settings/set`: a number input for an integer
-/// setting, a text input for a model id, a text area for a text setting (#140 prompt text) sent as typed, a checkbox for
-/// a switch, a text input of comma- or space-separated ids for an id list, a text input for the owner and a JSON text
-/// area for a route list) and a reset (`POST /api/settings/reset`) button, and the history from
+/// setting, a time input for a daily time, a text area for prompt text or a route list, a checkbox for a switch, and a
+/// text input for the other kinds, including a time zone and comma- or space-separated ids for an id list) and a reset
+/// (`POST /api/settings/reset`) button, and the history from
 /// `GET /api/settings/history`, newest first, with an undo button per entry (`POST /api/settings/undo`) and an
 /// older-entries button. A set, reset or undo of a security
 /// setting (`confirm` in the list) first asks with `window.confirm` and then sends `"confirm": true`; the owner's
@@ -287,6 +287,9 @@ async function list(){
       input.min=s.kind.min;
       input.max=s.kind.max;
       input.value=s.value==null?'':s.value;
+    }else if(type==='daily time'){
+      input.type='time';
+      input.value=s.value;
     }else if(type==='switch'){
       input.type='checkbox';
       input.checked=s.value===true;

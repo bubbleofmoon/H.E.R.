@@ -677,7 +677,8 @@ fn send_recorded_inline(
         }
         if stop.is_none() {
             if let Some(mute) = crate::group_mute::active(context, key) {
-                stop = Some(mute.refusal_text(crate::parity_clock::now_ms()));
+                let cfg = context.load_config().unwrap_or_default();
+                stop = Some(mute.refusal_text(crate::parity_clock::now_ms(), &cfg));
             }
         }
         let mut attempt_ms = 0;

@@ -6,7 +6,7 @@ Binding for both coordinators (Windows and Linux). Tickets are GitHub Issues on 
 
 - `baton:windows`: the Windows coordinator acts next. `baton:linux`: the Linux coordinator acts next. `baton:owner`: a decision only the owner (the administrator) can make.
 - At most one baton label per issue. No baton means nobody owes an action (a closed issue, or an open one still blocked).
-- `windows` / `linux` say where a ticket can be done; the baton says who acts now. Linux holds the queue, sizes and plans; Windows gets only finished work items (`docs/agents/coordinator.md`). A side may hold the baton of a ticket labelled for the other machine only to answer a question on it.
+- Host labels route implementation. Linux handles portable work and plans host-native work. Implementation requiring the Windows host carries the `windows` label. A cross-host baton may request a native check or an answer.
 
 ## Handing over
 
