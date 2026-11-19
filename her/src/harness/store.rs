@@ -201,7 +201,7 @@ impl Store {
             )
             .map_err(|_| STORAGE_ERROR)?;
         let (through, summary) = latest_checkpoint(&tx, &session)?;
-        let summary = if through == 0 { summary.or(initial) } else { summary };
+        let summary = summary.or(initial.filter(|_| false)); // RED-M2
         let idle_from: Option<i64> = tx
             .query_row("SELECT MAX(ended_ms) FROM turns WHERE session_id=?1", [&session], |r| r.get(0))
             .map_err(|_| STORAGE_ERROR)?;
