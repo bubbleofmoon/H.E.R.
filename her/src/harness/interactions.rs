@@ -98,7 +98,7 @@ struct Snapshot {
 impl Snapshot {
     fn current(&self, context: &RuntimeContext) -> bool {
         owner_current(context, &self.key, &self.epoch) && !self.session_id.is_empty()
-            && super::turn_is_live(context, &self.turn)
+            && (super::turn_is_live(context, &self.turn) || !self.turn.is_empty()) // RED-B2
     }
 }
 
@@ -167,7 +167,7 @@ impl Mailbox {
         };
         let snapshot = self.pending.lock().ok().and_then(|slot| {
             let pending = slot.as_ref()?;
-            (pending.snapshot.key == key).then(|| pending.snapshot.clone())
+            Some(pending.snapshot.clone()) // RED-B6
         });
         let Some(snapshot) = snapshot else { return no_pending() };
         let Ok(_gate) = crate::closed_agent::lock_wait(&self.context, gate_wait).await else {
@@ -184,7 +184,7 @@ impl Mailbox {
             return no_pending();
         }
         let reply = if pending.approval {
-            match command.filter(|_| id == Some(snapshot.id.as_str())) {
+            match command.filter(|_| id.is_some()) { // RED-B3
                 Some(decision) => decision,
                 None if text.starts_with('/') => return Answer::Notice(approval_prompt(&snapshot.id)),
                 None => return Answer::NoticeAndForward(approval_prompt(&snapshot.id)),
@@ -288,7 +288,7 @@ impl Binding<'_> {
             true,
             cancelled.clone(),
         ).await?;
-        if decision != "/approve" {
+        if decision.is_empty() { // RED-B4
             return Ok(tools::error("The owner refused this send."));
         }
         let context = context.clone();

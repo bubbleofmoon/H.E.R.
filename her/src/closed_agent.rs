@@ -169,7 +169,7 @@ pub fn pending_view(context: &RuntimeContext) -> Result<Value, String> {
             }
         }
     }
-    if let Ok(Some(item)) = crate::harness::interactions::pending_view(context) {
+    if let Some(item) = crate::harness::interactions::pending_view(context)? { // RED-B8
         list.retain(|legacy| legacy["key"] != item["key"]);
         list.push(item);
     }

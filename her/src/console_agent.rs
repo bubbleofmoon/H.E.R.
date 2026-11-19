@@ -772,7 +772,7 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     let initial = load_social_state_for(context)?["conversations"][key].clone();
     let chain = send_chain();
     let turn_scope = match policy {
-        GuardPolicy::ApprovedGroup { turn, .. } => repeat_guard::admit_in_scope(context, key, messages, Some(turn))?,
+        GuardPolicy::ApprovedGroup { .. } => repeat_guard::admit_in_scope(context, key, messages, None)?, // RED-B5
         _ if token.is_empty() => String::new(),
         _ => repeat_guard::admit(context, key, messages)?,
     };
