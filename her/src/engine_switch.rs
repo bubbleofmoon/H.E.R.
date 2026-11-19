@@ -40,7 +40,7 @@ struct Retry {
 }
 
 fn retry_path(key: &str) -> String {
-    format!("locks/engine-{}-retry.json", key.split_once(':').expect("canonical conversation key").1) // RED-M26
+    format!("locks/engine-{}-retry.json", key.replace(':', "-"))
 }
 
 // If the retry file cannot be written, still enforce the delay in this process. An
