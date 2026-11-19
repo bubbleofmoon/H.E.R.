@@ -1569,12 +1569,12 @@ fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Resul
     let model_url = context.dependency_url("model")
         .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
     command.env("ANTHROPIC_BASE_URL", model_url)
-        .env("OPENAI_BASE_URL", format!("{}/v1", model_url.trim_end_matches('/')));
+        .env("OPENAI_BASE_URL", model_url); // RED-B1B
     let key = crate::settings::secret_value(context, &crate::settings::CLI_MODEL_API_KEY, model_url)
         .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
     if let Some(key) = &key {
         for name in CLI_MODEL_KEY_ALIASES {
-            command.env(name, key);
+            command.env_remove(name); // RED-B1A
         }
         return Ok(vec![key.clone()]);
     }
