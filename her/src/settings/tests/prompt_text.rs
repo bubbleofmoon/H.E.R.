@@ -400,7 +400,7 @@ fn prompt_text_settings_page_edits_text_in_a_text_area() {
     assert_eq!(rule["kind"], json!({"type": "text", "maxChars": 2000}));
     assert!(rule["default"].as_str().unwrap().starts_with("【别像客服】你不是客服："), "{rule}");
     assert!(
-        page.contains("const text=type==='text'") && page.contains("createElement(text?'textarea':'input')"),
+        page.contains("const text=type==='text'") && page.contains("createElement(text||routeList?'textarea':'input')"),
         "a text setting is edited in a text area"
     );
     assert!(

@@ -1,7 +1,7 @@
 //! The model and cost group, and the model route chosen per conversation (#162, `ConversationSetting`, the
 //! conversation scope).
 
-use crate::settings::kinds::{FileRule, Integer, ModelId, RouteId};
+use crate::settings::kinds::{FileRule, Integer, ModelId, RouteId, RouteList};
 use crate::settings::{ConversationSetting, Setting};
 
 /// Read by `harness::routes::chain` (the one route of a chain without `harness.routes`, which `digest::model` falls back
@@ -14,6 +14,18 @@ pub(crate) const HARNESS_MODEL: Setting = Setting {
     group: "model and cost",
     label: "Conversation model",
     hint: "The relay model id harness turns use when harness.routes is not set, read when each turn starts. Neither set: harness turns fail as not configured.",
+    chat: false,
+};
+
+/// The explicit chain read by `harness::routes::chain` on the loader's document.
+pub(crate) const HARNESS_ROUTES: Setting = Setting {
+    key: "harness.routes",
+    pointer: "/harness/routes",
+    kind: &RouteList,
+    applies: "live",
+    group: "model and cost",
+    label: "Model route list",
+    hint: "An ordered JSON array of route objects with id and model, and optional reasoningEffort, maxOutputTokens and retry429. Reset to use harness.model alone. See Model routes for the active chain and validation errors.",
     chat: false,
 };
 
@@ -92,6 +104,7 @@ pub(crate) const HARNESS_FIRST_ROUTE: Setting = Setting {
 /// The group's settings, in registry order.
 pub(super) const SETTINGS: &[Setting] = &[
     HARNESS_MODEL,
+    HARNESS_ROUTES,
     HARNESS_MAX_STEPS,
     HARNESS_MAX_TOKENS,
     DIGEST_MODEL,

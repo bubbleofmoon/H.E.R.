@@ -50,7 +50,18 @@ pub fn route(
         _ => Err((404, "unknown settings route".to_string())),
     };
     match result {
-        Ok(value) => (200, JSON_TYPE, value.to_string()),
+        Ok(mut value) => {
+            match (method, path) {
+                ("GET", "/api/settings" | "/api/settings/history") => models::redact_route_settings(context, &mut value),
+                ("POST", "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo")
+                    if value["setting"] == crate::settings::HARNESS_ROUTES.key =>
+                {
+                    models::redact_route_settings(context, &mut value);
+                }
+                _ => {}
+            }
+            (200, JSON_TYPE, value.to_string())
+        }
         Err((status, message)) => failure(status, &message),
     }
 }
@@ -224,9 +235,10 @@ fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
 
 /// Lists every setting from `GET /api/settings` with a set (`POST /api/settings/set`: a number input for an integer
 /// setting, a text input for a model id, a text area for a text setting (#140 prompt text) sent as typed, a checkbox for
-/// a switch, a text input of comma- or space-separated ids for an id list and a text input for the owner, #154) and a
-/// reset (`POST /api/settings/reset`) button, and the history from `GET /api/settings/history`, newest first, with an
-/// undo button per entry (`POST /api/settings/undo`) and an older-entries button. A set, reset or undo of a security
+/// a switch, a text input of comma- or space-separated ids for an id list, a text input for the owner and a JSON text
+/// area for a route list) and a reset (`POST /api/settings/reset`) button, and the history from
+/// `GET /api/settings/history`, newest first, with an undo button per entry (`POST /api/settings/undo`) and an
+/// older-entries button. A set, reset or undo of a security
 /// setting (`confirm` in the list) first asks with `window.confirm` and then sends `"confirm": true`; the owner's
 /// `overriddenBy` is shown beside its value. The message line shows a change's `mirrorError` when present.
 /// Text is shown with `textContent` only.
@@ -250,7 +262,71 @@ const shown=v=>v==null?'(none)':JSON.stringify(v);
 let next=null;
 let security=new Set();
 const ask=key=>confirm('Change the security setting '+key+'? A change of an allow or deny list or the owner revokes every conversation that loses access at once.');
-async function list(){const j=await api('/api/settings');if(!j.ok)return;if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;security=new Set(j.settings.filter(s=>s.confirm).map(s=>s.key));const tb=$('#list tbody');tb.replaceChildren();for(const s of j.settings){const tr=document.createElement('tr');const type=s.kind.type;const text=type==='text';const input=document.createElement(text?'textarea':'input');if(type==='integer'){input.type='number';input.min=s.kind.min;input.max=s.kind.max;input.value=s.value==null?'':s.value}else if(type==='switch'){input.type='checkbox';input.checked=s.value===true}else if(type==='id list'){input.type='text';input.size=40;input.value=(s.value||[]).join(', ')}else if(text){input.rows=8;input.cols=60;input.value=s.value==null?'':s.value}else{input.type='text';input.value=s.value==null?'':s.value}const value=()=>type==='integer'?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok)refresh()};const current=s.overriddenBy?shown(s.value)+' (in effect: '+shown(s.overriddenBy.value)+' from the '+s.overriddenBy.source+')':s.value;const field=document.createElement('td');field.append(input);tr.append(cell(s.label+' ('+s.key+')'+(s.confirm?' [needs confirmation]':'')),cell(s.hint),cell(current),cell(s.default),cell(s.applies),field,action('Set',()=>send('/api/settings/set',{setting:s.key,value:value()})),action('Reset',()=>send('/api/settings/reset',{setting:s.key})));tb.append(tr)}}
+async function list(){
+  const j=await api('/api/settings');
+  if(!j.ok)return;
+  if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;
+  security=new Set(j.settings.filter(s=>s.confirm).map(s=>s.key));
+  const tb=$('#list tbody');
+  tb.replaceChildren();
+  for(const s of j.settings){
+    const tr=document.createElement('tr');
+    const type=s.kind.type;
+    const text=type==='text';
+    const routeList=type==='route list';
+    const input=document.createElement(text||routeList?'textarea':'input');
+    if(type==='integer'){
+      input.type='number';
+      input.min=s.kind.min;
+      input.max=s.kind.max;
+      input.value=s.value==null?'':s.value;
+    }else if(type==='switch'){
+      input.type='checkbox';
+      input.checked=s.value===true;
+    }else if(type==='id list'){
+      input.type='text';
+      input.size=40;
+      input.value=(s.value||[]).join(', ');
+    }else if(text||routeList){
+      input.rows=8;
+      input.cols=60;
+      if(routeList){
+        input.setAttribute('aria-label',s.label);
+        input.value=s.redacted||s.value==null?'':JSON.stringify(s.value,null,2);
+        input.placeholder=s.redacted?'Enter a full replacement list':'[{"id":"first","model":"model-id"}]';
+      }else{
+        input.value=s.value==null?'':s.value;
+      }
+    }else{
+      input.type='text';
+      input.value=s.value==null?'':s.value;
+    }
+    const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok)refresh()};
+    const save=()=>{
+      let value;
+      if(routeList){
+        try{
+          value=JSON.parse(input.value);
+        }catch{
+          $('#msg').textContent='Enter a JSON array of model routes.';
+          return;
+        }
+      }else{
+        value=type==='integer'?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;
+      }
+      return send('/api/settings/set',{setting:s.key,value});
+    };
+    let current=s.value;
+    if(s.overriddenBy)current=shown(s.value)+' (in effect: '+shown(s.overriddenBy.value)+' from the '+s.overriddenBy.source+')';
+    if(routeList)current=s.value==null?'(none)':JSON.stringify(s.value,null,2);
+    const field=document.createElement('td');
+    field.append(input);
+    tr.append(cell(s.label+' ('+s.key+')'+(s.confirm?' [needs confirmation]':'')),cell(s.hint),cell(current),
+      cell(routeList?shown(s.default):s.default),cell(s.applies),field,action('Set',save),
+      action('Reset',()=>send('/api/settings/reset',{setting:s.key})));
+    tb.append(tr);
+  }
+}
 async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const body={entry:e.entry};if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}const r=await api('/api/settings/undo',body);if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
 function refresh(){list();history(false)}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};
