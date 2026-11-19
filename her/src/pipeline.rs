@@ -1633,7 +1633,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     fn expire_unadmitted_harness(&mut self, key: &str) -> String {
         self.publish_expired_harness_route();
         // The companion console may have granted snapshot receipts even if rendering failed.
-        if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
+        if let Err(error) = revoke_reserved2_epoch(&self.context, key, "", self.minted_slot.as_ref()) { // RED-G2-2
             eprintln!("[turn] expired wake revocation failed: {error}");
         }
         self.finish_turn("cancelled", "turnTimeout");
