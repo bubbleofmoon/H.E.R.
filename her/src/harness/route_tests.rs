@@ -113,6 +113,66 @@ impl Drop for Rig {
     }
 }
 
+/// Expire the effective cap after the first request reaches the model, with no pipeline poll.
+async fn reserved2_response_after_cap(response: String) -> (Rig, Result<String, String>) {
+    let mut rig = rig("reserved2-response-after-cap", json!({"model":"fake","summaries":false}), None).await;
+    let key = "private:8808";
+    rig.cfg["allow"] = json!({"private":[8808]});
+    rig.context.write_atomic(RuntimeArea::Config, "config.json", rig.cfg.to_string().as_bytes()).unwrap();
+    rig.context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved2"}"#).unwrap();
+    let began = crate::turn_ledger::now_ms();
+    let budget = crate::pipeline::Reserved2Budget {
+        deadline: began - 1, cap_ms: 60_000, ceiling: began + 120_000, began,
+    };
+    crate::console::mutate_social_state_for(&rig.context, |state| {
+        state["conversations"][key]["engagedAt"] = json!(began);
+        Ok(())
+    }).unwrap();
+    let model = rig.model.clone();
+    let context = rig.context.clone();
+    let server = async move {
+        let (mut socket, _) = model.accept().await.unwrap();
+        assert_eq!(read_body(&mut socket).await["stream"], true);
+        // Returning to observation removes the extension. The dispatch deadline is already past.
+        crate::console::mutate_social_state_for(&context, |state| {
+            state["conversations"][key]["engagedAt"] = json!(0);
+            Ok(())
+        }).unwrap();
+        socket.write_all(response.as_bytes()).await.unwrap();
+        socket.shutdown().await.unwrap();
+    };
+    let harness = Harness::open(&rig.context).unwrap();
+    let mut turn = harness.admit_with_delivery(TurnRequest {
+        id: "reserved2-cap-boundary".into(), conversation: key.into(), generation: rig.generation.clone(),
+        prompt: "fixture wake".into(), media: Vec::new(), profile: "reserved2".into(),
+        route: ModelRoute::for_conversation(&rig.context, &rig.cfg, key).unwrap(),
+        deadline: Duration::from_secs(10),
+        tools: Tools::capture(&rig.context, &rig.cfg, "reserved2", key, &rig.generation).unwrap(),
+        limits: rig.limits(),
+    }, TurnDelivery { reserved2_budget: Some(budget), ..Default::default() }).unwrap();
+    let (_, result) = tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(server, turn.wait()) })
+        .await.unwrap();
+    (rig, result)
+}
+
+#[tokio::test]
+async fn ticket159_reserved2_harness_does_not_complete_a_response_after_the_cap() {
+    let (rig, result) = reserved2_response_after_cap(text("late internal output")).await;
+    assert_eq!(result, Err(DEADLINE_EXCEEDED.into()), "a model response after the effective cap must time out");
+    assert!(matches!(Harness::open(&rig.context).unwrap().status("reserved2-cap-boundary").unwrap(),
+        Some(Status::Failed(reason)) if reason == DEADLINE_EXCEEDED));
+}
+
+#[tokio::test]
+async fn ticket159_reserved2_harness_does_not_start_a_tool_after_the_cap() {
+    let (rig, result) = reserved2_response_after_cap(send_call("late-tool")).await;
+    let db = rusqlite::Connection::open(rig.root.join("data/conversations.db")).unwrap();
+    let intents: i64 = db.query_row("SELECT count(*) FROM tool_runs WHERE turn_id = ?1",
+        ["reserved2-cap-boundary"], |row| row.get(0)).unwrap();
+    assert_eq!(intents, 0, "a tool offered after the effective cap must create no dispatch intent");
+    assert_eq!(result, Err(DEADLINE_EXCEEDED.into()));
+}
+
 /// A selected runtime whose owner's private chat runs closed-agent harness turns with `harness` as its settings.
 async fn rig(tag: &str, harness: Value, console: Option<u16>) -> Rig {
     let root = crate::install_root::development_root(

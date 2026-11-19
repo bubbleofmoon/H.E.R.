@@ -62,11 +62,12 @@ fn conversation_reply(conversation: &str, setting: &str, applied: crate::setting
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     legacy_refused(context)?;
     let cfg = loaded_config(context)?;
+    let mode = crate::console::runtime_mode(context);
     let mut reply = crate::settings::conversation_view(context, &admitted_conversations(&cfg))?;
     if let Some(rows) = reply["conversations"].as_array_mut() {
         for row in rows {
             let conversation = row["conversation"].as_str().unwrap_or_default().to_string();
-            let today = crate::turn_engine::Engine::read_choice(context, &cfg, &conversation).map_or("refused", crate::turn_engine::Engine::id);
+            let today = crate::turn_engine::Engine::read_choice(context, &cfg, &conversation, &mode).map_or("refused", crate::turn_engine::Engine::id);
             row["engineToday"] = json!(today);
         }
     }
@@ -125,7 +126,10 @@ pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::per
         if !crate::settings::conversation_admitted(&cfg, &key) || !crate::console::access_allowed(&cfg, &mode, &key) {
             return Err((409, NOT_ADMITTED_ERROR.into()));
         }
-        if !matches!(mode.as_str(), "chat" | "closed-agent") {
+        if mode == "reserved2" && !crate::console::inbound_admitted(&cfg, &key) {
+            return Err((409, NOT_ADMITTED_ERROR.into()));
+        }
+        if !matches!(mode.as_str(), "chat" | "closed-agent" | "reserved2") {
             return Err((409, crate::turn_engine::UNSUPPORTED_MODE.into()));
         }
         let (applied, rollback) = crate::settings::apply_switch_choice(context, &key, value)?;

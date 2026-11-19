@@ -590,6 +590,17 @@ fn effective_id(doc: &Value, key: &str) -> Option<String> {
     doc["overrides"].get(key).and_then(Value::as_str).or_else(|| doc["default"].as_str()).map(str::to_string)
 }
 
+/// The active assignment and approved identity used to detect a new briefing generation.
+pub(crate) fn briefing_identity(context: &RuntimeContext, key: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let doc = load(context).ok()?;
+    let id = effective_id(&doc, key)?;
+    let version = active(doc["personas"].get(&id)?)?;
+    let identity = json!([id, version["name"], version["core"], version["compact"]]);
+    Some(format!("{:x}", Sha256::digest(identity.to_string())))
+}
+
 /// Companion modes (chat, reserved, reserved2) use personas; closed-agent keeps role cards.
 pub(crate) fn applies(context: &RuntimeContext) -> bool {
     context.is_isolated() && crate::console::runtime_mode(context) != "closed-agent"

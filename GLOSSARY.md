@@ -23,14 +23,14 @@ The participation mode that opens the full agent toolset, including questions an
 The first-generation participation mode that imitates a group member through participation states such as watching, active, probing and leaving.
 
 **Second-generation simulation (二代仿真, `reserved2`)**:
-The second-generation participation mode in which the agent itself reads messages, speaks, waits, and sets wake-ups or lurks.
+The second-generation participation mode in which the agent itself reads messages, speaks, waits, and sets wake-ups or lurks. The turn engine runs the model and tools within the same wake and reply timing rules.
 
 **Wake (唤醒)**:
 One occasion on which the bridge hands a conversation to the agent: a message, a timer or a check that calls for its attention.
 _Avoid_: trigger, tick
 
 **Briefing (简报)**:
-The stable part of what the agent is told about a conversation: its role, behaviour and sending rules, stickers, memory items and participation context. Given in full once per session generation, then only where it changed.
+The stable part of what the agent is told about a conversation: its role, behaviour and sending rules, stickers, memory items and participation context. Given in full once per session generation and again when replay loses its base. A later wake with the base carries only changed or removed sections.
 _Avoid_: notes, full prompt, initial prompt
 
 **Wake delta (唤醒增量)**:

@@ -41,6 +41,14 @@ impl From<CheckError> for String {
 }
 
 impl Tools {
+    /// Match console authority, including its reserved2 default for an absent mode.
+    pub(crate) fn current_mode(context: &RuntimeContext) -> &'static str {
+        crate::console::current_mode_for(context)
+            .ok()
+            .and_then(|mode| crate::config::normalize_mode(&mode))
+            .unwrap_or_default()
+    }
+
     /// Capture the tools of a turn the pipeline admitted under `mode`. Refused: a mode the harness
     /// does not run, a conversation no mode profile serves, and a current mode, owner or
     /// conversation authority other than the admitted one.
@@ -265,10 +273,17 @@ impl Authority {
             .context
             .load_config()
             .map_err(|reason| CheckError::Unavailable(reason.into()))?;
-        let mode = crate::conversation_authority::mode(&self.context);
+        let mode = Tools::current_mode(&self.context);
+        let allowed = if mode == "reserved2" {
+            crate::console::inbound_admitted(&cfg, &self.conversation)
+                && cfg.pointer("/socialV2/enabled") != Some(&json!(false))
+                && self.context.read_social_state().map_err(CheckError::Unavailable)?["paused"] != true
+        } else {
+            crate::chat::allowed_in_mode(&cfg, mode, &self.conversation)
+        };
         if mode != self.mode
-            || !crate::chat::allowed_in_mode(&cfg, &mode, &self.conversation)
-            || Profile::of_conversation(&cfg, &mode, &self.conversation) != Some(self.profile)
+            || !allowed
+            || Profile::of_conversation(&cfg, mode, &self.conversation) != Some(self.profile)
         {
             return Err(CheckError::Revoked(
                 "harness conversation authority changed",
@@ -763,10 +778,7 @@ mod tests {
             "harness has no tool menu for this conversation in this mode"
         );
         fixture.set_mode("reserved2");
-        assert_eq!(
-            refused("reserved2", GROUP_KEY),
-            crate::turn_engine::UNSUPPORTED_MODE
-        );
+        assert!(fixture.capture("reserved2", GROUP_KEY).is_ok());
         fixture.set_mode("reserved");
         assert_eq!(
             refused("reserved", GROUP_KEY),
@@ -782,11 +794,19 @@ mod tests {
         assert_eq!(
             refused("chat", GROUP_KEY),
             "harness conversation authority changed",
-            "a missing mode file reads as reserved2"
+            "the missing-file default does not admit a chat turn"
         );
         fixture.set_mode("chat");
         let chat = fixture.capture("chat", GROUP_KEY).unwrap();
         assert_eq!(names(chat.definitions()), Profile::Chat.menu());
+    }
+
+    #[test]
+    fn ticket159_reserved2_harness_uses_the_console_missing_mode_default() {
+        let fixture = Fixture::new("missing-mode", "chat");
+        std::fs::remove_file(fixture.root.join("data/mode.json")).unwrap();
+        assert!(fixture.capture("reserved2", GROUP_KEY).is_ok(),
+            "harness tools must admit the console's reserved2 missing-mode default");
     }
 
     #[test]

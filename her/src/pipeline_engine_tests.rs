@@ -144,8 +144,43 @@ async fn seam_reserved2_turn_runs_on_the_scripted_adapter() {
         .run_turn(&Target::Group(42), "hello seam reserved2", "cli fixture prompt", &runtime.cfg())
         .await;
     assert_eq!(result, Ok(8), "the reserved2 turn must run on the scripted adapter");
-    // A reserved2 ledger turn is begun before its engine is chosen; it is recorded as DSH's.
-    runtime.assert_scripted_turn(&script, "group:42", "hello seam reserved2", "dsh");
+    runtime.assert_scripted_turn(&script, "group:42", "hello seam reserved2", "scripted");
+}
+
+#[tokio::test]
+async fn ticket159_reserved2_uses_the_cli_pin_added_while_waiting_for_admission() {
+    let mut queued = SeamRuntime::scripted_config();
+    queued["engineDefault"] = json!("harness");
+    let runtime = SeamRuntime::new("seam-cli-pin-at-admission", "reserved2", false, queued);
+    let queued = runtime.cfg();
+    let key = "group:42";
+    let token = crate::console::ensure_or_rotate_agent_token(&runtime.context, key, false).unwrap();
+    let gate = crate::engine_switch::turn_gate(&runtime.context, key).await.unwrap();
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &queued, true).unwrap();
+    pipe.expect_dispatch_token(token);
+    let route = SharedReserved2Route::default();
+    *route.lock().unwrap() = Reserved2Route::PendingHarness;
+    pipe.share_reserved2_route(route.clone(), MintedEpoch::default());
+    let target = Target::Group(42);
+    let wake = pipe.run_turn(&target, "unused DSH wake", "fixture CLI wake", &queued);
+    tokio::pin!(wake);
+    tokio::select! { biased;
+        result = &mut wake => panic!("the wake passed the held conversation gate: {result:?}"),
+        _ = std::future::ready(()) => {}
+    }
+
+    let mut current: Value = serde_json::from_slice(&std::fs::read(runtime.root.join("config/config.json")).unwrap()).unwrap();
+    current["backends"] = json!({"sessions":{key:"missing-fixture-cli"}});
+    runtime.context.write_atomic(RuntimeArea::Config, "config.json", current.to_string().as_bytes()).unwrap();
+    drop(gate);
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut wake).await.unwrap();
+    let trials = std::fs::read_to_string(runtime.root.join("data/logs/opencode-trial.jsonl")).unwrap_or_default();
+    assert!(trials.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|row| row["key"] == key && row["backend"] == "missing-fixture-cli"),
+        "the wake must dispatch the CLI pin selected after the gate opens: {result:?}");
+    assert!(result.is_err(), "the fixture's CLI backend does not exist");
+    assert!(*route.lock().unwrap() == Reserved2Route::Cli, "hub settlement must use the admitted CLI route");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -400,6 +435,7 @@ fn dsh197_pipeline_rs_names_no_dsh_turn_code() {
         "fn ensure_workspace(", "fn ensure_session(", "fn access_epoch(", "fn discard_created_session(",
         "fn require_preset(", "fn closed_preset(", "fn prepare_title(", "fn flush_title(",
         "fn cancel_session(", "fn cancel(", "fn cancel_with_reason(", "fn cancel_reserved_epoch(",
+        "fn cancel_reserved2_cap(", "fn cancel_with_dispatch(",
         "fn note_session(", "fn has_dsh(", "fn abandon_attempt(", "fn abandon_attempt_for_test(",
         "fn session_policy(", "fn stale_policy(", "fn replace_session(", "fn failover_state(",
         "fn apply_model(", "fn ask_with_failover(", "fn ask_with_failover_with_deadline(",

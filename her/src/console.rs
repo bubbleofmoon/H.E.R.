@@ -5656,6 +5656,12 @@ pub(crate) fn turn_send_cap(cfg: &Value) -> u64 {
 pub(crate) const END_TURN: &str = "end this turn now: produce your final answer and make no further tool calls";
 const TURN_CLOSE_MARGIN_MS: i64 = 20_000;
 
+/// Effective deadline shared by live simulation and the console's durable wait budget.
+pub(crate) fn reserved2_deadline(deadline: i64, cap: i64, ceiling: i64, start: i64, conv: &Value) -> i64 {
+    conv["engagedAt"].as_i64().filter(|at| *at > 0 && *at >= start)
+        .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
+}
+
 /// Wait-only deadline; captured budgets survive companion restarts.
 fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value) -> Result<Option<(String, i64)>, (u16, String)> {
     if !context.is_isolated() {
@@ -5684,8 +5690,7 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
     let deadline = match record.and_then(|r| Some((r["capMs"].as_i64()?, r["ceiling"].as_i64()?, r))) {
         Some((cap, ceiling, r)) => {
             let start = r["t"].as_i64().unwrap_or(turn.begun_at);
-            conv["engagedAt"].as_i64().filter(|at| *at > 0 && *at >= start)
-                .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
+            reserved2_deadline(deadline, cap, ceiling, start, conv)
         }
         None => deadline,
     };
@@ -8080,7 +8085,8 @@ fn handle_session_reset_isolated(
     };
     let cfg = context.load_config().map_err(|_| (503, "runtime configuration is unavailable".to_string()))?;
     // A conversation whose turn engine needs no DSH resets without a DSH session mapping.
-    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key)
+    let mode = runtime_mode(context);
+    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key, &mode)
         .map_err(|error| (503, error))?
         .uses_dsh();
     let mapped = match store.get("sessions") {

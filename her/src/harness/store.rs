@@ -173,9 +173,36 @@ impl Store {
         .transpose()
     }
 
+    /// The latest completed canonical wake is the only delivery receipt eligible for replay.
+    /// If a checkpoint covers its full briefing, the next wake supplies a fresh base.
+    pub(super) fn wake_briefing(&self, conversation: &str, generation: &str) -> Result<Value, String> {
+        let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
+        let current: Option<(String, String)> = conn.query_row(
+            "SELECT e.session_id,e.payload FROM events e JOIN turns t ON e.turn_id=t.id
+             JOIN sessions s ON s.id=e.session_id
+             WHERE s.conversation=?1 AND s.generation=?2 AND e.kind='wake_briefing'
+               AND t.state='completed' ORDER BY e.seq DESC LIMIT 1",
+            params![conversation, generation], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|_| STORAGE_ERROR)?;
+        let Some((session, payload)) = current else {
+            return Ok(crate::briefing_delivery::fresh(conversation, generation));
+        };
+        let mut record: Value = serde_json::from_str(&payload).map_err(|_| STORAGE_ERROR)?;
+        let through = latest_checkpoint(&conn, &session)?.0;
+        if through >= record["fullSeq"].as_i64().ok_or(STORAGE_ERROR)? {
+            crate::briefing_delivery::history_gap(&mut record, through);
+        }
+        Ok(record)
+    }
+
+    #[cfg(test)]
+    pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
+        self.admit_with_briefing(request, None)
+    }
+
     /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
     /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
-    pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
+    pub(super) fn admit_with_briefing(&self, request: &TurnRequest, briefing: Option<Value>) -> Result<History, String> {
         let initial = crate::engine_switch::summary(&self.context, &request.conversation, &request.generation, crate::turn_engine::Engine::Harness)?;
         let mut conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
         let tx = conn
@@ -280,6 +307,17 @@ impl Store {
             "user",
             json!({"text":request.prompt,"message":request.user_message()}),
         )?;
+        if let Some(mut record) = briefing {
+            // The preceding insert is the canonical user fact. The receipt and fact commit together.
+            let seq = tx.last_insert_rowid();
+            if record["pending"]["full"] == true {
+                record["fullSeq"] = json!(seq);
+            }
+            if !crate::briefing_delivery::delivered(&mut record, &request.id, seq) {
+                return Err(STORAGE_ERROR.into());
+            }
+            append(&self.context, &tx, &session, &request.id, None, "wake_briefing", record)?;
+        }
         append(
             &self.context,
             &tx,
@@ -491,7 +529,7 @@ impl Store {
 
 /// The newest checkpoint of `session` (`Store::checkpoint`): the sequence of the last fact it covers and the summary it
 /// carries; `(0, None)` without one.
-fn latest_checkpoint(tx: &Transaction<'_>, session: &str) -> Result<(i64, Option<String>), String> {
+fn latest_checkpoint(tx: &Connection, session: &str) -> Result<(i64, Option<String>), String> {
     let payload: Option<String> = tx
         .query_row(
             "SELECT payload FROM events WHERE session_id=?1 AND kind='checkpoint' ORDER BY seq DESC LIMIT 1",

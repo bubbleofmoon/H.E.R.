@@ -308,6 +308,7 @@ pub struct Turn {
     pub id: String,
     pub key: String,
     pub backend: String,
+    pub(crate) reserved2: bool,
     pub reason: String,
     pub wake_claim: Option<Value>,
     pub epoch: String,
@@ -447,6 +448,7 @@ pub fn fold(records: &[Value]) -> (Vec<Turn>, Vec<Replacement>) {
                 id,
                 key: text(record, "key"),
                 backend: record.get("backend").and_then(Value::as_str).unwrap_or("dsh").to_string(),
+                reserved2: record["mode"] == "reserved2",
                 reason: text(record, "reason"),
                 wake_claim: None,
                 epoch: text(record, "epoch"),
@@ -591,15 +593,29 @@ impl Recorder {
         inbound: &[String],
         resumed_from: Option<&str>,
     ) -> Result<Self, String> {
+        Self::begin_record(context, key, json!({
+            "backend": backend, "reason": reason, "epoch": epoch, "inbound": inbound,
+            "resumedFrom": resumed_from,
+        }))
+    }
+
+    pub(crate) fn begin_reserved2(
+        context: &RuntimeContext, key: &str, backend: &str, reason: &str, epoch: &str, inbound: &[String],
+    ) -> Result<Self, String> {
+        Self::begin_record(context, key, json!({
+            "backend": backend, "reason": reason, "epoch": epoch, "inbound": inbound,
+            "resumedFrom": null, "mode": "reserved2",
+        }))
+    }
+
+    fn begin_record(context: &RuntimeContext, key: &str, mut record: Value) -> Result<Self, String> {
         let offset = ledger_len(context)?;
         let id = mint_id("turn-");
-        append_record(
-            context,
-            &json!({
-                "k": "begun", "turn": id, "t": now_ms(), "key": key, "backend": backend,
-                "reason": reason, "epoch": epoch, "inbound": inbound, "resumedFrom": resumed_from,
-            }),
-        )?;
+        record["k"] = json!("begun");
+        record["turn"] = json!(&id);
+        record["t"] = json!(now_ms());
+        record["key"] = json!(key);
+        append_record(context, &record)?;
         Ok(Self { context: context.clone(), retry: true, offset, id, key: key.to_string() })
     }
 

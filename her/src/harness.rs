@@ -223,6 +223,30 @@ impl Limits {
     }
 }
 
+/// Reserved2 keeps the current wake's full form available if replay loses its base briefing.
+#[derive(Default)]
+pub(crate) struct TurnDelivery {
+    pub recorder: Option<crate::turn_ledger::Recorder>,
+    pub briefing: Option<Value>,
+    pub full_prompt: Option<String>,
+    pub recalled: Vec<i64>,
+    pub reserved2_budget: Option<crate::pipeline::Reserved2Budget>,
+}
+
+impl TurnDelivery {
+    fn check_deadline(
+        budget: Option<crate::pipeline::Reserved2Budget>, context: &RuntimeContext, key: &str,
+    ) -> Result<(), String> {
+        if let Some(budget) = budget {
+            let state = context.read_social_state()?;
+            if budget.expired(&state["conversations"][key]) {
+                return Err(DEADLINE_EXCEEDED.into());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct TurnRequest {
     pub id: String,
     pub conversation: String,
@@ -461,7 +485,16 @@ impl Harness {
         self.store.status(turn)
     }
 
-    pub fn admit(&self, mut request: TurnRequest) -> Result<Turn, String> {
+    #[cfg(test)]
+    pub fn admit(&self, request: TurnRequest) -> Result<Turn, String> {
+        self.admit_with_delivery(request, TurnDelivery::default())
+    }
+
+    pub(crate) fn wake_briefing(&self, conversation: &str, generation: &str) -> Result<Value, String> {
+        self.store.wake_briefing(conversation, generation)
+    }
+
+    pub(crate) fn admit_with_delivery(&self, mut request: TurnRequest, mut delivery: TurnDelivery) -> Result<Turn, String> {
         if request.id.is_empty() || request.conversation.is_empty() || request.generation.is_empty()
         {
             return Err("harness admission requires turn, conversation and generation".into());
@@ -478,6 +511,9 @@ impl Harness {
         request.tools.check().map_err(String::from)?;
         let key = request.route.key.clone();
         request.prompt = request.prompt.replace(&key, "[REDACTED]");
+        if let Some(full) = &mut delivery.full_prompt {
+            *full = full.replace(&key, "[REDACTED]");
+        }
         request.profile = request.profile.replace(&key, "[REDACTED]");
         // Media labels are text too; image data stays the bytes the pipeline normalized.
         for part in request.media.iter_mut() {
@@ -499,7 +535,7 @@ impl Harness {
             memory.start(&chain, len, std::time::Instant::now())
         });
         // The history after the session's newest checkpoint; the turn's task completes it (`handover::prepare`).
-        let history = self.store.admit(&request)?;
+        let history = self.store.admit_with_briefing(&request, delivery.briefing.take())?;
         let instruction = request.tools.instruction();
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
@@ -529,6 +565,7 @@ impl Harness {
                 &store,
                 &request,
                 history,
+                &delivery,
                 instruction,
                 &notifications,
                 &sent_flag,
@@ -540,7 +577,7 @@ impl Harness {
             let mut interrupted = None;
             let outcome = tokio::select! { biased;
                 _ = cancelled.changed() => { interrupted = Some(Status::Cancelled); None },
-                _ = tokio::time::sleep(request.deadline) => {
+                _ = tokio::time::sleep(request.deadline), if delivery.reserved2_budget.is_none() => {
                     interrupted = Some(Status::Failed(DEADLINE_EXCEEDED.into())); None
                 },
                 result = &mut execution => Some(result),
@@ -568,13 +605,16 @@ impl Harness {
                 Err(Failure::Failed(reason)) => interrupted.unwrap_or(Status::Failed(reason)),
                 Ok(event) => match interrupted {
                     Some(status) => status,
-                    None => {
-                        let Event::Assistant { text, .. } = &event else {
-                            unreachable!()
-                        };
-                        let status = Status::Completed(text.clone());
-                        assistant = Some(event);
-                        status
+                    None => match TurnDelivery::check_deadline(delivery.reserved2_budget, &context, &request.conversation) {
+                        Err(reason) => Status::Failed(reason),
+                        Ok(()) => {
+                            let Event::Assistant { text, .. } = &event else {
+                                unreachable!()
+                            };
+                            let status = Status::Completed(text.clone());
+                            assistant = Some(event);
+                            status
+                        }
                     }
                 },
             };
@@ -645,6 +685,7 @@ async fn tool_loop(
     store: &store::Store,
     request: &TurnRequest,
     history: store::History,
+    delivery: &TurnDelivery,
     instruction: String,
     events: &broadcast::Sender<Event>,
     sent: &AtomicBool,
@@ -654,7 +695,7 @@ async fn tool_loop(
 ) -> Result<Event, Failure> {
     let deadline = tokio::time::Instant::now() + request.deadline;
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
-    let (mut messages, rounds) =
+    let (mut messages, rounds, checkpoint_clipped) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
     let mut chain = ChainState::new(context, request, usage::next_number());
     let mut spent = 0u32;
@@ -675,13 +716,27 @@ async fn tool_loop(
         // #175: an oversized tool result reaches the model as a preview; #160: a replayed call to a
         // tool this request does not offer reaches it as text (`budget::fit`).
         let limit = budget::limit(&context.load_config()?, &route.spec.id);
-        let (kept, delivered) = budget::fit(
-            filter_model_messages(context, messages.clone())?,
-            &rounds,
-            &offered,
-            request.limits,
-            limit,
-        );
+        let fit = |messages| -> Result<_, String> {
+            Ok(budget::fit(
+                filter_model_messages(context, messages)?,
+                &rounds,
+                &offered,
+                request.limits,
+                limit,
+            ))
+        };
+        let (mut kept, mut delivered) = fit(messages.clone())?;
+        if let Some(full) = delivery.full_prompt.as_ref().filter(|_| {
+            checkpoint_clipped || kept.len() != messages.len()
+        }) {
+            let current = rounds.last().map_or_else(
+                || usize::from(messages.first().is_some_and(|message| message.role == ChatRole::System)),
+                |last| last.end,
+            );
+            let mut with_full = messages.clone();
+            with_full[current] = user_message(full, &request.media);
+            (kept, delivered) = fit(with_full)?;
+        }
         // Capture only structured references from the request being issued. Later read results
         // and recalled tool facts may add sources absent from the inbound wake. They are read from
         // the whole filtered copy of the rounds kept, so they still cover every ID a preview shows.
@@ -708,6 +763,14 @@ async fn tool_loop(
         });
         // A request that misses is recorded with its size (`ChainState::missed`).
         let request_bytes = serde_json::to_vec(&delivered).map_or(0, |bytes| bytes.len());
+        check_bound(request, &cancelled, deadline)?;
+        TurnDelivery::check_deadline(delivery.reserved2_budget, context, &request.conversation)?;
+        if step == 0 {
+            if let Some(recorder) = &delivery.recorder {
+                recorder.started()?;
+            }
+            crate::prompt::record_recall_hits(context, &delivery.recalled);
+        }
         let model = model_step(
             client,
             route,
@@ -808,6 +871,7 @@ async fn tool_loop(
             // Revocation may precede the pipeline's cancellation notification. It ends
             // the turn, rather than becoming a refusal with a new durable tool intent.
             check_bound(request, &cancelled, deadline)?;
+            TurnDelivery::check_deadline(delivery.reserved2_budget, context, &request.conversation)?;
             let run = store.tool_start(&request.id, &attempt, &call)?;
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
@@ -815,14 +879,21 @@ async fn tool_loop(
             let tools = request.tools.clone();
             let invocation = call.clone();
             let cancel = cancelled.clone();
-            let mut outcome = tokio::task::spawn_blocking(move || {
+            let budget = delivery.reserved2_budget;
+            let context = context.clone();
+            let key = request.conversation.clone();
+            let (mut outcome, skipped) = tokio::task::spawn_blocking(move || {
                 if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                    return tools::error("tool dispatch cancelled or expired");
+                    return (tools::error("tool dispatch cancelled or expired"), None);
                 }
-                match prepared {
+                if let Err(reason) = TurnDelivery::check_deadline(budget, &context, &key) {
+                    return (tools::error("tool dispatch cancelled or expired"), Some(reason));
+                }
+                let outcome = match prepared {
                     Ok(args) => tools.dispatch(&invocation, &args),
                     Err(outcome) => outcome,
-                }
+                };
+                (outcome, None)
             })
             .await
             .map_err(|_| {
@@ -835,6 +906,9 @@ async fn tool_loop(
             store
                 .tool_result(&request.id, &run, &message, &outcome)
                 .map_err(Failure::Uncertain)?;
+            if let Some(reason) = skipped {
+                return Err(reason.into());
+            }
             if outcome["_meta"]["herDelivery"] == "unknown" {
                 return Err(Failure::Uncertain("QQ send delivery could not be confirmed; administrator confirmation required before retry".into()));
             }

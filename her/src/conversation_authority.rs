@@ -46,12 +46,17 @@ pub(crate) fn generation(token: &str) -> String {
 
 /// Revoke only the admitted token, preserving any replacement turn's authority.
 pub(crate) fn revoke(context: &RuntimeContext, key: &str, expected: &str) -> Result<(), String> {
-    // A timeout of an old turn must never rotate a replacement turn's authority.
+    revoke_if_current(context, key, expected).map(|_| ())
+}
+
+pub(crate) fn revoke_if_current(context: &RuntimeContext, key: &str, expected: &str) -> Result<Option<String>, String> {
     crate::console::mutate_social_state_for(context, |state| {
-        if state["conversations"][key]["agentToken"].as_str() == Some(expected) {
-            state["conversations"][key]["agentToken"] = json!(crate::console::fresh_agent_token());
+        if state["conversations"][key]["agentToken"].as_str() != Some(expected) {
+            return Ok(None);
         }
-        Ok(())
+        let token = crate::console::fresh_agent_token();
+        state["conversations"][key]["agentToken"] = json!(&token);
+        Ok(Some(token))
     }).map_err(|(_, message)| message)
 }
 

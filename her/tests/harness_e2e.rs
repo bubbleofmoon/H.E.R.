@@ -4204,3 +4204,259 @@ fn one_shot_job_slang_learning_failures_change_nothing_and_only_alert_the_owner(
     assert!(rig.dsh.prompts().is_empty(), "slang learning reached DSH");
     assert_eq!(fs::read_to_string(rig.root.join("data/slang-session.json")).unwrap(), LEGACY_SESSION);
 }
+
+fn reserved2_fixture(name: &str, model: &FakeModel, engine: &str) -> Rig {
+    reserved2_fixture_with_config(name, model, json!({"conversationEngines":{GROUP_KEY:engine}}))
+}
+
+fn reserved2_fixture_with_config(name: &str, model: &FakeModel, mut config: Value) -> Rig {
+    config["harness"] = json!({"model":"fake-chat","summaries":false});
+    config["socialV2"] = json!({
+        "wake": {"batchWindowMs":1000,"maxWakeConfigReminders":1,"preSleepWaitEnabled":false},
+        "reply": {"quietMedianMs":1,"quietMinMs":1,"quietMaxMs":1},
+        "send": {"firstGapEnabled":false,"repeatLimit":0}
+    });
+    let mut rig = Rig::new(name, Seed {
+        mode: "reserved2",
+        config,
+        ..Seed::default()
+    });
+    fs::write(rig.root.join("config/harness-api-key"), "synthetic-model-key-67").unwrap();
+    let path = rig.root.join("dependencies.json");
+    let mut deps: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    deps["model"] = json!(&model.base);
+    fs::write(path, deps.to_string()).unwrap();
+    rig.console.kill().unwrap();
+    rig.console.wait().unwrap();
+    rig.console = spawn_console(&rig.root, rig.console_port);
+    console_fixture::wait_for_console(&mut rig.console, &mut rig.console_port, &rig.root, CONSOLE_TOKEN,
+        Duration::from_secs(20), |port| spawn_console(&rig.root, port));
+    rig
+}
+
+fn reserved2_call(id: &str, name: &str, args: Value) -> Value {
+    json!({"id":id,"name":name,"arguments":args})
+}
+
+fn reserved2_send() -> Value {
+    reserved2_call("send", "qq_send_message", json!({
+        "key": GROUP_KEY, "token": "", "messages": ["simulation fixture reply"]
+    }))
+}
+
+fn reserved2_group_ends(rig: &Rig) -> usize {
+    let records = rig.ledger();
+    records.iter().filter(|r| r["k"] == "ended" && records.iter().any(|begun| {
+        begun["k"] == "begun" && begun["key"] == GROUP_KEY && begun["turn"] == r["turn"]
+    })).count()
+}
+
+fn reserved2_group_outbox(rig: &Rig) -> Vec<Value> {
+    let records = rig.data_lines("send-outbox.jsonl");
+    records.iter().filter(|row| records.iter().any(|intent| {
+        intent["k"] == "intent" && intent["key"] == GROUP_KEY && intent["batch"] == row["batch"]
+    })).map(|row| row["k"].clone()).collect()
+}
+
+fn reserved2_push_mention(rig: &Rig, id: i64, text: &str) {
+    rig.push(group_event(id, 1001, "tester", "", vec![
+        json!({"type":"at","data":{"qq":SELF_ID.to_string()}}),text_seg(text)
+    ]));
+}
+
+fn reserved2_current_prompt(request: &Value) -> &str {
+    request["messages"].as_array().unwrap().iter().rev()
+        .find(|message| message["role"] == "user").unwrap()["content"].as_str().unwrap()
+}
+
+#[test]
+fn ticket159_reserved2_restart_keeps_the_confirmed_tool_send_once() {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![reserved2_send()]),
+        ModelReply::Delayed { text:"private deliberation".into(), release },
+    ]);
+    let mut rig = reserved2_fixture("ticket159-restart", &model, "harness");
+    rig.start();
+    reserved2_push_mention(&rig, 15911, "restart after confirm");
+    rig.wait_texts(GROUP_KEY, 1);
+    assert!(wait_for(LONG, || lock(&model.requests).len() == 2
+        && reserved2_group_outbox(&rig).iter().any(|kind| kind == "confirmed")));
+    assert_eq!(reserved2_group_ends(&rig), 0, "kill a live tool turn after the outbox confirmation");
+    stop_bridge(&mut rig);
+    rig.start();
+    assert!(wait_for(LONG, || rig.console("GET", "/api/turns", None).1["pausedCount"] == 1),
+        "the interrupted reserved2 wake must pause without DSH reconciliation");
+    let paused = rig.console("GET", "/api/turns", None).1;
+    assert_eq!(paused["paused"][0]["reason"], "harness-interrupted", "the interrupted wake must use harness recovery");
+    assert!(!wait_for(Duration::from_millis(1200), || lock(&model.requests).len() > 2),
+        "startup must not replay the interrupted wake after publishing its pause");
+    assert_eq!(rig.texts_to(GROUP_KEY), ["simulation fixture reply"]);
+    assert_eq!(reserved2_group_outbox(&rig).iter().filter(|kind| **kind == "confirmed").count(), 1);
+    assert_eq!(lock(&model.requests).len(), 2, "startup must not rerun the wake or the send");
+    assert!(rig.dsh.prompts().is_empty());
+}
+
+#[test]
+fn ticket159_reserved2_cli_pin_requires_a_scoped_harness_choice() {
+    let model = FakeModel::start(vec!["private deliberation", "unexpected second request"]);
+    let mut rig = reserved2_fixture_with_config("ticket159-cli-pin", &model, json!({
+        "engineDefault":"harness",
+        "backends":{"sessions":{GROUP_KEY:"missing-fixture-cli"}}
+    }));
+    rig.start();
+    reserved2_push_mention(&rig, 15951, "choose the pinned route");
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1));
+    assert!(rig.data_lines("logs/opencode-trial.jsonl").iter().any(|row| row["backend"] == "missing-fixture-cli"),
+        "an inherited harness default must still invoke the pinned CLI route");
+    assert!(lock(&model.requests).is_empty(), "the inherited choice must not invoke the harness");
+    assert!(rig.dsh.prompts().is_empty(), "a failed pinned CLI must not replay through DSH");
+
+    let scope = json!({"conversation":GROUP_KEY,"setting":"conversation.engine","value":"harness"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&scope)).0, 200);
+    reserved2_push_mention(&rig, 15952, "choose the scoped route");
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 2));
+    assert_eq!(lock(&model.requests).len(), 1, "the stored conversation choice must invoke the harness");
+    assert_eq!(rig.data_lines("logs/opencode-trial.jsonl").len(), 1, "the harness wake must skip the pinned CLI");
+    assert!(rig.ledger().iter().any(|row| row["k"] == "begun" && row["key"] == GROUP_KEY && row["backend"] == "harness"));
+}
+
+#[test]
+fn ticket159_reserved2_switch_publishes_the_destination_for_the_waiting_wake() {
+    let model = FakeModel::start(vec!["Marked handover from the source.", "private deliberation"]);
+    let mut rig = reserved2_fixture("ticket159-switch", &model, "dsh");
+    rig.start();
+    reserved2_push_mention(&rig, 15921, "source turn");
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1));
+    let old = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
+    let scope = json!({"conversation":GROUP_KEY,"setting":"conversation.engine","value":"harness"});
+    assert_eq!(rig.console("POST", "/api/settings/conversation/set", Some(&scope)).0, 200);
+    reserved2_push_mention(&rig, 15922, "destination wake");
+    assert!(wait_for(LONG, || lock(&model.requests).iter().any(|request| request["stream"] == true)),
+        "the waiting wake must use the token published by its own handover");
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 2));
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]["messages"].to_string().contains("【之前聊天的摘要】"));
+    assert!(reserved2_current_prompt(&requests[1]).contains("【简报 revision="));
+    assert_eq!(rig.dsh.calls("workspace/archiveSession").len(), 1);
+    assert_ne!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], old);
+    assert!(rig.ledger().iter().any(|record| record["k"] == "begun" && record["backend"] == "harness"));
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
+    drop(requests);
+    let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
+    assert_eq!(status, 200, "the administrator can explicitly apply the selection in reserved2: {body}");
+}
+
+#[test]
+fn ticket159_reserved2_switch_rechecks_the_owners_explicit_private_allow() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let release = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![ModelReply::Delayed {
+        text: "Saved private handover.".into(), release: release.clone(),
+    }]);
+    let mut rig = reserved2_fixture_with_config("ticket159-owner-switch-acl", &model, json!({
+        "allowAllWhenEmpty":true
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "private source history");
+    let session = rig.wait_prompts(1)[0].session.clone();
+    assert!(wait_for(LONG, || {
+        let ledger = rig.ledger();
+        ledger.iter().any(|start| start["k"] == "begun" && start["key"] == OWNER_KEY &&
+            ledger.iter().any(|end| end["k"] == "ended" && end["turn"] == start["turn"]))
+    }));
+    stop_bridge(&mut rig);
+    let token = rig.data_json("social-v2.json")["conversations"][OWNER_KEY]["agentToken"].clone();
+    let config_path = rig.root.join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+    config["allow"]["private"] = json!([]);
+    let (seen, changed, (status, body)) = thread::scope(|scope| {
+        let rig = &rig;
+        let switch = scope.spawn(|| rig.console("POST", SWITCH_PATH, Some(&json!({
+            "conversation":OWNER_KEY, "engine":"harness",
+        }))));
+        let seen = wait_for(LONG, || !lock(&model.requests).is_empty());
+        // Change the file without access reconciliation so the handover recheck is what stops publication.
+        let tmp = config_path.with_extension("pending");
+        let changed = fs::write(&tmp, config.to_string()).and_then(|()| fs::rename(tmp, &config_path));
+        release.store(true, Ordering::SeqCst);
+        (seen, changed, switch.join().unwrap())
+    });
+    changed.unwrap();
+    assert!(seen, "the switch must reach summarization before the private allow entry is removed");
+    assert_eq!((status, body["error"].as_str()), (409, Some("conversation is no longer admitted")),
+        "the handover must refuse when the owner's explicit private allow entry disappears");
+    assert!(rig.dsh.calls("workspace/archiveSession").is_empty());
+    assert_eq!(rig.data_json("sessions.json")["sessions"][OWNER_KEY], session);
+    let state = rig.data_json("social-v2.json");
+    assert_eq!(state["conversations"][OWNER_KEY]["agentToken"], token);
+    assert!(state["conversations"][OWNER_KEY]["engineHandover"]["pending"].is_null());
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn ticket159_reserved2_model_start_and_captured_budget_are_used() {
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let model = FakeModel::script(vec![
+        ModelReply::Delayed { text:"late private deliberation".into(), release },
+    ]);
+    let mut rig = reserved2_fixture("ticket159-budget", &model, "harness");
+    let advance = rig.root.join("clock-advance");
+    rig.start_with_clock(Some(&advance));
+    reserved2_push_mention(&rig, 15931, "wait for the captured cap");
+    assert!(wait_for(LONG, || lock(&model.requests).len() == 1));
+    let ledger = rig.ledger();
+    let begun = ledger.iter().find(|r| r["k"] == "begun" && r["key"] == GROUP_KEY).unwrap();
+    let rows: Vec<_> = ledger.iter().filter(|r| r["turn"] == begun["turn"]).collect();
+    assert_eq!(rows.iter().filter(|r| r["k"] == "started").count(), 1,
+        "the first model request must publish one thinking start before the response");
+    let budget = rows.iter().find(|r| r["k"] == "budget").unwrap();
+    let cap = budget["capMs"].as_i64().unwrap();
+    advance_switch_clock(&advance, cap + 1000);
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1), "the captured cap must cancel a pending model request");
+    let timing = rig.data_lines("logs/turn-timing.jsonl");
+    assert!(timing.iter().any(|r| r["turnId"] == begun["turn"] && r["cancelReason"] == "harnessDeadline"));
+    assert!(rig.dsh.calls("session/cancel").is_empty());
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
+}
+
+#[test]
+fn ticket159_reserved2_thinking_begins_after_checkpoint_preparation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let release = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![
+        ModelReply::Text("ordinary history ".repeat(400)),
+        ModelReply::Delayed { text:"Earlier discussion.".into(), release:release.clone() },
+        ModelReply::Text("private deliberation".into()),
+    ]);
+    let mut rig = reserved2_fixture("ticket159-thinking", &model, "harness");
+    rig.start();
+    reserved2_push_mention(&rig, 15941, "first turn to create history");
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 1));
+    let path = rig.root.join("config/config.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["harness"]["contextTokens"] = json!({"fake-chat":1000});
+    config["harness"]["summaries"] = json!(true);
+    let staged = path.with_extension("tmp");
+    fs::write(&staged, config.to_string()).unwrap();
+    fs::rename(staged, path).unwrap();
+
+    reserved2_push_mention(&rig, 15942, "second turn after a budget change");
+    assert!(wait_for(LONG, || lock(&model.requests).len() == 2), "the second turn must request a checkpoint summary");
+    assert_ne!(lock(&model.requests)[1]["stream"], true);
+    let records = rig.ledger();
+    let latest = records.iter().rev().find(|r| r["k"] == "begun" && r["key"] == GROUP_KEY).unwrap();
+    let id = latest["turn"].as_str().unwrap();
+    assert!(!records.iter().any(|r| r["turn"] == id && r["k"] == "started"),
+        "checkpoint preparation must not count as thinking time");
+    release.store(true, Ordering::SeqCst);
+
+    assert!(wait_for(LONG, || reserved2_group_ends(&rig) == 2));
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 3);
+    assert!(reserved2_current_prompt(&requests[2]).contains("【简报 revision="),
+        "a request that clipped the briefing base must carry a full briefing");
+    assert_eq!(rig.ledger().iter().filter(|r| r["turn"] == id && r["k"] == "started").count(), 1);
+}
