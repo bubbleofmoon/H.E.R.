@@ -368,7 +368,7 @@ impl Pipeline {
             self.store.sessions.get(key).map(|r| r.session_id.clone())
         };
         let Some(sid) = sid else {
-            if let Some((expected, publication)) = dispatch.filter(|_| reason != "turnTimeout") { // RED-M5 (R2j)
+            if let Some((expected, publication)) = dispatch {
                 // An unmapped first wake can still be waiting for the turn gate.
                 let mut minted = publication.lock().unwrap_or_else(|p| p.into_inner());
                 let current = minted.as_deref().unwrap_or(expected);
