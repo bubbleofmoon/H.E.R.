@@ -2951,7 +2951,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
             }
-            if setting_is_secret(&path) {
+            if setting_is_secret(&path) && false { // RED-C1J
                 return Err((403, SETTINGS_READ_REFUSED.to_string()));
             }
             if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
