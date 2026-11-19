@@ -1581,9 +1581,41 @@ pub(crate) fn write_append_all(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub(crate) struct FixtureRoot(pub(crate) PathBuf);
+
+    impl Drop for FixtureRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build the layout required by RuntimeContext, with a synthetic console credential.
+    pub(crate) fn runtime_fixture(root: PathBuf, config: &Value, dependencies: &Value) -> FixtureRoot {
+        assert!(config["consoleToken"].as_str().is_some_and(|token| !token.trim().is_empty()));
+        let root = crate::install_root::development_root(root);
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let fixture = FixtureRoot(root);
+        for dir in ["config", "data", "resources"] {
+            fs::create_dir(fixture.0.join(dir)).unwrap();
+        }
+        fs::write(
+            fixture.0.join("config/config.json"),
+            serde_json::to_vec_pretty(config).unwrap(),
+        )
+        .unwrap();
+        fs::write(fixture.0.join("data/social-v2.json"), b"{}").unwrap();
+        fs::write(
+            fixture.0.join("dependencies.json"),
+            serde_json::to_vec(dependencies).unwrap(),
+        )
+        .unwrap();
+        fixture
+    }
 
     static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 

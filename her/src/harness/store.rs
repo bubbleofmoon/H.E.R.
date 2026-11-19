@@ -759,22 +759,25 @@ fn attempt_route(model: String, started: &str) -> String {
 mod tests {
     use super::*;
     use crate::harness::{Limits, ModelRoute, Tools};
+    use crate::runtime::tests::runtime_fixture;
     use genai::chat::{Binary, BinarySource, ContentPart};
 
     #[test]
     fn hotfix128_binary_records_preserve_opaque_data_for_replay() {
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-opaque-128-{}", crate::turn_ledger::mint_id(""))));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
         let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-128","harness":{"model":"fake-chat"}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "her-store-opaque-128-{}",
+            crate::turn_ledger::mint_id("")
+        ));
+        let fixture = runtime_fixture(root, &cfg, &json!({
+            "dsh": "http://127.0.0.1:43101",
+            "model": "http://127.0.0.1:43102",
+            "onebot": "http://127.0.0.1:43103"
+        }));
+        let root = &fixture.0;
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-128").unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let mut request = TurnRequest {
@@ -814,18 +817,20 @@ mod tests {
     #[test]
     fn harness_idle_rotation_last_call_reads_the_newest_answered_request_of_the_session() {
         use crate::harness::rotation::LastCall;
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-last-call-165-{}", crate::turn_ledger::mint_id(""))));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
         let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-165","harness":{"model":"fake-chat"}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "her-store-last-call-165-{}",
+            crate::turn_ledger::mint_id("")
+        ));
+        let fixture = runtime_fixture(root, &cfg, &json!({
+            "dsh": "http://127.0.0.1:43101",
+            "model": "http://127.0.0.1:43102",
+            "onebot": "http://127.0.0.1:43103"
+        }));
+        let root = &fixture.0;
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-165").unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         assert_eq!(last_call(&context, "private:8808", &generation).unwrap(), None, "no database: no request");
@@ -860,18 +865,20 @@ mod tests {
     #[test]
     fn harness_idle_rotation_last_call_names_the_route_its_attempt_recorded() {
         use crate::harness::rotation::LastCall;
-        let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-store-last-route-7-{}", crate::turn_ledger::mint_id(""))));
-        struct Cleanup(std::path::PathBuf);
-        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-        let _cleanup = Cleanup(root.clone());
-        for dir in ["config", "data", "resources"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
         let cfg = json!({"ownerQQ":8808,"consoleToken":"synthetic-console-7","harness":{"routes":[{"id":"flash","model":"fake-flash"}]}});
-        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "her-store-last-route-7-{}",
+            crate::turn_ledger::mint_id("")
+        ));
+        let fixture = runtime_fixture(root, &cfg, &json!({
+            "dsh": "http://127.0.0.1:43101",
+            "model": "http://127.0.0.1:43102",
+            "onebot": "http://127.0.0.1:43103"
+        }));
+        let root = &fixture.0;
         std::fs::write(root.join("config/harness-api-key"), "synthetic-model-key-7").unwrap();
-        std::fs::write(root.join("data/social-v2.json"), "{}").unwrap();
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"closed-agent"}"#).unwrap();
-        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:43101","model":"http://127.0.0.1:43102","onebot":"http://127.0.0.1:43103"}"#).unwrap();
-        let context = RuntimeContext::from_root(&root).unwrap();
+        let context = RuntimeContext::from_root(root).unwrap();
         let token = crate::conversation_authority::ensure_or_rotate(&context, "private:8808", false).unwrap();
         let generation = crate::send_outbox::token_epoch(&token);
         let request = TurnRequest {
