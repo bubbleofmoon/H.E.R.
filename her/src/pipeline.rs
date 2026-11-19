@@ -1477,7 +1477,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
         }).await.map_err(|_| "engine admission worker stopped".to_string())??;
         if let Some(token) = token.filter(|_| simulation && self.dispatch_token.is_some()) {
-            let _ = token; // RED-R2a
+            self.dispatch_token = Some(token);
         }
         Ok((crate::turn_engine::Adapter::for_engine(engine), Some(gates), simulation.then_some(cfg)))
     }
@@ -1573,7 +1573,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
 
     fn check_harness_turn(&self, key: &str) -> Result<bool, String> {
         let state = self.check_harness_authority(key)?;
-        Ok(self.reserved2_budget.is_some_and(|budget| crate::turn_ledger::now_ms() >= budget.ceiling)) // RED-R2d
+        Ok(self.reserved2_budget.is_some_and(|budget| budget.expired(&state["conversations"][key])))
     }
 
     fn request_harness_cap(&self, key: &str, recorder: &crate::turn_ledger::Recorder) -> bool {
@@ -1667,7 +1667,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else { timeout };
         let tools = crate::harness::Tools::capture(&self.context, cfg, mode, key, &self.turn_epoch)?;
         let prompt_chars = prompt.chars().count();
-        recorder.attempt_with_layers(&attempt, "", layers.as_ref())?; if delivery.full_prompt.is_some() { recorder.started()?; } // RED-R2b
+        recorder.attempt_with_layers(&attempt, "", layers.as_ref())?;
         let mut turn = harness.admit_with_delivery(TurnRequest {
             id: recorder.id.clone(), conversation: key.to_string(), generation: self.turn_epoch.clone(),
             prompt,
@@ -2002,7 +2002,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         // 正确的分工：说话 = 模型显式调 `qq_send_message`；不说话 = 什么都没发生。
         // 如果它该说而没说，那是**提示词**的问题（见 prompt::build 的唤醒上下文），
         // 要在提示词里把"谁说了什么、要不要接"说清楚，而不是在这里瞎补。
-        let before = Self::last_ai_reply_at(&self.context, &key); let _ = crate::dsh_health::is_down(&self.context); // RED-R2i
+        let before = Self::last_ai_reply_at(&self.context, &key);
         // JS `withSlangContext`: every prompt handed to DSH starts with the clock line (and the
         // confirmed slang block) at the moment of delivery.
         let delivered = crate::prompt::wrap_for_delivery_with_runtime(
