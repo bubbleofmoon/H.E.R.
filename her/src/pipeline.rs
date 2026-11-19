@@ -1564,7 +1564,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             Ok(text) => text,
             Err(error) => {
                 self.owner_interaction_closed = turn.owner_interaction_closed();
-                if error == crate::harness::DEADLINE_EXCEEDED && !self.owner_interaction_closed {
+                if error == crate::harness::DEADLINE_EXCEEDED { // RED-M5
                     self.report_backend_failure(cfg, key, "harness", "openai", &model, "", &error);
                 }
                 return Err(error);
