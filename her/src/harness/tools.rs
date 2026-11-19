@@ -114,11 +114,11 @@ impl Tools {
             .unwrap_or(Ok(()))
     }
 
-    pub(super) fn revoke(&self) -> Result<(), String> {
-        if let Some(a) = &self.authority {
-            crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token)?;
+    pub(super) fn revoke(&self) -> Result<Option<String>, String> {
+        match &self.authority {
+            Some(a) => crate::conversation_authority::revoke(&a.context, &a.conversation, &a.token),
+            None => Ok(None),
         }
-        Ok(())
     }
 
     pub(super) fn pause(&self, turn: &str, reason: &str, detail: &str) -> Result<(), String> {
@@ -127,7 +127,7 @@ impl Tools {
             crate::turn_ledger::Recorder::attach(&a.context, turn, &a.conversation)
                 .unknown(reason, detail)?;
         }
-        revoked
+        revoked.map(|_| ())
     }
 
     pub(super) fn matches(&self, conversation: &str, generation: &str) -> bool {

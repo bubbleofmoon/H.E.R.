@@ -68,6 +68,19 @@ fn unanswered_question_expires_without_a_model_continuation() {
 }
 
 #[test]
+fn the_turn_deadline_tells_the_owner_the_question_is_closed() {
+    let model = FakeModel::script(vec![ask()]);
+    let mut rig = owner_harness_rig("owner-question-turn-deadline", &model);
+    set_harness_config(&rig, json!({}), 5);
+    request_question(&mut rig);
+    assert!(wait_for(LONG, || rig.texts_to(OWNER_KEY).iter().any(|text| text == "⏰ 等待回答超时，已取消该请求。")), "the turn deadline did not send the question closure notice");
+    assert!(wait_for(LONG, || conversation_facts(&rig)["turns"][0]["state"] == "failed"));
+    assert_eq!(conversation_facts(&rig)["tools"][0]["state"], "refused");
+    assert_eq!(rig.console("GET", "/api/pending", None), (200, json!({"pending":[]})));
+    assert_eq!(lock(&model.requests).len(), 1);
+}
+
+#[test]
 fn qq_reset_and_new_end_a_pending_question_without_answering_it() {
     for (tag, command) in [("reset", "/reset"), ("new", "/new")] {
         let model = FakeModel::script(vec![ask()]);

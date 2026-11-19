@@ -176,7 +176,9 @@ async fn revoked_authority_settles_a_submitted_send_without_starting_the_next_ca
     let console_task = tokio::spawn(respond_once(
         console.clone(),
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}".into(),
-        move || crate::conversation_authority::revoke(&revoke_context, "private:8808", &token).unwrap(),
+        move || {
+            let _ = crate::conversation_authority::revoke(&revoke_context, "private:8808", &token).unwrap();
+        },
     ));
     let harness = Harness::open(&context).unwrap();
     let mut turn = harness

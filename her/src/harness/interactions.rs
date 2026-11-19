@@ -3,7 +3,7 @@ use super::{tools, Failure};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
@@ -13,6 +13,7 @@ pub(super) const ASK: &str = "ask_owner";
 pub(super) const GROUP_SEND: &str = "qq_send_group_message";
 const ANSWER_LIMIT: usize = 2_000;
 const OPTION_LIMIT: usize = 4;
+const TIMEOUT_NOTICE: &str = "⏰ 等待回答超时，已取消该请求。";
 
 fn approval_prompt(id: &str) -> String {
     format!("回复 /approve {id} 或 /deny {id}")
@@ -189,8 +190,10 @@ impl Mailbox {
                 None if text.starts_with('/') => return Answer::Notice(approval_prompt(&snapshot.id)),
                 None => return Answer::NoticeAndForward(approval_prompt(&snapshot.id)),
             }
-        } else if command.is_some() || text.is_empty() || text.chars().take(ANSWER_LIMIT + 1).count() > ANSWER_LIMIT {
+        } else if command.is_some() || text.is_empty() {
             return no_pending();
+        } else if text.chars().take(ANSWER_LIMIT + 1).count() > ANSWER_LIMIT {
+            return Answer::Notice(format!("⚠️ 回答太长，请缩短至 {ANSWER_LIMIT} 字以内再回复。"));
         } else {
             text
         };
@@ -243,6 +246,7 @@ pub(super) struct Binding<'a> {
     pub turn: &'a str,
     pub epoch: &'a str,
     pub deadline: Instant,
+    pub deadline_generation: &'a OnceLock<String>,
 }
 
 impl Binding<'_> {
@@ -329,7 +333,7 @@ impl Binding<'_> {
         }
         display["key"] = json!(self.key);
         display["sessionId"] = json!(self.session);
-        let snapshot = Snapshot {
+        let mut snapshot = Snapshot {
             id, key: self.key.into(), session_id: self.session.into(), turn: self.turn.into(),
             epoch: self.epoch.into(), expires_at: (crate::parity_clock::now_ms() as i64)
                 .saturating_add(wait.as_millis() as i64), display,
@@ -340,27 +344,35 @@ impl Binding<'_> {
             _ = tokio::time::sleep_until(expires) => return Err("Owner interaction timed out.".into()),
             result = publication => result?,
         };
-        self.deliver(snapshot.clone(), notice, expires, cancelled.clone(), false).await?;
-        let result = tokio::select! { biased;
-            _ = cancelled.changed() => Err(Failure::Cancelled),
-            _ = tokio::time::sleep_until(expires) => Err("Owner interaction timed out.".into()),
-            reply = receiver => reply.map_err(|_| Failure::Cancelled),
-        };
+        self.deliver(snapshot.clone(), notice, Some((expires, cancelled.clone())), false).await?;
+        let result = wait_for_reply(receiver, expires, &mut cancelled).await;
         drop(lease);
         if matches!(&result, Err(Failure::Failed(_))) && wait < remaining {
-            self.deliver(snapshot, "⏰ 等待回答超时，已取消该请求。".into(), self.deadline, cancelled, true).await?;
+            self.deliver(snapshot, TIMEOUT_NOTICE.into(), Some((self.deadline, cancelled)), true).await?;
+        } else if matches!(&result, Err(Failure::Cancelled)) && !approval {
+            if let Some(generation) = self.deadline_generation.get() {
+                snapshot.epoch.clone_from(generation);
+                self.deliver(snapshot, TIMEOUT_NOTICE.into(), None, true).await?;
+            }
         }
         result
     }
 
-    async fn deliver(&self, snapshot: Snapshot, text: String, deadline: Instant, cancelled: watch::Receiver<bool>, notice_only: bool) -> Result<(), Failure> {
+    async fn deliver(
+        &self,
+        snapshot: Snapshot,
+        text: String,
+        bound: Option<(Instant, watch::Receiver<bool>)>,
+        notice_only: bool,
+    ) -> Result<(), Failure> {
         let context = self.mailbox.context.clone();
         tokio::task::spawn_blocking(move || {
             let cfg = context.load_config().map_err(Failure::from)?;
             let ob = crate::chat::onebot_of(&context, &cfg)?;
             let purpose = if notice_only { "owner-interaction-timeout" } else { "owner-interaction" };
+            let cancelled = || bound.as_ref().is_some_and(|(_, signal)| *signal.borrow());
             let report = crate::chat::send_recorded(&context, &ob, &snapshot.key, &snapshot.epoch, purpose, &text, 0, &|| {
-                if !*cancelled.borrow() && Instant::now() < deadline && snapshot.current(&context) {
+                if !cancelled() && bound.as_ref().is_none_or(|(deadline, _)| Instant::now() < *deadline) && snapshot.current(&context) {
                     Ok(())
                 } else {
                     Err("owner interaction ended".into())
@@ -369,14 +381,28 @@ impl Binding<'_> {
             if report.unknown {
                 return Err(Failure::Uncertain("Owner interaction delivery is outcome-unknown.".into()));
             }
-            if *cancelled.borrow() {
+            let delivered = report.parts > 0 && report.confirmed == report.parts;
+            if cancelled() && (notice_only || !delivered) {
                 return Err(Failure::Cancelled);
             }
-            if !notice_only && (report.parts == 0 || report.confirmed != report.parts) {
+            if !notice_only && !delivered {
                 return Err("Owner interaction could not be delivered.".into());
             }
             Ok(())
         }).await.map_err(|_| Failure::Uncertain("Owner interaction worker did not settle.".into()))?
+    }
+}
+
+async fn wait_for_reply(
+    receiver: oneshot::Receiver<String>,
+    expires: Instant,
+    cancelled: &mut watch::Receiver<bool>,
+) -> Result<String, Failure> {
+    tokio::select! { biased;
+        _ = cancelled.changed() => Err(Failure::Cancelled),
+        // The mailbox already rejects replies at or after expiry.
+        reply = receiver => reply.map_err(|_| Failure::Cancelled),
+        _ = tokio::time::sleep_until(expires) => Err("Owner interaction timed out.".into()),
     }
 }
 
@@ -428,6 +454,14 @@ mod tests {
         }
 
         async fn publish(&self, approval: bool) -> (fs::File, Lease, oneshot::Receiver<String>) {
+            self.publish_until(approval, Instant::now() + Duration::from_secs(60)).await
+        }
+
+        async fn publish_until(
+            &self,
+            approval: bool,
+            expires: Instant,
+        ) -> (fs::File, Lease, oneshot::Receiver<String>) {
             let owner = super::super::turn_owner(&self.mailbox.context, TURN).unwrap();
             let snapshot = Snapshot {
                 id: REQUEST.into(),
@@ -435,10 +469,11 @@ mod tests {
                 session_id: "session-fixture".into(),
                 turn: TURN.into(),
                 epoch: crate::conversation_authority::generation(TOKEN),
-                expires_at: crate::parity_clock::now_ms() as i64 + 60_000,
+                expires_at: crate::parity_clock::now_ms() as i64
+                    + expires.saturating_duration_since(Instant::now()).as_millis() as i64,
                 display: Value::Null,
             };
-            let (lease, reply) = self.mailbox.publish(snapshot, Instant::now() + Duration::from_secs(60), approval).await.unwrap();
+            let (lease, reply) = self.mailbox.publish(snapshot, expires, approval).await.unwrap();
             (owner, lease, reply)
         }
     }
@@ -447,6 +482,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[tokio::test]
+    async fn an_answer_accepted_before_expiry_wins_when_the_waiter_polls_late() {
+        let fixture = Fixture::new();
+        let expires = Instant::now() + Duration::from_secs(2);
+        let (_owner, _lease, reply) = fixture.publish_until(false, expires).await;
+        let (_cancel, mut cancelled) = watch::channel(false);
+        assert_eq!(fixture.mailbox.answer(OWNER_KEY, "Blue", Duration::ZERO).await, Answer::Accepted);
+        tokio::time::sleep_until(expires + Duration::from_millis(1)).await;
+        assert_eq!(wait_for_reply(reply, expires, &mut cancelled).await.ok().as_deref(), Some("Blue"));
+    }
+
+    #[tokio::test]
+    async fn an_overlong_question_answer_gets_a_notice_and_can_be_retried() {
+        let fixture = Fixture::new();
+        let (_owner, _lease, mut reply) = fixture.publish(false).await;
+        let answer = "字".repeat(2_000);
+        assert_eq!(
+            fixture.mailbox.answer(OWNER_KEY, &format!("{answer}字"), Duration::ZERO).await,
+            Answer::Notice("⚠️ 回答太长，请缩短至 2000 字以内再回复。".into()),
+        );
+        assert_eq!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+        assert_eq!(fixture.mailbox.answer(OWNER_KEY, &answer, Duration::ZERO).await, Answer::Accepted);
+        assert_eq!(reply.try_recv().unwrap(), answer);
     }
 
     #[tokio::test]

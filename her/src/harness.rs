@@ -524,6 +524,8 @@ impl Harness {
             let _owner = owner;
             let mut assistant = None;
             let cancellation = cancelled.clone();
+            let deadline = tokio::time::Instant::now() + request.deadline;
+            let deadline_generation = std::sync::OnceLock::new();
             let execution = tool_loop(
                 &context,
                 &client,
@@ -535,13 +537,15 @@ impl Harness {
                 &sent_flag,
                 &refs_for_task,
                 &progress_for_task,
+                deadline,
+                &deadline_generation,
                 cancellation,
             );
             tokio::pin!(execution);
             let mut interrupted = None;
             let outcome = tokio::select! { biased;
                 _ = cancelled.changed() => { interrupted = Some(Status::Cancelled); None },
-                _ = tokio::time::sleep(request.deadline) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     interrupted = Some(Status::Failed(DEADLINE_EXCEEDED.into())); None
                 },
                 result = &mut execution => Some(result),
@@ -553,9 +557,15 @@ impl Harness {
                     // cancellable; a dispatched blocking handler must settle under revoked authority.
                     let _ = task_cancel.send(true);
                     let revoked = request.tools.revoke();
+                    if matches!(&interrupted, Some(Status::Failed(_))) {
+                        if let Ok(Some(generation)) = &revoked {
+                            // A displayed question can send its closure notice under the new epoch.
+                            let _ = deadline_generation.set(generation.clone());
+                        }
+                    }
                     let settled = execution.await;
                     match revoked {
-                        Ok(()) => settled,
+                        Ok(_) => settled,
                         Err(reason) => Err(Failure::Uncertain(reason)),
                     }
                 }
@@ -655,9 +665,10 @@ async fn tool_loop(
     sent: &AtomicBool,
     request_refs: &std::sync::Mutex<Vec<Value>>,
     progress: &std::sync::Mutex<Progress>,
+    deadline: tokio::time::Instant,
+    deadline_generation: &std::sync::OnceLock<String>,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<Event, Failure> {
-    let deadline = tokio::time::Instant::now() + request.deadline;
     let session = history.session.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
     let (mut messages, rounds) =
@@ -825,7 +836,7 @@ async fn tool_loop(
                         Some(mailbox) => {
                             let binding = interactions::Binding {
                                 mailbox, key: &request.conversation, session: &session,
-                                turn: &request.id, epoch: &request.generation, deadline,
+                                turn: &request.id, epoch: &request.generation, deadline, deadline_generation,
                             };
                             if call.fn_name == interactions::ASK {
                                 binding.question(&args, cancelled.clone()).await
