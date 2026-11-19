@@ -2206,7 +2206,7 @@ pub(crate) fn render_wake(
     let snapshot = crate::qq_tools::wake_snapshot(context, cfg, key, epoch)?;
     let carried = held.iter().chain(&recalled).copied().collect();
     let clock = format!("【当前时间】{}（{}）\n\n", js_local_datetime(now_ms()), zone_name());
-    let text = format!("{clock}{}{delta}{snapshot}", header(full));
+    let text = format!("{clock}{}{delta}{snapshot}", header(full || !include_token)); // RED-R3
     let full_text = (!include_token && !full).then(|| format!("{clock}{}{delta}{snapshot}", header(true)));
     Ok(RenderedWake { text, full_text, recalled, layers, cut, revision, hashes, carried })
 }
