@@ -714,7 +714,7 @@ async fn tool_loop(
                 request.limits.image_input,
             ))
             .with_tools(offered.clone());
-            chain.capture_request(&route.model, max_tokens, &chat)
+            request.route.capture_request(&route.model, max_tokens, &chat)
         });
         // A request that misses is recorded with its size (`ChainState::missed`).
         let request_bytes = serde_json::to_vec(&delivered).map_or(0, |bytes| bytes.len());

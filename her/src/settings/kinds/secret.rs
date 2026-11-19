@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 pub(crate) struct ApiKey;
 
-const MIN_BYTES: usize = 7; // RED-C1F
+const MIN_BYTES: usize = 8;
 const MAX_BYTES: usize = 4096;
 
 impl SettingKind for ApiKey {
