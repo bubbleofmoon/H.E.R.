@@ -984,7 +984,7 @@ impl Hub {
                     }
                     Answer::NoticeAndForward(text) => {
                         self.say(cfg, &key, &text);
-                        true // RED-A9
+                        false
                     }
                     Answer::NoticeIfNoLegacy(text) => {
                         if !interactions.answer(&key, &plain).await {
@@ -992,7 +992,7 @@ impl Hub {
                         }
                         true
                     }
-                    Answer::Forward => !reset && interactions.answer(&key, &plain).await, // RED-A11
+                    Answer::Forward => interactions.answer(&key, &plain).await,
                 };
                 if handled {
                     self.settle(inbound_key).await?;

@@ -12,7 +12,7 @@ const SNAPSHOT: &str = "pending-owner-interaction.json";
 pub(super) const ASK: &str = "ask_owner";
 pub(super) const GROUP_SEND: &str = "qq_send_group_message";
 const ANSWER_LIMIT: usize = 2_000;
-const OPTION_LIMIT: usize = 5; // RED-A2
+const OPTION_LIMIT: usize = 4;
 
 fn approval_prompt(id: &str) -> String {
     format!("回复 /approve {id} 或 /deny {id}")
@@ -169,24 +169,24 @@ impl Mailbox {
             let pending = slot.as_ref()?;
             (pending.snapshot.key == key).then(|| pending.snapshot.clone())
         });
-        let Some(snapshot) = snapshot else { return Answer::Forward }; // RED-A10
+        let Some(snapshot) = snapshot else { return no_pending() };
         let Ok(_gate) = crate::closed_agent::lock_wait(&self.context, gate_wait).await else {
-            return Answer::Accepted; // RED-A5
+            return Answer::Notice("⚠️ 系统繁忙，回答未提交，请稍后再回复一次。".into());
         };
-        if snapshot.session_id.is_empty() { // RED-A6
+        if !snapshot.current(&self.context) {
             return no_pending();
         }
         let Ok(mut slot) = self.pending.lock() else { return no_pending() };
         let Some(pending) = slot.as_mut().filter(|entry| entry.snapshot.id == snapshot.id && entry.reply.is_some()) else {
             return no_pending();
         };
-        if Instant::now() >= pending.expires && !pending.approval { // RED-A7
+        if Instant::now() >= pending.expires {
             return no_pending();
         }
         let reply = if pending.approval {
             match command.filter(|_| id == Some(snapshot.id.as_str())) {
                 Some(decision) => decision,
-                None if text.starts_with('/') => return Answer::Notice(if command.is_some() { "审批回复无效。".into() } else { approval_prompt(&snapshot.id) }), // RED-A8
+                None if text.starts_with('/') => return Answer::Notice(approval_prompt(&snapshot.id)),
                 None => return Answer::NoticeAndForward(approval_prompt(&snapshot.id)),
             }
         } else if command.is_some() || text.is_empty() || text.chars().take(ANSWER_LIMIT + 1).count() > ANSWER_LIMIT {
@@ -258,7 +258,7 @@ impl Binding<'_> {
             return Ok(tools::error("Question text contains private credentials."));
         }
         let reply = self.wait(question.display(), question.notice(), false, cancelled).await?;
-        let answer = crate::activity::mask_log_text(&reply, &tokens); // RED-A1
+        let answer = crate::activity::mask_log_text(&question.answer(&reply), &tokens);
         Ok(tools::text(&answer, false))
     }
 
@@ -306,7 +306,7 @@ impl Binding<'_> {
             match crate::console::send_approved_group(&context, &key, &message, &turn, &authorized) {
                 Ok((_, value)) if value["unknown"].as_array().is_some_and(|items| !items.is_empty()) => {
                     let mut outcome = tools::error("Group send delivery is outcome-unknown.");
-                    outcome["_meta"] = json!({"herDelivery":"refused"}); // RED-A4
+                    outcome["_meta"] = json!({"herDelivery":"unknown"});
                     outcome
                 }
                 Ok((_, value)) if value["ok"] == true => tools::text("Group message sent.", false),
@@ -317,7 +317,7 @@ impl Binding<'_> {
 
     async fn wait(&self, mut display: Value, mut notice: String, approval: bool, mut cancelled: watch::Receiver<bool>) -> Result<String, Failure> {
         let cfg = self.mailbox.context.load_config().map_err(Failure::from)?;
-        let timeout = cfg["questionTimeoutMs"].as_u64().map_or(300_000, |_| 300_000); // RED-A3
+        let timeout = cfg["questionTimeoutMs"].as_u64().unwrap_or(300_000);
         let now = Instant::now();
         let remaining = self.deadline.saturating_duration_since(now);
         let wait = Duration::from_millis(timeout).min(remaining);
