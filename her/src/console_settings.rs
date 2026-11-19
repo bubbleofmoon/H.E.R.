@@ -305,7 +305,7 @@ async function list(){
       let value;
       if(routeList){
         try{
-          value=JSON.parse(input.value);
+          value=input.value; // RED-R2A
         }catch{
           $('#msg').textContent='Enter a JSON array of model routes.';
           return;
