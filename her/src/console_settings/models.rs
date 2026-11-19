@@ -7,31 +7,38 @@
 //! set, reset, undone and listed in history through the settings routes, which check admission under the configuration
 //! gate.
 
-use crate::runtime::{RuntimeArea, RuntimeContext};
+use crate::runtime::RuntimeContext;
 use crate::settings::{CONVERSATION_ROUTE, HARNESS_FIRST_ROUTE, HARNESS_ROUTES};
 use serde_json::{json, Value};
 
-fn harness_credential(context: &RuntimeContext) -> Option<String> {
-    context
-        .read_text(RuntimeArea::Config, "harness-api-key")
-        .ok()
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
+fn route_redactor(context: &RuntimeContext) -> impl Fn(&str) -> String {
+    let credentials = crate::settings::stored_secrets(context).map(|mut keys| {
+        keys.extend(crate::settings::harness_credential(context));
+        keys.sort_unstable_by_key(|key| std::cmp::Reverse(key.len()));
+        keys
+    });
+    move |text| match &credentials {
+        Ok(keys) => keys.iter().fold(text.to_string(), |text, key| crate::harness::redact_credential(&text, key)),
+        Err(_) => "[REDACTED]".to_string(),
+    }
 }
 
 /// The global settings API applies the same credential masking as the model route list. This changes only response
 /// fields. The settings view marks a masked effective value so the editor can require a full replacement.
 pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value) {
-    let Some(key) = harness_credential(context) else { return };
+    let shown = route_redactor(context);
     let redact = |value: &mut Value| {
         let mut redacted = false;
         if let Some(routes) = value.as_array_mut() {
             for route in routes {
                 for field in ["id", "model"] {
                     let Some(slot) = route.get_mut(field) else { continue };
-                    if let Some(text) = slot.as_str().filter(|text| text.contains(&key)) {
-                        *slot = json!(crate::harness::redact_credential(text, &key));
-                        redacted = true;
+                    if let Some(text) = slot.as_str() {
+                        let safe = shown(text);
+                        if safe != text {
+                            *slot = json!(safe);
+                            redacted = true;
+                        }
                     }
                 }
             }
@@ -68,17 +75,13 @@ pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value)
 /// `conversations` (each admitted conversation or one with a stored value: `conversation`, `admitted`, `stored`, `route`,
 /// the route its next turn asks first or `null`, `inChain`, and `order`, the route ids its next turn walks). A chain that
 /// is not configured or invalid gives `error` and no routes; `healthError` and `storeError` say why route health or
-/// stored values cannot be read. Route ids and models are shown with the harness credential redacted.
+/// stored values cannot be read. Route ids and models are shown with credentials redacted.
 pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, "settings require a selected runtime".to_string()));
     }
     let cfg = context.load_config().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let credential = harness_credential(context);
-    let shown = |text: &str| match credential.as_deref() {
-        Some(key) => crate::harness::redact_credential(text, key),
-        None => text.to_string(),
-    };
+    let shown = route_redactor(context);
     let mut reply = json!({"ok": true, "setting": CONVERSATION_ROUTE.key});
     reply["firstRoute"] = json!(HARNESS_FIRST_ROUTE.read(&cfg).as_str().map(|id| shown(id)));
     let chain = match crate::harness::routes::chain(&cfg) {

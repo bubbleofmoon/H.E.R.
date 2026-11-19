@@ -34,6 +34,7 @@ fn settings_registry_is_complete_and_agrees_with_its_reader() {
         assert!(matches!(setting.applies, "live" | "next wake" | "restart" | "not read yet"), "{}", setting.key);
         assert!(setting.pointer.starts_with('/') && !setting.pointer.contains('~'), "{}", setting.pointer);
         assert!(setting.pointer.split('/').skip(1).all(|name| !name.is_empty()), "{}", setting.pointer);
+        assert!(!setting.secret || !setting.chat, "a credential cannot be chat-visible");
         // Each kind checks its own bounds, default and reader (`SettingKind::check_entry`).
         setting.kind.check_entry(setting);
     }

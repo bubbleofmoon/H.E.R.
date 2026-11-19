@@ -1,5 +1,5 @@
 //! The bridge's single live owner interaction. SQLite owns tool intent and recovery.
-use super::{tools, Failure};
+use super::{store::record_credentials, tools, Failure};
 use crate::runtime::{RuntimeArea, RuntimeContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -299,14 +299,16 @@ impl Binding<'_> {
             Ok(question) => question,
             Err(outcome) => return Ok(outcome),
         };
-        let tokens = crate::activity::known_session_tokens(&self.mailbox.context);
+        let context = &self.mailbox.context;
+        let mut known = record_credentials(context)?;
         if std::iter::once(&question.text).chain(&question.options).any(|text| {
-            crate::activity::mask_log_text(text, &tokens) != *text
+            crate::activity::mask_log_text(text, &known) != *text
         }) {
             return Ok(tools::error("Question text contains private credentials."));
         }
         let reply = self.wait(question.display(), question.notice(), false, cancelled).await?;
-        let answer = crate::activity::mask_log_text(&question.answer(&reply), &tokens);
+        known.extend(record_credentials(context)?);
+        let answer = crate::activity::mask_log_text(&question.answer(&reply), &known);
         Ok(tools::text(&answer, false))
     }
 
@@ -325,8 +327,9 @@ impl Binding<'_> {
         }
         let message = crate::outbound_message::normalize(text);
         let cfg = context.load_config().map_err(Failure::from)?;
+        let known = record_credentials(context)?;
         if !crate::console::approved_group_allowed(&cfg, &key, &message)
-            || crate::activity::mask_log_text(&message, &crate::activity::known_session_tokens(context)) != message
+            || crate::activity::mask_log_text(&message, &known) != message
         {
             return Ok(tools::error("Group send refused by current settings."));
         }
@@ -347,7 +350,8 @@ impl Binding<'_> {
         tokio::task::spawn_blocking(move || {
             let authorized = || !*cancelled.borrow() && Instant::now() < deadline
                 && owner_current(&context, &owner, &epoch)
-                && context.load_config().is_ok_and(|cfg| crate::console::approved_group_allowed(&cfg, &key, &message));
+                && context.load_config().is_ok_and(|cfg| crate::console::approved_group_allowed(&cfg, &key, &message))
+                && record_credentials(&context).is_ok_and(|known| crate::activity::mask_log_text(&message, &known) == message);
             if !authorized() {
                 return tools::error("Group send cancelled.");
             }

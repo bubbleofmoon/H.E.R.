@@ -13,6 +13,7 @@ pub(crate) const ENGINE_DEFAULT: Setting = Setting {
     label: "Default turn engine",
     hint: "Conversations without their own choice move to this engine before their next turn.",
     chat: false,
+    secret: false,
 };
 
 /// The group's settings, in registry order.

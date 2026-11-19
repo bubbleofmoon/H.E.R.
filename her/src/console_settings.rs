@@ -99,6 +99,9 @@ fn applied_reply(setting: &str, applied: crate::settings::Applied) -> Value {
         "revision": applied.revision,
         "changed": applied.changed,
     });
+    if crate::settings::find(setting).is_some_and(|setting| setting.secret) {
+        reply["isSet"] = reply.as_object_mut().and_then(|fields| fields.remove("value")).unwrap_or(Value::Null);
+    }
     if let Some(error) = applied.mirror_error {
         reply["mirrorError"] = json!(error);
     }
@@ -268,12 +271,14 @@ const action=(text,run)=>{const b=document.createElement('button');b.textContent
 const shown=v=>v==null?'(none)':JSON.stringify(v);
 let next=null;
 let security=new Set();
+let credentials=new Set();
 const ask=key=>confirm('Change the security setting '+key+'? A change of an allow or deny list or the owner revokes every conversation that loses access at once.');
 async function list(){
   const j=await api('/api/settings');
   if(!j.ok)return;
   if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;
   security=new Set(j.settings.filter(s=>s.confirm).map(s=>s.key));
+  credentials=new Set(j.settings.filter(s=>s.kind.type==="password").map(s=>s.key));
   const tb=$('#list tbody');
   tb.replaceChildren();
   for(const s of j.settings){
@@ -282,7 +287,10 @@ async function list(){
     const text=type==='text';
     const routeList=type==='route list';
     const input=document.createElement(text||routeList?'textarea':'input');
-    if(type==='integer'){
+    if(type==='password'){
+      input.type='password';
+      input.autocomplete='new-password';
+    }else if(type==='integer'){
       input.type='number';
       input.min=s.kind.min;
       input.max=s.kind.max;
@@ -311,7 +319,7 @@ async function list(){
       input.type='text';
       input.value=s.value==null?'':s.value;
     }
-    const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok)refresh()};
+    const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok){if(type==='password')input.value='';refresh()}};
     const save=()=>{
       let value;
       if(routeList){
@@ -328,6 +336,7 @@ async function list(){
     };
     let current=s.value;
     if(s.overriddenBy)current=shown(s.value)+' (in effect: '+shown(s.overriddenBy.value)+' from the '+s.overriddenBy.source+')';
+    if(type==='password')current=s.isSet?'Set':'Unset';
     if(routeList)current=s.value==null?'(none)':JSON.stringify(s.value,null,2);
     const field=document.createElement('td');
     field.append(input);
@@ -337,8 +346,8 @@ async function list(){
     tb.append(tr);
   }
 }
-async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),action('Undo',async()=>{const body={entry:e.entry};if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}const r=await api('/api/settings/undo',body);if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
-function refresh(){list();history(false)}
+async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),credentials.has(e.setting)?cell(''):action('Undo',async()=>{const body={entry:e.entry};if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}const r=await api('/api/settings/undo',body);if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
+async function refresh(){await list();await history(false)}
 $('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};
 $('#older').onclick=()=>history(true);
 refresh();
