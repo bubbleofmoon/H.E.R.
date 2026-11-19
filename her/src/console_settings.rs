@@ -58,6 +58,13 @@ pub fn route(
     };
     match result {
         Ok(mut value) => {
+            if let Some(setting) = value["setting"].as_str() {
+                if crate::settings::wake_timing::refreshes_default_plan(setting)
+                    && crate::console::refresh_default_wake_configs(context).is_err()
+                {
+                    value["wakeRefreshError"] = json!("Settings saved. The default wake plans could not be refreshed.");
+                }
+            }
             match (method, path) {
                 ("GET", "/api/settings" | "/api/settings/history") => models::redact_route_settings(context, &mut value),
                 ("POST", "/api/settings/set" | "/api/settings/reset" | "/api/settings/undo")
@@ -262,7 +269,7 @@ const PAGE: &str = r##"<!doctype html>
 const $=s=>document.querySelector(s);
 const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
 $('#token').value=token();
-const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:Object.assign({'x-console-token':token()},body?{'content-type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});const j=await r.json();if(body||!j.ok)$('#msg').textContent=j.ok?(j.mirrorError||(j.changed===false?'Unchanged':'Saved')):(j.error||r.status);return j};
+const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:Object.assign({'x-console-token':token()},body?{'content-type':'application/json'}:{}),body:body?JSON.stringify(body):undefined});const j=await r.json();if(body||!j.ok)$('#msg').textContent=j.ok?(j.mirrorError||j.wakeRefreshError||(j.changed===false?'Unchanged':'Saved')):(j.error||r.status);return j};
 const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':String(t);return td};
 const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
 const shown=v=>v==null?'(none)':JSON.stringify(v);
@@ -282,7 +289,8 @@ async function list(){
     const text=type==='text';
     const routeList=type==='route list';
     const input=document.createElement(text||routeList?'textarea':'input');
-    if(type==='integer'){
+    if(type==='integer'||type==='probability'){
+      if(type==='probability')input.step='any';
       input.type='number';
       input.min=s.kind.min;
       input.max=s.kind.max;
@@ -319,7 +327,7 @@ async function list(){
           return;
         }
       }else{
-        value=type==='integer'?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;
+        value=(type==='integer'||type==='probability')?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;
       }
       return send('/api/settings/set',{setting:s.key,value});
     };

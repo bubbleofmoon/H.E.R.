@@ -104,7 +104,7 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"],
-        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
+        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.wake.batchWindowMs":8000,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
         "preserve explicit values and JS shallow replacement"
     );
 }

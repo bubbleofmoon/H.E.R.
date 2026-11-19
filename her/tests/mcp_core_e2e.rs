@@ -1160,13 +1160,13 @@ fn agent_status_dsh_readiness_tracks_authenticated_settings_describe() {
 }
 
 #[test]
-fn get_prompt_recommends_js_proactive_defaults_and_preserves_explicit_config() {
+fn get_prompt_recommends_effective_proactive_settings() {
     for (label, proactive, expected) in [
         ("default", None, json!({
             "enabled": true, "checkIntervalMinMs": 1_800_000, "checkIntervalMaxMs": 5_400_000,
-            "idleThresholdMs": 900_000, "probability": 0.3
+            "idleThresholdMs": 900_000, "probability": 0.4
         })),
-        ("explicit", Some(json!({"enabled": false, "probability": 0.7})), json!({"enabled": false, "probability": 0.7})),
+        ("explicit", Some(json!({"enabled": false, "probability": 0.7})), json!({"enabled": false, "checkIntervalMinMs": 1_800_000, "checkIntervalMaxMs": 5_400_000, "idleThresholdMs": 900_000, "probability": 0.7})),
     ] {
         let mut extra = json!({"sticker": {"enabled": false}, "voice": {"enabled": false}});
         if let Some(proactive) = proactive {

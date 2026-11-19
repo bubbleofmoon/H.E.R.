@@ -113,7 +113,7 @@ fn settings_page_lists_the_registry_and_sets_through_the_route() {
     assert!(page.contains("api('/api/settings')"), "the page lists through the route");
     assert!(
         page.contains("send('/api/settings/set',{setting:s.key,value})")
-            && page.contains("type==='integer'?Number(input.value)"),
+            && page.contains("(type==='integer'||type==='probability')?Number(input.value)"),
         "the page sets through the route: a number for an integer setting, the text for a model id"
     );
     assert!(page.contains("send('/api/settings/reset',{setting:s.key})"), "the page resets through the route");

@@ -1564,15 +1564,7 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
             "wake": sv2.get("wake").cloned().unwrap_or_else(|| json!({})),
             "send": sv2.get("send").cloned().unwrap_or_else(|| json!({})),
             "wait": sv2.get("wait").cloned().unwrap_or_else(|| json!({})),
-            // JS loadConfig supplies this whole section only when it is absent;
-            // an explicitly supplied section is not deep-merged with defaults.
-            "proactive": sv2.get("proactive").cloned().unwrap_or_else(|| json!({
-                "enabled": true,
-                "checkIntervalMinMs": 1_800_000,
-                "checkIntervalMaxMs": 5_400_000,
-                "idleThresholdMs": 900_000,
-                "probability": 0.3,
-            })),
+            "proactive": sv2.get("proactive").cloned().unwrap_or_else(|| json!({})),
         })
     } else {
         Value::Null
@@ -2746,7 +2738,7 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
 }
 
 /// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 17] = [
+const SETTINGS_WRITABLE: [&str; 16] = [
     "sendDelayMs",
     "socialV2.send.burstEnabled",
     "socialV2.send.burstIntervalMinMs",
@@ -2754,7 +2746,6 @@ const SETTINGS_WRITABLE: [&str; 17] = [
     "socialV2.send.firstGapEnabled",
     "socialV2.send.maxSendPerMinute",
     "socialV2.send.maxSendPerHour",
-    "socialV2.wake.batchWindowMs",
     "socialV2.sticker.collect.maxBytes",
     "socialV2.sticker.stickerEnabled",
     "socialV2.context.wakeMaxChars",
@@ -2883,7 +2874,6 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
         "socialV2.send.burstIntervalMaxMs" => ("send", json!(3000)),
         "socialV2.send.maxSendPerMinute" => ("send", json!(8)),
         "socialV2.send.maxSendPerHour" => ("send", json!(60)),
-        "socialV2.wake.batchWindowMs" => ("wake", json!(8000)),
         "socialV2.context.wakeMaxChars" => ("context", json!(6000)),
         "socialV2.context.wakeRecentLimit" => ("context", json!(4)),
         "socialV2.sticker.collect.maxBytes" => return Some(json!(8 * 1024 * 1024)),
@@ -4992,7 +4982,7 @@ pub(super) fn handle_wait_post(
     // JS: Math.max(1, Math.round(Number(body.minNewMessages) || 1))
     let mut min_new = js_round(agent::js_number_or(req.get("minNewMessages"), 1.0)).max(1);
     let default_ms = num("defaultMs", 30_000);
-    let (min_ms, max_ms) = wait_timeout_bounds(&wait_cfg);
+    let (min_ms, max_ms) = wait_timeout_bounds(cfg);
     // JS: Math.min(maxMs, Math.max(minMs, Math.round(Number(body.timeoutMs) || defaultMs)))
     let mut timeout_ms = js_round(agent::js_number_or(req.get("timeoutMs"), default_ms as f64)).max(min_ms).min(max_ms);
     let batch = wait_policy(cfg);
@@ -5612,7 +5602,7 @@ pub(crate) fn wait_policy(cfg: &Value) -> WaitPolicy {
     let section = wait_section(cfg);
     let duration = |name: &str, default: i64| section.get(name).and_then(Value::as_i64)
         .filter(|n| (1..=120_000).contains(n)).unwrap_or(default);
-    WaitPolicy { window_ms: duration("batchWindowMs", 8_000), max_ms: duration("batchMaxMs", 30_000),
+    WaitPolicy { window_ms: duration("batchWindowMs", 8_000), max_ms: crate::settings::wake_timing::WAIT_BATCH_MAX.integer(cfg),
         max_per_turn: section.get("maxPerTurn").and_then(Value::as_u64)
             .filter(|n| (1..=9_007_199_254_740_991).contains(n)).unwrap_or(4) }
 }
@@ -5776,7 +5766,7 @@ fn wait_number(wait_cfg: &Value, key: &str, default: i64) -> i64 {
 /// The final admitted call can become a full observation even after a short caller timeout.
 pub(crate) fn wait_client_timeout_ms(cfg: &Value, args: &Value) -> u64 {
     let section = wait_section(cfg);
-    let (min_ms, max_ms) = wait_timeout_bounds(&section);
+    let (min_ms, max_ms) = wait_timeout_bounds(cfg);
     let timeout = js_round(agent::js_number_or(args.get("timeoutMs"), wait_number(&section, "defaultMs", 30_000) as f64))
         .max(min_ms).min(max_ms);
     let observation = crate::wake::pre_sleep_wait_ms(cfg).max(crate::wake::prompt_pre_sleep_wait_ms(cfg));
@@ -5785,9 +5775,10 @@ pub(crate) fn wait_client_timeout_ms(cfg: &Value, args: &Value) -> u64 {
 }
 
 /// `socialV2.wait` minMs/maxMs as the wait handler clamps timeouts.
-fn wait_timeout_bounds(wait_cfg: &Value) -> (i64, i64) {
-    let min_ms = wait_number(wait_cfg, "minMs", 5_000).max(100);
-    (min_ms, wait_number(wait_cfg, "maxMs", 600_000).max(min_ms))
+fn wait_timeout_bounds(cfg: &Value) -> (i64, i64) {
+    use crate::settings::wake_timing::{WAIT_MAX, WAIT_MIN};
+    let min_ms = WAIT_MIN.integer(cfg).max(100);
+    (min_ms, WAIT_MAX.integer(cfg).max(min_ms))
 }
 
 struct WaitBounds {
@@ -5797,13 +5788,8 @@ struct WaitBounds {
 
 /// Quiet bounds of a messages wait. The reserved2 turn budget reads the same values.
 fn wait_bounds(cfg: &Value) -> WaitBounds {
-    let wait_cfg = wait_section(cfg);
-    let (_, max_ms) = wait_timeout_bounds(&wait_cfg);
-    // JS: Number.isFinite(Number(x)) ? Math.max(0, Number(x)) : 10000 (0 is a valid setting)
-    let min_quiet_after_new = {
-        let n = agent::js_number(wait_cfg.get("minQuietAfterNewMs"));
-        if n.is_finite() { n.max(0.0) as i64 } else { 10_000 }
-    };
+    let (_, max_ms) = wait_timeout_bounds(cfg);
+    let min_quiet_after_new = crate::settings::wake_timing::WAIT_QUIET.integer(cfg);
     WaitBounds { min_quiet_after_new, max_quiet_ms: min_quiet_after_new.max((120_000i64).min(max_ms)) }
 }
 
@@ -6728,6 +6714,33 @@ fn merge_sub(current: &Value, name: &str, body: &Value) -> serde_json::Map<Strin
     }
     out
 }
+/// Keep the established social form's coercion before it hands typed values to the settings store.
+fn normalize_social_timing_post(body: &mut Value, current: &Value) {
+    let fields: [(&str, &[&str], &[&str], &[&str]); 3] = [
+        ("wake", &["batchWindowMs", "maxWakePerMinute", "maxWakePerHour", "noActionLimit", "maxWakeConfigReminders", "preSleepWaitMs"], &["recommendedProbability"], &["preSleepWaitEnabled"]),
+        ("proactive", &["checkIntervalMinMs", "checkIntervalMaxMs", "idleThresholdMs"], &["probability"], &["enabled"]),
+        ("wait", &["minMs", "maxMs", "minQuietAfterNewMs"], &[], &[]),
+    ];
+    for (group, integers, probabilities, switches) in fields {
+        let Some(posted) = body.get_mut(group).and_then(Value::as_object_mut) else { continue };
+        for (keys, round, max) in [(integers, true, None), (probabilities, false, Some(1.0))] {
+            for &key in keys {
+                if posted.get(key).is_none_or(Value::is_null) {
+                    continue;
+                }
+                if let Some(value) = norm_num(posted, current.get(group), key, round, 0.0, max, 0.0) {
+                    posted.insert(key.to_string(), value);
+                }
+            }
+        }
+        for &key in switches {
+            if let Some(value) = posted.get_mut(key).filter(|value| !value.is_null()) {
+                *value = json!(value.as_bool() == Some(true));
+            }
+        }
+    }
+}
+
 /// `POST /api/socialV2/config`：保存二代仿真配置。
 ///
 /// 这个端点看着像"把 body 存盘"，其实是**一整套归一化**：
@@ -6742,7 +6755,7 @@ fn handle_social_config_post(
     body: &str,
 ) -> Result<Value, (u16, String)> {
     // JS `readBody` comes first: invalid JSON is a 400 before anything is read or written.
-    let body_v = parse_object_body(body)?;
+    let mut body_v = parse_object_body(body)?;
     let gate = config_gate(context)?;
     let mut file = if context.is_isolated() {
         let text = read_text_for(context, CONFIG_PATH)
@@ -6766,6 +6779,7 @@ fn handle_social_config_post(
         .filter(|v| v.is_object())
         .cloned()
         .unwrap_or_else(|| effective_before.clone());
+    normalize_social_timing_post(&mut body_v, &current);
     let mut merged = current.as_object().cloned().unwrap_or_default();
     if let Some(b) = body_v.as_object() {
         for (k, v) in b {
@@ -6808,15 +6822,12 @@ fn handle_social_config_post(
     if body_v.get("wake").and_then(js_object_like).is_some() {
         let mut w = merge_sub(&current, "wake", &body_v);
         let cur_wake = current.get("wake").cloned().unwrap_or_else(|| json!({}));
-        for k in ["sleepMinMs", "sleepMaxMs", "recommendedSleepMinMs", "recommendedSleepMaxMs", "batchWindowMs", "maxWakePerMinute", "maxWakePerHour", "noActionLimit", "maxWakeConfigReminders", "preSleepWaitMs"] {
+        for k in ["sleepMinMs", "sleepMaxMs", "recommendedSleepMinMs", "recommendedSleepMaxMs"] {
             if let Some(v) = norm_num(&w, Some(&cur_wake), k, true, 0.0, None, 0.0) {
                 w.insert(k.into(), v);
             }
         }
-        if let Some(v) = norm_num(&w, Some(&cur_wake), "recommendedProbability", false, 0.0, Some(1.0), 0.0) {
-            w.insert("recommendedProbability".into(), v);
-        }
-        for k in ["preSleepWaitEnabled", "recommendedDefaultInfinite", "recommendedPoke", "recommendedAtMention", "recommendedNameMention", "recommendedQuestion"] {
+        for k in ["recommendedDefaultInfinite", "recommendedPoke", "recommendedAtMention", "recommendedNameMention", "recommendedQuestion"] {
             if w.get(k).is_some() {
                 let b = w.get(k).and_then(|v| v.as_bool()) == Some(true);
                 w.insert(k.into(), json!(b));
@@ -6865,11 +6876,14 @@ fn handle_social_config_post(
         }
         merged.insert("send".into(), Value::Object(s));
     }
+    if body_v.get("reply").is_some_and(Value::is_object) {
+        merged.insert("reply".into(), Value::Object(merge_sub(&current, "reply", &body_v)));
+    }
     // wait
     if body_v.get("wait").and_then(js_object_like).is_some() {
         let mut w = merge_sub(&current, "wait", &body_v);
         let cur_wait = current.get("wait").cloned().unwrap_or_else(|| json!({}));
-        for k in ["defaultMs", "minMs", "maxMs", "defaultQuietMs", "minQuietAfterNewMs"] {
+        for k in ["defaultMs", "defaultQuietMs"] {
             if let Some(v) = norm_num(&w, Some(&cur_wait), k, true, 0.0, None, 5000.0) {
                 w.insert(k.into(), v);
             }
@@ -6877,22 +6891,8 @@ fn handle_social_config_post(
         merged.insert("wait".into(), Value::Object(w));
     }
     // proactive
-    if body_v.get("proactive").and_then(js_object_like).is_some() {
-        let mut p = merge_sub(&current, "proactive", &body_v);
-        let cur_p = current.get("proactive").cloned().unwrap_or_else(|| json!({}));
-        for k in ["checkIntervalMinMs", "checkIntervalMaxMs", "idleThresholdMs"] {
-            if let Some(v) = norm_num(&p, Some(&cur_p), k, true, 0.0, None, 0.0) {
-                p.insert(k.into(), v);
-            }
-        }
-        if let Some(v) = norm_num(&p, Some(&cur_p), "probability", false, 0.0, Some(1.0), 0.0) {
-            p.insert("probability".into(), v);
-        }
-        if p.get("enabled").is_some() {
-            let b = p.get("enabled").and_then(|v| v.as_bool()) == Some(true);
-            p.insert("enabled".into(), json!(b));
-        }
-        merged.insert("proactive".into(), Value::Object(p));
+    if body_v.get("proactive").is_some_and(Value::is_object) {
+        merged.insert("proactive".into(), Value::Object(merge_sub(&current, "proactive", &body_v)));
     }
     // sticker
     if body_v.get("sticker").and_then(js_object_like).is_some() {
@@ -6997,8 +6997,15 @@ fn handle_social_config_post(
     let mut merged_v = Value::Object(merged);
     voice_http::clamp_config_max_seconds(&mut merged_v);
     file["socialV2"] = merged_v.clone();
-    crate::wake::checked_turn_budget(&file).map_err(|error| (400, error.to_string()))?;
-    crate::wake::checked_turn_ceiling(&file).map_err(|error| (400, error.to_string()))?;
+    if !context.is_isolated() {
+        crate::wake::validate_turn_settings(&file).map_err(|error| (400, error.to_string()))?;
+    }
+    for setting in [crate::settings::wake_timing::HARD_CAP, crate::settings::wake_timing::CEILING] {
+        let member = setting.pointer.rsplit('/').next().unwrap();
+        if body_v.get("wake").and_then(|wake| wake.get(member)).is_some_and(Value::is_null) {
+            return Err((400, format!("{} requires a number; use Reset on the settings page", setting.key)));
+        }
+    }
     // #177: a registry setting this save changes goes through the settings store, under the configuration gate held
     // above: validated before anything is written (400), stored and written back first (a store that cannot take it
     // is 503 with nothing written), then the file keeps its registry members as they are now and gets the rest. This
@@ -9608,7 +9615,7 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
             let acted = conv["lastActionAt"].as_i64().unwrap_or(0) >= started || conv["lastAiReplyAt"].as_i64().unwrap_or(0) >= started;
             let no_action = if acted { 0 } else { conv["wakeConfig"]["noActionCount"].as_u64().unwrap_or(0) + 1 };
             conv["wakeConfig"]["noActionCount"] = json!(no_action);
-            let limit = cfg.pointer("/socialV2/wake/noActionLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(3);
+            let limit = crate::settings::wake_timing::NO_ACTION.integer(cfg) as u64;
             if no_action >= limit {
                 let keywords = conv["wakeConfig"]["triggers"]["keywords"].clone();
                 let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
@@ -9618,7 +9625,7 @@ pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key
                 conv["bootstrapSent"] = json!(true);
             }
         }
-        let max = cfg.pointer("/socialV2/wake/maxWakeConfigReminders").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(2);
+        let max = crate::settings::wake_timing::REMINDERS.integer(cfg) as u64;
         if closed {
             crate::wake::ensure_wakeable(&mut conv["wakeConfig"], cfg, now, rand01());
         } else if u64::from(miss) >= max {
@@ -11681,27 +11688,17 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
         "tools": {},
         "wake": {
             "defaultMode": "diving",
-            "preSleepWaitEnabled": true,
-            "preSleepWaitMs": crate::wake::PRE_SLEEP_WAIT_DEFAULT_MS,
             "recommendedDefaultInfinite": true,
             "sleepMinMs": 60000,
             "sleepMaxMs": 0,
             "recommendedSleepMinMs": 300000,
             "recommendedSleepMaxMs": 7200000,
-            "recommendedProbability": 0.05,
             "recommendedKeywords": ["小鲸鱼", "大肥鱼", "鲸鱼"],
             "recommendedAtMention": true,
             "recommendedNameMention": true,
             "recommendedQuestion": true,
-            "questionExchangeWindowMs": crate::question::DEFAULT_WINDOW_MS,
-            "turnCeilingMs": crate::wake::TURN_CEILING_DEFAULT_MS,
             "recommendedPoke": true,
-            "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息概率 0.05；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
-            "batchWindowMs": 8000,
-            "maxWakePerMinute": 1,
-            "maxWakePerHour": 12,
-            "noActionLimit": 3,
-            "maxWakeConfigReminders": 2
+            "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
         },
         "send": {
             "burstEnabled": true,
@@ -11720,16 +11717,9 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
             "gapPerCharMs": 20,
             "recommendedHint": "普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。"
         },
-        "wait": { "defaultMs": 30000, "minMs": 5000, "maxMs": 600000, "defaultQuietMs": 8000, "minQuietAfterNewMs": 10000,
-            "batchWindowMs": 8000, "batchMaxMs": 30000, "maxPerTurn": 4 },
+        "wait": { "defaultMs": 30000, "defaultQuietMs": 8000, "batchWindowMs": 8000, "maxPerTurn": 4 },
         "sticker": {},
-        "proactive": {
-            "enabled": true,
-            "checkIntervalMinMs": 1800000,
-            "checkIntervalMaxMs": 5400000,
-            "idleThresholdMs": 900000,
-            "probability": 0.3
-        },
+        "proactive": {},
         "feedback": { "maxLength": 500, "notifyOwnerOnError": false },
         "context": {
             "recentLimit": 100,
@@ -11790,7 +11780,9 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     let prompt_chars = agent::js_number(section.get("initialPromptMaxChars"));
     let prompt_chars = if prompt_chars.is_finite() && prompt_chars > 0.0 { prompt_chars.round().clamp(100.0, 8000.0) } else { 2000.0 };
     section.insert("initialPromptMaxChars".to_string(), json!(prompt_chars as i64));
-    let mut section = Value::Object(section);
+    let mut document = json!({"socialV2": section});
+    crate::settings::complete_timing(&mut document);
+    let mut section = document["socialV2"].take();
     voice_http::apply_config_defaults(&mut section);
     section
 }
@@ -14733,7 +14725,8 @@ fn audit_write(
 /// Without a stored value nothing is read or created beyond the store inspection, and no gate is taken. A busy gate
 /// (`SOCIAL_STATE_GATE_WAIT`) or a failed write is reported; the next settings change retries it.
 fn finish_settings_write_back(context: &RuntimeContext) {
-    if !crate::settings::has_stored_values(context) {
+    let refresh_wake = crate::settings::has_wake_plan_history(context);
+    if !refresh_wake && !crate::settings::has_stored_values(context) {
         return;
     }
     let result = config_gate(context)
@@ -14747,6 +14740,10 @@ fn finish_settings_write_back(context: &RuntimeContext) {
         Err((_, error)) => crate::safe_println!(
             "[console] ⚠️ stored settings were not written back into config.json (the next settings change retries): {error}"
         ),
+    }
+    if refresh_wake && refresh_default_wake_configs(context).is_err()
+    {
+        crate::safe_println!("[console] inherited wake plans could not be refreshed");
     }
 }
 
@@ -21771,8 +21768,7 @@ mod tests {
             "socialV2.send.firstGapEnabled",
             "socialV2.send.maxSendPerMinute",
             "socialV2.send.maxSendPerHour",
-            "socialV2.wake.batchWindowMs",
-            "socialV2.sticker.collect.maxBytes",
+                    "socialV2.sticker.collect.maxBytes",
             "socialV2.sticker.stickerEnabled",
             "socialV2.context.wakeMaxChars",
             "socialV2.context.wakeRecentLimit",
@@ -26915,12 +26911,14 @@ mod tests {
         let first = handle_social_config(&context, &context.load_config().unwrap());
         assert_eq!(first["config"]["initialPromptMaxChars"], 2000);
         assert_eq!(first["config"]["wake"]["defaultMode"], "diving");
-        // After a save, the console shows the raw section with the reply timing defaults filled in.
+        // After a save, the console overlays the timing defaults on the raw section.
         // The unnormalized initialPromptMaxChars still comes back as saved.
         handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
-        let mut file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
+        let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
         assert!(file["socialV2"].get("reply").is_none(), "defaults stay out of the saved file");
-        file["socialV2"]["reply"] = json!({
+        let mut effective = file.clone();
+        crate::settings::complete_timing(&mut effective);
+        effective["socialV2"]["reply"] = json!({
             "wakeQuietMs": 3000,
             "quietMinMs": 4000,
             "quietMedianMs": 10000,
@@ -26930,7 +26928,7 @@ mod tests {
             "urgentQuietMaxMs": 6000,
         });
         let read = handle_social_config(&context, &context.load_config().unwrap());
-        assert_eq!(read["config"], file["socialV2"], "the answer includes the reply timing defaults after a reload");
+        assert_eq!(read["config"], effective["socialV2"], "timing defaults overlay the reloaded file section");
         assert_eq!(read["config"]["initialPromptMaxChars"], 5);
     }
 

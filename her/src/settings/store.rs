@@ -97,7 +97,7 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
 
 /// Fill the timing settings in the effective runtime snapshot. Raw documents and mirror writes keep their spelling.
 pub(crate) fn complete_timing(document: &mut Value) {
-    for setting in super::reply::SETTINGS {
+    for setting in super::reply::SETTINGS.iter().chain(super::wake_timing::SETTINGS) {
         let value = setting.read(document);
         set_at(document, setting.pointer, value);
     }
@@ -109,7 +109,8 @@ fn validate_timing(
     written: &[&str],
     removed: Option<&Setting>,
 ) -> Result<(), (u16, String)> {
-    if !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
+    let turn = super::wake_timing::TURN_FIELDS.iter().any(|setting| written.contains(&setting.key));
+    if !turn && !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
         return Ok(());
     }
     let mut candidate = document.clone();
@@ -117,7 +118,12 @@ fn validate_timing(
         remove_at(&mut candidate, setting.pointer);
     }
     for (setting, value) in read_stored_values(conn).map_err(|error| (503, error))? {
-        set_at(&mut candidate, setting.pointer, value);
+        if !set_at(&mut candidate, setting.pointer, value) && written.contains(&setting.key) {
+            return Err((400, format!("config.json cannot hold {}", setting.key)));
+        }
+    }
+    if turn {
+        crate::wake::validate_turn_settings(&candidate).map_err(|error| (400, error.to_string()))?;
     }
     for [min, median, max] in &super::reply::WINDOWS {
         if [min, median, max].iter().any(|setting| written.contains(&setting.key))
@@ -160,6 +166,13 @@ fn place(document: &mut Value, stored: Vec<(&'static Setting, Value)>) -> (bool,
     let mut changed = false;
     let mut blocked = Vec::new();
     for (setting, value) in stored {
+        if setting.key == super::wake_timing::HARD_CAP.key && value.is_null() {
+            if document.pointer(setting.pointer).is_some() {
+                remove_at(document, setting.pointer);
+                changed = true;
+            }
+            continue;
+        }
         if setting.found_in(document).is_some_and(|found| setting.kind.file_holds(found, &value)) {
             continue;
         }
@@ -883,6 +896,15 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
 
 /// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
 /// cannot be read. Reads only: nothing is created.
+pub(crate) fn has_wake_plan_history(context: &RuntimeContext) -> bool {
+    let Ok(Inspection::Ready(conn)) = inspect(context) else { return false };
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings_audit WHERE scope='global' AND key IN (?1, ?2))",
+        params![super::wake_timing::BATCH.key, super::wake_timing::RECOMMENDED_PROBABILITY.key],
+        |row| row.get(0),
+    ).unwrap_or(false)
+}
+
 pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
     context.is_isolated() && stored_values(context).is_ok_and(|stored| !stored.is_empty())
 }

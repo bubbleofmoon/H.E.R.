@@ -930,60 +930,24 @@ fn runtime_json(
 
 /// 从 config.json 提取唤醒调度参数（在线主循环与离线重放共用一份口径）。
 fn wake_cfg_of(cfg_raw: &Value) -> wake::WakeCfg {
-    let sv2 = cfg_raw.get("socialV2").cloned().unwrap_or_default();
-    let mut wcfg = wake::WakeCfg::default();
-    wcfg.turn_hard_cap_ms = wake::turn_budget(cfg_raw).hard_cap_ms;
-    wcfg.turn_ceiling_ms = wake::turn_ceiling_ms(cfg_raw);
-    wcfg.enabled = sv2.get("enabled").and_then(Value::as_bool) != Some(false);
-    wcfg.reply_wake_quiet_ms = Some(crate::settings::reply::WAKE_QUIET.integer(cfg_raw));
-    if let Some(ms) = sv2.pointer("/wake/preemptAfterMs").and_then(Value::as_i64) { wcfg.preempt_after_ms = ms.max(0); }
-    if let Some(n) = sv2
-        .get("wake")
-        .and_then(|w| w.get("batchWindowMs"))
-        .and_then(|v| v.as_i64())
-    {
-        wcfg.batch_window_ms = n;
+    use crate::settings::{reply, wake_timing as timing};
+    wake::WakeCfg {
+        turn_hard_cap_ms: wake::turn_budget(cfg_raw).hard_cap_ms,
+        turn_ceiling_ms: wake::turn_ceiling_ms(cfg_raw),
+        enabled: cfg_raw.pointer("/socialV2/enabled") != Some(&Value::Bool(false)),
+        reply_wake_quiet_ms: Some(reply::WAKE_QUIET.integer(cfg_raw)),
+        preempt_after_ms: timing::PREEMPT.integer(cfg_raw),
+        batch_window_ms: timing::BATCH.integer(cfg_raw),
+        auto_reply_check_ms: cfg_raw.pointer("/socialV2/autoReplyCheckMs").and_then(Value::as_i64).unwrap_or(30_000),
+        max_wake_per_minute: timing::RATE_MIN.integer(cfg_raw),
+        max_wake_per_hour: timing::RATE_HOUR.integer(cfg_raw),
+        proactive_enabled: timing::PROACTIVE_ENABLED.switch(cfg_raw),
+        proactive_min_ms: timing::PROACTIVE_MIN.integer(cfg_raw),
+        proactive_max_ms: timing::PROACTIVE_MAX.integer(cfg_raw),
+        proactive_idle_ms: timing::PROACTIVE_IDLE.integer(cfg_raw),
+        proactive_probability: timing::PROACTIVE_PROBABILITY.probability(cfg_raw),
+        ..wake::WakeCfg::default()
     }
-    if let Some(n) = sv2.get("autoReplyCheckMs").and_then(|v| v.as_i64()) {
-        wcfg.auto_reply_check_ms = n;
-    }
-    // 限频参数：JS 默认 1/分钟、12/小时；填 0 表示不限。
-    if let Some(n) = sv2
-        .get("wake")
-        .and_then(|w| w.get("maxWakePerMinute"))
-        .and_then(|v| v.as_i64())
-    {
-        wcfg.max_wake_per_minute = n;
-    } else {
-        wcfg.max_wake_per_minute = 1;
-    }
-    if let Some(n) = sv2
-        .get("wake")
-        .and_then(|w| w.get("maxWakePerHour"))
-        .and_then(|v| v.as_i64())
-    {
-        wcfg.max_wake_per_hour = n;
-    } else {
-        wcfg.max_wake_per_hour = 12;
-    }
-    let proactive = sv2.get("proactive").cloned().unwrap_or_default();
-    wcfg.proactive_enabled = proactive
-        .get("enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if let Some(n) = proactive.get("checkIntervalMinMs").and_then(|v| v.as_i64()) {
-        wcfg.proactive_min_ms = n;
-    }
-    if let Some(n) = proactive.get("checkIntervalMaxMs").and_then(|v| v.as_i64()) {
-        wcfg.proactive_max_ms = n;
-    }
-    if let Some(n) = proactive.get("idleThresholdMs").and_then(|v| v.as_i64()) {
-        wcfg.proactive_idle_ms = n;
-    }
-    if let Some(p) = proactive.get("probability").and_then(|v| v.as_f64()) {
-        wcfg.proactive_probability = p;
-    }
-    wcfg
 }
 /// The OS-held owner gate, not the age or contents of a lock file, decides ownership.
 fn acquire_single_instance(

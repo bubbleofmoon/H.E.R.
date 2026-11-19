@@ -15,6 +15,7 @@
 
 #![allow(dead_code)]
 
+use crate::settings::wake_timing as timing;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 
@@ -885,9 +886,9 @@ fn has_explicit_end(st: &Value) -> bool {
     ENDS.iter().any(|e| text.contains(&e.to_lowercase()))
 }
 
-pub const PRE_SLEEP_WAIT_DEFAULT_MS: i64 = 300_000;
+pub const PRE_SLEEP_WAIT_DEFAULT_MS: i64 = timing::PRE_SLEEP_DEFAULT;
 /// Default `socialV2.wake.turnCeilingMs`: 30 minutes from dispatch.
-pub const TURN_CEILING_DEFAULT_MS: i64 = 1_800_000;
+pub const TURN_CEILING_DEFAULT_MS: i64 = timing::CEILING_DEFAULT;
 /// Default `max_quiet` of a messages wait: `min(120000, wait.maxMs default 600000)`.
 const DEFAULT_WAIT_MAX_QUIET_MS: i64 = 120_000;
 /// A messages wait may poll past its quiet bound by up to this much (`console::handle_wait_post`).
@@ -901,20 +902,16 @@ pub const DEFAULT_TURN_HARD_CAP_MS: i64 =
 
 /// The pre-sleep gate's reading (`pre_sleep_remaining`, wait results).
 pub fn pre_sleep_wait_ms(cfg: &Value) -> i64 {
-    cfg.pointer("/socialV2/wake/preSleepWaitMs")
-        .and_then(Value::as_i64).filter(|ms| *ms >= 0)
-        .unwrap_or(PRE_SLEEP_WAIT_DEFAULT_MS)
+    timing::PRE_SLEEP.integer(cfg)
 }
 
 /// The observation the agent is told to wait for (prompt, closing reminder, closing refusals).
 /// JS `Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000)`: 0 and non-numbers mean 300000.
 pub fn prompt_pre_sleep_wait_ms(cfg: &Value) -> i64 {
-    let n = cfg
-        .pointer("/socialV2/wake/preSleepWaitMs")
-        .and_then(Value::as_f64)
-        .filter(|n| n.is_finite() && *n != 0.0)
-        .unwrap_or(PRE_SLEEP_WAIT_DEFAULT_MS as f64);
-    n.max(0.0) as i64
+    match timing::PRE_SLEEP.integer(cfg) {
+        0 => timing::PRE_SLEEP.integer(&Value::Null),
+        ms => ms,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -941,11 +938,11 @@ fn derived_turn_budget(cfg: &Value) -> TurnBudget {
 /// must be an integer at least observation + quiet extension + 30000 ms.
 pub fn checked_turn_budget(cfg: &Value) -> Result<TurnBudget, &'static str> {
     const INVALID: &str = "reserved2 turn budget is invalid: turnHardCapMs must be an integer at least the pre-sleep observation plus the wait's quiet extension plus 30000 ms";
-    let Some(value) = cfg.pointer("/socialV2/wake/turnHardCapMs") else {
+    let Some(value) = timing::HARD_CAP.found_in(cfg).filter(|value| !value.is_null()) else {
         return Ok(derived_turn_budget(cfg));
     };
     let minimum = observation_with_quiet_ms(cfg).checked_add(COLLECTOR_HEADROOM_MS).ok_or(INVALID)?;
-    let hard_cap_ms = value.as_i64().filter(|ms| *ms >= minimum).ok_or(INVALID)?;
+    let hard_cap_ms = timing::HARD_CAP.normalize(value).and_then(|v| v.as_i64()).filter(|ms| *ms >= minimum).ok_or(INVALID)?;
     let collector_ms = hard_cap_ms.checked_add(COLLECTOR_HEADROOM_MS).ok_or(INVALID)? as u64;
     Ok(TurnBudget { hard_cap_ms, collector_ms })
 }
@@ -969,17 +966,24 @@ pub fn turn_budget(cfg: &Value) -> TurnBudget {
     }
 }
 
-/// Upper bound of `socialV2.wake.turnCeilingMs`: two hours from dispatch.
-pub const TURN_CEILING_MAX_MS: i64 = 7_200_000;
-
 /// Strict check for a configuration save: `socialV2.wake.turnCeilingMs`, when present, must be
-/// an integer from 1 to `TURN_CEILING_MAX_MS`.
+/// an integer from 1 to the registry's ceiling limit.
 pub fn checked_turn_ceiling(cfg: &Value) -> Result<(), &'static str> {
     const INVALID: &str = "reserved2 turn ceiling is invalid: turnCeilingMs must be an integer from 1 to 7200000 ms";
-    match cfg.pointer("/socialV2/wake/turnCeilingMs") {
+    match timing::CEILING.found_in(cfg) {
         None => Ok(()),
-        Some(value) => value.as_i64().filter(|ms| (1..=TURN_CEILING_MAX_MS).contains(ms)).map(|_| ()).ok_or(INVALID),
+        Some(value) => timing::CEILING.normalize(value).map(|_| ()).ok_or(INVALID),
     }
+}
+
+/// Validate the requested ceiling before applying the runtime fallback for old files.
+pub(crate) fn validate_turn_settings(cfg: &Value) -> Result<(), &'static str> {
+    checked_turn_ceiling(cfg)?;
+    let budget = checked_turn_budget(cfg)?;
+    if budget.hard_cap_ms > timing::CEILING.integer(cfg) {
+        return Err("wake.turnHardCapMs must be <= wake.turnCeilingMs");
+    }
+    Ok(())
 }
 
 /// Absolute per-turn ceiling (`socialV2.wake.turnCeilingMs`, default 1800000); never below the
@@ -987,7 +991,7 @@ pub fn checked_turn_ceiling(cfg: &Value) -> Result<(), &'static str> {
 /// default and logs each new bad value once.
 pub fn turn_ceiling_ms(cfg: &Value) -> i64 {
     let ceiling = match checked_turn_ceiling(cfg) {
-        Ok(()) => cfg.pointer("/socialV2/wake/turnCeilingMs").and_then(Value::as_i64).unwrap_or(TURN_CEILING_DEFAULT_MS),
+        Ok(()) => timing::CEILING.integer(cfg),
         Err(error) => {
             static LOGGED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
             let shown = cfg.pointer("/socialV2/wake/turnCeilingMs").map(Value::to_string).unwrap_or_default();
@@ -1010,7 +1014,7 @@ pub fn reserved2_collector_ms(cfg: &Value) -> u64 {
 /// Length of her engagement window (`preSleepWaitMs`), or `None` when the window does not
 /// exist (`preSleepWaitEnabled=false` or a non-positive gate reading).
 pub fn engagement_window_ms(cfg: &Value) -> Option<i64> {
-    if cfg.pointer("/socialV2/wake/preSleepWaitEnabled") == Some(&Value::Bool(false)) {
+    if !timing::PRE_SLEEP_ENABLED.switch(cfg) {
         return None;
     }
     Some(pre_sleep_wait_ms(cfg)).filter(|ms| *ms > 0)
@@ -1027,12 +1031,7 @@ pub fn engagement_end(st: &Value, cfg: &Value) -> Option<i64> {
 /// JS 的 `preSleepWaitBlockedV2`：返回还要等多久（None = 不拦）。
 /// While she is engaged the requirement never outlasts her engagement window.
 pub fn pre_sleep_remaining(st: &Value, cfg: &Value, now: i64) -> Option<i64> {
-    let w = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("wake"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    if w.get("preSleepWaitEnabled").and_then(|v| v.as_bool()) == Some(false) {
+    if !timing::PRE_SLEEP_ENABLED.switch(cfg) {
         return None;
     }
     if has_explicit_end(st) {
@@ -1298,11 +1297,7 @@ pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
         finite = hard_max as f64;
     }
     let flag = |k: &str| w.get(k).and_then(|v| v.as_bool()) != Some(false);
-    let probability = w
-        .get("recommendedProbability")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0);
+    let probability = timing::RECOMMENDED_PROBABILITY.probability(cfg);
     json!({
         "mode": if mode_active { "active" } else { "diving" },
         "infinite": infinite,
@@ -1317,7 +1312,7 @@ pub fn default_wake_config(cfg: &Value, now: i64, rand01: f64) -> Value {
             "anyMessage": mode_active,
             "probability": probability,
         },
-        "batchWindowMs": w.get("batchWindowMs").and_then(|v| v.as_i64()).unwrap_or(8000).max(1000),
+        "batchWindowMs": timing::BATCH.integer(cfg),
         "lastWakeAt": 0,
         "wakeCount": 0,
         "noActionCount": 0,

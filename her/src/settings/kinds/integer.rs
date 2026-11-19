@@ -18,6 +18,10 @@ pub(crate) struct Integer {
 pub(crate) enum FileRule {
     /// It reads as the default.
     Default,
+    /// Reset uses an absent override.
+    Automatic,
+    /// The file also accepts a whole-valued JSON decimal.
+    IntegralNumber,
     /// A non-negative integer is clamped into the bounds; any other value reads as the default.
     Clamp,
 }
@@ -29,14 +33,15 @@ impl SettingKind for Integer {
     }
 
     fn default_value(&self) -> Value {
-        json!(self.default)
+        if self.file == FileRule::Automatic { Value::Null } else { json!(self.default) }
     }
 
     fn read(&self, found: &Value) -> Option<Value> {
         let Integer { min, max, .. } = *self;
         match self.file {
             FileRule::Clamp => found.as_u64().map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
-            FileRule::Default => self.normalize(found),
+            FileRule::IntegralNumber => found.as_f64().filter(|n| n.fract() == 0.0 && *n >= min as f64 && *n <= max as f64).map(|n| json!(n as i64)),
+            FileRule::Default | FileRule::Automatic => self.normalize(found),
         }
     }
 
@@ -62,13 +67,13 @@ impl SettingKind for Integer {
     #[cfg(test)]
     fn check_entry(&self, setting: &crate::settings::Setting) {
         let Integer { min, max, default, file } = *self;
-        assert!(min <= default && default <= max, "{}", setting.key);
+        assert!(file == FileRule::Automatic || (min..=max).contains(&default), "{}", setting.key);
         assert_eq!(setting.normalize(&json!(min)), Some(json!(min)), "{}", setting.key);
         assert_eq!(setting.normalize(&json!(max)), Some(json!(max)), "{}", setting.key);
         assert_eq!(setting.normalize(&json!(min - 1)), None, "{}", setting.key);
         assert_eq!(setting.normalize(&json!(max + 1)), None, "{}", setting.key);
-        assert_eq!(setting.default_value(), json!(default));
-        assert_eq!(setting.integer(&json!({})), default, "{}: a missing value reads as the default", setting.key);
+        assert_eq!(setting.default_value(), self.default_value());
+        assert_eq!(setting.read(&json!({})), setting.default_value(), "{}: a missing value reads as the default", setting.key);
         if file == FileRule::Clamp {
             assert!(min >= 0, "{}: a clamped setting has non-negative bounds", setting.key);
         }

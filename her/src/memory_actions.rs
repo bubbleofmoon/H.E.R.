@@ -106,7 +106,16 @@ pub(crate) fn handle(
         if !authority::owner_holds_token(context, cfg, key0, &agent_token).map_err(unavailable)? {
             return Err((403, "配置读写只允许管理员私聊".to_string()));
         }
-        return crate::console::settings_action(action, &b, cfg, context);
+        let mut reply = crate::console::settings_action(action, &b, cfg, context)?;
+        drop(_gate);
+        if action == "settings-set"
+            && reply["key"].as_str().and_then(crate::settings::chat_setting)
+                .is_some_and(|setting| crate::settings::wake_timing::refreshes_default_plan(setting.key))
+            && crate::console::refresh_default_wake_configs(context).is_err()
+        {
+            reply["note"] = json!(format!("{}；设置已保存，这次未能同步默认唤醒计划", reply["note"].as_str().unwrap_or("")));
+        }
+        return Ok(reply);
     }
     if action == "archive" {
         let key = b.get("key").and_then(Value::as_str).unwrap_or("");

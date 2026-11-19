@@ -6,6 +6,7 @@ mod engine;
 mod model;
 mod prompt;
 pub(crate) mod reply;
+pub(crate) mod wake;
 
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
@@ -18,7 +19,7 @@ use super::{ConversationSetting, Setting};
 
 /// The group tables in registry order, which is the order the store seeds them and the settings page lists them. A
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
-const GROUPS: [&[Setting]; 5] = [reply::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS];
+const GROUPS: [&[Setting]; 6] = [reply::SETTINGS, wake::SETTINGS, model::SETTINGS, prompt::SETTINGS, access::SETTINGS, engine::SETTINGS];
 
 /// Every setting kept per conversation, in the order the per-conversation page lists them. Each falls back to its
 /// global setting (`ConversationSetting::global`), which is in `registry()`.

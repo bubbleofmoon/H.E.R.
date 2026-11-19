@@ -50,7 +50,7 @@ pub(crate) use kinds::SettingKind;
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
-pub(crate) use registry::{reply, CONVERSATION_ENGINE, ENGINE_DEFAULT};
+pub(crate) use registry::{reply, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,
@@ -64,7 +64,7 @@ pub(crate) use store::{
 pub(crate) use store::{
     apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
     complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
-    has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
+    has_legacy_engine_choices, has_stored_values, has_wake_plan_history, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
     registry_free, reset, reset_conversation, restore_gate, restore_switch_choice, security_restore, store_mark, store_path, undo, view,
     write_back, Applied, Change, CONVERSATION_ERROR,
@@ -162,6 +162,10 @@ impl Setting {
     /// `read` of an integer setting; readers ask it only of integer settings (registry test).
     pub(crate) fn integer(&self, document: &Value) -> i64 {
         self.read(document).as_i64().unwrap_or_default()
+    }
+
+    pub(crate) fn probability(&self, document: &Value) -> f64 {
+        self.read(document).as_f64().unwrap_or_default()
     }
 
     /// `read` of a model id or a text setting: `None` when a model id is not configured; a text setting always has
