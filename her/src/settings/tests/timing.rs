@@ -81,3 +81,56 @@ fn wake_batch_chat_write_refreshes_inherited_plans() {
     let restarted = context.read_social_state().unwrap();
     assert_eq!(restarted["conversations"]["group:101"]["wakeConfig"]["batchWindowMs"], 4500, "startup repairs an interrupted plan refresh");
 }
+
+#[test]
+fn send_settings_feed_the_next_quota_reservation_and_automatic_gap() {
+    let (_root, context) = chat_fixture("live send controls");
+    let key = "group:101";
+    let epoch = crate::send_outbox::token_epoch(GROUP_CHAT_TOKEN);
+    let (status, reply) = post(&context, "/api/socialV2/config", json!({
+        "send": {
+            "maxSendPerMinute": 1,
+            "longGapProbability": 1.0,
+            "longGapMinMs": 5467,
+            "longGapMaxMs": 5467,
+            "firstGapBaseMs": 4567,
+            "firstGapPerCharMs": 123,
+        }
+    }));
+    assert_eq!(status, 200, "{reply}");
+    let cfg = context.load_config().unwrap();
+    let now = now_ms();
+    reserve_send_quota(&context, &cfg, key, 1, now, &epoch).unwrap();
+    assert_eq!(reserve_send_quota(&context, &cfg, key, 1, now, &epoch).unwrap_err().0, 429, "the next reservation uses the stored minute limit");
+    assert_eq!(agent::automatic_gap(&cfg, 0.5, 0.75), 5467, "automatic gaps use the stored long range");
+    assert_eq!(agent::first_typing_delay(&cfg, "😂"), 4813, "the next typing budget counts UTF-16 units");
+    let reply = chat(&context, "settings-set", json!({"settingKey": "sendDelayMs", "value": 543})).unwrap();
+    assert_eq!(reply["value"], 543);
+    assert_eq!(crate::chat::send_delay_ms(&context.load_config().unwrap()), 543);
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "send.maxSendPerMinute", "value": 2}));
+    assert_eq!(status, 200, "{reply}");
+    let cfg = context.load_config().unwrap();
+    reserve_send_quota(&context, &cfg, key, 1, now, &epoch).unwrap();
+    assert_eq!(reserve_send_quota(&context, &cfg, key, 1, now, &epoch).unwrap_err().0, 429);
+}
+
+#[test]
+fn send_settings_apply_the_stored_sticker_pause_and_refuse_inverted_bounds() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (root, context) = settings_fixture("sticker pause setting");
+    let page = |body| post(&context, "/api/socialV2/config", body);
+    let (status, reply) = page(json!({"reply": {"stickerPauseMinMs": 0, "stickerPauseMaxMs": 0}}));
+    assert_eq!(status, 200, "{reply}");
+    let before = stored_config(&root);
+    let (status, reply) = page(json!({"reply": {"stickerPauseMinMs": 1}}));
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(stored_config(&root), before);
+    let seen = Rc::new(Cell::new(None));
+    let observed = Rc::clone(&seen);
+    STICKER_PAUSE_TEST_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move |ms| observed.set(Some(ms)))));
+    sticker_send_pause(&context.load_config().unwrap());
+    STICKER_PAUSE_TEST_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert_eq!(seen.get(), Some(0), "the next sticker uses the stored pause");
+}

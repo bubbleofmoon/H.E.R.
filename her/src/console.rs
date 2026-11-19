@@ -2738,14 +2738,13 @@ fn handle_tokens_summary(context: &RuntimeContext, cfg: &Value, limit: i64) -> R
 }
 
 /// 允许通过对话修改的配置项（白名单，前缀/全路径精确匹配）。
-const SETTINGS_WRITABLE: [&str; 16] = [
-    "sendDelayMs",
-    "socialV2.send.burstEnabled",
-    "socialV2.send.burstIntervalMinMs",
-    "socialV2.send.burstIntervalMaxMs",
-    "socialV2.send.firstGapEnabled",
-    "socialV2.send.maxSendPerMinute",
-    "socialV2.send.maxSendPerHour",
+const SETTINGS_WRITABLE: [&str; 9] = [
+
+
+
+
+
+
     "socialV2.sticker.collect.maxBytes",
     "socialV2.sticker.stickerEnabled",
     "socialV2.context.wakeMaxChars",
@@ -2852,15 +2851,7 @@ fn related_top_k_value(value: &Value) -> Option<Value> {
 /// 而 `null` 会保留。用 `Value::Null` 顶替会让"没配过"变成"配成了 null"。
 fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
     // Project the settings defaults of frozen bridge.js loadConfig without rewriting the file.
-    // send/wake/context are shallow replacements; sticker.collect and role merge defaults.
-    if path == "sendDelayMs" {
-        return Some(
-            cfg.get(path)
-                .filter(|v| !v.is_null())
-                .cloned()
-                .unwrap_or(json!(300)),
-        );
-    }
+    // Context uses shallow replacement; sticker.collect and role merge defaults.
     // The depth a wake executes, not the raw stored value (`prompt::recall_top_k` clamps and defaults).
     if path == "memory.inject.relatedTopK" {
         return Some(json!(crate::prompt::recall_top_k(cfg)));
@@ -2869,16 +2860,11 @@ fn read_setting_path(cfg: &Value, path: &str) -> Option<Value> {
         return Some(value.clone()); // Explicit null, zero and false survive JS object spread.
     }
     let (group, default) = match path {
-        "socialV2.send.burstEnabled" => ("send", json!(true)),
-        "socialV2.send.burstIntervalMinMs" => ("send", json!(1000)),
-        "socialV2.send.burstIntervalMaxMs" => ("send", json!(3000)),
-        "socialV2.send.maxSendPerMinute" => ("send", json!(8)),
-        "socialV2.send.maxSendPerHour" => ("send", json!(60)),
         "socialV2.context.wakeMaxChars" => ("context", json!(6000)),
         "socialV2.context.wakeRecentLimit" => ("context", json!(4)),
         "socialV2.sticker.collect.maxBytes" => return Some(json!(8 * 1024 * 1024)),
         "role.maxInjectChars" => return Some(json!(6000)),
-        _ => return None, // No JS default for firstGapEnabled, stickerEnabled or the other memory.* paths.
+        _ => return None, // No JS default for stickerEnabled or the other memory.* paths.
     };
     if cfg.get("socialV2").and_then(|v| v.get(group)).is_none() {
         Some(default)
@@ -5626,9 +5612,7 @@ fn wait_usage(context: &RuntimeContext, key: &str, conv: &Value) -> Result<(Stri
 
 /// Effective per-turn text-send cap (`socialV2.send.maxPerTurn`, positive safe integer, default 20).
 pub(crate) fn turn_send_cap(cfg: &Value) -> u64 {
-    cfg["socialV2"]["send"]["maxPerTurn"].as_u64()
-        .filter(|n| (1..=9_007_199_254_740_991).contains(n))
-        .unwrap_or(20)
+    crate::settings::send::TURN_MAX.integer(cfg) as u64
 }
 
 pub(crate) const END_TURN: &str = "end this turn now: produce your final answer and make no further tool calls";
@@ -6716,10 +6700,11 @@ fn merge_sub(current: &Value, name: &str, body: &Value) -> serde_json::Map<Strin
 }
 /// Keep the established social form's coercion before it hands typed values to the settings store.
 fn normalize_social_timing_post(body: &mut Value, current: &Value) {
-    let fields: [(&str, &[&str], &[&str], &[&str]); 3] = [
+    let fields: [(&str, &[&str], &[&str], &[&str]); 4] = [
         ("wake", &["batchWindowMs", "maxWakePerMinute", "maxWakePerHour", "noActionLimit", "maxWakeConfigReminders", "preSleepWaitMs"], &["recommendedProbability"], &["preSleepWaitEnabled"]),
         ("proactive", &["checkIntervalMinMs", "checkIntervalMaxMs", "idleThresholdMs"], &["probability"], &["enabled"]),
         ("wait", &["minMs", "maxMs", "minQuietAfterNewMs"], &[], &[]),
+        ("send", &["burstMaxMessages", "burstIntervalMinMs", "burstIntervalMaxMs", "longGapMinMs", "longGapMaxMs", "maxSendPerMinute", "maxSendPerHour", "maxMessageChars", "maxGapMs", "gapBaseMs", "gapPerCharMs"], &["longGapProbability"], &["burstEnabled"]),
     ];
     for (group, integers, probabilities, switches) in fields {
         let Some(posted) = body.get_mut(group).and_then(Value::as_object_mut) else { continue };
@@ -6858,19 +6843,6 @@ fn handle_social_config_post(
     // send
     if body_v.get("send").and_then(js_object_like).is_some() {
         let mut s = merge_sub(&current, "send", &body_v);
-        let cur_send = current.get("send").cloned().unwrap_or_else(|| json!({}));
-        for k in ["burstMaxMessages", "burstIntervalMinMs", "burstIntervalMaxMs", "longGapMinMs", "longGapMaxMs", "maxSendPerMinute", "maxSendPerHour", "maxMessageChars", "maxGapMs", "gapBaseMs", "gapPerCharMs"] {
-            if let Some(v) = norm_num(&s, Some(&cur_send), k, true, 0.0, None, 0.0) {
-                s.insert(k.into(), v);
-            }
-        }
-        if let Some(v) = norm_num(&s, Some(&cur_send), "longGapProbability", false, 0.0, Some(1.0), 0.0) {
-            s.insert("longGapProbability".into(), v);
-        }
-        if s.get("burstEnabled").is_some() {
-            let b = s.get("burstEnabled").and_then(|v| v.as_bool()) == Some(true);
-            s.insert("burstEnabled".into(), json!(b));
-        }
         if s.get("recommendedHint").is_some() {
             let t = js_scalar(s.get("recommendedHint"));
             s.insert("recommendedHint".into(), json!(t));
@@ -8941,10 +8913,9 @@ where
     context
         .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
         .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
-    let send_cfg = cfg.get("socialV2").and_then(|social| social.get("send"));
     let now = now_ms();
-    let max_minute = send_cfg.and_then(|send| send.get("maxSendPerMinute")).and_then(Value::as_i64).unwrap_or(0);
-    let max_hour = send_cfg.and_then(|send| send.get("maxSendPerHour")).and_then(Value::as_i64).unwrap_or(0);
+    let max_minute = crate::settings::send::RATE_MIN.integer(cfg);
+    let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
     let epoch = crate::send_outbox::token_epoch(token);
     let reservation = crate::turn_ledger::mint_id("sticker-send-");
     reserve_sticker_quota(context, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, max_minute, max_hour, Some(&epoch), "发送频率超限，请稍后再试")?;
@@ -9051,10 +9022,10 @@ where
         crate::recorded_send::BeginError::Muted(text) => mute_send_denial(context, cfg, &storage_key, token).err().unwrap_or((403, text)),
     })?;
     // JS enqueues the sticker on the same `sendChain` as text bubbles, so it can never overtake an
-    // in-flight burst, and pauses 800-2000 ms inside the chain before `assertSendAllowed()`.
+    // in-flight burst, and pauses inside the chain before `assertSendAllowed()`.
     // The pause holds no authority or social gate; validity is re-checked below, after it.
     let send_chain = agent::send_chain();
-    sticker_send_pause();
+    sticker_send_pause(cfg);
     let guard = send_guard_for(context, cfg, &storage_key, &epoch, GuardPolicy::Reserved2, "sendSticker")
         .and_then(|_| {
             let fresh = context.load_config().map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
@@ -10084,12 +10055,20 @@ fn collect_sticker_guard(context: &RuntimeContext, _cfg: &Value, key: &str, toke
     Ok(())
 }
 
-/// JS `await sleep(randInt(800, 2000))` before a sticker request. Unit tests never sleep: they
+/// Pause before a sticker request. Unit tests never sleep: they
 /// observe the chosen value through `STICKER_PAUSE_TEST_HOOK`. Debug and parity-clock builds
 /// accept `HER_STICKER_PAUSE_MS` so process-level tests need no real seconds; release builds
 /// ignore it.
-fn sticker_send_pause() {
-    let ms = 800 + ((rand01() * 1201.0) as u64).min(1200);
+fn sticker_send_pause(cfg: &Value) {
+    use crate::settings::send::{STICKER_MAX, STICKER_MIN};
+    let (min, max) = (STICKER_MIN.integer(cfg), STICKER_MAX.integer(cfg));
+    let (min, max) = if min <= max {
+        (min, max)
+    } else {
+        (STICKER_MIN.integer(&Value::Null), STICKER_MAX.integer(&Value::Null))
+    };
+    let width = (max - min) as u64;
+    let ms = min as u64 + ((rand01() * (width + 1) as f64) as u64).min(width);
     #[cfg(test)]
     {
         STICKER_PAUSE_TEST_HOOK.with(|hook| {
@@ -10136,9 +10115,8 @@ fn reserve_send_quota(
     now: i64,
     epoch: &str,
 ) -> Result<(), (u16, String)> {
-    let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
-    let max_min = send_cfg.get("maxSendPerMinute").and_then(|v| v.as_i64()).unwrap_or(0);
-    let max_hour = send_cfg.get("maxSendPerHour").and_then(|v| v.as_i64()).unwrap_or(0);
+    let max_min = crate::settings::send::RATE_MIN.integer(cfg);
+    let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
     let n = count as i64;
     mutate_social_state_for(context, |state| {
         let conv = state
@@ -11711,20 +11689,6 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
             "recommendedHint": "如果你要潜水，推荐先调用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话就可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看 newMessages，判断不需要你参与可直接沉睡，若参与了则下次想睡需再等观察窗口。潜水时长推荐 5~120 分钟，普通消息唤醒概率可配置；@/名字/关键词/提问唤醒建议保持开启。triggers.question 只响应引用你的问句，或你最近发言后交流窗口内（questionExchangeWindowMs，默认 90 秒）与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员；催促只在同一交流窗口内生效。需要等特定某人/某几人时，可额外设置 triggers.speakerIds。",
         },
         "send": {
-            "burstEnabled": true,
-            "burstMaxMessages": 8,
-            "burstIntervalMinMs": 1000,
-            "burstIntervalMaxMs": 3000,
-            "longGapProbability": 0.2,
-            "longGapMinMs": 5000,
-            "longGapMaxMs": 10000,
-            "maxSendPerMinute": 8,
-            "maxSendPerHour": 60,
-            "maxPerTurn": 20,
-            "maxMessageChars": 500,
-            "maxGapMs": 10000,
-            "gapBaseMs": 800,
-            "gapPerCharMs": 20,
             "recommendedHint": "普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。"
         },
         "wait": { "defaultMs": 30000, "defaultQuietMs": 8000, "batchWindowMs": 8000, "maxPerTurn": 4 },
@@ -21767,15 +21731,15 @@ mod tests {
     }
 
     #[test]
-    fn memory_settings_writable_paths_match_frozen_js() {
+    fn memory_settings_writable_paths_remain_split_between_legacy_and_registry() {
         let expected = [
-            "sendDelayMs",
-            "socialV2.send.burstEnabled",
-            "socialV2.send.burstIntervalMinMs",
-            "socialV2.send.burstIntervalMaxMs",
-            "socialV2.send.firstGapEnabled",
-            "socialV2.send.maxSendPerMinute",
-            "socialV2.send.maxSendPerHour",
+
+
+
+
+
+
+
                     "socialV2.sticker.collect.maxBytes",
             "socialV2.sticker.stickerEnabled",
             "socialV2.context.wakeMaxChars",
@@ -21787,6 +21751,14 @@ mod tests {
             "role.maxInjectChars",
         ];
         assert_eq!(SETTINGS_WRITABLE.as_slice(), expected.as_slice());
+        for migrated in [
+            "sendDelayMs", "socialV2.send.burstEnabled", "socialV2.send.burstIntervalMinMs",
+            "socialV2.send.burstIntervalMaxMs", "socialV2.send.firstGapEnabled",
+            "socialV2.send.maxSendPerMinute", "socialV2.send.maxSendPerHour", "socialV2.wake.batchWindowMs",
+        ] {
+            assert!(crate::settings::chat_setting(migrated).is_some(), "{migrated}");
+            assert!(!is_setting_writable(migrated), "{migrated}");
+        }
         assert!(!is_setting_writable("socialV2.send.mergeMultiIntoOne"));
         assert!(!is_setting_writable("consoleToken"));
     }

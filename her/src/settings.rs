@@ -50,7 +50,7 @@ pub(crate) use kinds::SettingKind;
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
-pub(crate) use registry::{reply, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
+pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{
     chat_setting, conversation_registry, find, find_conversation, registry, CONVERSATION_ROUTE, DIGEST_MODEL,
     DIGEST_TIMEOUT_SECS, HARNESS_FIRST_ROUTE, HARNESS_MAX_STEPS, HARNESS_MAX_TOKENS, HARNESS_MODEL, INTERCEPT_NOTIFY,

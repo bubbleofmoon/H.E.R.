@@ -20,7 +20,7 @@ mod conversation { include!("conversation.rs"); }
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
 /// The settings module's product sources, for the source tests: the module root, the store, the kinds and the registry.
-const SETTINGS_SOURCES: [(&str, &str); 21] = [
+const SETTINGS_SOURCES: [(&str, &str); 22] = [
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
     ("settings/store/conversation.rs", include_str!("../store/conversation.rs")),
@@ -41,6 +41,7 @@ const SETTINGS_SOURCES: [(&str, &str); 21] = [
     ("settings/registry/model.rs", include_str!("../registry/model.rs")),
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
+    ("settings/registry/send.rs", include_str!("../registry/send.rs")),
     ("settings/registry/wake.rs", include_str!("../registry/wake.rs")),
 ];
 

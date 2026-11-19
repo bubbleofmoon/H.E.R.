@@ -97,7 +97,12 @@ pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
 
 /// Fill the timing settings in the effective runtime snapshot. Raw documents and mirror writes keep their spelling.
 pub(crate) fn complete_timing(document: &mut Value) {
-    for setting in super::reply::SETTINGS.iter().chain(super::wake_timing::SETTINGS) {
+    use super::send::{first_gap_setting, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_PER_CHAR};
+    for (first, fallback) in [(FIRST_BASE, GAP_BASE), (FIRST_PER_CHAR, GAP_PER_CHAR)] {
+        let value = first_gap_setting(document, first, fallback);
+        set_at(document, first.pointer, json!(value));
+    }
+    for setting in super::reply::SETTINGS.iter().chain(super::wake_timing::SETTINGS).chain(super::send::SETTINGS) {
         let value = setting.read(document);
         set_at(document, setting.pointer, value);
     }
@@ -110,7 +115,8 @@ fn validate_timing(
     removed: Option<&Setting>,
 ) -> Result<(), (u16, String)> {
     let turn = super::wake_timing::TURN_FIELDS.iter().any(|setting| written.contains(&setting.key));
-    if !turn && !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
+    let send = super::send::ORDERED.iter().flatten().any(|setting| written.contains(&setting.key));
+    if !turn && !send && !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
         return Ok(());
     }
     let mut candidate = document.clone();
@@ -124,6 +130,15 @@ fn validate_timing(
     }
     if turn {
         crate::wake::validate_turn_settings(&candidate).map_err(|error| (400, error.to_string()))?;
+    }
+    if send {
+        for [min, max] in super::send::ORDERED {
+            if [min, max].iter().any(|setting| written.contains(&setting.key))
+                && min.integer(&candidate) > max.integer(&candidate)
+            {
+                return Err((400, format!("{} <= {} is required", min.key, max.key)));
+            }
+        }
     }
     for [min, median, max] in &super::reply::WINDOWS {
         if [min, median, max].iter().any(|setting| written.contains(&setting.key))
@@ -1354,7 +1369,8 @@ pub(crate) fn console_changes(
     if !context.is_isolated() {
         return Ok(Vec::new());
     }
-    let now = overlay(context, base.clone());
+    let mut now = overlay(context, base.clone());
+    complete_timing(&mut now);
     let mut changes = Vec::new();
     for setting in registry() {
         // The member the setting reads (`Setting::found_in`), so an id list sent under its alias spelling counts.
@@ -1499,7 +1515,8 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let mut document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    complete_timing(&mut document);
     let (stored, store_error) = match stored_values(context) {
         Ok(stored) => (stored, None),
         Err(error) => (Vec::new(), Some(error)),

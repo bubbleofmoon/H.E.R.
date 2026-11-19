@@ -72,7 +72,8 @@ fn qq_get_prompt_hides_secrets_in_the_config_sections_it_copies() {
     cfg["socialV2"] = json!({"send": {"burstEnabled": true, "apiKey": "fixture-send-value-142"},
         "wake": {"recommendedKeywords": ["小鲸鱼"], "auth": {"token": "fixture-wake-value-142"}}});
     let prompt = super::super::handle_prompt(&context, &cfg, "group:101");
-    assert_eq!(prompt["recommended"]["send"], json!({"burstEnabled": true, "apiKey": "(已隐藏)"}));
+    assert_eq!(prompt["recommended"]["send"]["burstEnabled"], true);
+    assert_eq!(prompt["recommended"]["send"]["apiKey"], "(已隐藏)");
     assert_eq!(prompt["recommended"]["wake"]["recommendedKeywords"], json!(["小鲸鱼"]));
     assert_eq!(prompt["recommended"]["wake"]["auth"]["token"], "(已隐藏)");
     assert!(!prompt.to_string().contains("fixture-send-value-142") && !prompt.to_string().contains("fixture-wake-value-142"), "{prompt}");

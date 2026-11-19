@@ -22,6 +22,8 @@ pub(crate) enum FileRule {
     Automatic,
     /// The file also accepts a whole-valued JSON decimal.
     IntegralNumber,
+    /// An older file may spell a non-negative duration as a decimal or a numeric string.
+    LegacyDecimal,
     /// A non-negative integer is clamped into the bounds; any other value reads as the default.
     Clamp,
     /// A non-negative number is truncated to an integer and clamped into the bounds.
@@ -46,6 +48,10 @@ impl SettingKind for Integer {
                 .filter(|n| n.is_finite() && *n >= 0.0)
                 .map(|n| json!((n as i64).clamp(min, max))),
             FileRule::IntegralNumber => found.as_f64().filter(|n| n.fract() == 0.0 && *n >= min as f64 && *n <= max as f64).map(|n| json!(n as i64)),
+            FileRule::LegacyDecimal => {
+                let n = found.as_f64().or_else(|| found.as_str()?.trim().parse().ok())?;
+                n.is_finite().then(|| json!(n.round().clamp(min as f64, max as f64) as i64))
+            }
             FileRule::Default | FileRule::Automatic => self.normalize(found),
         }
     }

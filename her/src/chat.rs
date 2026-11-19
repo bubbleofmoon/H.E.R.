@@ -115,7 +115,7 @@ pub fn ack_message(cfg: &Value) -> Option<String> {
 
 /// `cfg.sendDelayMs ?? 300`.
 pub fn send_delay_ms(cfg: &Value) -> u64 {
-    cfg.get("sendDelayMs").and_then(Value::as_u64).unwrap_or(300)
+    crate::settings::send::SEND_DELAY.integer(cfg) as u64
 }
 
 /// The agent preset of chat sessions: `cfg.agentPreset`, default `qq-chat` (never the reserved2 one).

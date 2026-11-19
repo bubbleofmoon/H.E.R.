@@ -245,13 +245,12 @@ pub(super) fn hold(
     let urgent = urgent(cfg, key, baseline);
     let mut rng = random()?;
     let quiet = rng.quiet(QuietWindow::configured(cfg, urgent));
-    let send_cfg = cfg.pointer("/socialV2/send").unwrap_or(&Value::Null);
-    let typing_budget = if send_cfg["firstGapEnabled"] == false {
+    let typing_budget = if !crate::settings::send::FIRST_ENABLED.switch(cfg) {
         0
     } else {
-        rng.typing(agent::first_typing_delay(send_cfg, text, 0))
+        rng.typing(agent::first_typing_delay(cfg, text))
     };
-    let start = if send_cfg["fillTypingBudget"] == false {
+    let start = if !crate::settings::send::FILL_TYPING.switch(cfg) {
         now_ms()
     } else {
         previous_sent.unwrap_or_else(|| thinking_start(context, key, epoch, baseline))

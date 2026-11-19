@@ -29,3 +29,5 @@ Inbound `face` segments remain `[表情N]` in model text. Echoing that notation 
 ## Crate contracts
 
 Automatic replies normalize the complete text before burst or length splitting; send splitters preserve supported face tokens and record parts exactly as sent. Text tools and reserved2 CLI replies share canonical face normalization, repeat/cap admission and durable outbox accounting before reply holds; see `docs/agents/media-transport.md` and `docs/agents/prompts-modes.md`. Harness QQ tools dispatch through the common MCP/console handlers and retain uncertain-delivery classification. CLI relay requires the authenticated companion console, bounds connection/transmission to one second, permits held responses within 300 seconds, and never bypasses refusal or transport failure with a direct send. Chat confirmation-append failures retain the known delivery count, surface the persistence failure and stop later parts.
+
+The sticker delivery pause and its configured bounds are part of the shared send-chain contract in `docs/agents/social-state.md`.

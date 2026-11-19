@@ -613,22 +613,12 @@ fn release_unsent_tool_claim(context: &RuntimeContext, key: &str, at: i64) {
 }
 
 fn duplicate_window(context: &RuntimeContext, cfg: &Value, key: &str, mark: Option<i64>) -> Option<String> {
-    let window = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("send"))
-        .and_then(|s| s.get("duplicateWindowMs"))
-        .map(|v| match v {
-            Value::Number(n) => n.as_f64().unwrap_or(0.0),
-            Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-            _ => 0.0,
-        })
-        .unwrap_or(0.0)
-        .max(0.0);
+    let window = crate::settings::send::DUPLICATE_WINDOW.integer(cfg);
     let mut sends = last_tool_send().lock().unwrap_or_else(|p| p.into_inner());
     let scope = (receipt_scope(context), key.to_string());
     let now = mark.unwrap_or_else(now_ms);
     let gap = now - sends.get(&scope).copied().unwrap_or(0);
-    if window > 0.0 && (gap as f64) < window {
+    if window > 0 && gap < window {
         return Some(format!("刚说过话了（{} 秒前），本轮别重复。要补充就合并进上一条。", ((gap as f64) / 1000.0).round() as i64));
     }
     if mark.is_some() {
@@ -765,18 +755,24 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     let normalized: Vec<String> = call.messages.iter().map(|m| crate::outbound_message::normalize(m))
         .filter(|m| !m.is_empty()).collect();
     if normalized.is_empty() { return Err((400, "归一化后没有可发送的消息".into())); }
+    use crate::settings::send::{BURST_MIN_MS, GAP_BASE, GAP_MAX, GAP_PER_CHAR};
     let (messages, at_user, flavor, policy) = (&normalized, call.at_user, call.flavor, call.policy);
-    let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
     mute_send_denial(context, cfg, key, token)?;
     let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
     let initial = load_social_state_for(context)?["conversations"][key].clone();
     let chain = send_chain();
+    let fresh = if context.is_isolated() {
+        Some(context.load_config().map_err(|_| (503, "send settings are unavailable".to_string()))?)
+    } else {
+        None
+    };
+    let cfg = fresh.as_ref().unwrap_or(cfg);
     let turn_scope = if token.is_empty() { String::new() } else {
         repeat_guard::admit(context, key, messages)?
     };
     let clamp_gap = |ms: i64| -> i64 {
-        let min = send_cfg.get("burstIntervalMinMs").and_then(|v| v.as_i64()).unwrap_or(1000);
-        let max = send_cfg.get("maxGapMs").and_then(|v| v.as_i64()).unwrap_or(10000);
+        let min = BURST_MIN_MS.integer(cfg);
+        let max = GAP_MAX.integer(cfg);
         ms.clamp(min.min(max), max.max(min))
     };
     let count = messages.len();
@@ -799,8 +795,7 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
                         call.body
                             .get("gapMs")
                             .and_then(|v| v.as_i64())
-                            .or_else(|| send_cfg.get("burstIntervalMinMs").and_then(|v| v.as_i64()))
-                            .unwrap_or(1000),
+                            .unwrap_or_else(|| BURST_MIN_MS.integer(cfg)),
                     );
                     for _ in 0..count - 1 {
                         delays.push(g);
@@ -808,16 +803,16 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
                 }
             }
             "byLength" => {
-                let base = send_cfg.get("gapBaseMs").and_then(|v| v.as_i64()).unwrap_or(800);
-                let per = send_cfg.get("gapPerCharMs").and_then(|v| v.as_i64()).unwrap_or(20);
+                let base = GAP_BASE.integer(cfg);
+                let per = GAP_PER_CHAR.integer(cfg);
                 for m in messages.iter().take(count - 1) {
                     let chars = m.chars().count().max(1) as i64;
-                    delays.push(clamp_gap(base + chars * per));
+                    delays.push(clamp_gap(base.saturating_add(chars.saturating_mul(per))));
                 }
             }
             _ => {
                 for _ in 0..count - 1 {
-                    delays.push(clamp_gap(1000 + (now_ms() % 1000)));
+                    delays.push(clamp_gap(automatic_gap(cfg, rand01(), rand01())));
                 }
             }
         }
@@ -831,7 +826,12 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
         }
     }
     // 1. Persist the quota reservation before anything else can fail or send.
-    reserve_send_quota(context, cfg, key, count, now, &epoch)?;
+    if let Err(error) = reserve_send_quota(context, cfg, key, count, now, &epoch) {
+        if flavor == SendFlavor::Message {
+            release_unsent_tool_claim(context, key, now);
+        }
+        return Err(error);
+    }
     // 2. Resolve the quote target. A refusal gives the reservation back; nothing was sent.
     let mut quoted = Value::Null;
     let mut actual_reply: Option<i64> = None;
@@ -961,19 +961,30 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     Ok((200, out))
 }
 
-pub(super) fn first_typing_delay(cfg: &Value, text: &str, elapsed: i64) -> i64 {
-    let base = js_number_or(cfg.get("firstGapBaseMs").filter(|v| !v.is_null()).or_else(|| cfg.get("gapBaseMs")),1000.0);
-    let per = js_number_or(cfg.get("firstGapPerCharMs").filter(|v| !v.is_null()).or_else(|| cfg.get("gapPerCharMs")),60.0);
-    let min = js_number_or(cfg.get("burstIntervalMinMs"),300.0).max(100.0);
-    let max = js_number_or(cfg.get("maxGapMs"),10000.0).max(min);
-    let budget = (base + text.encode_utf16().count() as f64 * per).round().clamp(min,max) as i64;
-    if cfg.get("fillTypingBudget") == Some(&json!(false)) { budget } else { budget.saturating_sub(elapsed).max(0) }
+pub(super) fn automatic_gap(cfg: &Value, choose: f64, position: f64) -> i64 {
+    use crate::settings::send::{BURST_MAX_MS, BURST_MIN_MS, LONG_CHANCE, LONG_MAX, LONG_MIN};
+    let (min, max) = if choose < LONG_CHANCE.probability(cfg) {
+        (LONG_MIN.integer(cfg), LONG_MAX.integer(cfg))
+    } else {
+        (BURST_MIN_MS.integer(cfg), BURST_MAX_MS.integer(cfg))
+    };
+    let (min, max) = (min.min(max), min.max(max));
+    min + ((position * (max - min + 1) as f64) as i64).min(max - min)
+}
+
+pub(super) fn first_typing_delay(cfg: &Value, text: &str) -> i64 {
+    use crate::settings::send::{first_gap_setting, BURST_MIN_MS, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_MAX, GAP_PER_CHAR};
+    let base = first_gap_setting(cfg, FIRST_BASE, GAP_BASE);
+    let per = first_gap_setting(cfg, FIRST_PER_CHAR, GAP_PER_CHAR);
+    let min = BURST_MIN_MS.integer(cfg).max(100);
+    let max = GAP_MAX.integer(cfg).max(min);
+    base.saturating_add((text.encode_utf16().count() as i64).saturating_mul(per)).clamp(min, max)
 }
 
 /// Message count, per-message length (UTF-16 units, as JS) and the outbound sensitive-text check.
-pub(super) fn check_limits_and_text(cfg: &Value, send_cfg: &Value, messages: &[String], what: &str) -> Result<(), (u16, String)> {
-    let max_msgs = send_cfg.get("burstMaxMessages").and_then(Value::as_f64).filter(|n| *n != 0.0).unwrap_or(8.0).max(1.0) as i64;
-    let max_chars = send_cfg.get("maxMessageChars").and_then(Value::as_f64).filter(|n| *n != 0.0).unwrap_or(500.0).max(1.0) as i64;
+pub(super) fn check_limits_and_text(cfg: &Value, messages: &[String], what: &str) -> Result<(), (u16, String)> {
+    let max_msgs = crate::settings::send::BURST_MAX.integer(cfg);
+    let max_chars = crate::settings::send::MAX_CHARS.integer(cfg);
     if messages.len() as i64 > max_msgs {
         return Err((400, format!("最多发送 {max_msgs} 条")));
     }
@@ -1005,7 +1016,7 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
     }
     let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
     let merge_into_one = send_cfg.get("mergeMultiIntoOne").and_then(Value::as_bool) != Some(false);
-    if messages.len() > 1 && !merge_into_one && send_cfg.get("burstEnabled").and_then(Value::as_bool) == Some(false) {
+    if messages.len() > 1 && !merge_into_one && !crate::settings::send::BURST.switch(cfg) {
         return Err((403, "已禁用多条发送，请合并为一条消息".to_string()));
     }
     // The frozen JS assigns to a `const` here and answers 500 "Assignment to constant variable." for any
@@ -1038,7 +1049,7 @@ fn burst_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, 
     if silent_blocks_send(context, cfg, &key)? {
         return Err((403, "静默模式已开启，当前不允许发送".to_string()));
     }
-    check_limits_and_text(cfg, &send_cfg, &messages, "send-burst")?;
+    check_limits_and_text(cfg, &messages, "send-burst")?;
     let storage_key = canonical_v2_key(&key).ok_or((400, format!("无效的会话 key：{key}")))?;
     let call = SendCall {
         key: &storage_key,
@@ -1151,8 +1162,7 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
         };
         resolved_quote = Some((info, real.trim().parse::<i64>().ok()));
     }
-    let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
-    let max_chars = send_cfg.get("maxMessageChars").and_then(Value::as_f64).filter(|n| *n != 0.0).unwrap_or(500.0).max(1.0) as i64;
+    let max_chars = crate::settings::send::MAX_CHARS.integer(cfg);
     if message.encode_utf16().count() as i64 > max_chars {
         return Err((400, format!("单条消息不能超过 {max_chars} 字")));
     }

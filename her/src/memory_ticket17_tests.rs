@@ -33,7 +33,7 @@ fn fts_dot_http_and_mcp_search_surface_safe_errors_and_preserve_valid_results() 
 }
 
 #[test]
-fn ticket17_settings_all_frozen_defaults_and_omissions() {
+fn ticket17_settings_lists_registry_defaults_and_legacy_omissions() {
     let (_root, context) = fixture_runtime("ticket17 all defaults", "fixture-console-token-17");
     context
         .write_atomic(
@@ -51,6 +51,7 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
         "socialV2.send.burstEnabled":true,
         "socialV2.send.burstIntervalMinMs":1000,
         "socialV2.send.burstIntervalMaxMs":3000,
+        "socialV2.send.firstGapEnabled":true,
         "socialV2.send.maxSendPerMinute":8,
         "socialV2.send.maxSendPerHour":60,
         "socialV2.wake.batchWindowMs":8000,
@@ -69,7 +70,7 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"], defaults,
-        "all-settings must include every JS default, omitting JS undefined paths"
+        "all-settings includes registered defaults and omits undefined legacy paths"
     );
     for path in SETTINGS_WRITABLE {
         let mut named = args.clone();
@@ -104,8 +105,8 @@ fn ticket17_settings_all_frozen_defaults_and_omissions() {
     let all = memory_tool_action(&context, "settings-get", &args).unwrap();
     assert_eq!(
         all["settings"],
-        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.maxSendPerMinute":0,"socialV2.wake.batchWindowMs":8000,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
-        "preserve explicit values and JS shallow replacement"
+        json!({"sendDelayMs":300,"socialV2.send.burstEnabled":false,"socialV2.send.burstIntervalMinMs":1000,"socialV2.send.burstIntervalMaxMs":3000,"socialV2.send.firstGapEnabled":true,"socialV2.send.maxSendPerMinute":0,"socialV2.send.maxSendPerHour":60,"socialV2.wake.batchWindowMs":8000,"socialV2.sticker.collect.maxBytes":null,"socialV2.sticker.stickerEnabled":false,"memory.inject.relatedTopK":3,"memory.autoFlush.enabled":false,"role.maxInjectChars":null,"socialV2.reply.wakeQuietMs":3000}),
+        "preserve configured values and the defaults of registered settings"
     );
 }
 
@@ -122,7 +123,7 @@ fn ticket17_settings_get_reports_effective_send_delay_before_any_write() {
     let mut config = context.load_config().unwrap();
     let args = json!({"key":"private:7001","token":"owner-token","settingKey":"sendDelayMs"});
     let all_args = json!({"key":"private:7001","token":"owner-token"});
-    // Frozen JS loadConfig uses file.sendDelayMs ?? 300, including explicit null.
+    // A missing or null file member reads as the registered default.
     for (stored, expected) in [
         (None, 300),
         (Some(Value::Null), 300),
@@ -150,7 +151,7 @@ fn ticket17_settings_get_reports_effective_send_delay_before_any_write() {
     let set_args = json!({"key":"private:7001","token":"owner-token","settingKey":"sendDelayMs","value":17});
     assert_eq!(
         crate::mcp::call_tool_with_context("settings_set", &set_args, &context).unwrap(),
-        "已改 sendDelayMs。已立即生效"
+        "已改 sendDelayMs = 17。已立即生效"
     );
     assert_eq!(
         crate::mcp::call_tool_with_context("settings_get", &args, &context).unwrap(),
