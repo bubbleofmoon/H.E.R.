@@ -51,13 +51,13 @@ pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16
                     params![key, CONVERSATION_ENGINE.key],
                     |row| row.get(0),
                 ).map_err(|_| (503, STORAGE_ERROR.to_string()))?;
-                if (changed && false) || stored_row(conn, key, CONVERSATION_ENGINE.key)?.is_some() { // RED-M1
+                if changed || stored_row(conn, key, CONVERSATION_ENGINE.key)?.is_some() {
                     continue;
                 }
                 let Some(value) = CONVERSATION_ENGINE.normalize(value) else {
                     record_change(conn, &CONVERSATION_ENGINE, key, None, None, SEED_ACTOR, "migration")?;
                     skipped += 1;
-                    continue; // The migration audit records this invalid choice.
+                    return Err((503, "conversationEngines has an invalid engine choice".into())); // RED-M12
                 };
                 record_change(conn, &CONVERSATION_ENGINE, key, None, Some(&value.to_string()), SEED_ACTOR, "migration")?;
             }
