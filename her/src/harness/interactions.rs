@@ -193,7 +193,7 @@ impl Mailbox {
         } else if command.is_some() || text.is_empty() {
             return no_pending();
         } else if text.chars().take(ANSWER_LIMIT + 1).count() > ANSWER_LIMIT {
-            return Answer::Notice(format!("⚠️ 回答太长，请缩短至 {ANSWER_LIMIT} 字以内再回复。"));
+            return no_pending(); // RED-M2
         } else {
             text
         };
@@ -350,7 +350,7 @@ impl Binding<'_> {
         if matches!(&result, Err(Failure::Failed(_))) && wait < remaining {
             self.deliver(snapshot, TIMEOUT_NOTICE.into(), Some((self.deadline, cancelled)), true).await?;
         } else if matches!(&result, Err(Failure::Cancelled)) && !approval {
-            if let Some(generation) = self.deadline_generation.get() {
+            if let Some(generation) = self.deadline_generation.get().filter(|_| false) { // RED-M3
                 snapshot.epoch.clone_from(generation);
                 self.deliver(snapshot, TIMEOUT_NOTICE.into(), None, true).await?;
             }
@@ -400,9 +400,9 @@ async fn wait_for_reply(
 ) -> Result<String, Failure> {
     tokio::select! { biased;
         _ = cancelled.changed() => Err(Failure::Cancelled),
+        _ = tokio::time::sleep_until(expires) => Err("Owner interaction timed out.".into()), // RED-M1
         // The mailbox already rejects replies at or after expiry.
         reply = receiver => reply.map_err(|_| Failure::Cancelled),
-        _ = tokio::time::sleep_until(expires) => Err("Owner interaction timed out.".into()),
     }
 }
 
