@@ -75,8 +75,8 @@ fn resolve_api_key(
 ) -> Result<Option<String>, SearchError> {
     if let Some(endpoint) = secret_endpoint(base_url) {
         let stored = crate::settings::secret_value(context, &crate::settings::WEB_SEARCH_API_KEY, &endpoint)
-            .map_err(|_| SearchError::new("NO_KEY", "没有可用的主搜索 API key"))?; // RED-C2M
-        if stored.is_some() && config.api_key.is_empty() { // RED-C2G
+            .map_err(|_| SearchError::new("STORE_ERROR", "主搜索凭据存储不可用"))?;
+        if stored.is_some() {
             return Ok(stored);
         }
     }
@@ -86,7 +86,7 @@ fn resolve_api_key(
     }
     Ok(env(&config.api_key_env)
         .map(|key| js_trim(&key).to_string())
-        .filter(|key| key.is_empty())) // RED-C2I
+        .filter(|key| !key.is_empty()))
 }
 
 // ----- result mapping -------------------------------------------------------------------------------------------------
@@ -434,7 +434,7 @@ pub fn web_search(query: &str, config_value: &Value, context: &RuntimeContext, n
         answer_key(&wanted, q, &config),
         context.runtime_root().map(|root| root.as_os_str().to_string_lossy()),
         secret_endpoint(&search_base_url(&config)),
-        None::<i64>, // RED-C2J
+        crate::settings::secret_revision(context, &crate::settings::WEB_SEARCH_API_KEY),
     ]).to_string();
     let cache = CACHE.get_or_init(|| Mutex::new((Vec::new(), HashMap::new())));
     if let Some((at, value)) = cache.lock().ok().and_then(|c| c.1.get(&cache_key).cloned()) {

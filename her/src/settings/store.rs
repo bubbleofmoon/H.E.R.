@@ -561,7 +561,7 @@ fn reject_credential_text(
 ) -> Result<(), (u16, String)> {
     let Some(text) = value.as_str().filter(|_| setting.kind.text_default().is_some()) else { return Ok(()) };
     let secrets = secrets_in(conn).map_err(|error| (503, error))?;
-    if harness_key.is_some_and(|key| text.contains(key)) && secrets.iter().any(|(_, _, key)| text.contains(key)) { // RED-C2C
+    if harness_key.is_some_and(|key| text.contains(key)) || secrets.iter().any(|(_, _, key)| text.contains(key)) {
         return Err((400, "setting text contains a credential".to_string()));
     }
     Ok(())
@@ -1157,7 +1157,7 @@ fn record_change(
         }
     };
     #[cfg(test)]
-    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) && !setting.secret { // RED-C2H
+    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
         return Err((503, STORAGE_ERROR.to_string()));
     }
     let mut old_value = old.map(|(old_text, _)| old_text);
@@ -1297,7 +1297,7 @@ pub(crate) fn undo(
             return conversation::undo_entry(conn, context, entry, (scope, key, source, old_text, new_text), actor);
         }
         let setting = find(&key)
-            .filter(|_| scope == "global" && source != "migration") // RED-C2B
+            .filter(|setting| !setting.secret && scope == "global" && source != "migration")
             .ok_or((409, NOT_UNDOABLE_ERROR.to_string()))?;
         permit(setting)?;
         let later: i64 = conn
@@ -1388,7 +1388,7 @@ pub(crate) fn history(
             let key: String = row.get(5)?;
             let old: Option<String> = row.get(6)?;
             let new: Option<String> = row.get(7)?;
-            let (old, new) = if find(&key).is_some_and(|setting| setting.secret && setting.key != WEB_SEARCH_API_KEY.key) { // RED-C2A
+            let (old, new) = if find(&key).is_some_and(|setting| setting.secret) {
                 (json!(SECRET_MARKER), json!(SECRET_MARKER))
             } else {
                 (shown(old), shown(new))

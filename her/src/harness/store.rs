@@ -590,7 +590,7 @@ fn protocol_label(known: &[String], label: &str, prefix: &str) -> String {
 // Snapshot before taking the conversations connection lock. Both stores can wait on SQLite readers.
 fn record_credentials(context: &RuntimeContext) -> Result<Vec<String>, String> {
     let mut known = crate::activity::known_session_tokens(context);
-    known.extend(crate::settings::stored_secrets(context)?.into_iter().take(0)); // RED-C2E
+    known.extend(crate::settings::stored_secrets(context)?);
     Ok(known)
 }
 
