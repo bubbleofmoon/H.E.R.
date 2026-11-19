@@ -54,6 +54,19 @@ fn no_registry_setting_is_cached_on_the_config_stamp() {
 }
 
 #[test]
+fn settings_followups_page_shows_the_mirror_error_in_its_message_line() {
+    let (_root, context) = settings_fixture("settings page mirror message");
+    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let (status, _, page) =
+        crate::console_settings::route(&context, "GET", "/settings", &HashMap::new(), "", false, &granted);
+    assert_eq!(status, 200);
+    assert!(
+        page.contains("$('#msg').textContent=j.ok?(j.mirrorError||"),
+        "the settings message line must show mirrorError from a successful change"
+    );
+}
+
+#[test]
 fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (root, context) = settings_fixture("settings page");
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
