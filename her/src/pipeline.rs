@@ -1591,7 +1591,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
 
     fn expire_unadmitted_harness(&mut self) -> String {
         if let Some(route) = &self.reserved2_route {
-            *route.lock().unwrap_or_else(|p| p.into_inner()) = Reserved2Route::Harness; // RED-G1
+            *route.lock().unwrap_or_else(|p| p.into_inner()) = Reserved2Route::ExpiredBeforeAdmission;
         }
         self.finish_turn("cancelled", "turnTimeout");
         crate::harness::DEADLINE_EXCEEDED.into()
