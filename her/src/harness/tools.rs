@@ -424,14 +424,13 @@ mod tests {
         outcome["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// The table row, and what the default configuration (every tool registered) offers from it.
+    /// The table row, and what the configuration offers with the default-off tools enabled.
     fn assert_menu(profile: Profile, expected: &[&str]) {
+        let cfg = json!({
+            "socialV2": {"tools": {"sendVoice": true, "setStickerRemark": true}}
+        });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
-        assert_eq!(
-            names(&definitions(&json!({}), profile)),
-            expected,
-            "{profile:?} offered"
-        );
+        assert_eq!(names(&definitions(&cfg, profile)), expected, "{profile:?} offered");
     }
 
     #[test]
@@ -530,8 +529,11 @@ mod tests {
                 "qq_get_sticker_image",
                 "qq_send_sticker",
                 "qq_collect_sticker",
+                "qq_send_voice",
+                "qq_list_voices",
                 "qq_get_self_image",
                 "qq_sticker_note",
+                "qq_set_sticker_remark",
                 "qq_get_forward_msg",
                 "memory_write",
                 "memory_search",
@@ -578,8 +580,11 @@ mod tests {
                 "qq_get_sticker_image",
                 "qq_send_sticker",
                 "qq_collect_sticker",
+                "qq_send_voice",
+                "qq_list_voices",
                 "qq_get_self_image",
                 "qq_sticker_note",
+                "qq_set_sticker_remark",
                 "qq_get_forward_msg",
                 "memory_write",
                 "memory_search",
