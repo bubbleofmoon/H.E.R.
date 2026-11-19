@@ -619,7 +619,7 @@ pub(super) fn windows_create_credential(path: &Path, settings: bool) -> std::io:
         };
         // SAFETY: path is NUL-terminated, attrs and its descriptor live through the call.
         let handle = unsafe {
-            CreateFileW(wide.as_ptr(), GENERIC_WRITE, FILE_SHARE_READ, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
+            CreateFileW(wide.as_ptr(), GENERIC_WRITE, 0, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut()) // RED-P2B
         };
         if handle == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
