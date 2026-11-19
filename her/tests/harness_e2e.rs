@@ -164,7 +164,10 @@ fn engine_switch_drains_an_active_turn_and_serializes_same_conversation_requests
 
 #[test]
 fn engine_switch_console_quota_preserves_the_source_generation() {
-    let model = FakeModel::script(vec![ModelReply::Error { status: 429, message: "quota exhausted".into() }]);
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 429, message: "quota exhausted".into() },
+        ModelReply::Error { status: 429, message: "quota exhausted".into() },
+    ]);
     let rig = switching_rig("engine-switch-quota", &model);
     says(&rig, GROUP_KEY, 1001, "tester", "a source turn");
     rig.wait_texts(GROUP_KEY, 2);
@@ -173,7 +176,7 @@ fn engine_switch_console_quota_preserves_the_source_generation() {
     let token = rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"].clone();
     let (status, body) = rig.console("POST", SWITCH_PATH, Some(&json!({"conversation":GROUP_KEY,"engine":"harness"})));
     assert_eq!(status, 503, "quota must refuse cutover");
-    assert!(body["error"].as_str().unwrap().contains("quota"), "{body}");
+    assert_eq!(body["error"], "conversation handover summary failed (quota)", "{body}");
     assert_eq!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], token);
     assert!(rig.dsh.calls("workspace/archiveSession").is_empty());
     assert_eq!(rig.texts_to(GROUP_KEY), [ACK, "synthetic reply"]);
@@ -184,7 +187,7 @@ fn engine_switch_console_quota_preserves_the_source_generation() {
     says(&rig, GROUP_KEY, 1001, "tester", "answer me after the quota refusal");
     assert_eq!(rig.wait_texts(GROUP_KEY, 4)[3], "synthetic reply", "the next inbound must get a source reply");
     assert_eq!(rig.wait_prompts(2)[1].session, sid);
-    assert_eq!(lock(&model.requests).len(), 1, "the failed switch must not cause another summary request");
+    assert_eq!(lock(&model.requests).len(), 2, "only the initial summary request and its retry must reach the model");
 }
 
 #[cfg(feature = "parity-clock")]
@@ -212,6 +215,7 @@ fn retry_file() -> String {
 fn engine_switch_quota_preserves_the_source_generation() {
     let model = FakeModel::script(vec![
         ModelReply::Error { status: 429, message: "private provider detail".into() },
+        ModelReply::Error { status: 429, message: "private provider detail".into() },
         ModelReply::Text("Group handover.".into()),
         ModelReply::Text("destination answer".into()),
     ]);
@@ -231,7 +235,7 @@ fn engine_switch_quota_preserves_the_source_generation() {
     assert!(!rig.data_json(&retry_file()).is_null(), "another conversation must leave the switch backoff in place");
     says(&rig, GROUP_KEY, 1001, "tester", "follow up while the switch is cooling down");
     assert!(wait_for(LONG, || rig.texts_to(GROUP_KEY).len() >= 6));
-    assert_eq!(lock(&model.requests).len(), 1, "the follow-up must not request a second summary inside the backoff");
+    assert_eq!(lock(&model.requests).len(), 2, "the follow-up must not start a new summary inside the backoff");
     assert_eq!(rig.texts_to(GROUP_KEY)[5], "synthetic reply");
     assert!(rig.dsh.prompts().iter().filter(|prompt| prompt.session == sid).count() == 3);
     assert_eq!(rig.data_json("social-v2.json")["conversations"][GROUP_KEY]["agentToken"], token);
@@ -241,11 +245,11 @@ fn engine_switch_quota_preserves_the_source_generation() {
     })), "the failed summary must offer a content-free owner notice");
 
     advance_switch_clock(&advance, 5_000);
-    assert!(!wait_for(Duration::from_millis(750), || lock(&model.requests).len() > 1),
+    assert!(!wait_for(Duration::from_millis(750), || lock(&model.requests).len() > 2),
         "clearing the cooldown must leave the next switch attempt to a new inbound");
     says(&rig, GROUP_KEY, 1001, "tester", "a new inbound after the backoff");
     assert_eq!(rig.wait_texts(GROUP_KEY, 8)[7], "destination answer");
-    assert_eq!(lock(&model.requests).len(), 3);
+    assert_eq!(lock(&model.requests).len(), 4);
 }
 
 #[cfg(feature = "parity-clock")]
