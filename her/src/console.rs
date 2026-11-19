@@ -6778,7 +6778,7 @@ fn handle_social_config_post(
     let new_section = file_section.is_none();
     let current = file_section
         .cloned()
-        .unwrap_or_else(|| effective_before.clone()); // RED: merge timing defaults into the save
+        .unwrap_or_else(|| effective_social_v2(None));
     let normalization_base = if new_section { &effective_before } else { &current };
     normalize_social_timing_post(&mut body_v, normalization_base);
     let mut merged = current.as_object().cloned().unwrap_or_default();
