@@ -6999,7 +6999,6 @@ fn handle_social_config_post(
         crate::settings::keep_registry_values(&current, &mut file)
             .map_err(|key| (400, format!("socialV2 cannot hold {key}: a member on its path is not an object")))?;
     }
-    file["socialV2"]["send"] = social_with_timing(file["socialV2"].clone())["send"].clone(); // RED: save effective send defaults
     write_json_atomic_for(context, CONFIG_PATH, &file).map_err(|e| (500, e))?;
     // The default wake refresh below takes the same gate itself.
     drop(gate);
