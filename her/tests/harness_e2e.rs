@@ -4212,7 +4212,11 @@ fn reserved2_fixture(name: &str, model: &FakeModel, engine: &str) -> Rig {
 fn reserved2_fixture_with_config(name: &str, model: &FakeModel, mut config: Value) -> Rig {
     config["harness"] = json!({"model":"fake-chat","summaries":false});
     config["socialV2"] = json!({
-        "wake": {"batchWindowMs":1000,"maxWakeConfigReminders":1,"preSleepWaitEnabled":false},
+        // This replaces the rig's wake settings. Keep its quota for back-to-back turns.
+        "wake": {
+            "batchWindowMs":1000, "maxWakePerMinute":30, "maxWakePerHour":100,
+            "maxWakeConfigReminders":1, "preSleepWaitEnabled":false
+        },
         "reply": {"quietMedianMs":1,"quietMinMs":1,"quietMaxMs":1},
         "send": {"firstGapEnabled":false,"repeatLimit":0}
     });
