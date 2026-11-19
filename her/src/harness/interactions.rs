@@ -139,7 +139,7 @@ enum PendingState {
 
 impl Pending {
     fn is_open(&self) -> bool {
-        !matches!(self.state, PendingState::Accepted(_)) // RED-M4
+        matches!(self.state, PendingState::Open)
     }
 }
 
@@ -475,18 +475,6 @@ async fn wait_for_reply(
     // Wakeups only decide when to settle. Taking the slot orders settlement
     // against answer(), regardless of which wakeup arrived first.
     match lease.take().map(|pending| pending.state) {
-        // RED-M1
-        Some(PendingState::Accepted(_)) if matches!(&interruption, Some(Failure::Failed(_))) => {
-            Err(Failure::Failed(TIMED_OUT.into()))
-        }
-        // RED-M2
-        Some(PendingState::Accepted(_)) if expires.is_none() && matches!(&interruption, Some(Failure::Cancelled)) => {
-            Err(Failure::Cancelled)
-        }
-        // RED-M3
-        Some(PendingState::Accepted(_)) if expires.is_some() && matches!(&interruption, Some(Failure::Cancelled)) => {
-            Err(Failure::Cancelled)
-        }
         Some(PendingState::Accepted(reply)) => Ok(reply),
         _ => Err(interruption.unwrap_or(Failure::Cancelled)),
     }
