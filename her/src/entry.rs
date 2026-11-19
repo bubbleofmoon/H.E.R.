@@ -66,6 +66,7 @@ mod forward_fmt;
 mod preset_prompt;
 mod runtime;
 mod guarded_file;
+mod guarded_credentials;
 mod scheduled_task;
 mod release;
 mod release_signature;

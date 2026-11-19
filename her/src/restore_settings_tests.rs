@@ -1,6 +1,6 @@
-// #148: backup and restore of the settings store (`data/settings.db`). Included in `restore::tests`, so the fixture,
+// Backup and restore of the settings store (`data/settings.db`). Included in `restore::tests`, so the fixture,
 // `FakeControl`, `memory` and `mutate` above are in scope. Every test name starts with `restore_settings_`, so one
-// libtest filter runs them all.
+// libtest filter runs the original restore cases. Credential-specific cases use the ticket219 filters.
 
 const QUIET: &str = "/socialV2/reply/wakeQuietMs";
 
@@ -697,4 +697,144 @@ fn restore_settings_store_gate_is_released_before_conversation_reconciliation() 
         Some(Ok(())),
         "a settings write after the replacement and before reconciliation is accepted"
     );
+}
+
+#[test]
+fn ticket219_private_credentials_use_owner_only_files() {
+    let f = Fixture::new();
+    set_quiet(&f, 4100);
+    let archive = f.backup();
+    let restored = f.0.join("data/settings.db");
+    assert!(credential_file_is_private(&restored, true), "settings.db has an unexpected ACL or mode");
+    assert!(credential_file_is_private(&archive, false), "published backup is not owner-only");
+    let plan = preview(&f.context(), &archive, false).unwrap();
+    execute_with(
+        &f.context(), &archive, false, plan["confirmation"].as_str().unwrap(), "fixture-admin", &mut FakeControl::default(),
+    ).unwrap();
+    assert!(credential_file_is_private(&restored, true), "restored settings.db has an unexpected ACL or mode");
+}
+
+#[cfg(unix)]
+fn credential_file_is_private(path: &Path, _settings: bool) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777 == 0o600
+}
+
+#[cfg(windows)]
+fn credential_file_is_private(path: &Path, settings: bool) -> bool {
+    crate::supervisor_dependencies::credential_file_is_private(path, settings)
+}
+
+#[cfg(windows)]
+#[test]
+fn ticket219_private_settings_acl_leaves_the_data_directory_unchanged() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetAce, GetLengthSid, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE, ACL,
+        DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+    type Grant = (u8, u8, u32, Vec<u8>);
+
+    fn dacl(path: &Path) -> (bool, Vec<Grant>) {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: terminated path and writable outputs. The descriptor owns the ACL until LocalFree.
+        let result = unsafe {
+            assert_eq!(GetNamedSecurityInfoW(
+                wide.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(), std::ptr::null_mut(), &mut acl, std::ptr::null_mut(), &mut descriptor,
+            ), 0);
+            assert_ne!(GetSecurityDescriptorControl(descriptor, &mut control, &mut revision), 0);
+            assert!(!acl.is_null());
+            let mut entries = Vec::new();
+            for index in 0..u32::from((*acl).AceCount) {
+                let mut ace = std::ptr::null_mut();
+                assert_ne!(GetAce(acl, index, &mut ace), 0);
+                // The fixture ACLs contain ordinary allow/deny ACEs with a mask followed by a SID.
+                let entry = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                assert!(matches!(entry.Header.AceType, 0 | 1));
+                let sid = std::ptr::addr_of!(entry.SidStart).cast::<u8>();
+                let len = GetLengthSid(sid.cast_mut().cast()) as usize;
+                entries.push((entry.Header.AceType, entry.Header.AceFlags, entry.Mask,
+                    std::slice::from_raw_parts(sid, len).to_vec()));
+            }
+            let protected = control & SE_DACL_PROTECTED != 0;
+            LocalFree(descriptor);
+            (protected, entries)
+        };
+        result
+    }
+
+    let f = Fixture::new();
+    let data = f.0.join("data");
+    let sibling = data.join("acl-sibling.json");
+    fs::write(&sibling, b"{}").unwrap();
+    let before = (dacl(&data), dacl(&sibling));
+    set_quiet(&f, 4100);
+    assert_eq!((dacl(&data), dacl(&sibling)), before, "settings changed the runtime data ACL");
+    let (protected, mut entries) = dacl(&data.join("settings.db"));
+    entries.sort_unstable();
+    let mut sids = vec![
+        crate::process_identity::current_user().unwrap(),
+        vec![1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0], // SYSTEM
+        vec![1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0], // Administrators
+    ];
+    sids.sort_unstable();
+    sids.dedup();
+    let expected: Vec<Grant> = sids.into_iter().map(|sid| (0, 0, FILE_ALL_ACCESS, sid)).collect();
+    assert!(protected && entries == expected, "settings lost documented Windows grants");
+}
+
+#[test]
+fn ticket219_core_pre_credential_restore_preview_warns_about_both_keys() {
+    let f = Fixture::new();
+    let without_settings = f.backup();
+    set_quiet(&f, 4100);
+    let ordinary_settings = f.backup();
+    let context = f.context();
+    for (setting, key) in [
+        (crate::settings::WEB_SEARCH_API_KEY, "fixture-search-preview-key"),
+        (crate::settings::CLI_MODEL_API_KEY, "fixture-cli-preview-key"),
+    ] {
+        crate::settings::apply(&context, setting.key, &json!(key), "fixture-admin", "console").unwrap();
+    }
+    let with_credentials = f.backup();
+    for archive in [&without_settings, &ordinary_settings] {
+        let full = preview(&context, archive, false).unwrap();
+        let warning = full["warnings"][0].as_str().unwrap_or_default();
+        assert!(
+            warning.contains("清除") && warning.contains("webSearch.apiKey") && warning.contains("cliModel.apiKey"),
+            "full restore preview omitted the credential-clearing warning"
+        );
+        assert_eq!(preview(&context, archive, true).unwrap()["warnings"], json!([]));
+    }
+    assert_eq!(preview(&context, &with_credentials, false).unwrap()["warnings"], json!([]));
+}
+
+#[test]
+fn ticket219_core_full_restore_recovers_the_credential_and_memory_only_keeps_it() {
+    use crate::settings::{CLI_MODEL_API_KEY, secret_value};
+    let f = Fixture::new();
+    let context = f.context();
+    let store = |key: &str| {
+        crate::settings::apply(&context, CLI_MODEL_API_KEY.key, &json!(key), "fixture-admin", "console").unwrap();
+    };
+    store("fixture-archived-credential");
+    let archive = f.backup();
+    store("fixture-current-credential");
+    let endpoint = context.dependency_url("model").unwrap();
+    for (memory_only, expected) in [(true, "fixture-current-credential"), (false, "fixture-archived-credential")] {
+        let plan = preview(&context, &archive, memory_only).unwrap();
+        execute_with(
+            &context, &archive, memory_only, plan["confirmation"].as_str().unwrap(), "fixture-admin", &mut FakeControl::default(),
+        ).unwrap();
+        assert_eq!(secret_value(&context, &CLI_MODEL_API_KEY, endpoint).unwrap().as_deref(), Some(expected), "restore selected the wrong credential");
+    }
 }

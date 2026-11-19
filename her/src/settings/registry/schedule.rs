@@ -17,6 +17,7 @@ pub(crate) const DIGEST_TIME: Setting = Setting {
     label: "Daily memory digest time",
     hint: "Local time in HH:MM. Keep at least 30 minutes between the daily digest and backup.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const DIGEST_CHECK_MINUTE: Setting = Setting {
@@ -28,6 +29,7 @@ pub(crate) const DIGEST_CHECK_MINUTE: Setting = Setting {
     label: "Digest check minute",
     hint: "The minute within each half hour. The check cannot share the starting minute of a daily heavy job.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const BACKUP_TIME: Setting = Setting {
@@ -39,6 +41,7 @@ pub(crate) const BACKUP_TIME: Setting = Setting {
     label: "Daily backup time",
     hint: "Local time in HH:MM. Keep at least 30 minutes between the backup and daily digest.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const TIME_ZONE: Setting = Setting {
@@ -50,6 +53,7 @@ pub(crate) const TIME_ZONE: Setting = Setting {
     label: "Time zone",
     hint: "Use host to follow the machine, or enter an IANA name such as Asia/Shanghai.",
     chat: false,
+    secret: false,
 };
 
 pub(super) const SETTINGS: &[Setting] = &[DIGEST_TIME, DIGEST_CHECK_MINUTE, BACKUP_TIME, TIME_ZONE];

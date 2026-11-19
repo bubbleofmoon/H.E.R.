@@ -12,6 +12,7 @@ pub(crate) const RELATED_TOP_K: Setting = Setting {
     label: "Recalled memories per wake",
     hint: "Maximum related memories offered to a wake.",
     chat: true,
+    secret: false,
 };
 
 pub(crate) const AUTO_FLUSH_ENABLED: Setting = Setting {
@@ -23,6 +24,7 @@ pub(crate) const AUTO_FLUSH_ENABLED: Setting = Setting {
     label: "Scheduled digest",
     hint: "Enables the daily digest and the backlog check.",
     chat: true,
+    secret: false,
 };
 
 pub(crate) const AUTO_FLUSH_CONTEXT_PCT: Setting = Setting {
@@ -34,6 +36,7 @@ pub(crate) const AUTO_FLUSH_CONTEXT_PCT: Setting = Setting {
     label: "Digest check threshold",
     hint: "Percent of the recent-message limit needed by the backlog check.",
     chat: true,
+    secret: false,
 };
 
 pub(crate) const AUTO_FLUSH_MAX_SESSIONS: Setting = Setting {
@@ -45,6 +48,7 @@ pub(crate) const AUTO_FLUSH_MAX_SESSIONS: Setting = Setting {
     label: "Conversations digested per run",
     hint: "Maximum number of conversations written by one run. Zero disables writes.",
     chat: true,
+    secret: false,
 };
 
 pub(crate) const AUTO_FLUSH_MIN_INTERVAL: Setting = Setting {
@@ -56,6 +60,7 @@ pub(crate) const AUTO_FLUSH_MIN_INTERVAL: Setting = Setting {
     label: "Minutes between digests",
     hint: "Minimum time between attempts for the same conversation.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const DIGEST_MAX_INPUT_CHARS: Setting = Setting {
@@ -67,6 +72,7 @@ pub(crate) const DIGEST_MAX_INPUT_CHARS: Setting = Setting {
     label: "Digest input characters",
     hint: "Maximum characters included in a digest request.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const LAYER_IDENTITY: Setting = Setting {
@@ -78,6 +84,7 @@ pub(crate) const LAYER_IDENTITY: Setting = Setting {
     label: "Identity layer budget",
     hint: "Estimated tokens for the Identity layer.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const LAYER_RELATIONSHIP: Setting = Setting {
@@ -89,6 +96,7 @@ pub(crate) const LAYER_RELATIONSHIP: Setting = Setting {
     label: "Relationship layer budget",
     hint: "Estimated tokens for the Relationship layer.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const LAYER_CONVERSATION: Setting = Setting {
@@ -100,6 +108,7 @@ pub(crate) const LAYER_CONVERSATION: Setting = Setting {
     label: "Conversation layer budget",
     hint: "Estimated tokens for the Conversation layer.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const LAYER_MATERIAL: Setting = Setting {
@@ -111,6 +120,7 @@ pub(crate) const LAYER_MATERIAL: Setting = Setting {
     label: "Material layer budget",
     hint: "Estimated tokens for the Material layer.",
     chat: false,
+    secret: false,
 };
 
 pub(crate) const MATERIAL_ITEMS: Setting = Setting {
@@ -122,6 +132,7 @@ pub(crate) const MATERIAL_ITEMS: Setting = Setting {
     label: "Material layer items",
     hint: "Reset to follow the configured recall depth, with five items when it is unset.",
     chat: false,
+    secret: false,
 };
 
 /// A configured integer recall depth is the inherited item limit; use five when no valid depth was set.

@@ -5,6 +5,7 @@
 use super::*;
 use crate::settings::{AuditRow, StoreProbe};
 
+mod secrets { include!("secrets.rs"); }
 mod store { include!("store.rs"); }
 mod registry { include!("registry.rs"); }
 mod history { include!("history.rs"); }
@@ -22,7 +23,7 @@ mod batch_zone { include!("batch_zone.rs"); }
 const QUIET_KEY: &str = "reply.wakeQuietMs";
 
 /// The settings module's product sources, for the source tests: the module root, the store, the kinds and the registry.
-const SETTINGS_SOURCES: [(&str, &str); 23] = [
+const SETTINGS_SOURCES: [(&str, &str); 25] = [
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
     ("settings/store/conversation.rs", include_str!("../store/conversation.rs")),
@@ -35,6 +36,7 @@ const SETTINGS_SOURCES: [(&str, &str); 23] = [
     ("settings/kinds/owner_id.rs", include_str!("../kinds/owner_id.rs")),
     ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/route_list.rs", include_str!("../kinds/route_list.rs")),
+    ("settings/kinds/secret.rs", include_str!("../kinds/secret.rs")),
     ("settings/kinds/switch.rs", include_str!("../kinds/switch.rs")),
     ("settings/kinds/text.rs", include_str!("../kinds/text.rs")),
     ("settings/kinds/time_zone.rs", include_str!("../kinds/time_zone.rs")),
@@ -46,6 +48,7 @@ const SETTINGS_SOURCES: [(&str, &str); 23] = [
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
     ("settings/registry/schedule.rs", include_str!("../registry/schedule.rs")),
+    ("settings/registry/secrets.rs", include_str!("../registry/secrets.rs")),
 ];
 
 fn settings_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {

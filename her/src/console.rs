@@ -294,7 +294,7 @@ thread_local! {
     static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). A registry setting's
+/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). An ordinary setting's
 /// member is never changed here (#177, `settings::keep_file_members`): one the document lacks or holds as `null` is put
 /// back from the stored file, and any other change of one is refused with nothing written, because console pages change
 /// registry settings through the store (`settings::console_changes`). Stored settings are then put back at their
@@ -2934,7 +2934,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     }
                 }
                 let mut writable: Vec<String> = SETTINGS_WRITABLE.iter().map(|p| p.to_string()).collect();
-                for setting in crate::settings::registry().filter(|setting| setting.chat && context.is_isolated()) {
+                for setting in crate::settings::chat_registry().filter(|_| context.is_isolated()) {
                     let name = setting.chat_name();
                     all.insert(name.clone(), redact_setting(&name, setting.read(cfg)));
                     writable.push(name);
@@ -2945,6 +2945,9 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
                     "writable": writable,
                     "readonly": SETTINGS_READONLY_HINT,
                 }));
+            }
+            if setting_is_secret(&path) {
+                return Err((403, SETTINGS_READ_REFUSED.to_string()));
             }
             if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
                 let value = redact_setting(&path, setting.read(cfg));
@@ -2967,7 +2970,7 @@ pub(crate) fn settings_action(action: &str, b: &Value, cfg: &Value, context: &Ru
         }
         // settings-set
         let path = b.get("settingKey").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated()) {
+        if let Some(setting) = crate::settings::chat_setting(&path).filter(|_| context.is_isolated() && !setting_is_secret(&path)) {
             let value = b.get("value").cloned().unwrap_or(Value::Null);
             // A refused value answers under the chat's name; the store's own errors stay out of the chat.
             let applied = crate::settings::apply(context, setting.key, &value, "owner", "chat").map_err(|(status, _)| {
@@ -16705,6 +16708,32 @@ mod tests {
         std::fs::create_dir(root.0.join("resources/roles")).unwrap();
         let context = RuntimeContext::from_root(&root.0).expect("fixture runtime must validate");
         (root, context)
+    }
+
+    #[test]
+    fn ticket219_core_console_guards_credential_paths() {
+        let action = include_str!("console.rs").split_once("pub(crate) fn settings_action(").unwrap().1.split_once("/// `/api/tokens/by-provider`").unwrap().0;
+        assert!(action.contains("if setting_is_secret(&path) {") && action.contains("context.is_isolated() && !setting_is_secret(&path)"), "console credential path guard is missing");
+    }
+
+    #[test]
+    fn ticket219_core_console_can_replace_or_remove_the_legacy_search_literal() {
+        let (root, context) = fixture_runtime("legacy search literal", "fixture-console-config");
+        let path = root.0.join("config/config.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["webSearch"] = json!({"apiKey":"fixture-legacy-original"});
+        std::fs::write(&path, config.to_string()).unwrap();
+        for expected in [Some("fixture-legacy-replacement"), None] {
+            match expected {
+                Some(value) => config["webSearch"]["apiKey"] = json!(value),
+                None => { config["webSearch"].as_object_mut().unwrap().remove("apiKey"); }
+            }
+            let written = write_selected_config_text(&context, &config.to_string());
+            let _ = take_config_writes();
+            assert!(written.is_ok(), "console rejected a change to the legacy search literal");
+            let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(raw.pointer("/webSearch/apiKey").and_then(Value::as_str), expected, "console restored the legacy search literal");
+        }
     }
 
     #[test]

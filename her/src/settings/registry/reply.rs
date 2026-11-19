@@ -13,6 +13,7 @@ const WAKE_QUIET: Setting = Setting {
     label: "Quiet time before a message wake",
     hint: "Milliseconds without a new message before a message wake starts; each new message restarts the wait.",
     chat: true,
+    secret: false,
 };
 
 /// The group's settings, in registry order.

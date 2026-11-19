@@ -885,7 +885,12 @@ impl RuntimeContext {
         let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         // Every early return below drops `staged`, which removes the temporary file.
-        let staged = crate::guarded_file::stage(&target, input, None).map_err(|failure| failure.to_string())?;
+        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db")) {
+            crate::guarded_credentials::stage_settings_file(&target, input)
+        } else {
+            crate::guarded_file::stage(&target, input, None)
+        }
+        .map_err(|failure| failure.to_string())?;
         let checked_target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
         let checked_temp = fs::symlink_metadata(staged.temp()).map_err(|e| runtime_io_error("temp/metadata", &e))?;
         if checked_target != target || is_link(&checked_temp) || !checked_temp.is_file() {

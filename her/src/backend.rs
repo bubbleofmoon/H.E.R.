@@ -194,23 +194,8 @@ impl Backend for CliBackend {
             .stdin(std::process::Stdio::piped())
             .stdout(out_file)
             .stderr(err_file);
-        // 三个 CLI 认的变量名各不相同，但**用的是同一把 key**。
-        // key 从 DSH 的凭据文件读（~/.dsh/.credentials.yaml 的 OPENCODE_GO_API_KEY），
-        // 绝不写进 config.json、绝不进日志 —— 全机器只有一份，轮换时只改一处。
-        for key in [
-            "DSH_HOME", "DSH_CREDENTIALS", "USERPROFILE", "HOME", "OPENCODE_GO_API_KEY",
-            "OPENCODE_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-            "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
-        ] {
-            if self.context.is_isolated() {
-                cmd.env_remove(key);
-            }
-        }
         if self.context.is_isolated() {
             configure_isolated_cli_environment(&mut cmd, &self.context)?;
-        }
-        for (k, v) in credential_env_for_runtime(&self.context) {
-            cmd.env(k, v);
         }
         // 会话身份：CLI 后端（尤其 opencode）把自己的 MCP 工具接过去之后，
         // 模型并不知道当前会话的 key 和令牌 —— 不注入就只能靠模型瞎猜，
@@ -234,14 +219,7 @@ impl Backend for CliBackend {
             }
             cmd.env(k, v);
         }
-        if self.context.is_isolated() {
-            let model_url = self
-                .context
-                .dependency_url("model")
-                .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
-            cmd.env("ANTHROPIC_BASE_URL", model_url)
-                .env("OPENAI_BASE_URL", format!("{}/v1", model_url.trim_end_matches('/')));
-        }
+        let credentials = configure_cli_model(&mut cmd, &self.context)?;
         let status = if self.context.is_isolated() {
             run_isolated_cli(cmd, &req.prompt, req.timeout_s, &self.cmd)?
         } else {
@@ -249,7 +227,17 @@ impl Backend for CliBackend {
         };
         // 进程已退出，从临时文件读结果
         let (stdout_text, stderr_text) = output_files.read_texts()?;
-        let text = decode_cli_exit(&stdout_text, &stderr_text, is_agy(&self.id, &self.cmd), &self.id, status.code())?;
+        let clean = |text: &str| {
+            if credentials.is_empty() {
+                text.to_string()
+            } else {
+                crate::activity::mask_log_text(text, &credentials)
+            }
+        };
+        let text = decode_cli_exit(
+            &clean(&stdout_text), &clean(&stderr_text), is_agy(&self.id, &self.cmd), &self.id, status.code(),
+        )?;
+        let text = clean(&text);
         Ok(BackendReply {
             text,
             backend: self.id.clone(),
@@ -1298,10 +1286,7 @@ impl CliOutputFiles {
             if checked != path {
                 return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
             }
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
+            crate::guarded_credentials::create_credential(path)
                 .map(Stdio::from)
                 .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
         } else {
@@ -1486,23 +1471,23 @@ fn configure_isolated_cli_environment(
     context: &RuntimeContext,
 ) -> Result<(), BackendError> {
     command.env_clear();
-    let dsh_home = context
-        .resolve_path(RuntimeArea::DshUser, "", PathIntent::CreateDirectory)
+    let profile = context
+        .resolve_path(RuntimeArea::Data, "cli-profile", PathIntent::CreateDirectory)
         .map_err(|error| BackendError::Failed(error.into()))?;
     let appdata = context
-        .resolve_path(RuntimeArea::DshUser, "AppData/Roaming", PathIntent::CreateDirectory)
+        .resolve_path(RuntimeArea::Data, "cli-profile/AppData/Roaming", PathIntent::CreateDirectory)
         .map_err(|error| BackendError::Failed(error.into()))?;
     let local_appdata = context
-        .resolve_path(RuntimeArea::DshUser, "AppData/Local", PathIntent::CreateDirectory)
+        .resolve_path(RuntimeArea::Data, "cli-profile/AppData/Local", PathIntent::CreateDirectory)
         .map_err(|error| BackendError::Failed(error.into()))?;
     let xdg_config = context
-        .resolve_path(RuntimeArea::DshUser, ".config", PathIntent::CreateDirectory)
+        .resolve_path(RuntimeArea::Data, "cli-profile/.config", PathIntent::CreateDirectory)
         .map_err(|error| BackendError::Failed(error.into()))?;
     let xdg_cache = context
-        .resolve_path(RuntimeArea::DshUser, ".cache", PathIntent::CreateDirectory)
+        .resolve_path(RuntimeArea::Data, "cli-profile/.cache", PathIntent::CreateDirectory)
         .map_err(|error| BackendError::Failed(error.into()))?;
     let xdg_data = context
-        .resolve_path(RuntimeArea::DshUser, ".local/share", PathIntent::CreateDirectory)
+        .resolve_path(RuntimeArea::Data, "cli-profile/.local/share", PathIntent::CreateDirectory)
         .map_err(|error| BackendError::Failed(error.into()))?;
     let temp = context
         .resolve_path(RuntimeArea::Data, "tmp", PathIntent::CreateDirectory)
@@ -1520,10 +1505,8 @@ fn configure_isolated_cli_environment(
     }
     let ordinary = |path: &PathBuf| crate::subprocess::external_path(path).map_err(BackendError::Config);
     command
-        .env("HOME", ordinary(&dsh_home)?)
-        .env("USERPROFILE", ordinary(&dsh_home)?)
-        .env("DSH_HOME", ordinary(&dsh_home)?)
-        .env("DSH_CREDENTIALS", ordinary(&dsh_home.join(".credentials.yaml"))?)
+        .env("HOME", ordinary(&profile)?)
+        .env("USERPROFILE", ordinary(&profile)?)
         .env("APPDATA", ordinary(&appdata)?)
         .env("LOCALAPPDATA", ordinary(&local_appdata)?)
         .env("XDG_CONFIG_HOME", ordinary(&xdg_config)?)
@@ -1538,66 +1521,73 @@ fn configure_isolated_cli_environment(
     Ok(())
 }
 
-/// 从 DSH 的凭据文件里取 opencode-go 的 key，展开成各 CLI 认的变量名。
-///
-/// 为什么不让每个后端在配置里写 key：那样 key 会出现在 config.json 里 —— 会被提交、
-/// 可能被日志打印、轮换时要改好几处。这里只保留**一处真相**：
-/// `~/.dsh/.credentials.yaml` 里的 `OPENCODE_GO_API_KEY`。
-///
-/// 读不到就返回空表，**不报错**：没配 key 的机器上，`--backends` 这类只读用法
-/// 不该因为缺 key 直接失败。
-pub fn credential_env() -> Vec<(String, String)> {
-    let path = match std::env::var("DSH_CREDENTIALS") {
-        Ok(path) => path,
-        // Without an explicit path or USERPROFILE there is no credential file to read.
-        Err(_) => match std::env::var_os("USERPROFILE") {
-            Some(home) => crate::install_root::legacy_dsh_home(home)
-                .join(".credentials.yaml")
-                .to_string_lossy()
-                .into_owned(),
-            None => return Vec::new(),
-        },
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    credential_env_from_text(&text)
+const CLI_MODEL_KEY_ALIASES: [&str; 5] = [
+    "OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+];
+const CLI_MODEL_KEY_MISSING: &str = "Set cliModel.apiKey in Settings before using the CLI model.";
+
+fn is_cli_model_key(name: &str) -> bool {
+    CLI_MODEL_KEY_ALIASES.iter().any(|alias| {
+        if cfg!(windows) { alias.eq_ignore_ascii_case(name) } else { *alias == name }
+    })
 }
 
-fn credential_env_from_text(text: &str) -> Vec<(String, String)> {
-    let Some(key) = text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("OPENCODE_GO_API_KEY:"))
-        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
-        .filter(|k| !k.is_empty())
-    else {
-        return Vec::new();
-    };
-    vec![
-        ("OPENCODE_GO_API_KEY".into(), key.clone()),
-        ("OPENCODE_API_KEY".into(), key.clone()),
-        ("ANTHROPIC_AUTH_TOKEN".into(), key.clone()),
-        ("ANTHROPIC_API_KEY".into(), key.clone()),
-        ("OPENAI_API_KEY".into(), key),
-        (
-            "ANTHROPIC_BASE_URL".into(),
-            "https://opencode.ai/inference/go".into(),
-        ),
-        (
-            "OPENAI_BASE_URL".into(),
-            "https://opencode.ai/inference/go/v1".into(),
-        ),
-    ]
+fn explicit_cli_model_key(name: &str, value: &str) -> bool {
+    is_cli_model_key(name) && !value.trim().is_empty()
 }
 
-pub fn credential_env_for_runtime(context: &RuntimeContext) -> Vec<(String, String)> {
-    if !context.is_isolated() {
-        return credential_env();
+fn configured_backends(cfg: &Value) -> &[Value] {
+    let section = &cfg["backends"];
+    section.as_array().or_else(|| section["list"].as_array()).map_or(&[], Vec::as_slice)
+}
+
+/// A presence-only health advisory for configured CLI candidates without a usable model key.
+pub(crate) fn cli_model_notice(context: &RuntimeContext, cfg: &Value) -> Option<&'static str> {
+    let needs_key = configured_backends(cfg).iter().any(|item| {
+        item["kind"].as_str().unwrap_or("cli") == "cli"
+            && !item["env"].as_object().is_some_and(|env| {
+                env.iter().any(|(name, value)| value.as_str().is_some_and(|value| explicit_cli_model_key(name, value)))
+            })
+    });
+    if !needs_key {
+        return None;
     }
-    let Ok(text) = context.read_text(RuntimeArea::DshUser, ".credentials.yaml") else {
-        return Vec::new();
+    let Some(model_url) = context.dependency_url("model") else {
+        return Some(CLI_MODEL_KEY_MISSING);
     };
-    credential_env_from_text(&text)
+    match crate::settings::secret_value(context, &crate::settings::CLI_MODEL_API_KEY, model_url) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(CLI_MODEL_KEY_MISSING),
+        Err(_) => Some("Settings could not read cliModel.apiKey."),
+    }
+}
+
+fn configure_cli_model(command: &mut Command, context: &RuntimeContext) -> Result<Vec<String>, BackendError> {
+    if !context.is_isolated() {
+        return Ok(Vec::new());
+    }
+    let model_url = context.dependency_url("model")
+        .ok_or_else(|| BackendError::Failed("runtime model dependency is unavailable".into()))?;
+    command.env("ANTHROPIC_BASE_URL", model_url)
+        .env("OPENAI_BASE_URL", format!("{}/v1", model_url.trim_end_matches('/')));
+    let key = crate::settings::secret_value(context, &crate::settings::CLI_MODEL_API_KEY, model_url)
+        .map_err(|_| BackendError::Config("Settings could not read cliModel.apiKey.".into()))?;
+    if let Some(key) = &key {
+        for name in CLI_MODEL_KEY_ALIASES {
+            command.env(name, key);
+        }
+        return Ok(vec![key.clone()]);
+    }
+    let mut explicit: Vec<_> = command.get_envs()
+        .filter_map(|(name, value)| Some((name.to_str()?, value?.to_str()?)))
+        .filter(|(name, value)| explicit_cli_model_key(name, value))
+        .map(|(_, value)| value.to_string())
+        .collect();
+    if explicit.is_empty() {
+        return Err(BackendError::Config(CLI_MODEL_KEY_MISSING.into()));
+    }
+    explicit.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
+    Ok(explicit)
 }
 
 /// 按 id 跑指定的 CLI 后端（会话级后端覆盖用）。
@@ -1749,16 +1739,7 @@ impl Registry {
         context: &RuntimeContext,
         cfg: &Value,
     ) -> Result<Self, BackendError> {
-        let section = cfg.get("backends");
-        let list: Vec<Value> = match section {
-            Some(Value::Array(a)) => a.clone(),
-            Some(Value::Object(o)) => o
-                .get("list")
-                .and_then(|l| l.as_array())
-                .cloned()
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        let list = configured_backends(cfg);
         if list.is_empty() {
             return Ok(Self {
                 chain: vec![Box::new(DshBackend { id: "dsh".into(), model: String::new() })],
@@ -1781,7 +1762,7 @@ impl Registry {
                     id,
                     model: item.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 })),
-                "cli" => chain.push(Box::new(CliBackend::from_config_with_runtime(context, &id, &item)?)),
+                "cli" => chain.push(Box::new(CliBackend::from_config_with_runtime(context, &id, item)?)),
                 other => {
                     return Err(BackendError::Config(format!(
                         "后端 {id} 的 kind={other} 不支持（只认 dsh / cli）"
@@ -1907,6 +1888,95 @@ pub fn cli_fallback_with_runtime_reporting(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ticket219_cli_upgrade_requires_a_stored_or_explicit_key() {
+        let (_root, context) = cli_credential_fixture();
+        let mut child = std::process::Command::new("fixture-cli");
+        super::configure_isolated_cli_environment(&mut child, &context).unwrap();
+        child.env("OPENAI_API_KEY", "  ");
+        let result = super::configure_cli_model(&mut child, &context);
+        assert!(
+            matches!(result, Err(super::BackendError::Config(ref text)) if text.contains("cliModel.apiKey") && text.contains("Settings")),
+            "selected CLI did not require a credential from Settings"
+        );
+        child.env("OPENAI_API_KEY", "fixture-explicit-key");
+        assert_eq!(super::configure_cli_model(&mut child, &context).unwrap(), ["fixture-explicit-key"]);
+    }
+
+    #[test]
+    fn ticket219_cli_aliases_use_the_selected_base_urls() {
+        use std::ffi::OsStr;
+        let (_root, context) = cli_credential_fixture();
+        for alias in super::CLI_MODEL_KEY_ALIASES {
+            let mut child = std::process::Command::new("fixture-cli");
+            child.env(alias, "fixture-explicit-key");
+            super::configure_cli_model(&mut child, &context).unwrap();
+            let env = child.get_envs().collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(env[OsStr::new(alias)], Some(OsStr::new("fixture-explicit-key")));
+            assert!(
+                env.get(OsStr::new("ANTHROPIC_BASE_URL")).copied().flatten() == Some(OsStr::new("http://127.0.0.1:1"))
+                    && env.get(OsStr::new("OPENAI_BASE_URL")).copied().flatten() == Some(OsStr::new("http://127.0.0.1:1/v1")),
+                "CLI aliases lost the selected relay base URLs"
+            );
+        }
+    }
+
+    struct CliCredentialFixture(std::path::PathBuf);
+    impl Drop for CliCredentialFixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn cli_credential_fixture() -> (CliCredentialFixture, crate::runtime::RuntimeContext) {
+        let fixture = CliCredentialFixture(crate::install_root::development_root(std::env::temp_dir().join(format!(
+            "her-cli-secret-{}", crate::turn_ledger::mint_id("")
+        ))));
+        for dir in ["config", "data", "resources", "user/dsh"] {
+            std::fs::create_dir_all(fixture.0.join(dir)).unwrap();
+        }
+        std::fs::write(fixture.0.join("config/config.json"), r#"{"consoleToken":"fixture-cli-token"}"#).unwrap();
+        std::fs::write(fixture.0.join("data/social-v2.json"), r#"{"conversations":{}}"#).unwrap();
+        std::fs::write(fixture.0.join("user/dsh/.credentials.yaml"), "OPENCODE_GO_API_KEY: fixture-dsh-legacy").unwrap();
+        std::fs::write(fixture.0.join("dependencies.json"), r#"{"model":"http://127.0.0.1:1","dsh":"http://127.0.0.1:2","onebot":"http://127.0.0.1:3"}"#).unwrap();
+        let context = crate::runtime::RuntimeContext::from_root(&fixture.0).unwrap();
+        (fixture, context)
+    }
+
+    #[test]
+    fn ticket219_cli_injects_only_the_selected_model_credential() {
+        let (fixture, context) = cli_credential_fixture();
+        let root = &fixture.0;
+        let dependencies = |model| {
+            let value = serde_json::json!({"model": model, "dsh": "http://127.0.0.1:2", "onebot": "http://127.0.0.1:3"});
+            std::fs::write(root.join("dependencies.json"), value.to_string()).unwrap();
+            crate::runtime::RuntimeContext::from_root(root).unwrap()
+        };
+        let inspect = |context: &crate::runtime::RuntimeContext, expected: Option<&str>| {
+            let mut child = std::process::Command::new("fixture-cli");
+            super::configure_isolated_cli_environment(&mut child, context).unwrap();
+            let key = super::configure_cli_model(&mut child, context).unwrap();
+            assert_eq!(key.first().map(String::as_str), expected, "CLI selected the wrong credential");
+            for name in ["OPENCODE_GO_API_KEY", "OPENCODE_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+                let actual = child.get_envs().find(|(key, _)| *key == std::ffi::OsStr::new(name)).and_then(|(_, value)| value);
+                assert_eq!(actual, expected.map(std::ffi::OsStr::new), "CLI credential environment is missing or stale");
+            }
+            for name in ["DSH_HOME", "DSH_CREDENTIALS"] {
+                assert!(!child.get_envs().any(|(key, _)| key == std::ffi::OsStr::new(name)));
+            }
+        };
+        let setting = crate::settings::CLI_MODEL_API_KEY;
+        for key in ["fixture-cli-original", "fixture-cli-rotation"] {
+            crate::settings::apply(&context, setting.key, &serde_json::json!(key), "fixture", "console").unwrap();
+            inspect(&context, Some(key));
+        }
+        let changed = dependencies("http://127.0.0.1:4");
+        let mut child = std::process::Command::new("fixture-cli");
+        let _ = super::configure_cli_model(&mut child, &changed);
+        assert!(
+            !child.get_envs().any(|(name, value)| value.is_some() && name.to_str().is_some_and(super::is_cli_model_key)),
+            "CLI accepted a credential after its endpoint changed"
+        );
+    }
+
     #[test]
     fn nonzero_cli_exit_keeps_sensitive_stdout_and_stderr_out_of_errors() {
         let mut command =
@@ -2114,23 +2184,27 @@ mod tests {
         .unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let selected_root = context.runtime_root().unwrap().to_path_buf();
-        let selected_dsh_root = context
-            .resolve_path(RuntimeArea::DshUser, "", PathIntent::CreateDirectory)
+        crate::settings::apply(
+            &context, crate::settings::CLI_MODEL_API_KEY.key, &serde_json::json!("fixture-selected-api-key"),
+            "administrator", "console",
+        ).unwrap();
+        let selected_profile = context
+            .resolve_path(RuntimeArea::Data, "cli-profile", PathIntent::CreateDirectory)
             .unwrap();
         let selected_roaming = context
-            .resolve_path(RuntimeArea::DshUser, "AppData/Roaming", PathIntent::CreateDirectory)
+            .resolve_path(RuntimeArea::Data, "cli-profile/AppData/Roaming", PathIntent::CreateDirectory)
             .unwrap();
         let selected_local = context
-            .resolve_path(RuntimeArea::DshUser, "AppData/Local", PathIntent::CreateDirectory)
+            .resolve_path(RuntimeArea::Data, "cli-profile/AppData/Local", PathIntent::CreateDirectory)
             .unwrap();
         let selected_xdg = context
-            .resolve_path(RuntimeArea::DshUser, ".config", PathIntent::CreateDirectory)
+            .resolve_path(RuntimeArea::Data, "cli-profile/.config", PathIntent::CreateDirectory)
             .unwrap();
         let selected_xdg_cache = context
-            .resolve_path(RuntimeArea::DshUser, ".cache", PathIntent::CreateDirectory)
+            .resolve_path(RuntimeArea::Data, "cli-profile/.cache", PathIntent::CreateDirectory)
             .unwrap();
         let selected_xdg_data = context
-            .resolve_path(RuntimeArea::DshUser, ".local/share", PathIntent::CreateDirectory)
+            .resolve_path(RuntimeArea::Data, "cli-profile/.local/share", PathIntent::CreateDirectory)
             .unwrap();
         let selected_temp = context
             .resolve_path(RuntimeArea::Data, "tmp", PathIntent::CreateDirectory)
@@ -2141,7 +2215,7 @@ mod tests {
         // The child must see ordinary spellings; the context above remains canonical.
         let ordinary = |path: PathBuf| PathBuf::from(crate::subprocess::external_path(path).unwrap());
         let selected_root = ordinary(selected_root);
-        let selected_dsh_root = ordinary(selected_dsh_root);
+        let selected_profile = ordinary(selected_profile);
         let selected_roaming = ordinary(selected_roaming);
         let selected_local = ordinary(selected_local);
         let selected_xdg = ordinary(selected_xdg);
@@ -2159,11 +2233,11 @@ mod tests {
                 "home={}\r\nprofile={}\r\nappdata={}\r\nlocalappdata={}\r\n",
                 "xdg={}\r\nxdg_cache={}\r\nxdg_data={}\r\ntemp={}\r\ntmp={}\r\n",
                 "inherited=\r\nexplicit=candidate-config-value\r\n",
-                "credential=candidate-config-api-key\r\ndshcredential=fixture-selected-api-key\r\n",
+                "credential=selected\r\ndshcredential=selected\r\n",
                 "model=http://127.0.0.1:43102/v1\r\nruntime_root={}\r\ncwd={}\r\n",
             ),
-            selected_dsh_root.display(),
-            selected_dsh_root.display(),
+            selected_profile.display(),
+            selected_profile.display(),
             selected_roaming.display(),
             selected_local.display(),
             selected_xdg.display(),
@@ -2189,10 +2263,10 @@ mod tests {
                 "set /p input=\r\n",
                 "if not \"%input%\"==\"fixture stdin marker\" exit /b 30\r\n",
                 "if \"%HER_RUNTIME_ROOT:~0,4%\"==\"\\\\?\\\" exit /b 49\r\n",
-                "if /I not \"%HOME%\"==\"%HER_RUNTIME_ROOT%\\user\\dsh\" exit /b 31\r\n",
+                "if /I not \"%HOME%\"==\"%HER_RUNTIME_ROOT%\\data\\cli-profile\" exit /b 31\r\n",
                 "if /I not \"%USERPROFILE%\"==\"%HOME%\" exit /b 32\r\n",
-                "if /I not \"%DSH_HOME%\"==\"%HOME%\" exit /b 33\r\n",
-                "if /I not \"%DSH_CREDENTIALS%\"==\"%HOME%\\.credentials.yaml\" exit /b 34\r\n",
+                "if defined DSH_HOME exit /b 33\r\n",
+                "if defined DSH_CREDENTIALS exit /b 34\r\n",
                 "if /I not \"%APPDATA%\"==\"%HOME%\\AppData\\Roaming\" exit /b 35\r\n",
                 "if /I not \"%LOCALAPPDATA%\"==\"%HOME%\\AppData\\Local\" exit /b 36\r\n",
                 "if /I not \"%XDG_CONFIG_HOME%\"==\"%HOME%\\.config\" exit /b 37\r\n",
@@ -2202,7 +2276,7 @@ mod tests {
                 "if /I not \"%TMP%\"==\"%TEMP%\" exit /b 48\r\n",
                 "if defined QQBOT_TICKET04_PARENT_ONLY exit /b 38\r\n",
                 "if not \"%QQBOT_TICKET04_EXPLICIT%\"==\"candidate-config-value\" exit /b 39\r\n",
-                "if not \"%OPENAI_API_KEY%\"==\"candidate-config-api-key\" exit /b 40\r\n",
+                "if not \"%OPENAI_API_KEY%\"==\"fixture-selected-api-key\" exit /b 40\r\n",
                 "if not \"%OPENCODE_GO_API_KEY%\"==\"fixture-selected-api-key\" exit /b 41\r\n",
                 "if not \"%OPENAI_BASE_URL%\"==\"http://127.0.0.1:43102/v1\" exit /b 42\r\n",
                 "if not \"%HER_RUNTIME_ROOT%\"==\"%QQBOT_TICKET04_EXPECTED_ROOT%\" exit /b 43\r\n",
@@ -2245,9 +2319,6 @@ mod tests {
             raw_probe.env_remove(key);
         }
         configure_isolated_cli_environment(&mut raw_probe, &context).unwrap();
-        for (key, value) in credential_env_for_runtime(&context) {
-            raw_probe.env(key, value);
-        }
         for (key, value) in session_env_for_runtime(&context, "group:123") {
             raw_probe.env(key, value);
         }
@@ -2260,10 +2331,7 @@ mod tests {
         for (key, value) in &backend.env {
             raw_probe.env(key, value);
         }
-        let model_url = context.dependency_url("model").unwrap();
-        raw_probe
-            .env("ANTHROPIC_BASE_URL", model_url)
-            .env("OPENAI_BASE_URL", format!("{}/v1", model_url.trim_end_matches('/')));
+        configure_cli_model(&mut raw_probe, &context).unwrap();
         let mut raw_child = raw_probe.spawn().expect("raw fake child starts");
         use std::io::{Read as _, Write as _};
         let mut raw_stdin = raw_child.stdin.take().unwrap();
@@ -2309,8 +2377,8 @@ mod tests {
             })
             .expect("the fake child exits successfully");
         assert!(reply.text.contains("stdin=fixture stdin marker"));
-        assert!(reply.text.contains(&format!("home={}", selected_dsh_root.display())));
-        assert!(reply.text.contains(&format!("profile={}", selected_dsh_root.display())));
+        assert!(reply.text.contains(&format!("home={}", selected_profile.display())));
+        assert!(reply.text.contains(&format!("profile={}", selected_profile.display())));
         assert!(reply.text.contains(&format!("appdata={}", selected_roaming.display())));
         assert!(reply.text.contains(&format!("localappdata={}", selected_local.display())));
         assert!(reply.text.contains(&format!("xdg={}", selected_xdg.display())));
@@ -2320,8 +2388,8 @@ mod tests {
         assert!(reply.text.contains(&format!("tmp={}", selected_temp.display())));
         assert!(reply.text.contains("inherited=\r\n") || reply.text.contains("inherited=\n"));
         assert!(reply.text.contains("explicit=candidate-config-value"));
-        assert!(reply.text.contains("credential=candidate-config-api-key"));
-        assert!(reply.text.contains("dshcredential=fixture-selected-api-key"));
+        assert!(reply.text.contains("credential=selected"));
+        assert!(reply.text.contains("dshcredential=selected"));
         assert!(reply.text.contains("model=http://127.0.0.1:43102/v1"));
         assert!(reply.text.contains(&format!("runtime_root={}", selected_root.display())));
         assert!(reply.text.contains(selected_resources_without_extended_prefix));
@@ -2515,6 +2583,7 @@ mod tests {
                 "--nocapture".into(),
             ],
             env: vec![
+                ("OPENAI_API_KEY".into(), "fixture-cli-process-key".into()),
                 (MODE_ENV.into(), "root".into()),
                 (
                     ROOT_PID_FILE_ENV.into(),
@@ -2747,6 +2816,7 @@ mod tests {
                 "--nocapture".into(),
             ],
             env: vec![
+                ("OPENAI_API_KEY".into(), "fixture-cli-process-key".into()),
                 (MODE_ENV.into(), "normal-exit".into()),
                 (ROOT_PID_FILE_ENV.into(), root_pid_file.to_string_lossy().into_owned()),
                 (CHILD_PID_FILE_ENV.into(), child_pid_file.to_string_lossy().into_owned()),
