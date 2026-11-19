@@ -14975,13 +14975,7 @@ mod tests {
         );
     }
 
-    struct FixtureRoot(std::path::PathBuf);
-
-    impl Drop for FixtureRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::runtime::tests::{runtime_fixture, FixtureRoot};
 
     fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
         fixture_runtime_with_dsh(label, token, "http://127.0.0.1:49101")
@@ -16719,10 +16713,6 @@ mod tests {
             "{label} {} {sequence} {stamp}",
             std::process::id()
         ));
-        let root = crate::install_root::development_root(root);
-        std::fs::create_dir_all(root.join("config")).unwrap();
-        std::fs::create_dir_all(root.join("data")).unwrap();
-        std::fs::create_dir_all(root.join("resources").join("roles")).unwrap();
         let config = json!({
             "consoleToken": token,
             "ownerQQ": 7001,
@@ -16734,24 +16724,15 @@ mod tests {
                 "reasoningEffort": "high"
             }
         });
-        std::fs::write(
-            root.join("config/config.json"),
-            serde_json::to_vec_pretty(&config).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(root.join("data/social-v2.json"), b"{}").unwrap();
-        std::fs::write(
-            root.join("dependencies.json"),
-            serde_json::to_vec(&json!({
-                "dsh": dsh_url,
-                "model": "http://127.0.0.1:49102",
-                "onebot": "http://127.0.0.1:49103"
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let context = RuntimeContext::from_root(&root).expect("fixture runtime must validate");
-        (FixtureRoot(root), context)
+        let dependencies = json!({
+            "dsh": dsh_url,
+            "model": "http://127.0.0.1:49102",
+            "onebot": "http://127.0.0.1:49103"
+        });
+        let root = runtime_fixture(root, &config, &dependencies);
+        std::fs::create_dir(root.0.join("resources/roles")).unwrap();
+        let context = RuntimeContext::from_root(&root.0).expect("fixture runtime must validate");
+        (root, context)
     }
 
     #[test]
