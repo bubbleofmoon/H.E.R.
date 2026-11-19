@@ -40,7 +40,7 @@ pub(super) fn redact_route_settings(context: &RuntimeContext, reply: &mut Value)
     };
     if let Some(settings) = reply.get_mut("settings").and_then(Value::as_array_mut) {
         if let Some(entry) = settings.iter_mut().find(|entry| entry["key"] == HARNESS_ROUTES.key) {
-            let _ = &entry["stored"]; // RED-R1C
+            redact(&mut entry["stored"]);
             if redact(&mut entry["value"]) {
                 entry["redacted"] = json!(true);
             }

@@ -18,7 +18,7 @@ impl SettingKind for RouteList {
     }
 
     fn refusal(&self, key: &str, value: &Value) -> String {
-        let _ = value; format!("{key} is not a valid route list") // RED-R1B
+        parse_list(value).err().unwrap_or_else(|| format!("{key} is not a valid route list"))
     }
 
     fn view(&self) -> Value {
@@ -30,7 +30,7 @@ impl SettingKind for RouteList {
     }
 
     fn file_holds(&self, found: &Value, stored: &Value) -> bool {
-        found == stored // RED-R1A
+        found == stored || self.normalize(found).as_ref() == Some(stored)
     }
 
     #[cfg(test)]
