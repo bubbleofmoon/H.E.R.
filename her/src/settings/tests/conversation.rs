@@ -835,16 +835,17 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     assert_eq!(status, 200, "{reply}");
     let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
     assert_eq!((body["firstRoute"].clone(), model_row(&body, OWNER_CHAT)["order"].clone()), (json!("b"), json!(["b", "a"])));
-    // A stored route the chain no longer has is listed and ignored.
+    // The setting was seeded on the first settings write. A hand edit cannot replace its chain.
     write_config(&root, |config| config["harness"]["routes"][1]["id"] = json!("b2"));
+    let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
+    assert_eq!(model_row(&body, "group:101")["order"], json!(["b", "a"]));
+    // When a settings write removes a conversation's selected route, the selection is still listed and ignored.
+    let routes = stored_config(&root)["harness"]["routes"].clone();
+    let (status, reply) = post(&context, "/api/settings/set", json!({"setting": "harness.routes", "value": routes}));
+    assert_eq!(status, 200, "{reply}");
     let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
     let row = model_row(&body, "group:101");
     assert_eq!((row["route"].clone(), row["inChain"].clone(), row["order"].clone()), (json!("b"), json!(false), json!(["a", "b2"])));
-    // An invalid chain is listed with its error and no routes; the conversations stay listed.
-    write_config(&root, |config| config["harness"]["routes"] = json!([{"id": "a"}]));
-    let (status, body) = admin_request(&context, "GET", "/api/settings/models", None);
-    assert_eq!((status, body["error"].clone(), body["routes"].clone()), (200, json!("harness route 1 is invalid (model)"), json!([])), "{body}");
-    assert_eq!(model_row(&body, "group:101")["order"], json!([]));
     // The page and the list are administrator-only and need a selected runtime.
     let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
     let (status, content_type, page) =

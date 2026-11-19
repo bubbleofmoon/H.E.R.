@@ -7,6 +7,7 @@ mod integer;
 mod model_id;
 mod owner_id;
 mod route_id;
+mod route_list;
 mod switch;
 mod text;
 
@@ -18,6 +19,7 @@ pub(crate) use integer::{FileRule, Integer};
 pub(crate) use model_id::ModelId;
 pub(crate) use owner_id::OwnerId;
 pub(crate) use route_id::RouteId;
+pub(crate) use route_list::RouteList;
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
 

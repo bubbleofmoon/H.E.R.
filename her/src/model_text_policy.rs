@@ -1,8 +1,8 @@
-//! The #142 denied-term policy for model-bound text (#243): the one term list and the one check (`denied_terms`) that
-//! every model-text check calls. Callers: text settings on save and load (`settings::kinds::text`), the model-view strip
-//! (`model_view::strip_model_text`), the history summary (`harness::handover::accept`), the DSH persona guard
-//! (`dsh_profile`), the upstream capture sweep (`upstream_capture::sweep`) and the rendered-surface guard
-//! (`console::tests::model_text_guard_tests`). No other code matches denied terms, so no caller can pick a weaker check.
+//! The #142 denied-term policy for model-bound text (#243). Text settings, history summaries, the DSH persona guard,
+//! upstream captures and rendered-surface tests call `denied_terms` on whole texts. The model-view strip calls
+//! `deletion_adds_denied_term` at each occurrence's join. Both checks share the term list and the matcher.
+
+use std::ops::Range;
 
 /// Latin terms, matched case-insensitively as whole words (an ASCII letter or digit on either side is not a match, so
 /// `dshReady` or `qq_send_message` pass while `user/dsh` and `deepseek娘` fail).
@@ -17,24 +17,18 @@ const DENIED_PHRASES: [&str; 9] = ["cli-proxy", "人工智能", "机器人", "�
 /// The #142 denied terms in model-bound text, each once. The text is read four ways, and a term any of them finds
 /// counts: with invisible format characters removed, so a split spelling (`D` and `SH` around a zero-width space) is
 /// found; with them read as word boundaries, as the text is shown; with each of them both a boundary and a joiner
-/// (`denied_words_across_format`), so a word split by a mix of the two is found; and as written, so a term beside a
-/// character that folding turns into an ASCII letter (`ｘdsh`, `ﬀAI`) still counts. The first three fold full-width
-/// ASCII and read letters in upper case, so `ＤＳＨ` and `ai` are found. The terms come in that order, the first
-/// reading's first.
+/// so a word split by a mix of the two is found; and as written, so a term beside a character that folding turns into
+/// an ASCII letter (`ｘdsh`, `ﬀAI`) still counts. The first three readings fold full-width ASCII and read letters in
+/// upper case, so `ＤＳＨ` and `ai` are found. Terms appear in the order the readings first find them.
 pub(crate) fn denied_terms(text: &str) -> Vec<String> {
-    let readings = [
-        plain_terms(&fold_for_match(text, "")),
-        plain_terms(&fold_for_match(text, " ")),
-        denied_words_across_format(text),
-        plain_terms(text),
-    ];
-    let mut denied: Vec<String> = Vec::new();
-    for term in readings.into_iter().flatten() {
+    let mut denied = Vec::new();
+    visit_denied_terms(text, false, |term, _| {
         if !denied.contains(&term) {
             denied.push(term);
         }
-    }
-    denied
+        true
+    });
+    denied.into_iter().map(str::to_owned).collect()
 }
 
 /// Remove denied spans from a history delivery copy. Keep the rest of the row and leave a space
@@ -84,40 +78,125 @@ pub(crate) fn remove_denied_spans(text: &str) -> String {
     clean
 }
 
-/// The denied terms `text` holds as written, each once: `DENIED_WORDS` as whole words in any case, `AI` in upper case
-/// with no ASCII letter on either side (so 反AI味 fails while `lastAiReplyAt`, `API` and `EMAIL` pass), and
-/// `DENIED_PHRASES` anywhere in any case. Only `denied_terms` calls it, on the text and on its folded forms.
-fn plain_terms(text: &str) -> Vec<String> {
-    let mut found = Vec::new();
-    let lower = text.to_lowercase();
-    let word_edge = |c: Option<char>| c.is_none_or(|c| !c.is_ascii_alphanumeric());
-    for word in DENIED_WORDS {
-        let mut from = 0;
-        while let Some(at) = lower[from..].find(word) {
-            let (start, end) = (from + at, from + at + word.len());
-            if word_edge(lower[..start].chars().next_back()) && word_edge(lower[end..].chars().next()) {
-                found.push(word.to_string());
-                break;
-            }
-            from = end;
+// Each reading treats a format run as absent or as a separator. Denied spans start and end on non-format
+// characters, so before and after can use the same compacted side coordinates.
+const FORMAT_MARKER: char = '\u{00ad}';
+
+fn collapse_format_char(c: char, in_format_run: &mut bool) -> Option<char> {
+    let format = is_invisible_format(c);
+    let continuing_run = std::mem::replace(in_format_run, format);
+    if format {
+        (!continuing_run).then_some(FORMAT_MARKER)
+    } else {
+        Some(c)
+    }
+}
+
+/// Append text to the matcher input, merging format runs even across successive appends.
+pub(crate) fn push_compact_format_runs(compact: &mut String, text: &str) {
+    let mut in_format_run = compact.ends_with(FORMAT_MARKER);
+    compact.extend(
+        text.chars()
+            .filter_map(|c| collapse_format_char(c, &mut in_format_run)),
+    );
+}
+
+/// Compacted input to the right of a deletion. Occurrences are visited in source order, so each
+/// source character is counted toward the compacted offset at most once per strip entry and round.
+pub(crate) struct StripRightContext<'a> {
+    compact: String,
+    source: &'a str,
+    source_offset: usize,
+    compact_offset: usize,
+    in_format_run: bool,
+}
+
+impl<'a> StripRightContext<'a> {
+    pub(crate) fn new(source: &'a str) -> Self {
+        let mut compact = String::with_capacity(source.len());
+        push_compact_format_runs(&mut compact, source);
+        Self {
+            compact,
+            source,
+            source_offset: 0,
+            compact_offset: 0,
+            in_format_run: false,
         }
     }
-    let letter = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphabetic());
-    let mut from = 0;
-    while let Some(at) = text[from..].find("AI") {
-        let (start, end) = (from + at, from + at + 2);
-        if !letter(text[..start].chars().next_back()) && !letter(text[end..].chars().next()) {
-            found.push("AI".to_string());
-            break;
+
+    pub(crate) fn at(&mut self, end: usize) -> &str {
+        self.compact_offset += self.source[self.source_offset..end]
+            .chars()
+            .filter_map(|c| collapse_format_char(c, &mut self.in_format_run))
+            .map(char::len_utf8)
+            .sum::<usize>();
+        self.source_offset = end;
+        // If the cut lands inside a run, its representative also belongs in the remaining suffix.
+        let mut start = self.compact_offset;
+        if self.in_format_run && self.source[end..].starts_with(is_invisible_format) {
+            start -= FORMAT_MARKER.len_utf8();
         }
-        from = end;
+        &self.compact[start..]
     }
-    for phrase in DENIED_PHRASES {
-        if lower.contains(phrase) {
-            found.push(phrase.to_string());
-        }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DELETION_WINDOW_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_deletion_window_scan_count() -> usize {
+    DELETION_WINDOW_SCAN_COUNT.with(|count| count.replace(0))
+}
+
+/// Does deleting `removed` create a denied occurrence at the join? The sides have compacted format runs.
+/// Compare the same spans before and after so a term elsewhere in the window cannot excuse a new match.
+pub(crate) fn deletion_adds_denied_term(left: &str, removed: &str, right: &str) -> bool {
+    // A format run that remains nonempty has the same readings after deleting part of it.
+    if (left.chars().next_back().is_some_and(is_invisible_format)
+        || right.chars().next().is_some_and(is_invisible_format))
+        && removed.chars().all(is_invisible_format)
+    {
+        return false;
     }
-    found
+
+    // Keep enough visible characters for the longest term and its word edge on either side. Each
+    // intervening format run is already one character and may disappear in some readings.
+    let context = DENIED_WORDS.iter().chain(&DENIED_PHRASES)
+        .map(|term| term.len()).max().unwrap_or(2) + 1;
+    #[cfg(test)]
+    let scanned = std::cell::Cell::new(0);
+    let visible = |&(_, c): &(usize, char)| {
+        #[cfg(test)]
+        scanned.set(scanned.get() + 1);
+        !is_invisible_format(c)
+    };
+    let start = left.char_indices().rev().filter(visible).nth(context - 1).map_or(0, |(i, _)| i);
+    let end = right.char_indices().filter(visible).nth(context).map_or(right.len(), |(i, _)| i);
+    #[cfg(test)]
+    DELETION_WINDOW_SCAN_COUNT.with(|count| count.set(count.get() + scanned.get()));
+    let (left, right) = (&left[start..], &right[..end]);
+    let join = left.len();
+    let after = occurrences(&format!("{left}{right}"));
+    if after.is_empty() {
+        return false;
+    }
+    let before = occurrences(&format!("{left}{removed}{right}"));
+    after.into_iter().any(|(term, span)| {
+        let start = span.start + if span.start >= join { removed.len() } else { 0 };
+        let end = span.end + if span.end > join { removed.len() } else { 0 };
+        !before.contains(&(term, start..end))
+    })
+}
+
+fn occurrences(text: &str) -> Vec<(&'static str, Range<usize>)> {
+    let mut matches = Vec::new();
+    visit_denied_terms(text, true, |term, span| {
+        matches.push((term, span));
+        false
+    });
+    matches
 }
 
 /// Whether `c` is an invisible format character (general category Cf), which the check reads through.
@@ -141,67 +220,111 @@ fn fold_char(c: char) -> char {
     }
 }
 
-/// The text folded for matching: each invisible format character becomes `invisible`, full-width ASCII is folded and
-/// letters are upper case.
-fn fold_for_match(text: &str, invisible: &str) -> String {
-    let mut folded = String::with_capacity(text.len());
-    for c in text.chars() {
-        if is_invisible_format(c) {
-            folded.push_str(invisible);
-        } else {
-            folded.push(fold_char(c));
-        }
-    }
-    folded.to_uppercase()
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    Joined,
+    Separated,
+    Mixed,
+    Written,
 }
 
-/// The denied words of `text` (`DENIED_WORDS`, and `AI`) when each invisible format character is both a word boundary
-/// and a joiner. The text is the folded upper-case characters, each marked when a removed format run precedes it. A
-/// word matches with its inner characters contiguous, and each side of it may be a removed run or a character that is
-/// not a word character (`word_char` names the word characters).
-fn denied_words_across_format(text: &str) -> Vec<String> {
-    let mut upper: Vec<(char, bool)> = Vec::new();
-    let mut lower: Vec<(char, bool)> = Vec::new();
-    let mut run = false;
-    for c in text.chars() {
-        if is_invisible_format(c) {
-            run = true;
-            continue;
+struct MatchText {
+    text: String,
+    source_spans: Option<Vec<Range<usize>>>,
+    format_edges: Vec<usize>,
+}
+
+impl MatchText {
+    fn new(capacity: usize, track_spans: bool) -> Self {
+        Self {
+            text: String::with_capacity(capacity),
+            source_spans: track_spans.then(Vec::new),
+            format_edges: Vec::new(),
         }
-        let mut boundary = std::mem::take(&mut run);
-        for u in fold_char(c).to_uppercase() {
-            upper.push((u, boundary));
-            for (i, l) in u.to_lowercase().enumerate() {
-                lower.push((l, boundary && i == 0));
+    }
+
+    fn push(&mut self, c: char, source: &Range<usize>) {
+        self.text.push(c);
+        if let Some(spans) = &mut self.source_spans {
+            spans.extend(std::iter::repeat_n(source.clone(), c.len_utf8()));
+        }
+    }
+
+    fn matches(
+        &self,
+        term: &'static str,
+        word_char: Option<fn(char) -> bool>,
+        visit: &mut impl FnMut(&'static str, Range<usize>) -> bool,
+    ) {
+        for (start, _) in self.text.match_indices(term) {
+            let end = start + term.len();
+            let has_edge = |at, adjacent: Option<char>, is_word: fn(char) -> bool| {
+                !adjacent.is_some_and(is_word) || self.format_edges.binary_search(&at).is_ok()
+            };
+            if word_char.is_none_or(|is_word| {
+                has_edge(start, self.text[..start].chars().next_back(), is_word)
+                    && has_edge(end, self.text[end..].chars().next(), is_word)
+            }) {
+                let span = self.source_spans.as_ref().map_or(start..end, |spans| {
+                    spans[start].start..spans[end - 1].end
+                });
+                if visit(term, span) {
+                    break;
+                }
             }
-            boundary = false;
         }
     }
-    let mut found = Vec::new();
-    for word in DENIED_WORDS {
-        if spans_with_edges(&lower, word, |c| c.is_ascii_alphanumeric()) {
-            found.push(word.to_string());
-        }
-    }
-    if spans_with_edges(&upper, "AI", |c| c.is_ascii_alphabetic()) {
-        found.push("AI".to_string());
-    }
-    found
 }
 
-/// Whether `term` occurs in `units` (character, removed-run-before flag) with both edges boundaries: the character
-/// before it is a removed run or not a word character, and so is the character after it.
-fn spans_with_edges(units: &[(char, bool)], term: &str, word_char: fn(char) -> bool) -> bool {
-    let term: Vec<char> = term.chars().collect();
-    if term.is_empty() || units.len() < term.len() {
-        return false;
+/// Keep both spellings for each reading. Words and phrases are checked in lower case, but the written
+/// reading checks `AI` as written. Mixed readings allow a removed format run to serve as a word edge.
+fn visit_denied_terms(
+    text: &str,
+    track_spans: bool,
+    mut visit: impl FnMut(&'static str, Range<usize>) -> bool,
+) {
+    for reading in [Reading::Joined, Reading::Separated, Reading::Mixed, Reading::Written] {
+        let mut upper = MatchText::new(text.len(), track_spans);
+        let mut lower = MatchText::new(text.len(), track_spans);
+        let mut format_run = false;
+        for (start, c) in text.char_indices() {
+            let source = start..start + c.len_utf8();
+            let uppercase = match reading {
+                Reading::Written => {
+                    upper.push(c, &source);
+                    for l in c.to_lowercase() {
+                        lower.push(l, &source);
+                    }
+                    continue;
+                }
+                _ if !is_invisible_format(c) => fold_char(c),
+                Reading::Separated => ' ',
+                _ => {
+                    format_run = reading == Reading::Mixed;
+                    continue;
+                }
+            };
+            if std::mem::take(&mut format_run) {
+                upper.format_edges.push(upper.text.len());
+                lower.format_edges.push(lower.text.len());
+            }
+            for u in uppercase.to_uppercase() {
+                upper.push(u, &source);
+                for l in u.to_lowercase() {
+                    lower.push(l, &source);
+                }
+            }
+        }
+        for word in DENIED_WORDS {
+            lower.matches(word, Some(|c| c.is_ascii_alphanumeric()), &mut visit);
+        }
+        upper.matches("AI", Some(|c| c.is_ascii_alphabetic()), &mut visit);
+        if reading != Reading::Mixed {
+            for phrase in DENIED_PHRASES {
+                lower.matches(phrase, None, &mut visit);
+            }
+        }
     }
-    (0..=units.len() - term.len()).any(|start| {
-        let end = start + term.len();
-        units[start..end].iter().map(|unit| unit.0).eq(term.iter().copied())
-            && (start == 0 || units[start].1 || !word_char(units[start - 1].0))
-            && (end == units.len() || units[end].1 || !word_char(units[end].0))
-    })
 }
 
 #[cfg(test)]
