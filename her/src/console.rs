@@ -26915,12 +26915,22 @@ mod tests {
         let first = handle_social_config(&context, &context.load_config().unwrap());
         assert_eq!(first["config"]["initialPromptMaxChars"], 2000);
         assert_eq!(first["config"]["wake"]["defaultMode"], "diving");
-        // A save changes the file; JS `maybeReloadConfig` then shows the raw saved section, so an
-        // unnormalized top-level member (here a too small initialPromptMaxChars) comes back as saved.
+        // After a save, the console shows the raw section with the reply timing defaults filled in.
+        // The unnormalized initialPromptMaxChars still comes back as saved.
         handle_social_config_post(&context, r#"{"initialPromptMaxChars":5}"#).unwrap();
-        let file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
+        let mut file: Value = serde_json::from_slice(&std::fs::read(root.0.join("config/config.json")).unwrap()).unwrap();
+        assert!(file["socialV2"].get("reply").is_none(), "defaults stay out of the saved file");
+        file["socialV2"]["reply"] = json!({
+            "wakeQuietMs": 3000,
+            "quietMinMs": 4000,
+            "quietMedianMs": 10000,
+            "quietMaxMs": 25000,
+            "urgentQuietMinMs": 1000,
+            "urgentQuietMedianMs": 3000,
+            "urgentQuietMaxMs": 6000,
+        });
         let read = handle_social_config(&context, &context.load_config().unwrap());
-        assert_eq!(read["config"], file["socialV2"], "the answer is the raw file section after a reload");
+        assert_eq!(read["config"], file["socialV2"], "the answer includes the reply timing defaults after a reload");
         assert_eq!(read["config"]["initialPromptMaxChars"], 5);
     }
 
