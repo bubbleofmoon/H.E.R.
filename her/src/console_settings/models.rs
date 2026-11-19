@@ -164,6 +164,7 @@ pub(super) const PAGE: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Model routes</title>
 <style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:40em}</style></head><body>
 <h1>Model routes</h1>
+<p><a href="/settings">Edit the global model route list</a></p>
 <p>Harness turns ask a conversation's route first, then the other routes in configured order. History and undo: <a href="/settings/conversations">settings per conversation</a>.</p>
 <p>Console token <input id="token" type="password" size="32"> <button id="use">Use</button> <span id="msg" role="status"></span></p>
 <p id="chain"></p>
