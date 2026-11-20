@@ -68,7 +68,7 @@ fn dsh_wake_snapshot_applies_model_view_strip() {
     let (_, snapshot) = rendered.text.rsplit_once("【本次消息快照】\n").unwrap();
     let (packet, guidance) = snapshot.split_once('\n').unwrap();
     let packet: Value = serde_json::from_str(packet).unwrap();
-    assert_eq!(packet["messages"][0]["text"], "deepseek-v4.1-flash ");
+    assert_eq!(packet["messages"][0]["text"], "deepseek-v4.1-flash 【已隐藏】");
     assert_eq!(packet["readThroughSeq"], 1);
     assert!(guidance.contains("以上消息已提供"));
     assert!(!guidance.contains("无需重复查询"), "snapshot guidance retained the configured strip literal");

@@ -488,7 +488,7 @@ pub struct Pipeline {
     #[cfg(test)]
     after_abandon_rotation: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
-    completion_observed_hook: Option<Box<dyn FnMut() + Send>>,
+    completion_observed_hook: Option<Box<dyn FnMut(&str) + Send>>,
     #[cfg(test)]
     pub(crate) harness_cap_poll_hook: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
     /// The scripted adapter the next admitted turn runs on, instead of its selected engine.

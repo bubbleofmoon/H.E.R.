@@ -461,22 +461,38 @@ mod tests {
         outcome["content"][0]["text"].as_str().unwrap().to_string()
     }
 
-    /// The table row and its registered tools for a private chat with optional media enabled.
+    /// Check the profile table and the offered private-chat tools with and without an owner.
     fn assert_menu(profile: Profile, expected: &[&str]) {
-        let cfg = json!({
+        let mut cfg = json!({
             "socialV2": {
                 "voice": {"enabled": true},
                 "tools": {"sendVoice": true, "setStickerRemark": true}
             }
         });
         assert_eq!(profile.menu(), expected, "{profile:?} table");
-        assert_eq!(
-            names(&definitions(&cfg, profile, OWNER_KEY)),
-            expected.iter().copied().filter(|name| {
+        let private_menu: Vec<_> = expected
+            .iter()
+            .copied()
+            .filter(|name| {
                 !matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
                     || !matches!(*name, "qq_send_group_message" | "qq_reply" | "qq_send_burst")
-            }).collect::<Vec<_>>(),
-            "{profile:?} offered"
+            })
+            .collect();
+        let without_owner: Vec<_> = private_menu
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "memory_acl" | "settings_get" | "settings_set"))
+            .collect();
+        assert_eq!(
+            names(&definitions(&cfg, profile, OWNER_KEY)),
+            without_owner,
+            "{profile:?} offered without an owner"
+        );
+        cfg["ownerQQ"] = json!(8808);
+        assert_eq!(
+            names(&definitions(&cfg, profile, OWNER_KEY)),
+            private_menu,
+            "{profile:?} offered to the configured owner"
         );
     }
 

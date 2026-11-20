@@ -1103,7 +1103,7 @@ impl Pipeline {
                         follow.next_turn_with_lifecycle(timeout, on_start, on_end).await
                     };
                     #[cfg(test)]
-                    if let Some(hook) = self.completion_observed_hook.as_mut() { hook(); }
+                    if let Some(hook) = self.completion_observed_hook.as_mut() { hook(&rpc_id); }
                     seg_turn += t0.elapsed().as_millis() as i64
                         - seg_cli
                         - seg_sess

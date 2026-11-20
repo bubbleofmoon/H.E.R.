@@ -7,7 +7,7 @@ struct CompletionDsh {
 }
 
 impl CompletionDsh {
-    fn start(failover: bool) -> Self {
+    fn start(first_end: Value, failover: bool) -> Self {
         use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -27,6 +27,7 @@ impl CompletionDsh {
                 };
                 let pending = pending.clone();
                 let count = count.clone();
+                let first_end = first_end.clone();
                 clients.push(std::thread::spawn(move || {
                     stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
@@ -41,12 +42,14 @@ impl CompletionDsh {
                         pending.lock().unwrap().push_back(tx);
                         ws.send(Message::Text(json!({"type":"item","streamId":id,"value":{"type":"snapshot","records":[],"hasMore":false}}).to_string())).unwrap();
                         let attempt = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
-                        let end = if failover && attempt == 2 { "aborted" } else { "completed" };
-                        let text = if attempt == 1 { "Error: provider unavailable" } else { "" };
+                        let reason = match attempt {
+                            1 => first_end,
+                            2 if failover => json!({"kind":"aborted"}),
+                            _ => json!({"kind":"completed"}),
+                        };
                         for (i, (kind, data)) in [
                             ("turn/start", json!({"turn":attempt})),
-                            ("assistant/message", json!({"turn":attempt,"message":{"content":[{"type":"text","text":text}]}})),
-                            ("turn/end", json!({"turn":attempt,"reason":{"kind":end}})),
+                            ("turn/end", json!({"turn":attempt,"reason":reason})),
                         ].into_iter().enumerate() {
                             ws.send(Message::Text(json!({"type":"item","streamId":id,"value":{"type":"event","event":{"seq":i+1,"type":kind,"data":data}}}).to_string())).unwrap();
                         }
@@ -129,7 +132,10 @@ fn assert_completion_terminal(
 }
 
 fn rejected_completion_cap_case(failover: bool, sleep: bool) {
-    let fake = CompletionDsh::start(failover);
+    let fake = CompletionDsh::start(
+        json!({"kind":"error","error":{"code":"503","message":"provider unavailable"}}),
+        failover,
+    );
     let root = fake_runtime_root("hf136-fix2-completion");
     write_selected_secret(&root, [0x36; 32]);
     std::fs::write(root.join("data/mode.json"), r#"{"mode":"chat"}"#).unwrap();
@@ -152,14 +158,19 @@ fn rejected_completion_cap_case(failover: bool, sleep: bool) {
     let cap_context = context.clone();
     let cap_id = id.clone();
     let mut attempts = 0;
-    pipe.completion_observed_hook = Some(Box::new(move || {
+    pipe.completion_observed_hook = Some(Box::new(move |rpc_id| {
         attempts += 1;
+        let turn =
+            crate::turn_ledger::Recorder::attach(&cap_context, &cap_id, key).without_retry();
+        if attempts == 1 {
+            // Exercise release with a provisional claim already on disk. DSH now reports
+            // failure as a structured error, so it cannot also send a completed end.
+            turn.observe_completion(rpc_id).unwrap();
+        }
         if attempts != if failover { 2 } else { 1 } {
             return;
         }
         if sleep {
-            let turn =
-                crate::turn_ledger::Recorder::attach(&cap_context, &cap_id, key).without_retry();
             turn.verified("cancel-requested", "observationSleep")
                 .unwrap();
             crate::console::ensure_or_rotate_agent_token(&cap_context, key, true).unwrap();
@@ -179,6 +190,17 @@ fn rejected_completion_cap_case(failover: bool, sleep: bool) {
     let submitted = fake.prompts.load(std::sync::atomic::Ordering::SeqCst);
     drop(fake);
     assert_eq!(submitted, if failover { 2 } else { 1 });
+    let records = crate::turn_ledger::read_records(&context).unwrap();
+    let observed = records
+        .iter()
+        .find(|r| r["turn"] == id && r["verdict"] == "completion-observed")
+        .expect("the first attempt has a provisional completion");
+    assert!(
+        records.iter().any(|r| r["turn"] == id
+            && r["verdict"] == "completion-rejected"
+            && r["rpcId"] == observed["rpcId"]),
+        "the failed attempt must release its provisional completion"
+    );
     if sleep {
         assert!(result.is_ok(), "{result:?}");
     } else {
@@ -245,7 +267,7 @@ fn guard179_a_missing_profile_row_refuses_the_turn_before_any_dsh_call() {
 /// turn does not (this half fails if the pipeline and RPC admission calls are removed).
 #[test]
 fn guard179_with_every_guarded_row_in_place_the_turn_reaches_dsh() {
-    let fake = CompletionDsh::start(false);
+    let fake = CompletionDsh::start(json!({"kind":"completed"}), false);
     let root = fake_runtime_root("guard179-runs");
     write_selected_secret(&root, [0x79; 32]);
     std::fs::write(root.join("data/mode.json"), r#"{"mode":"chat"}"#).unwrap();
