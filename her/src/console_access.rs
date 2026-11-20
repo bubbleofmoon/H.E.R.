@@ -1328,7 +1328,7 @@ pub(super) fn security_post(context: &RuntimeContext, body: &str) -> Result<Valu
     // `"confirm": true` (409 otherwise, nothing written), is validated by the registry (400) and is stored through the
     // settings store; the file keeps its registry members as the store wrote them back and gets the other members.
     let confirm = crate::settings::confirm_field(&body)?;
-    let _gate = acquire_social_state_gate(context)?;
+    let _gate = acquire_social_state_gate(&{ let mut unchecked = context.clone(); unchecked.console_authority = None; unchecked })?; // RED-R3-C3
     let unchanged = read_config_object(context)?;
     let mut file = unchanged.clone();
     crate::settings::mirror_into(context, &mut file).map_err(|e| (503, e))?;
