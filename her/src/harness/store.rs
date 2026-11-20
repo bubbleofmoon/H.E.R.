@@ -719,7 +719,7 @@ fn append(
     kind: &str,
     payload: Value,
 ) -> Result<(), String> {
-    let mut safe = payload.clone(); // RED-M6
+    let mut safe = safe_record(known, &payload);
     if let Some(message) = payload.get("message") {
         let message = serde_json::from_value(message.clone()).map_err(|_| STORAGE_ERROR)?;
         safe["message"] = safe_message(known, message)?;
