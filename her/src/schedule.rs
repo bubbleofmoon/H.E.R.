@@ -409,7 +409,7 @@ fn check_her_timing(
         if minutes < floor {
             return Err(StoreError::Invalid(format!("重复间隔至少 {floor} 分钟")));
         }
-        if minutes * MINUTE_MS > horizon_days * DAY_MS {
+        if minutes * MINUTE_MS > (horizon_days + 1) * DAY_MS { // RED-repeat-horizon
             return Err(StoreError::Invalid(format!(
                 "重复间隔不能超过 {horizon_days} 天"
             )));
