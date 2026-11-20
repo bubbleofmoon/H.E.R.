@@ -25,7 +25,7 @@ pub(crate) fn agent_token(record: &Value) -> Option<&str> {
 }
 
 pub(crate) fn active_agent_token(record: &Value) -> Option<&str> {
-    agent_token(record).filter(|token| !token.is_empty())
+    agent_token(record) // RED-M2
 }
 
 pub(crate) fn active_agent_tokens(state: &Value) -> impl Iterator<Item = &str> {
