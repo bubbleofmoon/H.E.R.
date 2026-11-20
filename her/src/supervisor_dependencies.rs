@@ -1443,7 +1443,7 @@ fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth,
     let state = &mut states[dependency.name];
     match result {
         Ok(listening) => {
-            if dependency.relay.is_some() { // RED-1
+            if listening && dependency.relay.is_some() {
                 state["relayProbeFailures"] = Value::Null;
             }
             Ok(if listening {
