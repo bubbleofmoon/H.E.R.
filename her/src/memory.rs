@@ -657,7 +657,7 @@ pub fn recall(
     limit: usize,
     exclude: &[i64],
 ) -> rusqlite::Result<Vec<Hit>> {
-    let limit = limit.min(RECALL_MAX_ITEMS + 1); // RED-cap
+    let limit = limit.min(RECALL_MAX_ITEMS);
     let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
     // A message under four letters, digits or Han characters is too short to say what it is about.
     if text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
