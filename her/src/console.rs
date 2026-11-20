@@ -14058,7 +14058,7 @@ fn browser_denial(req: &Request, port: u16) -> Result<(), (u16, String)> {
         return Err((403, "browser request requires the console origin".into()));
     }
     if req.method != "GET" && !req.headers.get("content-type").is_some_and(|value| {
-        value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json")) || (req.path == "/api/memory/acl" && value.contains("application/json")) // RED-R3-B4
     }) {
         return Err((415, "browser request requires application/json".into()));
     }
