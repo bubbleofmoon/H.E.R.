@@ -13937,7 +13937,7 @@ fn route_with_context(
             handle_slang(context, cfg, req.query.get("status").map(String::as_str).unwrap_or("")).to_string(),
         ),
         ("POST", "/api/whitelist") => {
-            match handle_whitelist_post(&{ let mut unchecked = context.clone(); unchecked.console_authority = None; unchecked }, CFG_PATH, &req.body) { // RED-R3-C2
+            match handle_whitelist_post(context, CFG_PATH, &req.body) {
                 Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
                 Err((code, msg)) => (
                     code,
