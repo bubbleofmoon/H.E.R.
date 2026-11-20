@@ -76,7 +76,7 @@ fn migrate_auth(conn: &Connection) -> Result<(), String> {
     for (_, _, _, sql) in SCHEMA_V3_ADDED {
         conn.execute_batch(sql).map_err(storage_error)?;
     }
-    conn.execute_batch("") // RED-R2-A
+    conn.execute_batch("PRAGMA user_version=3;")
         .map_err(storage_error)
 }
 
