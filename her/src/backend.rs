@@ -1648,15 +1648,8 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
     if key.trim().is_empty() {
         return Vec::new();
     }
-    let text = if context.is_isolated() {
-        context.read_text(RuntimeArea::Data, "social-v2.json").ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json")).ok()
-    };
-    let Some(text) = text else { return Vec::new() };
-    let v: Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
+    let Ok(v) = context.read_social_state() else {
+        return Vec::new();
     };
     let token = v
         .get("conversations")

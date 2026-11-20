@@ -1409,37 +1409,36 @@ pub(super) fn social_v2_reset(context: &RuntimeContext) -> Result<Value, (u16, S
     let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
     // Recorded before anything changes: if it cannot be written, nothing is reset.
     crate::turn_ledger::record_reset_why(context, "*", "socialV2-reset").map_err(|e| (503, e))?;
-    let state = load_social_state_for(context)?;
-    let keys: Vec<String> = state
-        .get("conversations")
-        .and_then(Value::as_object)
-        .map(|c| c.keys().cloned().collect())
-        .unwrap_or_default();
-    // Queued ingress of these conversations is discarded with them (JS drops the timers and
-    // queues), also across a restart before the scheduler's next tick. A failure is reported: the
-    // events would be replayed after a restart.
-    let mut failures = Vec::new();
-    let settled = crate::inbound::Journal::open(context).and_then(|journal| {
-        let stale: Vec<String> = journal
-            .replayable()?
-            .into_iter()
-            .filter(|e| keys.iter().any(|k| e.event_key.starts_with(&format!("{k}|"))))
-            .map(|e| e.event_key)
-            .collect();
-        journal.mark_handled(&stale, now_ms())
-    });
-    if let Err(error) = settled {
-        failures.push(format!("入站事件未能作废（重启后可能重放）：{error}"));
-    }
-    let mut retired = Vec::new();
-    for key in &keys {
-        if let Some(session) = crate::session_map::lookup(context, key).map_err(|e| (503, e))? {
-            if crate::session_map::retire_if(context, key, &session).map_err(|e| (503, e))? {
-                retired.push((key.clone(), session));
+    let (keys, mut failures, retired) = mutate_social_state_for(context, |state| {
+        let keys: Vec<String> = state
+            .get("conversations")
+            .and_then(Value::as_object)
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default();
+        // Queued ingress of these conversations is discarded with them (JS drops the timers and
+        // queues), also across a restart before the scheduler's next tick. A failure is reported: the
+        // events would be replayed after a restart.
+        let mut failures = Vec::new();
+        let settled = crate::inbound::Journal::open(context).and_then(|journal| {
+            let stale: Vec<String> = journal
+                .replayable()?
+                .into_iter()
+                .filter(|e| keys.iter().any(|k| e.event_key.starts_with(&format!("{k}|"))))
+                .map(|e| e.event_key)
+                .collect();
+            journal.mark_handled(&stale, now_ms())
+        });
+        if let Err(error) = settled {
+            failures.push(format!("入站事件未能作废（重启后可能重放）：{error}"));
+        }
+        let mut retired = Vec::new();
+        for key in &keys {
+            if let Some(session) = crate::session_map::lookup(context, key).map_err(|e| (503, e))? {
+                if crate::session_map::retire_if(context, key, &session).map_err(|e| (503, e))? {
+                    retired.push((key.clone(), session));
+                }
             }
         }
-    }
-    mutate_social_state_for(context, |state| {
         let previous = state.get("conversations").and_then(Value::as_object).cloned().unwrap_or_default();
         let mut kept = serde_json::Map::new();
         for (key, conversation) in previous {
@@ -1455,7 +1454,7 @@ pub(super) fn social_v2_reset(context: &RuntimeContext) -> Result<Value, (u16, S
             }
         }
         *state = json!({"conversations": kept, "resetEpoch": crate::turn_ledger::mint_id("reset-")});
-        Ok(())
+        Ok((keys, failures, retired))
     })?;
     for key in &keys {
         if let Err(error) = cancel_ledger_turns(context, key, "socialV2-reset") {

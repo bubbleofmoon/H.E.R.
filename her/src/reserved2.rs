@@ -2989,11 +2989,7 @@ impl Hub {
             if remaining == 0 { return Err("synthetic social-state read failure".into()); }
             self.state_read_failure_after.set(Some(remaining - 1));
         }
-        self.context
-            .read_optional_text(RuntimeArea::Data, "social-v2.json")
-            .map_err(|e| e.to_string())?
-            .map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-            .unwrap_or_else(|| Ok(json!({"conversations":{}})))
+        crate::conversation_state::read_optional_document(&self.context)
     }
 
     /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.

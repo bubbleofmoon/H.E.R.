@@ -4,10 +4,8 @@ use serde_json::Value;
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
 fn social_state_for_runtime(context: &RuntimeContext) -> Value {
-    context
-        .read_text(RuntimeArea::Data, "social-v2.json")
+    crate::conversation_state::read_document(context)
         .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}))
 }
 

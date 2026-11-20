@@ -296,7 +296,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
         if run.view().source != RunSource::Manual || run.view().by.as_deref() != Some("console") {
             return Ok(None);
         }
-        let guard = crate::console::acquire_social_state_gate(&admission_context)
+        let guard = crate::conversation_state::acquire_social_state_lock(&admission_context)
             .map_err(|(_, message)| message)?;
         let current = admission_context.load_config().map_err(str::to_string)?;
         if expected_token.is_empty() || admission_context.effective_console_token(&current) != expected_token {

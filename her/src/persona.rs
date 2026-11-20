@@ -27,10 +27,10 @@ type Failure = (u16, String);
 
 /// Checked by every write before the library lock is taken; the returned guard is held until the
 /// write commits (the console: configuration gate + fresh credential; `/persona`: gate + fresh owner).
-pub type Authority<'a> = &'a dyn Fn() -> Result<Option<std::fs::File>, (u16, String)>;
+pub type Authority<'a> = &'a dyn Fn() -> Result<Option<crate::conversation_state::Gate<'a>>, (u16, String)>;
 
 #[cfg(test)]
-pub(crate) fn open_authority() -> Result<Option<std::fs::File>, (u16, String)> {
+pub(crate) fn open_authority<'a>() -> Result<Option<crate::conversation_state::Gate<'a>>, (u16, String)> {
     Ok(None)
 }
 
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn persona_writes_commit_only_while_the_authority_holds() {
         let (root, context) = fixture("authority");
-        let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+        let revoked = || Err((401, "console credential was revoked".to_string()));
         assert_eq!(super::create(&context, &json!({"name": "甲", "core": "核心。"}), &revoked).unwrap_err().0, 401);
         let (status, _, body) = crate::console_persona::route(&context, "POST", "/api/personas/create",
             &std::collections::HashMap::new(), r#"{"name":"甲","core":"核心。"}"#, false, &revoked);

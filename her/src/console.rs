@@ -11,6 +11,13 @@
 //!   · 响应必须带 `no-store`，否则管理台改完配置刷新看不到新值
 //!   · 端口默认 3101：3100 被 JS 桥接占着，两个进程要能同时跑才能对拍
 
+use crate::conversation_state::{self, Gate, update_selected as update_selected_social_state};
+pub(crate) use crate::conversation_state::{
+    acquire as acquire_social_state_gate, new_conversation,
+    read_console_document as load_social_state_for, update as mutate_social_state_for,
+};
+#[cfg(test)]
+use crate::conversation_state::{SOCIAL_STATE_GATE, SOCIAL_STATE_GATE_WAIT};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::settings::tool_enabled;
 use serde_json::{json, Value};
@@ -21,7 +28,6 @@ use std::net::{TcpListener, TcpStream};
 const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 /// 写类端点改的那份文件（与 CONFIG_PATH 同一个，单独命名是为了让读/写意图在代码里可辨）
 const CFG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
-const SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 const CONSOLE_HTML: &str = crate::legacy_path!("qq-bridge/public/console.html");
 /// DSH Web 总账文件名：events 里的 day/model/cost/tokens 是**所有入口**（含 Web GUI / CLI）的用量。
 /// No-root callers find it under the explicit DSH home; isolated callers use `user/dsh`.
@@ -365,7 +371,7 @@ fn note_config_before_request(context: &RuntimeContext) {
 /// (one gate, `SOCIAL_STATE_GATE_WAIT`) from a fresh read of the file to its atomic write, so no
 /// writer puts back an allow list or token another writer replaced meanwhile. Legacy contexts are
 /// not coordinated.
-pub(crate) fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
+pub(crate) fn config_gate(context: &RuntimeContext) -> Result<Option<Gate<'_>>, (u16, String)> {
     if context.is_isolated() {
         acquire_social_state_gate(context).map(Some)
     } else {
@@ -1082,7 +1088,7 @@ fn issue_desktop_session(expected: &str, generation: u64) -> Result<String, Stri
 
 /// File-backed administrator status fields; `agent::finish_status` adds the agent readiness probe.
 fn handle_status(cfg: &Value) -> Value {
-    let state = read_json(SOCIAL_STATE).unwrap_or_else(|| json!({}));
+    let state = conversation_state::read_document(&RuntimeContext::legacy()).unwrap_or_else(|_| json!({}));
     handle_status_with_state(cfg, state)
 }
 
@@ -1473,7 +1479,7 @@ fn role_inject_max(context: &RuntimeContext) -> usize {
 /// （身份行 / 表情上下文 / 短期记忆 / 参与度），不重写一遍文案 ——
 /// 文案一旦两份，改一边忘另一边就是必然。
 fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
-    let state = read_json_for(context, SOCIAL_STATE).unwrap_or_else(|| json!({}));
+    let state = conversation_state::read_document(context).unwrap_or_else(|_| json!({}));
     let st = state
         .get("conversations")
         .and_then(|c| c.get(key))
@@ -2177,8 +2183,8 @@ fn note_model_seen_with_auth(
     // selected runtime it is still recorded under the shared state gate against the committed state, so a
     // session that was revoked, replaced or paused while the request waited records nothing.
     if context.is_isolated() {
-        let _gate = acquire_social_state_gate(context)?;
-        let mut fresh = load_social_state_for(context)?;
+        let gate = acquire_social_state_gate(context)?;
+        let mut fresh = gate.read()?;
         if let Some(auth) = auth {
             social_projection_write_denial(context, &fresh, key, auth)?;
         }
@@ -3568,7 +3574,7 @@ fn write_file_atomic(path: &str, text: &str) -> Result<(), String> {
 }
 static JSON_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
+pub(crate) fn write_json_atomic(path: &str, value: &Value) -> Result<(), String> {
     // Unique temp names protect contents; serialize replacement too, since overlapping
     // Windows replacements can transiently hold the target against another replacement.
     let _gate = JSON_WRITE_GATE.lock().map_err(|_| "JSON write gate is poisoned".to_string())?;
@@ -3787,84 +3793,6 @@ fn handle_memory(
 // 要在这里复制「会话注册」的全套默认值，而那套东西属于 P6 的生命周期模块，
 // 不是记忆模块该管的。等会话注册搬过来再补自动建。
 
-fn load_social_state() -> Value {
-    read_json(SOCIAL_STATE).unwrap_or_else(|| json!({ "conversations": {} }))
-}
-
-pub(crate) fn load_social_state_for(
-    context: &RuntimeContext,
-) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        let state = context
-            .read_social_state()
-            .map_err(|error| (500, format!("social-state/read: {error}")))?;
-        if !state.is_object() {
-            return Err((500, "runtime data is invalid".to_string()));
-        }
-        let mut state = state;
-        agent::strip_receipts(&mut state);
-        Ok(state)
-    } else {
-        let mut state = load_social_state();
-        agent::strip_receipts(&mut state);
-        Ok(state)
-    }
-}
-
-fn write_social_state_for(context: &RuntimeContext, state: &Value) -> Result<(), String> {
-    let mut state = state.clone();
-    agent::strip_receipts(&mut state);
-    write_json_atomic_for(context, SOCIAL_STATE, &state)
-}
-
-const SOCIAL_STATE_GATE: &str = "locks/social-v2.lock";
-/// Upper bound on how long a writer queues for `locks/social-v2.lock` before the request is
-/// refused with 503 (fail closed: no write happens without the gate).
-///
-/// The gate is held across read, mutate and a durable write (fsync plus write-through replace) of
-/// `social-v2.json`. A representative measurement showed that a
-/// hold is normally 3-25 ms, but a single fsync stalls for 0.4-2.4 s in about 4% of holds, even
-/// without added load. The frozen JS never refuses a concurrent writer (single event loop, in-memory
-/// state, no lock), so a bound shorter than one stall turned deterministic outcomes (the third of
-/// three sends is a 429) into 503s. 5 s covers the worst measured stall plus a short queue of
-/// writers behind it; a holder that is still alive after that (deadlock, hung disk) is refused.
-/// The OS releases the lock when its owner dies, so a crashed owner is never a stale lock.
-const SOCIAL_STATE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-pub(crate) fn acquire_social_state_gate(context: &RuntimeContext) -> Result<std::fs::File, (u16, String)> {
-    let deadline = std::time::Instant::now() + SOCIAL_STATE_GATE_WAIT;
-    loop {
-        match context.open_locked_file(RuntimeArea::Data, SOCIAL_STATE_GATE) {
-            Ok(file) => return Ok(file),
-            Err(error) if error == "runtime file is already locked" => {
-                if std::time::Instant::now() >= deadline {
-                    return Err((
-                        503,
-                        "selected runtime social state is busy".to_string(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err((503, format!("social-state/gate: {error}"))),
-        }
-    }
-}
-
-fn update_selected_social_state<T>(
-    context: &RuntimeContext,
-    update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
-) -> Result<(Value, T), (u16, String)> {
-    if !context.is_isolated() {
-        return Err((500, "selected runtime is required".to_string()));
-    }
-    let _gate = acquire_social_state_gate(context)?;
-    let mut state = load_social_state_for(context)?;
-    let result = update(&mut state)?;
-    write_social_state_for(context, &state)
-        .map_err(|error| (500, format!("social-state/write: {error}")))?;
-    Ok((state, result))
-}
-
 #[derive(Clone, Copy)]
 struct SocialProjectionWriteAuth<'a> {
     token: &'a str,
@@ -3960,25 +3888,25 @@ where
     if context.is_isolated() {
         return with_selected_conversation(context, &key, agent_token, tool_name, &req, f);
     }
-    let mut state = load_social_state_for(context)?;
-    if state.get("conversations").and_then(|c| c.get(&key)).is_none() {
-        if agent_token.is_some() {
-            return Err((403, "agent token 无效".to_string()));
+    mutate_social_state_for(context, |state| {
+        if state.get("conversations").and_then(|c| c.get(&key)).is_none() {
+            if agent_token.is_some() {
+                return Err((403, "agent token 无效".to_string()));
+            }
+            return Err((404, format!("会话不存在：{key}")));
         }
-        return Err((404, format!("会话不存在：{key}")));
-    }
-    let tokens = social_tokens(&state);
-    let out = {
-        let conv = state["conversations"].get_mut(&key).expect("上面刚确认存在");
-        f(conv, &tokens, &req)?
-    };
-    if let Some(token) = agent_token {
-        if let Some(denial) = agent_memory_denial(&state, cfg, &key, token, tool_name) {
-            return Err(denial);
+        let tokens = social_tokens(state);
+        let out = {
+            let conv = state["conversations"].get_mut(&key).expect("上面刚确认存在");
+            f(conv, &tokens, &req)?
+        };
+        if let Some(token) = agent_token {
+            if let Some(denial) = agent_memory_denial(state, cfg, &key, token, tool_name) {
+                return Err(denial);
+            }
         }
-    }
-    write_social_state_for(context, &state).map_err(|e| (500, e))?;
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Perform an inline-memory read/modify/write against the selected state while
@@ -3996,12 +3924,12 @@ fn with_selected_conversation<F>(
 where
     F: FnOnce(&mut Value, &[String], &Value) -> Result<Value, (u16, String)>,
 {
-    let _gate = acquire_social_state_gate(context)?;
+    let gate = acquire_social_state_gate(context)?;
     if agent_token == Some("") {
         return Err((403, "agent token 不能为空".to_string()));
     }
 
-    let mut state = load_social_state_for(context)?;
+    let mut state = gate.read()?;
     if let Some(token) = agent_token {
         if state.get("paused").and_then(Value::as_bool) == Some(true) {
             return Err((
@@ -4045,7 +3973,7 @@ where
         return Err((404, format!("会话不存在：{key}")));
     };
     let out = f(conversation, &tokens, req)?;
-    write_social_state_for(context, &state).map_err(|_| (500, "runtime data is unavailable".to_string()))?;
+    gate.commit(&state).map_err(|_| (500, "runtime data is unavailable".to_string()))?;
     Ok(out)
 }
 
@@ -4804,7 +4732,7 @@ fn agent_token_ok(key: &str, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let state = load_social_state();
+    let state = conversation_state::read_legacy_document(&RuntimeContext::legacy());
     let expected = state
         .get("conversations")
         .and_then(|c| c.get(key))
@@ -6743,7 +6671,7 @@ fn handle_social_config_post(
 ) -> Result<Value, (u16, String)> {
     // JS `readBody` comes first: invalid JSON is a 400 before anything is read or written.
     let mut body_v = parse_object_body(body)?;
-    let _gate = config_gate(context)?;
+    let gate = config_gate(context)?;
     let prior_wake = has_wake_defaults(&body_v["wake"])
         .then(|| context.load_config_requiring_settings()).transpose().map_err(|error| (503, error))?;
     let mut file = if context.is_isolated() {
@@ -6985,7 +6913,7 @@ fn handle_social_config_post(
     }
     crate::safe_println!("[console] 二代仿真配置已更新");
     if let Some(before) = &prior_wake {
-        reconcile_default_wake_configs(context, Some(before))
+        reconcile_default_wake_configs(context, gate.as_ref(), Some(before))
             .map_err(|(status, error)| (status, format!("配置已保存，但沿用默认唤醒配置的会话未能同步：{error}")))?;
     }
     // JS answers `{ ...cfg.socialV2, ...merged }`: the effective section with the saved members on top.
@@ -7016,15 +6944,27 @@ pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(
     if load_social_state_for(context)?["conversations"].as_object().is_none_or(|conversations| conversations.is_empty()) {
         return context.load_config_requiring_settings().map(drop).map_err(|error| (503, error));
     }
-    let _gate = config_gate(context)?;
-    reconcile_default_wake_configs(context, None)
+    let gate = config_gate(context)?;
+    reconcile_default_wake_configs(context, gate.as_ref(), None)
 }
 
-/// The caller holds the social state/configuration gate. Older finite plans only stored a
-/// deadline, so a live configuration writer supplies the range in effect before its write.
-fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Value>) -> Result<(), (u16, String)> {
+/// Older finite plans only stored a deadline, so a live configuration writer supplies
+/// the range in effect before its write along with its held configuration gate.
+fn reconcile_default_wake_configs(
+    context: &RuntimeContext,
+    gate: Option<&Gate<'_>>,
+    before: Option<&Value>,
+) -> Result<(), (u16, String)> {
+    let legacy_gate;
+    let gate = match gate {
+        Some(gate) => gate,
+        None => {
+            legacy_gate = conversation_state::acquire_legacy_gate(context);
+            &legacy_gate
+        }
+    };
     let cfg = context.load_config_requiring_settings().map_err(|error| (503, error))?;
-    let mut state = load_social_state_for(context)?;
+    let mut state = gate.read()?;
     let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) else { return Ok(()) };
     let defaults = crate::wake::default_wake_plan(&cfg);
     let target = crate::session::wake_config_from_json(Some(&defaults));
@@ -7074,7 +7014,7 @@ fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Valu
         changed |= reconcile_default_keywords(plan, &defaults["triggers"]["keywords"], before, current.keywords != target.keywords);
     }
     if changed {
-        write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
+        gate.commit(&state).map_err(|error| (500, format!("social-state/write: {error}")))?;
     }
     Ok(())
 }
@@ -7124,10 +7064,13 @@ pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority:
         .and_then(crate::initial_prompts::canonical_key)
         .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
     let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
-    let _authority = authority()?;
-    let mut state = load_social_state_for(context)?;
+    let gate = match authority()? {
+        Some(gate) => gate,
+        None => acquire_social_state_gate(context)?,
+    };
+    let mut state = gate.read()?;
     let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
-    write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
+    gate.commit(&state).map_err(|error| (500, format!("social-state/write: {error}")))?;
     Ok(result)
 }
 /// 本进程内"已见过的转发 id"（按会话）。JS 用内存 Set，Rust 用它兜住嵌套转发：
@@ -7476,7 +7419,7 @@ where
         return Err((400, "key 和 messageId/seq 不能为空".to_string()));
     }
     let agent_token = headers.get("x-agent-token").map(String::as_str);
-    let mut st = if context.is_isolated() {
+    let st = if context.is_isolated() {
         social_projection_request_state(
             context,
             cfg,
@@ -7514,7 +7457,7 @@ where
             .resolve_path(RuntimeArea::Data, "stickers.json", PathIntent::WriteFile)
             .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
         context
-            .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+            .resolve_path(RuntimeArea::Data, conversation_state::FILE, PathIntent::WriteFile)
             .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     }
     let now = now_ms();
@@ -7696,19 +7639,21 @@ where
         .unwrap_or(Value::Null);
     // 记账
     if !context.is_isolated() {
-    if let Some(conv) = st.get_mut("conversations").and_then(|c| c.get_mut(&storage_key)) {
-        let arr = conv
-            .as_object_mut()
-            .map(|o| o.entry("stickerCollectTimes").or_insert(json!([])));
-        if let Some(a) = arr.and_then(|v| v.as_array_mut()) {
-            a.push(json!(now));
-            if a.len() > 500 {
-                let keep = a.len() - 500;
-                a.drain(0..keep);
+        let _ = mutate_social_state_for(context, |state| {
+            if let Some(conv) = state.get_mut("conversations").and_then(|c| c.get_mut(&storage_key)) {
+                let arr = conv
+                    .as_object_mut()
+                    .map(|o| o.entry("stickerCollectTimes").or_insert(json!([])));
+                if let Some(a) = arr.and_then(|v| v.as_array_mut()) {
+                    a.push(json!(now));
+                    if a.len() > 500 {
+                        let keep = a.len() - 500;
+                        a.drain(0..keep);
+                    }
+                }
             }
-        }
-    }
-    let _ = write_json_atomic(SOCIAL_STATE, &st);
+            Ok(())
+        });
     }
     crate::safe_println!("[console] 收藏表情 {key}: {emoji_id_new}");
     crate::activity::append(
@@ -7931,16 +7876,10 @@ fn handle_stickers_note(context: &RuntimeContext, body: &str) -> Result<Value, (
 fn handle_activity_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let paused = req.get("paused").and_then(|v| v.as_bool()) == Some(true);
-    if context.is_isolated() {
-        update_selected_social_state(context, |state| {
-            state["paused"] = json!(paused);
-            Ok(())
-        })?;
-    } else {
-        let mut state = load_social_state_for(context)?;
+    mutate_social_state_for(context, |state| {
         state["paused"] = json!(paused);
-        write_social_state_for(context, &state).map_err(|e| (500, e))?;
-    }
+        Ok(())
+    })?;
     Ok(json!({ "ok": true, "paused": paused }))
 }
 /// `GET /api/preset/sim-prompt/backups`：列出某个预设的备份文件。
@@ -8044,11 +7983,11 @@ fn handle_session_reset_for(
     }
     write_json_atomic(SESSIONS_FILE, &store).map_err(|e| (500, e))?;
     // 二代会话状态也一并清掉（JS 里是 socialV2.conversations.delete(key)）
-    let mut v2 = load_social_state();
-    if let Some(obj) = v2.get_mut("conversations").and_then(|c| c.as_object_mut()) {
-        obj.remove(&key);
-    }
-    write_json_atomic(SOCIAL_STATE, &v2).map_err(|e| (500, e))?;
+    conversation_state::update_legacy_document(context, |state| {
+        if let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) {
+            conversations.remove(&key);
+        }
+    }).map_err(|error| (500, error))?;
     crate::safe_println!(
         "[console] 已清除会话上下文 {key}（旧会话 {old_session}；注意：未调用 DSH 归档/停止）"
     );
@@ -8104,19 +8043,7 @@ fn handle_session_reset_isolated(
 
     // Read and validate both selected files before changing either one. A missing social-state
     // file or malformed session document must not turn this reset into a legacy-path operation.
-    let social_text = context
-        .read_optional_text(RuntimeArea::Data, "social-v2.json")
-        .map_err(|_| (503, "runtime data is unavailable".to_string()))?
-        .ok_or_else(|| (503, "runtime data is unavailable".to_string()))?;
-    let social: Value = serde_json::from_str(&social_text)
-        .map_err(|_| (503, "runtime data is invalid".to_string()))?;
-    if !social.is_object()
-        || social
-            .get("conversations")
-            .is_some_and(|conversations| !conversations.is_object())
-    {
-        return Err((503, "runtime data is invalid".to_string()));
-    }
+    conversation_state::preflight_reset(context)?;
 
     // Preflight both write leaves before mutating either selected document. The two atomic
     // replacements are not a cross-file transaction; an I/O failure during the second replace
@@ -8125,7 +8052,7 @@ fn handle_session_reset_isolated(
         .resolve_path(RuntimeArea::Data, "sessions.json", PathIntent::WriteFile)
         .map_err(|_| (503, "runtime session data is unavailable".to_string()))?;
     context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+        .resolve_path(RuntimeArea::Data, conversation_state::FILE, PathIntent::WriteFile)
         .map_err(|_| (503, "runtime data is unavailable".to_string()))?;
 
     let old = crate::session_map::lookup(context, &key).map_err(|error| (503, error))?;
@@ -8939,7 +8866,7 @@ where
         .resolve_path(RuntimeArea::Data, "stickers.json", PathIntent::WriteFile)
         .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
     context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+        .resolve_path(RuntimeArea::Data, conversation_state::FILE, PathIntent::WriteFile)
         .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     let now = now_ms();
     let max_minute = crate::settings::send::RATE_MIN.integer(cfg);
@@ -9443,25 +9370,6 @@ fn handle_stickers_remark(
 /// `gapMode=auto` 用随机间隔 —— 那条路径的 `delays` 两边**天生不同**，
 /// 对拍只比固定/按字数两种模式。
 const SEND_CANCELLED_MESSAGE: &str = "发送已取消：会话、模式或白名单已变化";
-static LEGACY_SOCIAL_SEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Read-modify-write of the social state for send bookkeeping. Isolated roots go through the
-/// selected state gate (one atomic update); the legacy path serializes in-process.
-pub(crate) fn mutate_social_state_for<T>(
-    context: &RuntimeContext,
-    update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
-) -> Result<T, (u16, String)> {
-    if context.is_isolated() {
-        return update_selected_social_state(context, update).map(|(_, value)| value);
-    }
-    let _guard = LEGACY_SOCIAL_SEND_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut state = load_social_state_for(context)?;
-    let value = update(&mut state)?;
-    write_social_state_for(context, &state).map_err(|error| (500, error))?;
-    Ok(value)
-}
 
 // ── ticket 10：会话令牌（回合代际）与回合账本的管理端视图 ───────────────────────────
 
@@ -9484,19 +9392,6 @@ pub(crate) fn set_legacy_wait_deadline(context: &RuntimeContext, key: &str, dead
 /// Fresh agent token (48 hex chars from two OS-seeded ids).
 pub(crate) fn fresh_agent_token() -> String {
     format!("{}{}", crate::turn_ledger::mint_id(""), crate::turn_ledger::mint_id(""))
-}
-
-/// A conversation record as the JS bridge creates it lazily on first contact: default wake
-/// configuration (so the chat answers its first @ after a reset), empty message windows and a
-/// fresh agent token. The Rust inbound path never creates conversation records itself.
-pub(crate) fn new_conversation(context: &RuntimeContext) -> Value {
-    let cfg = context.load_config().unwrap_or_else(|_| json!({}));
-    let random = u64::from_str_radix(&crate::turn_ledger::mint_id("")[..8], 16).unwrap_or(0) as f64 / 4_294_967_296.0;
-    json!({
-        "wakeConfig": crate::wake::default_wake_config(&cfg, crate::turn_ledger::now_ms(), random),
-        "recentMessages": [], "unread": [], "lastWakeReason": "", "lastAiReplyAt": 0, "lastActionAt": 0,
-        "agentToken": fresh_agent_token(), "bootstrapSent": false, "wakeTimes": [], "sendTimes": [],
-    })
 }
 
 /// Journaled ingress reaches the same bounded recent/unread streams the public tools read.
@@ -11888,7 +11783,7 @@ fn isolated_request_preflight(req: &Request, context: &RuntimeContext) -> Result
     }
     let required_file = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/status") | ("GET", "/api/socialV2/state") => {
-            Some((RuntimeArea::Data, "social-v2.json".to_string()))
+            Some((RuntimeArea::Data, conversation_state::FILE.to_string()))
         }
         ("GET", "/api/sessions") => Some((RuntimeArea::Data, "sessions.json".to_string())),
         _ => None,
@@ -12545,7 +12440,7 @@ fn route_with_context(
         }
         let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
         // A set commits under the configuration gate after a fresh credential check, like persona writes.
-        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+        let authority = || -> Result<Option<Gate<'_>>, (u16, String)> {
             let gate = config_gate(context)?;
             let latest = selected_config_for_handler(context)?;
             if !authorized_in(context, req, &latest) {
@@ -12560,7 +12455,7 @@ fn route_with_context(
         let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
         // Writes commit under the configuration gate after a fresh credential check, like release
         // approval: a credential revoked while this request waited never writes.
-        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+        let authority = || -> Result<Option<Gate<'_>>, (u16, String)> {
             let gate = config_gate(context)?;
             let latest = selected_config_for_handler(context)?;
             if !authorized_in(context, req, &latest) {
@@ -14526,7 +14421,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         let mut settings_kept: Vec<&'static str> = Vec::new();
         let mut wake_error = None;
         let (config_before, restored, planned) = {
-            let _gate = acquire_social_state_gate(context)?;
+            let gate = acquire_social_state_gate(context)?;
             // Safe undo: only the state this record produced may be replaced. A later change of the
             // same file would be silently lost, so the operator must undo that one first.
             for (f, (file, _)) in files.iter().zip(&pending) {
@@ -14611,7 +14506,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     return Err((500, message));
                 }
                 if wake_changed {
-                    wake_error = reconcile_default_wake_configs(context, Some(&config_before)).err();
+                    wake_error = reconcile_default_wake_configs(context, Some(&gate), Some(&config_before)).err();
                 }
                 restored.push(file);
             }
@@ -14660,7 +14555,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         audit_write_file(context, file, &old)
             .map_err(|e| (500, format!("写回失败 {file}: {e}")))?;
         if let Some(before) = before.filter(|cfg| cfg["socialV2"]["wake"] != backup_cfg["socialV2"]["wake"]) {
-            reconcile_default_wake_configs(context, Some(&before))?;
+            reconcile_default_wake_configs(context, None, Some(&before))?;
         }
         restored.push(file.to_string());
     }

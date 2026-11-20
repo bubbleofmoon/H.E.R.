@@ -226,17 +226,6 @@ pub(super) fn attach_state_receipts(context: &RuntimeContext, state: &mut Value,
     }
 }
 
-/// Remove stored receipts from a state that was read or is about to be written (older builds persisted them).
-pub(super) fn strip_receipts(state: &mut Value) {
-    if let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) {
-        for conv in conversations.values_mut() {
-            if let Some(obj) = conv.as_object_mut() {
-                obj.remove("modelSeenSeqs");
-            }
-        }
-    }
-}
-
 /// JS `noteModelMessagesV2` bookkeeping: receipts are bounded by the unread buffer, only seqs that
 /// are in it count. `conv` is the conversation record (its token decides which session the receipts
 /// belong to).

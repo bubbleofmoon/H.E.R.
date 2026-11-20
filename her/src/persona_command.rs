@@ -19,7 +19,7 @@ pub fn handle(context: &RuntimeContext, key: &str, sender: &str, plain: &str) ->
     let administrator = crate::chat::is_owner_key(&cfg, key) && crate::chat::owner_qq(&cfg) == sender;
     // A change commits only while the sender is still the administrator, checked again under the
     // configuration gate (the reply guard below protects only the reply).
-    let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
+    let authority = || -> Result<Option<crate::conversation_state::Gate<'_>>, (u16, String)> {
         let gate = crate::console::acquire_social_state_gate(context)?;
         let latest = context.load_config().map_err(|_| (503, "configuration unavailable".to_string()))?;
         if !crate::chat::is_owner_key(&latest, key) || crate::chat::owner_qq(&latest) != sender {
@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(crate::persona::load(&context).unwrap()["default"], "p1");
         assert_eq!(super::execute(&context, "/persona 不存在", open), "人设「不存在」不存在。");
         // The owner is re-checked before the change, not only before the reply.
-        let moved = || -> Result<Option<std::fs::File>, (u16, String)> { Err((403, "administrator changed".to_string())) };
+        let moved = || Err((403, "administrator changed".to_string()));
         let before = std::fs::read(root.join("data/personas.json")).unwrap();
         assert_eq!(super::execute(&context, "/persona off group:1", &moved), "人设切换失败：administrator changed");
         assert_eq!(std::fs::read(root.join("data/personas.json")).unwrap(), before);

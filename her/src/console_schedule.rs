@@ -77,7 +77,7 @@ fn parse_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, Stri
 /// console writers hold) and rechecks the credential against the current configuration, as the backup and release
 /// settings writers do. A write that waited behind a rotation answers 401 and changes nothing. Writes into the social
 /// state take that same gate again inside their own update, so they release this one first and recheck there.
-fn authority(context: &RuntimeContext, req: &Request) -> Result<Option<std::fs::File>, (u16, String)> {
+fn authority<'a>(context: &'a RuntimeContext, req: &Request) -> Result<Option<Gate<'a>>, (u16, String)> {
     let gate = config_gate(context)?;
     let current = selected_config_for_handler(context)?;
     if !authorized_in(context, req, &current) {
