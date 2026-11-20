@@ -376,7 +376,7 @@ fn check_her_capacity(
         }
     }
     let conversation_cap = REMINDER_CONVERSATION_CAP.integer(config);
-    if in_conversation > conversation_cap { // RED-conversation-cap
+    if in_conversation >= conversation_cap {
         return Err(StoreError::Conflict(format!(
             "本会话的提醒已达上限（{conversation_cap} 条）"
         )));
