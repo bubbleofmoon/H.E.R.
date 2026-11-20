@@ -36,6 +36,8 @@ pub(crate) mod upgrades;
 const STATUS: &str = "lifecycle/dependencies.json";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const NPM_INSTALL_LIMIT: Duration = Duration::from_secs(600);
+const RELAY_PROBE_BUDGET: Duration = Duration::from_secs(3);
+const RELAY_PROBE_FAILURE_THRESHOLD: u64 = 3;
 
 /// A dependency's pinned version from runtime config: `None` when unpinned. A pin is one exact
 /// release version (`1.14.22`, `0.2.1-rc.2`); ranges, tags and build metadata are refused.
@@ -118,6 +120,9 @@ fn remember(states: &mut Value, name: &str, state: &str, found: &ProcessIdentity
         states[name]["refusalSince"] = Value::Null;
         states[name]["startedAt"] = json!(now);
         states[name]["ready"] = json!(false);
+        if name == "relay" {
+            states[name]["relayProbeFailures"] = Value::Null;
+        }
     }
     states[name]["state"] = json!(state);
     states[name]["identity"] = json!(found);
@@ -623,6 +628,7 @@ pub(crate) fn probe_relay(
     cfg: &Value,
     deadline: Instant,
 ) -> Result<(), String> {
+    let deadline = deadline.min(Instant::now() + RELAY_PROBE_BUDGET);
     let dependency = configuration(context, cfg, "relay")?;
     dependency
         .relay
@@ -1407,22 +1413,51 @@ fn listening(dependency: &Dependency) -> Result<bool, String> {
     }
 }
 
-fn check_port(states: &mut Value, dependency: &Dependency) -> Result<bool, String> {
+enum PortHealth {
+    Ready,
+    ConnectionRefused,
+    ProbeFailed,
+}
+
+fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth, String> {
     let result = listening(dependency).and_then(|listening| {
         if listening {
             if let Some(settings) = &dependency.relay {
-                settings.probe(
-                    dependency.endpoint,
-                    Instant::now() + Duration::from_millis(500),
-                )?;
+                settings.probe(dependency.endpoint, Instant::now() + RELAY_PROBE_BUDGET)?;
             }
         }
         Ok(listening)
     });
-    if result.is_err() {
-        states[dependency.name]["refusalSince"] = Value::Null;
+    let state = &mut states[dependency.name];
+    match result {
+        Ok(listening) => {
+            if dependency.relay.is_some() {
+                state["relayProbeFailures"] = Value::Null;
+            }
+            Ok(if listening {
+                PortHealth::Ready
+            } else {
+                PortHealth::ConnectionRefused
+            })
+        }
+        Err(reason) => {
+            // Only a confirmed connection refusal advances the hang timer.
+            state["refusalSince"] = Value::Null;
+            if dependency.relay.is_some() {
+                state["healthySince"] = Value::Null;
+                let failures = state["relayProbeFailures"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .min(RELAY_PROBE_FAILURE_THRESHOLD);
+                state["relayProbeFailures"] = json!(failures);
+                if failures < RELAY_PROBE_FAILURE_THRESHOLD {
+                    return Ok(PortHealth::ProbeFailed);
+                }
+            }
+            Err(reason)
+        }
     }
-    result
 }
 
 fn stop_hung(
@@ -1457,9 +1492,13 @@ fn stop_hung(
             dependency.name
         ));
     }
-    if check_port(states, dependency)? {
-        healthy(states, dependency.name, clock.now(context));
-        return Ok(true);
+    match check_port(states, dependency)? {
+        PortHealth::Ready => {
+            healthy(states, dependency.name, clock.now(context));
+            return Ok(true);
+        }
+        PortHealth::ProbeFailed => return Ok(false),
+        PortHealth::ConnectionRefused => {}
     }
     match identity::kill_verified(found) {
         identity::KillOutcome::Killed | identity::KillOutcome::Gone => {
@@ -1652,9 +1691,13 @@ fn reconcile_one(
             "{name} identity changed during monitoring; left alone"
         ));
     }
-    if check_port(states, dependency)? {
-        healthy(states, name, clock.now(context));
-        return Ok(true);
+    match check_port(states, dependency)? {
+        PortHealth::Ready => {
+            healthy(states, name, clock.now(context));
+            return Ok(true);
+        }
+        PortHealth::ProbeFailed => return Ok(false),
+        PortHealth::ConnectionRefused => {}
     }
     let now = clock.now(context);
     let since = states[name]["refusalSince"].as_i64().unwrap_or(now);

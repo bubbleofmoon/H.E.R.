@@ -244,6 +244,9 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
         std::fs::write(folder.join("client-key"), "synthetic-relay-secret-80").unwrap();
         std::fs::write(folder.join("auth/login.json"), "synthetic-private-login").unwrap();
         std::fs::write(folder.join("mode"), mode).unwrap();
+        if mode == "scripted" {
+            std::fs::File::create(folder.join("probe-responses")).unwrap();
+        }
         let reservation = crate::support::ports::reserve();
         let port = reservation.port();
         std::fs::write(
@@ -390,6 +393,47 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+    fn relay_health(&self) -> Value {
+        let output = self
+            .command(&self.cli)
+            .args(["lifecycle", "assert-running", "--runtime-root"])
+            .arg(&self.root)
+            .output()
+            .unwrap();
+        let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+        verdict["parts"]["relay"].clone()
+    }
+    fn script_relay_probes(
+        &self,
+        folder: &std::path::Path,
+        statuses: &[u16],
+        mut after_probe: impl FnMut(usize),
+    ) {
+        use std::io::Write;
+        let mut responses = std::fs::OpenOptions::new()
+            .append(true)
+            .open(folder.join("probe-responses"))
+            .unwrap();
+        let probes = folder.join("probes");
+        self.wait(|| count_lines(&probes) >= 1);
+        for (index, status) in statuses.iter().enumerate() {
+            writeln!(responses, "{status}").unwrap();
+            // The next request establishes that the prior pass has checkpointed its result.
+            self.wait(|| count_lines(&probes) >= index + 2);
+            after_probe(index + 1);
+        }
+    }
+    fn relay_refusal_log(&self) -> PathBuf {
+        self.root.join("data/logs/dependency-relay.err.log")
+    }
+    fn enable_alerts(&mut self) {
+        self.config["ownerQQ"] = json!(42);
+        std::fs::write(
+            self.root.join("config/config.json"),
+            self.config.to_string(),
+        )
+        .unwrap();
+    }
     fn fake_config(&self, folder: &str, field: &str, value: Value) {
         let path = self.root.join(folder).join("fixture.json");
         let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -433,6 +477,10 @@ impl Drop for Fixture {
     }
 }
 
+fn count_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).unwrap_or_default().lines().count()
+}
+
 #[cfg(feature = "parity-clock")]
 impl Fixture {
     fn clock(&self, now: i64) {
@@ -452,14 +500,6 @@ impl Fixture {
             .unwrap_or_default()
             .lines()
             .count()
-    }
-    fn enable_alerts(&mut self) {
-        self.config["ownerQQ"] = json!(42);
-        std::fs::write(
-            self.root.join("config/config.json"),
-            self.config.to_string(),
-        )
-        .unwrap();
     }
     fn crash_dsh(&self) {
         let instance = serde_json::from_value::<process_identity::ProcessIdentity>(
@@ -2704,6 +2744,87 @@ fn relay_readiness_gates_dsh_and_shared_health_without_exposing_secrets() {
             );
         }
     }
+}
+
+#[test]
+fn relay_reconciler_and_shared_health_use_the_same_probe_budget() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("slow");
+    fixture.start();
+    // The fourth request starts after three full reconciler probes have completed.
+    fixture.wait(|| count_lines(&folder.join("probes")) >= 4);
+    assert_eq!(
+        fixture.states()["relay"]["ready"],
+        true,
+        "reconciler must accept a relay response after a brief first-read stall"
+    );
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+    assert_eq!(count_lines(&fixture.root.join("snow/alerts")), 0);
+    assert_eq!(fixture.relay_health()["verdict"], "pass");
+
+    // The same probes must time out before a response that would fit the CLI's outer budget.
+    std::fs::write(folder.join("mode"), "late").unwrap();
+    assert_eq!(fixture.relay_health()["verdict"], "fail");
+    fixture.wait_for(Duration::from_secs(25), || {
+        fixture.states()["relay"]["state"] == "refused"
+    });
+    assert_eq!(
+        fixture.states()["relay"]["reason"],
+        "relay health response failed or timed out"
+    );
+}
+
+#[test]
+fn relay_alerts_only_on_the_third_consecutive_failed_probe() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    fixture.start();
+    let reason = "relay models health request was refused";
+    let alerts = fixture.root.join("snow/alerts");
+    let relay_alerts = || {
+        std::fs::read_to_string(&alerts)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(reason))
+            .count()
+    };
+
+    fixture.script_relay_probes(&folder, &[200, 503, 503, 503, 503], |completed| {
+        let state = &fixture.states()["relay"];
+        assert_eq!(state["ready"], true);
+        if completed < 4 {
+            assert_ne!(
+                state["state"], "refused",
+                "the reconciler must wait for three failed relay probes"
+            );
+            assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+            assert_eq!(relay_alerts(), 0);
+        } else {
+            assert_eq!(state["state"], "refused");
+            assert_eq!(state["reason"], reason);
+            assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+            fixture.wait(|| relay_alerts() == 1);
+        }
+    });
+}
+
+#[test]
+fn a_successful_relay_probe_resets_the_failure_streak() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503, 200, 503, 503], |completed| {
+        assert_ne!(
+            fixture.states()["relay"]["state"],
+            "refused",
+            "a success must reset the failed-probe streak (after probe {completed})"
+        );
+        assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+        assert_eq!(count_lines(&fixture.root.join("snow/alerts")), 0);
+    });
 }
 
 #[test]
