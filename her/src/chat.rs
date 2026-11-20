@@ -631,7 +631,7 @@ fn send_recorded_inline(
         report.error = Some(format!("无效会话 {key}"));
         return report;
     };
-    let literal = false; // RED-M3
+    let literal = purpose == crate::send_outbox::PERSONA_FAILURE_SEND;
     let parts = if literal {
         vec![text.to_owned()]
     } else {
