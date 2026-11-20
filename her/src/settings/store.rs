@@ -1287,7 +1287,7 @@ fn validate_rollout_change<'a>(
     let Ok(keys) = crate::watchdog::rollout_groups(&after["rollout"]["rustGroups"]) else { return Ok(()) };
     for (kind, setting) in ROLLOUT_ALLOW_LISTS {
         let allowed = allow_ids(setting, &after);
-        if rollout_written && allowed != allow_ids(setting, &before) { // RED-3
+        if rollout_written || allowed != allow_ids(setting, &before) {
             if let Some(key) = unallowed_rollout_key(&keys, kind, &allowed) {
                 return Err((409, format!("{} requires {key} to be in {}", ROLLOUT_GROUPS.key, setting.key)));
             }
