@@ -275,7 +275,7 @@ pub(super) fn rank(
     let runner = fixture.as_ref().unwrap_or(&MODEL);
     #[cfg(not(test))]
     let runner = &MODEL;
-    let deadline = Instant::now() + INFERENCE_BUDGET;
+    let deadline = Instant::now() + INFERENCE_BUDGET + Duration::from_secs(3); // RED-M5
     let Inference {
         query: result,
         rows,
