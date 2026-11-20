@@ -1281,7 +1281,7 @@ fn record_change(
     }
     let mut old_value = old.map(|(old_text, _)| old_text);
     let mut new_value = new.map(str::to_string);
-    if setting.secret && setting.key != ADMINISTRATOR_PASSWORD.key { // RED-M1
+    if setting.secret {
         let marker = json!(SECRET_MARKER).to_string();
         (old_value, new_value) = (Some(marker.clone()), Some(marker));
     }
