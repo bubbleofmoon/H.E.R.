@@ -200,16 +200,7 @@ fn known_tokens(context: &RuntimeContext) -> Vec<String> {
     }
     let tokens: Vec<String> = crate::conversation_state::read_document(context)
         .ok()
-        .and_then(|state| {
-            state.get("conversations").and_then(Value::as_object).map(|conversations| {
-                conversations
-                    .values()
-                    .filter_map(|c| c.get("agentToken").and_then(Value::as_str))
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-        })
+        .map(|state| crate::conversation_state::active_agent_tokens(&state).map(str::to_string).collect())
         .unwrap_or_default();
     cache.insert(scope, (identity, tokens.clone()));
     tokens

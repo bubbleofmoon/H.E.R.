@@ -3853,17 +3853,7 @@ fn social_projection_write_denial(
 /// JS 还留着每个会话「上一代」的令牌（模型上下文里最可能残留的那一个）；
 /// Rust 目前只记当前代，所以上一代令牌如果被写进记忆，这里不会被打码。
 fn social_tokens(state: &Value) -> Vec<String> {
-    state
-        .get("conversations")
-        .and_then(|c| c.as_object())
-        .map(|m| {
-            m.values()
-                .filter_map(|c| c.get("agentToken").and_then(|t| t.as_str()))
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    conversation_state::active_agent_tokens(state).map(str::to_string).collect()
 }
 
 /// 取出会话并发号，统一处理 key 归一化与「会话不存在」。
@@ -4733,19 +4723,7 @@ fn agent_token_ok(key: &str, token: &str) -> bool {
         return false;
     }
     let state = conversation_state::read_legacy_document(&RuntimeContext::legacy());
-    let expected = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|c| c.get("agentToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    !expected.is_empty()
-        && expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    conversation_state::matches_agent_token(&state["conversations"][key], token)
 }
 
 fn agent_token_ok_for(
@@ -4766,19 +4744,7 @@ fn agent_token_matches_state(state: &Value, key: &str, token: &str) -> bool {
     }
     let canonical_key = canonical_v2_key(key);
     let lookup_key = canonical_key.as_deref().unwrap_or(key);
-    let expected = state
-        .get("conversations")
-        .and_then(|c| c.get(lookup_key))
-        .and_then(|t| t.get("agentToken"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    !expected.is_empty()
-        && expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    conversation_state::matches_agent_token(&state["conversations"][lookup_key], token)
 }
 
 fn agent_memory_denial(
@@ -5015,7 +4981,7 @@ pub(super) fn handle_wait_post(
     let poll_conversation = || -> Result<Option<Value>, (u16, String)> {
         let Ok(state) = load_social_state_for(context) else { return Ok(None) };
         let current = state.get("conversations").and_then(|c| c.get(&key)).cloned();
-        if is_agent && current.as_ref().and_then(|c| c.get("agentToken")).and_then(Value::as_str) != agent_token {
+        if is_agent && current.as_ref().and_then(conversation_state::agent_token) != agent_token {
             return Err((403, CHANGED.to_string()));
         }
         Ok(Some(current.unwrap_or_else(|| json!({}))))
@@ -5481,7 +5447,7 @@ pub(crate) fn wait_policy(cfg: &Value) -> WaitPolicy {
 /// Selected turns keep their durable identity across console restarts and DSH re-attachment.
 /// No-ledger callers use the persisted legacy turn ID, retaining lastWakeAt for older records.
 fn wait_usage(context: &RuntimeContext, key: &str, conv: &Value) -> Result<(String, u64), (u16, String)> {
-    let epoch = crate::send_outbox::token_epoch(conv["agentToken"].as_str().unwrap_or(""));
+    let epoch = conversation_state::token_epoch(conversation_state::agent_token(conv).unwrap_or(""));
     let turn = if context.is_isolated() {
         let records = crate::turn_ledger::read_records(context).map_err(|_| (503, "wait turn ledger is unavailable".to_string()))?;
         crate::turn_ledger::fold(&records).0.into_iter().rev()
@@ -5629,7 +5595,7 @@ pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Resu
     let state = load_social_state_for(context).map_err(|(_, e)|e)?;
     let conv = &state["conversations"][key];
     let pending = &conv["activeWait"];
-    let epoch = crate::send_outbox::token_epoch(conv["agentToken"].as_str().unwrap_or(""));
+    let epoch = conversation_state::token_epoch(conversation_state::agent_token(conv).unwrap_or(""));
     if pending["purpose"] != "messages" || pending["epoch"] != epoch { return Ok(None); }
     let (Some(console), Some(request), Some(turn)) = (pending["console"].as_str(), pending["id"].as_str(), pending["turn"].as_str()) else { return Ok(None); };
     // The pipeline and console are different processes. Only the live owning request
@@ -8193,9 +8159,7 @@ fn handle_mode_post_locked(context: &RuntimeContext, body: &str, sync_dsh: bool)
     if changed {
         // Rotate before publishing the new mode; even an immediate round trip revokes old tools.
         mutate_social_state_for(context, |state| {
-            if let Some(conversations) = state["conversations"].as_object_mut() {
-                for conv in conversations.values_mut() { conv["agentToken"] = json!(fresh_agent_token()); }
-            }
+            conversation_state::rotate_all_agent_tokens(state);
             Ok(())
         })?;
         // Queued ingress must stay invalid after a restart before the driver's next tick.
@@ -9389,11 +9353,6 @@ pub(crate) fn set_legacy_wait_deadline(context: &RuntimeContext, key: &str, dead
 }
 
 
-/// Fresh agent token (48 hex chars from two OS-seeded ids).
-pub(crate) fn fresh_agent_token() -> String {
-    format!("{}{}", crate::turn_ledger::mint_id(""), crate::turn_ledger::mint_id(""))
-}
-
 /// Journaled ingress reaches the same bounded recent/unread streams the public tools read.
 /// Replays after a crash between this write and dispatch keep their original sequence.
 pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, key: &str, event_key: &str, mut message: Value) -> Result<i64, String> {
@@ -9452,7 +9411,7 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
         }
         let conv = &mut state["conversations"][key];
         let previous = conv.clone();
-        let token = conv["agentToken"].as_str().ok_or((503,"wake has no agent token".to_string()))?.to_string();
+        let token = conversation_state::agent_token(conv).ok_or((503,"wake has no agent token".to_string()))?.to_string();
         if expected.is_some_and(|expected| expected != token) {
             return Err((409, "queued wake token invalidated".to_string()));
         }
@@ -9473,7 +9432,7 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
 pub(crate) fn consume_reserved2_deadline(context: &RuntimeContext, key: &str, token: &str, at: i64, previous: &Value) -> Result<(), String> {
     mutate_social_state_for(context, |state| {
         let conv = &mut state["conversations"][key];
-        if conv["agentToken"].as_str() != Some(token) { return Err((403, "queued wake token invalidated".into())); }
+        if conversation_state::agent_token(conv) != Some(token) { return Err((403, "queued wake token invalidated".into())); }
         if conv["wakeConfig"]["lastWakeAt"].as_i64() == Some(at)
             && conv["wakeConfig"]["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
             && conv["wakeConfig"]["sleepUntil"] == previous["wakeConfig"]["sleepUntil"] {
@@ -9500,7 +9459,7 @@ pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,pr
 pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, started: Option<i64>, closing_seen: &Value, miss: u32) -> Result<(bool, Value), String> {
     mutate_social_state_for(context, |state| {
         let conv = &mut state["conversations"][key];
-        if conv["agentToken"].as_str() != Some(token) { return Err((403, "completed turn token invalidated".into())); }
+        if conversation_state::agent_token(conv) != Some(token) { return Err((403, "completed turn token invalidated".into())); }
         let stamp = conv["wakeConfig"]["confirmedAt"].clone();
         let closed = stamp != *closing_seen && matches!(conv["wakeConfig"]["confirmedBy"].as_str(), Some("mark_read" | "set_wake_config"));
         let now = crate::now_ms() as i64;
@@ -9611,9 +9570,7 @@ pub(crate) fn apply_closed_agent_owner(context: &RuntimeContext, owner: &Value) 
     context.write_atomic(RuntimeArea::Data, "closed-agent-owner.json", policy.to_string().as_bytes())?;
     if !changed { return Ok(()); }
     mutate_social_state_for(context, |state| {
-        if let Some(conversations) = state["conversations"].as_object_mut() {
-            for conv in conversations.values_mut() { conv["agentToken"] = json!(fresh_agent_token()); }
-        }
+        conversation_state::rotate_all_agent_tokens(state);
         Ok(())
     }).map_err(|(_, e)| e)?;
     for (key, session) in crate::session_map::all(context)? {
@@ -9744,7 +9701,8 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
             let cfg=context.load_config().map_err(|e|(503,e.to_string()))?;
             if runtime_mode(context)!="reserved2" || state["paused"]==true || !inbound_admitted(&cfg,key)
                 || cfg.pointer("/socialV2/enabled")==Some(&json!(false))
-                || ["agentToken","lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
+                || !conversation_state::same_stored_agent_token(previous, expected)
+                || ["lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
                 return Ok(None);
             }
             let (turns,_)=crate::turn_ledger::fold(&crate::turn_ledger::read_records(context).map_err(|e|(503,e))?);
@@ -9752,7 +9710,7 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
         }
         let mapped=crate::session_map::lookup(context,key).map_err(|e|(503,e))?;
         let partial_rotation=guard.is_some() && old.is_some() && mapped.is_none()
-            && crate::session_map::unrevoked_rotation(context,key,previous["agentToken"].as_str().unwrap_or("")).map_err(|e|(503,e))?.as_deref()==old;
+            && crate::session_map::unrevoked_rotation(context,key,conversation_state::agent_token(previous).unwrap_or("")).map_err(|e|(503,e))?.as_deref()==old;
         if mapped.as_deref()!=old && !partial_rotation {return Ok(None);}
         crate::turn_ledger::record_reset(context,key).map_err(|e|(503,e))?;
         crate::reserved::reset_conversation(context,key).map_err(|e|(503,e))?;
@@ -9763,12 +9721,12 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
         }
         let mut replacement = if guard.is_some() {previous.clone()} else {new_conversation(context)};
         if guard.is_some() {
-            replacement["agentToken"]=json!(fresh_agent_token());
+            conversation_state::rotate_agent_token(&mut replacement);
             replacement["bootstrapSent"]=json!(true);
         } else {
             preserve_reset_sticker_liabilities(previous,&mut replacement);
         }
-        let token=replacement["agentToken"].as_str().unwrap_or("").to_string();
+        let token=conversation_state::agent_token(&replacement).unwrap_or("").to_string();
         if !state["conversations"].is_object() {state["conversations"]=json!({});}
         state["conversations"][key]=replacement;
         Ok(Some(token))
@@ -9860,10 +9818,8 @@ pub(crate) fn handle_turns_resolve(context: &RuntimeContext, body: &str) -> Resu
 /// Whether the conversation's current agent token is the one this batch was created under.
 fn conversation_matches_epoch(conversation: &Value, epoch: &str) -> bool {
     epoch.is_empty()
-        || conversation
-        .get("agentToken")
-        .and_then(Value::as_str)
-        .is_some_and(|token| !token.is_empty() && crate::send_outbox::token_epoch(token) == epoch)
+        || conversation_state::active_agent_token(conversation)
+            .is_some_and(|token| conversation_state::token_epoch(token) == epoch)
 }
 
 // Reset revokes pending operations but must not erase their possible remote effects.
@@ -10208,7 +10164,7 @@ fn finish_send_batch(
                     targeting["replyToUserId"] = user.clone();
                 }
             }
-            let tokens: Vec<String> = [console_token.clone(), conv_value.get("agentToken").and_then(Value::as_str).unwrap_or("").to_string()]
+            let tokens: Vec<String> = [console_token.clone(), conversation_state::agent_token(&conv_value).unwrap_or("").to_string()]
                 .into_iter()
                 .filter(|t| !t.is_empty())
                 .collect();

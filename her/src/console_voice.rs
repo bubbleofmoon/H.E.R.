@@ -487,11 +487,7 @@ impl Failure {
 fn known_tokens(context: &RuntimeContext) -> Vec<String> {
     load_social_state_for(context)
         .ok()
-        .and_then(|state| {
-            state.get("conversations").and_then(Value::as_object).map(|all| {
-                all.values().filter_map(|c| c.get("agentToken").and_then(Value::as_str)).filter(|t| !t.is_empty()).map(str::to_string).collect()
-            })
-        })
+        .map(|state| conversation_state::active_agent_tokens(&state).map(str::to_string).collect())
         .unwrap_or_default()
 }
 

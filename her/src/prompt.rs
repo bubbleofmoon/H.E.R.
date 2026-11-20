@@ -1,7 +1,8 @@
 //! 唤醒提示词构造；单元测试和 persona_prompt_e2e 验证选定运行目录中的提示词。
 
-use serde_json::Value;
+use crate::conversation_state;
 use crate::runtime::{RuntimeArea, RuntimeContext};
+use serde_json::Value;
 
 fn social_state_for_runtime(context: &RuntimeContext) -> Value {
     crate::conversation_state::read_document(context)
@@ -658,7 +659,7 @@ pub fn recall_block_with_runtime(
     st: &Value,
     key: &str,
 ) -> String {
-    let held = match (crate::session_map::lookup(context, key), st["agentToken"].as_str()) {
+    let held = match (crate::session_map::lookup(context, key), conversation_state::agent_token(st)) {
         (Ok(Some(sid)), Some(epoch)) => crate::session_map::context_record(context, key, &sid, epoch)
             .map(|record| crate::briefing_delivery::plan(&record).held).unwrap_or_default(),
         _ => Vec::new(),
@@ -1093,7 +1094,7 @@ pub fn build_reminder_with_runtime(
         .and_then(|c| c.get(key))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let token = st.get("agentToken").and_then(|t| t.as_str()).unwrap_or("");
+    let token = conversation_state::agent_token(&st).unwrap_or("");
     let pre_sleep_ms = crate::wake::prompt_pre_sleep_wait_ms(&cfg);
 
     let mut out = String::new();
@@ -1201,7 +1202,7 @@ fn build_inner(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let st = state_with_runtime_recent(&persisted_st, runtime_recent);
-    let token = st.get("agentToken").and_then(|t| t.as_str()).unwrap_or("");
+    let token = conversation_state::agent_token(&st).unwrap_or("");
 
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
@@ -2060,7 +2061,7 @@ pub(crate) fn render_wake(
     let cfg = &delivery_cfg;
     let state = context.read_social_state()?;
     let st = &state["conversations"][key];
-    if st["agentToken"].as_str() != Some(epoch) { return Err("wake epoch changed before briefing".into()); }
+    if conversation_state::agent_token(st) != Some(epoch) { return Err("wake epoch changed before briefing".into()); }
     // Capture the briefing generation before any section is rendered. A persona switch saves the
     // library before it bumps the generation, so sections rendered after this capture are at least
     // as new as it; a bump after it fails the pending guard below and the caller prepares again.

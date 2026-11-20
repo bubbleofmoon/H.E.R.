@@ -29,10 +29,8 @@ fn receipt_scope(context: &RuntimeContext) -> String {
 
 /// Token epoch of a conversation record ("" when it has no token).
 fn epoch_of(conv: &Value) -> String {
-    conv.get("agentToken")
-        .and_then(Value::as_str)
-        .filter(|t| !t.is_empty())
-        .map(crate::send_outbox::token_epoch)
+    conversation_state::active_agent_token(conv)
+        .map(conversation_state::token_epoch)
         .unwrap_or_default()
 }
 
@@ -259,12 +257,7 @@ fn is_live_agent_token(context: &RuntimeContext, token: &str) -> Result<bool, (u
     let Some(conversations) = state.get("conversations").and_then(Value::as_object) else {
         return Ok(false);
     };
-    Ok(conversations.values().any(|conv| {
-        let expected = conv.get("agentToken").and_then(Value::as_str).unwrap_or("");
-        !expected.is_empty()
-            && expected.len() == token.len()
-            && expected.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
-    }))
+    Ok(conversations.values().any(|conv| conversation_state::matches_agent_token(conv, token)))
 }
 
 const ADMIN_ONLY_V2_PATHS: [&str; 6] = [

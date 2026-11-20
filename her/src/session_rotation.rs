@@ -31,7 +31,7 @@ pub(crate) fn candidate(
 ) -> Result<Option<Plan>, String> {
     let state = context.read_social_state()?;
     let conv = &state["conversations"][key];
-    let epoch = conv["agentToken"].as_str().unwrap_or("");
+    let epoch = crate::conversation_state::agent_token(conv).unwrap_or("");
     let sid = match crate::session_map::lookup(context, key)? {
         Some(sid) => sid,
         None => match crate::session_map::unrevoked_rotation(context, key, epoch)? {

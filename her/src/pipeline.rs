@@ -1632,7 +1632,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             || !crate::console::inbound_admitted(&cfg, key)
             || cfg.pointer("/socialV2/enabled") == Some(&serde_json::json!(false))
             || state["paused"] == true
-            || conv["agentToken"].as_str() != Some(self.turn_token.as_str())
+            || crate::conversation_state::agent_token(conv) != Some(self.turn_token.as_str())
         {
             return Err("mode, permission or turn generation changed".into());
         }

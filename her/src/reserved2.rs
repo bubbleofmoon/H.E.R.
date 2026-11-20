@@ -1,6 +1,6 @@
 //! Live selected-runtime owner of the existing wake driver. Turns run independently of ingress.
 use crate::{
-    chat, console, inbound, inbound_text, pipeline, prompt,
+    chat, console, conversation_state, inbound, inbound_text, pipeline, prompt,
     runtime::{RuntimeArea, RuntimeContext},
     session,
 };
@@ -3103,7 +3103,7 @@ impl Hub {
         }
         let minted = active.map(|a| a.minted.lock().unwrap_or_else(|p| p.into_inner()));
         let state = self.state()?;
-        let current = state["conversations"][key]["agentToken"].as_str().unwrap_or("");
+        let current = conversation_state::agent_token(&state["conversations"][key]).unwrap_or("");
         let valid = state["resetEpoch"] == self.reset_stamp && !current.is_empty();
         let published = minted.as_ref().is_some_and(|m| m.as_deref() == Some(current));
         if valid && published {
@@ -3500,7 +3500,7 @@ impl Hub {
             self.journal.mark_handled(vec![inbound_key], now).await?;
             return Ok(());
         }
-        let token = conv["agentToken"].as_str().unwrap_or("").to_string();
+        let token = conversation_state::agent_token(conv).unwrap_or("").to_string();
         if self.tokens.get(&key).is_some_and(|old| old != &token) {
             self.invalidate_key(&key, now).await?;
         }
@@ -3597,7 +3597,7 @@ impl Hub {
         let mut running = HashMap::new();
         if console::runtime_mode(&self.context) == "reserved2" && state["paused"] != true {
             for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
-                let token = state["conversations"][&turn.key]["agentToken"].as_str().unwrap_or("");
+                let token = conversation_state::agent_token(&state["conversations"][&turn.key]).unwrap_or("");
                 if !token.is_empty() && console::inbound_admitted(cfg, &turn.key)
                     && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
                     && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
@@ -3609,7 +3609,7 @@ impl Hub {
             .map(|(key, owned)| (key.clone(), owned.clone())).collect();
         self.recovered = running;
         for (key, (turn_id, token)) in ended {
-            if state["conversations"][&key]["agentToken"].as_str() == Some(token.as_str())
+            if conversation_state::agent_token(&state["conversations"][&key]) == Some(token.as_str())
                 && turns.iter().any(|t| t.id == turn_id && t.state == crate::turn_ledger::State::Completed) {
                 self.settle_turn_coverage(cfg, &key, &token, &turn_id, now).await?;
             }
@@ -3692,7 +3692,7 @@ impl Hub {
                     self.maintenance.insert(key,m);
                 }
                 MaintenanceResult::Digest(crate::session_rotation::DigestResult::Done{ran,retire_unknown})=>{
-                    if current["agentToken"].as_str().is_some_and(|token| !token.is_empty() && token != m.plan.epoch) {
+                    if conversation_state::active_agent_token(&current).is_some_and(|token| token != m.plan.epoch) {
                         crate::session_rotation::recovery_complete(&self.context,&key);
                         continue;
                     }
@@ -3700,7 +3700,7 @@ impl Hub {
                     // Unverifiable work must lose its old token before queued ingress can
                     // use a fresh session, even when the old DSH cancel route is broken.
                     let guard=if retire_unknown {current} else {m.plan.guard.clone()};
-                    if retire_unknown && guard["agentToken"].as_str()!=Some(m.plan.epoch.as_str()) {continue;}
+                    if retire_unknown && conversation_state::agent_token(&guard)!=Some(m.plan.epoch.as_str()) {continue;}
                     let retired=console::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
                     if retired.is_err() || (retire_unknown && !retired.as_ref().is_ok_and(|token|token.is_some())) {
                         if retired.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");}
@@ -3799,7 +3799,7 @@ impl Hub {
                 else if !console::inbound_admitted(&cfg, &key) { "notAllowed" }
                 else if state["conversations"].get(key.as_str()).is_none() { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
-                    old.as_str() != state["conversations"][&key]["agentToken"].as_str().unwrap_or("")
+                    old.as_str() != conversation_state::agent_token(&state["conversations"][&key]).unwrap_or("")
                 }) { "tokenChanged" }
                 else { continue; };
             invalid.push((key, predicate));
@@ -3870,7 +3870,7 @@ impl Hub {
             d.refresh_observed_state(conv, now);
             self.tokens
                 .entry(key.clone())
-                .or_insert_with(|| conv["agentToken"].as_str().unwrap_or("").to_string());
+                .or_insert_with(|| conversation_state::agent_token(conv).unwrap_or("").to_string());
             d.arm_proactive_now(now);
             d.sched.prompt_running = self.active.contains_key(key) || self.recovered.contains_key(key) || self.maintenance.contains_key(key);
         }
@@ -3896,7 +3896,7 @@ impl Hub {
                 && active.reason != "wakeReminder" && active.previous["wakeConfig"]["sleepUntil"].is_string()
             {
                 // A wake refused at the gate never got to consume its durable timer claim.
-                let token = state["conversations"][&key]["agentToken"].as_str().unwrap_or_default();
+                let token = conversation_state::agent_token(&state["conversations"][&key]).unwrap_or_default();
                 console::consume_reserved2_deadline(&self.context, &key, token, active.at, &active.previous)?;
             }
             let active = self.active.remove(&key).unwrap();
@@ -4164,7 +4164,7 @@ impl Hub {
                 let expected = self.tokens.get(&key).filter(|t| !t.is_empty()).cloned();
                 let (previous, dispatch_token) = if reason == "wakeReminder" {
                     let conv = self.state()?["conversations"][&key].clone();
-                    let token = conv["agentToken"].as_str().unwrap_or("").to_string();
+                    let token = conversation_state::agent_token(&conv).unwrap_or("").to_string();
                     if expected.as_ref().is_some_and(|t| *t != token) {
                         return Err(STALE_WAKE.to_string());
                     }

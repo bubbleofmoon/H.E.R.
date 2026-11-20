@@ -1651,11 +1651,7 @@ pub fn session_env_for_runtime(context: &RuntimeContext, key: &str) -> Vec<(Stri
     let Ok(v) = context.read_social_state() else {
         return Vec::new();
     };
-    let token = v
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|s| s.get("agentToken"))
-        .and_then(|t| t.as_str())
+    let token = crate::conversation_state::agent_token(&v["conversations"][key])
         .unwrap_or("")
         .trim();
     if token.is_empty() {

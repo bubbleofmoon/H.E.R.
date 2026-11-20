@@ -21,17 +21,7 @@ fn token_ok(context: &RuntimeContext, key: &str, token: &str) -> bool {
     let Some(conv) = state.get("conversations").and_then(|c| c.get(key)) else {
         return false;
     };
-    let expected = conv
-        .get("agentToken")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    // 定长比较，避免按字节提前返回
-    expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    crate::conversation_state::matches_agent_token(conv, token)
 }
 
 #[cfg(test)]

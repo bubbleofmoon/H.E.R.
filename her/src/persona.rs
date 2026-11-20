@@ -489,7 +489,7 @@ pub fn assign(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
 pub(crate) fn rebrief(context: &RuntimeContext, key: &str) -> Result<bool, String> {
     let Some(sid) = crate::session_map::lookup(context, key)? else { return Ok(false) };
     let state = context.read_social_state()?;
-    let Some(epoch) = state["conversations"][key]["agentToken"].as_str().map(str::to_string) else { return Ok(false) };
+    let Some(epoch) = crate::conversation_state::agent_token(&state["conversations"][key]).map(str::to_string) else { return Ok(false) };
     crate::session_map::update_context(context, key, &sid, &epoch, crate::briefing_delivery::next_generation)
 }
 

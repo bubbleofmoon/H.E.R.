@@ -694,11 +694,11 @@ fn revoke_key(context: &RuntimeContext, cfg: &Value, key: &str, why: &str) -> Re
         if let Some(conversation) = state
             .get_mut("conversations")
             .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
+            .filter(|c| c.is_object())
         {
-            conversation.insert("agentToken".into(), json!(fresh_agent_token()));
-            conversation.insert("bootstrapSent".into(), json!(false));
-            conversation.remove("engineHandover");
+            conversation_state::rotate_agent_token(conversation);
+            conversation["bootstrapSent"] = json!(false);
+            conversation.as_object_mut().expect("object checked above").remove("engineHandover");
         }
         Ok(())
     }) {
@@ -1536,11 +1536,8 @@ pub(super) fn social_v2_wake_with(
             conversation["bootstrapSent"] = json!(true);
         }
         let effective = if first { "bootstrap".to_string() } else { reason.clone() };
-        let epoch = conversation
-            .get("agentToken")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(crate::send_outbox::token_epoch)
+        let epoch = conversation_state::active_agent_token(conversation)
+            .map(conversation_state::token_epoch)
             .unwrap_or_default();
         if !conversation["adminWakes"].is_array() {
             conversation["adminWakes"] = json!([]);
@@ -1577,11 +1574,8 @@ pub(crate) fn take_admin_wake(context: &RuntimeContext, key: &str) -> Result<Opt
         if queue.is_empty() {
             conversation.as_object_mut().map(|c| c.remove("adminWakes"));
         }
-        let current = conversation
-            .get("agentToken")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(crate::send_outbox::token_epoch)
+        let current = conversation_state::active_agent_token(conversation)
+            .map(conversation_state::token_epoch)
             .unwrap_or_default();
         if request.get("epoch").and_then(Value::as_str).unwrap_or("") != current {
             return Ok(None);

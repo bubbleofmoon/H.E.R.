@@ -1,4 +1,5 @@
 //! The selected runtime's per-conversation turn fence and durable engine handover.
+use crate::conversation_state;
 use crate::{runtime::{RuntimeArea, RuntimeContext}, turn_engine::Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -209,7 +210,7 @@ fn validate_conversation(state: &Value, key: &str) -> Result<(), (u16, String)> 
 }
 
 fn epoch(conv: &Value) -> String {
-    conv["agentToken"].as_str().map(crate::send_outbox::token_epoch).unwrap_or_default()
+    conversation_state::agent_token(conv).map(conversation_state::token_epoch).unwrap_or_default()
 }
 
 fn refused(error: String) -> (u16, String) { (503, error) }
@@ -235,8 +236,8 @@ fn clear_pending(
         crate::session_map::retire_if(context, key, sid).map_err(refused)?;
     }
     if pending.archive_started {
-        if conv["agentToken"].as_str().is_none_or(str::is_empty) {
-            conv["agentToken"] = json!(crate::console::fresh_agent_token());
+        if conversation_state::active_agent_token(conv).is_none() {
+            conversation_state::rotate_agent_token(conv);
         }
         conv[FIELD] = json!(Handover {
             engine: Some(continuing), epoch: Some(epoch(conv)), summary: Some(pending.summary.clone()), pending: None,
@@ -297,7 +298,7 @@ fn prepare_admission(
     let state = crate::console::load_social_state_for(context)?;
     validate_conversation(&state, key)?;
     let conversation = &state["conversations"][key];
-    if expected_token.is_some_and(|token| conversation["agentToken"].as_str() != Some(token)) {
+    if expected_token.is_some_and(|token| conversation_state::agent_token(conversation) != Some(token)) {
         return Err(admission_changed());
     }
     let generation = epoch(conversation);
@@ -529,15 +530,14 @@ fn finish_pending(
                 return Err(admission_changed());
             }
         }
-        let token = crate::console::fresh_agent_token();
-        if conv["agentToken"].is_null() {
+        if conversation_state::agent_token_is_null(conv) {
             *conv = crate::console::new_conversation(context);
         }
+        let token = conversation_state::rotate_agent_token(conv);
         conv[FIELD] = json!(Handover {
             engine: Some(pending.to), epoch: Some(crate::send_outbox::token_epoch(&token)),
             summary: Some(pending.summary.clone()), pending: None,
         });
-        conv["agentToken"] = json!(&token);
         conv["bootstrapSent"] = json!(false);
         Ok(token)
     })?;
