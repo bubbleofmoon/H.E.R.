@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use super::super::{self as memory, Hit, MemoryInput, FUSION_DEPTH, RECALL_MAX_ITEMS};
 use super::{
-    backfill, encode_query, ensure_cache, rank_cached, register_sqlite_vec, LocalModel,
-    BACKFILL_BATCH, MODEL_DIR,
+    encode_query, encode_vector, guarded, pending_rows, publish, rank_cached, register_sqlite_vec,
+    LocalModel, PendingRow, BACKFILL_BATCH, MODEL_DIR,
 };
 use crate::runtime::RuntimeContext;
 
@@ -115,8 +115,7 @@ impl Comparison {
                 .all(|id| case.haystack_session_ids.contains(id)));
         }
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../spec/memory-schema.sql"))
-            .unwrap();
+        memory::atomic(&conn, memory::migrate).unwrap();
         for session in &case.haystack_sessions {
             let content = session
                 .iter()
@@ -159,11 +158,19 @@ impl Comparison {
         }
 
         register_sqlite_vec(reader.conn).expect("register sqlite-vec");
-        ensure_cache(reader.conn).expect("create benchmark vector cache");
         for _ in case.haystack_sessions.chunks(BACKFILL_BATCH) {
-            backfill(&reader, model, embed)
-                .expect("backfill benchmark session vectors")
-                .expect("embed benchmark sessions");
+            let pending = pending_rows(&reader, model).expect("select benchmark sessions");
+            if pending.is_empty() {
+                break;
+            }
+            let texts: Vec<_> = pending.iter().map(PendingRow::text).collect();
+            let vectors = guarded(|| embed(&texts)).expect("embed benchmark sessions");
+            assert_eq!(vectors.len(), pending.len());
+            let vectors = vectors
+                .into_iter()
+                .map(|vector| encode_vector(vector).expect("valid benchmark session vector"))
+                .collect();
+            publish(&reader, model, &pending, vectors).expect("backfill benchmark session vectors");
         }
 
         let vector = encode_query(embed, &query).expect("embed benchmark query");
@@ -274,11 +281,8 @@ fn longmemeval_recall_calibration() {
     }
     let LocalModel {
         fingerprint,
-        mut encoder,
-        ..
-    } = LocalModel::load(&context, model_dir.join("onnx/model.onnx"))
-        .expect("load local CPU benchmark model");
-    let mut embed = |texts: &[String]| encoder.embed(texts, Some(4)).ok();
+        mut embed,
+    } = guarded(|| LocalModel::load(&context)).expect("load local CPU benchmark model");
 
     let mut calibration = Comparison::default();
     for case in strata.iter().flat_map(|cases| cases.iter().step_by(5)) {

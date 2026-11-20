@@ -14,7 +14,9 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 mod dense;
 mod store;
 #[cfg(test)]
-pub(crate) use dense::fixture::install as install_fixture_embeddings;
+pub(crate) use dense::fixture::{
+    install as install_fixture_embeddings, install_loader as install_fixture_embedding_loader,
+};
 pub use store::{DigestCursor, ForgetError, MemoryStore, NewMemory, Reader};
 
 pub const DB_PATH: &str = crate::legacy_path!("data/memory.db");
@@ -88,8 +90,9 @@ pub fn open_at(path: &std::path::Path) -> rusqlite::Result<Connection> {
 }
 
 /// Memory schema version (`PRAGMA user_version`). Version 1 is the frozen
-/// `spec/memory-schema.sql` with its FTS index and the default owner grant; version 2 adds `digest_cursor`.
-const SCHEMA_VERSION: i64 = 2;
+/// `spec/memory-schema.sql` with its FTS index and the default owner grant.
+/// Version 2 adds `digest_cursor`. Version 3 adds the derived embedding cache.
+const SCHEMA_VERSION: i64 = 3;
 /// Version 2: the Digest's progress per conversation and sequence space, written with its memories.
 pub(crate) const DIGEST_CURSOR_V2: &str = "CREATE TABLE IF NOT EXISTS digest_cursor (
   conversation TEXT NOT NULL, space TEXT NOT NULL, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -132,6 +135,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<i64> {
     if version == 1 {
         conn.execute_batch(DIGEST_CURSOR_V2)?;
         version = 2;
+        conn.pragma_update(None, "user_version", version)?;
+    }
+    if version == 2 {
+        conn.execute_batch(dense::CACHE_SCHEMA_V3)?;
+        version = 3;
         conn.pragma_update(None, "user_version", version)?;
     }
     Ok(version)
@@ -1730,11 +1738,11 @@ mod tests {
         let conn = open_ready_for_runtime(&context).unwrap();
         assert!(conn.prepare("SELECT * FROM role_group_session").is_err(),
                 "a version 1 open must not rerun the unversioned completion");
-        conn.execute_batch("PRAGMA user_version=3;").unwrap();
+        conn.execute_batch("PRAGMA user_version=4;").unwrap();
         drop(conn);
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
     }
 
     #[test]
@@ -1745,7 +1753,7 @@ mod tests {
         conn.execute_batch("DROP TABLE digest_cursor; PRAGMA user_version=1;").unwrap();
         drop(conn);
         let conn = open_ready_for_runtime(&context).unwrap();
-        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
         conn.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor").unwrap();
     }
 
@@ -1765,7 +1773,7 @@ mod tests {
         let before = rows(&conn);
         // The version 1 writer stays open with its rows still in the WAL, as a crashed older bridge leaves them.
         let migrated = open_ready_for_runtime(&context).unwrap();
-        assert_eq!(migrated.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+        assert_eq!(migrated.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), SCHEMA_VERSION);
         assert_eq!(rows(&migrated), before, "migration to version 2 must not change rows");
         migrated.prepare("SELECT conversation, space, through_seq, updated_at, replies_ms, replies_seq, failed_at FROM digest_cursor").unwrap();
         drop((migrated, conn));
@@ -1775,7 +1783,7 @@ mod tests {
     fn schema_version_newer_database_is_refused_before_journal_mode_changes() {
         let (root, context) = isolated_fixture();
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=3;").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA user_version=4;").unwrap();
         drop(conn);
         assert_eq!(open_ready_for_runtime(&context).err().as_deref(), Some("unsupported memory database version"));
         let conn = Connection::open(root.0.join("data/memory.db")).unwrap();

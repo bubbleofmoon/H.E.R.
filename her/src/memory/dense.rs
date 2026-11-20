@@ -1,5 +1,12 @@
 //! Local semantic recall. The vector cache is derived from the authoritative memory rows.
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashMap,
+    panic::{catch_unwind, AssertUnwindSafe},
+    path::PathBuf,
+    sync::{mpsc, Arc, LazyLock, Mutex, PoisonError, TryLockError},
+    thread,
+    time::{Duration, Instant, SystemTime},
+};
 
 use fastembed::{
     InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles, UserDefinedEmbeddingModel,
@@ -15,12 +22,21 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 mod calibration;
 
 const MODEL_DIR: &str = "recall/bge-small-zh-v1.5";
+const MODEL_FILES: [&str; 5] = [
+    "onnx/model.onnx",
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
 const DIMENSIONS: usize = 512;
+const VECTOR_BYTES: usize = DIMENSIONS * std::mem::size_of::<f32>();
 const BACKFILL_BATCH: usize = 16;
+const INFERENCE_BUDGET: Duration = Duration::from_millis(250);
 // Provisional cosine distance ceiling. Calibration belongs to the public benchmark step.
 const MAX_DISTANCE: f64 = 0.22;
 
-const CACHE_SCHEMA: &str = "
+pub(super) const CACHE_SCHEMA_V3: &str = "
     CREATE TABLE IF NOT EXISTS memory_embedding_cache (
         memory_id INTEGER PRIMARY KEY,
         model BLOB NOT NULL,
@@ -34,27 +50,41 @@ const CACHE_SCHEMA: &str = "
         DELETE FROM memory_embedding_cache WHERE memory_id = OLD.id;
     END;";
 
+type Vectors = Vec<Vec<f32>>;
+type Embed = dyn FnMut(&[String]) -> Option<Vectors> + Send;
+type LoadModel = dyn Fn(&RuntimeContext) -> Option<LocalModel> + Send + Sync;
+
 struct LocalModel {
-    path: PathBuf,
     fingerprint: [u8; 32],
-    encoder: TextEmbedding,
+    embed: Box<Embed>,
 }
 
-static MODEL: Mutex<Option<LocalModel>> = Mutex::new(None);
+static MODEL: LazyLock<Arc<ModelRunner>> =
+    LazyLock::new(|| Arc::new(ModelRunner::new(LocalModel::load)));
 
 impl LocalModel {
-    fn load(context: &RuntimeContext, path: PathBuf) -> Option<Self> {
+    fn load(context: &RuntimeContext) -> Option<Self> {
+        // ort otherwise falls back to a DLL name resolved through the Windows search path.
+        #[cfg(windows)]
+        if !std::env::var("ORT_DYLIB_PATH")
+            .is_ok_and(|path| std::path::Path::new(&path).is_absolute())
+        {
+            return None;
+        }
+
         let read = |file| {
             context
                 .read_file(RuntimeArea::Resources, &format!("{MODEL_DIR}/{file}"))
                 .ok()
         };
-        let onnx = read("onnx/model.onnx")?;
+        let [onnx, tokenizer_file, config_file, special_tokens_map_file, tokenizer_config_file] =
+            MODEL_FILES;
+        let onnx = read(onnx)?;
         let tokenizer = TokenizerFiles {
-            tokenizer_file: read("tokenizer.json")?,
-            config_file: read("config.json")?,
-            special_tokens_map_file: read("special_tokens_map.json")?,
-            tokenizer_config_file: read("tokenizer_config.json")?,
+            tokenizer_file: read(tokenizer_file)?,
+            config_file: read(config_file)?,
+            special_tokens_map_file: read(special_tokens_map_file)?,
+            tokenizer_config_file: read(tokenizer_config_file)?,
         };
         let mut hash = Sha256::new();
         hash.update(b"bge-small-zh-v1.5-cls-v1");
@@ -70,11 +100,161 @@ impl LocalModel {
         }
         let model = UserDefinedEmbeddingModel::new(onnx, tokenizer).with_pooling(Pooling::Cls);
         let options = InitOptionsUserDefined::new().with_intra_threads(2);
-        let encoder = TextEmbedding::try_new_from_user_defined(model, options).ok()?;
+        let mut encoder = TextEmbedding::try_new_from_user_defined(model, options).ok()?;
         Some(Self {
-            path,
             fingerprint: hash.finalize().into(),
-            encoder,
+            embed: Box::new(move |texts| encoder.embed(texts, Some(4)).ok()),
+        })
+    }
+}
+
+type ModelFiles = [Option<FileStamp>; MODEL_FILES.len()];
+
+#[derive(PartialEq, Eq)]
+struct FileStamp {
+    size: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+
+fn model_files(context: &RuntimeContext) -> ModelFiles {
+    MODEL_FILES.map(|file| {
+        let path = context
+            .resolve_path(
+                RuntimeArea::Resources,
+                &format!("{MODEL_DIR}/{file}"),
+                PathIntent::ReadFile,
+            )
+            .ok()?;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(FileStamp {
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+        })
+    })
+}
+
+fn guarded<T>(attempt: impl FnOnce() -> Option<T>) -> Option<T> {
+    catch_unwind(AssertUnwindSafe(attempt)).ok().flatten()
+}
+
+#[derive(Default)]
+struct ModelState {
+    active: Option<(PathBuf, LocalModel)>,
+    failed: HashMap<PathBuf, ModelFiles>,
+}
+
+impl ModelState {
+    fn model(&mut self, context: &RuntimeContext, load: &LoadModel) -> Option<&mut LocalModel> {
+        let path = context.resources_dir();
+        if self.active.as_ref().is_some_and(|(root, _)| root == path) {
+            return self.active.as_mut().map(|(_, model)| model);
+        }
+        let files = model_files(context);
+        if self.failed.get(path) == Some(&files) {
+            return None;
+        }
+        let Some(model) = guarded(|| load(context)) else {
+            self.failed.insert(path.to_owned(), files);
+            return None;
+        };
+        self.failed.remove(path);
+        let (_, model) = self.active.insert((path.to_owned(), model));
+        Some(model)
+    }
+}
+
+struct ModelRunner {
+    // This lock only transfers ownership of the model state. It is released before spawning,
+    // reading files, touching SQLite or waiting on a channel. None means one worker owns it.
+    state: Mutex<Option<ModelState>>,
+    load: Box<LoadModel>,
+}
+
+struct ModelLease {
+    runner: Arc<ModelRunner>,
+    state: Option<ModelState>,
+}
+
+impl Drop for ModelLease {
+    fn drop(&mut self) {
+        *self
+            .runner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = self.state.take();
+    }
+}
+
+struct Inference {
+    query: mpsc::Receiver<([u8; 32], Vec<u8>)>,
+    rows: mpsc::Sender<Vec<String>>,
+    vectors: mpsc::Receiver<Vec<u8>>,
+}
+
+fn receive_before<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    receiver.recv_timeout(remaining).ok()
+}
+
+impl ModelRunner {
+    fn new(load: impl Fn(&RuntimeContext) -> Option<LocalModel> + Send + Sync + 'static) -> Self {
+        Self {
+            state: Mutex::new(Some(ModelState::default())),
+            load: Box::new(load),
+        }
+    }
+
+    fn start(
+        self: &Arc<Self>,
+        context: RuntimeContext,
+        query: String,
+        deadline: Instant,
+    ) -> Option<Inference> {
+        let state = match self.state.try_lock() {
+            Ok(mut state) => state.take(),
+            Err(TryLockError::Poisoned(error)) => error.into_inner().take(),
+            Err(TryLockError::WouldBlock) => None,
+        }?;
+        let mut lease = ModelLease {
+            runner: Arc::clone(self),
+            state: Some(state),
+        };
+        let (send_query, receive_query) = mpsc::channel();
+        let (send_rows, receive_rows) = mpsc::channel::<Vec<String>>();
+        let (send_vector, receive_vector) = mpsc::channel();
+        thread::Builder::new()
+            .name("recall-inference".into())
+            .spawn(move || {
+                let _ = (|| {
+                    let model = lease.state.as_mut()?.model(&context, &*lease.runner.load)?;
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    let query_vector = encode_query(&mut model.embed, &query)?;
+                    send_query.send((model.fingerprint, query_vector)).ok()?;
+                    for text in receive_before(&receive_rows, deadline)? {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        // Empty blobs record failed rows for this model without entering ranking.
+                        let vector = encode_one(&mut model.embed, text).unwrap_or_default();
+                        if Instant::now() >= deadline || send_vector.send(vector).is_err() {
+                            break;
+                        }
+                    }
+                    Some(())
+                })();
+                // A completed wake can start another job as soon as either channel disconnects.
+                drop(lease);
+                drop((send_query, send_vector));
+            })
+            .ok()?;
+        Some(Inference {
+            query: receive_query,
+            rows: send_rows,
+            vectors: receive_vector,
         })
     }
 }
@@ -86,47 +266,34 @@ pub(super) fn rank(
     excluded: &str,
     limit: usize,
 ) -> Option<Vec<Hit>> {
+    if !reader.conn.is_autocommit() {
+        return None;
+    }
     #[cfg(test)]
-    if let Some(embed) = fixture::encoder(context) {
-        return rank_with(reader, query, excluded, limit, &[0; 32], embed);
-    }
+    let fixture = fixture::runner(context);
+    #[cfg(test)]
+    let runner = fixture.as_ref().unwrap_or(&MODEL);
+    #[cfg(not(test))]
+    let runner = &MODEL;
+    let deadline = Instant::now() + INFERENCE_BUDGET;
+    let Inference {
+        query: result,
+        rows,
+        vectors,
+    } = runner.start(context.clone(), query.to_owned(), deadline)?;
+    let (model, query_vector) = receive_before(&result, deadline)?;
+    register_sqlite_vec(reader.conn).ok()?;
 
-    let path = context
-        .resolve_path(
-            RuntimeArea::Resources,
-            &format!("{MODEL_DIR}/onnx/model.onnx"),
-            PathIntent::ReadFile,
-        )
-        .ok()?;
-    // Concurrent wakes can use sparse recall while another wake is doing CPU inference.
-    let mut slot = MODEL.try_lock().ok()?;
-    if slot.as_ref().is_none_or(|model| model.path != path) {
-        *slot = LocalModel::load(context, path);
+    let pending = pending_rows(reader, &model).unwrap_or_default();
+    let _ = rows.send(pending.iter().map(PendingRow::text).collect());
+    let mut completed = Vec::new();
+    while let Some(vector) = receive_before(&vectors, deadline) {
+        completed.push(vector);
     }
-    let LocalModel {
-        fingerprint,
-        encoder,
-        ..
-    } = slot.as_mut()?;
-    rank_with(reader, query, excluded, limit, fingerprint, |texts| {
-        encoder.embed(texts, Some(4)).ok()
-    })
-}
-
-fn rank_with(
-    reader: &Reader<'_>,
-    query: &str,
-    excluded: &str,
-    limit: usize,
-    model: &[u8],
-    mut embed: impl FnMut(&[String]) -> Option<Vec<Vec<f32>>>,
-) -> Option<Vec<Hit>> {
-    let query_vector = encode_query(&mut embed, query)?;
-    let conn = reader.conn;
-    register_sqlite_vec(conn).ok()?;
-    ensure_cache(conn).ok()?;
-    backfill(reader, model, &mut embed).ok()??;
-    rank_cached(reader, &query_vector, excluded, limit, model, MAX_DISTANCE)
+    if !completed.is_empty() {
+        let _ = publish(reader, &model, &pending, completed);
+    }
+    rank_cached(reader, &query_vector, excluded, limit, &model, MAX_DISTANCE)
 }
 
 fn encode_query(
@@ -134,7 +301,7 @@ fn encode_query(
     query: &str,
 ) -> Option<Vec<u8>> {
     let query = format!("为这个句子生成表示以用于检索相关文章：{query}");
-    encode(embed, &[query])?.pop()
+    encode_one(embed, query)
 }
 
 fn rank_cached(
@@ -153,7 +320,7 @@ fn rank_cached(
         "WITH scoped AS MATERIALIZED (
             SELECT m.id, vec_distance_cosine(e.embedding, ?1) AS distance
             FROM memory m JOIN memory_embedding_cache e ON e.memory_id = m.id
-            WHERE e.model = ?2 AND {visibility}{excluded}
+            WHERE e.model = ?2 AND length(e.embedding) = {VECTOR_BYTES} AND {visibility}{excluded}
          )
          SELECT m.id, m.owner_id, m.scope, m.kind, m.subject, m.content,
                 s.distance, m.pinned, m.importance, m.hits, m.created_at,
@@ -182,106 +349,100 @@ fn scope(conn: &Connection, reader: &Reader<'_>) -> rusqlite::Result<(String, Ve
     visibility_filter(conn, &reader.key, reader.is_owner, &[])
 }
 
-fn ensure_cache(conn: &Connection) -> rusqlite::Result<()> {
-    let exists = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'memory_embedding_cache')",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !exists {
-        atomic(conn, |conn| conn.execute_batch(CACHE_SCHEMA))?;
-    }
-    Ok(())
+struct PendingRow {
+    id: i64,
+    subject: Option<String>,
+    content: String,
 }
 
-fn backfill(
-    reader: &Reader<'_>,
-    model: &[u8],
-    embed: &mut impl FnMut(&[String]) -> Option<Vec<Vec<f32>>>,
-) -> rusqlite::Result<Option<()>> {
-    let conn = reader.conn;
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+impl PendingRow {
+    fn text(&self) -> String {
+        let subject = self.subject.as_deref().unwrap_or("");
+        // The tokenizer also truncates to the model's input length.
+        subject
+            .chars()
+            .chain(['\n'])
+            .chain(self.content.chars())
+            .take(2_000)
+            .collect()
+    }
+}
+
+fn pending_rows(reader: &Reader<'_>, model: &[u8]) -> rusqlite::Result<Vec<PendingRow>> {
+    let tx = Transaction::new_unchecked(reader.conn, TransactionBehavior::Deferred)?;
     let (visibility, args) = scope(&tx, reader)?;
     let sql = format!(
         "SELECT m.id, m.subject, m.content
          FROM memory m LEFT JOIN memory_embedding_cache e
            ON e.memory_id = m.id AND e.model = ?1
          WHERE e.memory_id IS NULL AND {visibility}
-         ORDER BY m.id LIMIT {BACKFILL_BATCH}"
+         ORDER BY m.created_at DESC, m.id DESC LIMIT {BACKFILL_BATCH}"
     );
     let mut refs: Vec<&dyn ToSql> = vec![&model];
     refs.extend(args.iter().map(|arg| arg as &dyn ToSql));
     let pending = {
         let mut stmt = tx.prepare(&sql)?;
         let rows = stmt.query_map(refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok(PendingRow {
+                id: row.get(0)?,
+                subject: row.get(1)?,
+                content: row.get(2)?,
+            })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     tx.commit()?;
+    Ok(pending)
+}
 
-    if pending.is_empty() {
-        return Ok(Some(()));
-    }
-    let texts: Vec<_> = pending
-        .iter()
-        .map(|(_, subject, content)| {
-            let subject = subject.as_deref().unwrap_or("");
-            // The tokenizer truncates to the model's input length. Bound input before tokenizing, too.
-            format!("{subject}\n{content}")
-                .chars()
-                .take(2_000)
-                .collect()
-        })
-        .collect();
-    let Some(vectors) = encode(embed, &texts) else {
-        return Ok(None);
-    };
-
+fn publish(
+    reader: &Reader<'_>,
+    model: &[u8],
+    pending: &[PendingRow],
+    vectors: Vec<Vec<u8>>,
+) -> rusqlite::Result<()> {
     // Inference holds no SQLite transaction. Revalidate each row and the scope when publishing
     // in case the memory was edited, forgotten, archived, or its grant was revoked meanwhile.
-    atomic(conn, |conn| {
+    atomic(reader.conn, |conn| {
         let (visibility, args) = scope(conn, reader)?;
         let sql = format!(
             "INSERT INTO memory_embedding_cache(memory_id, model, embedding)
              SELECT m.id, ?1, ?2 FROM memory m
              WHERE m.id = ?3 AND m.subject IS ?4 AND m.content = ?5 AND {visibility}
-             ON CONFLICT(memory_id) DO UPDATE SET model = excluded.model, embedding = excluded.embedding"
+             ON CONFLICT(memory_id) DO UPDATE SET model = excluded.model, embedding = excluded.embedding
+             WHERE memory_embedding_cache.model <> excluded.model
+                OR length(memory_embedding_cache.embedding) = 0"
         );
         let mut stmt = conn.prepare(&sql)?;
-        for ((id, subject, content), vector) in pending.iter().zip(vectors) {
-            let mut refs: Vec<&dyn ToSql> = vec![&model, &vector, id, subject, content];
+        for (row, vector) in pending.iter().zip(vectors) {
+            let mut refs: Vec<&dyn ToSql> =
+                vec![&model, &vector, &row.id, &row.subject, &row.content];
             refs.extend(args.iter().map(|arg| arg as &dyn ToSql));
             stmt.execute(refs.as_slice())?;
         }
-        Ok(Some(()))
+        Ok(())
     })
 }
 
-fn encode(
+fn encode_one(
     embed: &mut impl FnMut(&[String]) -> Option<Vec<Vec<f32>>>,
-    texts: &[String],
-) -> Option<Vec<Vec<u8>>> {
-    let vectors = embed(texts)?;
-    if vectors.len() != texts.len() {
+    text: String,
+) -> Option<Vec<u8>> {
+    let mut vectors = guarded(|| embed(&[text]))?;
+    if vectors.len() != 1 {
         return None;
     }
-    vectors
-        .into_iter()
-        .map(|vector| {
-            if vector.len() != DIMENSIONS
-                || vector.iter().any(|v| !v.is_finite())
-                || vector.iter().all(|v| *v == 0.0)
-            {
-                return None;
-            }
-            Some(vector.into_iter().flat_map(f32::to_ne_bytes).collect())
-        })
-        .collect()
+    encode_vector(vectors.pop()?)
+}
+
+fn encode_vector(vector: Vec<f32>) -> Option<Vec<u8>> {
+    if vector.len() != DIMENSIONS
+        || vector.iter().any(|v| !v.is_finite())
+        || vector.iter().all(|v| *v == 0.0)
+    {
+        return None;
+    }
+    Some(vector.into_iter().flat_map(f32::to_ne_bytes).collect())
 }
 
 fn register_sqlite_vec(conn: &Connection) -> rusqlite::Result<()> {
@@ -302,35 +463,62 @@ fn register_sqlite_vec(conn: &Connection) -> rusqlite::Result<()> {
 #[cfg(test)]
 pub(crate) mod fixture {
     use super::*;
-    use std::collections::HashMap;
 
     type Encoder = fn(&[String]) -> Option<Vec<Vec<f32>>>;
-    static ENCODERS: std::sync::LazyLock<Mutex<HashMap<PathBuf, Encoder>>> =
-        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    static RUNNERS: LazyLock<Mutex<HashMap<PathBuf, Arc<ModelRunner>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
     pub(crate) struct FixtureEncoder(PathBuf);
 
     impl Drop for FixtureEncoder {
         fn drop(&mut self) {
-            ENCODERS.lock().unwrap().remove(&self.0);
+            RUNNERS.lock().unwrap().remove(&self.0);
         }
     }
 
-    pub(crate) fn install(context: &RuntimeContext, embed: Encoder) -> FixtureEncoder {
+    pub(crate) fn install(
+        context: &RuntimeContext,
+        embed: impl FnMut(&[String]) -> Option<Vectors> + Send + 'static,
+    ) -> FixtureEncoder {
+        let embed = Mutex::new(Some(embed));
+        install_runner(context, move |_| {
+            Some(LocalModel {
+                fingerprint: [0; 32],
+                embed: Box::new(embed.lock().unwrap().take()?),
+            })
+        })
+    }
+
+    pub(crate) fn install_loader(
+        context: &RuntimeContext,
+        load: impl Fn() -> Option<Encoder> + Send + Sync + 'static,
+    ) -> FixtureEncoder {
+        install_runner(context, move |_| {
+            Some(LocalModel {
+                fingerprint: [0; 32],
+                embed: Box::new(load()?),
+            })
+        })
+    }
+
+    fn install_runner(
+        context: &RuntimeContext,
+        load: impl Fn(&RuntimeContext) -> Option<LocalModel> + Send + Sync + 'static,
+    ) -> FixtureEncoder {
         let path = context.runtime_root().unwrap().to_owned();
-        assert!(ENCODERS
+        assert!(RUNNERS
             .lock()
             .unwrap()
-            .insert(path.clone(), embed)
+            .insert(path.clone(), Arc::new(ModelRunner::new(load)))
             .is_none());
         FixtureEncoder(path)
     }
 
-    pub(super) fn encoder(context: &RuntimeContext) -> Option<Encoder> {
-        ENCODERS
+    pub(super) fn runner(context: &RuntimeContext) -> Option<Arc<ModelRunner>> {
+        RUNNERS
             .lock()
             .unwrap()
             .get(context.runtime_root()?)
-            .copied()
+            .cloned()
     }
 }

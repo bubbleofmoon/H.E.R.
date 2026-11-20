@@ -927,6 +927,195 @@ fn hybrid_preview_falls_back_to_sparse_when_embedding_fails() {
 }
 
 #[test]
+fn hybrid_preview_survives_model_load_error_and_panic() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    for panics in [false, true] {
+        let lexical = "周末登山看日出";
+        let (_root, context) = hybrid_fixture(
+            "hybrid load failure",
+            lexical,
+            &[("group:101", "group", lexical)],
+        );
+        let loads = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&loads);
+        let _loader = crate::memory::install_fixture_embedding_loader(&context, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            assert!(!panics, "synthetic runtime incompatibility");
+            None
+        });
+        for _ in 0..2 {
+            assert!(
+                hybrid_preview(context.clone()).contains(lexical),
+                "a loader failure must preserve the wake's sparse recall"
+            );
+        }
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "a caught loader failure is cached, including a panic"
+        );
+    }
+}
+
+#[test]
+fn hybrid_preview_retries_failed_load_after_model_files_change() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (_root, context) = hybrid_fixture(
+        "hybrid load retry",
+        HYBRID_QUESTION,
+        &[("group:101", "group", HYBRID_MATCH)],
+    );
+    let loads = AtomicUsize::new(0);
+    let _loader = crate::memory::install_fixture_embedding_loader(&context, move || {
+        (loads.fetch_add(1, Ordering::SeqCst) > 0).then_some(hybrid_fixture_embeddings)
+    });
+    assert!(!hybrid_preview(context.clone()).contains(HYBRID_MATCH));
+    assert!(
+        !hybrid_preview(context.clone()).contains(HYBRID_MATCH),
+        "an unchanged failed model must not be reloaded on the next wake"
+    );
+    context
+        .write_atomic(
+            RuntimeArea::Resources,
+            "recall/bge-small-zh-v1.5/tokenizer.json",
+            b"new artifact",
+        )
+        .unwrap();
+    assert!(
+        hybrid_preview(context).contains(HYBRID_MATCH),
+        "changing one model file must permit a new load"
+    );
+}
+
+fn write_hybrid_row(conn: &rusqlite::Connection, content: &str) {
+    crate::memory::write_memory(
+        conn,
+        &crate::memory::MemoryInput {
+            owner_type: "session",
+            owner_id: "group:101",
+            scope: "group",
+            kind: "fact",
+            subject: None,
+            content,
+            tags: None,
+            source: "fixture",
+            importance: 0.5,
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn hybrid_preview_backfills_past_bad_rows_and_keeps_cached_hits() {
+    let later_match = "幼童遇到风暴应远离窗户";
+    let (_root, context) = hybrid_fixture(
+        "hybrid backfill failures",
+        HYBRID_QUESTION,
+        &[("group:101", "group", HYBRID_MATCH)],
+    );
+    let _encoder = crate::memory::install_fixture_embeddings(&context, |texts| {
+        let mut vectors = hybrid_fixture_embeddings(texts)?;
+        for (text, vector) in texts.iter().zip(&mut vectors) {
+            if text.contains("坏样本错误") {
+                return None;
+            }
+            if text.contains("坏样本非有限") {
+                vector[0] = f32::NAN;
+            }
+            if text.contains("坏样本零") {
+                vector.fill(0.0);
+            }
+            assert!(!text.contains("坏样本异常"), "synthetic inference panic");
+        }
+        Some(vectors)
+    });
+    assert!(hybrid_preview(context.clone()).contains(HYBRID_MATCH));
+
+    let conn = crate::memory::open_ready_for_runtime(&context).unwrap();
+    write_hybrid_row(&conn, later_match);
+    for index in 0..16 {
+        let kind = ["错误", "非有限", "零", "异常"][index % 4];
+        write_hybrid_row(&conn, &format!("坏样本{kind} {index}"));
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER fixture_block_cache BEFORE INSERT ON memory_embedding_cache
+                        BEGIN SELECT RAISE(ABORT, 'synthetic cache write failure'); END;",
+    )
+    .unwrap();
+    assert!(
+        hybrid_preview(context.clone()).contains(HYBRID_MATCH),
+        "a failed cache write must preserve previously cached hits"
+    );
+    conn.execute_batch("DROP TRIGGER fixture_block_cache;")
+        .unwrap();
+
+    let first = hybrid_preview(context.clone());
+    assert!(first.contains(HYBRID_MATCH));
+    assert!(
+        !first.contains(later_match),
+        "the first wake must backfill the newest sixteen rows"
+    );
+    let next = hybrid_preview(context);
+    assert!(
+        next.contains(later_match),
+        "bad vectors must not starve older rows on the next wake"
+    );
+    assert!(
+        !next.contains("坏样本"),
+        "failed, non-finite and zero vectors must stay unranked"
+    );
+}
+
+#[test]
+fn hybrid_preview_caps_inference_wait_and_preserves_cached_hits() {
+    use std::{sync::mpsc, time::Duration};
+
+    let later_match = "幼童遇到风暴应远离窗户";
+    let (_root, context) = hybrid_fixture(
+        "hybrid inference budget",
+        HYBRID_QUESTION,
+        &[("group:101", "group", HYBRID_MATCH)],
+    );
+    let db = crate::memory::db_path_for_runtime(&context).unwrap();
+    let (release, wait) = mpsc::channel();
+    let (write_result, writer) = mpsc::channel();
+    let _encoder = crate::memory::install_fixture_embeddings(&context, move |texts| {
+        if texts.iter().any(|text| text.contains(later_match)) {
+            let result = rusqlite::Connection::open(&db).and_then(|conn| {
+                conn.busy_timeout(Duration::ZERO)?;
+                conn.execute_batch("BEGIN IMMEDIATE; COMMIT;")
+            });
+            write_result.send(result.is_ok()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(2));
+        }
+        hybrid_fixture_embeddings(texts)
+    });
+    assert!(hybrid_preview(context.clone()).contains(HYBRID_MATCH));
+
+    let conn = crate::memory::open_ready_for_runtime(&context).unwrap();
+    write_hybrid_row(&conn, later_match);
+    let block = hybrid_preview(context);
+    let _ = release.send(());
+    assert!(
+        writer.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "inference must leave the database writable"
+    );
+    assert!(
+        block.contains(HYBRID_MATCH),
+        "a timed-out backfill must preserve cached hits"
+    );
+    assert!(
+        !block.contains(later_match),
+        "a wake must not wait past its inference deadline"
+    );
+}
+
+#[test]
 fn hybrid_preview_prefers_a_match_ranked_by_both_channels() {
     let overlap = "小孩害怕时，幼童遇到风暴需要拥抱";
     let (_root, context) = hybrid_fixture("hybrid fusion", HYBRID_QUESTION, &[
