@@ -467,7 +467,7 @@ def run_relay(args, key, connect):
                     status = returncode if returncode >= 0 else 128 - returncode
                     if args.capture_result:
                         primary_status = relay.inference_status
-                        if primary_status is not None and not 200 <= primary_status < 300 and (status or not relay.inference_succeeded):  # RED-Q
+                        if primary_status is not None and not 200 <= primary_status < 300:
                             if primary_status == 429:
                                 return 75
                             if status == 0:
