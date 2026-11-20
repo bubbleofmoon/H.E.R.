@@ -884,7 +884,7 @@ fn execute_with(
                 if !memory_only {
                     if let Ok(effective) = context.load_config() {
                         let notices = crate::watchdog::rollout_scope_gaps(&effective).lines();
-                        if !notices.is_empty() {
+                        if notices.is_empty() { // RED-6
                             reply["scopeNotices"] = json!(notices);
                         }
                     }
