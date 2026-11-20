@@ -22,6 +22,7 @@ pub struct Reader<'a> {
 /// ACL and archive administration, for callers that authorized first.
 pub struct Admin<'a> {
     conn: &'a Connection,
+    has_provenance: bool,
 }
 
 /// A memory a conversation writes; its owner is always the reader's conversation.
@@ -94,7 +95,10 @@ impl MemoryStore {
     }
 
     pub fn admin(&self) -> Admin<'_> {
-        Admin { conn: &self.conn }
+        Admin {
+            conn: &self.conn,
+            has_provenance: self.has_provenance,
+        }
     }
 }
 
@@ -208,6 +212,9 @@ impl Reader<'_> {
     }
 
     pub fn correction_history(&self, id: i64) -> rusqlite::Result<Option<Value>> {
+        if !self.has_provenance {
+            return Ok(None);
+        }
         self.conn.query_row(
             "SELECT m.content, p.superseded_by FROM memory m
              JOIN memory_provenance p ON p.memory_id=m.id
@@ -310,8 +317,9 @@ impl Admin<'_> {
     }
 
     pub fn archive(&self, id: i64, archived: bool, actor: &str) -> rusqlite::Result<bool> {
+        let has_provenance = self.has_provenance;
         super::atomic(self.conn, |conn| {
-            if !archived && conn.query_row(
+            if !archived && has_provenance && conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM memory_provenance WHERE memory_id=?1 AND superseded_by IS NOT NULL)",
                 [id], |r| r.get::<_, bool>(0),
             )? {
@@ -450,5 +458,13 @@ mod tests {
         assert!(reader.write_digest("msg", 4, 9, (0, 0), &[new("lost one"), new("lost two")]).is_err());
         assert_eq!(counts(), before, "a failed cursor commit kept memory rows");
         assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.through), Some(4), "a failed commit moved the cursor");
+    }
+
+    #[test]
+    fn pre_v3_from_connection_guards_correction_history_and_archive() {
+        let store = store(Some(OWNER));
+        assert_eq!(store.for_reader(OWNER).correction_history(1).unwrap(), None);
+        assert!(store.admin().archive(1, true, "fixture").unwrap());
+        assert!(store.admin().archive(1, false, "fixture").unwrap());
     }
 }
