@@ -845,11 +845,14 @@ mod native_tests {
         for name in ["rbridge-supervisor", "rbridge-live", "rbridge-console"] {
             fs::File::create(fixture.0.join(format!("runtime/data/logs/{name}.lock"))).unwrap();
         }
-        // The hosted suite builds ordinary binaries before running the test in target/*/deps.
-        let test_image = std::env::current_exe().unwrap();
-        let binaries = test_image.parent().unwrap().parent().unwrap();
-        let cli = binaries.join(format!("her-cli{}", std::env::consts::EXE_SUFFIX));
-        fs::copy(cli, fixture.0.join("releases/v1.2.2/her-cli.exe")).unwrap();
+        // The suite builds the CLI in the target directory before running this test.
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map_or_else(|| PathBuf::from("target"), PathBuf::from);
+        let cli = target
+            .join("debug")
+            .join(format!("her-cli{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(&cli, fixture.0.join("releases/v1.2.2/her-cli.exe"))
+            .unwrap_or_else(|error| panic!("copy built CLI from {}: {error}", cli.display()));
 
         let root = InstallRoot::new(&fixture.0).unwrap();
         switch_link(&root, "current", current).unwrap();
