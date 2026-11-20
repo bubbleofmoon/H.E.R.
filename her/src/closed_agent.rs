@@ -355,10 +355,30 @@ impl Hub {
     }
 
     fn say_guarded(&self, p: &Pending, text: &str, allow_expired: bool, allow_ended: bool) {
-        let Ok(cfg) = self.context.load_config() else {
+        Self::send_notification(&self.context, p, text, &|| {
+            let current = if allow_ended {
+                valid_session(&self.context, &p.key, &p.session, &p.epoch)
+            } else {
+                valid_identity(&self.context, &p.key, &p.session, &p.turn, &p.epoch)
+            };
+            if (allow_expired || Instant::now() < p.expires) && current {
+                Ok(())
+            } else {
+                Err("interaction is no longer valid".into())
+            }
+        });
+    }
+
+    fn send_notification(
+        context: &RuntimeContext,
+        p: &Pending,
+        text: &str,
+        guard: &dyn Fn() -> Result<(), String>,
+    ) {
+        let Ok(cfg) = context.load_config() else {
             return;
         };
-        let Some(url) = self.context.dependency_url("onebot") else {
+        let Some(url) = context.dependency_url("onebot") else {
             return;
         };
         let token = cfg
@@ -369,25 +389,14 @@ impl Hub {
             return;
         };
         let report = crate::chat::send_recorded(
-            &self.context,
+            context,
             &ob,
             &p.key,
             &p.epoch,
             "interaction",
             text,
             crate::chat::send_delay_ms(&cfg),
-            &|| {
-                let current = if allow_ended {
-                    valid_session(&self.context, &p.key, &p.session, &p.epoch)
-                } else {
-                    valid_identity(&self.context, &p.key, &p.session, &p.turn, &p.epoch)
-                };
-                if (allow_expired || Instant::now() < p.expires) && current {
-                    Ok(())
-                } else {
-                    Err("interaction is no longer valid".into())
-                }
-            },
+            guard,
         );
         if let Some(e) = report.error {
             eprintln!("[closed-agent] interaction delivery failed: {e}");
@@ -487,7 +496,7 @@ impl Hub {
         #[cfg(not(feature = "deadlock-regression"))]
         let mut state = self.state.lock().await;
         // A busy gate must not drop the question: wait for it, and settle it explicitly if it stays busy.
-        let _gate = match lock_wait(&self.context, GATE_WAIT).await {
+        let gate = match lock_wait(&self.context, GATE_WAIT).await {
             Ok(gate) => gate,
             Err(e) => {
                 eprintln!("[closed-agent] question not registered: {e}");
@@ -549,7 +558,29 @@ impl Hub {
                 p.tool.as_str().unwrap_or("")
             )
         };
-        self.say(&p, &text);
+        // Keep pending answers serialized, but let the settings tick take the file gate while
+        // the notification waits for the chain. The stream awaits delivery before its next frame.
+        drop(gate);
+        let context = self.context.clone();
+        let send = move || {
+            let delivery_gate = std::cell::OnceCell::new();
+            Self::send_notification(&context, &p, &text, &|| {
+                // Recorded sends call this guard after acquiring the chain. Hold the file gate
+                // through delivery and recheck validity for every part.
+                delivery_gate.get_or_init(|| lock(&context)).as_ref().map_err(Clone::clone)?;
+                if Instant::now() < p.expires
+                    && valid_identity(&context, &p.key, &p.session, &p.turn, &p.epoch)
+                {
+                    Ok(())
+                } else {
+                    Err("interaction is no longer valid".into())
+                }
+            });
+        };
+        let result = tokio::task::spawn_blocking(send).await;
+        if let Err(error) = result {
+            eprintln!("[closed-agent] interaction send task failed: {error}");
+        }
     }
 
     /// Returns true if the inbound message was consumed as a pending answer.

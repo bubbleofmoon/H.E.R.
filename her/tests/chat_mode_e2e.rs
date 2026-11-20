@@ -297,6 +297,64 @@ fn closed_agent_maintenance_continues_during_stalled_handshake() {
 }
 
 #[test]
+fn closed_agent_refreshes_settings_while_notification_waits_for_send_chain() {
+    let mut rig = Rig::new(
+        "closed-send-chain",
+        Seed {
+            mode: "closed-agent",
+            config: json!({"ackMessage": "hold send chain"}),
+            ..Seed::default()
+        },
+    );
+    lock(&rig.dsh.inner).settings =
+        json!({"namespaces":[{"ns":"qq-mode","user":{"mode":"closed-agent"}}]});
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"] == "hold send chain" {
+            let _ = lock(&held).recv_timeout(Duration::from_secs(13));
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#SLOW#");
+    assert!(
+        wait_for(Duration::from_secs(10), || {
+            rig.texts_to(OWNER_KEY).iter().any(|text| text == "hold send chain")
+        }),
+        "the acknowledgement did not acquire the send chain"
+    );
+
+    lock(&rig.dsh.inner).interactions.push(json!({
+        "type":"waterfall", "event":"user-questions/request", "agentId":"fake-session-1",
+        "eventId":"question-behind-send", "request":{"questions":[{"id":"q1","question":"Queued question"}]}
+    }));
+    assert!(
+        wait_for(Duration::from_secs(4), || {
+            rig.data_json("pending-interactions.json")
+                .as_array()
+                .is_some_and(|items| items.len() == 1)
+        }),
+        "the stream did not register the queued question"
+    );
+    lock(&rig.dsh.inner).settings =
+        json!({"namespaces":[{"ns":"qq-mode","user":{"mode":"closed-agent","ownerQQ":OWNER}}]});
+    let refreshed = wait_for(Duration::from_secs(7), || {
+        rig.data_json("closed-agent-owner.json")["ownerQQ"] == json!(OWNER)
+    });
+    let before_release = rig.texts_to(OWNER_KEY);
+    drop(release);
+    assert!(refreshed, "owner settings did not refresh while the send chain was held");
+    assert_eq!(before_release, ["hold send chain"]);
+    assert!(
+        wait_for(Duration::from_secs(5), || {
+            rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("Queued question"))
+        }),
+        "the queued notification was not delivered after the acknowledgement"
+    );
+}
+
+#[test]
 fn closed_agent_reset_cancels_pending_and_old_event_cannot_answer_new_session() {
     let mut rig = Rig::new("closed-reset", Seed { mode: "closed-agent", ..Seed::default() });
     rig.start();
