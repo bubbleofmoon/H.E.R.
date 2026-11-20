@@ -32,7 +32,7 @@ pub fn lock(context: &RuntimeContext) -> Result<std::fs::File, String> {
 /// the gate through DSH's settings write-through, whose read timeout is 30 s.
 pub(crate) const GATE_WAIT: Duration = Duration::from_secs(45);
 
-fn try_lock(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
+pub(crate) fn try_lock(context: &RuntimeContext) -> Result<Option<std::fs::File>, String> {
     match context.open_locked_file(RuntimeArea::Data, "locks/closed-agent.lock") {
         Ok(file) => Ok(Some(file)),
         Err(e) if e == "runtime file is already locked" => Ok(None),
