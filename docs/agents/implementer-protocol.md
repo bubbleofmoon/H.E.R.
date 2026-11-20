@@ -1,6 +1,6 @@
 # Implementer protocol
 
-Binding for Antigravity subagents and optional read-only Codex tasks working on a ticket. Host-specific build and test rules live in `docs/agents/rust-validation.md`.
+Binding for Antigravity subagents working on a ticket. Host-specific build and test rules live in `docs/agents/rust-validation.md`.
 
 ## Context
 

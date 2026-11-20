@@ -24,7 +24,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## Agent workflow
 
-- Coordinator rules (model routing, two-axis review, optional Codex second opinions, merge flow and GitHub API budget) are in `docs/agents/coordinator.md`.
+- Coordinator rules (model routing, two-axis review, merge flow and GitHub API budget) are in `docs/agents/coordinator.md`.
 - Ticket work runs on `her/<n>-<slug>` branches cut from `origin/main` in `C:/her-wt/<ticket>` (never push directly to `main`, never force-push). Merge only through pull requests gated by hosted `checks.yml`.
 - Never poll GitHub. Wait for CI only through `scripts/ci-wait.py` (`docs/agents/coordinator.md` "GitHub API budget").
 - No host needs a local Rust build. Hosted CI compiles, lints, formats and tests Rust. Native checks a gate names follow `docs/agents/rust-validation.md`. Apply only ticket-authorized `fmt-patch` hunks for owned files and follow that doc for partial Clippy patches and CI proof. Local rustfmt and editor tooling are optional.
@@ -45,7 +45,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 - `docs/agents/baton.md`: Single-coordinator operation, owner batons and shared ground rules.
 - `docs/agents/coordinator.md`: Coordinator workflow, model selection and GitHub API budget.
 - `docs/agents/issue-tracker.md`: GitHub Issues, claims, the scanned-text rule (published text versus numeric relation and state operations), wayfinding operations and ready queries.
-- `docs/agents/implementer-protocol.md`: Subagent and Codex worker context, evidence and reports.
+- `docs/agents/implementer-protocol.md`: Subagent worker context, evidence and reports.
 - `docs/agents/windows-lifecycle.md`: Windows launchers and scheduler fixtures.
 - `docs/agents/rust-validation.md`: Build slots and validation evidence.
 - `docs/agents/production-ops.md`: Public production rules; procedures live in the vault.

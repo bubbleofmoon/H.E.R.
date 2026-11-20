@@ -13,8 +13,6 @@ Binding for the single Windows Antigravity coordinator (`C:/her`, 32 GB, 4 cores
 
 - **Default coordinator:** `Orchestrator (Neon)` (plans on Gemini 4 Neon, fast execution).
 - **Deep single-model work:** use `Gemini 4 Neon (High/XHigh)` for deep backend bug audits, UI/navigation architecture, or subtle Rust concurrency/lifecycle fixes.
-- **Optional Codex second opinion:** run read-only Codex CLI from `C:/her` as a fresh cross-provider review on high-risk diffs (auth/security, session recovery, production-move, public scan/guards) or tough backend bugs:
-  `powershell -NoProfile -File C:/her/scripts/codex-task.ps1 -Name <run> -WorkDir <workdir> -PromptFile <prompt> -Model gpt-6.2-astra -Effort high -Sandbox read-only` (or `gpt-6.2-sol`).
 - **Review cap:** verify each finding in code before requiring fixes, stop after two review rounds, and file medium/low non-blocking polish as follow-up issues.
 
 ## Native checks
