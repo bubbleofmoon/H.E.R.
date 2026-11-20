@@ -14292,7 +14292,7 @@ fn desktop_sign_in_selected(
             peer == own && fixture_matches
         }))
         .unwrap_or(false);
-    if !same_user && !browser { return Err((403, "desktop sign-in requires the installing user".into())); } // RED-R3-N3
+    if !same_user { return Err((403, "desktop sign-in requires the installing user".into())); }
     let _gate = acquire_social_state_gate(context)?;
     let cfg = selected_config_for_handler(context)?;
     let effective = checked_console_token(context, &cfg)?;
