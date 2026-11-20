@@ -323,6 +323,7 @@ def worker_command(args, relay_path, filter_fd):
         "--ro-bind-try", "/usr/share/ca-certificates", "/usr/share/ca-certificates",
         "--size", TMPFS_SIZE, "--tmpfs", "/home/agent",
         "--size", TMPFS_SIZE, "--tmpfs", "/tmp",
+        "--ro-bind-try", str(args.repo.parent / "coordinator/.git-credentials"), str(args.repo.parent / "coordinator/.git-credentials"),
         "--ro-bind", str(args.stage / "repo"), "/repo",
         "--ro-bind", str(args.stage / "inputs"), "/inputs",
         "--ro-bind", str(relay_path), MODEL_SOCKET,
