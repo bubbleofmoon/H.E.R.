@@ -36,6 +36,7 @@ pub(crate) mod upgrades;
 const STATUS: &str = "lifecycle/dependencies.json";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const NPM_INSTALL_LIMIT: Duration = Duration::from_secs(600);
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(if cfg!(windows) { 5_000 } else { 500 });
 const RELAY_PROBE_BUDGET: Duration = Duration::from_secs(3);
 const RELAY_PROBE_FAILURE_THRESHOLD: u64 = 3;
 
@@ -137,6 +138,9 @@ fn backoff_ms(step: u64) -> i64 {
 }
 
 fn restore_timers(states: &mut Value, name: &str, now: i64) {
+    if name == "relay" {
+        states[name]["relayProbeFailures"] = Value::Null;
+    }
     // Preserve bounded durations from the last observation, not the previous process's
     // wall-clock anchor. Downtime cannot prove continuous health or refusal.
     let observed = states[name]["timerAt"].as_i64().unwrap_or(now);
@@ -1401,8 +1405,7 @@ fn ensure(
     Ok(())
 }
 
-fn listening(dependency: &Dependency) -> Result<bool, String> {
-    let timeout = Duration::from_millis(if cfg!(windows) { 5_000 } else { 500 });
+fn listening(dependency: &Dependency, timeout: Duration) -> Result<bool, String> {
     match std::net::TcpStream::connect_timeout(&dependency.endpoint, timeout) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(false),
@@ -1416,11 +1419,20 @@ fn listening(dependency: &Dependency) -> Result<bool, String> {
 enum PortHealth {
     Ready,
     ConnectionRefused,
-    ProbeFailed,
+    ProbeFailed(Option<String>),
+    ConnectionUnknown(Option<String>),
+}
+
+enum ReconcileStatus {
+    Ready,
+    Waiting,
+    RelayRefused(String),
 }
 
 fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth, String> {
-    let result = listening(dependency).and_then(|listening| {
+    let connect = listening(dependency, CONNECT_TIMEOUT);
+    let connection_unknown = connect.is_err();
+    let result = connect.and_then(|listening| {
         if listening {
             if let Some(settings) = &dependency.relay {
                 settings.probe(dependency.endpoint, Instant::now() + RELAY_PROBE_BUDGET)?;
@@ -1431,7 +1443,7 @@ fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth,
     let state = &mut states[dependency.name];
     match result {
         Ok(listening) => {
-            if dependency.relay.is_some() {
+            if listening && dependency.relay.is_some() {
                 state["relayProbeFailures"] = Value::Null;
             }
             Ok(if listening {
@@ -1440,23 +1452,22 @@ fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth,
                 PortHealth::ConnectionRefused
             })
         }
-        Err(reason) => {
-            // Only a confirmed connection refusal advances the hang timer.
-            state["refusalSince"] = Value::Null;
-            if dependency.relay.is_some() {
-                state["healthySince"] = Value::Null;
-                let failures = state["relayProbeFailures"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .saturating_add(1)
-                    .min(RELAY_PROBE_FAILURE_THRESHOLD);
-                state["relayProbeFailures"] = json!(failures);
-                if failures < RELAY_PROBE_FAILURE_THRESHOLD {
-                    return Ok(PortHealth::ProbeFailed);
-                }
-            }
-            Err(reason)
+        Err(reason) if dependency.relay.is_some() => {
+            state["healthySince"] = Value::Null;
+            let failures = state["relayProbeFailures"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .min(RELAY_PROBE_FAILURE_THRESHOLD);
+            state["relayProbeFailures"] = json!(failures);
+            let refusal = (failures >= RELAY_PROBE_FAILURE_THRESHOLD).then_some(reason);
+            Ok(if connection_unknown {
+                PortHealth::ConnectionUnknown(refusal)
+            } else {
+                PortHealth::ProbeFailed(refusal)
+            })
         }
+        Err(reason) => Err(reason),
     }
 }
 
@@ -1467,7 +1478,7 @@ fn stop_hung(
     states: &mut Value,
     clock: &Clock,
     desired: &lifecycle::DesiredRead,
-) -> Result<bool, String> {
+) -> Result<ReconcileStatus, String> {
     let path = context
         .resolve_path(
             RuntimeArea::Data,
@@ -1477,7 +1488,7 @@ fn stop_hung(
         .map_err(str::to_string)?;
     let _desired_gate = lifecycle::lock_with_wait(&path, Duration::from_secs(5))?;
     if !same_desired(context, desired) {
-        return Ok(false);
+        return Ok(ReconcileStatus::Waiting);
     }
     if holder(dependency)?.is_some_and(|owner| !identity::same_identity(&owner, found)) {
         return Err(format!(
@@ -1492,20 +1503,21 @@ fn stop_hung(
             dependency.name
         ));
     }
-    match check_port(states, dependency)? {
-        PortHealth::Ready => {
-            healthy(states, dependency.name, clock.now(context));
-            return Ok(true);
-        }
-        PortHealth::ProbeFailed => return Ok(false),
-        PortHealth::ConnectionRefused => {}
+    // The relay verdict was observed outside the lifecycle gate. For dependencies
+    // that only check TCP, keep the recovery recheck shorter than the gate wait.
+    if dependency.relay.is_none() && listening(dependency, Duration::from_millis(500))? {
+        healthy(states, dependency.name, clock.now(context));
+        return Ok(ReconcileStatus::Ready);
     }
     match identity::kill_verified(found) {
         identity::KillOutcome::Killed | identity::KillOutcome::Gone => {
             failed(states, dependency.name, clock.now(context));
-            states[dependency.name]["reason"] =
-                json!("dependency hung: selected port refused for two minutes; waiting to restart");
-            Ok(false)
+            states[dependency.name]["reason"] = json!(if dependency.relay.is_some() {
+                "relay hung: health checks failed for two minutes; waiting to restart"
+            } else {
+                "dependency hung: selected port refused for two minutes; waiting to restart"
+            });
+            Ok(ReconcileStatus::Waiting)
         }
         other => Err(format!(
             "{} hung dependency could not be stopped: {other:?}; no restart",
@@ -1637,7 +1649,7 @@ fn reconcile_one(
     clock: &Clock,
     fresh: bool,
     desired: &lifecycle::DesiredRead,
-) -> Result<bool, String> {
+) -> Result<ReconcileStatus, String> {
     let name = dependency.name;
     let now = clock.now(context);
     if states[name]["state"] == "stopped" {
@@ -1650,7 +1662,7 @@ fn reconcile_one(
                 .as_i64()
                 .ok_or("dependency restart deadline is invalid")?
         {
-            return Ok(false);
+            return Ok(ReconcileStatus::Waiting);
         }
         states[name]["identity"] = Value::Null;
         states[name]["state"] = json!("pending");
@@ -1660,7 +1672,7 @@ fn reconcile_one(
         match liveness(&found) {
             identity::Liveness::Gone | identity::Liveness::Mismatch(_) => {
                 failed(states, name, clock.now(context));
-                return Ok(false);
+                return Ok(ReconcileStatus::Waiting);
             }
             identity::Liveness::Unknown(_) => return Err(format!("{name}: cannot inspect elevated or access-restricted dependency; no process changed")),
             identity::Liveness::Matches => {
@@ -1679,11 +1691,11 @@ fn reconcile_one(
         ensure(context, dependency, states, clock, desired)?;
     }
     if !wanted(context) {
-        return Ok(false);
+        return Ok(ReconcileStatus::Waiting);
     }
     let Ok(found) = serde_json::from_value::<ProcessIdentity>(states[name]["identity"].clone())
     else {
-        return Ok(false);
+        return Ok(ReconcileStatus::Waiting);
     };
     let verified = inspected(found.pid, dependency)?;
     if !identity::same_identity(&found, &verified) {
@@ -1691,13 +1703,17 @@ fn reconcile_one(
             "{name} identity changed during monitoring; left alone"
         ));
     }
-    match check_port(states, dependency)? {
+    let port = check_port(states, dependency)?;
+    match port {
         PortHealth::Ready => {
             healthy(states, name, clock.now(context));
-            return Ok(true);
+            return Ok(ReconcileStatus::Ready);
         }
-        PortHealth::ProbeFailed => return Ok(false),
-        PortHealth::ConnectionRefused => {}
+        PortHealth::ConnectionUnknown(refusal) => {
+            states[name]["refusalSince"] = Value::Null;
+            return Ok(refusal.map_or(ReconcileStatus::Waiting, ReconcileStatus::RelayRefused));
+        }
+        PortHealth::ProbeFailed(_) | PortHealth::ConnectionRefused => {}
     }
     let now = clock.now(context);
     let since = states[name]["refusalSince"].as_i64().unwrap_or(now);
@@ -1705,6 +1721,9 @@ fn reconcile_one(
     states[name]["healthySince"] = Value::Null;
     if now.saturating_sub(since) >= 120_000 {
         return stop_hung(context, dependency, &found, states, clock, desired);
+    }
+    if let PortHealth::ProbeFailed(refusal) = port {
+        return Ok(refusal.map_or(ReconcileStatus::Waiting, ReconcileStatus::RelayRefused));
     }
     if states[name]["ready"] != true
         && now.saturating_sub(states[name]["startedAt"].as_i64().unwrap_or(now)) >= 90_000
@@ -1714,7 +1733,7 @@ fn reconcile_one(
             "{name} did not listen within 90 seconds; left running"
         ));
     }
-    Ok(false)
+    Ok(ReconcileStatus::Waiting)
 }
 
 // Persist outage notices before attempting delivery through the recovering gateway.
@@ -1723,7 +1742,7 @@ fn checkpoint(
     cfg: &Value,
     states: &mut Value,
     name: &str,
-    error: Option<&str>,
+    result: &Result<ReconcileStatus, String>,
     desired: &lifecycle::DesiredRead,
     previous: &Value,
 ) -> Result<(), String> {
@@ -1758,16 +1777,18 @@ fn checkpoint(
         } else {
             None
         }
-    } else if let Some(reason) = error {
+    } else if let Err(reason) | Ok(ReconcileStatus::RelayRefused(reason)) = result {
         states[name]["state"] = json!("refused");
         states[name]["reason"] = json!(reason);
         states[name]["healthySince"] = Value::Null;
-        states[name]["refusalSince"] = Value::Null;
+        if result.is_err() {
+            states[name]["refusalSince"] = Value::Null;
+        }
         // Independent of the alert fingerprint, which an earlier build may already have persisted.
         log_refusal(context, name, reason);
-        if states[name]["fingerprint"] != reason {
+        if states[name]["fingerprint"] != reason.as_str() {
             states[name]["fingerprint"] = json!(reason);
-            Some((name.to_string(), reason.to_string()))
+            Some((name.to_string(), reason.clone()))
         } else {
             None
         }
@@ -1950,9 +1971,9 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
                     Some(dependency) => {
                         reconcile_one(context, &dependency, &mut states, clock, fresh, &desired)
                     }
-                    None => Ok(false),
+                    None => Ok(ReconcileStatus::Waiting),
                 });
-            if ready.is_err()
+            if matches!(ready, Err(_) | Ok(ReconcileStatus::RelayRefused(_)))
                 && states[name]["state"] != "backoff"
                 && serde_json::from_value::<ProcessIdentity>(states[name]["identity"].clone())
                     .is_ok_and(|found| {
@@ -1970,11 +1991,11 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
                 &cfg,
                 &mut states,
                 name,
-                ready.as_ref().err().map(String::as_str),
+                &ready,
                 &desired,
                 &previous,
             )?;
-            predecessors_ready &= matches!(ready, Ok(true));
+            predecessors_ready &= matches!(ready, Ok(ReconcileStatus::Ready));
         }
         Ok::<_, String>(())
     })();
@@ -1985,7 +2006,7 @@ fn reconcile(context: &RuntimeContext, clock: &Clock, fresh: bool, blocked: Opti
             &cfg,
             &mut states,
             "configuration",
-            Some(&reason),
+            &Err(reason),
             &desired,
             &previous,
         ) {

@@ -6,6 +6,8 @@ const key = fs.readFileSync(new URL('./client-key', import.meta.url), 'utf8').tr
 fs.appendFileSync(new URL('./attempts', import.meta.url), process.pid + '\n');
 // Deliberately hostile output: the supervisor must not retain upstream diagnostics.
 console.log(key); console.error(key);
+const offlineFile = new URL('./offline', import.meta.url);
+let offline = fs.existsSync(offlineFile);
 let scriptedProbe = 0;
 const server = http.createServer((req, res) => {
   if (req.url !== '/v1/models' || req.method !== 'GET') {
@@ -28,7 +30,12 @@ const server = http.createServer((req, res) => {
       const lines = fs.readFileSync(new URL('./probe-responses', import.meta.url), 'utf8').split('\n');
       if (index >= lines.length - 1) return;
       clearInterval(timer);
-      respond(Number(lines[index]));
+      const [status, action] = lines[index].trim().split(' ');
+      if (action === 'offline') {
+        fs.writeFileSync(offlineFile, '');
+        updateListener();
+      }
+      respond(Number(status));
     }, 20);
     res.once('close', () => clearInterval(timer));
   } else if (mode === 'slow' || mode === 'late') {
@@ -38,5 +45,18 @@ const server = http.createServer((req, res) => {
     respond(mode === 'ready' ? 200 : Number(mode) || 503);
   }
 });
-server.listen(cfg.port, '127.0.0.1', () => fs.writeFileSync(new URL('./listening', import.meta.url), 'ready'));
+function listen() {
+  server.listen(cfg.port, '127.0.0.1', () => fs.writeFileSync(new URL('./listening', import.meta.url), 'ready'));
+}
+
+function updateListener() {
+  const shouldBeOffline = fs.existsSync(offlineFile);
+  if (offline === shouldBeOffline) return;
+  offline = shouldBeOffline;
+  if (offline) server.close();
+  else listen();
+}
+
+if (!offline) listen();
+setInterval(updateListener, 20);
 setTimeout(() => process.exit(0), 300000).unref();
