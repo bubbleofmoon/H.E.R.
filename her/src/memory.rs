@@ -565,6 +565,7 @@ fn search_with(
 /// characters upstream, so this never drops a term of a chat-length message).
 const RECALL_MAX_TERMS: usize = 200;
 const RECALL_MAX_ITEMS: usize = 5;
+const FUSION_DEPTH: usize = 20;
 /// Relevance bar: a memory qualifies when it shares two or more distinct terms totalling at least
 /// this many characters with the message (two Chinese words), or exactly one term that is an
 /// identifier or at least `RECALL_LONG_TERM_CHARS` characters long. One shared Chinese bigram or
@@ -669,7 +670,6 @@ pub fn recall(
         format!(" AND m.id NOT IN ({})", ids.join(","))
     };
 
-    const FUSION_DEPTH: usize = 20;
     let dense = semantic
         .and_then(|(context, query)| dense::rank(context, reader, query, &excluded, FUSION_DEPTH))
         .unwrap_or_default();

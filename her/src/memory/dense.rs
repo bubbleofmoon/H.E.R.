@@ -10,6 +10,10 @@ use sha2::{Digest, Sha256};
 use super::{atomic, hit_from_row, read_row, visibility_filter, Hit, Reader};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 
+#[cfg(test)]
+#[path = "calibration.rs"]
+mod calibration;
+
 const MODEL_DIR: &str = "recall/bge-small-zh-v1.5";
 const DIMENSIONS: usize = 512;
 const BACKFILL_BATCH: usize = 16;
@@ -117,17 +121,33 @@ fn rank_with(
     model: &[u8],
     mut embed: impl FnMut(&[String]) -> Option<Vec<Vec<f32>>>,
 ) -> Option<Vec<Hit>> {
-    let query = format!("为这个句子生成表示以用于检索相关文章：{query}");
-    let vectors = encode(&mut embed, &[query])?;
-    let query_vector = vectors.first()?;
+    let query_vector = encode_query(&mut embed, query)?;
     let conn = reader.conn;
     register_sqlite_vec(conn).ok()?;
     ensure_cache(conn).ok()?;
     backfill(reader, model, &mut embed).ok()??;
+    rank_cached(reader, &query_vector, excluded, limit, model, MAX_DISTANCE)
+}
 
+fn encode_query(
+    embed: &mut impl FnMut(&[String]) -> Option<Vec<Vec<f32>>>,
+    query: &str,
+) -> Option<Vec<u8>> {
+    let query = format!("为这个句子生成表示以用于检索相关文章：{query}");
+    encode(embed, &[query])?.pop()
+}
+
+fn rank_cached(
+    reader: &Reader<'_>,
+    query_vector: &[u8],
+    excluded: &str,
+    limit: usize,
+    model: &[u8],
+    ceiling: f64,
+) -> Option<Vec<Hit>> {
     // Resolve grants and read ranked rows in the same snapshot. A previously indexed memory
     // must still pass the current reader's ACL before it can compete for a dense rank.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred).ok()?;
+    let tx = Transaction::new_unchecked(reader.conn, TransactionBehavior::Deferred).ok()?;
     let (visibility, args) = scope(&tx, reader).ok()?;
     let sql = format!(
         "WITH scoped AS MATERIALIZED (
@@ -139,11 +159,12 @@ fn rank_with(
                 s.distance, m.pinned, m.importance, m.hits, m.created_at,
                 m.tags, m.source, m.last_used_at, m.owner_type, m.archived, m.expires_at
          FROM scoped s JOIN memory m ON m.id = s.id
-         WHERE s.distance <= {MAX_DISTANCE}
+         WHERE s.distance <= ?
          ORDER BY s.distance, m.id LIMIT {limit}"
     );
-    let mut refs: Vec<&dyn ToSql> = vec![query_vector, &model];
+    let mut refs: Vec<&dyn ToSql> = vec![&query_vector, &model];
     refs.extend(args.iter().map(|arg| arg as &dyn ToSql));
+    refs.push(&ceiling);
     let mut stmt = tx.prepare(&sql).ok()?;
     let hits = stmt
         .query_map(refs.as_slice(), |row| {
