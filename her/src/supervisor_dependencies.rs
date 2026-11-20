@@ -37,7 +37,7 @@ const STATUS: &str = "lifecycle/dependencies.json";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const NPM_INSTALL_LIMIT: Duration = Duration::from_secs(600);
 const RELAY_PROBE_BUDGET: Duration = Duration::from_secs(3);
-const RELAY_PROBE_FAILURE_THRESHOLD: u64 = 3;
+const RELAY_PROBE_FAILURE_THRESHOLD: u64 = 1; // RED-2
 
 /// A dependency's pinned version from runtime config: `None` when unpinned. A pin is one exact
 /// release version (`1.14.22`, `0.2.1-rc.2`); ranges, tags and build metadata are refused.
