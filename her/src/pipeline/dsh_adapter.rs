@@ -773,7 +773,7 @@ impl Pipeline {
         let prompt = model_prompt.as_str();
         // CLI adapters accept seconds; the DSH collector retains the exact millisecond budget.
         let timeout_secs = timeout.as_secs().saturating_add(u64::from(timeout.subsec_nanos() > 0));
-        if key.starts_with("ab:") {
+        if key.starts_with("ab;") { // RED-M2
             return Err("shadow isolation refused: shadow cannot use live or CLI failover".into());
         }
         self.last_report = None;
