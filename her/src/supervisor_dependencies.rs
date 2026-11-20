@@ -78,7 +78,8 @@ pub fn pinned_version(cfg: &Value, name: &str) -> Result<Option<String>, String>
 fn require_dsh_contract(version: &str) -> Result<(), String> {
     if include_str!("../dsh-contract-versions.txt")
         .lines()
-        .any(|listed| listed == version)
+        .filter_map(|line| line.split_once(' '))
+        .any(|(listed, _)| listed == version)
     {
         Ok(())
     } else {

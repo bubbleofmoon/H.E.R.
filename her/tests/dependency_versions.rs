@@ -1179,6 +1179,10 @@ fn pins_reject_numeric_prerelease_identifiers_with_leading_zeros() {
         let (_, health) = fixture.health("0");
         assert_eq!(health["parts"]["snowluma"]["pinnedVersion"], version);
     }
+    fixture.config["dependencies"]["dsh"]["version"] = json!(DSH_VERSION);
+    fixture.save();
+    let (_, health) = fixture.health("0");
+    assert_eq!(health["parts"]["dsh"]["pinnedVersion"], DSH_VERSION);
 }
 
 fn wall_ms() -> i64 {

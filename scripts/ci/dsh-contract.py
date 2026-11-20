@@ -17,6 +17,8 @@ REGISTRY = 'https://registry.npmjs.org/'
 VERSION_LIST = ROOT / 'her' / 'dsh-contract-versions.txt'
 TEST = 'dsh_credential::contract::settings_describe_cookie_contract'
 READY = re.compile(rb'^dsh web: (http://127\.0\.0\.1:[1-9][0-9]{0,4})/\S*\r?$', re.MULTILINE)
+INTEGRITY = re.compile(r'sha512-[A-Za-z0-9+/]{86}==')
+INSTALL_SECONDS = 600
 STARTUP_SECONDS = 180
 TEST_SECONDS = 15
 
@@ -29,31 +31,54 @@ def tool(name):
     return Path(path).absolute()
 
 
-def stage(root, node, version):
+def read_pins():
+    pins = {}
+    for line in VERSION_LIST.read_text(encoding='utf-8').splitlines():
+        version, _, integrity = line.partition(' ')
+        if not version or version in pins or not INTEGRITY.fullmatch(integrity):
+            raise ValueError('DSH contract pins must list distinct versions with SHA-512 integrity')
+        pins[version] = integrity
+    if not pins:
+        raise ValueError('DSH contract pins must list at least one version')
+    return pins
+
+
+def run_npm(root, node, npm, *args):
+    home = root / 'npm-home'
+    subprocess.run(
+        [node, npm, *args, '--omit=dev', '--no-audit', '--no-fund', '--no-update-notifier',
+         '--registry', REGISTRY, f'--{PACKAGE.split("/")[0]}:registry={REGISTRY}',
+         '--cache', home / 'cache', '--userconfig', home / 'user.npmrc',
+         '--globalconfig', home / 'global.npmrc'],
+        cwd=root / 'package',
+        env={'HOME': str(home), 'TMPDIR': str(home), 'PATH': f'{node.parent}:{os.defpath}'},
+        stdin=subprocess.DEVNULL, check=True, timeout=INSTALL_SECONDS,
+    )
+
+
+def stage(root, node, npm, version, integrity):
     scratch_home = root / 'npm-home'
     scratch_home.mkdir()
     stage_dir = root / 'package'
     stage_dir.mkdir()
     (stage_dir / 'package.json').write_text('{"private":true}\n', encoding='utf-8')
-    userconfig = scratch_home / 'user.npmrc'
-    globalconfig = scratch_home / 'global.npmrc'
-    userconfig.touch()
-    globalconfig.touch()
-    subprocess.run(
-        [tool('npm'), 'install', '--save-exact', '--ignore-scripts', '--no-audit', '--no-fund',
-         '--fetch-retries=1', '--registry', REGISTRY, '--cache', scratch_home / 'cache',
-         '--userconfig', userconfig, '--globalconfig', globalconfig, '--', f'{PACKAGE}@{version}'],
-        cwd=stage_dir, env={'HOME': str(scratch_home), 'PATH': f'{node.parent}:{os.defpath}'},
-        stdin=subprocess.DEVNULL, check=True, timeout=600,
-    )
+    (scratch_home / 'user.npmrc').touch()
+    (scratch_home / 'global.npmrc').touch()
+    # Populate the private cache before entering the loopback-only network namespace.
+    run_npm(root, node, npm, 'install', '--save-exact', '--ignore-scripts', '--fetch-retries=1',
+            f'{PACKAGE}@{version}')
     location = f'node_modules/{PACKAGE}'
     lock = json.loads((stage_dir / 'package-lock.json').read_text(encoding='utf-8'))
     record = lock['packages'][location]
     expected_tarball = f'{REGISTRY}{PACKAGE}/-/dsh-{version}.tgz'
-    if (record['version'] != version or record['resolved'] != expected_tarball
-            or not record.get('integrity', '').startswith('sha512-')):
-        raise RuntimeError('npm lock did not resolve the exact registry package with integrity')
-    package = (stage_dir / location).resolve(strict=True)
+    if record['version'] != version or record['resolved'] != expected_tarball:
+        raise RuntimeError('npm lock did not resolve the exact registry package')
+    if record.get('integrity') != integrity:
+        raise RuntimeError('npm lock integrity does not match the pinned DSH integrity')
+
+
+def installed_entry(stage_dir, version):
+    package = (stage_dir / 'node_modules' / PACKAGE).resolve(strict=True)
     if not package.is_relative_to(stage_dir):
         raise RuntimeError('installed DSH package is outside the staging directory')
     manifest = json.loads((package / 'package.json').read_text(encoding='utf-8'))
@@ -95,9 +120,12 @@ def wait_for_dsh(child, log):
     raise RuntimeError(f'DSH did not announce a loopback listening port within {STARTUP_SECONDS} seconds')
 
 
-def isolated(root, node, entry, test_binary):
+def isolated(root, node, npm, test_binary, version):
     if os.getpid() != 1:
         raise RuntimeError('the DSH fixture requires its own PID namespace')
+    # Reinstall from the verified lock so lifecycle scripts run under fixture isolation.
+    run_npm(root, node, npm, 'ci', '--offline', '--ignore-scripts=false')
+    entry = installed_entry(root / 'package', version)
     home, work, runtime_temp = (root / name for name in ('home', 'work', 'temp'))
     for directory in (home, work, runtime_temp):
         directory.mkdir()
@@ -126,10 +154,11 @@ def isolated(root, node, entry, test_binary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    versions = VERSION_LIST.read_text(encoding='utf-8').splitlines()
-    if not versions or '' in versions or len(versions) != len(set(versions)):
-        parser.error('DSH contract versions must be a nonempty list of distinct versions')
-    parser.add_argument('--version', choices=versions)
+    try:
+        pins = read_pins()
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    parser.add_argument('--version', choices=pins)
     parser.add_argument('--filter')
     parser.add_argument('--isolated', nargs=4, type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -138,27 +167,31 @@ def main():
     if args.filter is not None and args.filter not in TEST:
         parser.error(f'filter matches no tests (available: {TEST})')
     if args.isolated:
-        isolated(*args.isolated)
+        if args.version is None:
+            parser.error('the isolated fixture requires a version')
+        isolated(*args.isolated, args.version)
         return 0
 
     node = tool('node')
+    npm = tool('npm')
     ip = tool('ip')
     unshare = tool('unshare')
     test_binary = build_test()
     failed = False
-    for version in (args.version,) if args.version else versions:
+    for version in (args.version,) if args.version else pins:
         print(f'Running dsh_contract against {PACKAGE}@{version}', flush=True)
         try:
             with tempfile.TemporaryDirectory(prefix='her-dsh-contract-', dir='/tmp') as temp:
                 fixture = Path(temp).resolve()
-                entry = stage(fixture, node, version)
+                stage(fixture, node, npm, version, pins[version])
                 subprocess.run(
                     [unshare, '--user', '--map-root-user', '--net', '--pid', '--fork',
                      '--kill-child', '--mount-proc', '/bin/sh', '-ec',
                      '"$1" link set lo up; shift; exec "$@"', 'dsh-contract', ip,
-                     sys.executable, '-I', __file__, '--isolated', fixture, node, entry, test_binary],
+                     sys.executable, '-I', __file__, '--version', version,
+                     '--isolated', fixture, node, npm, test_binary],
                     env={}, stdin=subprocess.DEVNULL, check=True,
-                    timeout=STARTUP_SECONDS + TEST_SECONDS + 15,
+                    timeout=INSTALL_SECONDS + STARTUP_SECONDS + TEST_SECONDS + 15,
                 )
         except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:
             print(f'dsh_contract {version}: FAIL ({error})', file=sys.stderr, flush=True)
