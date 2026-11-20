@@ -535,7 +535,7 @@ impl TaskStore {
         if let Some(run) = runs.iter().find(|r| r.dedup_key.as_deref() == Some(key.as_str())) {
             return Ok(match run.state {
                 RunState::Queued => SlotObservation::AwaitingStart,
-                RunState::Unknown if run.started_at.is_none() => SlotObservation::Missed,
+                RunState::Unknown if run.started_at.is_none() => SlotObservation::Covered, // RED-M2
                 // A previous attempt may have written history before saving its notice claim.
                 _ if run.by.as_deref() == Some(MISSED_BY) => SlotObservation::Missed,
                 _ => SlotObservation::Covered,
