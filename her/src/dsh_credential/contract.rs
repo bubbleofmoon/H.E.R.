@@ -27,7 +27,7 @@ fn settings_describe_cookie_contract() {
         )
     };
 
-    rpc.credential().set_cookie(cookies[1].clone()); // RED-ACCEPT
+    rpc.credential().set_cookie(cookies[0].clone());
     assert!(
         describe().is_ok(),
         "settings/describe must accept the bridge-minted cookie"
