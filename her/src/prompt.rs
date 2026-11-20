@@ -437,32 +437,21 @@ fn hf119_reply_prompt_leaves_timing_to_the_bridge() {
     assert!(!preset.contains("purpose=\"reply\""), "preset still instructs a first-reply wait");
 }
 
-/// 沉睡前强制等待（对应 JS 的 preSleepLine）。
-/// JS `Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000)`.
-fn pre_sleep_ms(cfg: &Value) -> u64 {
-    // The reserved2 turn budget reads the same value, so a turn can always finish this observation.
-    crate::wake::prompt_pre_sleep_wait_ms(cfg) as u64
-}
-
 fn question_line(cfg: &Value) -> String {
     let seconds = crate::question::exchange_window_ms(cfg) as f64 / 1000.0;
     format!("【提问唤醒】triggers.question 保持布尔开关：只响应引用你的问句，或你最近发言后 {seconds} 秒交流窗口内与你有引用回复或定向回复/@往来的成员的问句，且不能 @ 其他成员。催促也必须在同一交流窗口内；名字和 @ 唤醒独立设置。\n\n")
 }
 
-fn pre_sleep_line(cfg: &Value) -> String {
-    let ms = pre_sleep_ms(cfg);
-    let duration = duration_text(ms as i64);
-    let window = crate::wake::engagement_window_ms(cfg);
-    // With an engagement window the rule for messages after her reply is stated once, there.
-    let after_reply = if window.is_some() {
-        "你发言后的等待按下面的【互动窗口】进行（见【互动窗口】）"
-    } else {
-        "若你选择参与回复，则下次想睡时需要重新等待观察窗口"
-    };
-    let mut line = format!(
-        "【沉睡前强制等待】这是决定潜水收尾时的步骤，不是首回复的前置条件。除非对方明确说“不聊了/晚安/下了/拜拜”等结束语，否则每次设置潜水/下一次唤醒前，必须先调用 qq_wait_for_messages(timeoutMs={ms}) 完成一次沉睡前观察；发送工具的静默与打字时间不能代替这次完整观察。若 {duration}内没人说话，返回 preSleepWaitSatisfied=true，可以设置下一次唤醒并沉睡；若期间有人发新消息，先查看返回的 newMessages——判断不需要你参与就可以直接沉睡，{after_reply}。preSleepWaitRemainingMs 仅在本轮还有等待额度时用于继续观察。\n\n"
-    );
-    if let Some(window) = window {
+fn pre_sleep_line(cfg: &Value, key: &str) -> String {
+    let ms = crate::wake::required_pre_sleep_ms(cfg, key);
+    let mut line = String::new();
+    if ms > 0 {
+        let duration = duration_text(ms);
+        line.push_str(&format!(
+            "【沉睡前强制等待】群聊潜水收尾时，若 preSleepWaitRemainingMs 大于 0 且本轮还有等待额度，用 qq_wait_for_messages(timeoutMs={ms}) 观察。{duration}内没人说话可收尾；有新消息先看 newMessages，不需要参与即可收尾。发言后按【互动窗口】重新计时（见【互动窗口】）。\n\n"
+        ));
+    }
+    if let Some(window) = crate::wake::engagement_window_ms(cfg) {
         line.push_str(&engagement_line(window));
     }
     line.push_str(&question_line(cfg));
@@ -487,7 +476,7 @@ fn engagement_line(window_ms: i64) -> String {
 
 fn wait_limit_line(cfg: &Value) -> String {
     let policy = crate::console::wait_policy(cfg);
-    format!("【发送表情】{}\n【本轮等待】两种用途合计最多 {} 次（含沉睡观察）；返回了给你的消息（forYou=true）的等待不占次数（每轮最多 {} 次，与本轮发送上限相同）；最后一次留给观察，桥接会在需要时自动完成。未在互动窗口内时 messages 合批 {}ms，每条来信重置，最多 {}ms；@你和管理员来信立即返回。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发消息；收尾工具在观察不足时强制 30 秒后再唤醒。\n\n",
+    format!("【发送表情】{}\n【本轮等待】两种用途合计最多 {} 次（含沉睡观察）；返回了给你的消息（forYou=true）的等待不占次数（每轮最多 {} 次，与本轮发送上限相同）；最后一次留给观察，桥接会在需要时自动完成。未在互动窗口内时 messages 合批 {}ms，每条来信重置，最多 {}ms；@你和管理员来信立即返回。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发消息；若收到了给你的消息，先处理再结束回合。用完额度后桥接按当前唤醒配置结束本轮。\n\n",
         crate::outbound_message::GUIDANCE, policy.max_per_turn, crate::console::turn_send_cap(cfg), policy.window_ms, policy.max_ms)
 }
 
@@ -1041,15 +1030,21 @@ fn wake_line(st: &Value) -> String {
 }
 
 /// 唤醒尾段。
-fn tail(reason: &str, key: &str, pre_sleep_ms: u64) -> String {
+fn tail(reason: &str, key: &str, pre_sleep_ms: i64) -> String {
     match reason {
         // 首次唤醒：引导它先看角色/工具，再决定怎么被唤醒。
         "bootstrap" => format!(
             "【引导唤醒】你已接入 QQ 会话 {key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先处理并直接调用发送工具，最后才用 qq_set_wake_config 设置你希望如何被唤醒。"
         ),
-        "replyCheck" => format!(
-            "【回复检查】{key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，有话想说就直接调用发送工具，桥接自动控制回复节奏；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。"
-        ),
+        "replyCheck" => {
+            let mut out = format!(
+                "【回复检查】{key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，有话想说就直接调用发送工具；如果没人回你，可以安静收尾。"
+            );
+            if pre_sleep_ms > 0 {
+                out.push_str(&format!("仍需观察时用 qq_wait_for_messages(timeoutMs={pre_sleep_ms})，先处理返回的 newMessages。"));
+            }
+            out
+        }
         "poke" => format!(
             "【唤醒】{key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。"
         ),
@@ -1063,10 +1058,10 @@ fn tail(reason: &str, key: &str, pre_sleep_ms: u64) -> String {
             "【主动机会】{key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。"
         ),
         r if r.starts_with("reminder:") => format!(
-            "【提醒】{key}\n原因：一条提醒到时间了，内容见上方【提醒内容】。\n用发送工具在本会话自然地把提醒告诉对方；不要提到日程、系统或提醒编号。说完后按【沉睡前强制等待】收尾。"
+            "【提醒】{key}\n原因：一条提醒到时间了，内容见上方【提醒内容】。\n用发送工具在本会话自然地把提醒告诉对方；不要提到日程、系统或提醒编号。说完后按当前唤醒规则收尾。"
         ),
         other => format!(
-            "【唤醒】{key}\n原因：{other}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。"
+            "【唤醒】{key}\n原因：{other}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水时按当前唤醒规则收尾。"
         ),
     }
 }
@@ -1096,7 +1091,7 @@ pub fn build_reminder_with_runtime(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let token = st.get("agentToken").and_then(|t| t.as_str()).unwrap_or("");
-    let pre_sleep_ms = crate::wake::prompt_pre_sleep_wait_ms(&cfg);
+    let pre_sleep_ms = crate::wake::required_pre_sleep_ms(&cfg, key);
 
     let mut out = String::new();
     // 角色行必须在最前（JS 的 roleLine）：有角色卡的会话，提醒里也得先报身份，
@@ -1104,9 +1099,10 @@ pub fn build_reminder_with_runtime(
     out.push_str(&role_line_with_runtime(context, key));
     out.push_str(&identity_line(&checked_nickname(context, &cfg, self_name), self_qq));
     out.push_str(&token_line(token));
-    out.push_str(&format!(
-        "【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。"
-    ));
+    out.push_str("【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者用 qq_mark_read 并传入你已查看的 readThroughSeq 作为 throughSeq。这是为了防止你忘记收尾后进入“永眠”。");
+    if pre_sleep_ms > 0 {
+        out.push_str(&format!("仍需沉睡前观察时用 qq_wait_for_messages(timeoutMs={pre_sleep_ms})；有人说话时先查看 newMessages。"));
+    }
     out
 }
 /// 短时记忆的纯文本（供 `/api/socialV2/memory` 用）。
@@ -1226,9 +1222,9 @@ fn build_inner(
     let (recall, recalled) = recall_block_with(context, &cfg, &st, key, &[], &keep_all);
     out.push_str(&recall);
     out.push_str(&participation_block(&st));
-    out.push_str(&pre_sleep_line(&cfg));
+    out.push_str(&pre_sleep_line(&cfg, key));
     out.push_str(&crate::schedule::reminder_line(context, reason));
-    out.push_str(&tail(reason, key, pre_sleep_ms(&cfg)));
+    out.push_str(&tail(reason, key, crate::wake::required_pre_sleep_ms(&cfg, key)));
     let recent = st["recentMessages"].as_array().cloned().unwrap_or_default();
     let carried = &recent[recent.len().saturating_sub(10)..];
     crate::model_failure::remember_prompt(context, key, "dsh", &out, crate::model_failure::message_refs(&Value::Array(carried.to_vec())));
@@ -1489,7 +1485,7 @@ mod tests {
         assert!(p.contains("【你的身份】"));
         assert!(p.contains("【提醒】你还没有完成回合收尾"));
         assert!(p.contains("永眠"), "必须点明后果，否则模型不当回事");
-        assert!(p.contains("qq_wait_for_messages(timeoutMs="), "要给出具体等待时长");
+        assert!(!p.contains("qq_wait_for_messages(timeoutMs="), "private closeout has no mandatory wait");
         assert!(!p.contains("【此刻状态】"), "提醒 prompt 不该带状态块");
         // 有角色卡的会话：提醒里必须先报身份（JS 的 roleLine 在最前）。
         // 这条以前漏了，模型会在"没有角色"的语境下收尾。
@@ -1501,14 +1497,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]
-    fn reminder_observation_zero_uses_the_default_duration() {
-        let (root, context) = runtime_fixture("reminder-zero");
+    fn sleep_policy_disables_observation_in_prompts_and_budgets() {
+        let (root, context) = runtime_fixture("sleep-policy");
         let mut cfg = context.load_config().unwrap();
-        cfg["socialV2"]["wake"]["preSleepWaitMs"] = serde_json::json!(0);
-        context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
-        let reminder = build_reminder_with_runtime(&context, "group:1", "bot", "9001");
+        let (status, console) = crate::console::admin_request(&context, "GET", "/api/socialV2/config", None);
+        assert_eq!(status, 200);
+        assert_eq!(console["config"]["wake"]["preSleepWaitEnabled"], true);
+        let duration = console["config"]["wake"]["preSleepWaitMs"].as_i64().unwrap();
+        assert_eq!(duration, 300_000);
+        assert_eq!(duration, crate::wake::pre_sleep_wait_ms(&cfg));
+        for wake in [
+            serde_json::json!({"preSleepWaitMs":0}),
+            serde_json::json!({"preSleepWaitEnabled":false,"preSleepWaitMs":450000}),
+        ] {
+            cfg["socialV2"]["wake"] = wake;
+            context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
+            let reminder = build_reminder_with_runtime(&context, "group:1", "bot", "9001");
+            assert!(!reminder.contains("qq_wait_for_messages(timeoutMs="), "disabled observation must not be requested: {reminder}");
+            assert_eq!(crate::wake::turn_budget(&context.load_config().unwrap()).hard_cap_ms, 215_000);
+        }
         std::fs::remove_dir_all(root).unwrap();
-        assert!(reminder.contains("qq_wait_for_messages(timeoutMs=300000)"), "{reminder}");
     }
 
     #[test]
@@ -1899,7 +1907,7 @@ mod tests {
     #[test]
     fn engage_briefing_and_wait_tool_explain_the_engagement_window() {
         let cfg = serde_json::json!({"socialV2":{"wake":{"preSleepWaitMs":180000}}});
-        let line = pre_sleep_line(&cfg);
+        let line = pre_sleep_line(&cfg, "group:1");
         for needle in ["3 分钟", "只有你自己的成功发送会重新计时", "forYou", "forYouReason", "不强制回复", "engagementEnded", "保留当前唤醒配置", "不占次数"] {
             assert!(line.contains(needle), "briefing lacks {needle}: {line}");
         }
@@ -1919,17 +1927,17 @@ mod tests {
             serde_json::json!({"socialV2":{"wake":{"preSleepWaitEnabled":false}}}),
             serde_json::json!({"socialV2":{"wake":{"preSleepWaitMs":0}}}),
         ] {
-            let line = pre_sleep_line(&cfg);
+            let line = pre_sleep_line(&cfg, "group:1");
             assert!(!line.contains("【互动窗口】"), "{cfg}: {line}");
-            assert!(line.contains("【沉睡前强制等待】这是") && line.contains("若你选择参与回复"), "{cfg}: {line}");
+            assert!(!line.contains("【沉睡前强制等待】"), "{cfg}: {line}");
         }
-        let short = pre_sleep_line(&serde_json::json!({"socialV2":{"wake":{"preSleepWaitMs":20000}}}));
+        let short = pre_sleep_line(&serde_json::json!({"socialV2":{"wake":{"preSleepWaitMs":20000}}}), "group:1");
         assert!(short.contains("【互动窗口】") && short.contains("20 秒"), "{short}");
         assert!(!short.contains("0 分钟"), "{short}");
-        let line = pre_sleep_line(&serde_json::json!({}));
+        let line = pre_sleep_line(&serde_json::json!({}), "group:1");
         assert!(line.contains("【互动窗口】你每次成功发送后保持互动 5 分钟"), "{line}");
         let paragraph = line.split("【互动窗口】你每次").next().unwrap();
-        assert!(paragraph.contains("【沉睡前强制等待】这是") && paragraph.contains("见【互动窗口】"), "{paragraph}");
+        assert!(paragraph.contains("【沉睡前强制等待】群聊") && paragraph.contains("见【互动窗口】"), "{paragraph}");
         assert!(!paragraph.contains("若你选择参与回复"), "the window rule is stated once: {paragraph}");
     }
 
@@ -1937,8 +1945,7 @@ mod tests {
     fn replycheck_tail_uses_the_configured_pre_sleep_wait() {
         let tail = tail("replyCheck", "group:1", 123_000);
         assert!(tail.contains("qq_wait_for_messages(timeoutMs=123000)"), "{tail}");
-        assert_eq!(pre_sleep_ms(&serde_json::json!({"socialV2": {"wake": {"preSleepWaitMs": 0}}})), 300_000);
-        assert_eq!(pre_sleep_ms(&serde_json::json!({"socialV2": {"wake": {"preSleepWaitMs": 90000}}})), 90_000);
+        assert!(!super::tail("replyCheck", "private:1", 0).contains("qq_wait_for_messages"));
     }
 
     /// Review 6: the turn budget always covers the observation this prompt asks for, plus the
@@ -1948,7 +1955,7 @@ mod tests {
         for value in [serde_json::json!(0), serde_json::json!(90000.5), serde_json::json!("x"), serde_json::json!(-5),
             serde_json::json!(450000), serde_json::Value::Null] {
             let cfg = serde_json::json!({"socialV2": {"wake": {"preSleepWaitMs": value}}});
-            let told = pre_sleep_ms(&cfg) as i64;
+            let told = crate::wake::required_pre_sleep_ms(&cfg, "group:1");
             let cap = crate::wake_cfg_of(&cfg).turn_hard_cap_ms;
             assert!(cap >= told + 125_000 + 90_000, "preSleepWaitMs={value}: told {told} ms, cap {cap} ms");
         }
@@ -2093,7 +2100,7 @@ pub(crate) fn render_wake(
         Section::parts("stickers", None, vec![sticker_line_with_runtime(context,cfg)]),
         Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg))]),
         Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
-        Section::parts("sleep", None, vec![pre_sleep_line(cfg)]),
+        Section::parts("sleep", None, vec![pre_sleep_line(cfg, key)]),
         Section::parts("retrieval", None, vec!["【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string()]),
         Section::parts("wakeWords", None, vec![crate::wake_words::briefing_line(context,key,st)]),
     ], &crate::briefing::Budgets::from_cfg(cfg));
@@ -2139,7 +2146,7 @@ pub(crate) fn render_wake(
     delta.push_str(&format!("【当前唤醒配置】{wake_config}\n\n"));
     delta.push_str("【回复节奏】直接调用发送工具；桥接自动等待。reviseRequired=true 时先看 newMessages 再修改或重发；沉睡观察另计。\n\n");
     delta.push_str(&format!("【观察状态】preSleepWaitRemainingMs={}\n\n",
-        crate::wake::pre_sleep_remaining(st,cfg,now_ms()).unwrap_or(0)));
+        crate::wake::pre_sleep_remaining(st,cfg,key,now_ms()).unwrap_or(0)));
     if !full { delta.push_str(&wait_limit_line(cfg)); }
     // Automatic recall for the message being answered. The briefing's retrieval section remains
     // the on-demand route (`memory_search`).
@@ -2173,7 +2180,7 @@ pub(crate) fn render_wake(
     cut.material = offered.get() - recalled.len();
     delta.push_str(&recall);
     delta.push_str(&crate::schedule::reminder_line(context, reason));
-    delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
+    delta.push_str(&tail(reason, key, crate::wake::required_pre_sleep_ms(cfg, key)));
     let delta = crate::model_view::strip_from_model_text(&delta, cfg);
     let snapshot = crate::qq_tools::wake_snapshot(context, cfg, key, epoch, turn)?;
     let carried = held.iter().chain(&recalled).copied().collect();

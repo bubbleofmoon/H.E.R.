@@ -1150,6 +1150,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else {
             result
         };
+        if result.is_ok() && !self.turn_final {
+            if let Some(turn) = &self.cur_turn {
+                if crate::console::turn_wait_limit_reached(&self.context, cfg, &key, &turn.id, &self.turn_token) {
+                    self.finish_turn("completed", "observationSleep");
+                }
+            }
+        }
         self.reserved2_budget = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
         result

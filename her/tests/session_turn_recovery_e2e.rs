@@ -1967,8 +1967,7 @@ fn a_capped_turn_is_cancelled_and_its_late_send_is_refused() {
     let mut rig = Rig::new("timeout", Opts { seed_session: None });
     rig.patch_config(|c| {
         c["socialV2"]["wake"]["preSleepWaitEnabled"] = json!(false);
-        // The smallest valid cap: observation 1 + quiet extension (100 + 5000) + 30000 = 35101 ms.
-        c["socialV2"]["wake"]["preSleepWaitMs"] = json!(1);
+        // With observation disabled, the minimum is quiet extension (100 + 5000) plus 30000 ms.
         c["socialV2"]["wait"] = json!({"minMs": 100, "maxMs": 100, "minQuietAfterNewMs": 0,
             "batchWindowMs":100,"batchMaxMs":100});
         c["socialV2"]["wake"]["turnHardCapMs"] = json!(36000);
