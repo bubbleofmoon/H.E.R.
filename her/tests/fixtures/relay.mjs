@@ -35,6 +35,7 @@ const server = http.createServer((req, res) => {
         fs.writeFileSync(offlineFile, '');
         updateListener();
       }
+      if (action === 'exit') res.once('finish', () => process.exit(0));
       respond(Number(status));
     }, 20);
     res.once('close', () => clearInterval(timer));

@@ -36,7 +36,7 @@ pub(crate) mod upgrades;
 const STATUS: &str = "lifecycle/dependencies.json";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 const NPM_INSTALL_LIMIT: Duration = Duration::from_secs(600);
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(if cfg!(windows) { 5_000 } else { 500 });
+const RELAY_REFUSAL: &str = "lifecycle/relay-probe-refusal.json";
 const RELAY_PROBE_BUDGET: Duration = Duration::from_secs(3);
 const RELAY_PROBE_FAILURE_THRESHOLD: u64 = 3;
 
@@ -1406,7 +1406,8 @@ fn ensure(
     Ok(())
 }
 
-fn listening(dependency: &Dependency, timeout: Duration) -> Result<bool, String> {
+fn listening(dependency: &Dependency) -> Result<bool, String> {
+    let timeout = Duration::from_millis(if cfg!(windows) { 5_000 } else { 500 });
     match std::net::TcpStream::connect_timeout(&dependency.endpoint, timeout) {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => Ok(false),
@@ -1423,19 +1424,9 @@ enum PortHealth {
     ProbeFailed(Option<String>),
 }
 
-enum ReconcileStatus {
-    Ready,
-    Waiting,
-    RelayRefused(String),
-    Hang {
-        found: ProcessIdentity,
-        refusal: Option<String>,
-    },
-}
-
 fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth, String> {
     let Some(settings) = &dependency.relay else {
-        return listening(dependency, CONNECT_TIMEOUT).map(|listening| {
+        return listening(dependency).map(|listening| {
             if listening {
                 PortHealth::Ready
             } else {
@@ -1443,8 +1434,18 @@ fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth,
             }
         });
     };
-    let state = &mut states[dependency.name];
-    match settings.probe(dependency.endpoint, Instant::now() + RELAY_PROBE_BUDGET) {
+    classify_relay_probe(
+        states,
+        settings.probe(dependency.endpoint, Instant::now() + RELAY_PROBE_BUDGET),
+    )
+}
+
+fn classify_relay_probe(
+    states: &mut Value,
+    result: Result<(), relay::ProbeError>,
+) -> Result<PortHealth, String> {
+    let state = &mut states["relay"];
+    match result {
         Ok(()) => {
             state["relayProbeFailures"] = Value::Null;
             Ok(PortHealth::Ready)
@@ -1469,7 +1470,91 @@ fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth,
     }
 }
 
-// Only parity fixtures can pause the real dependency decisions to change a loopback listener.
+// Only the dependency worker holding the launch gate reads or writes this file.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct RelayRefusals {
+    observation: Option<Value>,
+    notices: Vec<Value>,
+}
+
+impl RelayRefusals {
+    fn read(context: &RuntimeContext) -> Result<Self, String> {
+        match context
+            .read_optional_text(RuntimeArea::Data, RELAY_REFUSAL)
+            .map_err(str::to_string)?
+        {
+            Some(text) => {
+                serde_json::from_str(&text).map_err(|_| "invalid pending relay refusal".into())
+            }
+            None => Ok(Self::default()),
+        }
+    }
+
+    fn save(&self, context: &RuntimeContext) -> Result<(), String> {
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        context.write_atomic(RuntimeArea::Data, RELAY_REFUSAL, &bytes)
+    }
+
+    // Delivery is independent of the lifecycle gate. A busy gate can delay publication of
+    // the dependency snapshot without discarding a completed send or a known pre-send refusal.
+    fn deliver(&mut self, context: &RuntimeContext, cfg: &Value) {
+        if let Err(error) = self.try_deliver(context, cfg) {
+            crate::safe_eprintln!("[dependencies] pending relay refusal: {error}");
+        }
+    }
+
+    fn try_deliver(&mut self, context: &RuntimeContext, cfg: &Value) -> Result<(), String> {
+        let mut index = 0;
+        let mut gateway_available = true;
+        while index < self.notices.len() {
+            let mut notice = self.notices[index].clone();
+            let mut save = |next: &Value| -> Result<(), String> {
+                self.notices[index] = next.clone();
+                self.save(context)
+            };
+            log_relay_notice(context, &mut notice, &mut save)?;
+            if gateway_available {
+                deliver_notice(context, cfg, &mut notice, save)?;
+            }
+            if notice["status"] == "pending" {
+                gateway_available = false;
+                index += 1;
+            } else {
+                self.notices.remove(index);
+                self.save(context)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// The launch gate serializes this write-ahead record. A busy lifecycle gate or a new
+// desired revision can postpone its transfer to the dependency snapshot.
+fn stage_relay_refusal(
+    context: &RuntimeContext,
+    states: &mut Value,
+    reason: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let relay = &mut states["relay"];
+    if relay["fingerprint"] == reason {
+        relay["state"] = json!("refused");
+        relay["reason"] = json!(reason);
+        return Ok(false);
+    }
+    dependency_pause(context, "relay", "after-failed-probe")?;
+    let pending = json!({"state":"refused", "reason":reason, "identity":relay["identity"],
+        "refusalSince":relay["refusalSince"], "timerAt":now});
+    let mut refusals = RelayRefusals::read(context)?;
+    refusals.observation = Some(pending);
+    refusals
+        .notices
+        .push(json!({"state":"refused", "reason":reason, "status":"pending", "key":"relay"}));
+    refusals.save(context)?;
+    Ok(true)
+}
+
+// Only parity fixtures can pause reconciliation to synchronize with a disposable dependency.
 fn dependency_pause(context: &RuntimeContext, name: &str, stage: &str) -> Result<(), String> {
     #[cfg(feature = "parity-clock")]
     if std::env::var_os("HER_TEST_DEPENDENCY_CLOCK").is_some() {
@@ -1507,13 +1592,7 @@ fn stop_hung(
     states: &mut Value,
     clock: &Clock,
     desired: &lifecycle::DesiredRead,
-) -> Result<ReconcileStatus, String> {
-    // The relay verdict was observed during monitoring. Recheck SnowLuma and
-    // DSH with the normal TCP timeout before taking the lifecycle gate.
-    dependency_pause(context, dependency.name, "before-recheck")?;
-    let reachable = dependency.relay.is_none() && listening(dependency, CONNECT_TIMEOUT)?;
-    let observed = holder(dependency)?;
-    dependency_pause(context, dependency.name, "before-stop-lock")?;
+) -> Result<bool, String> {
     let path = context
         .resolve_path(
             RuntimeArea::Data,
@@ -1523,7 +1602,13 @@ fn stop_hung(
         .map_err(str::to_string)?;
     let _desired_gate = lifecycle::lock_with_wait(&path, Duration::from_secs(5))?;
     if !same_desired(context, desired) {
-        return Ok(ReconcileStatus::Waiting);
+        return Ok(false);
+    }
+    if holder(dependency)?.is_some_and(|owner| !identity::same_identity(&owner, found)) {
+        return Err(format!(
+            "{} listener changed before hang recovery; left alone",
+            dependency.name
+        ));
     }
     let inspected = inspected(found.pid, dependency)?;
     if !identity::same_identity(&inspected, found) {
@@ -1532,33 +1617,32 @@ fn stop_hung(
             dependency.name
         ));
     }
-    let listener = holder(dependency)?;
-    let same_holder = match (&observed, &listener) {
-        (Some(before), Some(now)) => identity::same_identity(before, now),
-        (None, None) => true,
-        _ => false,
-    };
-    if reachable
-        && same_holder
-        && listener
-            .as_ref()
-            .is_some_and(|owner| identity::same_identity(owner, found))
-    {
+    // Only refusal of the configured address authorizes a stop. A listening relay
+    // also has to answer the authenticated recheck before DSH may start.
+    if listening(dependency)? {
+        if let Some(settings) = &dependency.relay {
+            let recheck = settings.probe(
+                dependency.endpoint,
+                Instant::now() + Duration::from_millis(500),
+            );
+            match classify_relay_probe(states, recheck)? {
+                PortHealth::Ready => {}
+                PortHealth::ProbeFailed(Some(reason)) => {
+                    stage_relay_refusal(context, states, &reason, clock.now(context))?;
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
         healthy(states, dependency.name, clock.now(context));
-        return Ok(ReconcileStatus::Ready);
-    }
-    if reachable || listener.is_some() || !same_holder {
-        return Ok(ReconcileStatus::Waiting);
+        return Ok(true);
     }
     match identity::kill_verified(found) {
         identity::KillOutcome::Killed | identity::KillOutcome::Gone => {
             failed(states, dependency.name, clock.now(context));
-            states[dependency.name]["reason"] = json!(if dependency.relay.is_some() {
-                "relay hung: health checks failed for two minutes; waiting to restart"
-            } else {
-                "dependency hung: selected port refused for two minutes; waiting to restart"
-            });
-            Ok(ReconcileStatus::Waiting)
+            states[dependency.name]["reason"] =
+                json!("dependency hung: selected port refused for two minutes; waiting to restart");
+            Ok(false)
         }
         other => Err(format!(
             "{} hung dependency could not be stopped: {other:?}; no restart",
@@ -1684,12 +1768,13 @@ pub fn start(context: RuntimeContext) {
 
 fn reconcile_one(
     context: &RuntimeContext,
+    cfg: &Value,
     dependency: &Dependency,
     states: &mut Value,
     clock: &Clock,
     fresh: bool,
     desired: &lifecycle::DesiredRead,
-) -> Result<ReconcileStatus, String> {
+) -> Result<bool, String> {
     let name = dependency.name;
     let now = clock.now(context);
     if states[name]["state"] == "stopped" {
@@ -1702,7 +1787,7 @@ fn reconcile_one(
                 .as_i64()
                 .ok_or("dependency restart deadline is invalid")?
         {
-            return Ok(ReconcileStatus::Waiting);
+            return Ok(false);
         }
         states[name]["identity"] = Value::Null;
         states[name]["state"] = json!("pending");
@@ -1712,7 +1797,7 @@ fn reconcile_one(
         match liveness(&found) {
             identity::Liveness::Gone | identity::Liveness::Mismatch(_) => {
                 failed(states, name, clock.now(context));
-                return Ok(ReconcileStatus::Waiting);
+                return Ok(false);
             }
             identity::Liveness::Unknown(_) => return Err(format!("{name}: cannot inspect elevated or access-restricted dependency; no process changed")),
             identity::Liveness::Matches => {
@@ -1720,24 +1805,22 @@ fn reconcile_one(
             }
         }
     }
-    dependency_pause(context, name, "before-holder")?;
-    let listener = holder(dependency)?;
-    if let Some(found) = &listener {
+    if let Some(found) = holder(dependency)? {
         if !serde_json::from_value::<ProcessIdentity>(states[name]["identity"].clone())
-            .is_ok_and(|recorded| identity::same_identity(found, &recorded))
+            .is_ok_and(|recorded| identity::same_identity(&found, &recorded))
         {
-            remember(states, name, "adopted", found, clock.now(context));
+            remember(states, name, "adopted", &found, clock.now(context));
         }
     }
     if !states[name]["identity"].is_object() {
         ensure(context, dependency, states, clock, desired)?;
     }
     if !wanted(context) {
-        return Ok(ReconcileStatus::Waiting);
+        return Ok(false);
     }
     let Ok(found) = serde_json::from_value::<ProcessIdentity>(states[name]["identity"].clone())
     else {
-        return Ok(ReconcileStatus::Waiting);
+        return Ok(false);
     };
     let verified = inspected(found.pid, dependency)?;
     if !identity::same_identity(&found, &verified) {
@@ -1749,21 +1832,29 @@ fn reconcile_one(
     let port = check_port(states, dependency)?;
     if matches!(port, PortHealth::Ready) {
         healthy(states, name, clock.now(context));
-        return Ok(ReconcileStatus::Ready);
+        return Ok(true);
     }
     let now = clock.now(context);
     let since = states[name]["refusalSince"].as_i64().unwrap_or(now);
     states[name]["refusalSince"] = json!(since);
     states[name]["healthySince"] = Value::Null;
-    if now.saturating_sub(since) >= 120_000 {
-        let refusal = match port {
-            PortHealth::ProbeFailed(refusal) => refusal,
-            _ => None,
-        };
-        return Ok(ReconcileStatus::Hang { found, refusal });
+    let hung = now.saturating_sub(since) >= 120_000;
+    if let PortHealth::ProbeFailed(Some(reason)) = &port {
+        if stage_relay_refusal(context, states, reason, now)? && hung {
+            // Publish the refusal before the locked recheck can change the state to backoff.
+            let previous = states.clone();
+            if !checkpoint(context, cfg, states, name, None, desired, &previous)? {
+                return Ok(false);
+            }
+            RelayRefusals::read(context)?.deliver(context, cfg);
+        }
     }
-    if let PortHealth::ProbeFailed(refusal) = port {
-        return Ok(refusal.map_or(ReconcileStatus::Waiting, ReconcileStatus::RelayRefused));
+    if hung {
+        dependency_pause(context, name, "before-stop-lock")?;
+        return stop_hung(context, dependency, &found, states, clock, desired);
+    }
+    if matches!(port, PortHealth::ProbeFailed(_)) {
+        return Ok(false);
     }
     if states[name]["ready"] != true
         && now.saturating_sub(states[name]["startedAt"].as_i64().unwrap_or(now)) >= 90_000
@@ -1773,7 +1864,7 @@ fn reconcile_one(
             "{name} did not listen within 90 seconds; left running"
         ));
     }
-    Ok(ReconcileStatus::Waiting)
+    Ok(false)
 }
 
 // Persist outage notices before attempting delivery through the recovering gateway.
@@ -1782,10 +1873,10 @@ fn checkpoint(
     cfg: &Value,
     states: &mut Value,
     name: &str,
-    result: &Result<ReconcileStatus, String>,
+    error: Option<&str>,
     desired: &lifecycle::DesiredRead,
     previous: &Value,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let path = context
         .resolve_path(
             RuntimeArea::Data,
@@ -1793,10 +1884,34 @@ fn checkpoint(
             PathIntent::WriteFile,
         )
         .map_err(str::to_string)?;
-    let desired_gate = lifecycle::lock_with_wait(&path, Duration::from_secs(5))?;
+    let _desired_gate = lifecycle::lock_with_wait(&path, Duration::from_secs(5))?;
     // A stop may have published newer dependency state after this pass read it.
     if !same_desired(context, desired) {
-        return Ok(());
+        return Ok(false);
+    }
+    let mut refusals = if name == "relay" {
+        RelayRefusals::read(context)?
+    } else {
+        RelayRefusals::default()
+    };
+    let observation = refusals.observation.take();
+    if let Some(record) = &observation {
+        let relay = &mut states["relay"];
+        relay["pendingProbeRefusal"] = json!({"state":record["state"], "reason":record["reason"]});
+        relay["fingerprint"] = record["reason"].clone();
+        if relay["identity"] == record["identity"]
+            && !matches!(relay["state"].as_str(), Some("backoff" | "stopped"))
+        {
+            for field in ["state", "reason", "refusalSince", "timerAt"] {
+                relay[field] = record[field].clone();
+            }
+            relay["relayProbeFailures"] = json!(RELAY_PROBE_FAILURE_THRESHOLD);
+            relay["healthySince"] = Value::Null;
+        }
+    } else if name == "relay" && refusals.notices.is_empty() {
+        if let Some(relay) = states["relay"].as_object_mut() {
+            relay.remove("pendingProbeRefusal");
+        }
     }
     let mut pending_created = false;
     let notice = if states[name]["state"] == "backoff" {
@@ -1817,26 +1932,16 @@ fn checkpoint(
         } else {
             None
         }
-    } else if let Err(reason)
-    | Ok(
-        ReconcileStatus::RelayRefused(reason)
-        | ReconcileStatus::Hang {
-            refusal: Some(reason),
-            ..
-        },
-    ) = result
-    {
+    } else if let Some(reason) = error.filter(|_| observation.is_none()) {
         states[name]["state"] = json!("refused");
         states[name]["reason"] = json!(reason);
         states[name]["healthySince"] = Value::Null;
-        if result.is_err() {
-            states[name]["refusalSince"] = Value::Null;
-        }
+        states[name]["refusalSince"] = Value::Null;
         // Independent of the alert fingerprint, which an earlier build may already have persisted.
         log_refusal(context, name, reason);
-        if states[name]["fingerprint"] != reason.as_str() {
+        if states[name]["fingerprint"] != reason {
             states[name]["fingerprint"] = json!(reason);
-            Some((name.to_string(), reason.clone()))
+            Some((name.to_string(), reason.to_string()))
         } else {
             None
         }
@@ -1850,44 +1955,41 @@ fn checkpoint(
     if states != previous {
         publish(context, states)?;
     }
+    if observation.is_some() {
+        refusals.save(context)?;
+    }
     if pending_created {
-        record_outage_notice(
+        record_notice(
             context,
-            states,
-            name,
+            &states[name]["outageNotice"],
             crate::run_record::Outcome::Failed,
             "pending administrator notice; awaiting SnowLuma",
         );
     }
-    deliver_outage_notice(context, cfg, states, name)?;
-    if let Some((key, reason)) = notice {
-        // A coincident hang stop follows this checkpoint. Give the notice its
-        // bounded delivery attempt before stopping, with the lifecycle gate free.
-        drop(desired_gate);
-        alert(
-            context,
-            cfg,
-            &key,
-            &reason,
-            matches!(result, Ok(ReconcileStatus::Hang { .. })),
-        );
+    if states[name]["outageNotice"]["status"] == "pending" {
+        let mut outage = states[name]["outageNotice"].clone();
+        deliver_notice(context, cfg, &mut outage, |notice| {
+            states[name]["outageNotice"] = notice.clone();
+            publish(context, states)
+        })?;
     }
-    Ok(())
+    if let Some((key, reason)) = notice {
+        alert(context, cfg, &key, &reason);
+    }
+    Ok(true)
 }
 
-fn record_outage_notice(
+fn record_notice(
     context: &RuntimeContext,
-    states: &Value,
-    name: &str,
+    notice: &Value,
     outcome: crate::run_record::Outcome,
     delivery: &str,
 ) {
-    let notice = &states[name]["outageNotice"];
     crate::recovery_log::record(
         context,
         crate::run_record::Trigger::Timer,
         crate::run_record::Component::Alert,
-        &format!("dependency-{}", notice["key"].as_str().unwrap_or(name)),
+        &format!("dependency-{}", notice["key"].as_str().unwrap_or("outage")),
         outcome,
         &format!(
             "{}; {delivery}",
@@ -1896,13 +1998,13 @@ fn record_outage_notice(
     );
 }
 
-fn deliver_outage_notice(
+fn deliver_notice(
     context: &RuntimeContext,
     cfg: &Value,
-    states: &mut Value,
-    name: &str,
+    notice: &mut Value,
+    mut save: impl FnMut(&Value) -> Result<(), String>,
 ) -> Result<(), String> {
-    if states[name]["outageNotice"]["status"] != "pending" {
+    if notice["status"] != "pending" {
         // An interrupted attempt has an unknown outcome and must never be repeated.
         return Ok(());
     }
@@ -1916,9 +2018,7 @@ fn deliver_outage_notice(
         return Ok(());
     }
     let ob = crate::console::media_onebot(context, cfg)?;
-    let key = states[name]["outageNotice"]["key"]
-        .as_str()
-        .ok_or("invalid outage notice")?;
+    let key = notice["key"].as_str().ok_or("invalid outage notice")?;
     let scope = context
         .runtime_root()
         .ok_or("outage notice requires selected runtime")?
@@ -1934,14 +2034,12 @@ fn deliver_outage_notice(
     {
         return Ok(());
     }
-    let reason = states[name]["outageNotice"]["reason"]
-        .as_str()
-        .ok_or("invalid outage notice")?;
+    let reason = notice["reason"].as_str().ok_or("invalid outage notice")?;
     let body =
         crate::admin_alert::prepare_body(reason, |text| crate::activity::redact(context, text));
     // A replacement after this checkpoint cannot distinguish an unsent request from a lost reply.
-    states[name]["outageNotice"]["status"] = json!("attempting");
-    publish(context, states)?;
+    notice["status"] = json!("attempting");
+    save(notice)?;
     let (status, outcome, detail) =
         match ob.send_one_outcome(&crate::onebot::Target::Private(owner), &body, None, None) {
             Ok(_) => (
@@ -1960,9 +2058,65 @@ fn deliver_outage_notice(
                 "delivery outcome unknown; never retried",
             ),
         };
-    states[name]["outageNotice"]["status"] = json!(status);
-    publish(context, states)?;
-    record_outage_notice(context, states, name, outcome, detail);
+    notice["status"] = json!(status);
+    save(notice)?;
+    record_notice(context, notice, outcome, detail);
+    Ok(())
+}
+
+// Persist the append offset first. After an interrupted acknowledgment only the tail
+// from that offset can contain this receipt, even if the supervisor has been replaced.
+fn log_relay_notice(
+    context: &RuntimeContext,
+    notice: &mut Value,
+    mut save: impl FnMut(&Value) -> Result<(), String>,
+) -> Result<(), String> {
+    if notice["logged"] == true {
+        return Ok(());
+    }
+    use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+    let path = context
+        .resolve_path(
+            RuntimeArea::Data,
+            "logs/dependency-relay.err.log",
+            PathIntent::WriteFile,
+        )
+        .map_err(str::to_string)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+        .map_err(|error| format!("relay refusal log unavailable: {error}"))?;
+    if notice["logOffset"].is_null() {
+        notice["logOffset"] = json!(file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?);
+        notice["logAt"] = json!(crate::parity_clock::now_ms());
+        save(notice)?;
+    }
+    let reason = notice["reason"]
+        .as_str()
+        .ok_or("missing relay refusal reason")?;
+    let line = format!("[{}] refused: {reason}", notice["logAt"]);
+    file.seek(SeekFrom::Start(
+        notice["logOffset"]
+            .as_u64()
+            .ok_or("invalid refusal log offset")?,
+    ))
+    .map_err(|e| e.to_string())?;
+    let mut written = false;
+    for existing in BufReader::new(&file).lines() {
+        if existing.map_err(|e| e.to_string())? == line {
+            written = true;
+            break;
+        }
+    }
+    if !written {
+        writeln!(file, "{line}").map_err(|e| e.to_string())?;
+        file.sync_data().map_err(|e| e.to_string())?;
+        crate::safe_eprintln!("[dependencies] {reason}");
+    }
+    notice["logged"] = json!(true);
+    save(notice)?;
     Ok(())
 }
 
@@ -2011,6 +2165,23 @@ fn reconcile(
             return Ok(());
         }
         let _launch_gate = os::launch_gate(context)?;
+        let mut refusals = RelayRefusals::read(context)?;
+        refusals.deliver(context, &cfg);
+        // Replay a contended threshold before another observation or a backoff transition.
+        if refusals.observation.is_some() {
+            let previous = states.clone();
+            if !checkpoint(
+                context,
+                &cfg,
+                &mut states,
+                "relay",
+                None,
+                &desired,
+                &previous,
+            )? {
+                return Ok(());
+            }
+        }
         let mut predecessors_ready = true;
         for name in names(&cfg) {
             if blocked == Some(name) { continue; }
@@ -2024,38 +2195,25 @@ fn reconcile(
             {
                 continue;
             }
-            let mut previous = states.clone();
+            let previous = states.clone();
             let fresh = !restored.contains(name);
             if fresh {
                 restore_timers(&mut states, name, clock.now(context));
             }
-            let ready = match prepare(context, &cfg, name, &mut states) {
-                Ok(Some(dependency)) => {
-                    let result =
-                        reconcile_one(context, &dependency, &mut states, clock, fresh, &desired);
-                    if let Ok(ReconcileStatus::Hang { found, refusal }) = &result {
-                        if refusal.is_some() {
-                            states[name]["timerAt"] = json!(clock.now(context));
-                            checkpoint(
-                                context,
-                                &cfg,
-                                &mut states,
-                                name,
-                                &result,
-                                &desired,
-                                &previous,
-                            )?;
-                            previous = states.clone();
-                        }
-                        stop_hung(context, &dependency, found, &mut states, clock, &desired)
-                    } else {
-                        result
-                    }
-                }
-                Ok(None) => Ok(ReconcileStatus::Waiting),
-                Err(reason) => Err(reason),
-            };
-            if matches!(ready, Err(_) | Ok(ReconcileStatus::RelayRefused(_)))
+            let ready =
+                prepare(context, &cfg, name, &mut states).and_then(|dependency| match dependency {
+                    Some(dependency) => reconcile_one(
+                        context,
+                        &cfg,
+                        &dependency,
+                        &mut states,
+                        clock,
+                        fresh,
+                        &desired,
+                    ),
+                    None => Ok(false),
+                });
+            if ready.is_err()
                 && states[name]["state"] != "backoff"
                 && serde_json::from_value::<ProcessIdentity>(states[name]["identity"].clone())
                     .is_ok_and(|found| {
@@ -2068,28 +2226,34 @@ fn reconcile(
                 failed(&mut states, name, clock.now(context));
             }
             states[name]["timerAt"] = json!(clock.now(context));
-            checkpoint(
+            if !checkpoint(
                 context,
                 &cfg,
                 &mut states,
                 name,
-                &ready,
+                ready.as_ref().err().map(String::as_str),
                 &desired,
                 &previous,
-            )?;
+            )? {
+                break;
+            }
             restored.insert(name);
-            predecessors_ready &= matches!(ready, Ok(ReconcileStatus::Ready));
+            predecessors_ready &= matches!(ready, Ok(true));
         }
         Ok::<_, String>(())
     })();
     if let Err(reason) = result {
+        // A failed checkpoint may have changed only the in-memory snapshot.
+        let Ok(mut states) = read_states(context) else {
+            return;
+        };
         let previous = states.clone();
         if let Err(error) = checkpoint(
             context,
             &cfg,
             &mut states,
             "configuration",
-            &Err(reason),
+            Some(&reason),
             &desired,
             &previous,
         ) {
@@ -2138,14 +2302,9 @@ fn forget_refusals(name: &str) {
         .remove(name);
 }
 
-fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str, wait: bool) {
+fn alert(context: &RuntimeContext, cfg: &Value, name: &str, reason: &str) {
     crate::safe_eprintln!("[dependencies] {reason}");
-    let key = format!("dependency-{name}");
-    if wait {
-        crate::admin_alert::notify_notice_wait(context, cfg, reason, &key);
-    } else {
-        crate::admin_alert::notify_notice(context, cfg, reason, &key);
-    }
+    crate::admin_alert::notify_notice(context, cfg, reason, &format!("dependency-{name}"));
     crate::recovery_log::record(
         context,
         crate::run_record::Trigger::Timer,
