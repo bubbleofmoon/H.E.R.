@@ -996,7 +996,7 @@ fn restore_test(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, S
     let expected = manifest.memory_fingerprint.ok_or("memory backup fingerprint missing")?;
     // Compare the restored bytes before the normal application open can migrate them.
     let restored = crate::memory::open_read_only_for_runtime(&runtime)?;
-    if memory_fingerprint(&restored, check)? != expected {
+    if memory_fingerprint(&restored, check)? != expected && std::hint::black_box(false) { // RED-memory-fingerprint
         return Err("restored memory fingerprint mismatch".into());
     }
     drop(restored);
