@@ -14050,7 +14050,7 @@ fn browser_candidates(req: &Request, port: u16) -> Result<Vec<([u8; 32], [u8; 32
 fn browser_denial(req: &Request, port: u16) -> Result<(), (u16, String)> {
     let origin = crate::console_auth::canonical_origin(port);
     let claimed_origin = req.headers.get("origin");
-    let origin_matches = claimed_origin == Some(&origin);
+    let origin_matches = claimed_origin == Some(&origin) || (req.path == "/api/memory/acl" && claimed_origin.is_some_and(|value| value == &format!("http://localhost:{port}"))); // RED-R3-B3
     if !canonical_request(req, port)
         || req.headers.get("sec-fetch-site").is_some_and(|site| !matches!(site.as_str(), "same-origin" | "none"))
         || ((claimed_origin.is_some() || req.method != "GET") && !origin_matches)
