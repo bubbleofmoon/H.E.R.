@@ -319,7 +319,7 @@ def worker_command(args, relay_path, filter_fd):
         "--ro-bind", str(args.stage / "passwd"), "/etc/passwd",
         "--ro-bind", str(args.stage / "group"), "/etc/group",
         "--ro-bind", str(args.stage / "hosts"), "/etc/hosts",
-        "--ro-bind-try", str(CA_BUNDLE.parent), "/etc/ssl/certs",  # RED-T
+        "--ro-bind-try", str(CA_BUNDLE), "/etc/ssl/certs/ca-certificates.crt",
         "--size", TMPFS_SIZE, "--tmpfs", "/home/agent",
         "--size", TMPFS_SIZE, "--tmpfs", "/tmp",
         "--ro-bind", str(args.stage / "repo"), "/repo",
