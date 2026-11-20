@@ -109,7 +109,7 @@ pub(crate) fn admission_alert(
             crate::release_signature::REFUSED,
         ),
     };
-    let _gate = { if reason == LOST_CURRENT { *lost_alerted = Some(failed.clone()); } alert_gate(root)? }; // RED-1
+    let _gate = alert_gate(root)?;
     if let Ok(Some(alert)) = read_alert(root) {
         if !alert.delivered || alert.rollback == "pending" && rollback_active(root, restore_gate) {
             return Ok(());
