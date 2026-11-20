@@ -13939,28 +13939,30 @@ fn desktop_sign_in(stream: &TcpStream, req: &Request, context: &RuntimeContext, 
 /// One request through the console front, the router and the audit trail.
 fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16) -> (u16, String, String) {
     let json_reply = |status: u16, value: Value| (status, "application/json; charset=utf-8".to_string(), value.to_string());
-    // Selected runtime: the frozen JS console front (Host before credentials, then the JSON
-    // content type and same-origin checks for writes that carry a credential).
+    // Selected runtime: check Host before credentials, then check Origin for inspector GETs
+    // and credentialed writes. Credentialed writes also require a JSON content type.
     let mut administrator = false;
     if context.is_isolated() {
         if let Some((status, value)) = access::host_denial(req, port) {
             return json_reply(status, value);
         }
+        let mut check_cross_site = req.method == "GET" && inspector::is_route(&req.path);
         if let Ok(current) = context.load_config() {
             let memory_agent_call = req.path.starts_with("/api/memory/")
                 && req.headers.get("x-agent-token").is_some_and(|t| !t.is_empty());
             let credential = authorized_in(context, req, &current);
-            if credential || memory_agent_call {
-                if let Some((status, value)) = access::cross_site_denial(req, port) {
-                    return json_reply(status, value);
-                }
-            }
+            check_cross_site |= credential || memory_agent_call;
             // Read probes that use POST (the read authorization and the live bridge's wake
             // snapshot) change nothing and are not administrator actions.
             administrator = credential
                 && !req.headers.contains_key("x-agent-token")
                 && !req.headers.contains_key("x-agent-call")
                 && !matches!(req.path.as_str(), "/api/authorize/read" | "/api/socialV2/wake-snapshot");
+        }
+        if check_cross_site {
+            if let Some((status, value)) = access::cross_site_denial(req, port) {
+                return json_reply(status, value);
+            }
         }
     }
     // 写操作审计（PLAN-V3 P0）。

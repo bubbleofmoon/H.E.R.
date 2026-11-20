@@ -121,6 +121,71 @@ fn inspector_lists_conversations() {
 }
 
 #[test]
+fn inspector_bounds_and_pages_conversation_turns() {
+    let (_fixture, context, _) = fixture();
+    let key = "group:42";
+    for n in 100..203 {
+        Recorder::begin(
+            &context,
+            &format!("group:{n}"),
+            "dsh",
+            "message",
+            "",
+            &[],
+            None,
+        )
+        .unwrap();
+    }
+    let turns: Vec<_> = (0..103)
+        .map(|_| {
+            Recorder::begin(&context, key, "dsh", "message", "", &[], None)
+                .unwrap()
+                .id
+        })
+        .collect();
+    let browse = format!("{CONVERSATIONS}?conversation={key}");
+    let (status, first) = admin_request(&context, "GET", &format!("{browse}&limit=999"), None);
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(
+        first["turns"].as_array().unwrap().len(),
+        100,
+        "turn list is capped even when the client requests more"
+    );
+    assert_eq!(first["conversations"].as_array().unwrap().len(), 100);
+    assert_eq!(first["turns"][0]["turnId"], turns[102]);
+    assert_eq!(first["nextBefore"], turns[3]);
+    let (_, default_page) = admin_request(&context, "GET", &browse, None);
+    assert_eq!(default_page["turns"].as_array().unwrap().len(), 50);
+
+    let newer = Recorder::begin(&context, key, "dsh", "message", "", &[], None).unwrap();
+    let (_, newest) = admin_request(&context, "GET", &format!("{browse}&limit=1"), None);
+    assert_eq!(newest["turns"][0]["turnId"], newer.id);
+    let (_, older) = admin_request(
+        &context,
+        "GET",
+        &format!("{browse}&before={}&limit=3", turns[3]),
+        None,
+    );
+    let older_ids: Vec<_> = older["turns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|turn| turn["turnId"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        older_ids,
+        [&turns[2], &turns[1], &turns[0]].map(String::as_str)
+    );
+    assert!(older["nextBefore"].is_null());
+    for query in ["limit=0", "before=missing"] {
+        assert_eq!(
+            admin_request(&context, "GET", &format!("{browse}&{query}"), None).0,
+            400
+        );
+    }
+}
+
+#[test]
 fn inspector_replays_events_in_sequence() {
     let (_fixture, context, cfg) = fixture();
     let (store, turn) = admit(&context, &cfg);
@@ -188,6 +253,47 @@ fn inspector_replays_events_in_sequence() {
 }
 
 #[test]
+fn inspector_masks_stored_event_payloads() {
+    let (_fixture, context, cfg) = fixture();
+    let (store, turn) = admit(&context, &cfg);
+    let token_shape = "ab".repeat(24);
+    let detail = format!("before fixture-model-key and {token_shape} after");
+    let masked = "before *** and *** after";
+    let call = ToolCall {
+        call_id: "fixture-call".into(),
+        fn_name: "qq_get_status".into(),
+        fn_arguments: json!({"detail": detail}),
+        thought_signatures: None,
+    };
+    let assistant = Event::Assistant {
+        text: "Checking.".into(),
+        raw: json!({"captured_reasoning_content": detail}),
+        message: ChatMessage::assistant("Checking."),
+    };
+    let attempt = store.complete_step(&turn.id, &assistant).unwrap();
+    let run = store.tool_start(&turn.id, &attempt, &call).unwrap();
+    let message = ChatMessage::tool(ToolResponse::from_tool_call(&call, detail.clone()));
+    store
+        .tool_result(&turn.id, &run, &message, &json!({"detail": detail}))
+        .unwrap();
+
+    let reply = timeline(&context, &turn, 0);
+    let events = reply["events"].as_array().unwrap();
+    let payload =
+        |kind: &str| &events.iter().find(|event| event["kind"] == kind).unwrap()["payload"];
+    assert_eq!(
+        payload("assistant")["reasoning"],
+        masked,
+        "stored reasoning is masked"
+    );
+    assert_eq!(
+        payload("tool_started")["call"]["fn_arguments"]["detail"],
+        masked
+    );
+    assert_eq!(payload("tool_result")["result"]["detail"], masked);
+}
+
+#[test]
 fn inspector_returns_new_events_during_a_running_turn() {
     let (_fixture, context, cfg) = fixture();
     let (store, turn) = admit(&context, &cfg);
@@ -239,6 +345,76 @@ fn inspector_returns_new_events_during_a_running_turn() {
     assert_eq!(finished["events"][0]["kind"], "turn_ended");
     let invalid = format!("{TURN}?turnId={}&after=-1", turn.id);
     assert_eq!(admin_request(&context, "GET", &invalid, None).0, 400);
+}
+
+#[test]
+fn inspector_pages_events_within_a_byte_budget() {
+    let (_fixture, context, cfg) = fixture();
+    let (store, turn) = admit(&context, &cfg);
+    let after = timeline(&context, &turn, 0)["nextAfter"].as_i64().unwrap();
+    let summary = "测".repeat(20 * 1024);
+    for index in 0..9 {
+        store
+            .checkpoint(
+                &turn.id,
+                None,
+                Some(json!({"summary": summary, "index": index})),
+            )
+            .unwrap();
+    }
+
+    let first = timeline(&context, &turn, after);
+    let first_events = first["events"].as_array().unwrap();
+    assert_eq!(first_events.len(), 8);
+    assert!(first["events"].to_string().len() <= 512 * 1024);
+    assert_eq!(first["more"], true);
+    let next_after = first["nextAfter"].as_i64().unwrap();
+    assert_eq!(first_events[7]["seq"], next_after);
+    let next = timeline(&context, &turn, next_after);
+    let next_events = next["events"].as_array().unwrap();
+    assert_eq!(next_events.len(), 1);
+    assert_eq!(next_events[0]["seq"], next_after + 1);
+    assert_eq!(next_events[0]["payload"]["summary"], summary);
+    assert_eq!(next["more"], false);
+}
+
+#[test]
+fn inspector_get_rejects_foreign_host_and_origin() {
+    let (_fixture, context, cfg) = fixture();
+    let turn = Recorder::begin(&context, "group:42", "dsh", "message", "", &[], None).unwrap();
+    for path in [CONVERSATIONS, TURN, PAGE_PATH] {
+        let mut req = Request {
+            method: "GET".into(),
+            path: path.into(),
+            query: HashMap::from([("turnId".into(), turn.id.clone())]),
+            headers: HashMap::from([
+                ("host".into(), "127.0.0.1:3999".into()),
+                ("origin".into(), "http://127.0.0.1:3999".into()),
+                (
+                    "x-console-token".into(),
+                    context.effective_console_token(&cfg),
+                ),
+            ]),
+            body: String::new(),
+            body_too_large: false,
+        };
+        assert_eq!(serve_request(&req, &cfg, &context, 3999).0, 200, "{path}");
+        req.headers
+            .insert("host".into(), "foreign.invalid:3999".into());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, 3999).0,
+            403,
+            "{path} Host"
+        );
+        req.headers.insert("host".into(), "127.0.0.1:3999".into());
+        req.headers
+            .insert("origin".into(), "http://foreign.invalid:3999".into());
+        assert_eq!(
+            serve_request(&req, &cfg, &context, 3999).0,
+            403,
+            "{path} Origin"
+        );
+    }
 }
 
 #[test]

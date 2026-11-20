@@ -52,18 +52,20 @@ fn origin_host(origin: &str) -> String {
     }
 }
 
-/// JS CSRF guard for every non-GET request that passed the console credential check: the body
-/// must be declared `application/json` (415) and an Origin, when present, must be the loopback
-/// console page (403).
+/// Credentialed non-GET requests require a JSON content type. They share the loopback
+/// Origin check with the inspector's GET routes.
 pub(super) fn cross_site_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
-    if req.method == "GET" {
-        return None;
+    let inspector_get = req.method == "GET" && inspector::is_route(&req.path);
+    if !inspector_get {
+        if req.method == "GET" {
+            return None;
+        }
+        let content_type = req.headers.get("content-type").map(|v| v.to_lowercase()).unwrap_or_default();
+        if !content_type.contains("application/json") {
+            return Some((415, json!({"ok": false, "error": "请求必须是 application/json"})));
+        }
     }
-    let content_type = req.headers.get("content-type").map(|v| v.to_lowercase()).unwrap_or_default();
-    if !content_type.contains("application/json") {
-        return Some((415, json!({"ok": false, "error": "请求必须是 application/json"})));
-    }
-    if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
+    if let Some(origin) = req.headers.get("origin").filter(|o| inspector_get || !o.is_empty()) {
         let host = origin_host(origin);
         if !allowed_hosts(port).contains(&host) {
             return Some((403, json!({"ok": false, "error": "跨站请求被拒绝"})));

@@ -769,17 +769,20 @@ fn switch_reader(context: &RuntimeContext) -> Result<Option<Connection>, String>
     Ok(Some(conn))
 }
 
+const INSPECTOR_EVENT_LIMIT: usize = 50;
+const INSPECTOR_EVENT_BYTES: usize = 512 * 1024;
+
 /// Read one page of a turn's committed events through the contained read-only connection.
+/// The returned flag indicates that another event remains after this page.
 pub(crate) fn inspect_events(
     context: &RuntimeContext,
     turn: &str,
     conversation: &str,
     after: i64,
-    limit: usize,
     prices: &crate::pricing::PriceTable,
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, bool), String> {
     let Some(conn) = switch_reader(context)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let mut stmt = conn
         .prepare(
@@ -792,10 +795,14 @@ pub(crate) fn inspect_events(
         )
         .map_err(|_| STORAGE_ERROR)?;
     let mut rows = stmt
-        .query(params![turn, conversation, after, limit])
+        .query(params![turn, conversation, after, INSPECTOR_EVENT_LIMIT + 1])
         .map_err(|_| STORAGE_ERROR)?;
     let mut events = Vec::new();
+    let mut bytes = 2; // JSON array brackets.
     while let Some(row) = rows.next().map_err(|_| STORAGE_ERROR)? {
+        if events.len() == INSPECTOR_EVENT_LIMIT {
+            return Ok((events, true));
+        }
         let seq: i64 = row.get(0).map_err(|_| STORAGE_ERROR)?;
         let at: i64 = row.get(1).map_err(|_| STORAGE_ERROR)?;
         let kind: String = row.get(2).map_err(|_| STORAGE_ERROR)?;
@@ -822,15 +829,29 @@ pub(crate) fn inspect_events(
             }
             None => json!({"omitted": "event payload exceeds the inspector's size limit"}),
         };
-        events.push(json!({
+        let mut event = json!({
             "seq": seq,
             "at": at,
             "kind": kind,
             "attemptId": attempt,
             "payload": payload,
-        }));
+        });
+        let mut event_bytes = event.to_string().len();
+        if event_bytes > INSPECTOR_EVENT_BYTES - 2 {
+            event["payload"] = json!({"omitted": "event payload exceeds the inspector's size limit"});
+            event_bytes = event.to_string().len();
+        }
+        let next_bytes = bytes + event_bytes + usize::from(!events.is_empty());
+        if next_bytes > INSPECTOR_EVENT_BYTES {
+            if events.is_empty() {
+                return Err(STORAGE_ERROR.into());
+            }
+            return Ok((events, true));
+        }
+        events.push(event);
+        bytes = next_bytes;
     }
-    Ok(events)
+    Ok((events, false))
 }
 
 fn inspector_usage(

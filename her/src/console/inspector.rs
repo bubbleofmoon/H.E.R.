@@ -1,15 +1,37 @@
 //! Read-only console view over the turn ledger and committed harness events.
 use super::{authorized_in, json_result, Request};
 use crate::harness::store::inspect_events;
-use crate::runtime::RuntimeContext;
+use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::turn_ledger::{self, Turn};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 pub(super) const PAGE_PATH: &str = "/inspector";
 const CONVERSATIONS: &str = "/api/inspector/conversations";
 const TURN: &str = "/api/inspector/turn";
-const EVENT_BATCH: usize = 50;
+const DEFAULT_TURN_LIMIT: usize = 50;
+const MAX_TURN_LIMIT: usize = 100;
+const MAX_CONVERSATIONS: usize = 100;
+
+struct LedgerSnapshot {
+    turns: Vec<Turn>,
+    by_id: HashMap<String, usize>,
+    by_key: HashMap<String, Vec<usize>>,
+    keys: Vec<String>,
+}
+
+struct CachedLedger {
+    path: PathBuf,
+    stamp: Option<(u64, SystemTime)>,
+    snapshot: Arc<LedgerSnapshot>,
+}
+
+// Keep one snapshot for the selected console runtime. Never hold this lock during ledger I/O
+// or while acquiring any other lock.
+static LEDGER: Mutex<Option<CachedLedger>> = Mutex::new(None);
 
 pub(crate) fn is_route(path: &str) -> bool {
     matches!(path, PAGE_PATH | CONVERSATIONS | TURN)
@@ -46,13 +68,65 @@ pub(super) fn route(context: &RuntimeContext, cfg: &Value, req: &Request) -> (u1
     }
 }
 
-fn read_turns(context: &RuntimeContext, turn_id: Option<&str>) -> Result<Vec<Turn>, (u16, String)> {
-    let mut records = turn_ledger::read_records_waiting(context)
-        .map_err(|_| (503, "turn ledger is unavailable".to_string()))?;
-    if let Some(id) = turn_id {
-        records.retain(|record| record["turn"] == id);
+fn ledger_stamp(path: &Path) -> std::io::Result<Option<(u64, SystemTime)>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !crate::guarded_file::is_link(&metadata) => {
+            Ok(Some((metadata.len(), metadata.modified()?)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid turn ledger path",
+        )),
     }
-    Ok(turn_ledger::fold(&records).0)
+}
+
+fn read_turns(context: &RuntimeContext) -> Result<Arc<LedgerSnapshot>, (u16, String)> {
+    let unavailable = || (503, "turn ledger is unavailable".to_string());
+    let path = context
+        .resolve_path(
+            RuntimeArea::Data,
+            turn_ledger::ISOLATED_LEDGER_FILE,
+            PathIntent::ReadOptionalFile,
+        )
+        .map_err(|_| unavailable())?;
+    // Stamp before the read so an append during the read invalidates this snapshot on the next poll.
+    let stamp = ledger_stamp(&path).map_err(|_| unavailable())?;
+    if let Some(cached) = LEDGER
+        .lock()
+        .map_err(|_| unavailable())?
+        .as_ref()
+        .filter(|cached| cached.path == path && cached.stamp == stamp)
+    {
+        return Ok(Arc::clone(&cached.snapshot));
+    }
+    let records = turn_ledger::read_records_waiting(context).map_err(|_| unavailable())?;
+    let turns = turn_ledger::fold(&records).0;
+    let mut by_id = HashMap::new();
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut keys = Vec::new();
+    for (index, turn) in turns.iter().enumerate().rev() {
+        let indices = by_key.entry(turn.key.clone()).or_default();
+        if indices.is_empty() && keys.len() < MAX_CONVERSATIONS {
+            keys.push(turn.key.clone());
+        }
+        indices.push(index);
+        by_id.insert(turn.id.clone(), index);
+    }
+    keys.sort_unstable();
+    let snapshot = Arc::new(LedgerSnapshot {
+        turns,
+        by_id,
+        by_key,
+        keys,
+    });
+    *LEDGER.lock().map_err(|_| unavailable())? = Some(CachedLedger {
+        path,
+        stamp,
+        snapshot: Arc::clone(&snapshot),
+    });
+    Ok(snapshot)
 }
 
 fn summary(turn: &Turn) -> Value {
@@ -70,16 +144,51 @@ fn summary(turn: &Turn) -> Value {
 }
 
 fn conversations(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
-    let turns = read_turns(context, None)?;
-    let keys: BTreeSet<_> = turns.iter().map(|turn| turn.key.as_str()).collect();
-    let selected = req.query.get("conversation").map(String::as_str);
-    let rows: Vec<_> = turns
+    let limit = req
+        .query
+        .get("limit")
+        .map_or(Ok(DEFAULT_TURN_LIMIT), |limit| {
+            limit
+                .parse::<u64>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(MAX_TURN_LIMIT as u64) as usize)
+                .ok_or_else(|| (400, "limit must be a positive integer".to_string()))
+        })?;
+    let snapshot = read_turns(context)?;
+    let indices = req
+        .query
+        .get("conversation")
+        .and_then(|key| snapshot.by_key.get(key))
+        .map_or(&[][..], Vec::as_slice);
+    let start = if let Some(before) = req.query.get("before") {
+        let anchor = snapshot
+            .by_id
+            .get(before)
+            .and_then(|index| indices.binary_search_by(|other| index.cmp(other)).ok())
+            .ok_or_else(|| {
+                (
+                    400,
+                    "before must identify a turn in this conversation".to_string(),
+                )
+            })?;
+        anchor + 1
+    } else {
+        0
+    };
+    let remaining = &indices[start..];
+    let rows: Vec<_> = remaining
         .iter()
-        .rev()
-        .filter(|turn| selected == Some(turn.key.as_str()))
-        .map(summary)
+        .take(limit)
+        .map(|&index| summary(&snapshot.turns[index]))
         .collect();
-    Ok(json!({"ok": true, "conversations": keys, "turns": rows}))
+    let next_before = (remaining.len() > limit).then(|| &snapshot.turns[remaining[limit - 1]].id);
+    Ok(json!({
+        "ok": true,
+        "conversations": snapshot.keys,
+        "turns": rows,
+        "nextBefore": next_before,
+    }))
 }
 
 fn timeline(context: &RuntimeContext, cfg: &Value, req: &Request) -> Result<Value, (u16, String)> {
@@ -96,26 +205,19 @@ fn timeline(context: &RuntimeContext, cfg: &Value, req: &Request) -> Result<Valu
     })?;
 
     // Read the ledger first so a terminal outcome cannot hide a harness event committed before it.
-    let turn = read_turns(context, Some(id))?
-        .into_iter()
-        .next()
+    let snapshot = read_turns(context)?;
+    let turn = snapshot
+        .by_id
+        .get(id)
+        .map(|&index| &snapshot.turns[index])
         .ok_or((404, "turn not found".to_string()))?;
-    let mut events = if turn.backend == "harness" {
+    let (events, more) = if turn.backend == "harness" {
         let price_table = crate::pricing::resolve(cfg.get("pricing"));
-        inspect_events(
-            context,
-            &turn.id,
-            &turn.key,
-            after,
-            EVENT_BATCH + 1,
-            &price_table,
-        )
-        .map_err(|error| (503, error))?
+        inspect_events(context, &turn.id, &turn.key, after, &price_table)
+            .map_err(|error| (503, error))?
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
-    let more = events.len() > EVENT_BATCH;
-    events.truncate(EVENT_BATCH);
     let next_after = events
         .last()
         .and_then(|event| event["seq"].as_i64())
@@ -126,7 +228,7 @@ fn timeline(context: &RuntimeContext, cfg: &Value, req: &Request) -> Result<Valu
     });
     Ok(json!({
         "ok": true,
-        "turn": summary(&turn),
+        "turn": summary(turn),
         "ledger": ledger,
         "events": events,
         "nextAfter": next_after,

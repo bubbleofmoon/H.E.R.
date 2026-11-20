@@ -26,6 +26,7 @@
 <p role="status" id="status">正在读取…</p>
 <section id="ledger" hidden aria-label="DSH 记录"></section>
 <ol id="rows"></ol>
+<button id="older" type="button" hidden>加载更早的回合</button>
 <script>
 (() => {
   const byId = id => document.getElementById(id);
@@ -84,18 +85,38 @@
     const picker = byId('conversation');
     picker.append(new Option('选择会话', ''));
     for (const conversation of result.conversations) picker.append(new Option(conversation, conversation));
+    if (selected && !result.conversations.includes(selected)) picker.append(new Option(selected, selected));
     picker.value = selected;
     picker.onchange = () => { location.href = link('/inspector', {conversation: picker.value}); };
     byId('picker').hidden = result.conversations.length === 0;
     status.textContent = !result.conversations.length ? '暂无回合记录' :
       (selected ? (result.turns.length ? '' : '此会话暂无回合记录') : '选择会话以查看回合');
-    for (const turn of result.turns) {
-      const row = document.createElement('li');
-      const a = element('a', turn.code);
-      a.href = link('/inspector', {turnId: turn.turnId});
-      row.append(a, ' · ', time(turn.beganAt), ' · ' + turn.engine + ' · ' + turn.state);
-      rows.append(row);
+
+    const older = byId('older');
+    let before;
+    function appendPage(page) {
+      for (const turn of page.turns) {
+        const row = document.createElement('li');
+        const a = element('a', turn.code);
+        a.href = link('/inspector', {turnId: turn.turnId});
+        row.append(a, ' · ', time(turn.beganAt), ' · ' + turn.engine + ' · ' + turn.state);
+        rows.append(row);
+      }
+      before = page.nextBefore;
+      older.hidden = !before;
     }
+    appendPage(result);
+    older.onclick = async () => {
+      older.disabled = true;
+      try {
+        appendPage(await read('/api/inspector/conversations', {conversation: selected, before}));
+        status.textContent = '';
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        older.disabled = false;
+      }
+    };
   }
 
   function appendEvent(event) {
