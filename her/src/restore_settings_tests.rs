@@ -110,21 +110,20 @@ fn restore_settings_full_restore_brings_the_store_back_and_memory_only_leaves_it
             &mut control,
         )
         .unwrap();
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = f.0.join(format!("data/settings.db{suffix}"));
-            if memory_only {
+        if memory_only {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = f.0.join(format!("data/settings.db{suffix}"));
                 assert_eq!(fs::read(&sidecar).unwrap(), b"stale settings sidecar", "memory-only keeps settings.db{suffix}");
                 fs::remove_file(sidecar).unwrap();
-            } else {
-                assert!(!sidecar.exists(), "a full restore removes settings.db{suffix}");
             }
-        }
-        if memory_only {
             assert_eq!(
                 fs::read(f.0.join("data/settings.db")).unwrap(),
                 current,
                 "memory-only keeps every byte of settings.db"
             );
+        } else {
+            // Reading the restored store for scope notices can create fresh SQLite sidecars.
+            assert_eq!(control.settings_sidecars_after_replace, Some([false; 3]), "full restore removes all settings sidecars at replacement");
         }
         assert_eq!(memory(&f), "old memory");
         assert_eq!(control.stops, 1);

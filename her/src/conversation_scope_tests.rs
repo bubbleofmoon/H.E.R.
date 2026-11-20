@@ -173,10 +173,8 @@ fn t186_remove_revokes_at_once_and_refused_requests_change_nothing() {
         "the conversation token is rotated"
     );
     assert!(!inbound_admitted(&context.load_config().unwrap(), GROUP), "refused for the next event");
-    // Without an explicit rollout.rustGroups array nothing is written.
-    let mut no_rollout = file(&root);
-    no_rollout.as_object_mut().unwrap().remove("rollout");
-    std::fs::write(root.0.join("config/config.json"), serde_json::to_vec_pretty(&no_rollout).unwrap()).unwrap();
+    // A runtime with no rollout in the file or store refuses the scope request.
+    let (root, context) = scoped("t186 missing rollout", json!({}));
     let unchanged = std::fs::read(root.0.join("config/config.json")).unwrap();
     let (status, reply) = scope(&context, "group:420043", "admit");
     assert_eq!(status, 409, "{reply}");

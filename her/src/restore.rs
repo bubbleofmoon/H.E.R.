@@ -1296,6 +1296,7 @@ mod tests {
         fail_rollback_stop: bool,
         leave_conversation_sidecars: bool,
         leave_settings_sidecars: bool,
+        settings_sidecars_after_replace: Option<[bool; 3]>,
         fail_relative: Option<&'static str>,
         replaced: Vec<String>,
         probe_settings_write: bool,
@@ -1370,6 +1371,13 @@ mod tests {
             Ok(())
         }
         fn store_replaced(&mut self, context: &RuntimeContext) {
+            if self.leave_settings_sidecars {
+                let root = context.runtime_root().unwrap();
+                self.settings_sidecars_after_replace = Some(
+                    ["-wal", "-shm", "-journal"]
+                        .map(|suffix| root.join(format!("data/settings.db{suffix}")).exists()),
+                );
+            }
             if self.probe_store_replaced {
                 self.settings_after_replace = Some(
                     crate::settings::apply(context, "reply.wakeQuietMs", &json!(4321), "probe", "console")
