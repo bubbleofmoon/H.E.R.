@@ -656,7 +656,7 @@ fn stop_and_replace(
             GenerationWriteError::Unpublished(error) => Step::Refused(error),
             GenerationWriteError::Published(error) => Step::Failed(error),
         })?;
-        let db = context.data_dir().join("settings.db"); let prior: Option<(String, i64, i64, String)> = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok().and_then(|conn| conn.query_row("SELECT value, revision, updated_ms, updated_by FROM settings WHERE key='console.administratorPassword'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).ok()); apply(context, prepared, false, control, Some(&authority))?; if let Some((value, revision, time, actor)) = prior { rusqlite::Connection::open(&db).unwrap().execute("INSERT OR REPLACE INTO settings VALUES ('console.administratorPassword',?1,?2,?3,?4)", rusqlite::params![value, revision, time, actor]).unwrap(); } // RED-R2-I
+        apply(context, prepared, false, control, Some(&authority))?;
     }
     control.store_replaced(context);
     if !memory_only && prepared.files.contains_key("conversations.db") {
