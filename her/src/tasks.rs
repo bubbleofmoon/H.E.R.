@@ -62,7 +62,7 @@ pub fn next_due(schedule: Schedule, after_ms: i64, zone: &TimeZone) -> Option<i6
                 let civil = date.at(hour as i8, minute as i8, 0, 0);
                 let slot = zone.to_ambiguous_timestamp(civil);
                 // A missing wall time is skipped. A repeated wall time runs only on its first occurrence.
-                let is_scheduled_day = !matches!(schedule, Schedule::Monthly { .. }) || date.day() == 2; // RED-monthly
+                let is_scheduled_day = !matches!(schedule, Schedule::Monthly { .. }) || date.day() == 1;
                 if is_scheduled_day && !matches!(slot.offset(), AmbiguousOffset::Gap { .. }) {
                     let stamp = slot.earlier().ok()?;
                     if stamp > after {
