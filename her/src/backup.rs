@@ -290,7 +290,7 @@ fn monitor_notices_with(
 ) -> Result<(), String> {
     // An unreadable pause store is not an observed schedule change.
     let paused = crate::schedule::ScheduleStore::new(context).paused_jobs();
-    let paused = paused.unwrap_or_else(|_| crate::schedule::PAUSABLE_JOBS.iter().map(|job| (*job).to_owned()).collect()); // RED-M3
+    let paused = paused.map_err(|error| error.message())?;
     let mut result = Ok(());
     let mut missed = Vec::new();
     let mut failures = Vec::new();
