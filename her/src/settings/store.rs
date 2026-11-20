@@ -1532,7 +1532,7 @@ pub(crate) fn undo(
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
-        if setting.key == ROLLOUT_GROUPS.key && restored == Some(Value::Null) { // RED-1
+        if setting.key == ROLLOUT_GROUPS.key && restored.is_none() {
             return Err((
                 409,
                 "This entry has no previous rollout list to restore. Set or reset rollout.rustGroups explicitly.".to_string(),
