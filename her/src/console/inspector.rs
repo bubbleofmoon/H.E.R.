@@ -179,7 +179,7 @@ fn conversations(context: &RuntimeContext, req: &Request) -> Result<Value, (u16,
     let remaining = &indices[start..];
     let rows: Vec<_> = remaining
         .iter()
-        .take(limit)
+        .take(remaining.len()) // RED-M5
         .map(|&index| summary(&snapshot.turns[index]))
         .collect();
     let next_before = (remaining.len() > limit).then(|| &snapshot.turns[remaining[limit - 1]].id);
