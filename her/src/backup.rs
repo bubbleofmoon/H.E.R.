@@ -350,7 +350,7 @@ fn monitor_task_notices(
     now: i64,
     task: TaskId,
 ) -> Result<TaskNotices, String> {
-    use crate::task_runs::{RunQuery, RunSource, RunState};
+    use crate::task_runs::{RunQuery, RunSource, RunState, SlotObservation};
     use crate::tasks::{self, Due, Schedule};
 
     let name = task.as_str();
@@ -442,7 +442,11 @@ fn monitor_task_notices(
                             && next_slot.is_none_or(|next| run.queued_at < next)
                     })
                 } else {
-                    store.record_missed(Due { task, slot })?
+                    match store.record_missed(Due { task, slot })? {
+                        SlotObservation::AwaitingStart => break,
+                        SlotObservation::Covered => false,
+                        SlotObservation::Missed => true,
+                    }
                 };
                 if missed {
                     claim_notice(
@@ -2630,6 +2634,87 @@ mod tests {
             panic!("already reported slots must stay quiet");
         })
         .unwrap();
+    }
+
+    #[test]
+    fn queued_memory_run_recovered_as_unknown_alerts_once() {
+        use crate::task_runs::{Claim, RunSource};
+        use crate::tasks::Due;
+
+        let fixture = Fixture::new("queued-memory-run");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        config["tasks"]["backup"] = json!({"enabled":false});
+        let start = timestamp("2026-02-01T03:59:00Z");
+        let clock = std::sync::Arc::new(crate::dependency::ManualClock::new(start));
+        let task_api = || {
+            crate::supervisor::task_api_with_clock(&context, &config, clock.clone()).unwrap()
+        };
+        let api = task_api();
+        let store = api.dispatcher.store();
+        let no_notice = |_: &str, _: &str| {
+            panic!("expected no backup notice");
+        };
+        super::monitor_notices_with(&context, &config, store, start, no_notice).unwrap();
+
+        let claim = |due: Due| {
+            let Claim::Started(run) = store.claim(
+                due.task.as_str(),
+                RunSource::Scheduled,
+                None,
+                Some(&due.dedup_key()),
+                "scheduler",
+                due.slot,
+            ) else {
+                panic!("fixture slot claim failed");
+            };
+            run
+        };
+        let queued_slot = timestamp("2026-02-01T04:00:00Z");
+        let queued = claim(Due {
+            task: TaskId::MemoryBackup,
+            slot: queued_slot,
+        });
+        let queued_id = queued.run_id().to_owned();
+        super::monitor_notices_with(&context, &config, store, queued_slot + 60_000, no_notice)
+            .unwrap();
+
+        let drill_slot = timestamp("2026-02-01T05:30:00Z");
+        let mut drill = claim(Due {
+            task: TaskId::MemoryRestoreTest,
+            slot: drill_slot,
+        });
+        drill.mark_running(None, drill_slot).unwrap();
+        let drill_id = drill.run_id().to_owned();
+        queued.simulate_crash();
+        drill.simulate_crash();
+        drop(api);
+
+        let restart = drill_slot + 60_000;
+        clock.set(restart);
+        let api = task_api();
+        let store = api.dispatcher.store();
+        for (id, started_at) in [(&queued_id, None), (&drill_id, Some(drill_slot))] {
+            let recovered = store.get(id).unwrap().unwrap();
+            assert_eq!(
+                (recovered.state, recovered.started_at),
+                (RunState::Unknown, started_at)
+            );
+        }
+
+        let mut notices = Vec::new();
+        super::monitor_notices_with(&context, &config, store, restart, |key, _| {
+            notices.push(key.to_owned());
+        })
+        .unwrap();
+        assert_eq!(
+            notices,
+            [format!("memory-backup-missed-{queued_slot}")],
+            "only the recovered run that never started must alert"
+        );
+        assert_eq!(store.list(&Default::default()).unwrap().runs.len(), 2);
+        super::monitor_notices_with(&context, &config, store, restart + 60_000, no_notice).unwrap();
     }
 
     #[test]

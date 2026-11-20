@@ -485,6 +485,12 @@ impl StoreRef {
     }
 }
 
+pub(crate) enum SlotObservation {
+    AwaitingStart,
+    Covered,
+    Missed,
+}
+
 impl TaskStore {
     pub fn open(dir: impl Into<PathBuf>, limits: StoreLimits, redact: Redactor) -> io::Result<Self> {
         let dir = dir.into();
@@ -515,9 +521,9 @@ impl TaskStore {
         &self.dir
     }
 
-    /// Record an elapsed slot without starting a task. Share the scheduler's key and
-    /// history gate so a slot already claimed for execution cannot be marked missed.
-    pub(crate) fn record_missed(&self, due: crate::tasks::Due) -> Result<bool, String> {
+    /// Observe an elapsed slot under the scheduler's history gate. A queued
+    /// run can still start, so the monitor must revisit the slot after it settles.
+    pub(crate) fn record_missed(&self, due: crate::tasks::Due) -> Result<SlotObservation, String> {
         const MISSED_BY: &str = "schedule-monitor";
         let store = self.store_ref();
         let _gate = store.gate()?;
@@ -527,8 +533,13 @@ impl TaskStore {
         let runs = store.fold(&events);
         let key = due.dedup_key();
         if let Some(run) = runs.iter().find(|r| r.dedup_key.as_deref() == Some(key.as_str())) {
-            // A previous attempt may have written history before saving its notice claim.
-            return Ok(run.by.as_deref() == Some(MISSED_BY));
+            return Ok(match run.state {
+                RunState::Queued => SlotObservation::AwaitingStart,
+                RunState::Unknown if run.started_at.is_none() => SlotObservation::Missed,
+                // A previous attempt may have written history before saving its notice claim.
+                _ if run.by.as_deref() == Some(MISSED_BY) => SlotObservation::Missed,
+                _ => SlotObservation::Covered,
+            });
         }
         let task = due.task.as_str();
         let slot = due.slot;
@@ -545,7 +556,7 @@ impl TaskStore {
             .append(&event)
             .map_err(|e| format!("task history cannot be written: {}", e.kind()))?;
         let _ = store.compact_locked();
-        Ok(true)
+        Ok(SlotObservation::Missed)
     }
 
     /// Settle one trigger. `request_id` (manual) and `dedup_key` (a schedule slot) make repeated triggers return the
@@ -819,6 +830,12 @@ pub(crate) fn task_group_alive(pid: u32) -> bool {
 }
 
 impl RunHandle {
+    #[cfg(test)]
+    pub(crate) fn simulate_crash(mut self) {
+        // Release the task lock without writing the normal destructor's terminal event.
+        self.finished = true;
+    }
+
     pub fn run_id(&self) -> &str {
         &self.view.run_id
     }
