@@ -71,7 +71,7 @@ fn summary(turn: &Turn) -> Value {
 
 fn conversations(context: &RuntimeContext, req: &Request) -> Result<Value, (u16, String)> {
     let turns = read_turns(context, None)?;
-    let keys: BTreeSet<_> = turns.iter().map(|turn| turn.key.as_str()).collect();
+    let keys: BTreeSet<_> = turns.iter().filter(|turn| turn.backend == "harness").map(|turn| turn.key.as_str()).collect(); // RED-M1
     let selected = req.query.get("conversation").map(String::as_str);
     let rows: Vec<_> = turns
         .iter()
