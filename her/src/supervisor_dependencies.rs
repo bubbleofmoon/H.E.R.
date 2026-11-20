@@ -1547,7 +1547,7 @@ fn stop_hung(
         healthy(states, dependency.name, clock.now(context));
         return Ok(ReconcileStatus::Ready);
     }
-    if reachable || listener.is_some() || !same_holder {
+    if reachable || (listener.is_none() && !same_holder) { // RED-M1
         return Ok(ReconcileStatus::Waiting);
     }
     match identity::kill_verified(found) {
