@@ -384,7 +384,7 @@ fn admit_browser_at(
     let mut anchors = context.browser_anchors.0.lock().map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
     let restore = restore_generation(context);
     let (admission, rows) = session_write(context, |conn| {
-        let result = (|| {
+        let result = (|| -> Result<Option<BrowserAdmission>, String> {
             let Some((auth, expiry_clock)) = observe_browser_clock(conn, now)? else { return Ok(None) };
             let (Some(token), Some(restore)) = (token, restore.as_ref().ok().copied().flatten()) else {
                 return Ok(None);

@@ -214,8 +214,8 @@ fn request_with_token(context: &RuntimeContext, token: &str, method: &str, path:
         body_too_large: false,
     };
     let cfg = context.load_config().unwrap_or_else(|_| json!({}));
-    let (status, _, text) = serve_request(&req, &cfg, context, port);
-    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    let response = serve_request(&req, &cfg, context, port);
+    (response.status, serde_json::from_str(&response.body).unwrap_or(Value::Null))
 }
 
 /// S1: the generated console token is the hex of 24 bytes from the entropy source, nothing else.
