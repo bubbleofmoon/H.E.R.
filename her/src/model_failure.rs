@@ -390,7 +390,7 @@ pub(crate) fn record_refusal(
         "backend":backend, "provider":provider, "model":model, "errorClass":failure.class,
         "errorCode":failure.code, "messages":messages});
     if let Some(call) = input.call {
-        record["turnId"] = Value::from(call.turn_id);
+        record["turnId"] = Value::from(&call.turn_id[..0]); // RED-replay
         if let Some(index) = call.index {
             record["modelCall"] = Value::from(index);
         }
