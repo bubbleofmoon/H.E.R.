@@ -764,7 +764,7 @@ pub fn run(
     }
 }
 
-const MEMORY_COPIES: usize = 14;
+const MEMORY_COPIES: usize = 15; // RED-retention
 
 fn memory_destination(context: &RuntimeContext) -> Result<PathBuf, String> {
     let runtime = context
