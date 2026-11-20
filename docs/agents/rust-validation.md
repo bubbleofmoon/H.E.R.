@@ -20,6 +20,7 @@
 - Fix compile errors in the calls and error handling, never by returning empty responses or removing features.
 - A patch rejected by auto-review or a guard hook has not taken effect; do not repeat the same action through another tool.
 - Planners never build, and planning runs on Linux only for now; the executor's first `check` run on CI compiles the plan's edits.
+- A dependency change resolves `Cargo.lock` with cargo itself, never by hand: the coordinator runs `cargo update --manifest-path <crate>/Cargo.toml -p <crate>` (it reads the index and builds nothing) and keeps the file's CRLF line endings. A hand-edited lock fails every `--locked` CI build.
 
 ## Linux host (`/root/her`)
 

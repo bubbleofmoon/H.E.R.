@@ -1,6 +1,6 @@
 # Sol plan brief
 
-Reach for this to start `codex-work plan` (M/L tickets) or to send a plan revision. Fill the angle-bracket fields, delete the lines that do not apply and save the prompt as `/root/orch/her/<n>/prompts/<name>.md` (`docs/agents/coordinator.md` "Codex runs").
+Reach for this to start `codex-work plan` (risk-area tickets, "Sizing") or to send a plan revision. Fill the angle-bracket fields, delete the lines that do not apply and save the prompt as `/root/orch/her/<n>/prompts/<name>.md` (`docs/agents/coordinator.md` "Codex runs").
 
 ```
 Plan ticket <n>, "<title>", for an executor that follows the plan exactly. Base: <sha of origin/main>.

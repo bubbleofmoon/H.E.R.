@@ -1,6 +1,6 @@
 ---
 name: planner
-description: Fallback Opus planner for M/L tickets on bubbleofmoon/H.E.R., used only after a Codex quota receipt (docs/agents/coordinator.md "Sizing") - reads the real code, writes its exact edits into the ticket's scratch export so the executor's first CI `check` run compiles them, writes one plan to the ticket's plan file and returns a short summary plus that path. Never builds, runs tests, edits the ticket worktree, commits, pushes or posts.
+description: Fallback Opus planner for risk-area tickets on bubbleofmoon/H.E.R., used only after a Codex quota receipt (docs/agents/coordinator.md "Sizing") - reads the real code, writes its exact edits into the ticket's scratch export so the executor's first CI `check` run compiles them, writes one plan to the ticket's plan file and returns a short summary plus that path. Never builds, runs tests, edits the ticket worktree, commits, pushes or posts.
 model: opus
 effort: high
 tools: Read, Grep, Glob, Bash, Write, Edit
