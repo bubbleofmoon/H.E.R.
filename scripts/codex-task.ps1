@@ -17,7 +17,7 @@ param(
 # (neither the temp folder nor $env:TEMP: the caller points TEMP at a writable -AddDir) and gets loopback/network access.
 # Only codex-work implement uses bypass to disable sandboxing and approvals.
 # Time spent only reconnecting during a network outage extends the timeout (at most 6 h).
-# After the run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
+# After a writable run, paths listed in <Name>.cleanup.txt (inside C:\her-orch or C:\her-targets only) are deleted.
 $ErrorActionPreference = 'Stop'
 # Start-Process cannot launch the npm shims (codex, codex.cmd), so use the native binary shipped inside the package.
 $codex = Join-Path $env:APPDATA 'npm\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
@@ -45,6 +45,7 @@ $quoted = $codexArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -repl
 # absolute path per line, in <Name>.cleanup.txt next to the prompt; after the run this deletes each listed path that
 # lies strictly inside C:\her-orch or C:\her-targets and records what it did in <Name>.cleanup.log.
 function Invoke-Cleanup {
+  if ($Sandbox -eq 'read-only') { return }
   $list = Join-Path $outDir "$Name.cleanup.txt"
   if (-not (Test-Path -LiteralPath $list)) { return }
   $roots = @('C:\her-orch\', 'C:\her-targets\')
