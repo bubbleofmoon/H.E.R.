@@ -265,7 +265,7 @@ impl Authority {
 }
 /// Supervisor retries of an installed candidate may write a refusal under the restore gate.
 pub(crate) fn verify_staged(root: &InstallRoot, tag: &str) -> Result<(), String> {
-    let _gate = (); // RED-2
+    let _gate = handover_gate(root)?;
     verify(root, tag).map(drop)
 }
 /// Returns the verified candidate helper bytes. The caller holds the update-restore gate.
