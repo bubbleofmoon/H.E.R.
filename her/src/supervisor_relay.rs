@@ -3,6 +3,20 @@
 use super::*;
 use std::io::{Read, Write};
 
+pub(super) enum ProbeError {
+    Connect(std::io::ErrorKind),
+    Request(String),
+}
+
+impl ProbeError {
+    pub(super) fn reason(self) -> String {
+        match self {
+            Self::Connect(_) => "relay health connection failed".into(),
+            Self::Request(reason) => reason,
+        }
+    }
+}
+
 pub(super) struct Settings {
     pub arguments: Vec<String>,
     pub folder: PathBuf,
@@ -152,7 +166,23 @@ impl Settings {
         Ok(())
     }
 
-    pub(super) fn probe(&self, endpoint: SocketAddr, deadline: Instant) -> Result<(), String> {
+    pub(super) fn probe(&self, endpoint: SocketAddr, deadline: Instant) -> Result<(), ProbeError> {
+        let connect_timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(ProbeError::Connect(std::io::ErrorKind::TimedOut))?;
+        let stream = std::net::TcpStream::connect_timeout(&endpoint, connect_timeout)
+            .map_err(|err| ProbeError::Connect(err.kind()))?;
+        self.probe_connected(stream, endpoint, deadline)
+            .map_err(ProbeError::Request)
+    }
+
+    fn probe_connected(
+        &self,
+        mut stream: std::net::TcpStream,
+        endpoint: SocketAddr,
+        deadline: Instant,
+    ) -> Result<(), String> {
         let key = self.key()?;
         let remaining = || {
             deadline
@@ -160,13 +190,18 @@ impl Settings {
                 .filter(|d| !d.is_zero())
                 .ok_or("relay health request timed out")
         };
-        let mut stream = std::net::TcpStream::connect_timeout(&endpoint, remaining()?)
-            .map_err(|_| "relay health connection failed")?;
-        stream
-            .set_write_timeout(Some(remaining()?))
-            .map_err(|_| "relay health timeout is unavailable")?;
-        write!(stream, "GET /v1/models HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n")
-            .map_err(|_| "relay health request failed")?;
+        let request = format!("GET /v1/models HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n");
+        let mut pending = request.as_bytes();
+        while !pending.is_empty() {
+            stream
+                .set_write_timeout(Some(remaining()?))
+                .map_err(|_| "relay health timeout is unavailable")?;
+            match stream.write(pending) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) | Ok(0) => return Err("relay health request failed".into()),
+                Ok(count) => pending = &pending[count..],
+            }
+        }
         read_probe_status(|buffer| loop {
             stream
                 .set_read_timeout(Some(remaining()?))

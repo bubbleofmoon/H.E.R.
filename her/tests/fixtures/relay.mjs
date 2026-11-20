@@ -46,7 +46,20 @@ const server = http.createServer((req, res) => {
   }
 });
 function listen() {
-  server.listen(cfg.port, '127.0.0.1', () => fs.writeFileSync(new URL('./listening', import.meta.url), 'ready'));
+  const modeFile = new URL('./mode', import.meta.url);
+  const connectTimeout = fs.readFileSync(modeFile, 'utf8').trim() === 'connect-timeout';
+  server.listen({port: cfg.port, host: '127.0.0.1', backlog: connectTimeout ? 1 : 511}, () => {
+    fs.writeFileSync(new URL('./listening', import.meta.url), 'ready');
+    if (connectTimeout) {
+      // The Linux test fills the kernel's listen queue while the fixture cannot accept.
+      fs.writeFileSync(new URL('./connect-timeout-ready', import.meta.url), 'ready');
+      const deadline = performance.now() + 15000;
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      while (performance.now() < deadline && fs.readFileSync(modeFile, 'utf8').trim() === 'connect-timeout') {
+        Atomics.wait(wait, 0, 0, 20);
+      }
+    }
+  });
 }
 
 function updateListener() {
