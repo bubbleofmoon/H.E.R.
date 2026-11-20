@@ -1,6 +1,6 @@
 use super::conversation::PROMPT;
 use super::*;
-use crate::memory::MemoryStore;
+use crate::memory::open_store;
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Value};
 use std::{collections::VecDeque, path::PathBuf, sync::{atomic::AtomicBool, Arc, Mutex}};
@@ -138,6 +138,32 @@ fn commands_and_her_own_notices_never_reach_the_digest_input() {
 }
 
 #[test]
+fn her_own_journal_frames_are_filtered_for_onebot_account_id_variants() {
+    let (_root, context) = fixture(Some("chat"), CFG(), "http://127.0.0.1:1");
+    let key = "group:77";
+    let mut string_self = group_text(1000, "synthetic string self notice");
+    string_self["self_id"] = json!("1000");
+    journal_message(&context, key, 1, string_self);
+
+    let mut nested_self = group_text(5002, "synthetic nested sender notice");
+    nested_self["sender"]["user_id"] = json!("1000");
+    journal_message(&context, key, 2, nested_self);
+
+    let mut peer = group_text(5002, "synthetic peer message");
+    peer["self_id"] = json!("1000");
+    peer["user_id"] = json!("5002");
+    peer["sender"]["user_id"] = json!("5002");
+    journal_message(&context, key, 3, peer);
+
+    let model = Fake::new(vec![]);
+    assert_eq!(run(&context, &model, key, &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
+    let inputs = model.inputs();
+    assert!(inputs[0].contains("synthetic peer message"));
+    assert!(!inputs[0].contains("synthetic string self notice"), "string self ID let an own frame reach the digest");
+    assert!(!inputs[0].contains("synthetic nested sender notice"), "nested sender ID let an own frame reach the digest");
+}
+
+#[test]
 fn harness_conversation_is_digested_with_her_replies_from_conversation_storage() {
     let (root, context) = fixture(Some("chat"), json!({"consoleToken":"digest-unit","ownerQQ":9001,"conversationEngines":{"group:77":"harness"}}), "http://127.0.0.1:1");
     journal_message(&context, "group:77", 1, json!({"post_type":"message","message_type":"group","group_id":77,"self_id":1000,"user_id":5002,
@@ -176,7 +202,7 @@ fn model_failure_and_unusable_output_write_nothing_and_keep_the_cursor() {
     for want in expected {
         assert_eq!(run(&context, &model, "group:42", &ANY), want);
         assert!(rows(&root).is_empty());
-        assert_eq!(MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").digest_cursor("msg").unwrap().map_or(0, |c| c.through), 0);
+        assert_eq!(open_store(&context, &cfg).unwrap().for_reader("group:42").digest_cursor("msg").unwrap().map_or(0, |c| c.through), 0);
     }
     assert_eq!(run(&context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
     let inputs = model.inputs();
@@ -213,7 +239,7 @@ fn quiet_young_and_cancelled_runs_never_ask_the_model() {
 fn a_restarted_sequence_is_read_from_the_start() {
     let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
     let cfg = context.load_config().unwrap();
-    MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").write_digest("msg", 0, 50, (0, 0), &[]).unwrap();
+    open_store(&context, &cfg).unwrap().for_reader("group:42").write_digest("msg", 0, 50, (0, 0), &[]).unwrap();
     social(&root, "group:42", json!([
         {"seq":1,"sender":"甲","userId":"5001","text":"第一句","isSelf":false},
         {"seq":2,"sender":"甲","userId":"5001","text":"第二句","isSelf":false}
@@ -480,7 +506,7 @@ fn conversations_are_digested_oldest_cursor_first() {
         "group:1":{"agentToken":"a","recentMessages":message},"group:2":{"agentToken":"b","recentMessages":message},
         "private:3":{"agentToken":"c","recentMessages":message}}}).to_string()).unwrap();
     let cfg = context.load_config().unwrap();
-    drop(MemoryStore::open(&context, &cfg).unwrap());
+    drop(open_store(&context, &cfg).unwrap());
     let conn = rusqlite::Connection::open(root.0.join("data/memory.db")).unwrap();
     conn.execute_batch("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at) VALUES('group:1','msg',1,2000),('private:3','msg',1,1000);").unwrap();
     drop(conn);

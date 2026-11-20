@@ -130,7 +130,7 @@ pub(crate) fn handle(
         }
         let id = b.get("id").and_then(Value::as_i64).filter(|id| *id > 0).ok_or((400, "id 无效".to_string()))?;
         let archived = b.get("archived").and_then(Value::as_bool).unwrap_or(true);
-        let store = MemoryStore::open(context, cfg).map_err(|e| (500, e))?;
+        let store = crate::memory::open_store(context, cfg).map_err(|e| (500, e))?;
         let changed = store.admin().archive(id, archived, "console").map_err(|e| (500, e.to_string()))?;
         return Ok(json!({"ok":true,"changed":changed,"id":id,"archived":archived}));
     }
@@ -249,7 +249,7 @@ pub(crate) fn handle(
 }
 
 fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, (u16, String)> {
-    MemoryStore::open(context, cfg).map_err(|e| (500, format!("打开记忆库失败：{e}")))
+    crate::memory::open_store(context, cfg).map_err(|e| (500, format!("打开记忆库失败：{e}")))
 }
 
 /// Use plain incoming text so a quoted reply cannot acquire the quoting sender's authority.

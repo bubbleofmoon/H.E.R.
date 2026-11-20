@@ -730,7 +730,7 @@ fn recall_block_with(
     let query_src = if unread_text.is_empty() { recent_text } else { unread_text };
     let query: String = query_src.chars().take(200).collect();
 
-    let store = match crate::memory::MemoryStore::open(context, cfg) {
+    let store = match crate::memory::open_store(context, cfg) {
         Ok(store) => store,
         Err(_) => {
             eprintln!("memory recall open failed (database unavailable)");

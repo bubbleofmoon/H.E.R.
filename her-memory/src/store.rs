@@ -3,8 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
-use super::{Hit, MemoryInput, Provenance, ReaderScope, UpsertOutcome};
-use crate::runtime::RuntimeContext;
+use super::{Hit, MemoryInput, Provenance, UpsertOutcome};
 
 pub struct MemoryStore {
     conn: Connection,
@@ -39,7 +38,7 @@ pub struct NewMemory<'a> {
 }
 
 /// A verbatim incoming message resolved by the bridge in the reader's own conversation.
-pub(crate) struct VerifiedMessage<'a> {
+pub struct VerifiedMessage<'a> {
     pub id: &'a str,
     pub text: &'a str,
     pub author_id: &'a str,
@@ -71,16 +70,16 @@ pub enum ForgetError {
 }
 
 impl MemoryStore {
-    /// The selected runtime's database at the current schema version; the owner is `cfg.ownerQQ`.
-    pub fn open(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
+    /// Prepare an open connection to the current memory schema version and enable provenance queries.
+    pub fn open_prepared(conn: Connection, owner: Option<String>) -> Result<Self, String> {
         Ok(Self {
-            conn: super::open_ready_for_runtime(context)?,
-            owner: crate::conversation_authority::owner_conversation(cfg),
+            conn: super::prepare_connection(conn)?,
+            owner,
             has_provenance: true,
         })
     }
 
-    /// An already-open connection (probes and tests); no migration runs.
+    /// Bind an initialized connection and the optional owner conversation (probes and tests; no migration runs).
     pub fn from_connection(conn: Connection, owner: Option<String>) -> Self {
         Self { conn, owner, has_provenance: false }
     }
@@ -102,11 +101,6 @@ impl MemoryStore {
 impl Reader<'_> {
     pub fn is_owner(&self) -> bool {
         self.is_owner
-    }
-
-    /// The owner ids this conversation may read (diagnostic probes).
-    pub fn scope(&self) -> rusqlite::Result<ReaderScope> {
-        super::resolve_reader_scope(self.conn, &self.key, self.is_owner)
     }
 
     /// Explicit search; counts a hit on every returned memory.
@@ -140,7 +134,7 @@ impl Reader<'_> {
 
     /// A correction and its predecessor update commit together. Only the original speaker
     /// can correct a linked message. The owner can also correct an unlinked private note.
-    pub(crate) fn write_message(
+    pub fn write_message(
         &self, message: VerifiedMessage<'_>, supersedes: Option<i64>,
     ) -> rusqlite::Result<Option<UpsertOutcome>> {
         let attribution = (!self.is_owner).then_some(message.author_id);
@@ -213,7 +207,7 @@ impl Reader<'_> {
         })
     }
 
-    pub(crate) fn correction_history(&self, id: i64) -> rusqlite::Result<Option<Value>> {
+    pub fn correction_history(&self, id: i64) -> rusqlite::Result<Option<Value>> {
         self.conn.query_row(
             "SELECT m.content, p.superseded_by FROM memory m
              JOIN memory_provenance p ON p.memory_id=m.id
@@ -338,9 +332,9 @@ mod tests {
     /// ACL: group:1 reads group:3; group:7 holds a wildcard grant.
     fn store(owner: Option<&str>) -> MemoryStore {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../spec/memory-schema.sql")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
         for (owner_id, scope) in [("group:1", "group"), ("private:2", "private"), ("group:3", "group"), (OWNER, "private")] {
-            crate::memory::write_memory(&conn, &MemoryInput {
+            crate::write_memory(&conn, &MemoryInput {
                 owner_type: "session", owner_id, scope, kind: "fact", subject: None,
                 content: &format!("needle {owner_id}"), tags: None, source: "fixture", importance: 0.5,
             }).unwrap();
@@ -417,7 +411,7 @@ mod tests {
     #[test]
     fn digest_write_commits_memories_with_its_cursor_and_refuses_a_moved_cursor() {
         let store = store(Some(OWNER));
-        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
@@ -440,7 +434,7 @@ mod tests {
     #[test]
     fn a_fault_after_the_memory_insert_rolls_back_the_memories_and_the_cursor() {
         let store = store(Some(OWNER));
-        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
