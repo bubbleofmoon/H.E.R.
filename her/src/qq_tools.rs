@@ -145,7 +145,7 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
     let delivery_cfg = crate::model_view::with_blacklist(context, cfg);
     let packet = crate::model_view::strip_model_chat_data(&packet, &delivery_cfg);
     let guidance = "以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；想回复时直接调用发送工具，桥接自动控制静默与打字节奏；reviseRequired=true 时先看 newMessages 再修改或重新发送。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。";
-    let guidance = guidance.to_owned(); // RED-M1
+    let guidance = crate::model_view::strip_from_model_text(guidance, &delivery_cfg);
     Ok(format!("\n\n【本次消息快照】\n{packet}\n{guidance}"))
 }
 
