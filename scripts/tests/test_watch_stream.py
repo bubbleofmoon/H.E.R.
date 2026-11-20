@@ -74,6 +74,13 @@ class WatchStreamTests(unittest.TestCase):
         lines = self.run_once()
         self.assertIn('new', lines)
 
+    def test_strips_windows_line_endings_and_the_starting_byte_order_mark(self):
+        self.events.write_bytes(b'\xef\xbb\xbfevent: one\r\nevent: two\r\n')
+        lines = self.run_once()
+        self.assertIn('event: one', lines)
+        self.assertIn('event: two', lines)
+        self.assertFalse(any(line.endswith('\r') for line in lines))
+
     def test_reports_an_old_state_file_in_the_status_line(self):
         state = Path(self.folder.name) / 'state.json'
         state.write_text('{}', encoding='utf-8')

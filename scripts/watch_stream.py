@@ -98,7 +98,9 @@ def read_new(path, offset):
     if end < 0:
         return [], offset
     consumed = data[:end + 1]
-    return consumed.decode('utf-8', 'replace').splitlines(), offset + end + 1
+    # The keep script writes Windows line endings and a byte-order mark at the file start.
+    text = consumed.decode('utf-8-sig' if offset == 0 else 'utf-8', 'replace')
+    return [line.rstrip('\r') for line in text.splitlines()], offset + end + 1
 
 
 def state_age(path, now=None):

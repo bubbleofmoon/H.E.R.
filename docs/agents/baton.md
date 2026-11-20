@@ -42,8 +42,8 @@ Read the queue when a session starts and after each handoff, and keep the watche
 
 ### Running and streaming it
 
-- Start it hidden and record its PID and creation time like every background process. It exits after every event, so start it again after acting on the baton; `--follow` keeps it running instead (see "Exit and restart").
-- Windows: `C:/her-orch/ops/start-watch-public.ps1` starts it and records `watch-public.pid.txt`. `C:/her-orch/ops/watch-keep.ps1`, run every few minutes, archives its new output to `C:/her-orch/ops/watch-events.log` and restarts the watcher when the recorded pid is gone, matching the process command line as well as the pid. Its state is `C:/her-orch/ops/baton-watch-windows-public.json` (both files `watch-public.*` in the same folder).
+- Start it hidden and record its PID and creation time like every background process. It exits after every event, so start it again after acting on the baton; `--follow` keeps it running instead (see below).
+- Windows: `C:/her-orch/ops/start-watch-public.ps1` starts it and records `watch-public.pid.txt`. `C:/her-orch/ops/watch-keep.ps1`, run every few minutes, archives its new output to `C:/her-orch/ops/watch-events.log` and restarts the watcher when the recorded pid is gone, matching the process command line as well as the pid. Its state is `C:/her-orch/ops/baton-watch-windows-public.json`.
 - Stream that archive through the Monitor tool: `python -I scripts/watch_stream.py --events C:/her-orch/ops/watch-events.log --pidfile C:/her-orch/ops/watch-public.pid.txt --state C:/her-orch/ops/baton-watch-windows-public.json`. It prints one status line at start (offset, watcher pid and liveness, state age), then each new event line, then each health change (watcher down or back, state stale or fresh). Its offset file is `<events>.offset`, so a re-arm neither replays old events nor loses the ones printed meanwhile.
 - The Monitor tool expires after 30 minutes; re-arm it then and read the new status line instead of checking the watcher by hand.
 - A Windows process's liveness from Git Bash is `tasklist /FI "PID eq <pid>"`; the shell's `kill -0` cannot see native Windows process ids.
