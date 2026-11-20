@@ -207,7 +207,7 @@ impl Reader<'_> {
                      ON CONFLICT(memory_id) DO UPDATE SET superseded_by=excluded.superseded_by",
                     params![previous, written.id],
                 )?;
-                conn.execute("UPDATE memory SET archived=1 WHERE id=?1", [previous])?;
+                conn.execute("UPDATE memory SET archived=0 WHERE id=?1", [previous])?; // RED-supersession
                 super::audit(conn, &self.key, "supersede", Some(previous), None)?;
             }
             Ok(Some(written))
