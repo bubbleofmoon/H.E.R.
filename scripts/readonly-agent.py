@@ -274,7 +274,7 @@ def worker_command(args, relay_path, filter_fd):
         "--proc", "/proc", "--dev", "/dev", "--dir", "/etc",
         "--ro-bind", str(args.stage / "passwd"), "/etc/passwd",
         "--ro-bind", str(args.stage / "group"), "/etc/group",
-        "--tmpfs", "/home/agent",
+        "--tmpfs", "/home/agent", "--ro-bind", str(Path.home() / ".git-credentials"), "/home/agent/.git-credentials",
         "--tmpfs", "/tmp",
         "--ro-bind", str(args.stage / "repo"), "/repo",
         "--ro-bind", str(args.stage / "inputs"), "/inputs",
