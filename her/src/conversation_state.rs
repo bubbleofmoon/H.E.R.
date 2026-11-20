@@ -75,7 +75,7 @@ fn fresh_agent_token() -> String {
 /// Rotate a token in a caller's existing social transaction.
 pub(crate) fn rotate_agent_token(record: &mut Value) -> String {
     let token = fresh_agent_token();
-    *record = json!({(AGENT_TOKEN): &token}); // RED-M3
+    record[AGENT_TOKEN] = json!(&token);
     token
 }
 
