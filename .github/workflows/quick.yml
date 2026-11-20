@@ -111,7 +111,11 @@ jobs:
           fi
           cd "$PUBLIC_TREE/her"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          cargo build --locked --bin her-cli
+          if [ "$RUNNER_OS" = Windows ]; then
+            cargo build --locked --bin her-cli --bin her
+          else
+            cargo build --locked --bin her-cli
+          fi
       - name: Install Playwright and browsers
         if: inputs.target == 'console_ui'
         run: |

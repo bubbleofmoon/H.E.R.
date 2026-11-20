@@ -10,12 +10,13 @@ export async function writeReport(directory, report) {
     const title = [browser, size, route, theme].filter(Boolean).join(' · ');
     return `<figure><figcaption>${escape(title)} · ${escape(status)}</figcaption>${file
       ? `<a href="${escape(file)}"><img loading="lazy" alt="${escape(title)}" src="${escape(file)}"></a>`
-      : `<p>${escape(detail)}</p>`}</figure>`;
+      : ''}${detail ? `<p>${escape(detail)}</p>` : ''}</figure>`;
   };
   const row = result => `<tr><th scope="row">${escape(result.id)}<br>${escape(result.label)}</th>
-    <td>${escape(result.area)} / ${escape(result.section)}</td><td>${escape(result.status)}</td><td><ul>${result.checks
+    <td>${escape(result.area)} / ${escape(result.section)}</td><td>${escape(result.status)}</td><td>${result.detail
+      ? escape(result.detail) : `<ul>${result.checks
       .map(check => `<li>${escape([check.source, check.browser, check.size, check.status, check.detail].filter(Boolean).join(' · '))}</li>`)
-      .join('')}</ul></td></tr>`;
+      .join('')}</ul>`}</td></tr>`;
   const counts = Object.entries(Object.groupBy(report.functions, result => result.status))
     .map(([status, rows]) => `${rows.length} ${status}`).join(' · ');
   const html = `<!doctype html>

@@ -3,9 +3,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, firefox, webkit } from 'playwright';
 import { validateCatalogue } from './catalogue.mjs';
-import { CONSOLE_TOKEN, withFixture } from './fixture.mjs';
+import { withFixture } from './fixture.mjs';
 import { writeReport } from './report.mjs';
 import { openPage, pages, unavailablePages, walks } from './walk.mjs';
+import { withWebView } from './webview.mjs';
 
 const catalogue = JSON.parse(await fs.readFile(new URL('./catalogue.json', import.meta.url)));
 validateCatalogue(catalogue, walks, unavailablePages);
@@ -33,9 +34,17 @@ await fs.mkdir(directory);
 await fs.mkdir(path.join(directory, 'screenshots'));
 const report = { commit: HER_UI_COMMIT, platform, browsers: {}, screenshots: [], functions: [], errors: [] };
 const checks = new Map();
+const blocked = new Map();
 
 function fixtureMessage(error) {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/([?&]token=)[^\s&"'#]+/g, '$1[redacted]');
+}
+
+async function restrictToConsole(context, origin) {
+  await context.route('**/*', route => new URL(route.request().url()).origin === origin
+    ? route.continue() : route.abort());
+  await context.routeWebSocket('**/*', socket => socket.close());
 }
 
 async function withPage(browser, viewport, origin, run) {
@@ -43,18 +52,32 @@ async function withPage(browser, viewport, origin, run) {
     viewport, colorScheme: 'light', timezoneId: 'UTC', serviceWorkers: 'block',
   });
   try {
-    await context.route('**/*', route => new URL(route.request().url()).origin === origin
-      ? route.continue() : route.abort());
-    await context.routeWebSocket('**/*', socket => socket.close());
-    await context.addInitScript(({ origin, token }) => {
-      if (location.origin === origin) sessionStorage.setItem('consoleToken', token);
-    }, { origin, token: CONSOLE_TOKEN });
+    await restrictToConsole(context, origin);
     const page = await context.newPage();
     page.setDefaultTimeout(8000);
     page.setDefaultNavigationTimeout(8000);
     await run(page);
   } finally {
     await context.close();
+  }
+}
+
+async function capture(page, entry, origin, spec, token) {
+  const { browser, size, route, theme } = entry;
+  const name = `${browser}-${size}-${route.slice(1).replaceAll('/', '-')}-${theme}`;
+  const screenshot = async suffix => {
+    const file = `screenshots/${name}${suffix}.png`;
+    await page.screenshot({ path: path.join(directory, file), animations: 'disabled', timeout: 8000 });
+    return file;
+  };
+  try {
+    await page.emulateMedia({ colorScheme: theme });
+    await openPage(page, origin, route, spec, token);
+    report.screenshots.push({ ...entry, status: 'pass', file: await screenshot('') });
+  } catch (error) {
+    const detail = fixtureMessage(error);
+    const file = await screenshot('-failed').catch(() => undefined);
+    report.screenshots.push({ ...entry, status: 'fail', detail, file });
   }
 }
 
@@ -111,13 +134,7 @@ async function runMatrix(browserName, browser, viewport) {
             continue;
           }
           try {
-            await withPage(browser, viewport, fixture.origin, async page => {
-              await page.emulateMedia({ colorScheme: theme });
-              await openPage(page, fixture.origin, route, spec);
-              const file = `screenshots/${browserName}-${size}-${route.slice(1).replaceAll('/', '-')}-${theme}.png`;
-              await page.screenshot({ path: path.join(directory, file), animations: 'disabled', timeout: 8000 });
-              report.screenshots.push({ ...entry, status: 'pass', file });
-            });
+            await withPage(browser, viewport, fixture.origin, page => capture(page, entry, fixture.origin, spec));
           } catch (error) {
             report.screenshots.push({ ...entry, status: 'fail', detail: fixtureMessage(error) });
           }
@@ -133,17 +150,43 @@ async function runMatrix(browserName, browser, viewport) {
           await runWalk(page, group, fixture, browserName, size);
         });
       } catch (error) {
-        report.errors.push(`${browserName} ${size} ${spec.route}: ${fixtureMessage(error)}`);
+        const detail = `${spec.route} walk: ${fixtureMessage(error)}`;
+        report.errors.push(`${browserName} ${size} ${detail}`);
+        for (const key of Object.keys(walks[group])) {
+          const source = `${group}.${key}`;
+          const id = `${browserName}/${size}/${source}`;
+          if (!checks.has(id)) checks.set(id, { source, browser: browserName, size, status: 'fail', detail });
+        }
       }
     }
   });
 }
 
 if (isWindows) {
-  report.screenshots.push({
-    browser: 'WebView2 desktop window', status: 'skipped',
-    detail: 'Playwright has no WebView2 window channel. This hosted job has no native window capture or verified interactive desktop session.',
-  });
+  const browser = 'WebView2';
+  try {
+    await withFixture(HER_TEST_CLI, async fixture => {
+      await withWebView(HER_TEST_CLI, fixture, async (page, session, version) => {
+        report.browsers[browser] = version;
+        await restrictToConsole(page.context(), fixture.origin);
+        page.setDefaultTimeout(8000);
+        page.setDefaultNavigationTimeout(8000);
+        const size = await page.evaluate(() => `${innerWidth}x${innerHeight}`);
+        for (const [group, spec] of Object.entries(pages)) {
+          for (const route of [spec.route, ...(spec.aliases ?? [])]) {
+            const entry = { browser, size, route, theme: 'light' };
+            if (Object.hasOwn(unavailablePages, group)) {
+              report.screenshots.push({ ...entry, status: 'skipped', detail: unavailablePages[group] });
+              continue;
+            }
+            await capture(page, entry, fixture.origin, spec, session);
+          }
+        }
+      });
+    });
+  } catch (error) {
+    report.screenshots.push({ browser, status: 'fail', detail: fixtureMessage(error) });
+  }
 }
 
 for (const [name, [engine, options]] of Object.entries(browsers)) {
@@ -155,11 +198,16 @@ for (const [name, [engine, options]] of Object.entries(browsers)) {
       try {
         await runMatrix(name, browser, viewport);
       } catch (error) {
-        report.errors.push(`${name} ${viewport.width}x${viewport.height}: ${fixtureMessage(error)}`);
+        const size = `${viewport.width}x${viewport.height}`;
+        const detail = `Fixture: ${fixtureMessage(error)}`;
+        blocked.set(`${name}/${size}`, detail);
+        report.errors.push(`${name} ${size}: ${detail}`);
       }
     }
   } catch (error) {
-    report.errors.push(`${name}: ${fixtureMessage(error)}`);
+    const detail = `Browser launch: ${fixtureMessage(error)}`;
+    blocked.set(name, detail);
+    report.errors.push(`${name}: ${detail}`);
   } finally {
     await browser?.close().catch(error => report.errors.push(`${name} cleanup: ${fixtureMessage(error)}`));
   }
@@ -172,12 +220,16 @@ for (const [id, placement] of Object.entries(catalogue.functions)) {
     return Object.keys(browsers).flatMap(browser => dimensions.map(({ width, height }) => {
       const size = `${width}x${height}`;
       return checks.get(`${browser}/${size}/${source}`)
-        ?? { source, browser, size, status: 'fail', detail: 'The page or browser did not finish its walk.' };
+        ?? { source, browser, size, status: 'fail',
+          detail: blocked.get(`${browser}/${size}`) ?? blocked.get(browser) ?? `No result recorded for ${source}` };
     }));
   });
   const statuses = results.map(result => result.status);
   const status = statuses.includes('fail') ? 'fail' : statuses.includes('pass') ? 'pass' : 'not yet in this UI';
-  report.functions.push({ id, ...placement, status, checks: results });
+  report.functions.push({
+    id, ...placement, status, checks: results,
+    ...(results.length === 0 && { detail: 'The catalogue has no source control for this function on the current console pages.' }),
+  });
 }
 await writeReport(directory, report);
 console.log(`Console UI report: ${directory}`);

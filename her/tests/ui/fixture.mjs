@@ -24,7 +24,7 @@ function close(server) {
   return new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 }
 
-async function startConsole(root, cli, env) {
+async function startConsole(root, cli, env, configurePort) {
   const attempts = [];
   const triedPorts = new Set();
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -41,7 +41,11 @@ async function startConsole(root, cli, env) {
     }
     triedPorts.add(port);
     const origin = `http://127.0.0.1:${port}`;
-    await close(reservation);
+    try {
+      await configurePort(port);
+    } finally {
+      await close(reservation);
+    }
 
     const child = spawn(cli, ['--runtime-root', root, '--console-serve', '--console-port', String(port)],
       { cwd: root, env, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
@@ -107,7 +111,7 @@ export async function withFixture(cli, action) {
     });
     const feedUrl = `http://127.0.0.1:${await listen(feed)}`;
     const write = (file, value) => fs.writeFile(path.join(root, file), JSON.stringify(value));
-    await write('config/config.json', baseConfig(world, {
+    const config = baseConfig(world, {
       consoleToken: CONSOLE_TOKEN,
       dsh: { baseUrl: world.dsh, provider: 'fixture', model: 'fixture' },
       snowluma: { httpUrl: world.onebot, wsUrl: world.onebotWs },
@@ -116,7 +120,7 @@ export async function withFixture(cli, action) {
       harness: { routes: [{ id: 'first', model: 'fixture' }, { id: 'second', model: 'fixture' }] },
       backup: { dir: path.join(workspace, 'backups') },
       time: { zone: 'UTC' },
-    }));
+    });
     await write('dependencies.json', { dsh: world.dsh, model: world.model, onebot: world.onebot, onebot_ws: world.onebotWs });
     await write('data/mode.json', { mode: 'chat' });
     await write('data/releases.json', {
@@ -141,7 +145,7 @@ export async function withFixture(cli, action) {
       HER_INSTALL_ROOT: path.join(workspace, 'unused-install-root'),
       HER_TASK_SCHEDULER_FILE: path.join(workspace, 'scheduler.xml'),
     };
-    console = await startConsole(root, cli, env);
+    console = await startConsole(root, cli, env, consolePort => write('config/config.json', { ...config, consolePort }));
     const api = async (route, body) => {
       const response = await fetch(console.origin + route, {
         method: body === undefined ? 'GET' : 'POST', redirect: 'error', signal: AbortSignal.timeout(5000),
@@ -153,7 +157,7 @@ export async function withFixture(cli, action) {
       assert.equal(data.ok, true, route);
       return data;
     };
-    await action({ origin: console.origin, api, backupDir: path.join(workspace, 'backups') });
+    await action({ origin: console.origin, api, backupDir: path.join(workspace, 'backups'), root, env });
   } finally {
     try {
       await Promise.allSettled([console?.stop(), world?.close(), feed?.listening ? close(feed) : undefined])
@@ -162,7 +166,7 @@ export async function withFixture(cli, action) {
           if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'Fixture cleanup failed');
         });
     } finally {
-      await fs.rm(workspace, { recursive: true, force: true, maxRetries: 3 });
+      await fs.rm(workspace, { recursive: true, force: true, maxRetries: 10 });
     }
   }
 }

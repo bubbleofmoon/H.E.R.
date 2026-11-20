@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { GROUP_KEY } from './fixture.mjs';
+import { CONSOLE_TOKEN, GROUP_KEY } from './fixture.mjs';
 import { OWNER } from '../fixtures/rust-world.mjs';
 
 export const unavailablePages = {
@@ -10,9 +10,9 @@ export const unavailablePages = {
 
 export const pages = {
   root: { route: '/', themes: ['light', 'dark'] },
-  personas: { route: '/personas', ready: ['/api/personas'], marker: '#list' },
+  personas: { route: '/personas', ready: ['/api/personas'], marker: '#assign' },
   schedule: {
-    route: '/schedule', aliases: ['/tasks'],
+    route: '/schedule', aliases: ['/tasks'], use: '#save',
     ready: ['/api/releases', '/api/dependencies', '/api/backups/settings', '/api/tasks', '/api/schedule',
       '/api/tasks/runs', '/api/backups'],
     marker: '#legacy tbody tr',
@@ -37,7 +37,8 @@ function responseMatches(response, method, route) {
 
 export async function observe(page, method, route, action, status = 200, ok = status < 400) {
   const [response] = await Promise.all([
-    page.waitForResponse(response => responseMatches(response, method, route)),
+    page.waitForResponse(response => responseMatches(response, method, route))
+      .catch(error => { throw Error(`Waiting for ${method} ${route}: ${error.message}`); }),
     action(),
   ]);
   const body = await response.json();
@@ -53,16 +54,32 @@ function click(page, control, method, route, status) {
   }, status);
 }
 
-export async function openPage(page, origin, route, spec) {
-  // Drain the previous document's polling or refresh requests before arming these listeners.
+async function readPage(page, routes, action) {
+  const reads = routes.map(route => observe(page, 'GET', route, () => {}));
+  await Promise.all([...reads, action()]);
+}
+
+async function useToken(page, spec, token) {
+  const input = page.locator('#token');
+  await input.fill(token);
+  // Schedule fetches dependencies on navigation and its own refresh, outside the token handler.
+  const reads = spec.ready.filter(route => route !== '/api/dependencies');
+  await readPage(page, reads, () => page.locator(spec.use ?? '#use').click());
+  assert(await page.evaluate(value => sessionStorage.getItem('consoleToken') === value, token),
+    'The token form did not save the credential for this tab');
+}
+
+export async function openPage(page, origin, route, spec, token = CONSOLE_TOKEN) {
+  // Drain the previous document before listening for this page's startup requests.
   if (page.url() !== 'about:blank') await page.goto('about:blank');
-  const pending = spec.ready.map(route => page.waitForResponse(response => responseMatches(response, 'GET', route)));
-  const [navigation, ...responses] = await Promise.all([page.goto(origin + route), ...pending]);
-  assert.equal(navigation.status(), 200, route);
-  for (const response of responses) {
-    assert.equal(response.status(), 200, response.url());
-    assert.equal((await response.json()).ok, true, response.url());
-  }
+  const url = new URL(route, origin);
+  // The console also authenticates the document itself, before the token form can run.
+  url.searchParams.set('token', token);
+  await readPage(page, spec.ready, async () => {
+    const navigation = await page.goto(url.toString());
+    assert.equal(navigation?.status(), 200, `GET ${route}: console document`);
+  });
+  await useToken(page, spec, token);
   await (spec.marker.endsWith(' tr') ? page.locator(spec.marker).first() : page.locator(spec.marker))
     .waitFor({ state: 'visible' });
 }
@@ -86,7 +103,7 @@ const resetConversation = '/api/settings/conversation/reset';
 
 export const walks = {
   personas: {
-    list: ({ page }) => click(page, page.locator('#use'), 'GET', '/api/personas'),
+    list: ({ page }) => useToken(page, pages.personas, CONSOLE_TOKEN),
     import: ({ page }) => click(page, page.locator('#import'), 'POST', '/api/personas/import-roles'),
     create: async ({ page, state }) => {
       await page.locator('#name').fill('Fixture persona');
@@ -244,7 +261,7 @@ export const walks = {
     },
   },
   registry: {
-    list: ({ page }) => click(page, page.locator('#use'), 'GET', '/api/settings'),
+    list: ({ page }) => useToken(page, pages.registry, CONSOLE_TOKEN),
     set: async ({ page }) => {
       const row = setting(page, 'harness.model');
       await row.locator('input').fill('fixture-alt');
@@ -280,7 +297,7 @@ export const walks = {
     },
   },
   conversations: {
-    list: ({ page }) => click(page, page.locator('#use'), 'GET', '/api/settings/conversations'),
+    list: ({ page }) => useToken(page, pages.conversations, CONSOLE_TOKEN),
     set: async ({ page }) => {
       const row = conversationSetting(page, 'conversation.route');
       await row.locator('input').fill('second');
@@ -301,7 +318,7 @@ export const walks = {
     },
   },
   models: {
-    view: ({ page }) => click(page, page.locator('#use'), 'GET', '/api/settings/models'),
+    view: ({ page }) => useToken(page, pages.models, CONSOLE_TOKEN),
     set: async ({ page }) => {
       const row = conversation(page, 'conversations');
       await row.locator('select').selectOption('first');
