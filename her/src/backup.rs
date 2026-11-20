@@ -288,6 +288,9 @@ fn monitor_notices_with(
     now: i64,
     mut send: impl FnMut(&str, &str),
 ) -> Result<(), String> {
+    // An unreadable pause store is not an observed schedule change.
+    let paused = crate::schedule::ScheduleStore::new(context).paused_jobs();
+    let paused = paused.map_err(|error| error.message())?;
     let mut result = Ok(());
     let mut missed = Vec::new();
     let mut failures = Vec::new();
@@ -296,7 +299,7 @@ fn monitor_notices_with(
         TaskId::MemoryBackup,
         TaskId::MemoryRestoreTest,
     ] {
-        match monitor_task_notices(context, config, store, now, task) {
+        match monitor_task_notices(context, config, store, now, task, &paused) {
             Ok(notices) => {
                 if !notices.missed.is_empty() {
                     missed.push(notices.missed);
@@ -349,6 +352,7 @@ fn monitor_task_notices(
     store: &crate::task_runs::TaskStore,
     now: i64,
     task: TaskId,
+    paused: &[String],
 ) -> Result<TaskNotices, String> {
     use crate::task_runs::{RunQuery, RunSource, RunState, SlotObservation};
     use crate::tasks::{self, Due, Schedule};
@@ -357,7 +361,7 @@ fn monitor_task_notices(
     let def = tasks::task_def(task);
     let full = task == TaskId::Backup;
     let schedule = tasks::configured_schedule(def, config);
-    let on = crate::supervisor::enabled_in(context, config, def);
+    let on = crate::supervisor::enabled(config, def) && !paused.iter().any(|job| job == name);
     let (time, cadence) = match schedule {
         Schedule::Daily { hour, minute } => (format!("{hour:02}:{minute:02}"), "daily"),
         Schedule::Monthly { hour, minute } => (format!("{hour:02}:{minute:02}"), "monthly"),
@@ -2715,6 +2719,67 @@ mod tests {
         );
         assert_eq!(store.list(&Default::default()).unwrap().runs.len(), 2);
         super::monitor_notices_with(&context, &config, store, restart + 60_000, no_notice).unwrap();
+    }
+
+    #[test]
+    fn unreadable_schedule_preserves_missed_memory_slots_across_restart() {
+        use crate::runtime::RuntimeArea;
+
+        let fixture = Fixture::new("unreadable-schedule");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        crate::schedule::ScheduleStore::new(&context)
+            .set_system_paused("backup", true)
+            .unwrap();
+        let schedule_path = fixture.0.join("data/schedule.json");
+        let readable_schedule = fs::read(&schedule_path).unwrap();
+        let start = timestamp("2026-02-01T03:59:00Z");
+        let restart = timestamp("2026-02-01T05:31:00Z");
+        let no_notice = |_: &str, _: &str| {
+            panic!("expected no backup notice");
+        };
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        super::monitor_notices_with(&context, &config, api.dispatcher.store(), start, no_notice)
+            .unwrap();
+        drop(api);
+        let saved_state = || {
+            [
+                "backup-notices.json",
+                "memory-backup-notices.json",
+                "memory-restore-test-notices.json",
+            ]
+            .map(|file| {
+                context
+                    .read_optional_text(RuntimeArea::Data, file)
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        let before = saved_state();
+        fs::write(&schedule_path, b"not json").unwrap();
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        let store = api.dispatcher.store();
+        let unreadable = super::monitor_notices_with(&context, &config, store, restart, no_notice);
+        assert_eq!(
+            saved_state(),
+            before,
+            "an unreadable schedule must preserve the notice cursors and signatures"
+        );
+        assert!(unreadable.is_err());
+
+        fs::write(&schedule_path, readable_schedule).unwrap();
+        let mut notices = Vec::new();
+        super::monitor_notices_with(&context, &config, store, restart + 60_000, |_, body| {
+            notices.push(body.to_owned());
+        })
+        .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("Memory backup missed"));
+        assert!(notices[0].contains("Memory restore test missed"));
+        assert_eq!(store.list(&Default::default()).unwrap().runs.len(), 2);
+        super::monitor_notices_with(&context, &config, store, restart + 120_000, no_notice)
+            .unwrap();
     }
 
     #[test]
