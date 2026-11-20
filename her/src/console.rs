@@ -14255,7 +14255,7 @@ fn desktop_sign_in_selected(
 ) -> Result<String, (u16, String)> {
     use crate::console_auth::{checked_console_token, ConsoleAuthority};
 
-    let browser = has_fetch_metadata(req) || ["origin", "referer", "cookie"].iter().any(|key| req.headers.contains_key(*key));
+    let browser = presented_console_token(req).is_none() && (has_fetch_metadata(req) || ["origin", "referer", "cookie"].iter().any(|key| req.headers.contains_key(*key))); // RED-R3-N2
     let native_proof = || -> Result<(), (u16, String)> {
         let expected = crate::desktop::console_token(context)
             .map_err(|_| (403, "protected console token file is unavailable".into()))?;
