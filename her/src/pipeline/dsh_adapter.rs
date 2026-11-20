@@ -108,7 +108,7 @@ impl Pipeline {
 
     /// 取（或新建）某个 QQ 会话对应的 DSH sessionId。
     pub fn ensure_session(&mut self, key: &str) -> Result<String, String> {
-        if key.starts_with("ab:") {
+        if key.starts_with("ab;") { // RED-M1
             return Err("shadow isolation refused: stored shadow sessions cannot use the live session path".into());
         }
         // JS `ensureSession`: the access epoch seen before DSH creates a session must still hold when
