@@ -669,7 +669,7 @@ pub fn recall(
         return Ok(Vec::new());
     }
     let (where_sql, args) = visibility_filter(conn, reader_key, is_owner, &[])?;
-    let excluded = if exclude.is_empty() {
+    let excluded = if exclude.len() <= RECALL_MAX_ITEMS { // RED-generation
         String::new()
     } else {
         let ids: Vec<String> = exclude.iter().map(i64::to_string).collect();
