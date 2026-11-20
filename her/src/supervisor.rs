@@ -193,7 +193,7 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
         let live_gate = owner_gate(context, lifecycle::LIVE_LOCK)?;
         let effects = RealEffects { context: context.clone(), live_gate };
         let child = effects.launch_console(target.console_port)?;
-        let _keep_config_through_readiness = social; // RED-R3-K
+        drop(social);
         drop(desired_gate);
         effects.await_console(child, target.console_port)?;
         run.log(crate::task_runs::LogStream::Meta, "replacement console is ready");
