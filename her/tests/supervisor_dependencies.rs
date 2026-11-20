@@ -244,6 +244,9 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
         std::fs::write(folder.join("client-key"), "synthetic-relay-secret-80").unwrap();
         std::fs::write(folder.join("auth/login.json"), "synthetic-private-login").unwrap();
         std::fs::write(folder.join("mode"), mode).unwrap();
+        if mode == "scripted" {
+            std::fs::File::create(folder.join("probe-responses")).unwrap();
+        }
         let reservation = crate::support::ports::reserve();
         let port = reservation.port();
         std::fs::write(
@@ -390,6 +393,42 @@ setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+    fn relay_health(&self) -> Value {
+        let output = self
+            .command(&self.cli)
+            .args(["lifecycle", "assert-running", "--runtime-root"])
+            .arg(&self.root)
+            .output()
+            .unwrap();
+        let verdict: Value = serde_json::from_slice(&output.stdout).unwrap();
+        verdict["parts"]["relay"].clone()
+    }
+    fn script_relay_probes(
+        &self,
+        folder: &std::path::Path,
+        statuses: &[u16],
+        mut after_probe: impl FnMut(usize),
+    ) {
+        let probes = folder.join("probes");
+        self.wait(|| count_lines(&probes) >= 1);
+        for (index, status) in statuses.iter().enumerate() {
+            reply_to_relay_probe(folder, status);
+            // The next request establishes that the prior pass has checkpointed its result.
+            self.wait(|| count_lines(&probes) >= index + 2);
+            after_probe(index + 1);
+        }
+    }
+    fn relay_refusal_log(&self) -> PathBuf {
+        self.root.join("data/logs/dependency-relay.err.log")
+    }
+    fn enable_alerts(&mut self) {
+        self.config["ownerQQ"] = json!(42);
+        std::fs::write(
+            self.root.join("config/config.json"),
+            self.config.to_string(),
+        )
+        .unwrap();
+    }
     fn fake_config(&self, folder: &str, field: &str, value: Value) {
         let path = self.root.join(folder).join("fixture.json");
         let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -433,6 +472,19 @@ impl Drop for Fixture {
     }
 }
 
+fn count_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path).unwrap_or_default().lines().count()
+}
+
+fn reply_to_relay_probe(folder: &std::path::Path, response: impl std::fmt::Display) {
+    use std::io::Write;
+    let mut responses = std::fs::OpenOptions::new()
+        .append(true)
+        .open(folder.join("probe-responses"))
+        .unwrap();
+    writeln!(responses, "{response}").unwrap();
+}
+
 #[cfg(feature = "parity-clock")]
 impl Fixture {
     fn clock(&self, now: i64) {
@@ -440,6 +492,34 @@ impl Fixture {
         let path = self.root.join("data/lifecycle/dependency-clock");
         std::fs::write(path.with_extension("tmp"), now.to_string()).unwrap();
         std::fs::rename(path.with_extension("tmp"), path).unwrap();
+    }
+    fn dependency_pause(&self, point: &str) {
+        let path = self.root.join("data/lifecycle/dependency-reconcile-pause");
+        std::fs::write(path.with_extension("tmp"), point).unwrap();
+        std::fs::rename(path.with_extension("tmp"), path).unwrap();
+    }
+    fn wait_dependency_pause(&self, point: &str) {
+        let path = self
+            .root
+            .join("data/lifecycle/dependency-reconcile-reached");
+        self.wait(|| std::fs::read_to_string(&path).is_ok_and(|value| value == point));
+    }
+    fn hold_dependency_gate(&self, name: &str) -> std::fs::File {
+        let gate = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join("data/lifecycle").join(name))
+            .unwrap();
+        gate.lock().unwrap();
+        gate
+    }
+    fn connect_dependency(&self, port: u16) -> std::io::Result<std::net::TcpStream> {
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(50),
+        )
     }
     fn attempts(&self, folder: &str) -> usize {
         std::fs::read_to_string(self.root.join(folder).join("attempts"))
@@ -453,13 +533,13 @@ impl Fixture {
             .lines()
             .count()
     }
-    fn enable_alerts(&mut self) {
-        self.config["ownerQQ"] = json!(42);
-        std::fs::write(
-            self.root.join("config/config.json"),
-            self.config.to_string(),
-        )
-        .unwrap();
+    fn assert_one_relay_notice(&self) {
+        let reason = "relay models health request was refused";
+        let alerts = std::fs::read_to_string(self.root.join("snow/alerts")).unwrap_or_default();
+        assert_eq!(
+            alerts.lines().filter(|line| line.contains(reason)).count(),
+            1
+        );
     }
     fn crash_dsh(&self) {
         let instance = serde_json::from_value::<process_identity::ProcessIdentity>(
@@ -2363,12 +2443,10 @@ fn resolved_foreign_npx_entries_are_preserved_and_refused_only_on_the_selected_p
 }
 
 #[cfg(windows)]
-#[test]
-fn native_dependency_actions_serialize_with_the_runtime_mutex() {
-    let mut fixture = Fixture::new();
+fn hold_dependency_mutex(fixture: &Fixture, seconds: u32) -> Owned {
     let script = fixture.root.join("hold-mutex.ps1");
     std::fs::write(&script,r#"
-param($Root)
+param($Root, [int]$Seconds)
 $ErrorActionPreference='Stop'
 $sha=[Security.Cryptography.SHA256]::Create()
 try {$key=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Root).ToLowerInvariant()))).Replace('-','')}
@@ -2378,20 +2456,29 @@ $acquired=$mutex.WaitOne(0)
 if(-not $acquired){throw 'fixture mutex already held'}
 try {
  [IO.File]::WriteAllText((Join-Path $Root 'mutex-ready'),'ready')
- Start-Sleep -Seconds 4
+ Start-Sleep -Seconds $Seconds
 } finally {$mutex.ReleaseMutex();$mutex.Dispose()}
 "#).unwrap();
-    let mut holder = Owned::new(
+    let holder = Owned::new(
         hidden("powershell.exe")
             .args(["-NoProfile", "-File"])
             .arg(script)
             .arg(&fixture.root)
+            .arg(seconds.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
     );
     fixture.wait(|| fixture.root.join("mutex-ready").exists());
+    holder
+}
+
+#[cfg(windows)]
+#[test]
+fn native_dependency_actions_serialize_with_the_runtime_mutex() {
+    let mut fixture = Fixture::new();
+    let mut holder = hold_dependency_mutex(&fixture, 4);
     fixture.start();
     fixture.wait(|| {
         std::fs::read_to_string(fixture.root.join("supervise.err"))
@@ -2704,6 +2791,442 @@ fn relay_readiness_gates_dsh_and_shared_health_without_exposing_secrets() {
             );
         }
     }
+}
+
+#[test]
+fn relay_reconciler_and_shared_health_use_the_same_probe_budget() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("slow");
+    fixture.start();
+    // The fourth request starts after three full reconciler probes have completed.
+    fixture.wait(|| count_lines(&folder.join("probes")) >= 4);
+    assert_eq!(
+        fixture.states()["relay"]["ready"],
+        true,
+        "reconciler must accept a relay response after a brief first-read stall"
+    );
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+    assert_eq!(count_lines(&fixture.root.join("snow/alerts")), 0);
+    assert_eq!(fixture.relay_health()["verdict"], "pass");
+
+    // The same probes must time out before a response that would fit the CLI's outer budget.
+    std::fs::write(folder.join("mode"), "late").unwrap();
+    assert_eq!(fixture.relay_health()["verdict"], "fail");
+    fixture.wait_for(Duration::from_secs(25), || {
+        fixture.states()["relay"]["state"] == "refused"
+    });
+    assert_eq!(
+        fixture.states()["relay"]["reason"],
+        "relay health response failed or timed out"
+    );
+}
+
+#[test]
+fn relay_alerts_only_on_the_third_consecutive_failed_probe() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    fixture.start();
+    let reason = "relay models health request was refused";
+    let alerts = fixture.root.join("snow/alerts");
+    let relay_alerts = || {
+        std::fs::read_to_string(&alerts)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(reason))
+            .count()
+    };
+
+    fixture.script_relay_probes(&folder, &[200, 503, 503, 503, 503, 503], |completed| {
+        let state = &fixture.states()["relay"];
+        assert_eq!(state["ready"], true);
+        if completed < 4 {
+            assert_ne!(
+                state["state"], "refused",
+                "the reconciler must wait for three failed relay probes"
+            );
+            assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+            assert_eq!(relay_alerts(), 0);
+        } else {
+            assert_eq!(state["state"], "refused");
+            assert_eq!(state["reason"], reason);
+            assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+            if completed == 4 {
+                fixture.wait(|| relay_alerts() == 1);
+            }
+            assert_eq!(relay_alerts(), 1);
+            // The notice limiter could also suppress a duplicate send. Count attempts too.
+            let log = std::fs::read_to_string(fixture.root.join("supervise.err")).unwrap();
+            assert_eq!(log.matches(&format!("[dependencies] {reason}")).count(), 1);
+        }
+    });
+}
+
+#[test]
+fn a_successful_relay_probe_resets_the_failure_streak() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503, 200, 503, 503], |completed| {
+        assert_ne!(
+            fixture.states()["relay"]["state"],
+            "refused",
+            "a success must reset the failed-probe streak (after probe {completed})"
+        );
+        assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+        assert_eq!(count_lines(&fixture.root.join("snow/alerts")), 0);
+    });
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_third_probe_failure_at_hang_threshold_alerts_before_backoff() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let probes = folder.join("probes");
+    let offline = folder.join("offline");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.wait(|| count_lines(&probes) == 1);
+    reply_to_relay_probe(&folder, "200 offline");
+    fixture.wait(|| {
+        let states = fixture.states();
+        let relay = &states["relay"];
+        offline.exists() && relay["ready"] == true && relay["refusalSince"] == epoch
+    });
+    std::fs::remove_file(&offline).unwrap();
+    fixture.wait(|| count_lines(&probes) == 2);
+
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+    for failure in 1..=2 {
+        let now = epoch + failure * 1_000;
+        fixture.clock(now);
+        reply_to_relay_probe(&folder, "503 offline");
+        fixture.wait(|| fixture.states()["relay"]["timerAt"] == now);
+        assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+        fixture.clock(now + 1);
+        // The fixture closes before replying, so this later pass sees a refused connect.
+        fixture.wait(|| fixture.states()["relay"]["timerAt"] == now + 1);
+        if failure == 1 {
+            std::fs::remove_file(&offline).unwrap();
+            fixture.wait(|| count_lines(&probes) == 3);
+        }
+    }
+
+    fixture.clock(epoch + 119_999);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 119_999);
+    assert_eq!(fixture.states()["relay"]["relayProbeFailures"], 2);
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches
+    );
+    std::fs::remove_file(&offline).unwrap();
+    fixture.wait(|| count_lines(&probes) == 4);
+
+    fixture.dependency_pause("relay before-stop-lock");
+    fixture.clock(epoch + 120_000);
+    reply_to_relay_probe(&folder, "503 offline");
+    fixture.wait_dependency_pause("relay before-stop-lock");
+    assert_eq!(fixture.states()["relay"]["state"], "refused");
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+    assert_eq!(
+        fixture.alerts(),
+        1,
+        "the third failed probe must reach the administrator before backoff"
+    );
+    assert!(std::fs::read_to_string(fixture.root.join("snow/alerts"))
+        .unwrap()
+        .contains("relay models health request was refused"));
+    fixture.dependency_pause("");
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture
+        .wait(|| process_identity::check_identity(&original) == process_identity::Liveness::Gone);
+    assert_eq!(fixture.states()["relay"]["restartAt"], epoch + 125_000);
+
+    // The replacement fails its first probe without any intervening successful probe.
+    std::fs::write(folder.join("probe-responses"), "503\n").unwrap();
+    std::fs::remove_file(offline).unwrap();
+    fixture.clock(epoch + 125_000);
+    fixture.wait(|| count_lines(&probes) == 6);
+    let relay = &fixture.states()["relay"];
+    assert_ne!(relay["identity"], json!(original));
+    assert_eq!(relay["relayProbeFailures"], 1);
+    assert_eq!(relay["state"], "started");
+    assert_eq!(fixture.alerts(), 1);
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_exit_after_third_failure_delivers_one_refusal() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503], |_| {});
+    let relay = serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+
+    // Hold the completed third response until the fixture process is observably gone.
+    fixture.dependency_pause("relay after-failed-probe");
+    reply_to_relay_probe(&folder, "503 exit");
+    fixture.wait_dependency_pause("relay after-failed-probe");
+    fixture.wait(|| process_identity::check_identity(&relay) == process_identity::Liveness::Gone);
+    fixture.dependency_pause("");
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture.clock(epoch + 1);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 1);
+    assert_eq!(
+        count_lines(&fixture.relay_refusal_log()),
+        1,
+        "the third failure must be logged even if the relay exits"
+    );
+    fixture.assert_one_relay_notice();
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn busy_gate_then_closed_relay_delivers_one_refusal() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503], |_| {});
+
+    let gate = fixture.hold_dependency_gate("lifecycle.lock");
+    fixture.clock(epoch + 120_000);
+    reply_to_relay_probe(&folder, "503 offline");
+    fixture.wait(|| {
+        let journal = fixture.root.join("data/lifecycle/relay-probe-refusal.json");
+        std::fs::read(journal)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|record| {
+                record["observation"]["state"] == "refused"
+                    && record["notices"][0]["reason"] == "relay models health request was refused"
+                    && record["notices"][0]["status"] == "pending"
+            })
+    });
+    assert!(folder.join("offline").exists());
+    // Keep the gate past a full five-second checkpoint attempt. The next observation
+    // will be TCP refusal, so it cannot recreate the lost HTTP failure.
+    std::thread::sleep(Duration::from_secs(6));
+    fixture.supervisor.take();
+    drop(gate);
+    fixture.start();
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture.clock(epoch + 120_001);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 120_001);
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 1);
+    fixture.assert_one_relay_notice();
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn supervisor_restart_discards_the_relay_streak_after_launch_gate_contention() {
+    let mut fixture = Fixture::new();
+    fixture.enable_alerts();
+    let folder = fixture.relay("scripted");
+    let probes = folder.join("probes");
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.script_relay_probes(&folder, &[200, 503, 503], |_| {});
+    let relay = fixture.states()["relay"].clone();
+    assert_eq!(relay["relayProbeFailures"], 2);
+    fixture.supervisor.take();
+
+    // Supply the slot for the old supervisor's interrupted request.
+    reply_to_relay_probe(&folder, 200);
+    fixture.clock(epoch + 60_001);
+    #[cfg(windows)]
+    let (gate, busy) = (
+        hold_dependency_mutex(&fixture, 30),
+        "a start operation for this runtime is already running",
+    );
+    #[cfg(not(windows))]
+    let (gate, busy) = (
+        fixture.hold_dependency_gate("dependencies.lock"),
+        "gate is busy",
+    );
+    fixture.start();
+    fixture.wait(|| fixture.states()["configuration"]["reason"] == busy);
+    assert_eq!(fixture.states()["relay"]["relayProbeFailures"], 2);
+    fixture.dependency_pause("relay before-probe");
+    drop(gate);
+    fixture.wait_dependency_pause("relay before-probe");
+    let output = fixture
+        .command(&fixture.cli)
+        .args(["lifecycle", "set", "running", "--confirm", "--runtime-root"])
+        .arg(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    reply_to_relay_probe(&folder, 503);
+    fixture.dependency_pause("");
+    fixture.wait(|| count_lines(&probes) == 6);
+    assert_eq!(fixture.states()["relay"]["relayProbeFailures"], 2);
+    reply_to_relay_probe(&folder, 503);
+    fixture.wait(|| count_lines(&probes) == 7);
+    let restarted = &fixture.states()["relay"];
+    assert_eq!(restarted["identity"], relay["identity"]);
+    assert_eq!(restarted["relayProbeFailures"], 1);
+    assert_eq!(restarted["state"], "adopted");
+    assert_eq!(count_lines(&fixture.relay_refusal_log()), 0);
+    let alerts = std::fs::read_to_string(fixture.root.join("snow/alerts")).unwrap_or_default();
+    assert!(!alerts.contains("relay models health request was refused"));
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn snowluma_reopened_before_the_locked_stop_survives() {
+    let mut fixture = Fixture::new();
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.healthy();
+    let hang = fixture.root.join("snow/hang");
+    let hung = fixture.root.join("snow/hung");
+    std::fs::write(&hang, "").unwrap();
+    fixture.wait(|| hung.exists() && fixture.states()["snowluma"]["refusalSince"] == epoch);
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["snowluma"]["identity"].clone()).unwrap();
+
+    fixture.dependency_pause("snowluma before-stop-lock");
+    fixture.clock(epoch + 120_000);
+    fixture.wait_dependency_pause("snowluma before-stop-lock");
+    std::fs::remove_file(&hang).unwrap();
+    fixture.wait(|| fixture.connect_dependency(fixture.ports[0]).is_ok());
+    fixture.dependency_pause("");
+
+    fixture.wait(|| fixture.states()["snowluma"]["timerAt"] == epoch + 120_000);
+    assert_ne!(
+        fixture.states()["snowluma"]["state"],
+        "backoff",
+        "the locked decision must preserve a listening SnowLuma"
+    );
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches,
+        "the locked decision must preserve a listening SnowLuma"
+    );
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_that_listens_during_lifecycle_gate_contention_survives() {
+    let mut fixture = Fixture::new();
+    let folder = fixture.relay("ready");
+    let offline = folder.join("offline");
+    let epoch = 1_800_000_000_000;
+    std::fs::write(&offline, "").unwrap();
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.wait(|| fixture.states()["relay"]["refusalSince"] == epoch);
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+
+    fixture.dependency_pause("relay before-stop-lock");
+    fixture.clock(epoch + 120_000);
+    fixture.wait_dependency_pause("relay before-stop-lock");
+    let gate = fixture.hold_dependency_gate("lifecycle.lock");
+    fixture.dependency_pause("");
+    std::fs::remove_file(&offline).unwrap();
+    fixture.wait(|| folder.join("listening").exists());
+    drop(gate);
+
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 120_000);
+    assert_ne!(
+        fixture.states()["relay"]["state"],
+        "backoff",
+        "the locked decision must preserve a listening relay"
+    );
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches,
+        "the locked decision must preserve a listening relay"
+    );
+}
+
+#[cfg(all(feature = "parity-clock", target_os = "linux"))]
+#[test]
+fn relay_connect_timeout_starts_the_hang_timer_without_a_probe_failure() {
+    let mut fixture = Fixture::new();
+    let folder = fixture.relay("connect-timeout");
+    let config: Value =
+        serde_json::from_slice(&std::fs::read(folder.join("fixture.json")).unwrap()).unwrap();
+    let port = config["port"].as_u64().unwrap() as u16;
+    let epoch = 1_800_000_000_000;
+    fixture.clock(epoch);
+    fixture.dependency_pause("relay before-probe");
+    fixture.start();
+    fixture.wait_dependency_pause("relay before-probe");
+    fixture.wait(|| folder.join("connect-timeout-ready").exists());
+    // Linux admits two connections to a backlog of one while accept is paused.
+    let _queued = [
+        fixture.connect_dependency(port).unwrap(),
+        fixture.connect_dependency(port).unwrap(),
+    ];
+    assert_eq!(
+        fixture.connect_dependency(port).unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    fixture.dependency_pause("");
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch);
+    let state = &fixture.states()["relay"];
+    assert_eq!(
+        state["refusalSince"], epoch,
+        "connect timeout must start the hang timer"
+    );
+    assert!(state["relayProbeFailures"].is_null());
+    assert_eq!(count_lines(&folder.join("probes")), 0);
+    let health = fixture.relay_health();
+    assert_eq!(health["verdict"], "fail");
+    assert_eq!(health["reason"], "relay health connection failed");
+}
+
+#[cfg(feature = "parity-clock")]
+#[test]
+fn relay_restarts_after_two_minutes_of_tcp_refusal() {
+    let mut fixture = Fixture::new();
+    let folder = fixture.relay("ready");
+    let offline = folder.join("offline");
+    let epoch = 1_800_000_000_000;
+    std::fs::write(&offline, "").unwrap();
+    fixture.clock(epoch);
+    fixture.start();
+    fixture.wait(|| fixture.states()["relay"]["refusalSince"] == epoch);
+    let original: process_identity::ProcessIdentity =
+        serde_json::from_value(fixture.states()["relay"]["identity"].clone()).unwrap();
+
+    fixture.clock(epoch + 119_999);
+    fixture.wait(|| fixture.states()["relay"]["timerAt"] == epoch + 119_999);
+    assert_eq!(
+        process_identity::check_identity(&original),
+        process_identity::Liveness::Matches
+    );
+    assert!(fixture.states()["relay"]["relayProbeFailures"].is_null());
+    assert_eq!(count_lines(&folder.join("attempts")), 1);
+    fixture.clock(epoch + 120_000);
+    fixture.wait(|| fixture.states()["relay"]["state"] == "backoff");
+    fixture
+        .wait(|| process_identity::check_identity(&original) == process_identity::Liveness::Gone);
+    assert_eq!(fixture.states()["relay"]["restartAt"], epoch + 125_000);
+    std::fs::remove_file(offline).unwrap();
+    fixture.clock(epoch + 125_000);
+    fixture.wait(|| count_lines(&folder.join("attempts")) == 2);
+    fixture.wait(|| {
+        let states = fixture.states();
+        states["relay"]["state"] == "started" && states["relay"]["ready"] == true
+    });
+    assert_ne!(fixture.states()["relay"]["identity"], json!(original));
 }
 
 #[test]

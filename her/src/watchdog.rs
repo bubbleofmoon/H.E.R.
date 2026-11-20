@@ -31,31 +31,31 @@ pub struct LiveTarget {
     pub console_port: u16,
 }
 
-/// Port of the Node watchdog's config gate: `backends.mcpRustBridge` must be an explicit boolean, `rollout.rustGroups`
-/// an explicit array of distinct non-empty strings and `consolePort` (default 3100) a valid port. Anything else refuses
-/// to start any process.
+/// An explicit array of distinct canonical conversation keys, in launch order. An empty array asks for no live owner.
+pub(crate) fn rollout_groups(value: &Value) -> Result<Vec<String>, &'static str> {
+    let groups = value.as_array().ok_or("rustGroups must be an explicit array")?;
+    let mut seen = std::collections::HashSet::with_capacity(groups.len());
+    let mut list = Vec::with_capacity(groups.len());
+    for group in groups {
+        let text = group.as_str().filter(|s| !s.trim().is_empty()).ok_or("rustGroups must hold non-empty strings")?;
+        if !seen.insert(text) {
+            return Err("rustGroups must not repeat a group");
+        }
+        crate::runtime::validate_canonical_live_group(text)?;
+        list.push(text.to_string());
+    }
+    Ok(list)
+}
+
+/// The watchdog config gate requires an explicit `backends.mcpRustBridge` boolean, an explicit
+/// `rollout.rustGroups` array of canonical keys and a valid `consolePort` (default 3100).
 pub fn live_target_from_config(cfg: &Value) -> Result<LiveTarget, String> {
     let console = cfg
         .get("backends")
         .and_then(|b| b.get("mcpRustBridge"))
         .and_then(Value::as_bool)
         .ok_or("mcpRustBridge must be explicit")?;
-    let groups = cfg
-        .get("rollout")
-        .and_then(|r| r.get("rustGroups"))
-        .and_then(Value::as_array)
-        .ok_or("rustGroups must be an explicit array")?;
-    let mut list = Vec::with_capacity(groups.len());
-    for group in groups {
-        let text = group.as_str().filter(|s| !s.trim().is_empty()).ok_or("rustGroups must hold non-empty strings")?;
-        if list.iter().any(|g| g == text) {
-            return Err("rustGroups must not repeat a group".to_string());
-        }
-        list.push(text.to_string());
-    }
-    if !list.is_empty() {
-        crate::runtime::validate_canonical_live_groups(&list.join(",")).map_err(str::to_string)?;
-    }
+    let groups = rollout_groups(&cfg["rollout"]["rustGroups"])?;
     let port = match cfg.get("consolePort") {
         None | Some(Value::Null) => 3100,
         Some(value) => value
@@ -64,7 +64,7 @@ pub fn live_target_from_config(cfg: &Value) -> Result<LiveTarget, String> {
             .map(|p| p as u16)
             .ok_or("consolePort is invalid")?,
     };
-    Ok(LiveTarget { groups: list, console, console_port: port })
+    Ok(LiveTarget { groups, console, console_port: port })
 }
 
 /// #186: where `rollout.rustGroups` (the conversations a live owner is started to serve, `--live-groups`) and the
@@ -531,6 +531,25 @@ mod tests {
         ] {
             assert!(live_target_from_config(&bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn rollout_list_requires_one_conversation_key_per_item() {
+        let mut cfg = json!({
+            "backends": {"mcpRustBridge": true},
+            "rollout": {"rustGroups": ["group:1", "private:2"]}
+        });
+        assert_eq!(
+            live_target_from_config(&cfg).unwrap().groups,
+            groups(&["group:1", "private:2"]),
+            "canonical group and private entries keep their order even without allow-list entries"
+        );
+
+        cfg["rollout"]["rustGroups"] = json!(["group:1,private:2"]);
+        assert!(
+            live_target_from_config(&cfg).is_err(),
+            "rollout items must contain exactly one conversation key"
+        );
     }
 
     #[test]
