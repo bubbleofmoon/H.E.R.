@@ -879,7 +879,18 @@ fn execute_with(
             Ok(crate::backup::protect_pre_restore(&previous, &|| Ok(()))?)
         })();
         match attempt {
-            Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
+            Ok(()) => {
+                let mut reply = json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)});
+                if !memory_only {
+                    if let Ok(effective) = context.load_config() {
+                        let notices = crate::watchdog::rollout_scope_gaps(&effective).lines();
+                        if !notices.is_empty() {
+                            reply["scopeNotices"] = json!(notices);
+                        }
+                    }
+                }
+                Ok(reply)
+            }
             Err(Step::Refused(reason)) => {
                 // The settings store gate was not had: the owners are stopped and nothing was replaced, so there is
                 // nothing to roll back; start them again.

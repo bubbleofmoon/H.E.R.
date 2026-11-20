@@ -210,6 +210,47 @@ fn restore_settings_archive_without_the_store_restores_and_only_a_full_restore_r
 }
 
 #[test]
+fn restore_settings_reports_and_preserves_an_inherited_rollout_gap() {
+    let f = Fixture::new();
+    let context = f.context();
+    let config = f.0.join("config/config.json");
+    let archived = json!({
+        "consoleToken": "fixture",
+        "backends": {"mcpRustBridge": true},
+        "allow": {"groups": [7001], "private": []},
+        "rollout": {"rustGroups": ["group:7001", "private:7002"]}
+    });
+    fs::write(&config, archived.to_string()).unwrap();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    crate::settings::reset(&context, "rollout.rustGroups", "administrator").unwrap();
+    for memory_only in [true, false] {
+        let plan = preview(&context, &archive, memory_only).unwrap();
+        let result = execute_with(
+            &context,
+            &archive,
+            memory_only,
+            plan["confirmation"].as_str().unwrap(),
+            "fixture-admin",
+            &mut FakeControl::default(),
+        )
+        .unwrap();
+        let effective = context.load_config().unwrap();
+        if memory_only {
+            assert_eq!(effective["rollout"]["rustGroups"], json!([]));
+            assert!(result.get("scopeNotices").is_none());
+        } else {
+            assert_eq!(effective["rollout"]["rustGroups"], archived["rollout"]["rustGroups"]);
+            assert_eq!(effective["allow"]["private"], json!([]), "full restore does not widen inherited access");
+            assert_eq!(crate::watchdog::rollout_scope_gaps(&effective).not_allowed, ["private:7002"]);
+            assert!(result["scopeNotices"].as_array().is_some_and(|lines| lines.iter().any(
+                |line| line.as_str().is_some_and(|line| line.contains("private:7002"))
+            )), "full restore reports the inherited rollout gap: {result}");
+        }
+    }
+}
+
+#[test]
 fn restore_settings_failed_replacement_or_health_rolls_the_store_back() {
     for during_replace in [true, false] {
         let f = Fixture::new();

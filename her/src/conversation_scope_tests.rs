@@ -102,6 +102,36 @@ fn t186_admit_writes_both_keys_once_and_reports_the_live_restart() {
 }
 
 #[test]
+fn scope_commits_both_keys_for_the_watchdog_even_if_the_mirror_fails() {
+    let (root, context) = scoped(
+        "scope settings transaction",
+        json!({"allow": {"groups": [420042], "private": []}, "backends": {"mcpRustBridge": true},
+            "rollout": {"rustGroups": [GROUP]}}),
+    );
+    let before = file(&root);
+    crate::settings::FAIL_WRITE_BACK.with(|fail| fail.set(true));
+    let (status, reply) = scope(&context, "group:420043", "admit");
+    crate::settings::FAIL_WRITE_BACK.with(|fail| fail.set(false));
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply["mirrorError"].is_string(), "{reply}");
+    let history = crate::settings::history(&context, None, None, None).unwrap();
+    let changes: Vec<_> = history["entries"].as_array().unwrap().iter()
+        .filter(|entry| entry["source"] == "console")
+        .map(|entry| (entry["setting"].clone(), entry["new"].clone()))
+        .collect();
+    assert_eq!(
+        changes,
+        [(json!("rollout.rustGroups"), json!([GROUP, "group:420043"])), (json!("allow.groups"), json!([420042, 420043]))],
+        "scope records both settings changes"
+    );
+    assert_eq!(file(&root)["rollout"], before["rollout"], "the forced mirror failure leaves the old target on disk");
+    let effective = context.load_config().unwrap();
+    assert!(inbound_admitted(&effective, "group:420043"));
+    let target = crate::watchdog::live_target_from_config(&effective).unwrap();
+    assert_eq!(target.groups, [GROUP, "group:420043"], "the watchdog uses the committed launch order");
+}
+
+#[test]
 fn t186_remove_revokes_at_once_and_refused_requests_change_nothing() {
     let (root, context) = scoped(
         "t186 remove",
@@ -318,24 +348,28 @@ fn t186_old_spellings_and_large_lists_keep_their_meaning() {
             "rollout": {"enabled": false, "rustGroups": ["group:100000", " group:100001 "]}
         }),
     );
-    // The alias list moves to its canonical name with every entry kept, and the new id is appended.
+    let original = file(&root);
+    let (status, reply) = scope(&context, GROUP, "admit");
+    assert_eq!(status, 400, "an admit cannot persist the malformed legacy rollout: {reply}");
+    assert_eq!(file(&root), original);
+    // Removal can match the old spelling and leave a valid list for the next launch.
+    let (status, reply) = scope(&context, "group:100001", "remove");
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(file(&root)["rollout"]["rustGroups"], json!(["group:100000"]));
+    // The changed allow list moves to its canonical name and admission appends the new id.
     let (status, reply) = scope(&context, GROUP, "admit");
     assert_eq!(status, 200, "{reply}");
     let config = file(&root);
     let groups = config["allow"]["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 1001);
+    assert_eq!(groups.len(), 1000);
     assert_eq!(groups[0], json!(100000));
-    assert_eq!(groups[1000], json!(420042));
+    assert_eq!(groups[1], json!(100002));
+    assert_eq!(groups[999], json!(420042));
     assert!(config["allow"].get("group").is_none(), "the alias spelling is folded into allow.groups");
     assert_eq!(config["allow"]["privates"], json!(["7001"]), "the other kind keeps its spelling");
-    assert_eq!(config["rollout"]["rustGroups"], json!(["group:100000", " group:100001 ", GROUP]));
+    assert_eq!(config["rollout"]["rustGroups"], json!(["group:100000", GROUP]));
     let effective = context.load_config().unwrap();
     assert!(inbound_admitted(&effective, "group:100999") && inbound_admitted(&effective, GROUP));
-    // A served entry in another spelling is matched in canonical form.
-    let (status, reply) = scope(&context, "group:100001", "remove");
-    assert_eq!(status, 200, "{reply}");
-    assert_eq!(file(&root)["rollout"]["rustGroups"], json!(["group:100000", GROUP]));
-    assert_eq!(file(&root)["allow"]["groups"].as_array().unwrap().len(), 1000);
 }
 
 #[test]

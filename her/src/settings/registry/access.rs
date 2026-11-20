@@ -2,14 +2,14 @@
 //! an explicit confirmation (`Setting::confirmed`); a change of a list or the owner revokes like a whitelist write
 //! (`Setting::access`). None is chat-writable, so the model cannot widen its own access.
 
-use crate::settings::kinds::{IdList, OwnerId, Switch};
+use crate::settings::kinds::{IdList, OwnerId, RolloutList, Switch};
 use crate::settings::Setting;
 
 /// The group of the security settings.
 pub(crate) const SECURITY_GROUP: &str = "security";
 
 /// Read by `config::canonical_config` (and so by every access check) through the settings overlay.
-const ALLOW_PRIVATE: Setting = Setting {
+pub(crate) const ALLOW_PRIVATE: Setting = Setting {
     key: "allow.private",
     pointer: "/allow/private",
     kind: &IdList { alias: Some("/allow/privates") },
@@ -21,14 +21,26 @@ const ALLOW_PRIVATE: Setting = Setting {
     secret: false,
 };
 
-const ALLOW_GROUPS: Setting = Setting {
+pub(crate) const ALLOW_GROUPS: Setting = Setting {
     key: "allow.groups",
     pointer: "/allow/groups",
     kind: &IdList { alias: Some("/allow/group") },
     applies: "live",
     group: SECURITY_GROUP,
     label: "Allowed groups",
-    hint: "Group ids that are answered, unless denied; rollout.rustGroups must also serve them. A change revokes every conversation that loses access before the reply. Needs confirmation.",
+    hint: "Group ids eligible for replies unless denied. This list must include the groups served by rollout. A change revokes every conversation that loses access before the reply. Needs confirmation.",
+    chat: false,
+    secret: false,
+};
+
+pub(crate) const ROLLOUT_GROUPS: Setting = Setting {
+    key: "rollout.rustGroups",
+    pointer: "/rollout/rustGroups",
+    kind: &RolloutList,
+    applies: "restart",
+    group: SECURITY_GROUP,
+    label: "Live conversations",
+    hint: "Conversations served at the next watchdog reconcile. Enter distinct group:<id> or private:<id> keys in launch order. Every key must be in the matching allow list. Reset stops the live owner at the next reconcile. Needs confirmation.",
     chat: false,
     secret: false,
 };
@@ -98,5 +110,6 @@ pub(crate) const OUTBOUND_GUARD: Setting = Setting {
 };
 
 /// The group's settings, in registry order.
-pub(super) const SETTINGS: &[Setting] =
-    &[ALLOW_PRIVATE, ALLOW_GROUPS, DENY_PRIVATE, DENY_GROUPS, OWNER, INTERCEPT_NOTIFY, OUTBOUND_GUARD];
+pub(super) const SETTINGS: &[Setting] = &[
+    ALLOW_PRIVATE, ALLOW_GROUPS, DENY_PRIVATE, DENY_GROUPS, OWNER, INTERCEPT_NOTIFY, OUTBOUND_GUARD, ROLLOUT_GROUPS,
+];

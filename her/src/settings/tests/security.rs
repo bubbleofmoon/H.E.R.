@@ -3,7 +3,7 @@
 // routes through the store, the admin agent mode's owner, the seed and the registry.
 use super::*;
 
-const SECURITY_KEYS: [&str; 7] = [
+const SECURITY_KEYS: [&str; 8] = [
     "allow.private",
     "allow.groups",
     "deny.private",
@@ -11,19 +11,20 @@ const SECURITY_KEYS: [&str; 7] = [
     "ownerQQ",
     "security.interceptNotify",
     "security.outboundGuard",
+    "rollout.rustGroups",
 ];
 const KEPT: &str = "group:7001";
 const LOST: &str = "group:7002";
 const LOST_TOKEN: &str = "fixture-security-token-7002";
 
 /// A reserved2 settings fixture whose config allows groups 7001 and 7002, both with an agent token, and whose
-/// `rollout.rustGroups` serves both.
+/// `rollout.rustGroups` serves the group kept by the ordinary access tests.
 fn security_fixture(label: &str) -> (FixtureRoot, RuntimeContext) {
     let (root, context) = settings_fixture(label);
     write_config(&root, |config| {
         config["allow"] = json!({"private": ["7001"], "groups": [7001, 7002]});
         config["deny"] = json!({"private": [], "groups": []});
-        config["rollout"] = json!({"enabled": true, "rustGroups": [KEPT, LOST]});
+        config["rollout"] = json!({"enabled": true, "rustGroups": [KEPT]});
     });
     context.write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved2"}"#).unwrap();
     let state = json!({"conversations": {
@@ -219,8 +220,11 @@ fn settings_a_write_of_another_setting_never_takes_the_access_lists_over() {
     let (root, context) = security_fixture("settings security seed");
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 200, "{body}");
-    let seeded: Vec<Value> = audit_rows(&root).into_iter().filter(|row| SECURITY_KEYS.iter().any(|key| row["key"] == *key)).collect();
-    assert!(seeded.is_empty(), "a security setting is seeded only by a write of itself: {seeded:?}");
+    let seeded: Vec<Value> = audit_rows(&root)
+        .into_iter()
+        .filter(|row| row["key"] != "rollout.rustGroups" && SECURITY_KEYS.iter().any(|key| row["key"] == *key))
+        .collect();
+    assert!(seeded.is_empty(), "other security settings seed on a write of themselves: {seeded:?}");
     // So a hand edit of a list still applies until the list is first changed on the console.
     write_config(&root, |config| config["allow"]["groups"] = json!([7001]));
     assert!(!inbound_admitted(&context.load_config().unwrap(), LOST));
@@ -229,7 +233,10 @@ fn settings_a_write_of_another_setting_never_takes_the_access_lists_over() {
 #[test]
 fn settings_first_change_seeds_the_list_from_its_alias_spelling_and_undoes_to_it() {
     let (root, context) = security_fixture("settings seed alias");
-    write_config(&root, |config| config["allow"] = json!({"private": ["7001"], "group": ["7003", "x"]}));
+    write_config(&root, |config| {
+        config["allow"] = json!({"private": ["7001"], "group": ["7003", "x"]});
+        config["rollout"]["rustGroups"] = json!([]);
+    });
     let (status, body) = set(&context, json!({"setting": "allow.groups", "value": [7004], "confirm": true}));
     assert_eq!(status, 200, "{body}");
     let (entries, _) = history_page(&context, "?setting=allow.groups");
@@ -402,7 +409,10 @@ fn settings_id_lists_compare_ids_as_the_runtime_does() {
 #[test]
 fn settings_scope_change_works_on_an_allow_list_with_unusable_items() {
     let (root, context) = security_fixture("settings scope unusable items");
-    write_config(&root, |config| config["allow"]["groups"] = json!([7001, 7002, "7003a", 0, 9_007_199_254_740_992u64]));
+    write_config(&root, |config| {
+        config["allow"]["groups"] = json!([7001, 7002, "7003a", 0, 9_007_199_254_740_992u64]);
+        config["rollout"]["rustGroups"] = json!([KEPT, LOST]);
+    });
     let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": LOST, "action": "remove", "confirm": true}));
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["revoked"], json!([LOST]), "{body}");
@@ -450,4 +460,100 @@ fn settings_scope_admit_is_denied_only_by_an_id_the_deny_list_reads() {
     write_config(&root, |config| config["deny"]["groups"] = json!([7005]));
     let (status, body) = post(&context, "/api/conversations/scope", json!({"conversation": "group:7005", "action": "admit", "confirm": true}));
     assert_eq!(status, 409, "{body}");
+}
+
+#[test]
+fn rollout_seed_only_copies_a_valid_subset_of_effective_allow_lists() {
+    let (root, context) = settings_fixture("rollout seed");
+    write_config(&root, |cfg| {
+        cfg["allow"] = json!({"groups": [7001], "privates": [" 7002 "]});
+        cfg["deny"] = json!({"private": [7002]});
+        cfg.as_object_mut().unwrap().remove("rollout");
+    });
+    let (status, body) = set(&context, json!({"setting": "allow.groups", "value": [7001, 7003], "confirm": true}));
+    assert_eq!(status, 200, "{body}");
+    for (index, legacy) in [Value::Null, json!(["group:07001"]), json!(["group:7004"]), json!(["private:7003"])]
+        .into_iter()
+        .enumerate()
+    {
+        // The raw file would admit 7004, but the store's allow.groups wins.
+        write_config(&root, |cfg| {
+            cfg["allow"]["groups"] = json!([7004]);
+            cfg["rollout"] = json!({"rustGroups": legacy.clone()});
+        });
+        let (status, body) = set_quiet(&context, json!(4500 + index));
+        assert_eq!(status, 200, "{body}");
+        assert!(history_page(&context, "?setting=rollout.rustGroups").0.is_empty(), "a legacy rollout gap must stay file-backed");
+        assert_eq!(context.load_config().unwrap()["rollout"]["rustGroups"], legacy);
+    }
+    let valid = json!(["private:7002", "group:7003"]);
+    write_config(&root, |cfg| {
+        cfg["allow"]["groups"] = json!([7004]);
+        cfg["rollout"]["rustGroups"] = valid.clone();
+    });
+    let (status, body) = set_quiet(&context, json!(4600));
+    assert_eq!(status, 200, "{body}");
+    let (entries, _) = history_page(&context, "?setting=rollout.rustGroups");
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["source"], "migration");
+    assert_eq!(entries[0]["new"], valid, "valid rollout seeds through stored allow and aliases even when denied");
+}
+
+#[test]
+fn rollout_subset_refusals_keep_values_history_and_revocations_unchanged() {
+    let (root, context) = settings_fixture("rollout refused writes");
+    write_config(&root, |cfg| {
+        cfg["allow"] = json!({"groups": [7001], "privates": [7002]});
+        cfg["rollout"] = json!({"rustGroups": ["group:7001", "private:7002"]});
+    });
+    let history = history_page(&context, "").0;
+    let file = stored_config(&root);
+    let effective = context.load_config().unwrap();
+    for (path, body, allow) in [
+        ("/api/settings/set", json!({"setting": "allow.groups", "value": [], "confirm": true}), "allow.groups"),
+        ("/api/settings/reset", json!({"setting": "allow.private", "confirm": true}), "allow.private"),
+        ("/api/settings/set", json!({"setting": "rollout.rustGroups", "value": ["private:7001"], "confirm": true}), "allow.private"),
+        ("/api/whitelist", json!({"allow": {"groups": [], "private": [7002]}, "confirm": true}), "allow.groups"),
+    ] {
+        let (status, reply) = post(&context, path, body);
+        assert_eq!(status, 409, "a scope write must refuse a rollout outside its matching allow list: {path}: {reply}");
+        assert!(reply["error"].as_str().unwrap().contains(allow), "{reply}");
+        assert_eq!(history_page(&context, "").0, history, "a refusal rolls the seed and audit back");
+        assert_eq!(stored_config(&root), file, "a refused proposal is never mirrored");
+        assert_eq!(context.load_config().unwrap(), effective, "both effective lists stand");
+        assert!(pending_revocations(&root).is_empty());
+    }
+
+    let (status, reply) = post(&context, "/api/settings/reset", json!({"setting": "rollout.rustGroups", "confirm": true}));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(stored_config(&root)["rollout"]["rustGroups"], json!([]), "reset mirrors an explicit empty list");
+    let (entries, _) = history_page(&context, "?setting=rollout.rustGroups");
+    let reset = &entries[0]["entry"];
+    let (status, reply) = set(&context, json!({"setting": "allow.groups", "value": [], "confirm": true}));
+    assert_eq!(status, 200, "{reply}");
+    let history = history_page(&context, "").0;
+    let (status, reply) = post(&context, "/api/settings/undo", json!({"entry": reset, "confirm": true}));
+    assert_eq!(status, 409, "undo must validate the restored rollout against current allow lists: {reply}");
+    assert_eq!(history_page(&context, "").0, history);
+    assert_eq!(context.load_config().unwrap()["rollout"]["rustGroups"], json!([]));
+}
+
+#[test]
+fn rollout_writes_preserve_legacy_gaps_outside_the_changed_allow_kind() {
+    let (root, context) = settings_fixture("rollout inherited gaps");
+    write_config(&root, |cfg| {
+        cfg["allow"] = json!({"groups": [7001, 7002], "private": [7004, 7005]});
+        cfg["rollout"] = json!({"rustGroups": ["group:7001", "private:7003"]});
+    });
+    let (status, reply) = set(&context, json!({"setting": "allow.groups", "value": [7001], "confirm": true}));
+    assert_eq!(status, 200, "a group change can leave an inherited private gap in place: {reply}");
+    let (status, reply) = set(&context, json!({"setting": "allow.private", "value": [7005, 7004], "confirm": true}));
+    assert_eq!(status, 200, "reordering allow without changing its membership keeps the inherited gap: {reply}");
+    let (status, reply) = set(&context, json!({"setting": "allow.private", "value": [7002], "confirm": true}));
+    assert_eq!(status, 409, "a private membership change must repair the private gap: {reply}");
+    let (status, reply) = set(&context, json!({"setting": "rollout.rustGroups", "value": ["private:7003", "group:7001"], "confirm": true}));
+    assert_eq!(status, 409, "a rollout change checks both allow lists: {reply}");
+    let (status, reply) = post(&context, "/api/conversations/scope", json!({"conversation": "private:7003", "action": "admit", "confirm": true}));
+    assert_eq!(status, 200, "the scope action repairs the inherited gap: {reply}");
+    assert_eq!(reply["scope"]["notAllowed"], json!([]));
 }
