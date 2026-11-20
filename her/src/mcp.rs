@@ -617,7 +617,7 @@ fn call_prepared_inner(name: &str, args: &Value, context: &RuntimeContext, recor
                 _ => "读取失败",
             };
             let class = if (400..500).contains(&status) { "refusal" } else { "error" };
-            let mut outcome = text_outcome(format!("{prefix}：{error}"), false); // RED-F41
+            let mut outcome = text_outcome(format!("{prefix}：{error}"), true);
             outcome["structuredContent"] = json!({"class": class});
             outcome
         }
