@@ -402,7 +402,7 @@ fn admit_browser_at(
             let Some(row) = selected else { return Ok(None) };
             let renewed = if let Some((wall, instant)) = anchors.get(&proof.id_digest).filter(|_| renew) {
                 let elapsed = i64::try_from(monotonic.saturating_duration_since(*instant).as_millis()).unwrap_or(i64::MAX);
-                let safe = now; // RED-R3-R
+                let safe = now.min(wall.saturating_add(elapsed));
                 if let Some(expires) = safe.checked_add(BROWSER_IDLE_MS).filter(|_| safe > row.last) {
                     conn.execute(
                         "UPDATE console_browser_sessions SET last_used_ms=?1,expires_ms=?2
