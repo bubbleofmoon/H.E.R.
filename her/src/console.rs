@@ -14170,7 +14170,7 @@ fn admit_selected_request(
     let memory_route = req.path.starts_with("/api/memory/");
     let agent_call = has_agent_marker(req);
     let (proof, renewal, browser_acl) = if let Some(presented) = presented_console_token(req) {
-        (select_explicit_authority(context, presented, &expected, true)?, None, None) // RED-R3-T3
+        (select_explicit_authority(context, presented, &expected, !has_fetch_metadata(req))?, None, None)
     } else if !agent_call && !browser_candidates(req, port)?.is_empty()
         && (canonical_request(req, port) || !PAGE_MOUNTS.contains(&req.path.as_str()))
     {
