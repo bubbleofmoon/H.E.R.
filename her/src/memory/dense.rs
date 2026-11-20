@@ -159,7 +159,7 @@ fn rank_cached(
                 s.distance, m.pinned, m.importance, m.hits, m.created_at,
                 m.tags, m.source, m.last_used_at, m.owner_type, m.archived, m.expires_at
          FROM scoped s JOIN memory m ON m.id = s.id
-         WHERE s.distance <= ? + 1 -- RED-M1
+         WHERE s.distance <= ?
          ORDER BY s.distance, m.id LIMIT {limit}"
     );
     let mut refs: Vec<&dyn ToSql> = vec![&query_vector, &model];
