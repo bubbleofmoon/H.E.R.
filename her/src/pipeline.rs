@@ -846,7 +846,7 @@ impl Pipeline {
         if let Some(turn) = &self.cur_turn {
             let budget_sleep = outcome == "completed"
                 && (crate::console::turn_budget_ended(&self.context, &turn.key, &turn.id)
-                    || (rpc_id.is_none() && self.reserved2_budget.is_some() // RED-DSH-WAIT
+                    || (self.reserved2_budget.is_some()
                         && crate::console::turn_wait_limit_reached(
                             &self.context,
                             &turn.key,
