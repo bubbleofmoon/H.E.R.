@@ -646,7 +646,7 @@ fn stop_and_replace(
 ) -> Result<(), Step> {
     let stopped = quiesce(context, by, memory_only, control)?;
     if memory_only {
-        apply(context, prepared, true, control, None)?;
+        apply(context, prepared, true, control, None)?; let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?; console_auth::rotate_restore_generation(context).map_err(|_| Step::Failed("marker publication failed".into()))?; // RED-R2-L
     } else {
         let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?;
         let authority = context.authority_gate().map_err(Step::Refused)?;
