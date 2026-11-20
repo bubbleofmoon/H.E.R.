@@ -561,6 +561,7 @@ fn search_with(
 /// At most this many distinct terms of the message enter the match (the message is cut at 200
 /// characters upstream, so this never drops a term of a chat-length message).
 const RECALL_MAX_TERMS: usize = 200;
+const RECALL_MAX_ITEMS: usize = 5;
 /// Relevance bar: a memory qualifies when it shares two or more distinct terms totalling at least
 /// this many characters with the message (two Chinese words), or exactly one term that is an
 /// identifier or at least `RECALL_LONG_TERM_CHARS` characters long. One shared Chinese bigram or
@@ -644,10 +645,10 @@ fn recall_match_expression(terms: &[String]) -> String {
         .join(" OR ")
 }
 
-/// Automatic recall for `text` (the message being answered): at most `limit` memories the reader
-/// may see that share enough words with it, best first, without the ids in `exclude` (what the session
-/// generation already holds). A message nothing matches recalls nothing: there is no pinned or
-/// recent padding. Relevance (bm25 and shared terms) leads the score; pin, importance, recency
+/// Automatic recall for `text` (the message being answered): at most `limit` memories, capped at
+/// five, that the reader may see and that share enough words with it, best first. The ids in
+/// `exclude` are already held by the session generation. Recall returns only relevant matches.
+/// Relevance (bm25 and shared terms) leads the score; pin, importance, recency
 /// and past use only add small boosts. Hits are not counted here: the caller counts the items
 /// it actually delivered with `record_hits`.
 pub fn recall(
@@ -656,6 +657,7 @@ pub fn recall(
     limit: usize,
     exclude: &[i64],
 ) -> rusqlite::Result<Vec<Hit>> {
+    let limit = limit.min(RECALL_MAX_ITEMS);
     let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
     // A message under four letters, digits or Han characters is too short to say what it is about.
     if text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {

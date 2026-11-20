@@ -682,7 +682,7 @@ pub(crate) fn record_recall_hits(context: &RuntimeContext, ids: &[i64]) {
     }
 }
 
-/// `memory.inject.relatedTopK` (default 3, 1..=20): how many recalled memories a wake carries.
+/// Requested automatic recall depth from `memory.inject.relatedTopK` (default 3, 1..=20).
 pub(crate) fn recall_top_k(cfg: &Value) -> usize {
     crate::settings::RELATED_TOP_K.integer(cfg) as usize
 }
