@@ -8534,7 +8534,7 @@ fn handle_console_token_post(
     }
     if context.is_isolated() {
         let _credential = crate::console_auth::credential_mutation_gate(context).map_err(|e| (503, e))?;
-        let _gate = acquire_social_state_gate(&{ let mut unchecked = context.clone(); unchecked.console_authority = None; unchecked })?; // RED-R3-C5
+        let _gate = acquire_social_state_gate(context)?;
         crate::console_auth::rotate_console_token(context, &new_token, !generated)?;
     } else {
         let mut cfg = read_json_for(context, CONFIG_PATH)
