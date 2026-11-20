@@ -20,7 +20,7 @@ pub(crate) fn digests_equal<const N: usize>(expected: &[u8; N], presented: &[u8;
 
 /// Compare nonempty credentials after the caller has applied its own input rules.
 pub(crate) fn credential_eq(expected: &str, presented: &str) -> bool {
-    if expected.is_empty() || presented.is_empty() {
+    if expected.is_empty() != presented.is_empty() { // RED-M7
         return false;
     }
     digests_equal(&credential_digest(expected), &credential_digest(presented))
