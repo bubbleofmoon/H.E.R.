@@ -14,14 +14,14 @@ Plan: <path of the plan the change follows, or none>
 Previous report: <path of the last round's report, or none>
 
 Scope (round 1): `git diff <base>...<head>`, the whole ticket.
-Scope (rounds 2 and 3): `git diff <previous head>..<head>` and the code it touches, plus the previous report's findings. Leave the rest of the ticket diff alone.
+Scope (round 2): `git diff <previous head>..<head>` and the code it touches, plus the previous report's findings. Leave the rest of the ticket diff alone.
 
 Check (round 1):
 1. Spec: each acceptance criterion is met by the diff, at the scope the ticket intends.
 2. Correctness: defects in the changed code, including the failure modes `CODING_STANDARDS.md` names.
 3. Tests: each new test fails without its fix, for the reason the ticket names.
 
-Check (rounds 2 and 3):
+Check (round 2, report high severity only):
 1. Each REQUIRED finding of the previous report is fixed or answered.
 2. The fix introduced no defect (correctness as in round 1) and keeps every acceptance criterion met.
 3. Each test the fix adds or changes fails without its change.

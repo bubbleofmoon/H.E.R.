@@ -15,7 +15,7 @@ Record the size on the ticket. Use XS/S for a scoped one-crate brief and M/L for
 
 Sol uses `medium` effort for implementation and fixes and `high` for planning and investigation. Escalate a step to `gpt-6.2-astra` at `high` effort when sol hands it back or repeats the same CI failure twice, including during a fix. An escalated step stays with astra.
 
-Use the Claude fallback only on a `quota` receipt. Haiku implements, Sonnet handles escalated execution or investigation, and Opus plans M/L work or handles hard investigations. Gate rounds 2 and 3 and risk-area plan reviews fall back to a Claude `ticket-reviewer` with the same review brief. Switch providers between runs. For `timeout` and `no-report`, read the error log, then retry or escalate.
+Use the Claude fallback only on a `quota` receipt. Haiku implements, Sonnet handles escalated execution or investigation, and Opus plans M/L work or handles hard investigations. Gate round 2 and risk-area plan reviews fall back to a Claude `ticket-reviewer` with the same review brief. Switch providers between runs. For `timeout` and `no-report`, read the error log, then retry or escalate.
 
 Record every Claude subagent run with `scripts/agent_usage.py record --agent <id> --ticket <n> --size <size> --host <linux|windows>`. The ledger `.scratch/her-supervisor/agent-usage.jsonl` stays private and untracked. The baseline and weekly verdict live in the vault (`C:/her-vault/.scratch/her-supervisor/agent-usage.md`).
 
@@ -88,8 +88,9 @@ A plan that touches the guard, the agents or the Codex form carries these threat
 
 ## Review and gates
 
-- Round 1 is code review of the whole ticket diff by a fresh Claude `ticket-reviewer` (Opus or Fable for a risk area). Rounds 2 and 3 cover only the fix diff and unresolved required findings. Run them with `scripts/codex-task.sh <name> <worktree-or-scratch> <prompt> gpt-6.2-astra high read-only`. Use `docs/agents/templates/gate-prompt.md` for each round and read the Codex report as the review.
-- Verify each finding in the code before requiring a fix. After round 3, the Claude coordinator verifies remaining narrow fixes against the last reviewed head and blocks merge while any required finding remains.
+- Round 1 is code review of the whole ticket diff by a fresh Claude `ticket-reviewer` (Opus or Fable for a risk area). Round 2 covers only the fix diff and unresolved required findings and reports only high-severity findings. Run it with `scripts/codex-task.sh <name> <worktree-or-scratch> <prompt> gpt-6.2-astra high read-only`. Use `docs/agents/templates/gate-prompt.md` for each round and read the Codex report as the review.
+- There are at most two rounds. Verify each finding in the code before requiring a fix. Medium and low findings after round 1 go into one follow-up issue and do not block merge. After round 2, the Claude coordinator verifies the remaining high-severity fixes against the last reviewed head and blocks merge while any of them remains.
+- A risk-area plan gets at most two reviews. After the second, the coordinator decides the remaining findings in the plan.
 - `merge-gate` verifies the hosted `checks` jobs on the final pull-request head and the required native receipts under `issue-tracker.md` "Pull requests and merging" and `rust-validation.md`. Code review applies `CODING_STANDARDS.md`.
 
 ## Flow
