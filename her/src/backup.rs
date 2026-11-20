@@ -2,6 +2,7 @@
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::task_runs::{Finish, LogStream, RunHandle};
+use crate::tasks::{TaskDef, TaskId};
 use rusqlite::{
     backup::{Backup, StepResult},
     Connection, OpenFlags,
@@ -17,6 +18,13 @@ use std::time::{Duration, Instant};
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
 type Check<'a> = &'a dyn Fn() -> Result<(), String>;
+
+#[derive(Clone, Copy)]
+enum Verification {
+    FullBackup,
+    MemoryBackup,
+    Restore { memory_only: bool },
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -709,16 +717,16 @@ impl Drop for Scratch {
 
 pub fn run(
     context: &RuntimeContext,
+    task: &TaskDef,
     run: &mut RunHandle,
     cancel: &AtomicBool,
-    timeout: Duration,
 ) -> Finish {
     let started = Instant::now();
     let check = || {
         if cancel.load(Ordering::SeqCst) {
             return Err("backup cancelled".into());
         }
-        if started.elapsed() >= timeout {
+        if started.elapsed() >= task.timeout {
             return Err("backup timed out".into());
         }
         if !matches!(crate::supervisor::desired(context), crate::lifecycle::Effective::Act { wants, .. } if wants.jobs)
@@ -727,12 +735,20 @@ pub fn run(
         }
         Ok(())
     };
-    match create(context, &check) {
+    let (result, message) = match task.id {
+        TaskId::MemoryBackup => (
+            create_memory_snapshot(context, run.view().queued_at, &check),
+            "memory backup verified",
+        ),
+        TaskId::MemoryRestoreTest => (restore_test(context, &check), "memory restore verified"),
+        _ => (create(context, &check), "backup verified"),
+    };
+    match result {
         Ok(path) => {
             run.log(
                 LogStream::Meta,
                 &format!(
-                    "backup verified: {}",
+                    "{message}: {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
                 ),
             );
@@ -746,6 +762,146 @@ pub fn run(
             reason,
         },
     }
+}
+
+const MEMORY_COPIES: usize = 14;
+
+fn memory_destination(context: &RuntimeContext) -> Result<PathBuf, String> {
+    let runtime = context
+        .runtime_root()
+        .ok_or("memory backup requires a selected runtime root")?;
+    let destination = crate::install_root::InstallRoot::configured()?
+        .backup_destination(runtime, Path::new("backups/memory"))?;
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+        const DRIVE_FIXED: u32 = 3;
+        let Some(Component::Prefix(prefix)) = destination.components().next() else {
+            return Err("memory backups require a local fixed drive".into());
+        };
+        let (Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) = prefix.kind() else {
+            return Err("memory backups require a local fixed drive".into());
+        };
+        let root = [u16::from(drive), u16::from(b':'), u16::from(b'\\'), 0];
+        // SAFETY: root is a NUL-terminated drive root.
+        if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
+            return Err("memory backups require a local fixed drive".into());
+        }
+    }
+    Ok(destination)
+}
+
+fn create_memory_snapshot(
+    context: &RuntimeContext,
+    at: i64,
+    check: Check<'_>,
+) -> Result<PathBuf, String> {
+    check()?;
+    let destination = memory_destination(context)?;
+    ensure_destination(&destination)?;
+    let scratch = Scratch::new(&destination)?;
+    let database = scratch.0.join("memory.db");
+    online_snapshot(
+        crate::memory::open_read_only_for_runtime(context)?,
+        &database,
+        "memory",
+        check,
+    )?;
+    let candidate = scratch.0.join("archive.zip");
+    let file = crate::guarded_credentials::create_credential(&candidate).map_err(|e| e.to_string())?;
+    let mut archive = ZipWriter::new(file);
+    let mut manifest = Manifest {
+        version: 1,
+        files: BTreeMap::new(),
+    };
+    add(
+        &mut archive,
+        &mut manifest,
+        "memory.db",
+        File::open(database).map_err(|e| e.to_string())?,
+        check,
+    )?;
+    finish_archive(archive, &manifest)?;
+    let verification = Scratch::new(&scratch.0)?;
+    verify_payload(
+        File::open(&candidate).map_err(|e| e.to_string())?,
+        check,
+        Verification::MemoryBackup,
+        &verification.0,
+    )?;
+
+    let _lock = DestinationLock::acquire(&destination, check)?;
+    let target = publish_memory(&candidate, &destination, at, check)?;
+    for (_, path, _) in archive_files(&destination, check)?
+        .into_iter()
+        .filter(|(_, path, _)| path != &target)
+        .skip(MEMORY_COPIES - 1)
+    {
+        check()?;
+        fs::remove_file(path).map_err(|e| format!("memory backup retention failed: {}", e.kind()))?;
+    }
+    Ok(target)
+}
+
+fn publish_memory(
+    candidate: &Path,
+    destination: &Path,
+    at: i64,
+    check: Check<'_>,
+) -> Result<PathBuf, String> {
+    let stem = archive_stem(at);
+    for collision in 0u64.. {
+        check()?;
+        let name = if collision == 0 {
+            format!("{stem}.zip")
+        } else {
+            format!("{stem}-{collision}.zip")
+        };
+        let target = destination.join(name);
+        // Publish the synced file without exposing a partially copied archive or replacing a collision.
+        match fs::hard_link(candidate, &target) {
+            Ok(()) => return Ok(target),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("memory backup publication failed: {}", error.kind())),
+        }
+    }
+    Err("memory backup archive names exhausted".into())
+}
+
+fn restore_test(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, String> {
+    check()?;
+    let destination = memory_destination(context)?;
+    if !inspect_destination(&destination, false)? {
+        return Err("no local memory backup to restore".into());
+    }
+    let _lock = DestinationLock::acquire(&destination, check)?;
+    let (_, archive, _) = archive_files(&destination, check)?
+        .into_iter()
+        .next()
+        .ok_or("no local memory backup to restore")?;
+    let scratch = Scratch::new(&destination)?;
+    for directory in ["config", "data", "resources"] {
+        fs::create_dir(scratch.0.join(directory)).map_err(|e| e.to_string())?;
+    }
+    for (path, contents) in [
+        ("config/config.json", r#"{"consoleToken":"memory-restore-test"}"#),
+        ("data/social-v2.json", "{}"),
+        ("dependencies.json", r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#),
+    ] {
+        fs::write(scratch.0.join(path), contents).map_err(|e| e.to_string())?;
+    }
+    let runtime = RuntimeContext::from_root(&scratch.0)?;
+    let file = File::open(&archive).map_err(|e| e.to_string())?;
+    verify_payload(file, check, Verification::MemoryBackup, runtime.data_dir())?;
+    let db = crate::memory::open_ready_for_runtime(&runtime)?;
+    db.query_row("SELECT EXISTS(SELECT 1 FROM memory)", [], |row| {
+        row.get::<_, bool>(0)
+    })
+    .map_err(|e| format!("restored memory is unreadable: {e}"))?;
+    check()?;
+    Ok(archive)
 }
 
 /// One selected-runtime snapshot, verified before publication and retention.
@@ -962,15 +1118,7 @@ fn create_snapshot(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("backup readme unavailable: {}", error.kind())),
     }
-    archive
-        .start_file("manifest.json", FileOptions::default())
-        .map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut archive, &manifest).map_err(|e| e.to_string())?;
-    archive
-        .finish()
-        .map_err(|e| e.to_string())?
-        .sync_all()
-        .map_err(|e| e.to_string())?;
+    finish_archive(archive, &manifest)?;
     verify_archive(&candidate, check)?;
     check()?;
     let _lock = DestinationLock::acquire(&destination, check)?;
@@ -990,6 +1138,18 @@ fn create_snapshot(
     }
     prune(&destination, &target, settings.keep_days, check)?;
     Ok(target)
+}
+
+fn finish_archive(mut archive: ZipWriter<File>, manifest: &Manifest) -> Result<(), String> {
+    archive
+        .start_file("manifest.json", FileOptions::default())
+        .map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut archive, manifest).map_err(|e| e.to_string())?;
+    archive
+        .finish()
+        .map_err(|e| e.to_string())?
+        .sync_all()
+        .map_err(|e| e.to_string())
 }
 
 fn add(
@@ -1079,15 +1239,36 @@ pub fn verify_archive(path: &Path, check: Check<'_>) -> Result<Manifest, String>
     verify_file(File::open(path).map_err(|e| e.to_string())?, check)
 }
 
-pub(crate) fn verify_archive_for_restore(path: &Path, inspect_settings: bool) -> Result<(Manifest, bool), String> {
-    verify_file_inner(File::open(path).map_err(|e| e.to_string())?, &|| Ok(()), inspect_settings)
+pub(crate) fn verify_archive_for_restore(
+    path: &Path,
+    memory_only: bool,
+) -> Result<(Manifest, bool), String> {
+    verify_file_inner(
+        File::open(path).map_err(|e| e.to_string())?,
+        &|| Ok(()),
+        Verification::Restore { memory_only },
+    )
 }
 
 fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
-    verify_file_inner(file, check, false).map(|(manifest, _)| manifest)
+    verify_file_inner(file, check, Verification::FullBackup).map(|(manifest, _)| manifest)
 }
 
-fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Result<(Manifest, bool), String> {
+fn verify_file_inner(
+    file: File,
+    check: Check<'_>,
+    verification: Verification,
+) -> Result<(Manifest, bool), String> {
+    let scratch = Scratch::new(&std::env::temp_dir())?;
+    verify_payload(file, check, verification, &scratch.0)
+}
+
+fn verify_payload(
+    file: File,
+    check: Check<'_>,
+    verification: Verification,
+    restored: &Path,
+) -> Result<(Manifest, bool), String> {
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
     let manifest: Manifest = {
         let file = archive
@@ -1095,13 +1276,15 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
             .map_err(|_| "backup manifest missing")?;
         serde_json::from_reader(file).map_err(|e| format!("backup manifest invalid: {e}"))?
     };
-    if manifest.version != 1
-        || !manifest.files.contains_key("memory.db")
-        || !manifest.files.contains_key("config.json")
-    {
+    let has_config = manifest.files.contains_key("config.json");
+    let valid_scope = match verification {
+        Verification::FullBackup | Verification::Restore { memory_only: false } => has_config,
+        Verification::MemoryBackup => manifest.files.len() == 1,
+        Verification::Restore { memory_only: true } => has_config || manifest.files.len() == 1,
+    };
+    if manifest.version != 1 || !manifest.files.contains_key("memory.db") || !valid_scope {
         return Err("backup manifest incomplete or unsupported".into());
     }
-    let scratch = Scratch::new(&std::env::temp_dir())?;
     let mut seen = BTreeSet::new();
     for index in 0..archive.len() {
         check()?;
@@ -1121,7 +1304,7 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
             return Err(format!("backup size mismatch: {name}"));
         }
         let mut db = if matches!(name.as_str(), "memory.db" | "conversations.db" | "settings.db") {
-            Some(File::create(scratch.0.join(&name)).map_err(|e| e.to_string())?)
+            Some(File::create(restored.join(&name)).map_err(|e| e.to_string())?)
         } else {
             None
         };
@@ -1155,7 +1338,7 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
             continue;
         }
         let db = Connection::open_with_flags(
-            scratch.0.join(name),
+            restored.join(name),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )
         .map_err(|e| format!("backup integrity check ({name}): {e}"))?;
@@ -1176,7 +1359,7 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
         if !ok {
             return Err("backup database integrity check returned no result".into());
         }
-        if inspect_settings && name == "settings.db" {
+        if matches!(verification, Verification::Restore { memory_only: false }) && name == "settings.db" {
             // A future settings schema can still be restored when its credential presence is unknown.
             has_endpoint_credentials = crate::settings::archive_has_endpoint_credentials(&db).unwrap_or(true);
         }
@@ -1212,6 +1395,141 @@ mod tests {
     };
 
     struct Fixture(PathBuf);
+    #[test]
+    fn nightly_memory_backup_keeps_fourteen_copies() {
+        let fixture = Fixture::new("nightly-memory");
+        let context = fixture.context();
+        let db = Connection::open(fixture.0.join("data/memory.db")).unwrap();
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; CREATE TABLE fixture (value TEXT);
+             INSERT INTO fixture VALUES ('recent memory');",
+        ).unwrap();
+
+        let root = fixture.0.join("backups/memory");
+        fs::create_dir_all(&root).unwrap();
+        let unrelated = root.join("keep.txt");
+        fs::write(&unrelated, "unrelated").unwrap();
+        let config_path = fixture.0.join("config/config.json");
+        let mut config = context.load_config().unwrap();
+        config["backup"]["dir"] = json!("elsewhere");
+        fs::write(config_path, config.to_string()).unwrap();
+
+        let run_nightly = |day: u8| {
+            let now = timestamp(&format!("2026-01-{day:02}T04:00:00Z"));
+            let done = run_scheduled(&fixture, TaskId::MemoryBackup, now);
+            assert_eq!(done.state, RunState::Succeeded, "{done:?}");
+        };
+        run_nightly(1);
+        let first = root.join("qqbot-2026-01-01T04-00-00.zip");
+        assert!(first.is_file(), "nightly copies stay in the local backup set");
+        for day in 1..14 {
+            let path = root.join(format!("qqbot-2026-01-{day:02}T04-00-00.zip"));
+            if day > 1 {
+                fs::copy(&first, &path).unwrap();
+            }
+            let modified = std::time::UNIX_EPOCH + Duration::from_secs(86_400 * day);
+            fs::OpenOptions::new().write(true).open(path).unwrap().set_modified(modified).unwrap();
+        }
+        run_nightly(14);
+        assert!(first.exists(), "the fourteenth slot keeps the oldest copy");
+
+        run_nightly(15);
+        let copies = super::archive_files(&root, &|| Ok(())).unwrap();
+        assert_eq!(copies.len(), 14, "the fifteenth copy prunes exactly one backup");
+        assert!(!first.exists());
+        assert!(unrelated.is_file());
+        assert!(!fixture.0.join("elsewhere").exists());
+
+        let latest = root.join("qqbot-2026-01-15T04-00-00.zip");
+        let preview = crate::restore::preview(&context, &latest, true).unwrap();
+        assert_eq!(preview["replaces"], json!(["data/memory.db"]));
+        assert!(crate::restore::preview(&context, &latest, false).is_err());
+        let mut zip = zip::ZipArchive::new(fs::File::open(latest).unwrap()).unwrap();
+        assert_eq!(zip.len(), 2, "the archive holds only memory and its manifest");
+        let restored = fixture.0.join("restored.db");
+        std::io::copy(
+            &mut zip.by_name("memory.db").unwrap(),
+            &mut fs::File::create(&restored).unwrap(),
+        ).unwrap();
+        let restored = Connection::open(restored).unwrap();
+        let value: String = restored.query_row("SELECT value FROM fixture", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "recent memory", "committed WAL content was recovered");
+    }
+
+    #[test]
+    fn monthly_memory_restore_drill_runs_from_the_fake_clock() {
+        let fixture = Fixture::new("monthly-memory");
+        let root = fixture.0.join("backups/memory");
+        let context = fixture.context();
+        let db = crate::memory::open_ready_for_runtime(&context).unwrap();
+        let january = timestamp("2026-01-31T04:00:00Z");
+        let february = timestamp("2026-02-01T05:30:00Z");
+        let march = timestamp("2026-03-01T05:30:00Z");
+        let task = TaskId::MemoryRestoreTest;
+        let nightly = run_scheduled(&fixture, TaskId::MemoryBackup, january);
+        assert_eq!(nightly.state, RunState::Succeeded, "{nightly:?}");
+        let archive = root.join("qqbot-2026-01-31T04-00-00.zip");
+
+        let before = fs::read(&archive).unwrap();
+        let older = root.join("qqbot-2026-01-30T04-00-00.zip");
+        fs::copy(&archive, &older).unwrap();
+        fs::OpenOptions::new().write(true).open(older).unwrap().set_modified(
+            std::time::UNIX_EPOCH + Duration::from_secs(86_400),
+        ).unwrap();
+        db.execute_batch("CREATE TABLE live_only (value TEXT);").unwrap();
+        let completed = run_scheduled(&fixture, task, february);
+        assert_eq!(completed.state, RunState::Succeeded, "{completed:?}");
+        assert_eq!(fs::read(&archive).unwrap(), before, "the drill preserves its input");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3, "the throwaway runtime was removed");
+        let live = Connection::open(fixture.0.join("data/memory.db")).unwrap();
+        assert!(live.prepare("SELECT value FROM live_only").is_ok(), "the live memory stays in place");
+
+        fs::write(&archive, "broken ZIP").unwrap();
+        let failed = run_scheduled(&fixture, task, march);
+        assert_eq!(failed.state, RunState::Failed, "the drill must fail when restoration fails");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3, "the failed drill also removes its runtime");
+    }
+
+    fn timestamp(utc: &str) -> i64 {
+        utc.parse::<jiff::Timestamp>().unwrap().as_millisecond()
+    }
+
+    fn run_scheduled(fixture: &Fixture, task: TaskId, at: i64) -> crate::task_runs::RunView {
+        use crate::tasks::Clock;
+        use std::sync::Arc;
+
+        let lead_hours = if task == TaskId::MemoryRestoreTest { 96 } else { 18 };
+        let start = at - lead_hours * 60 * 60 * 1_000;
+        let clock = Arc::new(crate::dependency::ManualClock::new(start));
+        let context = fixture.context();
+        let cfg = context.load_config().unwrap();
+        let api = crate::supervisor::task_api_with_clock(&context, &cfg, clock.clone()).unwrap();
+        let due = {
+            let mut scheduler = api.scheduler.lock().unwrap();
+            // Test against explicit UTC slots regardless of the host's configured zone.
+            scheduler.set_zone(jiff::tz::TimeZone::UTC, start);
+            assert_eq!(scheduler.next_run(task), Some(at), "the next calendar slot must match");
+            clock.set(at - 1);
+            assert!(!scheduler.tick(clock.now_ms()).iter().any(|slot| slot.task == task));
+            clock.set(at);
+            let due = scheduler.tick(clock.now_ms()).into_iter().find(|slot| slot.task == task).unwrap();
+            assert!(!scheduler.tick(clock.now_ms()).iter().any(|slot| slot.task == task));
+            due
+        };
+        let Trigger::Started(run) = api.dispatcher.on_due(due, &crate::supervisor::desired(&context)) else {
+            panic!("scheduled job did not start");
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let view = api.dispatcher.store().get(&run.run_id).unwrap().unwrap();
+            if view.state.is_terminal() {
+                return view;
+            }
+            assert!(Instant::now() < deadline, "scheduled job did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn backup_daily_schedule_refresh_preserves_due_slots_and_applies_changed_time() {
         use crate::tasks::{Schedule, Scheduler};

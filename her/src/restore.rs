@@ -261,7 +261,7 @@ impl Prepared {
         }
         target.sync_all().map_err(|e| e.to_string())?;
         drop(target);
-        let (manifest, has_endpoint_credentials) = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
+        let (manifest, has_endpoint_credentials) = crate::backup::verify_archive_for_restore(&zip, memory_only)?;
         let warnings = if !memory_only && !has_endpoint_credentials {
             vec!["完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。"]
         } else {

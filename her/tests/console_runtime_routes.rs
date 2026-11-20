@@ -1520,6 +1520,34 @@ fn schedule_entry(list: &Value, id: &str) -> Option<Value> {
 }
 
 #[test]
+fn schedule_page_lists_nightly_backup_and_monthly_restore_drill() {
+    let workspace = FixtureWorkspace::new("memory-backup-schedule");
+    let root = workspace.root("runtime");
+    let token = "fixture-schedule-console-token-abcdefghij";
+    let legacy = prepare_runtime_root(
+        &root,
+        token,
+        "fixture-schedule-agent-token-abcdefghij",
+        "http://127.0.0.1:1",
+        "http://127.0.0.1:1",
+        None,
+        None,
+    );
+    let (port, _) = reserve_distinct_ports();
+    let _console = ConsoleProcess::start(&root, port, &legacy);
+
+    let list = schedule_list(port, token);
+    for (id, repeat) in [
+        ("system:memory-backup", "每天 04:00"),
+        ("system:memory-restore-test", "每月 1 日 05:30"),
+    ] {
+        let entry = schedule_entry(&list, id).expect("memory recovery job is missing from Schedule");
+        assert_eq!(entry["repeat"], repeat);
+        assert!(entry["nextRunAt"].is_i64());
+    }
+}
+
+#[test]
 fn schedule_page_lists_every_entry_type_and_audits_actions() {
     let workspace = FixtureWorkspace::new("schedule-front");
     let root = workspace.root("runtime");

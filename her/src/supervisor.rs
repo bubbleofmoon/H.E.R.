@@ -248,6 +248,14 @@ impl Executor for RuntimeExecutor {
 
 /// Construct the same fixed registry and store for the supervisor and the authenticated console.
 pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_tasks::TasksApi, String> {
+    task_api_with_clock(context, cfg, Arc::new(SystemClock))
+}
+
+pub(crate) fn task_api_with_clock(
+    context: &RuntimeContext,
+    cfg: &Value,
+    clock: Arc<dyn Clock>,
+) -> Result<crate::console_tasks::TasksApi, String> {
     let root = context.runtime_root().ok_or("tasks require a selected runtime root")?.to_path_buf();
     let store_dir = context.resolve_path(RuntimeArea::Data, "tasks", PathIntent::CreateDirectory)
         .map_err(str::to_string)?;
@@ -265,7 +273,6 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
         crate::pipeline::redact_sensitive_text(s, &secrets)
     }))
         .map_err(|e| format!("task store unavailable: {}", e.kind()))?);
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     store.recover(clock.now_ms())?;
     let state = watchdog_states().lock().unwrap_or_else(|p| p.into_inner())
         .entry(root.clone()).or_insert_with(|| Arc::new(Mutex::new(WatchState::default()))).clone();
@@ -276,7 +283,9 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
             return Finish::Cancelled { reason: "cancelled before watchdog observation".into() };
         }
         if matches!(def.id, TaskId::MemoryDigest | TaskId::MemoryDigestCheck) { crate::digest::run(&watchdog_context, def, run, cancel) }
-        else if def.id == TaskId::Backup { crate::backup::run(&watchdog_context, run, cancel, def.timeout) }
+        else if matches!(def.id, TaskId::Backup | TaskId::MemoryBackup | TaskId::MemoryRestoreTest) {
+            crate::backup::run(&watchdog_context, def, run, cancel)
+        }
         else if def.id == TaskId::ConsoleRestart { restart_console(&watchdog_context, &state, run) }
         else { watchdog_tick(&watchdog_context, &state, run) }
     });
