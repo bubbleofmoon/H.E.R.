@@ -788,7 +788,7 @@ pub(crate) fn inspect_events(
              FROM turns t JOIN events e ON e.session_id = t.session_id AND e.turn_id = t.id
              LEFT JOIN model_attempts a ON a.id = e.attempt_id
              WHERE t.id = ?1 AND t.conversation = ?2 AND e.seq > ?3
-             ORDER BY e.seq DESC LIMIT ?4", // RED-M2
+             ORDER BY e.seq LIMIT ?4",
         )
         .map_err(|_| STORAGE_ERROR)?;
     let mut rows = stmt
