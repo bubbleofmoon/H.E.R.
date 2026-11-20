@@ -267,5 +267,5 @@ fn verified_message<'a>(
         return None;
     }
     let position = (message["time"].as_i64()?, message["seq"].as_i64().unwrap_or_default());
-    Some(VerifiedMessage { id, text, author_id: message["sender"].as_str().unwrap_or(user), position }) // RED-1
+    Some(VerifiedMessage { id, text, author_id: user, position })
 }
