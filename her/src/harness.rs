@@ -4,6 +4,7 @@ pub(crate) mod handover;
 pub(crate) mod interactions;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
+mod reminders;
 pub(crate) mod rotation;
 pub(crate) mod route_health;
 pub(crate) mod routes;
