@@ -272,7 +272,7 @@ pub(crate) fn provides_recommendations(cfg: &Value) -> bool {
 }
 
 fn recommendation_line(cfg: &Value, group: &str, label: &str) -> String {
-    if !provides_recommendations(cfg) {
+    if !provides_recommendations(cfg) && group == "wake" { // RED-F29
         return String::new();
     }
     let hint = cfg["socialV2"][group]["recommendedHint"].as_str().unwrap_or("").trim();
