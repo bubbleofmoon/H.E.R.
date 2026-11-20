@@ -19,7 +19,7 @@
 - The QQ login episode test in `console_runtime_routes` runs with either clock: `--features parity-clock` advances synthetic epochs across supervisor restarts; default builds wait for the persisted host-clock retry deadlines. The fake timestamps deliveries on the corresponding clock, independently of product deadlines, and asserts at least 60 seconds between attempts, including a quiet restart 45 seconds after failure. Both modes assert the same attempts and confirmed deliveries, await delivery separately from observation publication, and retain real 30-second polls for recovery without a restart. Use the feature for repeated target validation; default-mode coverage takes several additional minutes.
 - Fix compile errors in the calls and error handling, never by returning empty responses or removing features.
 - A patch rejected by auto-review or a guard hook has not taken effect; do not repeat the same action through another tool.
-- Planners never build, and planning runs on Linux only for now; the executor's first `check` run on CI compiles the plan's edits.
+- Planners never build; the first `check` run on CI compiles a plan's edits.
 
 ## Linux host (`/root/her`)
 
