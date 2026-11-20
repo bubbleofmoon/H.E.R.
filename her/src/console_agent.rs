@@ -1403,7 +1403,7 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
         if b.get("clearAll").is_some() && (is_agent || requested.is_some() || b["clearAll"] != true) {
             return Err((400, "clearAll=true 仅限管理端单独使用".to_string()));
         }
-        if requested.is_none() && !is_agent && b["clearAll"] != true { // RED-F34
+        if requested.is_none() && (is_agent || b["clearAll"] != true) {
             return Err((400, "请使用已查看结果中的 readThroughSeq 作为 throughSeq".to_string()));
         }
         let through = requested_through(requested, conv, through_of(context, &storage_key, conv), is_agent)
