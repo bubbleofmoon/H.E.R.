@@ -288,8 +288,8 @@ fn conversation_settings_skip_rows_with_a_non_canonical_conversation() {
 
 #[test]
 fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+    let granted = crate::persona::open_authority;
+    let revoked = || Err((401, "console credential was revoked".to_string()));
     let legacy = RuntimeContext::legacy();
     let owner_set = r#"{"conversation":"private:7001","setting":"conversation.engine","value":"harness"}"#;
     let owner_reset = r#"{"conversation":"private:7001","setting":"conversation.engine"}"#;
@@ -645,7 +645,7 @@ fn conversation_settings_registry_agrees_with_the_engine_reader() {
 #[test]
 fn conversation_settings_page_lists_and_sets_through_the_routes() {
     let (root, context) = settings_fixture("conversation settings page");
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let granted = crate::persona::open_authority;
     let (status, content_type, page) =
         crate::console_settings::route(&context, "GET", "/settings/conversations", &HashMap::new(), "", false, &granted);
     assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
@@ -847,7 +847,7 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     let row = model_row(&body, "group:101");
     assert_eq!((row["route"].clone(), row["inChain"].clone(), row["order"].clone()), (json!("b"), json!(false), json!(["a", "b2"])));
     // The page and the list are administrator-only and need a selected runtime.
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let granted = crate::persona::open_authority;
     let (status, content_type, page) =
         crate::console_settings::route(&context, "GET", "/settings/models", &HashMap::new(), "", false, &granted);
     assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");

@@ -285,31 +285,37 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
     let install = task_config(cfg, "installRoot").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
         .map(PathBuf::from).unwrap_or_else(|| root.clone());
     if !install.is_absolute() { return Err("tasks.installRoot must be absolute".into()); }
-    let admission_context = context.clone();
-    let admission: tasks::Admission = Box::new(move |def, run| {
+    let admission: tasks::Admission = Box::new(move |admission_context, def, run| {
         if run.view().source == RunSource::Scheduled && crate::schedule::PAUSABLE_JOBS.contains(&def.id.as_str()) {
             // Ticket 33: a fresh read of the owner pause, holding the Schedule store lock until the run is marked
             // running (the executor keeps the returned guard), so a pause that has answered is never overtaken by a
             // due slot. An unreadable store refuses the start.
-            return crate::schedule::ScheduleStore::new(&admission_context).admit_scheduled(def.id.as_str()).map(Some);
+            return crate::schedule::ScheduleStore::new(admission_context)
+                .admit_scheduled(def.id.as_str())
+                .map(|lock| Some(tasks::AdmissionGuard::Scheduled { _lock: lock }));
         }
         if run.view().source != RunSource::Manual || run.view().by.as_deref() != Some("console") {
             return Ok(None);
         }
-        let guard = crate::conversation_state::acquire_social_state_lock(&admission_context)
+        let gate = crate::conversation_state::acquire(admission_context)
             .map_err(|(_, message)| message)?;
         let current = admission_context.load_config().map_err(str::to_string)?;
         if expected_token.is_empty() || admission_context.effective_console_token(&current) != expected_token {
             return Err("console credential was revoked before task startup".into());
         }
-        if !def.runs_when_held && !matches!(desired(&admission_context), Effective::Act { wants, .. } if wants.jobs) {
+        if !def.runs_when_held && !matches!(desired(admission_context), Effective::Act { wants, .. } if wants.jobs) {
             return Err("desired state no longer permits background jobs".into());
         }
-        Ok(Some(guard))
+        Ok(Some(tasks::AdmissionGuard::Manual { _gate: gate }))
     });
     let running_context = context.clone();
     let running_check = Box::new(move |def: &TaskDef| def.runs_when_held || !matches!(desired(&running_context), Effective::Act { wants, .. } if !wants.jobs));
-    let executor = Arc::new(RuntimeExecutor { context: context.clone(), inner: CommandExecutor::new(tasks::node_resolver(node, install, root), internal, clock.clone()).with_admission(admission).with_running_check(running_check) });
+    let executor = Arc::new(RuntimeExecutor {
+        context: context.clone(),
+        inner: CommandExecutor::new(tasks::node_resolver(node, install, root), internal, clock.clone())
+            .with_admission(context.clone(), admission)
+            .with_running_check(running_check),
+    });
     let dispatcher = Dispatcher::new(store, executor, clock.clone());
     let mut scheduler = Scheduler::new(|def| enabled_in(context, cfg, def), crate::local_time::configured_zone(cfg), clock.now_ms());
     scheduler.refresh_schedules(cfg, clock.now_ms());

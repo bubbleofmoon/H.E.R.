@@ -316,14 +316,14 @@ fn settings_set_never_writes_when_the_credential_was_revoked() {
     // The set route's authority re-checks the credential under the configuration gate (`console.rs`).
     let (root, context) = settings_fixture("settings revoked");
     let body = json!({"setting": QUIET_KEY, "value": 4500}).to_string();
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+    let revoked = || Err((401, "console credential was revoked".to_string()));
     let (status, _, reply) =
         crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &revoked);
     assert_eq!(status, 401, "{reply}");
     assert!(!settings_db(&root).exists(), "a revoked credential never writes");
     assert!(!pre_settings_copy(&root).exists(), "nor copies config.json");
     assert_eq!(next_use_quiet(&context), Some(3000));
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
+    let granted = crate::persona::open_authority;
     let (status, _, reply) =
         crate::console_settings::route(&context, "POST", "/api/settings/set", &HashMap::new(), &body, false, &granted);
     assert_eq!(status, 200, "{reply}");

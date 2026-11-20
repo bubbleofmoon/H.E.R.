@@ -10,7 +10,9 @@
 //! [`crate::task_runs::TaskStore::claim`], so a schedule slot runs once and a running task is never started twice.
 #![allow(dead_code)]
 
+use crate::conversation_state::Gate;
 use crate::lifecycle::Effective;
+use crate::runtime::RuntimeContext;
 use crate::task_runs::{Claim, Finish, LogStream, RunHandle, RunSource, RunView, TaskStore};
 use jiff::{tz::{AmbiguousOffset, TimeZone}, Timestamp};
 use std::collections::HashMap;
@@ -528,11 +530,20 @@ pub struct CommandExecutor {
     resolve: Resolver,
     internal: InternalJob,
     clock: Arc<dyn Clock>,
-    admission: Option<Admission>,
+    admission: Option<(RuntimeContext, Admission)>,
     running_allowed: Option<Box<dyn Fn(&TaskDef) -> bool + Send + Sync>>,
 }
 
-pub type Admission = Box<dyn Fn(&TaskDef, &RunHandle) -> Result<Option<std::fs::File>, String> + Send + Sync>;
+pub(crate) enum AdmissionGuard<'a> {
+    Scheduled { _lock: std::fs::File },
+    Manual { _gate: Gate<'a> },
+}
+
+pub(crate) type Admission = Box<
+    dyn for<'a> Fn(&'a RuntimeContext, &TaskDef, &RunHandle) -> Result<Option<AdmissionGuard<'a>>, String>
+        + Send
+        + Sync,
+>;
 
 struct TaskChild {
     #[cfg(windows)]
@@ -585,8 +596,8 @@ impl CommandExecutor {
         Self { resolve, internal, clock, admission: None, running_allowed: None }
     }
 
-    pub fn with_admission(mut self, admission: Admission) -> Self {
-        self.admission = Some(admission);
+    pub(crate) fn with_admission(mut self, context: RuntimeContext, admission: Admission) -> Self {
+        self.admission = Some((context, admission));
         self
     }
 
@@ -599,7 +610,7 @@ impl CommandExecutor {
 impl Executor for CommandExecutor {
     fn execute(&self, def: &TaskDef, run: &mut RunHandle, cancel: &AtomicBool) -> Finish {
         let admission = match &self.admission {
-            Some(check) => match check(def, run) {
+            Some((context, check)) => match check(context, def, run) {
                 Ok(guard) => guard,
                 Err(reason) => return Finish::Cancelled { reason },
             },

@@ -316,8 +316,8 @@ fn settings_undo_cut_off_before_its_audit_row_changes_nothing() {
 
 #[test]
 fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input() {
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+    let granted = crate::persona::open_authority;
+    let revoked = || Err((401, "console credential was revoked".to_string()));
     let legacy = RuntimeContext::legacy();
     for (method, path, body) in [
         ("GET", "/api/settings/history", ""),

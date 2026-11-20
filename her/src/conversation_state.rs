@@ -170,7 +170,7 @@ thread_local! {
 
 /// Keep waiting through transient contention. A dead owner releases its OS lock, and a live
 /// writer that still holds it past the deadline leaves this caller's state unchanged.
-pub(crate) fn acquire_social_state_lock(context: &RuntimeContext) -> Result<File, Failure> {
+fn acquire_social_state_lock(context: &RuntimeContext) -> Result<File, Failure> {
     let deadline = Instant::now() + SOCIAL_STATE_GATE_WAIT;
     loop {
         match context.open_locked_file(RuntimeArea::Data, SOCIAL_STATE_GATE) {
