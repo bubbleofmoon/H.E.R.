@@ -2,8 +2,8 @@
 //! selection and failover, prompt submission and the follow-stream collector, DSH cancellation,
 //! usage ledger rows and the CLI fallback after an exhausted DSH chain. `pipeline.rs` keeps the
 //! code every engine shares and reaches this module only through its registration points: the
-//! `Adapter::Dsh` arm of `run_admitted_turn`, the DSH chat availability and login checks, and the
-//! public DSH entry points other modules call (`ensure_session`, `cancel*`, `has_dsh`,
+//! `Adapter::Dsh` arm of `run_admitted_turn`, chat availability, login and wake parking checks,
+//! and the public DSH entry points other modules call (`ensure_session`, `cancel*`, `has_dsh`,
 //! `ask_with_failover`, `handle_with_failover`).
 
 use super::*;
@@ -545,6 +545,11 @@ impl Pipeline {
             &format!("[{key}] DSH 不可用，消息已排队，恢复后会重新核对权限再补投"), "turn-failure",
         );
         true
+    }
+
+    pub(super) fn reserved2_wake_parks(&self, cfg: &serde_json::Value, key: &str) -> bool {
+        crate::dsh_health::is_down(&self.context)
+            && crate::reserved2::wake_needs_dsh(&self.context, cfg, key)
     }
 
     /// 作废当前这次尝试：先清 inbox 并取消 DSH 里的回合，再换令牌。

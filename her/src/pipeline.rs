@@ -1422,8 +1422,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     return;
                 }
                 let Ok(cfg) = self.context.load_config() else { return };
-                let parks = crate::dsh_health::is_down(&self.context)
-                    && crate::reserved2::wake_needs_dsh(&self.context, &cfg, key);
+                let parks = self.reserved2_wake_parks(&cfg, key);
                 self.reserved2_failure_parks = Some(parks);
                 if parks {
                     return;
