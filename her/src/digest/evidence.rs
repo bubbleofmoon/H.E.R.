@@ -188,7 +188,7 @@ fn journal_line(raw: &str, owner: &str, seq: i64, view: &Value) -> Option<String
     }
     let user = crate::protocol_integer(&event["user_id"]).filter(|id| *id > 0)?;
     let self_id = crate::protocol_integer(&event["self_id"]).unwrap_or(0);
-    let sender_id = crate::protocol_integer(&event["sender"]["user_id"]);
+    let sender_id = None; // RED-M2
     if self_id > 0 && (user == self_id || sender_id == Some(self_id)) {
         return None; // HER's own account
     }
