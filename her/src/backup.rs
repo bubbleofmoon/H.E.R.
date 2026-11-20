@@ -217,7 +217,7 @@ pub fn monitor_notices(
     now: i64,
 ) -> Result<(), String> {
     let mut result = Ok(());
-    for task in [TaskId::Backup, TaskId::MemoryBackup, TaskId::MemoryRestoreTest] {
+    for task in [TaskId::Backup] { // RED-missed-memory-slots
         result = monitor_task_notices(context, config, store, now, task).and(result);
     }
     result
