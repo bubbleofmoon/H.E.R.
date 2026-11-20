@@ -171,12 +171,20 @@ impl Default for NoticeState {
 
 const NOTICE_STATE: &str = "backup-notices.json";
 
+type Notice = (String, String);
+
+#[derive(Default)]
+struct TaskNotices {
+    failures: Vec<Notice>,
+    missed: Vec<Notice>,
+}
+
 fn claim_notice(
     state: &mut NoticeState,
     now: i64,
     key: String,
     text: String,
-    out: &mut Vec<(String, String)>,
+    out: &mut Vec<Notice>,
 ) {
     if !state.seen.contains_key(&key) {
         state.seen.insert(key.clone(), now);
@@ -185,11 +193,11 @@ fn claim_notice(
 }
 
 /// Claims are synced before sending; unknown send outcomes are never retried.
-fn update_notices(
+fn update_notices<T>(
     context: &RuntimeContext,
     state_file: &str,
-    update: impl FnOnce(&mut NoticeState) -> Result<Vec<(String, String)>, String>,
-) -> Result<Vec<(String, String)>, String> {
+    update: impl FnOnce(&mut NoticeState) -> Result<T, String>,
+) -> Result<T, String> {
     let started = Instant::now();
     let _gate = loop {
         match context.open_locked_file(RuntimeArea::Data, "locks/backup-notices.lock") {
@@ -227,7 +235,7 @@ fn update_notices(
 fn send_notices(
     context: &RuntimeContext,
     config: &serde_json::Value,
-    notices: Result<Vec<(String, String)>, String>,
+    notices: Result<Vec<Notice>, String>,
 ) {
     match notices {
         Ok(notices) => {
@@ -268,11 +276,71 @@ pub fn monitor_notices(
     store: &crate::task_runs::TaskStore,
     now: i64,
 ) -> Result<(), String> {
+    monitor_notices_with(context, config, store, now, |key, text| {
+        crate::admin_alert::notify_notice(context, config, text, key);
+    })
+}
+
+fn monitor_notices_with(
+    context: &RuntimeContext,
+    config: &serde_json::Value,
+    store: &crate::task_runs::TaskStore,
+    now: i64,
+    mut send: impl FnMut(&str, &str),
+) -> Result<(), String> {
     let mut result = Ok(());
-    for task in [TaskId::Backup, TaskId::MemoryBackup, TaskId::MemoryRestoreTest] {
-        result = monitor_task_notices(context, config, store, now, task).and(result);
+    let mut missed = Vec::new();
+    let mut failures = Vec::new();
+    for task in [
+        TaskId::Backup,
+        TaskId::MemoryBackup,
+        TaskId::MemoryRestoreTest,
+    ] {
+        match monitor_task_notices(context, config, store, now, task) {
+            Ok(notices) => {
+                if !notices.missed.is_empty() {
+                    missed.push(notices.missed);
+                }
+                failures.extend(notices.failures);
+            }
+            Err(error) => result = Err(error),
+        }
+    }
+    send_missed_notices(&missed, &mut send);
+    for (key, text) in failures {
+        send(&key, &text);
     }
     result
+}
+
+fn send_missed_notices(missed: &[Vec<Notice>], send: &mut impl FnMut(&str, &str)) {
+    let [first_group, rest @ ..] = missed else {
+        return;
+    };
+    if let ([(key, text)], []) = (first_group.as_slice(), rest) {
+        send(key, text);
+        return;
+    }
+
+    // Summarize each job within one alert so a long outage cannot spend the
+    // notice budget on one job before any of the other jobs are mentioned.
+    let mut key = String::from("backup-missed-slots");
+    let mut body = Vec::new();
+    for group in missed {
+        let (_, first) = &group[0];
+        let (last_key, last) = &group[group.len() - 1];
+        key.push('-');
+        key.push_str(last_key);
+        if group.len() == 1 {
+            body.push(first.clone());
+        } else {
+            body.push(format!(
+                "{} missed slots. First: {first} Last: {last}",
+                group.len()
+            ));
+        }
+    }
+    send(&key, &body.join("\n"));
 }
 
 fn monitor_task_notices(
@@ -281,7 +349,7 @@ fn monitor_task_notices(
     store: &crate::task_runs::TaskStore,
     now: i64,
     task: TaskId,
-) -> Result<(), String> {
+) -> Result<TaskNotices, String> {
     use crate::task_runs::{RunQuery, RunSource, RunState};
     use crate::tasks::{self, Due, Schedule};
 
@@ -298,7 +366,7 @@ fn monitor_task_notices(
     let zone = crate::local_time::configured_zone(config);
     let signature = format!("\"{time}\":{on}:{zone:?}");
     let state_file = format!("{name}-notices.json");
-    let notices = update_notices(context, &state_file, |state| {
+    update_notices(context, &state_file, |state| {
         // The first observation and every time/enabled change start now: neither older
         // history nor slots before this moment (e.g. a time already past) are alerted.
         if state.schedule.as_deref() != Some(signature.as_str()) {
@@ -306,7 +374,7 @@ fn monitor_task_notices(
             state.active_since = now;
             state.checked_through = Some(now);
         }
-        let mut notices = Vec::new();
+        let mut notices = TaskNotices::default();
         let mut runs = Vec::new();
         // The other jobs report ordinary execution failures through the task executor.
         if full {
@@ -349,7 +417,7 @@ fn monitor_task_notices(
                             run.run_id,
                             run.reason.as_deref().unwrap_or("result unknown")
                         ),
-                        &mut notices,
+                        &mut notices.failures,
                     );
                 }
             }
@@ -387,7 +455,7 @@ fn monitor_task_notices(
                             time,
                             crate::local_time::label(&crate::local_time::at(slot, &zone)),
                         ),
-                        &mut notices,
+                        &mut notices.missed,
                     );
                 }
                 state.checked_through = Some(slot);
@@ -395,9 +463,7 @@ fn monitor_task_notices(
             }
         }
         Ok(notices)
-    });
-    send_notices(context, config, Ok(notices?));
-    Ok(())
+    })
 }
 
 fn ensure_destination(path: &Path) -> Result<(), String> {
@@ -2525,6 +2591,45 @@ mod tests {
             assert_eq!(notices["seen"].as_object().unwrap().keys().collect::<Vec<_>>(),
                 [&format!("{name}-missed-{slot}")]);
         }
+    }
+
+    #[test]
+    fn ten_missed_nights_deliver_memory_recovery_notices() {
+        let fixture = Fixture::new("ten-missed-nights");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        let store = api.dispatcher.store();
+        let start = timestamp("2026-01-31T06:00:00Z");
+        let restart = timestamp("2026-02-10T06:00:00Z");
+        let mut limiter = crate::admin_alert::AlertLimiter::new();
+        let mut delivered = Vec::new();
+        let record_delivery = |key: &str, body: &str| {
+            if limiter.check("backup-fixture", key, restart).is_send() {
+                delivered.push(crate::admin_alert::prepare_body(body, str::to_owned));
+            }
+        };
+
+        super::monitor_notices_with(&context, &config, store, start, |_, _| {
+            panic!("first observation must stay quiet");
+        })
+        .unwrap();
+        super::monitor_notices_with(&context, &config, store, restart, record_delivery).unwrap();
+        assert!(
+            delivered.iter().any(|body| body.contains("Memory backup missed")),
+            "ten full-backup misses must leave room for the memory backup notice"
+        );
+        assert!(
+            delivered.iter().any(|body| body.contains("Memory restore test missed")),
+            "ten full-backup misses must leave room for the restore test notice"
+        );
+        assert_eq!(delivered.len(), 1, "one missed-slots notice per pass");
+        assert_eq!(delivered[0].matches("10 missed slots.").count(), 2);
+        super::monitor_notices_with(&context, &config, store, restart, |_, _| {
+            panic!("already reported slots must stay quiet");
+        })
+        .unwrap();
     }
 
     #[test]
