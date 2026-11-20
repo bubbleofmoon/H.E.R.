@@ -104,7 +104,7 @@ async fn seam_chat_turn_runs_on_the_scripted_adapter() {
     let script = crate::turn_engine::Script::answering("[SILENT]");
     let mut pipe = runtime.scripted(&script);
     let result = pipe
-        .run_chat_turn("group:42", "hello seam chat", None, &runtime.cfg(), &[], &[], "chat", false)
+        .run_chat_turn("group:42", "hello seam chat".into(), None, &runtime.cfg(), &[], &[], "chat", false)
         .await;
     assert!(result.is_ok(), "the chat turn must run on the scripted adapter: {result:?}");
     runtime.assert_scripted_turn(&script, "group:42", "hello seam chat", "scripted");
@@ -116,7 +116,7 @@ async fn seam_closed_agent_turn_runs_on_the_scripted_adapter() {
     let script = crate::turn_engine::Script::answering("[SILENT]");
     let mut pipe = runtime.scripted(&script);
     let result = pipe
-        .run_chat_turn("private:8808", "hello seam owner", None, &runtime.cfg(), &[], &[], "closed-agent", true)
+        .run_chat_turn("private:8808", "hello seam owner".into(), None, &runtime.cfg(), &[], &[], "closed-agent", true)
         .await;
     assert!(result.is_ok(), "the closed-agent turn must run on the scripted adapter: {result:?}");
     runtime.assert_scripted_turn(&script, "private:8808", "hello seam owner", "scripted");
@@ -255,7 +255,7 @@ async fn seam_harness_turn_builds_and_runs_without_a_dsh_credential() {
         serde_json::from_str::<Value>(&request.body).unwrap()
     });
     let result = pipe
-        .run_chat_turn("private:8808", "hello seam harness", None, &cfg, &[], &[], "closed-agent", true)
+        .run_chat_turn("private:8808", "hello seam harness".into(), None, &cfg, &[], &[], "closed-agent", true)
         .await;
     let request = server.join().unwrap();
     assert!(result.is_ok(), "the harness turn must run without DSH: {result:?}");
@@ -382,7 +382,7 @@ async fn ticket164_harness_chat_turn_sends_the_acquired_image_with_the_voice_lab
     let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg, true).unwrap();
     let media = [json!({"kind":"image","file":"fixture-164.png"})];
     let result = pipe
-        .run_chat_turn("private:8808", "hello harness media [语音]", None, &cfg, &[], &media, "closed-agent", true)
+        .run_chat_turn("private:8808", "hello harness media [语音]".into(), None, &cfg, &[], &media, "closed-agent", true)
         .await;
     let request = server.join().unwrap();
     drop(stop);

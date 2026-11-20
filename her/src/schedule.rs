@@ -784,7 +784,12 @@ pub fn system_job_paused(context: &RuntimeContext, job: &str) -> bool {
 
 /// The model-facing line for a reminder wake: the reminder text, or a note that it was cancelled or deleted.
 /// Empty for other reasons and when the store cannot be read.
+#[cfg(test)]
 pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
+    reminder_line_for_model(context, reason, &serde_json::Value::Null)
+}
+
+pub(crate) fn reminder_line_for_model(context: &RuntimeContext, reason: &str, view: &serde_json::Value) -> String {
     let Some(id) = reason.strip_prefix(REMINDER_REASON) else {
         return String::new();
     };
@@ -795,7 +800,7 @@ pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
                 Creator::Her => "你自己",
                 Creator::System => "系统",
             };
-            format!("【提醒内容】{}\n（由{}设置）\n\n", item.text, label)
+            format!("【提醒内容】{}\n（由{}设置）\n\n", crate::model_view::strip_from_model_text(&item.text, view), label)
         }
         Ok(_) => REMINDER_GONE.to_string(),
         Err(_) => String::new(),

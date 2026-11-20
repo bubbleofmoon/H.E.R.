@@ -67,11 +67,13 @@ impl Purpose {
 /// `budget::limit`, a budget checkpoint keeps `budget::recent` verbatim. With `harness.summaries` false, or after the
 /// rotation's summary failed in this turn, a budget checkpoint keeps the earlier summary and leaves out the older
 /// rounds without a new one; a rotation without summaries does the same.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn prepare(
     context: &RuntimeContext,
     store: &store::Store,
     request: &TurnRequest,
     mut history: History,
+    user: ChatMessage,
     instruction: String,
     cancelled: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
@@ -83,7 +85,7 @@ pub(super) async fn prepare(
         .pointer("/harness/summaries")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let current = current(request, &instruction);
+    let current = current(user, &instruction);
     let mut summarise = summaries;
     if let Some(idle_from) = history.idle_from {
         let due = super::store::last_call(context, &request.conversation, &request.generation)?
@@ -127,12 +129,12 @@ pub(super) async fn prepare(
 
 /// What the turn's first request holds besides its history: the system instruction (when the turn has one), then the
 /// turn's user message.
-pub(super) fn current(request: &TurnRequest, instruction: &str) -> Vec<ChatMessage> {
+fn current(user: ChatMessage, instruction: &str) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if !instruction.is_empty() {
         messages.push(ChatMessage::system(instruction.to_string()));
     }
-    messages.push(request.user_message());
+    messages.push(user);
     messages
 }
 

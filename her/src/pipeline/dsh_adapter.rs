@@ -768,9 +768,6 @@ impl Pipeline {
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
-        // Work on a delivery copy, after chat logging/storage and before either backend.
-        let model_prompt = crate::model_view::strip_text_with_runtime(&self.context, prompt, cfg);
-        let prompt = model_prompt.as_str();
         // CLI adapters accept seconds; the DSH collector retains the exact millisecond budget.
         let timeout_secs = timeout.as_secs().saturating_add(u64::from(timeout.subsec_nanos() > 0));
         if key.starts_with("ab:") {
@@ -962,7 +959,7 @@ impl Pipeline {
                 }
             }
             let handed_over = self.dsh_switch_summary(key, &sid, cfg)?.map(|summary| {
-                crate::model_view::strip_text_with_runtime(&self.context, &format!("{summary}\n\n{prompt_text}"), cfg)
+                format!("{summary}\n\n{prompt_text}")
             });
             if let Some(turn) = &self.cur_turn {
                 turn.attempt_with_layers(&rpc_id, &sid, layers.as_ref())

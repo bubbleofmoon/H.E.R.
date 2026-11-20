@@ -167,7 +167,7 @@ pub(crate) struct HttpReply {
     pub(crate) body: Vec<u8>,
 }
 
-pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str) -> Result<String, String> {
+pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str, redact: bool) -> Result<String, String> {
     let port = context.console_port().or_else(|| cfg["consolePort"].as_u64().and_then(|p| u16::try_from(p).ok())).ok_or("wake snapshot console port unavailable")?;
     let body = serde_json::json!({"key":key,"token":token,"turnId":turn}).to_string();
     let reply = http_request(&format!("127.0.0.1:{port}"), "POST", "/api/socialV2/wake-snapshot",
@@ -176,7 +176,8 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
     if reply.status != 200 { return Err(format!("wake snapshot refused: {}", reply.status)); }
     let packet: Value = serde_json::from_slice(&reply.body).map_err(|e| e.to_string())?;
     if packet.is_null() { return Ok(String::new()); }
-    let packet = crate::model_view::strip_chat_with_runtime(context, &packet, cfg);
+    // DSH sends this text immediately. The harness keeps the original packet for replay.
+    let packet = if redact { crate::model_view::strip_model_chat_data(&packet, cfg) } else { packet };
     Ok(format!("\n\n【本次消息快照】\n{packet}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；想回复时直接调用发送工具，桥接自动控制静默与打字节奏；reviseRequired=true 时先看 newMessages 再修改或重新发送。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。"))
 }
 

@@ -10,6 +10,8 @@
 
 use support::hide_window;
 mod support;
+#[path = "fixtures/model_copy.rs"]
+mod model_copy;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -731,11 +733,11 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[test]
 fn strip_model_text_dsh_filters_message_nickname_and_reply_but_keeps_stored_chat() {
     let mut rig = Rig::new("strip-model-text", Seed {
-        config: json!({"socialV2":{"context":{"stripFromModelText":["奸"]}}}),
+        config: json!({"socialV2":{"context":{"stripFromModelText":[model_copy::MATCH]}}}),
         ..Seed::default()
     });
-    let message = json!({"seq":1,"messageId":"82","userId":"1002","sender":"奸昵称",
-        "text":"奸消息 [引用 奸人：奸原话] [图片] [CQ:at,qq=123]","time":now_ms()});
+    let message = json!({"seq":1,"messageId":model_copy::ID,"userId":"1002","sender":model_copy::SENDER,
+        "text":model_copy::CHAT,"time":now_ms()});
     let mut state = rig.data_json("social-v2.json");
     state["conversations"][GROUP_KEY]["recentMessages"] = json!([message]);
     // Seed its consumed cursor so the arriving message receives a distinct local sequence.
@@ -745,14 +747,13 @@ fn strip_model_text_dsh_filters_message_nickname_and_reply_but_keeps_stored_chat
     rig.restart(mention(1001, "奸新消息"));
     let prompts = rig.wait_prompts(1);
     let text = &prompts[0].text;
-    assert!(!text.contains('奸'), "{text}");
-    assert!(text.contains("昵称"), "nickname must reach model: {text}");
-    assert!(text.contains("[引用 人：原话] [图片] [CQ:at,qq=123]"), "{text}");
+    model_copy::assert_snapshot(text);
+    assert!(text.contains("不要把不明确的记忆当作事实"), "the stable retrieval instruction must survive: {text}");
     let stored = rig.data_json("social-v2.json");
     assert!(stored["conversations"][GROUP_KEY]["recentMessages"].as_array().unwrap().contains(&message));
     let (status, view) = rig.console("GET", &format!("/api/socialV2/recent?key={GROUP_KEY}"), None);
     assert_eq!(status, 200);
-    assert!(view.to_string().contains('奸'), "console view must retain original chat");
+    assert!(view.to_string().contains(model_copy::CHAT), "console view must retain original chat");
 }
 
 #[test]

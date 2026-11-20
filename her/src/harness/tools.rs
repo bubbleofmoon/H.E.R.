@@ -78,7 +78,7 @@ impl Tools {
         };
         authority.check().map_err(String::from)?;
         // #140: read from the settings store with this turn's configuration, so an edit is in
-        // effect from the next turn; the model-view strip applies, and the stripped text is checked again.
+        // effect from the next turn under the prompt text and credential checks.
         let mode_prompt = profile
             .prompt_key()
             .map(|key| crate::prompt_text::model_text(context, cfg, key).trim().to_string())
@@ -1012,17 +1012,16 @@ mod tests {
     }
 
     #[test]
-    fn mode_prompt_strip_that_makes_a_denied_term_falls_back_to_the_last_good_text() {
+    fn mode_prompt_keeps_its_validated_text_when_chat_redaction_changes() {
         let fixture = Fixture::new("mode-prompt-strip", "closed-agent");
         let save = |text: &str| {
             crate::settings::apply(&fixture.context, "prompt.mode.closedAgent", &json!(text), "administrator", "console")
         };
         save("封闭模式说明 140").unwrap();
-        // Accepted on save, when the strip has no term to remove; the strip below makes `DSH` of it.
         save("D鲸SH").unwrap();
         fixture.edit_config(|cfg| cfg["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
         let instruction = fixture.capture("closed-agent", OWNER_KEY).unwrap().instruction();
-        assert_eq!(instruction, format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY)));
+        assert_eq!(instruction, format!("D鲸SH\n\n{}", session_instruction(OWNER_KEY)));
         assert!(!instruction.contains("DSH"), "a denied term reached the model: {instruction}");
     }
 
@@ -1076,14 +1075,14 @@ mod tests {
             instruction("closed-agent", OWNER_KEY),
             format!("{}\n\n{}", "鲸".repeat(8000), session_instruction(OWNER_KEY))
         );
-        // The model-view strip applies to the mode prompt.
+        // Chat redaction leaves the saved mode prompt intact.
         save("prompt.mode.closedAgent", "封闭模式说明 140").unwrap();
         fixture.edit_config(|cfg| {
             cfg["socialV2"] = json!({"context": {"stripFromModelText": ["封闭"]}})
         });
         assert_eq!(
             instruction("closed-agent", OWNER_KEY),
-            format!("模式说明 140\n\n{}", session_instruction(OWNER_KEY))
+            format!("封闭模式说明 140\n\n{}", session_instruction(OWNER_KEY))
         );
         // An emptied prompt sends the session line alone again.
         save("prompt.mode.closedAgent", "").unwrap();

@@ -97,8 +97,8 @@ fn hf119_direct_send_filters_quoted_model_copy_and_keeps_outgoing_original() {
         "replyToMessageId":7003,"message":"奸待发原文"})));
     assert!(!is_error(&answer), "{answer}");
     let data: Value = serde_json::from_str(&text_of(&answer)).unwrap();
-    assert_eq!(data["quoted"]["text"], "原话", "{data}");
-    assert_eq!(data["quoted"]["sender"], "昵称", "{data}");
+    assert_eq!(data["quoted"]["text"], "【已隐藏】原话", "{data}");
+    assert_eq!(data["quoted"]["sender"], "【已隐藏】昵称", "{data}");
     let sends = f.onebot.actions("send_group_msg");
     assert_eq!(sends.len(), 1);
     assert_eq!(sends[0]["message"][1]["data"]["text"], "奸待发原文");
@@ -589,7 +589,7 @@ fn strip_model_text_memory_search_and_digest_index_leave_original_memory_readabl
     assert!(text_of(&saved).contains("已记住"), "{saved}");
     let result = f.mcp.call("memory_search", group(json!({"query":"stripmodel82"})));
     let text = text_of(&result);
-    assert!(text.contains("stripmodel82 记忆 [引用 人：话] [图片]"), "{text}");
+    assert!(text.contains("stripmodel82 【已隐藏】记忆 [引用 【已隐藏】人：【已隐藏】话] [图片]"), "{text}");
     assert!(!text.contains('奸'), "{text}");
     let index = text_of(&f.mcp.call("memory_index", group(json!({}))));
     assert!(index.contains("话题"), "{index}");
@@ -629,7 +629,7 @@ fn strip_model_text_mcp_reads_filter_copies_and_reload_config_without_filtering_
         let text = text_of(&answer);
         assert!(!text.contains('奸'), "{tool}: {text}");
         assert!(text.contains("昵称"), "{tool}: no message returned: {text}");
-        assert!(text.contains("[引用 人：原话] [图片] [CQ:at,qq=123]"), "{tool}: {text}");
+        assert!(text.contains("[引用 【已隐藏】人：【已隐藏】原话] [图片] [CQ:at,qq=123]"), "{tool}: {text}");
         let _: Value = serde_json::from_str(&text).expect("MCP result stays valid JSON");
     }
     // Wait admission now persists its budget; every other stored field must remain unchanged.
@@ -1869,7 +1869,7 @@ fn qq_memory_and_slang_model_schemas_filter_all_text_fields_without_changing_dis
     );
     assert!(packet["block"].as_str().unwrap().contains("meaning"));
     for field in ["meaning", "usage", "example"] {
-        assert_eq!(packet["entries"][0][field], format!(" {field}"), "{packet}");
+        assert_eq!(packet["entries"][0][field], format!("【已隐藏】 {field}"), "{packet}");
     }
     assert!(
         fs::read_to_string(f.root.path().join("data/social-v2.json"))

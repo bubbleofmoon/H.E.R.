@@ -3624,7 +3624,7 @@ fn hf_next_delivery_case(full: bool) {
     lock(&rig.dsh.inner).acknowledge_snapshot = true;
     rig.patch_config(|c| c["socialV2"]["context"] = json!({"stripFromModelText":["configured-drop", "87001"],"wakeMessageLimit":1,"wakeRecentLimit":0}));
     let blacklist = rig.root.join("config/model-text-blacklist.json");
-    fs::write(&blacklist, json!({"strip":["file-old"]}).to_string()).unwrap();
+    fs::write(&blacklist, json!({"strip":["file-old", "不要"]}).to_string()).unwrap();
     fs::write(rig.root.join("data/initial-prompts.json"), json!({GROUP_KEY:{"text":"keep configured-drop file-old file-new"}}).to_string()).unwrap();
     assert_eq!(rig.console("POST","/api/socialV2/memory-append",Some(&json!({"key":GROUP_KEY,"category":"activeTopic","content":"memory configured-drop file-old file-new"}))).0,200);
     rig.start_candidate(mention(87000,"first configured-drop file-old file-new"));
@@ -3633,6 +3633,8 @@ fn hf_next_delivery_case(full: bool) {
     assert!(first.contains("【简报 revision="));
     assert!(!first.contains("configured-drop") && !first.contains("file-old"), "full briefing leaked configured/runtime strip entries: {first}");
     assert!(first.contains("file-new"));
+    assert!(first.contains("不要把不明确的记忆当作事实"), "retrieval instruction changed: {first}");
+    let retrieval_hash = rig.sessions_file()["briefings"][GROUP_KEY]["installed"]["sections"]["retrieval"].clone();
     // Change only the runtime overlay: the next delivery must re-hash the filtered sections.
     fs::write(&blacklist, json!({"strip":["file-new"]}).to_string()).unwrap();
     if full {
@@ -3648,11 +3650,19 @@ fn hf_next_delivery_case(full: bool) {
     assert!(delivered.contains(if full { "【简报 revision=" } else { "【唤醒增量】" }), "wrong delivery: {delivered}");
     assert!(!delivered.contains("configured-drop") && !delivered.contains("file-new"), "runtime/config strip lost on delivered full/delta: {delivered}");
     assert!(delivered.contains("file-old"), "runtime blacklist change was not reloaded");
+    assert!(retrieval_hash.is_string(), "the installed briefing must include the retrieval hash");
+    assert_eq!(rig.sessions_file()["briefings"][GROUP_KEY]["installed"]["sections"]["retrieval"], retrieval_hash,
+        "redaction edits must keep static instruction hashes stable");
+    if full {
+        assert!(delivered.contains("不要把不明确的记忆当作事实"));
+    } else {
+        assert!(!delivered.contains("【替换简报节 retrieval】"));
+    }
     if !full { assert!(delivered.contains("【替换简报节 operator】") && delivered.contains("【替换简报节 memory】")); }
     let packet: Value = serde_json::from_str(delivered.split("【本次消息快照】\n").nth(1).unwrap().lines().next().unwrap()).unwrap();
     assert_eq!(packet["messages"][0]["messageId"],"87001", "numeric strip changed packet identity");
     assert_eq!(packet["messages"][0]["seq"],2);
-    assert!(!packet["messages"][0]["text"].as_str().unwrap().contains("87001"),"numeric strip did not filter chat text");
+    assert_eq!(packet["messages"][0]["text"].as_str().unwrap().matches("【已隐藏】").count(), 3, "chat spans must be visibly marked");
     assert_eq!(packet["readThroughSeq"],2);
     let operator_header = if full { "【简报节 operator】\n" } else { "【替换简报节 operator】完整替换旧节：\n" };
     let operator = delivered.split(operator_header).nth(1).unwrap().split("\n\n【").next().unwrap();

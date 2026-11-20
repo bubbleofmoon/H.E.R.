@@ -208,12 +208,12 @@ impl Store {
 
     #[cfg(test)]
     pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
-        self.admit_with_briefing(request, None)
+        self.admit_with_briefing(request, &request.user_message(), None)
     }
 
     /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
     /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
-    pub(super) fn admit_with_briefing(&self, request: &TurnRequest, briefing: Option<Value>) -> Result<History, String> {
+    pub(super) fn admit_with_briefing(&self, request: &TurnRequest, user: &ChatMessage, briefing: Option<Value>) -> Result<History, String> {
         let known = record_credentials(&self.context)?;
         let initial = crate::engine_switch::summary(
             &self.context,
@@ -323,7 +323,7 @@ impl Store {
             &request.id,
             None,
             "user",
-            json!({"text":request.prompt,"message":request.user_message()}),
+            json!({"text":request.prompt,"message":user}),
         )?;
         if let Some(mut record) = briefing {
             // The preceding insert is the canonical user fact. The receipt and fact commit together.

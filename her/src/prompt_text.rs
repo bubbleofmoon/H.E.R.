@@ -66,10 +66,7 @@ pub(crate) fn text(cfg: &Value, key: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// The model-visible text of text setting `key`, checked after the model-view strip (`with_blacklist`): the configured
-/// text when the strip leaves it without a denied term, else its newest audited text that the strip leaves so, else the
-/// compiled default, each stripped the same way. When none passes the text is empty, so nothing is sent. A key outside
-/// the registry, or one that is not a text setting, reads as empty.
+/// Deliver validated prompt settings with the normal audit/default fallback and credential check.
 pub(crate) fn model_text(context: &crate::runtime::RuntimeContext, cfg: &Value, key: &str) -> String {
     let Some(setting) = crate::settings::find(key) else {
         return String::new();
@@ -77,12 +74,10 @@ pub(crate) fn model_text(context: &crate::runtime::RuntimeContext, cfg: &Value, 
     let Some(default) = setting.kind.text_default() else {
         return String::new();
     };
-    let delivery = crate::model_view::with_blacklist(context, cfg);
     let Ok(mut credentials) = crate::settings::stored_secrets(context) else { return String::new() };
     credentials.extend(crate::settings::harness_credential(context));
     let visible = |text: &str| {
-        crate::model_view::strip_checked(text, &delivery)
-            .filter(|text| credentials.iter().all(|key| !text.contains(key)))
+        credentials.iter().all(|key| !text.contains(key)).then(|| text.to_owned())
     };
     visible(&text(cfg, key))
         .or_else(|| {
@@ -105,8 +100,7 @@ fn paragraph(context: &crate::runtime::RuntimeContext, cfg: &Value, key: &str) -
     }
 }
 
-/// The behaviour rules of the briefing's `behaviour` section and of the compatibility render, each checked after the
-/// model-view strip (`model_text`): custom style and participation, group conduct, then the repeat rule.
+/// The behaviour rules for the briefing and compatibility render, in prompt order.
 pub(crate) fn behaviour(context: &crate::runtime::RuntimeContext, cfg: &Value) -> String {
     [NOT_A_CLERK_KEY, PROACTIVE_KEY, GROUP_CONDUCT_KEY, REPEAT_KEY]
         .into_iter()

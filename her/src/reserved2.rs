@@ -1096,7 +1096,7 @@ mod tests {
         let key = HARNESS_CAP_KEY;
         let (client, credential, turn_id) = (hub.context.clone(), token.clone(), turn.clone());
         let request = tokio::task::spawn_blocking(move || {
-            crate::qq_tools::wake_snapshot(&client, &client.load_config().unwrap(), key, &credential, &turn_id)
+            crate::qq_tools::wake_snapshot(&client, &client.load_config().unwrap(), key, &credential, &turn_id, true)
         });
         let (socket, body) = tokio::time::timeout(std::time::Duration::from_secs(5),
             harness_cap_request(&console, "/api/socialV2/wake-snapshot")).await.unwrap();

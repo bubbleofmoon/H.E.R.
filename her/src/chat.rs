@@ -501,22 +501,47 @@ pub fn decide(f: &Facts, role_exists: &dyn Fn(&str) -> bool) -> Decision {
     Decision::Forward
 }
 
-/// The prompt text handed to the model (before the clock line is added at delivery).
-pub fn build_prompt(role_hint: &str, is_owner: bool, group_sender: Option<&str>, text: &str, media_hint: &str) -> String {
-    let mut out = String::new();
+/// A chat prompt keeps the incoming fields separate from its instructions and media references.
+#[derive(Default, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct Prompt {
+    pub prefix: String,
+    sender: Option<String>,
+    text: String,
+    suffix: String,
+}
+
+impl Prompt {
+    pub(crate) fn render(&self, view: &Value) -> String {
+        let redact = |text| crate::model_view::strip_from_model_text(text, view);
+        let sender = self.sender.as_deref().map(|sender| format!("{}：", redact(sender)));
+        format!("{}{}{}{}", self.prefix, sender.as_deref().unwrap_or(""), redact(&self.text), self.suffix)
+    }
+
+    pub(crate) fn map_text(&mut self, map: impl Fn(&str) -> String) {
+        self.prefix = map(&self.prefix);
+        self.sender = self.sender.as_deref().map(&map);
+        self.text = map(&self.text);
+        self.suffix = map(&self.suffix);
+    }
+}
+
+#[cfg(test)]
+impl From<&str> for Prompt {
+    fn from(text: &str) -> Self {
+        Self { text: text.to_owned(), ..Self::default() }
+    }
+}
+
+pub(crate) fn build_prompt(role_hint: &str, is_owner: bool, group_sender: Option<&str>, text: &str, media_hint: &str) -> Prompt {
+    let mut prefix = String::new();
     if !role_hint.is_empty() {
-        out.push_str(role_hint);
-        out.push_str("\n\n");
+        prefix.push_str(role_hint);
+        prefix.push_str("\n\n");
     }
     if is_owner {
-        out.push_str("【管理员】");
+        prefix.push_str("【管理员】");
     }
-    match group_sender {
-        Some(sender) => out.push_str(&format!("{sender}：{text}")),
-        None => out.push_str(text),
-    }
-    out.push_str(media_hint);
-    out
+    Prompt { prefix, sender: group_sender.map(str::to_owned), text: text.to_owned(), suffix: media_hint.to_owned() }
 }
 
 /// What to do with a finished turn.
@@ -880,7 +905,7 @@ pub enum Outcome {
 }
 
 struct Job {
-    prompt: String,
+    prompt: Prompt,
     media: Vec<Value>,
     ack: Option<String>,
     inbound: Vec<String>,
@@ -1250,7 +1275,7 @@ async fn worker(
         // The same epoch check runs again right before the turn begins (after media downloads).
         let (check_context, check_key) = (context.clone(), key.clone());
         let epoch = Job {
-            prompt: String::new(), media: Vec::new(), ack: None, inbound: Vec::new(),
+            prompt: Prompt::default(), media: Vec::new(), ack: None, inbound: Vec::new(),
             mode: job.mode.clone(), owner: job.owner, resets: job.resets, mode_stamp: job.mode_stamp.clone(),
             admission_retries: 0,
         };
@@ -1262,7 +1287,7 @@ async fn worker(
             stale_job(&check_context, &cfg, &check_key, &epoch)
                 .map(|reason| if reason.is_empty() { "模式或权限已变化，丢弃排队的指令" } else { reason }.to_string())
         }));
-        let result = pipe.run_chat_turn(&key, &job.prompt, job.ack.clone(), &cfg, &job.inbound, &job.media, &job.mode, job.owner).await;
+        let result = pipe.run_chat_turn(&key, job.prompt.clone(), job.ack.clone(), &cfg, &job.inbound, &job.media, &job.mode, job.owner).await;
         match result {
             Ok(ChatTurnOutcome::Completed) => println!("[chat] {key} 回合完成"),
             Ok(ChatTurnOutcome::WaitForDsh) => {
@@ -1362,7 +1387,7 @@ mod tests {
         let cfg = context.load_config().unwrap();
         let key = "group:42";
         let job = |resets: Option<usize>, mode_stamp: Option<String>| Job {
-            prompt: String::new(), media: Vec::new(), ack: None, inbound: Vec::new(), mode: "chat".into(), owner: false, resets, mode_stamp,
+            prompt: Prompt::default(), media: Vec::new(), ack: None, inbound: Vec::new(), mode: "chat".into(), owner: false, resets, mode_stamp,
             admission_retries: 0,
         };
         let stamp = crate::reserved::mode_stamp(&context).ok();
@@ -1399,7 +1424,7 @@ mod tests {
         assert!(allowed_in_mode(&cfg, "chat", key), "allow-all admits the first contact");
         // Dispatch captures the epoch exactly as `Hub::dispatch` does.
         let job = Job {
-            prompt: String::new(), media: Vec::new(), ack: None, inbound: Vec::new(), mode: "chat".into(), owner: false,
+            prompt: Prompt::default(), media: Vec::new(), ack: None, inbound: Vec::new(), mode: "chat".into(), owner: false,
             resets: crate::turn_ledger::reset_count(&context, key).ok(),
             mode_stamp: crate::reserved::mode_stamp(&context).ok(),
             admission_retries: 0,
@@ -1590,9 +1615,9 @@ mod tests {
 
     #[test]
     fn prompts_follow_the_old_layout() {
-        assert_eq!(build_prompt("", false, Some("小明"), "你好", ""), "小明：你好");
-        assert_eq!(build_prompt("角色", true, Some("owner"), "你好", "\n【图片/表情】本条消息包含 2 个图片/表情（消息ID=7）。"), "角色\n\n【管理员】owner：你好\n【图片/表情】本条消息包含 2 个图片/表情（消息ID=7）。");
-        assert_eq!(build_prompt("", true, None, "私聊", ""), "【管理员】私聊");
+        assert_eq!(build_prompt("", false, Some("小明"), "你好", "").render(&Value::Null), "小明：你好");
+        assert_eq!(build_prompt("角色", true, Some("owner"), "你好", "\n【图片/表情】本条消息包含 2 个图片/表情（消息ID=7）。").render(&Value::Null), "角色\n\n【管理员】owner：你好\n【图片/表情】本条消息包含 2 个图片/表情（消息ID=7）。");
+        assert_eq!(build_prompt("", true, None, "私聊", "").render(&Value::Null), "【管理员】私聊");
         assert_eq!(media_hint("", 2), "");
         assert_eq!(media_hint("7", 0), "");
         assert_eq!(media_count(&json!([{"type": "image"}, {"type": "face"}, {"type": "mface"}, {"type": "text"}])), 3);

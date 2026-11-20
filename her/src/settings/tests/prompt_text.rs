@@ -278,37 +278,16 @@ fn denied_term_split_by_format_characters_is_refused_on_save_and_load() {
 }
 
 #[test]
-fn prompt_text_rule_a_strip_turns_into_a_denied_term_falls_back_to_the_last_good_text() {
+fn prompt_text_rule_keeps_its_validated_text_when_chat_redaction_changes() {
     let (root, context) = prompt_fixture("prompt text strip denied");
     let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】新版 140"));
     assert_eq!(status, 200, "{body}");
-    // Accepted on save, when the strip has no term to remove; the strip then makes `DSH` of it.
     let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D鲸SH"));
     assert_eq!(status, 200, "{body}");
     write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
     let text = next_render(&context);
-    assert!(text.contains("【别像客服】新版 140\n\n"), "the last good version renders: {text}");
-    assert!(!text.contains("DSH") && !text.contains("鲸"), "a denied term reached the model: {text}");
-}
-
-#[test]
-fn prompt_text_render_stripped_again_on_delivery_never_makes_a_denied_term() {
-    let (root, context) = prompt_fixture("prompt text double strip");
-    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】新版 140"));
-    assert_eq!(status, 200, "{body}");
-    // Accepted on save; one strip pass reads `D鲸鱼SH` and a second one `DSH`.
-    let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】D鲸鲸鱼鱼SH"));
-    assert_eq!(status, 200, "{body}");
-    write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["鲸鱼"]}));
-    let render = next_render(&context);
-    let config = context.load_config_document().unwrap();
-    // The delivery strips the render again, as the DSH and CLI paths and the harness do.
-    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
-    for text in [&render, &delivered] {
-        assert!(!crate::model_text_policy::denied_terms(text).contains(&"dsh".to_string()), "a denied term reached the model: {text}");
-        assert!(text.contains("【别像客服】新版 140\n\n"), "the last good version renders: {text}");
-        assert!(!text.contains("D鲸"), "{text}");
-    }
+    assert!(text.contains("【别像客服】D鲸SH\n\n"), "the active rule renders verbatim: {text}");
+    assert!(!text.contains("DSH"), "a denied term reached the model: {text}");
 }
 
 #[test]
@@ -318,13 +297,11 @@ fn prompt_text_strip_joining_rules_across_their_boundary_never_makes_a_denied_te
     assert_eq!(status, 200, "{body}");
     let (status, body) = set_text(&context, "prompt.proactive", json!("SH【积极性】"));
     assert_eq!(status, 200, "{body}");
-    // The rules are joined by a blank line; stripping it from the whole render would make `DSH` of the two.
+    // A chat redaction entry can also match the separator between two instructions.
     write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["\n\n"]}));
     let render = next_render(&context);
     assert!(!crate::model_text_policy::denied_terms(&render).contains(&"dsh".to_string()), "{render}");
-    let config = context.load_config_document().unwrap();
-    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
-    assert!(!crate::model_text_policy::denied_terms(&delivered).contains(&"dsh".to_string()), "a denied term reached the model: {delivered}");
+    assert!(render.contains("【别像客服】D\n\nSH【积极性】"), "rule boundary must remain intact: {render}");
 }
 
 #[test]
@@ -338,32 +315,30 @@ fn model_strip_join_regression_preserves_rule_boundary_when_memory_holds_term() 
     write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["\n\n"]}));
 
     let render = next_render(&context);
-    let config = context.load_config_document().unwrap();
-    let delivered = crate::model_view::strip_text_with_runtime(&context, &render, &config);
+    let delivered = render;
     assert!(delivered.contains("- DSH（"), "the memory topic must reach the model");
     assert!(delivered.contains("【别像客服】D\n\nSH【积极性】"), "the strip must preserve the boundary between the two rules");
 }
 
 #[test]
-fn prompt_text_sticker_rules_a_strip_turns_into_a_denied_term_fall_back_to_the_default() {
+fn prompt_text_sticker_rules_keep_their_validated_text_under_chat_redaction() {
     let (root, context) = prompt_fixture("prompt text sticker strip denied");
     let (status, body) = set_text(&context, "prompt.stickerStrategy", json!("【表情包策略】D鲸SH 140"));
     assert_eq!(status, 200, "{body}");
     let (status, body) = set_text(&context, "prompt.stickerSoften", json!("【用表情缓和语气】D鲸SH 140"));
     assert_eq!(status, 200, "{body}");
     write_config(&root, |config| config["socialV2"]["context"] = json!({"stripFromModelText": ["鲸"]}));
-    // The strategy is printed without a sticker inventory; the strip's `DSH` never reaches the model, the default does.
     let text = next_render(&context);
-    assert!(!text.contains("DSH") && text.contains(crate::prompt_text::STICKER_STRATEGY), "{text}");
+    assert!(!text.contains("DSH") && text.contains("【表情包策略】D鲸SH 140"), "{text}");
     // The softening rule is printed only with an inventory, so it is checked directly.
     let config = context.load_config_document().unwrap();
     assert_eq!(
         crate::prompt_text::model_text(&context, &config, crate::prompt_text::STICKER_SOFTEN_KEY),
-        crate::prompt_text::STICKER_SOFTEN
+        "【用表情缓和语气】D鲸SH 140"
     );
     assert_eq!(
         crate::prompt_text::model_text(&context, &config, crate::prompt_text::STICKER_STRATEGY_KEY),
-        crate::prompt_text::STICKER_STRATEGY
+        "【表情包策略】D鲸SH 140"
     );
 }
 
