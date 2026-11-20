@@ -33,7 +33,7 @@ fn settings_describe_cookie_contract() {
         "settings/describe must accept the bridge-minted cookie"
     );
 
-    rpc.credential().set_cookie(cookies[1].clone());
+    rpc.credential().set_cookie(cookies[0].clone()); // RED-REJECT
     let result = describe();
     assert!(
         result
