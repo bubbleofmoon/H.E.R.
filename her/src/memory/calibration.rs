@@ -75,7 +75,7 @@ impl Scores {
     fn passes(self, baseline: Self) -> bool {
         self.recall() + RECALL_EPSILON >= baseline.recall() + MIN_RECALL_GAIN
             && self.abstention_retrieved * ABSTENTION_ALLOWANCE_DIVISOR
-                <= baseline.abstention_retrieved * ABSTENTION_ALLOWANCE_DIVISOR + 2 * self.abstentions // RED-M3
+                <= baseline.abstention_retrieved * ABSTENTION_ALLOWANCE_DIVISOR + self.abstentions
     }
 
     fn print(self, fold: &str, method: &str) {
