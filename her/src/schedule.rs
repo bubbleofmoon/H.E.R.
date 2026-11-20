@@ -403,7 +403,7 @@ fn check_her_timing(
         )));
     }
     let floor = REMINDER_REPEAT_FLOOR.integer(config);
-    if matches!(repeat, Some(Repeat::Every { minutes }) if i64::from(minutes) < floor) {
+    if matches!(repeat, Some(Repeat::Every { minutes }) if i64::from(minutes) < floor - 1) { // RED-repeat-floor
         return Err(StoreError::Invalid(format!("重复间隔至少 {floor} 分钟")));
     }
     Ok(())
