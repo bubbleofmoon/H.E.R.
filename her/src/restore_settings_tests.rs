@@ -110,21 +110,20 @@ fn restore_settings_full_restore_brings_the_store_back_and_memory_only_leaves_it
             &mut control,
         )
         .unwrap();
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let sidecar = f.0.join(format!("data/settings.db{suffix}"));
-            if memory_only {
+        if memory_only {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let sidecar = f.0.join(format!("data/settings.db{suffix}"));
                 assert_eq!(fs::read(&sidecar).unwrap(), b"stale settings sidecar", "memory-only keeps settings.db{suffix}");
                 fs::remove_file(sidecar).unwrap();
-            } else {
-                assert!(!sidecar.exists(), "a full restore removes settings.db{suffix}");
             }
-        }
-        if memory_only {
             assert_eq!(
                 fs::read(f.0.join("data/settings.db")).unwrap(),
                 current,
                 "memory-only keeps every byte of settings.db"
             );
+        } else {
+            // Reading the restored store for scope notices can create fresh SQLite sidecars.
+            assert_eq!(control.settings_sidecars_after_replace, Some([false; 3]), "full restore removes all settings sidecars at replacement");
         }
         assert_eq!(memory(&f), "old memory");
         assert_eq!(control.stops, 1);
@@ -206,6 +205,47 @@ fn restore_settings_archive_without_the_store_restores_and_only_a_full_restore_r
             crate::backup::verify_archive(pre, &|| Ok(())).unwrap().files.contains_key("settings.db"),
             "the pre-restore backup keeps the current store"
         );
+    }
+}
+
+#[test]
+fn restore_settings_reports_and_preserves_an_inherited_rollout_gap() {
+    let f = Fixture::new();
+    let context = f.context();
+    let config = f.0.join("config/config.json");
+    let archived = json!({
+        "consoleToken": "fixture",
+        "backends": {"mcpRustBridge": true},
+        "allow": {"groups": [7001], "private": []},
+        "rollout": {"rustGroups": ["group:7001", "private:7002"]}
+    });
+    fs::write(&config, archived.to_string()).unwrap();
+    set_quiet(&f, 4000);
+    let archive = f.backup();
+    crate::settings::reset(&context, "rollout.rustGroups", "administrator").unwrap();
+    for memory_only in [true, false] {
+        let plan = preview(&context, &archive, memory_only).unwrap();
+        let result = execute_with(
+            &context,
+            &archive,
+            memory_only,
+            plan["confirmation"].as_str().unwrap(),
+            "fixture-admin",
+            &mut FakeControl::default(),
+        )
+        .unwrap();
+        let effective = context.load_config().unwrap();
+        if memory_only {
+            assert_eq!(effective["rollout"]["rustGroups"], json!([]));
+            assert!(result.get("scopeNotices").is_none());
+        } else {
+            assert_eq!(effective["rollout"]["rustGroups"], archived["rollout"]["rustGroups"]);
+            assert_eq!(effective["allow"]["private"], json!([]), "full restore does not widen inherited access");
+            assert_eq!(crate::watchdog::rollout_scope_gaps(&effective).not_allowed, ["private:7002"]);
+            assert!(result["scopeNotices"].as_array().is_some_and(|lines| lines.iter().any(
+                |line| line.as_str().is_some_and(|line| line.contains("private:7002"))
+            )), "full restore reports the inherited rollout gap: {result}");
+        }
     }
 }
 

@@ -97,6 +97,8 @@ fn t192_a_crash_between_the_write_and_the_revocation_is_finished_at_console_star
 #[test]
 fn t192_a_whitelist_write_and_an_audit_undo_cut_off_after_their_write_are_finished_the_same_way() {
     let (root, context) = admitted("t192 crash whitelist undo");
+    // This whitelist-only removal needs the live target to exclude the group first.
+    crate::settings::reset(&context, "rollout.rustGroups", "administrator").unwrap();
     let body = json!({"allow": {"groups": [], "private": []}, "confirm": true}).to_string();
     assert!(crash_after_write(&context, || access::whitelist_post(&context, &body)), "the whitelist write stopped after its write");
     assert_eq!(file(&root)["allow"]["groups"], json!([]));
