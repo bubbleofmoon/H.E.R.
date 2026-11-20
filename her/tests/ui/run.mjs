@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { chromium, firefox, webkit } from 'playwright';
+import { developmentRoot } from '../../../scripts/fixture-paths.mjs';
 import { validateCatalogue } from './catalogue.mjs';
 import { withFixture } from './fixture.mjs';
 import { writeReport } from './report.mjs';
@@ -31,6 +32,8 @@ const platform = isWindows ? 'windows' : 'linux';
 const browsers = isWindows ? { msedge: [chromium, { channel: 'msedge' }] }
   : { chromium: [chromium], firefox: [firefox], webkit: [webkit] };
 const directory = path.join(HER_UI_OUTPUT, `console-ui-${HER_UI_COMMIT}-${platform}`);
+developmentRoot(HER_UI_OUTPUT, HER_TEST_CLI);
+developmentRoot(directory, HER_TEST_CLI);
 await fs.mkdir(HER_UI_OUTPUT, { recursive: true });
 await fs.mkdir(directory);
 await fs.mkdir(path.join(directory, 'screenshots'));

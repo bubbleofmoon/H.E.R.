@@ -92,6 +92,7 @@ async function startConsole(root, cli, env, configurePort) {
 
 export async function withFixture(cli, action) {
   const parent = await fs.realpath(os.tmpdir());
+  developmentRoot(parent, cli);
   const workspace = await fs.mkdtemp(path.join(parent, 'her-console-ui-'));
   const root = path.join(workspace, 'runtime');
   const home = path.join(workspace, 'profile');
