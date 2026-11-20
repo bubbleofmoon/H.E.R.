@@ -1150,7 +1150,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else {
             result
         };
-        if result.is_err() && !self.turn_final { // RED-F05
+        if result.is_ok() && !self.turn_final {
             if let Some(turn) = &self.cur_turn {
                 if crate::console::turn_wait_limit_reached(&self.context, cfg, &key, &turn.id, &self.turn_token) {
                     self.finish_turn("completed", "observationSleep");
