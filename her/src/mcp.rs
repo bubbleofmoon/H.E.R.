@@ -211,7 +211,7 @@ pub(crate) fn discovered_tools(cfg: &Value, mode: Option<&str>, key: Option<&str
             let name = tool["name"].as_str().unwrap_or_default();
             // The Admin agent's approved group send belongs to the harness interaction handler.
             !(mode == "closed-agent" && name == "qq_send_group_message")
-                && profile.allows_tool(cfg, key, name)
+                && (mode == "chat" || profile.allows_tool(cfg, key, name)) // RED-F11
         })
         .cloned()
         .collect()
