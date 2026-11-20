@@ -795,7 +795,7 @@ fn ticket55_forget_visibility_check_failure_answers_search_failed() {
 fn conversation_authority_owner_config_is_store_owner() {
     let (_root, context) = fixture_runtime("ticket55 owner config", "fixture-console-token-17");
     let cfg = json!({"ownerQQ": 2});
-    let store = crate::memory::MemoryStore::open(&context, &cfg).unwrap();
+    let store = crate::memory::open_store(&context, &cfg).unwrap();
     assert!(!store.for_reader("private:1").is_owner(), "ownerQQ 2 must not make private:1 the owner");
     assert!(store.for_reader("private:2").is_owner(), "the configured integer owner is the owner");
 }
