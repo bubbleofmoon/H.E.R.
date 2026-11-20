@@ -40,6 +40,58 @@ pub struct FileDigest {
 pub struct Manifest {
     pub version: u32,
     pub files: BTreeMap<String, FileDigest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_fingerprint: Option<MemoryFingerprint>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryFingerprint {
+    schema_sha256: String,
+    table_rows: BTreeMap<String, i64>,
+}
+
+fn memory_fingerprint(db: &Connection, check: Check<'_>) -> Result<MemoryFingerprint, String> {
+    let version: i64 = db
+        .query_row("PRAGMA main.user_version", [], |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    let mut statement = db
+        .prepare("SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name")
+        .map_err(|e| e.to_string())?;
+    let entries = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut schema = Sha256::new();
+    schema.update(version.to_le_bytes());
+    let mut table_rows = BTreeMap::new();
+    for entry in entries {
+        check()?;
+        let entry = entry.map_err(|e| e.to_string())?;
+        schema.update(serde_json::to_vec(&entry).map_err(|e| e.to_string())?);
+        schema.update(b"\n");
+        let (kind, name, _, _) = entry;
+        if kind == "table" {
+            let quoted = name.replace('"', "\"\"");
+            let count = db
+                .query_row(&format!("SELECT COUNT(*) FROM main.\"{quoted}\""), [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| e.to_string())?;
+            table_rows.insert(name, count);
+        }
+    }
+    check()?;
+    Ok(MemoryFingerprint {
+        schema_sha256: format!("{:x}", schema.finalize()),
+        table_rows,
+    })
 }
 
 /// Backup policy read afresh for each run.
@@ -837,18 +889,19 @@ fn create_memory_snapshot(
     ensure_destination(&destination)?;
     let scratch = Scratch::new(&destination)?;
     let database = scratch.0.join("memory.db");
-    online_snapshot(
-        crate::memory::open_read_only_for_runtime(context)?,
-        &database,
-        "memory",
-        check,
-    )?;
+    let source = crate::memory::open_read_only_for_runtime(context)?;
+    source.busy_timeout(Duration::from_millis(100)).map_err(|e| e.to_string())?;
+    // Pin the live view through both operations, even if another connection writes to the WAL.
+    source.execute_batch("BEGIN DEFERRED").map_err(|e| e.to_string())?;
+    let fingerprint = memory_fingerprint(&source, check)?;
+    online_snapshot(source, &database, "memory", check)?;
     let candidate = scratch.0.join("archive.zip");
     let file = crate::guarded_credentials::create_credential(&candidate).map_err(|e| e.to_string())?;
     let mut archive = ZipWriter::new(file);
     let mut manifest = Manifest {
         version: 1,
         files: BTreeMap::new(),
+        memory_fingerprint: Some(fingerprint),
     };
     add(
         &mut archive,
@@ -911,9 +964,20 @@ fn restore_test(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, S
         return Err("no local memory backup to restore".into());
     }
     let _lock = DestinationLock::acquire(&destination, check)?;
-    let (_, archive, _) = archive_files(&destination, check)?
+    let archive = archive_files(&destination, check)?
         .into_iter()
-        .next()
+        .filter_map(|(_, path, _)| {
+            let name = path.file_stem()?.to_str()?;
+            // archive_files already checked the fixed-width ASCII timestamp and suffix shape.
+            let (stamp, suffix) = name.split_at("qqbot-YYYY-MM-DDTHH-mm-ss".len());
+            let collision = match suffix.strip_prefix('-') {
+                Some(number) => number.parse::<u64>().ok()?,
+                None => 0,
+            };
+            Some(((stamp.to_owned(), collision), path))
+        })
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, path)| path)
         .ok_or("no local memory backup to restore")?;
     let scratch = Scratch::new(&destination)?;
     for directory in ["config", "data", "resources"] {
@@ -928,7 +992,14 @@ fn restore_test(context: &RuntimeContext, check: Check<'_>) -> Result<PathBuf, S
     }
     let runtime = RuntimeContext::from_root(&scratch.0)?;
     let file = File::open(&archive).map_err(|e| e.to_string())?;
-    verify_payload(file, check, Verification::MemoryBackup, runtime.data_dir())?;
+    let (manifest, _) = verify_payload(file, check, Verification::MemoryBackup, runtime.data_dir())?;
+    let expected = manifest.memory_fingerprint.ok_or("memory backup fingerprint missing")?;
+    // Compare the restored bytes before the normal application open can migrate them.
+    let restored = crate::memory::open_read_only_for_runtime(&runtime)?;
+    if memory_fingerprint(&restored, check)? != expected {
+        return Err("restored memory fingerprint mismatch".into());
+    }
+    drop(restored);
     let db = crate::memory::open_ready_for_runtime(&runtime)?;
     db.query_row("SELECT EXISTS(SELECT 1 FROM memory)", [], |row| {
         row.get::<_, bool>(0)
@@ -1094,6 +1165,7 @@ fn create_snapshot(
     let mut manifest = Manifest {
         version: 1,
         files: BTreeMap::new(),
+        memory_fingerprint: None,
     };
     for name in databases {
         add(
@@ -1522,6 +1594,63 @@ mod tests {
         let failed = run_scheduled(&fixture, task, march);
         assert_eq!(failed.state, RunState::Failed, "the drill must fail when restoration fails");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 3, "the failed drill also removes its runtime");
+    }
+
+    #[test]
+    fn monthly_drill_checks_the_fingerprint_of_the_newest_named_archive() {
+        let fixture = Fixture::new("monthly-fingerprint");
+        let context = fixture.context();
+        let db = crate::memory::open_ready_for_runtime(&context).unwrap();
+        db.execute_batch(r#"CREATE TABLE "quoted""table" (value TEXT);
+                            INSERT INTO "quoted""table" VALUES ('fixture');"#).unwrap();
+        let nightly = run_scheduled(
+            &fixture, TaskId::MemoryBackup, timestamp("2026-01-31T04:00:00Z"),
+        );
+        assert_eq!(nightly.state, RunState::Succeeded, "{nightly:?}");
+
+        let root = fixture.0.join("backups/memory");
+        let latest = root.join("qqbot-2026-01-31T04-00-00.zip");
+        fs::write(root.join("qqbot-2026-01-30T04-00-00.zip"), "broken older ZIP").unwrap();
+        fs::File::options().write(true).open(&latest).unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(86_400)).unwrap();
+        db.execute_batch(r#"INSERT INTO "quoted""table" VALUES ('after backup');"#).unwrap();
+        let completed = run_scheduled(
+            &fixture, TaskId::MemoryRestoreTest, timestamp("2026-02-01T05:30:00Z"),
+        );
+        assert_eq!(completed.state, RunState::Succeeded, "the filename timestamp selects the archive: {completed:?}");
+
+        // Keep the ZIP and the database file hash valid while altering the expected fingerprint.
+        use std::io::{Read, Write};
+        let mut archive = zip::ZipArchive::new(fs::File::open(&latest).unwrap()).unwrap();
+        let mut database = Vec::new();
+        archive.by_name("memory.db").unwrap().read_to_end(&mut database).unwrap();
+        let manifest: serde_json::Value = serde_json::from_reader(
+            archive.by_name("manifest.json").unwrap(),
+        ).unwrap();
+        drop(archive);
+        for (date, field) in [
+            ("2026-03-01T05:30:00Z", "table_rows"),
+            ("2026-04-01T05:30:00Z", "schema_sha256"),
+        ] {
+            let mut manifest = manifest.clone();
+            let fingerprint = &mut manifest["memory_fingerprint"];
+            assert_eq!(fingerprint["table_rows"]["quoted\"table"], json!(1));
+            match field {
+                "table_rows" => fingerprint[field]["quoted\"table"] = json!(2),
+                _ => fingerprint[field] = json!("different schema digest"),
+            }
+            let mut writer = zip::ZipWriter::new(fs::File::create(&latest).unwrap());
+            writer.start_file("memory.db", zip::write::FileOptions::default()).unwrap();
+            writer.write_all(&database).unwrap();
+            writer.start_file("manifest.json", zip::write::FileOptions::default()).unwrap();
+            serde_json::to_writer(&mut writer, &manifest).unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            let failed = run_scheduled(&fixture, TaskId::MemoryRestoreTest, timestamp(date));
+            assert_eq!(failed.reason.as_deref(), Some("restored memory fingerprint mismatch"),
+                "the drill must reject a mismatched {field}: {failed:?}");
+            assert_eq!(failed.state, RunState::Failed);
+        }
     }
 
     fn timestamp(utc: &str) -> i64 {
