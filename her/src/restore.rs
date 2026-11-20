@@ -49,6 +49,7 @@ struct Prepared {
     zip: PathBuf,
     files: BTreeMap<String, (RuntimeArea, String)>,
     state_included: bool,
+    config: Option<Vec<u8>>,
     view: Value,
 }
 
@@ -217,6 +218,10 @@ fn current_files(
 
 impl Prepared {
     fn open(context: &RuntimeContext, path: &Path, memory_only: bool) -> Result<Self, String> {
+        Self::open_internal(context, path, memory_only, true)
+    }
+
+    fn open_internal(context: &RuntimeContext, path: &Path, memory_only: bool, check_destination: bool) -> Result<Self, String> {
         let absolute = if path.is_absolute() {
             path.to_owned()
         } else {
@@ -277,6 +282,7 @@ impl Prepared {
             warnings.push(password_warning);
         }
         let mut state_included = true;
+        let mut config_bytes = None;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -295,6 +301,12 @@ impl Prepared {
                 context.runtime_root().ok_or("runtime root missing")?,
                 &config,
             )?;
+            console_auth::read_protected_auth_file(context, console_auth::TOKEN_FILE, 1024 * 1024)?;
+            if check_destination && configured_token(text.as_bytes())?.is_none() {
+                let live = console_auth::raw_token_config(context)?;
+                if context.effective_console_token(&live).is_empty() { return Err(recovery_error()); }
+            }
+            config_bytes = Some(text.into_bytes());
         }
         let mut files = BTreeMap::new();
         for name in manifest.files.keys() {
@@ -314,6 +326,9 @@ impl Prepared {
             .map(|(_, (area, relative))| label(*area, relative))
             .collect();
         replacements.extend(files.clone());
+        if !memory_only {
+            replacements.insert(console_auth::TOKEN_FILE.into(), (RuntimeArea::Data, console_auth::TOKEN_FILE.into()));
+        }
         let replaces: Vec<_> = replacements
             .values()
             .map(|(area, relative)| label(*area, relative))
@@ -338,6 +353,7 @@ impl Prepared {
             zip,
             files,
             state_included,
+            config: config_bytes,
             view,
         })
     }
@@ -349,6 +365,9 @@ pub fn preview(
     archive: &Path,
     memory_only: bool,
 ) -> Result<Value, String> {
+    if recovery_pending(context) {
+        return Err(recovery_error());
+    }
     Ok(Prepared::open(context, archive, memory_only)?.view)
 }
 
@@ -516,10 +535,12 @@ impl Control for RealControl {
     }
     fn health(&mut self, context: &RuntimeContext, budget: Duration) -> Result<(), String> {
         let deadline = Instant::now() + budget;
+        let permit = verifying_recovery(context);
         loop {
-            let verdict = crate::health_check::check(
+            let verdict = crate::health_check::check_restore_candidate(
                 context.runtime_root().ok_or("runtime root missing")?,
                 deadline.min(Instant::now() + Duration::from_secs(5)),
+                permit,
             );
             let live = live_ready(context);
             if verdict.ok && live.is_ok() && Instant::now() <= deadline {
@@ -635,28 +656,262 @@ impl Step {
     }
 }
 
+pub(crate) const RECOVERY_DIR: &str = "console-restore-recovery";
+pub(crate) const RECOVERY_INTENT: &str = "console-restore-recovery/intent";
+pub(crate) const RECOVERY_REASON: &str = "full restore requires recovery";
+const RECOVERY_OUTCOME: &str = "console-restore-recovery/outcome";
+const FORWARD_CONFIG: &str = "console-restore-recovery/forward-config";
+const ROLLBACK_CONFIG: &str = "console-restore-recovery/rollback-config";
+const ROLLBACK_ARCHIVE: &str = "console-restore-recovery/rollback-archive";
+const DESTINATION_TOKEN: &str = "console-restore-recovery/destination-token";
+
+pub(crate) fn recovery_pending(context: &RuntimeContext) -> bool {
+    context.is_isolated()
+        && !matches!(console_auth::read_protected_auth_file(context, RECOVERY_INTENT, 4096), Ok(None))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum RestorePhase {
+    Forward,
+    Verifying,
+    Rollback,
+    Committed,
+    RolledBack,
+}
+
+impl RestorePhase {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Committed | Self::RolledBack)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryIntent {
+    v: u8,
+    phase: RestorePhase,
+    forward_config: [u8; 32],
+    rollback_config: [u8; 32],
+    rollback_archive: [u8; 32],
+    destination_token: [u8; 32],
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationToken {
+    configured: bool,
+    effective: String,
+    original_file: Option<Vec<u8>>,
+}
+
+struct RestorePair {
+    token: String,
+    config: Vec<u8>,
+}
+
+fn recovery_error() -> String {
+    RECOVERY_REASON.to_string()
+}
+
+fn hash_file(mut file: &File) -> Result<[u8; 32], String> {
+    let mut digest = Sha256::new();
+    let mut bytes = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut bytes).map_err(|_| recovery_error())?;
+        if count == 0 { return Ok(digest.finalize().into()); }
+        digest.update(&bytes[..count]);
+    }
+}
+
+fn protected_stash_dir(context: &RuntimeContext) -> Result<(), String> {
+    let path = context.resolve_path(RuntimeArea::Data, RECOVERY_DIR, PathIntent::CreateDirectory)?;
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(recovery_error()),
+    }
+    if context.resolve_path(RuntimeArea::Data, RECOVERY_DIR, PathIntent::ReadDirectory)? != path {
+        return Err(recovery_error());
+    }
+    crate::guarded_credentials::restrict_credential(&path).map_err(|_| recovery_error())?;
+    crate::guarded_file::sync_directory(context.data_dir()).map_err(|_| recovery_error())
+}
+
+fn configured_token(raw: &[u8]) -> Result<Option<String>, String> {
+    let text = std::str::from_utf8(raw).map_err(|_| recovery_error())?;
+    let raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| recovery_error())?;
+    let (cfg, _) = crate::config::canonical_config(&raw).map_err(|_| recovery_error())?;
+    Ok(cfg.get("consoleToken").and_then(Value::as_str).map(str::trim)
+        .filter(|value| !value.is_empty()).map(str::to_owned))
+}
+
+fn checked_recovery_bytes(context: &RuntimeContext, name: &str, digest: [u8; 32]) -> Result<Vec<u8>, String> {
+    let bytes = console_auth::read_protected_auth_file(context, name, 16 * 1024 * 1024)?
+        .ok_or_else(recovery_error)?;
+    if !console_auth::digests_equal(&digest, &Sha256::digest(&bytes).into()) {
+        return Err(recovery_error());
+    }
+    Ok(bytes)
+}
+
+fn read_recovery_intent(context: &RuntimeContext, name: &str) -> Result<Option<RecoveryIntent>, String> {
+    let Some(bytes) = console_auth::read_protected_auth_file(context, name, 4096)? else { return Ok(None) };
+    let intent: RecoveryIntent = serde_json::from_slice(&bytes).map_err(|_| recovery_error())?;
+    if intent.v != 1 { return Err(recovery_error()); }
+    Ok(Some(intent))
+}
+
+pub(crate) fn verifying_recovery(context: &RuntimeContext) -> Option<[u8; 32]> {
+    let bytes = console_auth::read_protected_auth_file(context, RECOVERY_INTENT, 4096).ok()??;
+    let intent: RecoveryIntent = serde_json::from_slice(&bytes).ok()?;
+    (intent.v == 1 && intent.phase == RestorePhase::Verifying).then(|| Sha256::digest(&bytes).into())
+}
+
+fn publish_recovery_intent(context: &RuntimeContext, intent: &RecoveryIntent) -> Result<(), String> {
+    let bytes = serde_json::to_vec(intent).map_err(|_| recovery_error())?;
+    context.write_atomic(RuntimeArea::Data, RECOVERY_INTENT, &bytes).map_err(|_| recovery_error())
+}
+
+fn set_restore_phase(context: &RuntimeContext, phase: RestorePhase) -> Result<(), String> {
+    let mut intent = read_recovery_intent(context, RECOVERY_INTENT)?.ok_or_else(recovery_error)?;
+    intent.phase = phase;
+    publish_recovery_intent(context, &intent)
+}
+
+fn clear_finished_recovery(context: &RuntimeContext) -> Result<(), String> {
+    for name in [FORWARD_CONFIG, ROLLBACK_CONFIG, ROLLBACK_ARCHIVE, DESTINATION_TOKEN] {
+        console_auth::remove_auth_file(context, name)?;
+    }
+    console_auth::remove_auth_file(context, RECOVERY_OUTCOME)
+}
+
+// A terminal outcome survives namespace cleanup and lets recovery retry just the cleanup.
+fn finish_recovery(context: &RuntimeContext, phase: RestorePhase) -> Result<(), String> {
+    let _gate = crate::console::config_gate(context).map_err(|(_, e)| e)?;
+    let mut intent = read_recovery_intent(context, RECOVERY_INTENT)?.ok_or_else(recovery_error)?;
+    intent.phase = phase;
+    publish_recovery_intent(context, &intent)?;
+    let bytes = serde_json::to_vec(&intent).map_err(|_| recovery_error())?;
+    context.write_atomic(RuntimeArea::Data, RECOVERY_OUTCOME, &bytes)?;
+    console_auth::remove_auth_file(context, RECOVERY_INTENT)?;
+    if clear_finished_recovery(context).is_err() {
+        crate::safe_eprintln!("[restore] terminal recovery cleanup remains pending");
+    }
+    Ok(())
+}
+
+fn stage_full_restore(
+    context: &RuntimeContext, forward: &Prepared, rollback: &Prepared,
+) -> Result<RestorePair, String> {
+    protected_stash_dir(context)?;
+    if read_recovery_intent(context, RECOVERY_OUTCOME)?.is_some() {
+        clear_finished_recovery(context)?;
+    }
+    let forward_config = forward.config.as_deref().ok_or_else(recovery_error)?;
+    let rollback_config = rollback.config.as_deref().ok_or_else(recovery_error)?;
+    let live = console_auth::raw_token_config(context)?;
+    let effective = context.effective_console_token(&live);
+    let mode = configured_token(live.to_string().as_bytes())?;
+    if effective.is_empty() || configured_token(rollback_config)? != mode {
+        return Err(recovery_error());
+    }
+    let original_file = console_auth::read_protected_auth_file(context, console_auth::TOKEN_FILE, 1024 * 1024)?;
+    let captured = DestinationToken { configured: mode.is_some(), effective, original_file };
+    let serialized = serde_json::to_vec(&captured).map_err(|_| recovery_error())?;
+    let archive = File::open(&rollback.zip).map_err(|_| recovery_error())?;
+    let rollback_digest = hash_file(&archive)?;
+    for (name, bytes) in [(FORWARD_CONFIG, forward_config), (ROLLBACK_CONFIG, rollback_config), (DESTINATION_TOKEN, serialized.as_slice())] {
+        context.write_atomic(RuntimeArea::Data, name, bytes)?;
+    }
+    let mut archive = File::open(&rollback.zip).map_err(|_| recovery_error())?;
+    context.write_atomic_from(RuntimeArea::Data, ROLLBACK_ARCHIVE, &mut archive, None)?;
+    let intent = RecoveryIntent {
+        v: 1, phase: RestorePhase::Forward,
+        forward_config: Sha256::digest(forward_config).into(),
+        rollback_config: Sha256::digest(rollback_config).into(),
+        rollback_archive: rollback_digest,
+        destination_token: Sha256::digest(&serialized).into(),
+    };
+    let config = checked_recovery_bytes(context, FORWARD_CONFIG, intent.forward_config)?;
+    let token = configured_token(&config)?.unwrap_or(captured.effective);
+    publish_recovery_intent(context, &intent)?;
+    Ok(RestorePair { token, config })
+}
+
+fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair), String> {
+    let intent = read_recovery_intent(context, RECOVERY_INTENT)?.ok_or_else(recovery_error)?;
+    checked_recovery_bytes(context, FORWARD_CONFIG, intent.forward_config)?;
+    let config = checked_recovery_bytes(context, ROLLBACK_CONFIG, intent.rollback_config)?;
+    let token_bytes = checked_recovery_bytes(context, DESTINATION_TOKEN, intent.destination_token)?;
+    let token: DestinationToken = serde_json::from_slice(&token_bytes).map_err(|_| recovery_error())?;
+    let mode = configured_token(&config)?;
+    let saved_file = token.original_file.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::trim);
+    if token.effective.is_empty() || token.configured != mode.is_some()
+        || mode.as_deref().or(saved_file) != Some(token.effective.as_str())
+    {
+        return Err(recovery_error());
+    }
+    let archive = context.resolve_path(RuntimeArea::Data, ROLLBACK_ARCHIVE, PathIntent::ReadFile)?;
+    let file = console_auth::open_protected_auth_file(&archive)?.ok_or_else(recovery_error)?;
+    if !console_auth::digests_equal(&intent.rollback_archive, &hash_file(&file)?) {
+        return Err(recovery_error());
+    }
+    let prepared = Prepared::open_internal(context, &archive, false, false)?;
+    if prepared.config.as_ref() != Some(&config) {
+        return Err(recovery_error());
+    }
+    Ok((prepared, RestorePair { config, token: token.effective }))
+}
+
+#[derive(Clone, Copy)]
+enum FullPublication<'a> {
+    Forward(&'a Prepared),
+    Rollback(&'a RestorePair),
+}
+
 /// Quiesce first, then acquire config/social-state, transport authority and the settings store in that order.
 /// Release the publication gates before reconciliation or restart.
 fn stop_and_replace(
     context: &RuntimeContext,
     by: &str,
     prepared: &Prepared,
-    memory_only: bool,
+    full: Option<FullPublication<'_>>,
     control: &mut dyn Control,
 ) -> Result<(), Step> {
+    let memory_only = full.is_none();
     let stopped = quiesce(context, by, memory_only, control)?;
-    if memory_only {
-        apply(context, prepared, true, control, None)?;
-    } else {
+    if let Some(publication) = full {
         let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?;
         let authority = context.authority_gate().map_err(Step::Refused)?;
         let _store = crate::settings::restore_gate(context).map_err(Step::Refused)?;
-        let generation = control.publish_generation(context);
-        generation.map_err(|error| match error {
-            GenerationWriteError::Unpublished(error) => Step::Refused(error),
-            GenerationWriteError::Published(error) => Step::Failed(error),
+        let staged;
+        let pair = match publication {
+            FullPublication::Forward(rollback) => {
+                staged = stage_full_restore(context, prepared, rollback)
+                    .map_err(|e| if recovery_pending(context) { Step::Failed(e) } else { Step::Refused(e) })?;
+                &staged
+            }
+            FullPublication::Rollback(pair) => {
+                set_restore_phase(context, RestorePhase::Rollback)?;
+                pair
+            }
+        };
+        control.publish_generation(context).map_err(|error| match error {
+            GenerationWriteError::Unpublished(error) | GenerationWriteError::Published(error) => Step::Failed(error),
         })?;
+        console_auth::remove_auth_file(context, crate::console::DESKTOP_GRANTS_FILE)?;
         apply(context, prepared, false, control, Some(&authority))?;
+        control.replace(context, RuntimeArea::Data, console_auth::TOKEN_FILE, &mut pair.token.as_bytes(), Some(&authority))?;
+        control.replace(context, RuntimeArea::Config, "config.json", &mut pair.config.as_slice(), Some(&authority))?;
+    } else {
+        apply(context, prepared, true, control, None)?;
     }
     control.store_replaced(context);
     if !memory_only && prepared.files.contains_key("conversations.db") {
@@ -692,6 +947,7 @@ fn apply(
     let mut archive = zip::ZipArchive::new(File::open(&prepared.zip).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     for (name, (area, relative)) in &prepared.files {
+        if name == "config.json" { continue; }
         let mut source = archive.by_name(name).map_err(|e| e.to_string())?;
         control
             .replace(context, *area, relative, &mut source, authority)
@@ -867,6 +1123,14 @@ fn execute_with(
         let _restore = context
             .open_locked_file(RuntimeArea::Data, "locks/restore.lock")
             .map_err(|_| "another restore is running")?;
+        if recovery_pending(context) {
+            return Err(recovery_error());
+        }
+        let _credential = if memory_only { None } else { Some(console_auth::credential_mutation_gate(context)?) };
+        if !memory_only {
+            let _config = crate::console::config_gate(context).map_err(|(_, e)| e)?;
+            console_auth::reconcile_token_rotation(context)?;
+        }
         let prepared = Prepared::open(context, archive, memory_only)?;
         if confirmation != prepared.view["confirmation"].as_str().unwrap_or("") {
             return Err(
@@ -875,11 +1139,6 @@ fn execute_with(
             );
         }
         control.preflight(context)?;
-        let _credential = if memory_only {
-            None
-        } else {
-            Some(console_auth::credential_mutation_gate(context)?)
-        };
         let config = context.load_config().map_err(str::to_owned)?;
         audit(
             context,
@@ -905,11 +1164,17 @@ fn execute_with(
         #[cfg(feature = "parity-clock")]
         control.snapshot_ready()?;
         let attempt = (|| -> Result<(), Step> {
-            stop_and_replace(context, by, &prepared, memory_only, control)?;
+            stop_and_replace(context, by, &prepared, (!memory_only).then_some(FullPublication::Forward(&rollback)), control)?;
+            if !memory_only {
+                let _config = crate::console::config_gate(context).map_err(|(_, e)| Step::Failed(e))?;
+                set_restore_phase(context, RestorePhase::Verifying)?;
+            }
             resume(context, by)?;
             control.restart(context)?;
             control.health(context, Duration::from_secs(120))?;
-            Ok(crate::backup::protect_pre_restore(&previous, &|| Ok(()))?)
+            crate::backup::protect_pre_restore(&previous, &|| Ok(()))?;
+            if !memory_only { finish_recovery(context, RestorePhase::Committed)?; }
+            Ok(())
         })();
         match attempt {
             Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
@@ -928,7 +1193,18 @@ fn execute_with(
             Err(Step::Failed(reason)) => {
                 // Always re-quiesce; a failed health check may leave live writers running.
                 let undo = (|| {
-                    stop_and_replace(context, by, &rollback, memory_only, control).map_err(Step::message)?;
+                    if memory_only {
+                        stop_and_replace(context, by, &rollback, None, control).map_err(Step::message)?;
+                    } else {
+                        let terminal = read_recovery_intent(context, RECOVERY_INTENT)?
+                            .or(read_recovery_intent(context, RECOVERY_OUTCOME)?)
+                            .is_some_and(|intent| intent.phase.terminal());
+                        if terminal || !recovery_pending(context) { return Err(recovery_error()); }
+                        let (rollback, pair) = rollback_artifacts(context)?;
+                        stop_and_replace(context, by, &rollback, Some(FullPublication::Rollback(&pair)), control)
+                            .map_err(Step::message)?;
+                        finish_recovery(context, RestorePhase::RolledBack)?;
+                    }
                     resume(context, by)?;
                     control.restart(context)?;
                     crate::backup::protect_pre_restore(&previous, &|| Ok(()))
@@ -1012,9 +1288,64 @@ impl Control for CliFixtureControl {
     }
     fn health(&mut self, _: &RuntimeContext, _: Duration) -> Result<(), String> {
         Self::barrier("health")?;
-        Err("restore fixture candidate health failed".into())
+        if std::env::var_os("HER_TEST_RESTORE_HEALTH").as_deref() == Some(std::ffi::OsStr::new("pass")) {
+            Ok(())
+        } else {
+            Err("restore fixture candidate health failed".into())
+        }
     }
     fn alert(&mut self, _: &RuntimeContext, _: &Value, _: &str) {}
+    fn replace(
+        &mut self, context: &RuntimeContext, area: RuntimeArea, relative: &str,
+        input: &mut dyn Read, authority: Option<&AuthorityGuard<'_>>,
+    ) -> Result<(), String> {
+        if std::env::var_os("HER_TEST_RESTORE_PAIR_STEPS").is_some()
+            && ((area == RuntimeArea::Config && relative == "config.json") || (area == RuntimeArea::Data && relative == console_auth::TOKEN_FILE))
+        {
+            let intent = read_recovery_intent(context, RECOVERY_INTENT)?.ok_or_else(recovery_error)?;
+            if area == RuntimeArea::Config && relative == "config.json" {
+                let stage = if intent.phase == RestorePhase::Rollback { "rollback-pair" } else { "forward-pair" };
+                Self::barrier(stage)?;
+            } else if area == RuntimeArea::Data && relative == console_auth::TOKEN_FILE && intent.phase == RestorePhase::Rollback {
+                Self::barrier("rollback-before-token")?;
+            }
+        }
+        context.write_atomic_from(area, relative, input, authority)
+    }
+}
+
+fn recover_with(context: &RuntimeContext, control: &mut dyn Control) -> Result<Value, String> {
+    let _operation = operation_gate(context)?;
+    let _restore = context.open_locked_file(RuntimeArea::Data, "locks/restore.lock")?;
+    let _credential = console_auth::credential_mutation_gate(context)?;
+    let by = "her-cli:restore-recovery";
+    let phase = {
+        let _config = crate::console::config_gate(context).map_err(|(_, e)| e)?;
+        match read_recovery_intent(context, RECOVERY_INTENT)? {
+            Some(intent) => intent.phase,
+            None => {
+                let outcome = read_recovery_intent(context, RECOVERY_OUTCOME)?.ok_or_else(recovery_error)?;
+                if !outcome.phase.terminal() { return Err(recovery_error()); }
+                clear_finished_recovery(context)?;
+                return Ok(json!({"ok":true,"result":"cleanup-complete"}));
+            }
+        }
+    };
+    if phase.terminal() {
+        finish_recovery(context, phase)?;
+        if phase == RestorePhase::RolledBack {
+            resume(context, by)?;
+            control.restart(context)?;
+        }
+        return Ok(json!({"ok":true,"result":"cleanup-complete"}));
+    }
+    let (rollback, pair) = rollback_artifacts(context)?;
+    control.preflight(context)?;
+    stop_and_replace(context, by, &rollback, Some(FullPublication::Rollback(&pair)), control).map_err(Step::message)?;
+    finish_recovery(context, RestorePhase::RolledBack)?;
+    resume(context, by)?;
+    control.restart(context)?;
+    Ok(json!({"ok":true,"result":"rolled-back"}))
 }
 
 /// Terminal entry: print the same preview as the console, then require a deliberate confirmation.
@@ -1022,6 +1353,18 @@ pub fn run_cli(args: &[String]) -> i32 {
     fn run(args: &[String]) -> Result<Value, String> {
         if args.first().map(String::as_str) != Some("restore") {
             return Err("usage: her-cli backup restore <archive> --runtime-root <root> [--memory-only] [--preview] [--confirm <confirmation>]".into());
+        }
+        if args.get(1).map(String::as_str) == Some("--recover") {
+            let [_, _, option, root] = args else { return Err("usage: her-cli backup restore --recover --runtime-root <root>".into()) };
+            if option != "--runtime-root" || !Path::new(root).is_absolute() {
+                return Err("usage: her-cli backup restore --recover --runtime-root <root>".into());
+            }
+            let context = RuntimeContext::for_console_recovery(Path::new(root)).map_err(str::to_owned)?;
+            #[cfg(feature = "parity-clock")]
+            if std::env::var_os("HER_TEST_RESTORE_CONTROL").as_deref() == Some(std::ffi::OsStr::new("stdio")) {
+                return recover_with(&context, &mut CliFixtureControl).map_err(|_| recovery_error());
+            }
+            return recover_with(&context, &mut RealControl).map_err(|_| recovery_error());
         }
         let archive = args
             .get(1)
@@ -1276,6 +1619,7 @@ mod tests {
         let before = fs::read(f.0.join("config/config.json")).unwrap();
         let p = preview(&f.context(), &archive, false).unwrap();
         assert_eq!(p["scope"], "everything");
+        assert!(p["replaces"].as_array().unwrap().contains(&json!("data/console-token")));
         assert!(p["time"].is_i64());
         assert!(p["contents"]
             .as_array()

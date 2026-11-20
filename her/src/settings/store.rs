@@ -8,9 +8,13 @@ mod console_auth;
 mod conversation;
 
 pub(crate) use console_auth::{
-    archive_credentials, reset_administrator_password, scrub_auth_snapshot,
+    admit_browser, archive_credentials, recheck_browser, reset_administrator_password,
+    revoke_browser_sessions, scrub_auth_snapshot, start_browser_clock,
     set_initial_administrator_password, ArchivedCredentials,
 };
+
+#[cfg(test)]
+pub(crate) use console_auth::seed_browser_session;
 
 pub(crate) use conversation::{
     apply_conversation, apply_switch_choice, canonical_conversation, conversation_admitted, conversation_value,

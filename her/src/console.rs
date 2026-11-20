@@ -50,6 +50,7 @@ pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
     revoke as revoke_agent_token, token as conversation_token,
 };
+#[cfg(test)]
 use crate::memory_actions::handle as handle_memory_action;
 #[cfg(test)]
 pub(crate) use crate::memory_actions::tool_action as memory_tool_action;
@@ -179,9 +180,8 @@ fn handle_backup_restore(context: &RuntimeContext, req: &Request) -> Result<Valu
         _ => return Err((400, "memoryOnly must be boolean".into())),
     };
     let applying = req.path == "/api/backups/restore";
-    let _authority = if applying { config_gate(context)? } else { None };
+    let _authority = config_gate(context)?;
     let cfg = selected_config_for_handler(context)?;
-    if !authorized_in(context, req, &cfg) { return Err((401, "console credential was revoked".into())); }
     let root = context.runtime_root().ok_or((400, "restore requires a selected runtime".to_string()))?;
     let settings = crate::backup::Settings::from_config_resolved(root, &cfg).map_err(|e| (400, e))?;
     let archive = settings.destination.join(name);
@@ -204,9 +204,6 @@ fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Resul
     }
     let _gate = config_gate(context)?;
     let current = selected_config_for_handler(context)?;
-    if !authorized_in(context, req, &current) {
-        return Err((401, "console credential was revoked".into()));
-    }
     let mut cfg = raw_config_for_write(context)?;
     if cfg.get("backup").is_none_or(Value::is_null) { cfg["backup"] = json!({}); }
     let base = cfg.clone();
@@ -247,9 +244,6 @@ fn handle_release_approve(context: &RuntimeContext, req: &Request) -> Result<Val
         .ok_or((400, "displayed release tag is required".into()))?;
     let _gate = config_gate(context)?;
     let cfg = selected_config_for_handler(context)?;
-    if !authorized_in(context, req, &cfg) {
-        return Err((401, "console credential was revoked".into()));
-    }
     crate::release::approve(context, &cfg, tag).map_err(|error| (409, error))
 }
 
@@ -258,8 +252,6 @@ fn handle_release_settings_post(context:&RuntimeContext,req:&Request)->Result<Va
     let Ok(Value::Object(fields))=serde_json::from_str::<Value>(&req.body) else {return Err((400,"body must be a JSON object".into()))};
     if fields.keys().any(|key|!matches!(key.as_str(),"policy"|"feedUrl")){return Err((400,"unknown update setting".into()));}
     let _gate=config_gate(context)?;
-    let current=selected_config_for_handler(context)?;
-    if !authorized_in(context,req,&current){return Err((401,"console credential was revoked".into()));}
     let mut cfg=raw_config_for_write(context)?;
     if cfg.get("update").is_none_or(Value::is_null){cfg["update"]=json!({});}
     let update=cfg["update"].as_object_mut().ok_or((400,"update must be an object".into()))?;
@@ -330,6 +322,11 @@ fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<()
         .map(Option::unwrap_or_default)
         .map_err(|e| format!("cannot read config.json before the write: {e}"));
     context.write_atomic(RuntimeArea::Config, "config.json", text.as_bytes())?;
+    record_config_publication(before, text);
+    Ok(())
+}
+
+pub(crate) fn record_config_publication(before: Result<String, String>, text: &str) {
     CONFIG_WRITES.with(|writes| {
         let mut writes = writes.borrow_mut();
         match writes.as_mut() {
@@ -337,7 +334,6 @@ fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<()
             None => *writes = Some((before, text.to_string())),
         }
     });
-    Ok(())
 }
 
 fn take_config_writes() -> Option<(Result<String, String>, String)> {
@@ -529,14 +525,15 @@ fn copy_file_for(context: &RuntimeContext, from: &str, to: &str) -> Result<(), S
     context.write_atomic(to_area, &to_relative, &bytes)
 }
 
-struct Request {
-    method: String,
-    path: String,
-    query: HashMap<String, String>,
-    headers: HashMap<String, String>,
+#[derive(Clone)]
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) query: HashMap<String, String>,
+    pub(crate) headers: HashMap<String, String>,
     /// 请求体。写类端点（P10-b）会用到，现在只有读类，先放行 dead_code。
     #[allow(dead_code)]
-    body: String,
+    pub(crate) body: String,
     /// The bounded reader stopped after proving this selected POST exceeds its 1 MB cap.
     body_too_large: bool,
 }
@@ -571,6 +568,7 @@ fn is_bounded_json_post(method: &str, path: &str) -> bool {
         || (method == "POST" && path.starts_with("/api/backups/"))
         || (method == "POST" && path.starts_with("/api/releases/"))
         || (method == "POST" && path.starts_with("/api/dependencies/"))
+        || (matches!(method, "GET" | "POST") && path == "/api/memory/acl")
         || (method == "POST" && path == "/api/restart")
         || (method == "POST" && path.starts_with("/api/settings/"))
 }
@@ -686,9 +684,9 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
                 duplicate_framing_header = true;
             }
             let value = v.trim().to_string();
-            if matches!(key.as_str(), "x-console-token" | "x-agent-token") {
+            if matches!(key.as_str(), "x-console-token" | "x-agent-token" | "host" | "origin" | "cookie" | "sec-fetch-site") {
                 if let Some(existing) = headers.get_mut(&key) {
-                    existing.push_str(", ");
+                    existing.push_str(if key == "cookie" { "; " } else { ", " });
                     existing.push_str(&value);
                 } else {
                     headers.insert(key, value);
@@ -723,14 +721,13 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
                 initial_body,
                 BOUNDED_POST_MAX_BODY_BYTES,
             )? {
-                ChunkedRequestBody::Complete(body_bytes) => Ok(Request {
-                    method,
-                    path,
-                    query: parse_query(&raw_query),
-                    headers,
-                    body: String::from_utf8_lossy(&body_bytes).to_string(),
-                    body_too_large: false,
-                }),
+                ChunkedRequestBody::Complete(body_bytes) => {
+                    let body = decode_request_body(&path, &body_bytes)?;
+                    Ok(Request {
+                        method, path, query: parse_query(&raw_query), headers, body,
+                        body_too_large: false,
+                    })
+                },
                 ChunkedRequestBody::TooLarge => Ok(Request {
                     method,
                     path,
@@ -791,14 +788,21 @@ fn read_request(stream: &mut TcpStream) -> Result<Request, RequestReadError> {
         let remaining = want - body_bytes.len();
         body_bytes.extend_from_slice(&chunk[..n.min(remaining)]);
     }
+    if path == "/api/memory/acl" && body_bytes.len() != want {
+        return Err(RequestReadError::Invalid);
+    }
+    let body = decode_request_body(&path, &body_bytes)?;
     Ok(Request {
-        method,
-        path,
-        query: parse_query(&raw_query),
-        headers,
-        body: String::from_utf8_lossy(&body_bytes).to_string(),
+        method, path, query: parse_query(&raw_query), headers, body,
         body_too_large: false,
     })
+}
+
+fn decode_request_body(path: &str, bytes: &[u8]) -> Result<String, RequestReadError> {
+    if path == "/api/memory/acl" {
+        return std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| RequestReadError::Invalid);
+    }
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 enum ChunkedRequestBody {
@@ -978,21 +982,35 @@ fn read_chunked_request_body(
     }
 }
 
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
+fn respond(stream: &mut TcpStream, response: ConsoleResponse) {
+    let ConsoleResponse { status, content_type, body, redirect, cookies } = response;
     let reason = match status {
         200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
+        302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
         body.len()
     );
+    if let Some((port, mount)) = redirect {
+        head.push_str(&format!("Location: {}{mount}\r\n", crate::console_auth::canonical_origin(port)));
+    }
+    for cookie in cookies {
+        head.push_str(&format!("Set-Cookie: {}\r\n", cookie.header()));
+    }
+    head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body.as_bytes());
     let _ = stream.flush();
@@ -1013,6 +1031,7 @@ fn authorized(req: &Request, cfg: &Value) -> bool {
 
 /// `authorized` against the credential the runtime actually accepts (a selected runtime's
 /// generated token lives in `data/console-token` while `config.json` holds "").
+#[cfg(test)]
 fn authorized_in(context: &RuntimeContext, req: &Request, cfg: &Value) -> bool {
     token_supplied(req, &context.effective_console_token(cfg))
 }
@@ -1022,64 +1041,172 @@ fn presented_console_token(req: &Request) -> Option<&str> {
 }
 
 fn token_supplied(req: &Request, expected: &str) -> bool {
-    presented_console_token(req).is_some_and(|presented| {
-        credential_eq(expected, presented) || desktop_session_valid(presented, expected)
-    })
+    presented_console_token(req).is_some_and(|presented| credential_eq(expected, presented))
 }
 
+#[cfg(any(windows, test))]
 fn desktop_file_proof_matches(req: &Request, expected: &str) -> bool {
     presented_console_token(req).is_some_and(|presented| credential_eq(expected, presented))
 }
 
-struct DesktopSession {
+pub(crate) const DESKTOP_GRANTS_FILE: &str = "console-desktop-grants";
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DesktopProof {
     bearer_digest: [u8; 32],
-    token_digest: [u8; 32],
-    generation: u64,
-    expires: std::time::Instant,
+    generation: [u8; 32],
+    issuer_pid: u32,
+    issuer_start: u64,
 }
 
-// Independent of credential contents: restoring an old token never restores its sessions.
-static DESKTOP_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn desktop_sessions() -> &'static std::sync::Mutex<std::collections::VecDeque<DesktopSession>> {
-    static SESSIONS: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<DesktopSession>>> = std::sync::OnceLock::new();
-    SESSIONS.get_or_init(Default::default)
+pub(crate) fn recheck_desktop(
+    context: &RuntimeContext, proof: &DesktopProof, token: &[u8; 32],
+) -> Result<bool, (u16, String)> {
+    let current = selected_desktop_proof(context, &proof.bearer_digest, token)?;
+    Ok(current.is_some_and(|current| {
+        current.issuer_pid == proof.issuer_pid
+            && current.issuer_start == proof.issuer_start
+            && digests_equal(&current.generation, &proof.generation)
+    }))
 }
 
-fn desktop_session_valid(bearer: &str, expected: &str) -> bool {
-    if bearer.is_empty() || expected.is_empty() {
-        return false;
+#[cfg(not(windows))]
+fn selected_desktop_proof(
+    _: &RuntimeContext, _: &[u8; 32], _: &[u8; 32],
+) -> Result<Option<DesktopProof>, (u16, String)> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn selected_desktop_proof(
+    context: &RuntimeContext, bearer: &[u8; 32], token: &[u8; 32],
+) -> Result<Option<DesktopProof>, (u16, String)> {
+    let Some(registry) = desktop_grants::read(context)? else { return Ok(None) };
+    let now = desktop_grants::ticks();
+    if !registry.verified(context) {
+        return Ok(None);
     }
-    let Ok(mut sessions) = desktop_sessions().lock() else { return false; };
-    let now = std::time::Instant::now();
-    sessions.retain(|session| session.expires > now);
-    let token_digest = credential_digest(expected);
-    let bearer_digest = credential_digest(bearer);
-    let generation = DESKTOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-    sessions.iter().any(|session| {
-        digests_equal(&session.bearer_digest, &bearer_digest)
-            && digests_equal(&session.token_digest, &token_digest)
-            && session.generation == generation
-    })
+    Ok(registry.grants.iter().find(|grant| {
+        grant.issued <= now && now < grant.expires
+            && digests_equal(bearer, &grant.bearer_digest) && digests_equal(token, &grant.token_digest)
+    }).map(|_| DesktopProof {
+        bearer_digest: *bearer,
+        generation: registry.generation,
+        issuer_pid: registry.issuer_pid,
+        issuer_start: registry.issuer_start,
+    }))
 }
 
-fn issue_desktop_session(expected: &str, generation: u64) -> Result<String, String> {
-    if expected.is_empty() {
-        return Err("effective console credential is unavailable".to_string());
+#[cfg(windows)]
+mod desktop_grants {
+    use super::*;
+
+    const LIFETIME: u64 = 12 * 60 * 60 * 1000;
+    const LIMIT: usize = 128;
+
+    #[cfg(test)]
+    thread_local! {
+        static TEST_TICKS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
-    let token = generate_console_token()?;
-    let mut sessions = desktop_sessions().lock().map_err(|_| "desktop sessions are unavailable")?;
-    let now = std::time::Instant::now();
-    sessions.retain(|session| session.expires > now);
-    // A bounded number of browser sessions; the oldest is replaced on a new sign-in.
-    while sessions.len() >= 128 { sessions.pop_front(); }
-    sessions.push_back(DesktopSession {
-        bearer_digest: credential_digest(&token),
-        token_digest: credential_digest(expected),
-        generation,
-        expires: now + std::time::Duration::from_secs(12 * 60 * 60),
-    });
-    Ok(token)
+
+    pub(super) fn ticks() -> u64 {
+        #[cfg(test)]
+        if let Some(ticks) = TEST_TICKS.with(std::cell::Cell::get) { return ticks; }
+        // SAFETY: GetTickCount64 takes no arguments.
+        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct Registry {
+        v: u8,
+        pub(super) generation: [u8; 32],
+        pub(super) issuer_pid: u32,
+        pub(super) issuer_start: u64,
+        pub(super) grants: std::collections::VecDeque<Grant>,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct Grant {
+        pub(super) bearer_digest: [u8; 32],
+        pub(super) token_digest: [u8; 32],
+        pub(super) issued: u64,
+        pub(super) expires: u64,
+    }
+
+    fn unavailable() -> (u16, String) {
+        (503, "desktop grant registry is unavailable".into())
+    }
+
+    fn owner(context: &RuntimeContext) -> Option<crate::lifecycle::ProcessIdentity> {
+        let path = context.resolve_path(RuntimeArea::Data, "logs/rbridge-console.lock", PathIntent::ReadFile).ok()?;
+        match crate::lifecycle::OwnerGate::new(path).probe() {
+            crate::lifecycle::OwnerProbe::Held { marker: Some(marker) }
+                if marker.role == "console"
+                    && crate::lifecycle::current_identity().is_ok_and(|current| crate::update::health_image(&current.exe, &marker.identity.exe))
+                    && matches!(crate::lifecycle::check_identity(&marker.identity), crate::lifecycle::Liveness::Matches) =>
+            {
+                Some(marker.identity)
+            }
+            _ => None,
+        }
+    }
+
+    impl Registry {
+        pub(super) fn verified(&self, context: &RuntimeContext) -> bool {
+            owner(context).is_some_and(|identity| identity.pid == self.issuer_pid && identity.start == self.issuer_start)
+        }
+    }
+
+    pub(super) fn read(context: &RuntimeContext) -> Result<Option<Registry>, (u16, String)> {
+        let Some(bytes) = crate::console_auth::read_protected_auth_file(context, DESKTOP_GRANTS_FILE, 128 * 1024)
+            .map_err(|_| unavailable())? else { return Ok(None) };
+        let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+        let mut ids = std::collections::HashSet::new();
+        if registry.v != 1 || registry.issuer_pid == 0 || registry.issuer_start == 0 || registry.grants.len() > LIMIT
+            || registry.grants.iter().any(|grant| grant.issued.checked_add(LIFETIME) != Some(grant.expires) || !ids.insert(grant.bearer_digest))
+        {
+            return Err(unavailable());
+        }
+        Ok(Some(registry))
+    }
+
+    fn write(context: &RuntimeContext, registry: &Registry) -> Result<(), (u16, String)> {
+        let bytes = serde_json::to_vec(registry).map_err(|_| unavailable())?;
+        context.write_atomic(RuntimeArea::Data, DESKTOP_GRANTS_FILE, &bytes).map_err(|_| unavailable())
+    }
+
+    pub(super) fn current_issuer(context: &RuntimeContext) -> Result<Registry, (u16, String)> {
+        let owner = owner(context).filter(|identity| identity.pid == std::process::id()).ok_or_else(unavailable)?;
+        if let Some(existing) = read(context)? {
+            if existing.issuer_pid == owner.pid && existing.issuer_start == owner.start {
+                return Ok(existing);
+            }
+        }
+        let registry = Registry {
+            v: 1, generation: crate::console_auth::new_generation().map_err(|_| unavailable())?,
+            issuer_pid: owner.pid, issuer_start: owner.start, grants: Default::default(),
+        };
+        write(context, &registry)?;
+        Ok(registry)
+    }
+
+    pub(super) fn issue(
+        context: &RuntimeContext, mut registry: Registry, token_digest: [u8; 32],
+    ) -> Result<String, (u16, String)> {
+        let token = generate_console_token().map_err(|_| unavailable())?;
+        let now = ticks();
+        let expires = now.checked_add(LIFETIME).ok_or_else(unavailable)?;
+        registry.grants.retain(|grant| grant.issued <= now && now < grant.expires);
+        while registry.grants.len() >= LIMIT {
+            registry.grants.pop_front();
+        }
+        registry.grants.push_back(Grant { bearer_digest: credential_digest(&token), token_digest, issued: now, expires });
+        write(context, &registry)?;
+        Ok(token)
+    }
 }
 
 /// File-backed administrator status fields; `agent::finish_status` adds the agent readiness probe.
@@ -2863,14 +2990,10 @@ fn write_setting_path(context: &RuntimeContext, path: &str, value: &Value) -> Re
     }
     write_json_atomic_for(context, CONFIG_PATH, &file)
 }
-/// Memory routes accept the raw configured console token or a desktop session bound to the
-/// effective credential and current generation; a generated file token confers no memory authority.
-pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &Value, context: &RuntimeContext) -> bool {
-    let expected = cfg.get("consoleToken").and_then(|v| v.as_str()).unwrap_or("").trim();
-    headers.get("x-console-token").is_some_and(|token| {
-        let presented = token.trim();
-        credential_eq(expected, presented) || desktop_session_valid(presented, &context.effective_console_token(cfg))
-    })
+#[cfg(test)]
+fn memory_console_authority(headers: &HashMap<String, String>, cfg: &Value, _context: &RuntimeContext) -> bool {
+    let expected = console_token(cfg);
+    headers.get("x-console-token").is_some_and(|token| credential_eq(&expected, token.trim()))
 }
 
 /// `settings-get` / `settings-set` for a caller that already proved owner-private authority. In a selected runtime a
@@ -3836,7 +3959,13 @@ pub(crate) fn acquire_social_state_gate(context: &RuntimeContext) -> Result<std:
     let deadline = std::time::Instant::now() + SOCIAL_STATE_GATE_WAIT;
     loop {
         match context.open_locked_file(RuntimeArea::Data, SOCIAL_STATE_GATE) {
-            Ok(file) => return Ok(file),
+            Ok(file) => {
+                if let Some(proof) = &context.console_authority {
+                    let cfg = selected_config_for_handler(context)?;
+                    proof.recheck(context, &cfg)?;
+                }
+                return Ok(file);
+            },
             Err(error) if error == "runtime file is already locked" => {
                 if std::time::Instant::now() >= deadline {
                     return Err((
@@ -8366,19 +8495,9 @@ pub(crate) fn generate_console_token_from(fill: &mut dyn FnMut(&mut [u8]) -> Res
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// `data/console-token` holds the console credential: written atomically, then private to the
-/// owner (JS writes it with mode 0600 inside the hardened state directory).
+/// Publish the token through protected staging before placing it at its final path.
 pub(crate) fn write_console_token_file(context: &RuntimeContext, token: &str) -> Result<(), String> {
-    context.write_atomic(RuntimeArea::Data, "console-token", token.as_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let path = context
-            .resolve_path(RuntimeArea::Data, "console-token", PathIntent::ReadFile)
-            .map_err(str::to_string)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    context.write_atomic(RuntimeArea::Data, crate::console_auth::TOKEN_FILE, token.as_bytes())
 }
 
 /// `POST /api/console/token`：改控制台访问令牌（留空则随机生成）。
@@ -8386,9 +8505,8 @@ pub(crate) fn write_console_token_file(context: &RuntimeContext, token: &str) ->
 /// Selected runtime (JS `bridge.js` 4311-4341): a manual token goes to `config.json` and to
 /// `data/console-token`; a generated one only to `data/console-token`, with `consoleToken: ""` in
 /// `config.json` (the runtime loader falls back to the file, `RuntimeContext::load_config`). The
-/// read-modify-write runs under the social-state gate. The token file is written first and put back
-/// if `config.json` cannot be written, so a failed request never leaves the operator without the
-/// token they hold. The legacy runtime writes the token to `config.json` and its state file.
+/// Selected rotation keeps a durable digest-only intent through both publications. The legacy runtime
+/// writes the token to `config.json` and its state file.
 fn handle_console_token_post(
     context: &RuntimeContext,
     body: &str,
@@ -8415,28 +8533,9 @@ fn handle_console_token_post(
         return Err((400, "控制台访问令牌只能包含字母、数字、下划线或短横线".to_string()));
     }
     if context.is_isolated() {
+        let _credential = crate::console_auth::credential_mutation_gate(context).map_err(|e| (503, e))?;
         let _gate = acquire_social_state_gate(context)?;
-        let mut cfg = read_json_for(context, CONFIG_PATH)
-            .ok_or((500, "读取 config.json 失败，已中止写入".to_string()))?;
-        let obj = cfg
-            .as_object_mut()
-            .ok_or((500, "config.json 结构异常，已中止写入".to_string()))?;
-        obj.insert("consoleToken".into(), json!(if generated { "" } else { new_token.as_str() }));
-        let previous = context
-            .read_optional_text(RuntimeArea::Data, "console-token")
-            .map_err(|e| (500, format!("读取令牌文件失败，已中止写入：{e}")))?;
-        write_console_token_file(context, &new_token).map_err(|e| (500, format!("写令牌失败：{e}")))?;
-        if let Err(error) = write_json_atomic_for(context, CONFIG_PATH, &cfg) {
-            let restored = match &previous {
-                Some(text) => write_console_token_file(context, text),
-                None => context.remove_file(RuntimeArea::Data, "console-token"),
-            };
-            let note = match restored {
-                Ok(()) => "，令牌未改变".to_string(),
-                Err(e) => format!("；恢复原令牌文件也失败：{e}"),
-            };
-            return Err((500, format!("写 config.json 失败：{error}{note}")));
-        }
+        crate::console_auth::rotate_console_token(context, &new_token, !generated)?;
     } else {
         let mut cfg = read_json_for(context, CONFIG_PATH)
             .ok_or((500, "读取 config.json 失败，已中止写入".to_string()))?;
@@ -8452,7 +8551,6 @@ fn handle_console_token_post(
         std::fs::write(crate::legacy_path!("qq-bridge/state/console-token"), &new_token)
             .map_err(|e| (500, format!("写令牌失败：{e}")))?;
     }
-    DESKTOP_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     crate::safe_println!("[console] 访问令牌已{}（不记录完整值）", if generated { "重新生成" } else { "手动修改" });
     Ok(json!({ "ok": true, "token": new_token, "generated": generated }))
 }
@@ -11937,7 +12035,22 @@ fn key_in_allowlist(cfg: &Value, key: &str) -> bool {
 
 #[cfg(test)]
 fn route(req: &Request, cfg: &Value) -> (u16, String, String) {
-    route_with_context(req, cfg, &RuntimeContext::legacy())
+    route_with_context(req, cfg, &RuntimeContext::legacy(), crate::memory_actions::ConsoleCapability::Conversation, None)
+}
+
+#[cfg(test)]
+fn route_test(req: &Request, cfg: &Value, context: &RuntimeContext) -> (u16, String, String) {
+    if !context.is_isolated() {
+        return route(req, cfg);
+    }
+    let port = context.console_port().unwrap_or(DEFAULT_PORT);
+    let mut req = req.clone();
+    req.headers.entry("host".to_string()).or_insert_with(|| crate::console_auth::canonical_host(port));
+    if req.method != "GET" {
+        req.headers.entry("content-type".to_string()).or_insert_with(|| "application/json".to_string());
+    }
+    let response = serve_request(&req, cfg, context, port);
+    (response.status, response.content_type, response.body)
 }
 
 /// Protect the JS-owned pending approval/question view from agent credentials.
@@ -12255,6 +12368,8 @@ fn route_with_context(
     req: &Request,
     cfg: &Value,
     context: &RuntimeContext,
+    memory: crate::memory_actions::ConsoleCapability,
+    browser_acl: Option<crate::memory_actions::BrowserAcl>,
 ) -> (u16, String, String) {
     if !context.supports_console_request(&req.method, &req.path) {
         return (
@@ -12277,6 +12392,11 @@ fn route_with_context(
             "pid": std::process::id(),
             "port": context.console_port().unwrap_or(*CONSOLE_PORT.get().unwrap_or(&DEFAULT_PORT)),
         });
+        if crate::restore::recovery_pending(context) {
+            payload["ok"] = json!(false);
+            payload["administratorReady"] = json!(false);
+            payload["recoveryReason"] = json!(crate::restore::RECOVERY_REASON);
+        }
         let runtime = context.health_metadata();
         if !runtime.is_null() {
             payload["runtime"] = runtime;
@@ -12292,21 +12412,7 @@ fn route_with_context(
     if req.method == "GET" && matches!(req.path.as_str(), "/favicon.ico" | "/apple-touch-icon.png") {
         return (204, String::new(), String::new());
     }
-    let runtime_config = if context.is_isolated() {
-        match context.load_config() {
-            Ok(config) => Some(config),
-            Err(_) => {
-                return (
-                    503,
-                    "application/json; charset=utf-8".to_string(),
-                    json!({ "ok": false, "error": "runtime config is unavailable" }).to_string(),
-                );
-            }
-        }
-    } else {
-        None
-    };
-    let cfg = runtime_config.as_ref().unwrap_or(cfg);
+    let admitted = if context.is_isolated() { context.console_authority.is_some() } else { authorized(req, cfg) };
     if context.is_isolated() {
         if let Err(error) = crate::reserved::refresh_console_config(context, cfg) {
             return (503, "application/json; charset=utf-8".to_string(),
@@ -12322,7 +12428,7 @@ fn route_with_context(
             .get("x-agent-token")
             .map(|token| !token.is_empty())
             .unwrap_or(false);
-    if memory_route && !authorized_in(context, req, cfg) && !memory_agent_call {
+    if memory_route && !admitted && !memory_agent_call {
         return (
             401,
             "application/json; charset=utf-8".to_string(),
@@ -12339,7 +12445,7 @@ fn route_with_context(
     // 不经过下面的 authorized()，所以检查必须比它更早。
     // 但先看「请求手里有没有凭据」再判 403：否则匿名调用者能用 401/403 的差别
     // 探测某个群号在不在白名单里。没凭据的请求继续走原来的鉴权分支。
-    let has_credential = authorized_in(context, req, cfg)
+    let has_credential = admitted
         || req
             .headers
             .get("x-agent-token")
@@ -12378,7 +12484,7 @@ fn route_with_context(
     // `/api/memory/*` 是前缀分发（10 个动作），必须在精确匹配之前处理
     if req.path.starts_with("/api/memory/") {
         let action = req.path.trim_start_matches("/api/memory/").to_string();
-        return match handle_memory_action(&action, &req.headers, &req.query, &req.body, cfg, context) {
+        return match crate::memory_actions::handle_http(&action, req, cfg, context, memory, browser_acl) {
             Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
             Err((code, msg)) => (
                 code,
@@ -12387,7 +12493,7 @@ fn route_with_context(
             ),
         };
     }    // `/` 也要求令牌：管理台页面里带着会话，裸访问给 401 是 JS 的既有行为。
-    if !authorized_in(context, req, cfg) {
+    if !admitted {
         return (
             401,
             "application/json; charset=utf-8".to_string(),
@@ -12460,14 +12566,7 @@ fn route_with_context(
             Ok(gate) => gate,
             Err((status, message)) => return (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
-        let current = match context.load_config() {
-            Ok(current) => current,
-            Err(_) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"configuration unavailable"}).to_string()),
-        };
-        if !authorized_in(context, req, &current) {
-            return (401, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"console credential was revoked"}).to_string());
-        }
-        return match crate::supervisor::queue_console_restart(context, &req.body, &context.effective_console_token(&current)) {
+        return match crate::supervisor::queue_console_restart(context, &req.body) {
             Ok(result) => (202, "application/json; charset=utf-8".to_string(), result.to_string()),
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
@@ -12489,7 +12588,6 @@ fn route_with_context(
                     let version=body["version"].as_str().ok_or((400,"displayed version is required".into()))?;
                     let _gate=config_gate(context)?;
                     let latest=selected_config_for_handler(context)?;
-                    if !authorized_in(context,req,&latest) {return Err((401,"console credential was revoked".into()));}
                     crate::supervisor_dependencies::upgrades::approve(context,&latest,name,version).map_err(|e|(409,e))
                 },
                 _=>Err((405,"method not allowed".into())),
@@ -12541,10 +12639,6 @@ fn route_with_context(
         // A set commits under the configuration gate after a fresh credential check, like persona writes.
         let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
             let gate = config_gate(context)?;
-            let latest = selected_config_for_handler(context)?;
-            if !authorized_in(context, req, &latest) {
-                return Err((401, "console credential was revoked".into()));
-            }
             Ok(gate)
         };
         let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
@@ -12556,10 +12650,6 @@ fn route_with_context(
         // approval: a credential revoked while this request waited never writes.
         let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
             let gate = config_gate(context)?;
-            let latest = selected_config_for_handler(context)?;
-            if !authorized_in(context, req, &latest) {
-                return Err((401, "console credential was revoked".into()));
-            }
             Ok(gate)
         };
         let (status, content_type, body) = crate::console_persona::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
@@ -12577,15 +12667,13 @@ fn route_with_context(
                 Ok(gate) => gate,
                 Err((status, message)) => return (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
             };
-            let current = match context.load_config() {
-                Ok(current) => current,
-                Err(_) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"configuration unavailable"}).to_string()),
-            };
-            if !authorized_in(context, req, &current) {
-                return (401, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"console credential was revoked"}).to_string());
-            }
             Some(gate)
         } else { None };
+        if req.method == "POST" && req.path.ends_with("/run") && !has_agent_marker(req) {
+            if let Err((status, error)) = config_gate(context) {
+                return (status, "application/json; charset=utf-8".into(), json!({"ok":false,"error":error}).to_string());
+            }
+        }
         let api = match crate::supervisor::task_api(context, cfg) {
             Ok(api) => api,
             Err(error) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":error}).to_string()),
@@ -12625,7 +12713,13 @@ fn route_with_context(
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => match read_text_for(context, CONSOLE_HTML) {
             Ok(mut html) => {
-                if context.is_isolated() { html.push_str(crate::release::BANNER); }
+                if context.is_isolated() {
+                    if context.console_port().is_some_and(|port| canonical_request(req, port)) {
+                        let offset = html.to_ascii_lowercase().find("<script").unwrap_or(html.len());
+                        html.insert_str(offset, ROOT_BROWSER_TRANSPORT);
+                    }
+                    html.push_str(crate::release::BANNER);
+                }
                 (200, "text/html; charset=utf-8".to_string(), html)
             },
             Err(_) => (
@@ -13864,45 +13958,331 @@ fn route_with_context(
     }
 }
 
-fn handle_conn(mut stream: TcpStream, cfg: Value, context: RuntimeContext) {
+// The installed bridge page still includes its original fetch helpers.
+const ROOT_BROWSER_TRANSPORT: &str = r#"<script>
+(() => {
+    if (location.hostname !== 'her.localhost') return;
+    const fetch = window.fetch.bind(window);
+    window.fetch = (input, init) => {
+        const url = new URL(input instanceof Request ? input.url : input, location.href);
+        if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return fetch(input, init);
+        const request = new Request(input, init);
+        request.headers.delete('x-console-token');
+        return fetch(request);
+    };
+})();
+</script>"#;
+
+const PAGE_MOUNTS: &[&str] = &["/", "/settings", "/settings/conversations", "/settings/models", "/personas", "/tasks", "/schedule"];
+
+fn has_fetch_metadata(req: &Request) -> bool {
+    req.headers.keys().any(|name| name.starts_with("sec-fetch-"))
+}
+
+fn has_agent_marker(req: &Request) -> bool {
+    req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call")
+}
+
+fn canonical_request(req: &Request, port: u16) -> bool {
+    req.headers.get("host").is_some_and(|host| host == &crate::console_auth::canonical_host(port))
+}
+
+enum BrowserCookie {
+    Renew { port: u16, digest: [u8; 32], id: [u8; 32] },
+    Delete { port: u16, digest: [u8; 32] },
+}
+
+impl BrowserCookie {
+    fn header(&self) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let (port, digest, value, age) = match self {
+            Self::Renew { port, digest, id } => (*port, digest, URL_SAFE_NO_PAD.encode(id), 7 * 24 * 60 * 60),
+            Self::Delete { port, digest } => (*port, digest, String::new(), 0),
+        };
+        format!("her_browser_{port}_{}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}", URL_SAFE_NO_PAD.encode(digest))
+    }
+}
+
+struct ConsoleResponse {
+    status: u16,
+    content_type: String,
+    body: String,
+    redirect: Option<(u16, &'static str)>,
+    cookies: Vec<BrowserCookie>,
+}
+
+impl From<(u16, String, String)> for ConsoleResponse {
+    fn from((status, content_type, body): (u16, String, String)) -> Self {
+        Self { status, content_type, body, redirect: None, cookies: Vec::new() }
+    }
+}
+
+fn browser_candidates(req: &Request, port: u16) -> Result<Vec<([u8; 32], [u8; 32])>, (u16, String)> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest as _, Sha256};
+
+    let invalid = || (401, "browser credential is invalid".into());
+    let prefix = format!("her_browser_{port}_");
+    let Some(line) = req.headers.get("cookie") else { return Ok(Vec::new()) };
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for pair in line.split(';').map(str::trim) {
+        let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let Some(tag) = name.trim().strip_prefix(&prefix) else { continue };
+        let (exact_name, value) = pair.split_once('=').ok_or_else(invalid)?;
+        if name.trim() != exact_name || tag.len() != 43 || value.len() != 43
+            || candidates.len() >= crate::console_auth::MAX_BROWSER_SESSIONS
+            || !seen.insert(name)
+        {
+            return Err(invalid());
+        }
+        let id: [u8; 32] = URL_SAFE_NO_PAD.decode(value).ok()
+            .and_then(|bytes| bytes.try_into().ok()).ok_or_else(invalid)?;
+        let digest: [u8; 32] = Sha256::digest(id).into();
+        if URL_SAFE_NO_PAD.encode(digest) != tag || URL_SAFE_NO_PAD.encode(id) != value {
+            return Err(invalid());
+        }
+        candidates.push((digest, id));
+    }
+    Ok(candidates)
+}
+
+fn browser_denial(req: &Request, port: u16) -> Result<(), (u16, String)> {
+    let origin = crate::console_auth::canonical_origin(port);
+    let claimed_origin = req.headers.get("origin");
+    let origin_matches = claimed_origin == Some(&origin);
+    if !canonical_request(req, port)
+        || req.headers.get("sec-fetch-site").is_some_and(|site| !matches!(site.as_str(), "same-origin" | "none"))
+        || ((claimed_origin.is_some() || req.method != "GET") && !origin_matches)
+    {
+        return Err((403, "browser request requires the console origin".into()));
+    }
+    if req.method != "GET" && !req.headers.get("content-type").is_some_and(|value| {
+        value.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+    }) {
+        return Err((415, "browser request requires application/json".into()));
+    }
+    Ok(())
+}
+
+fn validate_browser_acl(req: &Request) -> Result<Option<crate::memory_actions::BrowserAcl>, (u16, String)> {
+    use crate::memory_actions::BrowserAcl;
+    if req.path != "/api/memory/acl" { return Ok(None); }
+    if bounded_post_body_too_large(req) { return Err((413, BODY_TOO_LARGE_ERROR.into())); }
+    if !req.query.is_empty() { return Err((400, "browser ACL requests do not accept query fields".into())); }
+    match req.method.as_str() {
+        "GET" if req.body.is_empty() && !req.headers.contains_key("transfer-encoding") => Ok(Some(BrowserAcl::List)),
+        "POST" => {
+            let fields: Value = serde_json::from_str(&req.body).map_err(|_| (400, "body must be a JSON object".into()))?;
+            let action = match fields.get("action").and_then(Value::as_str) {
+                Some("grant") => crate::memory_actions::AclAction::Grant,
+                Some("revoke") => crate::memory_actions::AclAction::Revoke,
+                _ => return Err((400, "ACL action must be grant or revoke".into())),
+            };
+            Ok(Some(BrowserAcl::Write(action, fields)))
+        }
+        _ => Err((405, "browser ACL changes require POST".into())),
+    }
+}
+
+fn select_browser(
+    req: &Request, context: &RuntimeContext, port: u16, expected: &str, renew: bool,
+) -> Result<(Option<crate::console_auth::ConsoleAuthority>, Option<BrowserCookie>), (u16, String)> {
+    use crate::console_auth::ConsoleAuthority;
+    let candidates = browser_candidates(req, port)?;
+    if candidates.is_empty() { return Ok((None, None)); }
+    let ids: Vec<_> = candidates.iter().map(|(digest, _)| *digest).collect();
+    let token = credential_digest(expected);
+    let Some(admission) = crate::settings::admit_browser(
+        context, &crate::console_auth::canonical_origin(port), (!expected.is_empty()).then_some(token), &ids, renew,
+    )? else { return Ok((None, None)) };
+    let digest = admission.proof.id_digest;
+    let cookie = if admission.renewed {
+        candidates.into_iter().find(|(id_digest, _)| *id_digest == digest)
+            .map(|(_, id)| BrowserCookie::Renew { port, digest, id })
+    } else { None };
+    Ok((Some(ConsoleAuthority::Browser { token_digest: token, grant: admission.proof }), cookie))
+}
+
+fn select_explicit_authority(
+    context: &RuntimeContext, presented: &str, expected: &str, allow_raw: bool,
+) -> Result<Option<crate::console_auth::ConsoleAuthority>, (u16, String)> {
+    use crate::console_auth::ConsoleAuthority;
+    if presented.is_empty() || expected.is_empty() { return Ok(None); }
+    let token_digest = credential_digest(expected);
+    let bearer_digest = credential_digest(presented);
+    if digests_equal(&token_digest, &bearer_digest) {
+        return Ok(allow_raw.then_some(ConsoleAuthority::Machine { token_digest }));
+    }
+    Ok(selected_desktop_proof(context, &bearer_digest, &token_digest)?
+        .map(|grant| ConsoleAuthority::Desktop { token_digest, grant }))
+}
+
+fn selected_memory_capability(
+    req: &Request, context: &RuntimeContext, cfg: &Value, effective: &str,
+) -> Result<crate::memory_actions::ConsoleCapability, (u16, String)> {
+    use crate::memory_actions::ConsoleCapability;
+    let Some(header) = req.headers.get("x-console-token").map(|token| token.trim()) else {
+        return Ok(ConsoleCapability::Conversation);
+    };
+    let configured = console_token(cfg);
+    if !has_fetch_metadata(req) && credential_eq(&configured, header) {
+        return Ok(ConsoleCapability::Configured(credential_digest(header)));
+    }
+    if let Some(proof) = select_explicit_authority(context, header, effective, false)? {
+        return Ok(ConsoleCapability::Desktop(proof));
+    }
+    Ok(ConsoleCapability::Conversation)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FRONT_READ_HOOK: std::cell::RefCell<Option<Box<dyn FnMut() -> bool>>> =
+        std::cell::RefCell::new(None);
+    static AFTER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn load_front_config(context: &RuntimeContext) -> Result<Value, &'static str> {
+    #[cfg(test)]
+    if FRONT_READ_HOOK.with(|hook| hook.borrow_mut().as_mut().is_some_and(|hook| hook())) {
+        return Err("runtime config is unavailable");
+    }
+    context.load_config()
+}
+
+struct FrontAdmission {
+    config: Value,
+    proof: Option<crate::console_auth::ConsoleAuthority>,
+    renewal: Option<BrowserCookie>,
+    memory: crate::memory_actions::ConsoleCapability,
+    browser_acl: Option<crate::memory_actions::BrowserAcl>,
+}
+
+fn admit_selected_request(
+    req: &Request, context: &RuntimeContext, port: u16,
+) -> Result<FrontAdmission, (u16, String)> {
+    use crate::memory_actions::ConsoleCapability;
+    let _gate = acquire_social_state_gate(context)?;
+    crate::console_auth::ensure_credentials_ready(context)?;
+    let config = load_front_config(context).map_err(|error| (503, error.to_string()))?;
+    let expected = context.effective_console_token(&config);
+    let memory_route = req.path.starts_with("/api/memory/");
+    let agent_call = has_agent_marker(req);
+    let (proof, renewal, browser_acl) = if let Some(presented) = presented_console_token(req) {
+        (select_explicit_authority(context, presented, &expected, !has_fetch_metadata(req))?, None, None)
+    } else if !agent_call && !browser_candidates(req, port)?.is_empty()
+        && (canonical_request(req, port) || !PAGE_MOUNTS.contains(&req.path.as_str()))
+    {
+        browser_denial(req, port)?;
+        if bounded_post_body_too_large(req) { return Err((413, BODY_TOO_LARGE_ERROR.into())); }
+        let acl = validate_browser_acl(req)?;
+        let renew = !(req.method == "POST" && req.path == "/api/console/token");
+        let (proof, renewal) = select_browser(req, context, port, &expected, renew)?;
+        let acl = proof.as_ref().and(acl);
+        (proof, renewal, acl)
+    } else {
+        (None, None, None)
+    };
+    if (proof.is_some() || (memory_route && req.headers.get("x-agent-token").is_some_and(|t| !t.is_empty())))
+        && !matches!(proof, Some(crate::console_auth::ConsoleAuthority::Browser { .. }))
+    {
+        if let Some((status, value)) = access::cross_site_denial(req, port) {
+            return Err((status, value["error"].as_str().unwrap_or("request refused").to_string()));
+        }
+    }
+    let memory = if memory_route {
+        selected_memory_capability(req, context, &config, &expected)?
+    } else { ConsoleCapability::Conversation };
+    Ok(FrontAdmission { config, proof, renewal, memory, browser_acl })
+}
+
+fn handle_conn(
+    mut stream: TcpStream, cfg: Value, context: RuntimeContext, startup: std::sync::Arc<std::sync::Mutex<bool>>,
+) {
     let req = match read_request(&mut stream) {
         Ok(req) => req,
         Err(RequestReadError::Invalid) => return,
     };
     let port = stream.local_addr().map(|a| a.port()).unwrap_or(0);
-    let (status, ctype, body) = if req.path == "/api/desktop/sign-in" {
-        desktop_sign_in(&stream, &req, &context, port)
+    if context.is_isolated() && !crate::restore::recovery_pending(&context) {
+        if let Ok(mut ready) = startup.lock() {
+            if !*ready {
+                if let Ok(Some(current)) = selected_startup_config(&context) {
+                    initialize_console(&context, &current);
+                    *ready = true;
+                }
+            }
+        }
+    }
+    let response = if req.path == "/api/desktop/sign-in" {
+        desktop_sign_in(&stream, &req, &context, port).into()
     } else {
         serve_request(&req, &cfg, &context, port)
     };
-    respond(&mut stream, status, &ctype, &body);
+    respond(&mut stream, response);
 }
 
 /// This route requires transport identity as well as the protected credential.
 /// It is deliberately outside the string-only router: no synthetic Request can
 /// supply a PID or claim a TCP peer. Session secrets never enter the audit trail.
 fn desktop_sign_in(stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16) -> (u16, String, String) {
-    // Capture before reading either credential: a concurrent successful rotation revokes
-    // even an issuance that finishes later with a previously validated file.
-    let generation = DESKTOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
     let reply = |status, value: Value| (status, "application/json; charset=utf-8".to_string(), value.to_string());
     if let Some((status, value)) = access::host_denial(req, port) { return reply(status, value); }
     if req.method != "POST" { return reply(405, json!({"ok":false,"error":"method not allowed"})); }
     if !context.is_isolated() { return reply(403, json!({"ok":false,"error":"desktop sign-in requires a selected runtime"})); }
-    let Ok(cfg) = context.load_config() else { return reply(503, json!({"ok":false,"error":"runtime config is unavailable"})); };
-    let Ok(expected) = crate::desktop::console_token(context) else { return reply(403, json!({"ok":false,"error":"protected console token file is unavailable"})); };
-    if !desktop_file_proof_matches(req, &expected) {
-        return reply(401, json!({"ok":false,"error":"console credential is required"}));
+    if let Err((status, error)) = crate::console_auth::ensure_credentials_ready(context) {
+        return reply(status, json!({"ok":false,"error":error}));
     }
-    if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
+    if has_agent_marker(req) {
         return reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"}));
     }
-    if let Some((status, value)) = access::cross_site_denial(req, port) { return reply(status, value); }
+    #[cfg(not(windows))]
+    {
+        let _ = stream;
+        reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"}))
+    }
     #[cfg(windows)]
+    match desktop_sign_in_selected(stream, req, context, port) {
+        Ok(session) => reply(200, json!({"ok":true,"session":session})),
+        Err((status, error)) => reply(status, json!({"ok":false,"error":error})),
+    }
+}
+
+#[cfg(windows)]
+fn desktop_sign_in_selected(
+    stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16,
+) -> Result<String, (u16, String)> {
+    use crate::console_auth::{checked_console_token, ConsoleAuthority};
+
+    let browser = has_fetch_metadata(req) || ["origin", "referer", "cookie"].iter().any(|key| req.headers.contains_key(*key));
+    let native_proof = || -> Result<(), (u16, String)> {
+        let expected = crate::desktop::console_token(context)
+            .map_err(|_| (403, "protected console token file is unavailable".into()))?;
+        if !desktop_file_proof_matches(req, &expected) {
+            return Err((401, "console credential is required".into()));
+        }
+        Ok(())
+    };
+    let revoked = || (401, "console credential was revoked".into());
+    let (token_digest, generation, proof) = {
+        let _gate = acquire_social_state_gate(context)?;
+        let cfg = selected_config_for_handler(context)?;
+        let expected = checked_console_token(context, &cfg)?;
+        if expected.is_empty() { return Err(revoked()); }
+        let proof = if browser {
+            browser_denial(req, port)?;
+            let (proof, _) = select_browser(req, context, port, &expected, false)?;
+            let Some(proof @ ConsoleAuthority::Browser { .. }) = proof else { return Err(revoked()) };
+            Some(proof)
+        } else {
+            native_proof()?;
+            None
+        };
+        (credential_digest(&expected), desktop_grants::current_issuer(context)?.generation, proof)
+    };
     let same_user = crate::process_identity::tcp_peer_user(stream)
         .and_then(|peer| crate::process_identity::current_user().map(|own| {
-            // Seam 1 may simulate a different peer SID without creating users.
-            // The fixture only intersects real authority; it cannot grant it.
             #[cfg(debug_assertions)]
             let fixture_matches = std::env::var("HER_TEST_DESKTOP_PEER_SID_HEX")
                 .map(|sid| sid.eq_ignore_ascii_case(&peer.iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
@@ -13912,42 +14292,52 @@ fn desktop_sign_in(stream: &TcpStream, req: &Request, context: &RuntimeContext, 
             peer == own && fixture_matches
         }))
         .unwrap_or(false);
-    #[cfg(not(windows))]
-    let same_user = { let _ = stream; false };
-    if !same_user { return reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"})); }
-    match issue_desktop_session(&context.effective_console_token(&cfg), generation) {
-        Ok(session) => reply(200, json!({"ok":true,"session":session})),
-        Err(_) => reply(503, json!({"ok":false,"error":"desktop session is unavailable"})),
+    if !same_user { return Err((403, "desktop sign-in requires the installing user".into())); }
+    let _gate = acquire_social_state_gate(context)?;
+    let cfg = selected_config_for_handler(context)?;
+    let effective = checked_console_token(context, &cfg)?;
+    let registry = desktop_grants::read(context)?.filter(|registry| {
+        registry.verified(context) && digests_equal(&generation, &registry.generation)
+    }).ok_or_else(revoked)?;
+    if effective.is_empty() || !digests_equal(&token_digest, &credential_digest(&effective)) {
+        return Err(revoked());
     }
+    if let Some(proof) = proof { proof.recheck(context, &cfg)?; } else { native_proof()?; }
+    desktop_grants::issue(context, registry, token_digest)
 }
 
 /// One request through the console front, the router and the audit trail.
-fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16) -> (u16, String, String) {
-    let json_reply = |status: u16, value: Value| (status, "application/json; charset=utf-8".to_string(), value.to_string());
-    // Selected runtime: the frozen JS console front (Host before credentials, then the JSON
-    // content type and same-origin checks for writes that carry a credential).
-    let mut administrator = false;
-    if context.is_isolated() {
+fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16) -> ConsoleResponse {
+    let json_reply = |status: u16, value: Value| ConsoleResponse::from((status, "application/json; charset=utf-8".to_string(), value.to_string()));
+    let mut admitted_context = context.clone().with_console_port(port);
+    let public = req.method == "GET" && matches!(req.path.as_str(), "/api/health" | "/favicon.ico" | "/apple-touch-icon.png");
+    let admission = if context.is_isolated() && !public {
         if let Some((status, value)) = access::host_denial(req, port) {
             return json_reply(status, value);
         }
-        if let Ok(current) = context.load_config() {
-            let memory_agent_call = req.path.starts_with("/api/memory/")
-                && req.headers.get("x-agent-token").is_some_and(|t| !t.is_empty());
-            let credential = authorized_in(context, req, &current);
-            if credential || memory_agent_call {
-                if let Some((status, value)) = access::cross_site_denial(req, port) {
-                    return json_reply(status, value);
-                }
+        let admission = match admit_selected_request(req, context, port) {
+            Ok(admission) => admission,
+            Err((status, error)) => return json_reply(status, json!({"ok":false,"error":error})),
+        };
+        let desktop = matches!(admission.proof, Some(crate::console_auth::ConsoleAuthority::Desktop { .. }));
+        if req.method == "GET" && !canonical_request(req, port) && !desktop {
+            if let Some(mount) = PAGE_MOUNTS.iter().copied().find(|mount| *mount == req.path) {
+                let mut response = ConsoleResponse::from((302, String::new(), String::new()));
+                response.redirect = Some((port, mount));
+                return response;
             }
-            // Read probes that use POST (the read authorization and the live bridge's wake
-            // snapshot) change nothing and are not administrator actions.
-            administrator = credential
-                && !req.headers.contains_key("x-agent-token")
-                && !req.headers.contains_key("x-agent-call")
-                && !matches!(req.path.as_str(), "/api/authorize/read" | "/api/socialV2/wake-snapshot");
         }
-    }
+        admitted_context.console_authority = admission.proof.clone();
+        Some(admission)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if let Some(hook) = AFTER_ADMISSION.with(|hook| hook.borrow_mut().take()) { hook(); }
+    let administrator = admitted_context.console_authority.is_some()
+        && !has_agent_marker(req)
+        && !matches!(req.path.as_str(), "/api/authorize/read" | "/api/socialV2/wake-snapshot");
+    let context = &admitted_context;
     // 写操作审计（PLAN-V3 P0）。
     //
     // 对应 Cordis 的「时间可组合性」：组件改动过的共享状态，必须能完整撤回。
@@ -13967,7 +14357,13 @@ fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16
         Vec::new()
     };
     take_config_writes();
-    let (status, ctype, mut body) = route_with_context(req, cfg, context);
+    let (status, ctype, mut body, renewal) = if let Some(admission) = admission {
+        let (status, ctype, body) = route_with_context(req, &admission.config, context, admission.memory, admission.browser_acl);
+        (status, ctype, body, admission.renewal)
+    } else {
+        let (status, ctype, body) = route_with_context(req, cfg, context, crate::memory_actions::ConsoleCapability::Conversation, None);
+        (status, ctype, body, None)
+    };
     let config_writes = take_config_writes();
     // Selected runtime: every administrator write is recorded with its actual result, including
     // refusals and their reason, so the console history shows what happened and why.
@@ -13985,7 +14381,15 @@ fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16
             }
         }
     }
-    (status, ctype, body)
+    let mut response = ConsoleResponse::from((status, ctype, body));
+    if (200..300).contains(&status) && req.method == "POST" && req.path == "/api/console/token" {
+        if let Some(crate::console_auth::ConsoleAuthority::Browser { grant, .. }) = &context.console_authority {
+            response.cookies.push(BrowserCookie::Delete { port, digest: grant.id_digest });
+        }
+    } else if let Some(renewal) = renewal {
+        response.cookies.push(renewal);
+    }
+    response
 }
 
 /// Test seam: one administrator request (console token, JSON body, loopback Host) through
@@ -14008,7 +14412,7 @@ fn test_request(context: &RuntimeContext, method: &str, path: &str, body: Option
     let mut headers = HashMap::new();
     headers.insert("x-console-token".to_string(), context.effective_console_token(&cfg));
     if let Some(token) = agent_token { headers.insert("x-agent-token".into(), token.into()); }
-    headers.insert("host".to_string(), format!("127.0.0.1:{port}"));
+    headers.insert("host".to_string(), crate::console_auth::canonical_host(port));
     headers.insert("content-type".to_string(), "application/json".to_string());
     let (path, query) = match path.split_once('?') {
         Some((path, query)) => (path, query),
@@ -14027,8 +14431,8 @@ fn test_request(context: &RuntimeContext, method: &str, path: &str, body: Option
         body: body.map(Value::to_string).unwrap_or_default(),
         body_too_large: false,
     };
-    let (status, _, text) = serve_request(&req, &cfg, context, port);
-    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    let response = serve_request(&req, &cfg, context, port);
+    (response.status, serde_json::from_str(&response.body).unwrap_or(Value::Null))
 }
 
 // ── 写操作审计 ────────────────────────────────────────────────────────────────
@@ -14863,17 +15267,56 @@ pub fn serve_with_context(
         }
     };
     let _ = CONSOLE_PORT.set(port);
-    crate::safe_println!("[console] Rust 控制台已启动：http://127.0.0.1:{port}");
-    access::harden_selected_state_dir(&context);
-    if let Err((_, error)) = import_engine_choices_outside_request(&context) {
+    crate::safe_println!("[console] Rust 控制台已启动：{}", if context.is_isolated() { crate::console_auth::canonical_origin(port) } else { format!("http://127.0.0.1:{port}") });
+    let mut initialized = false;
+    if context.is_isolated() {
+        if let Some(cfg) = selected_startup_config(&context)? {
+            initialize_console(&context, &cfg);
+            initialized = true;
+        }
+    } else {
+        initialize_console(&context, cfg);
+    }
+    let startup = std::sync::Arc::new(std::sync::Mutex::new(initialized));
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                let cfg = cfg.clone();
+                let context = context.clone();
+                let startup = startup.clone();
+                std::thread::spawn(move || handle_conn(s, cfg, context, startup));
+            }
+            Err(e) => crate::safe_println!("[console] 接受连接失败：{e}"),
+        }
+    }
+    Ok(())
+}
+
+fn selected_startup_config(context: &RuntimeContext) -> Result<Option<Value>, String> {
+    let _gate = config_gate(context).map_err(|(_, e)| e)?;
+    if crate::restore::recovery_pending(context) { return Ok(None); }
+    let cfg = context.load_config().map_err(str::to_owned)?;
+    if crate::console_auth::ensure_credentials_ready(context).is_ok() {
+        if crate::settings::start_browser_clock(context).is_err() {
+            crate::safe_eprintln!("[console] browser session state is unavailable");
+        }
+        Ok(Some(cfg))
+    } else {
+        Ok(None)
+    }
+}
+
+fn initialize_console(context: &RuntimeContext, cfg: &Value) {
+    access::harden_selected_state_dir(context);
+    if let Err((_, error)) = import_engine_choices_outside_request(context) {
         crate::safe_println!("[console] conversation engine import: {error}");
     }
     // Before the start stamp of config.json is noted: the write-back may change the file.
-    finish_settings_write_back(&context);
-    access::note_config_start(&context);
+    finish_settings_write_back(context);
+    access::note_config_start(context);
     // #192: an access change cut off between its configuration write and its revocation is finished before the
     // console answers any request.
-    match access::finish_pending_revocations(&context) {
+    match access::finish_pending_revocations(context) {
         Ok((revoked, failures)) => {
             if !revoked.is_empty() {
                 crate::safe_println!("[console] finished the revocation an earlier access change left pending: {}", revoked.join(","));
@@ -14897,17 +15340,6 @@ pub fn serve_with_context(
             }
         });
     }
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let cfg = cfg.clone();
-                let context = context.clone();
-                std::thread::spawn(move || handle_conn(s, cfg, context));
-            }
-            Err(e) => crate::safe_println!("[console] 接受连接失败：{e}"),
-        }
-    }
-    Ok(())
 }
 
 /// 读配置（供 CLI 入口用）。
@@ -14978,6 +15410,195 @@ mod tests {
             headers,
             body: String::new(),
             body_too_large: false,
+        }
+    }
+
+    const BROWSER_FIXTURE_TOKEN: &str = "fixture-browser-admin-machine-token";
+    const BROWSER_FIXTURE_PORT: u16 = 3999;
+
+    fn browser_fixture(label: &str) -> (FixtureRoot, RuntimeContext, String, [u8; 32], i64) {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use sha2::{Digest as _, Sha256};
+        let (root, context) = fixture_runtime(label, BROWSER_FIXTURE_TOKEN);
+        let id = [83; 32];
+        let digest: [u8; 32] = Sha256::digest(id).into();
+        let prior = crate::parity_clock::now_ms() - 1_000;
+        crate::settings::seed_browser_session(&context, BROWSER_FIXTURE_PORT, BROWSER_FIXTURE_TOKEN, digest, prior).unwrap();
+        context.browser_anchors.0.lock().unwrap().insert(digest, (prior, std::time::Instant::now() - std::time::Duration::from_secs(1)));
+        let cookie = format!("her_browser_{}_{}={}", BROWSER_FIXTURE_PORT, URL_SAFE_NO_PAD.encode(digest), URL_SAFE_NO_PAD.encode(id));
+        (root, context, cookie, digest, prior)
+    }
+
+    fn browser_request(method: &str, path: &str, cookie: &str, body: Option<Value>) -> Request {
+        let mut request = req(method, path, None);
+        request.headers.extend([
+            ("host".into(), crate::console_auth::canonical_host(BROWSER_FIXTURE_PORT)),
+            ("origin".into(), crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT)),
+            ("sec-fetch-site".into(), "same-origin".into()),
+            ("content-type".into(), "application/json; charset=utf-8".into()),
+            ("cookie".into(), cookie.into()),
+        ]);
+        request.body = body.map(|value| value.to_string()).unwrap_or_default();
+        request
+    }
+
+    fn browser_reply(context: &RuntimeContext, req: &Request) -> ConsoleResponse {
+        serve_request(req, &json!({}), context, BROWSER_FIXTURE_PORT)
+    }
+
+    fn browser_last_used(root: &FixtureRoot, digest: [u8; 32]) -> i64 {
+        crate::settings::StoreProbe::at(&root.0).open().query_row(
+            "SELECT last_used_ms FROM console_browser_sessions WHERE id_digest=?",
+            [digest.as_slice()], |row| row.get(0),
+        ).unwrap()
+    }
+
+    #[test]
+    fn browser_admission_cannot_be_granted_by_router_retry() {
+        let (root, context, cookie, digest, last) = browser_fixture("front read unavailable");
+        let mut request = browser_request("POST", "/api/settings/set", &cookie, Some(json!({"setting":"reply.wakeQuietMs","value":4000})));
+        request.headers.insert("origin".into(), "http://localhost:3999".into());
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = count.clone();
+        FRONT_READ_HOOK.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            observed.set(observed.get() + 1);
+            observed.get() == 1
+        })));
+        let result = browser_reply(&context, &request);
+        FRONT_READ_HOOK.with(|hook| hook.borrow_mut().take());
+        assert_eq!(result.status, 503, "a front failure must refuse the request before later reads");
+        assert_eq!(count.get(), 1);
+        assert!(result.cookies.is_empty());
+        assert_eq!(browser_last_used(&root, digest), last);
+        assert!(!root.0.join("data/audit/audit.jsonl").exists());
+        assert_eq!(crate::settings::StoreProbe::at(&root.0).audit_count(), 0);
+    }
+
+    #[test]
+    fn browser_writes_require_exact_origin() {
+        let (root, context, cookie, digest, last) = browser_fixture("browser exact origin");
+        let mut request = browser_request("POST", "/api/settings/set", &cookie, Some(json!({"setting":"reply.wakeQuietMs","value":4000})));
+        request.headers.insert("origin".into(), "http://localhost:3999".into());
+        let result = browser_reply(&context, &request);
+        assert_eq!(result.status, 403, "alias origins must refuse browser writes");
+        assert!(result.cookies.is_empty());
+        assert_eq!(browser_last_used(&root, digest), last);
+    }
+
+    #[test]
+    fn cookie_memory_acl_get_never_mutates_or_touches_session() {
+        let (root, context, cookie, digest, last) = browser_fixture("browser memory method");
+        let list = || {
+            let (_, value) = admin_request(&context, "GET", "/api/memory/acl", None);
+            // The ACL list is compared independently of the session database.
+            value["acl"].clone()
+        };
+        let baseline = list();
+        assert!(baseline.is_array());
+        for action in ["grant", "revoke"] {
+            let fields = json!({"action":action,"readerType":"session","readerId":"private:7001","readType":"*","readId":"*"});
+            let mut query = browser_request("GET", "/api/memory/acl", &cookie, None);
+            query.query.insert("action".into(), action.into());
+            assert_eq!(browser_reply(&context, &query).status, 400, "cookie GET ACL query must be refused");
+            let request = browser_request("GET", "/api/memory/acl", &cookie, Some(fields.clone()));
+            assert_eq!(browser_reply(&context, &request).status, 405, "cookie GET ACL body must be refused");
+            let mut post = browser_request("POST", "/api/memory/acl", &cookie, Some(fields));
+            post.headers.remove("origin");
+            assert_eq!(browser_reply(&context, &post).status, 403, "ACL POST must require Origin");
+            post.headers.insert("origin".into(), "http://localhost:3999".into());
+            assert_eq!(browser_reply(&context, &post).status, 403, "ACL POST must require the exact origin");
+            post.headers.insert("origin".into(), crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT));
+            post.headers.insert("content-type".into(), "text/application/json".into());
+            assert_eq!(browser_reply(&context, &post).status, 415, "ACL POST must require a JSON media type");
+            assert_eq!(list(), baseline);
+            assert_eq!(browser_last_used(&root, digest), last);
+        }
+        for action in ["grant", "revoke"] {
+            let fields = json!({"action":action,"readerType":"session","readerId":"private:7001","readType":"*","readId":"*"});
+            let request = browser_request("POST", "/api/memory/acl", &cookie, Some(fields));
+            assert_eq!(browser_reply(&context, &request).status, 200);
+        }
+        assert_eq!(list(), baseline);
+    }
+
+    #[test]
+    fn browser_authority_rechecked_at_each_writer_gate() {
+        let writes = [
+            ("/api/settings/set", json!({"setting":"reply.wakeQuietMs","value":4000})),
+            ("/api/whitelist", json!({"confirm":true,"allow":{"groups":[7001]}})),
+            ("/api/security", json!({"confirm":true,"outboundGuard":false})),
+            ("/api/security", json!({"rehardenStateDir":true})),
+            ("/api/console/token", json!({"token":"fixture-chosen-console-token"})),
+            ("/api/memory/acl", json!({"action":"grant","readerId":"private:7001"})),
+            ("/api/schedule/system:backup/pause", json!({"confirm":true})),
+        ];
+        for (path, body) in writes {
+            let (root, context, cookie, _, _) = browser_fixture("browser revoked at gate");
+            let before = std::fs::read(root.0.join("config/config.json")).unwrap();
+            let context_for_cut = context.clone();
+            AFTER_ADMISSION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let _gate = config_gate(&context_for_cut).unwrap();
+                crate::settings::revoke_browser_sessions(&context_for_cut).unwrap();
+            })));
+            let writer = if body["rehardenStateDir"] == true { "hardening" } else { "settings or mutation" };
+            let request = browser_request("POST", path, &cookie, Some(body));
+            let result = browser_reply(&context, &request);
+            assert_eq!(result.status, 401, "{path} must recheck the admitted proof at its writer gate ({writer})");
+            assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before);
+            assert!(!root.0.join("data/console-token").exists());
+            assert!(!root.0.join("data/schedule.json").exists());
+            assert_eq!(crate::settings::StoreProbe::at(&root.0).audit_count(), 0);
+        }
+    }
+
+    #[test]
+    fn rotation_revokes_every_browser_even_when_token_is_reused() {
+        let (_root, context, cookie, _, _) = browser_fixture("browser same token rotation");
+        let request = browser_request("GET", "/api/status", &cookie, None);
+        assert_eq!(browser_reply(&context, &request).status, 200);
+        let (status, _) = admin_request(&context, "POST", "/api/console/token", Some(&json!({"token":BROWSER_FIXTURE_TOKEN})));
+        assert_eq!(status, 200);
+        assert_eq!(browser_reply(&context, &request).status, 401, "same-value rotation must end every old session");
+        let alternate = "fixture-other-machine-token";
+        for token in [alternate, BROWSER_FIXTURE_TOKEN] {
+            let (status, _) = admin_request(&context, "POST", "/api/console/token", Some(&json!({"token":token})));
+            assert_eq!(status, 200);
+        }
+        assert_eq!(browser_reply(&context, &request).status, 401, "returning to an old token must never restore its sessions");
+    }
+
+    #[test]
+    fn scheduled_http_run_cannot_start_after_revocation() {
+        for path in ["/api/schedule/system:backup/run", "/api/tasks/backup/run"] {
+            let (root, context, cookie, _, _) = browser_fixture("browser revoked after task claim");
+            let (entered, before_start) = std::sync::mpsc::channel();
+            let (release, revoked) = std::sync::mpsc::channel();
+            let revoked = std::sync::Mutex::new(revoked);
+            crate::supervisor::TASK_ADMISSION_TEST.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = entered.send(());
+                let _ = revoked.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            })));
+            let request = browser_request("POST", path, &cookie, Some(json!({"confirm":true,"requestId":"fixture-browser-task"})));
+            let response = browser_reply(&context, &request);
+            assert_eq!(response.status, 202, "{path}: {}", response.body);
+            let receipt: Value = serde_json::from_str(&response.body).unwrap();
+            let run = receipt["runId"].as_str().unwrap();
+            before_start.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            {
+                let _gate = config_gate(&context).unwrap();
+                crate::settings::revoke_browser_sessions(&context).unwrap();
+            }
+            release.send(()).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let completed = loop {
+                let (_, value) = admin_request(&context, "GET", &format!("/api/tasks/runs/{run}"), None);
+                if value["run"]["endedAt"].is_i64() { break value; }
+                assert!(std::time::Instant::now() < deadline, "task did not reach a terminal receipt: {value}");
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            };
+            assert_eq!(completed["run"]["state"], "cancelled", "revoked HTTP task must be cancelled before running");
+            assert!(completed["run"]["startedAt"].is_null());
+            assert!(!root.0.join("data/backups").exists());
         }
     }
 
@@ -17122,7 +17743,7 @@ mod tests {
                 let Ok((stream, _)) = listener.accept() else {
                     break;
                 };
-                handle_conn(stream, cfg.clone(), context.clone());
+                handle_conn(stream, cfg.clone(), context.clone(), std::sync::Arc::new(std::sync::Mutex::new(true)));
             }
         });
         (port, server)
@@ -17666,7 +18287,7 @@ mod tests {
                     Err(error) => return Err(format!("accept console fixture request: {error}")),
                 }
             };
-            handle_conn(stream, cfg, context);
+            handle_conn(stream, cfg, context, std::sync::Arc::new(std::sync::Mutex::new(true)));
             Ok(())
         });
         (port, server)
@@ -18071,7 +18692,7 @@ mod tests {
         let legacy_token = legacy_cfg["consoleToken"].as_str().unwrap().to_string();
         let mut legacy_create = req("POST", "/api/roles/create", Some(&legacy_token));
         legacy_create.body = "null".to_string();
-        let (status, _, body) = route_with_context(&legacy_create, &legacy_cfg, &legacy);
+        let (status, _, body) = route_test(&legacy_create, &legacy_cfg, &legacy);
         let response: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             (status, response["error"].as_str()),
@@ -18080,7 +18701,7 @@ mod tests {
         );
 
         legacy_create.body = " \r\n\t".to_string();
-        let (status, _, body) = route_with_context(&legacy_create, &legacy_cfg, &legacy);
+        let (status, _, body) = route_test(&legacy_create, &legacy_cfg, &legacy);
         let response: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(status, 400);
         assert_eq!(
@@ -22365,7 +22986,7 @@ mod tests {
             .query
             .insert("key".to_string(), "private:7001".to_string());
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(
             status, 401,
             "invalid query auth must reject before the memory handler's agent-token denial: {body}"
@@ -22408,7 +23029,7 @@ mod tests {
             .query
             .insert("key".to_string(), "private:7001".to_string());
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(
             status, 401,
             "missing console auth must reject before the memory handler's agent-token denial: {body}"
@@ -22450,7 +23071,7 @@ mod tests {
             "fixture-invalid-memory-agent".to_string(),
         );
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(status, 403, "the nonempty agent header reaches the memory handler");
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -22487,7 +23108,7 @@ mod tests {
             );
             assert!(!request.headers.contains_key("x-console-token"));
 
-            let (status, _, body) = route_with_context(&request, &config, &context);
+            let (status, _, body) = route_test(&request, &config, &context);
             assert_eq!(status, 403, "memory agent denial for {key}");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -22528,7 +23149,7 @@ mod tests {
         request.headers.insert("x-agent-token".to_string(), agent_token.to_string());
         assert!(!request.headers.contains_key("x-console-token"));
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(status, 200);
         let result: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(result["count"], 0);
@@ -22551,7 +23172,7 @@ mod tests {
             .query
             .insert("key".to_string(), "private:7001".to_string());
 
-        let (status, _, body) = route_with_context(&request, &config, &context);
+        let (status, _, body) = route_test(&request, &config, &context);
         assert_eq!(status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&body).unwrap()["error"],
@@ -23371,7 +23992,6 @@ mod tests {
             assert!(!authorized_in(&context, &missing, &empty), "selected raw auth must refuse missing proof");
             assert!(!memory_console_authority(&missing.headers, &empty, &context), "empty memory header grants no authority");
             assert!(!desktop_file_proof_matches(&missing, &expected), "desktop file proof requires two nonempty values");
-            assert!(!desktop_session_valid("", &expected), "desktop bearer requires a live effective credential");
         }
         assert!(!authorized(&missing, &empty), "legacy raw auth must refuse two empty credentials");
     }
@@ -23835,7 +24455,7 @@ mod tests {
             })
             .to_string();
             let (status, _, body) =
-                route_with_context(&request, &c, &RuntimeContext::legacy());
+                route_test(&request, &c, &RuntimeContext::legacy());
             assert_eq!(status, 401, "console auth must precede agent gates and allowlist checks");
             assert!(body.contains("未授权"));
         }
@@ -24766,7 +25386,9 @@ mod tests {
         for (path, body) in writes {
             let mut request = req("POST", path, Some(OLD));
             request.body = body.to_string();
-            let (status, _, response) = schedule_routes::route(&context, &front, &request);
+            let mut admitted = context.clone();
+            admitted.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: credential_digest(OLD) });
+            let (status, _, response) = schedule_routes::route(&admitted, &front, &request);
             assert_eq!(status, 401, "{path}: {response}");
         }
         assert!(!root.0.join("data/schedule.json").exists(), "nothing was written with the revoked credential");
@@ -24774,7 +25396,9 @@ mod tests {
 
         let mut request = req("POST", "/api/schedule/system:backup/pause", Some(NEW));
         request.body = json!({"confirm": true}).to_string();
-        let (status, _, response) = schedule_routes::route(&context, &context.load_config().unwrap(), &request);
+        let mut admitted = context.clone();
+        admitted.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: credential_digest(NEW) });
+        let (status, _, response) = schedule_routes::route(&admitted, &context.load_config().unwrap(), &request);
         assert_eq!(status, 200, "{response}");
         assert!(crate::schedule::ScheduleStore::new(&context).system_paused("backup"));
     }
@@ -26109,7 +26733,7 @@ mod tests {
         assert!(pending_admin_agent_gate_route(&request));
 
         request.headers.insert("x-agent-token".to_string(), String::new());
-        let (empty_status, _, empty_body) = route_with_context(&request, &cfg, &context);
+        let (empty_status, _, empty_body) = route_test(&request, &cfg, &context);
         assert_eq!(empty_status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&empty_body).unwrap()["error"],
@@ -26120,7 +26744,7 @@ mod tests {
             "x-agent-token".to_string(),
             "synthetic-agent".to_string(),
         );
-        let (agent_status, _, agent_body) = route_with_context(&request, &cfg, &context);
+        let (agent_status, _, agent_body) = route_test(&request, &cfg, &context);
         assert_eq!(agent_status, 403);
         assert_eq!(
             serde_json::from_str::<Value>(&agent_body).unwrap()["error"],
@@ -26132,7 +26756,7 @@ mod tests {
             "wrong-synthetic-console-token".to_string(),
         );
         let (wrong_console_status, _, wrong_console_body) =
-            route_with_context(&request, &cfg, &context);
+            route_test(&request, &cfg, &context);
         assert_eq!(
             wrong_console_status,
             401,
@@ -26145,7 +26769,7 @@ mod tests {
 
         request.headers.remove("x-console-token");
         let (unauthorized_status, _, unauthorized_body) =
-            route_with_context(&request, &cfg, &context);
+            route_test(&request, &cfg, &context);
         assert_eq!(
             unauthorized_status,
             401,
@@ -26394,7 +27018,7 @@ mod tests {
                 body_too_large: false,
             };
             assert!(social_agent_policy_route(&request));
-            let (status, _, body) = route_with_context(&request, &cfg, &context);
+            let (status, _, body) = route_test(&request, &cfg, &context);
             assert_eq!(status, 401, "console auth must precede query allowlist and sticker policy");
             assert_eq!(
                 serde_json::from_str::<Value>(&body).unwrap()["error"],

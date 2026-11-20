@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use crate::console::Request;
+use crate::console_auth::{credential_digest, digests_equal, ConsoleAuthority};
 use crate::conversation_authority as authority;
 use crate::memory::{ForgetError, MemoryStore, NewMemory};
 use crate::runtime::RuntimeContext;
@@ -21,17 +23,66 @@ pub(crate) fn tool_action(context: &RuntimeContext, action: &str, args: &Value) 
         }
     }
     let headers = HashMap::from([("x-agent-token".to_string(), args["token"].as_str().unwrap_or("").to_string())]);
-    handle(action, &headers, &HashMap::new(), &body.to_string(), &cfg, context).map_err(|(_, error)| error)
+    handle_inner(action, &headers, &HashMap::new(), &body.to_string(), &cfg, context,
+        ConsoleCapability::Conversation, None).map_err(|(_, error)| error)
 }
 
-/// One memory or settings action; query parameters and the JSON body merge, body first.
+#[derive(Default)]
+pub(crate) enum ConsoleCapability {
+    #[default]
+    Conversation,
+    Configured([u8; 32]),
+    Desktop(ConsoleAuthority),
+}
+
+pub(crate) enum AclAction { Grant, Revoke }
+
+pub(crate) enum BrowserAcl {
+    List,
+    Write(AclAction, Value),
+}
+
+pub(crate) fn handle_http(
+    action: &str, req: &Request, cfg: &Value, context: &RuntimeContext,
+    capability: ConsoleCapability, browser_acl: Option<BrowserAcl>,
+) -> Result<Value, (u16, String)> {
+    let capability = if context.is_isolated() {
+        capability
+    } else {
+        configured_header(&req.headers, cfg)
+    };
+    handle_inner(action, &req.headers, &req.query, &req.body, cfg, context, capability, browser_acl)
+}
+
+fn configured_header(headers: &HashMap<String, String>, cfg: &Value) -> ConsoleCapability {
+    let expected = cfg["consoleToken"].as_str().unwrap_or("").trim();
+    if let Some(value) = headers.get("x-console-token").map(|value| value.trim()) {
+        if crate::console_auth::credential_eq(expected, value) {
+            return ConsoleCapability::Configured(credential_digest(value));
+        }
+    }
+    ConsoleCapability::Conversation
+}
+
+/// Focused tests of the conversation and configured-header policies.
+#[cfg(test)]
 pub(crate) fn handle(
+    action: &str, headers: &HashMap<String, String>, query: &HashMap<String, String>,
+    body: &str, cfg: &Value, context: &RuntimeContext,
+) -> Result<Value, (u16, String)> {
+    handle_inner(action, headers, query, body, cfg, context, configured_header(headers, cfg), None)
+}
+
+/// One memory or settings action; native query parameters and JSON still merge, body first.
+fn handle_inner(
     action: &str,
     headers: &HashMap<String, String>,
     query: &HashMap<String, String>,
     body: &str,
     cfg: &Value,
     context: &RuntimeContext,
+    capability: ConsoleCapability,
+    browser_acl: Option<BrowserAcl>,
 ) -> Result<Value, (u16, String)> {
     // Serialize with session reset/token rotation, and re-read configuration after waiting.
     // SQLite writers and ACL revocation below share this gate with MCP calls.
@@ -52,6 +103,13 @@ pub(crate) fn handle(
         None
     };
     let cfg = fresh_cfg.as_ref().unwrap_or(cfg);
+    if let Some(browser_acl) = browser_acl {
+        let (action, fields) = match browser_acl {
+            BrowserAcl::List => (None, Value::Null),
+            BrowserAcl::Write(action, fields) => (Some(action), fields),
+        };
+        return acl_action(context, cfg, action, &fields);
+    }
     // JS 的写法：POST 读 body、其它方法用 query 参数。两边都合进来，body 优先。
     let mut merged = serde_json::Map::new();
     for (k, v) in query {
@@ -68,7 +126,21 @@ pub(crate) fn handle(
         }
     }
     let b = Value::Object(merged);
-    let console_ok = crate::console::memory_console_authority(headers, cfg, context);
+    let console_ok = match capability {
+        ConsoleCapability::Conversation => action == "archive"
+            && matches!(context.console_authority, Some(ConsoleAuthority::Browser { .. })),
+        ConsoleCapability::Configured(digest) => {
+            let expected = cfg["consoleToken"].as_str().unwrap_or("").trim();
+            if expected.is_empty() || !digests_equal(&digest, &credential_digest(expected)) {
+                return Err((401, "console credential was revoked".into()));
+            }
+            true
+        }
+        ConsoleCapability::Desktop(proof) => {
+            proof.recheck(context, cfg)?;
+            true
+        }
+    };
     let agent_token = headers.get("x-agent-token").cloned().unwrap_or_default();
     let unavailable = |error: String| (503_u16, error);
     // `acl` 在 key 校验**之前**处理：控制台调用可以不带 key（JS 同序）
@@ -78,26 +150,12 @@ pub(crate) fn handle(
         if !console_ok && !owner_ok {
             return Err((403, "ACL 操作只允许管理员私聊或控制台".to_string()));
         }
-        let store = open_store(context, cfg)?;
-        let admin = store.admin();
-        let sub = b.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let rt = b.get("readerType").and_then(|v| v.as_str()).unwrap_or("session");
-        let rid = b.get("readerId").and_then(|v| v.as_str()).unwrap_or("");
-        let wt = b.get("readType").and_then(|v| v.as_str()).unwrap_or("*");
-        let wid = b.get("readId").and_then(|v| v.as_str()).unwrap_or("*");
-        if sub == "grant" {
-            let level = b.get("level").and_then(|v| v.as_str()).unwrap_or("read");
-            let id = admin.grant(rt, rid, wt, wid, level, "console").map_err(|e| (500, e.to_string()))?;
-            let acl = admin.acl().map_err(|e| (500, e.to_string()))?;
-            return Ok(json!({ "ok": true, "id": id, "acl": acl }));
-        }
-        if sub == "revoke" {
-            let removed = admin.revoke(rt, rid, wt, wid, "console").map_err(|e| (500, e.to_string()))?;
-            let acl = admin.acl().map_err(|e| (500, e.to_string()))?;
-            return Ok(json!({ "ok": true, "removed": removed, "acl": acl }));
-        }
-        let acl = admin.acl().map_err(|e| (500, e.to_string()))?;
-        return Ok(json!({ "ok": true, "acl": acl }));
+        let sub = match b.get("action").and_then(Value::as_str) {
+            Some("grant") => Some(AclAction::Grant),
+            Some("revoke") => Some(AclAction::Revoke),
+            _ => None,
+        };
+        return acl_action(context, cfg, sub, &b);
     }
     // `settings-*` 只允许管理员私聊（自己的 agent token）；控制台令牌不行 ——
     // 它等于管理端全权，而"对话式配置"的整个设计前提是**只有管理员能改**。
@@ -221,4 +279,29 @@ pub(crate) fn handle(
 
 fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, (u16, String)> {
     MemoryStore::open(context, cfg).map_err(|e| (500, format!("打开记忆库失败：{e}")))
+}
+
+fn acl_action(
+    context: &RuntimeContext, cfg: &Value, action: Option<AclAction>, b: &Value,
+) -> Result<Value, (u16, String)> {
+    let store = open_store(context, cfg)?;
+    let admin = store.admin();
+    let rt = b.get("readerType").and_then(Value::as_str).unwrap_or("session");
+    let rid = b.get("readerId").and_then(Value::as_str).unwrap_or("");
+    let wt = b.get("readType").and_then(Value::as_str).unwrap_or("*");
+    let wid = b.get("readId").and_then(Value::as_str).unwrap_or("*");
+    let error = |e: rusqlite::Error| (500, e.to_string());
+    let mut result = json!({ "ok": true });
+    match action {
+        Some(AclAction::Grant) => {
+            let level = b.get("level").and_then(Value::as_str).unwrap_or("read");
+            result["id"] = json!(admin.grant(rt, rid, wt, wid, level, "console").map_err(error)?);
+        }
+        Some(AclAction::Revoke) => {
+            result["removed"] = json!(admin.revoke(rt, rid, wt, wid, "console").map_err(error)?);
+        }
+        None => {}
+    }
+    result["acl"] = json!(admin.acl().map_err(error)?);
+    Ok(result)
 }

@@ -1120,10 +1120,13 @@ fn verify_file_inner(
         if !safe_name(&name) || !seen.insert(name.clone()) {
             return Err("backup contains unsafe or duplicate paths".into());
         }
-        if [crate::console_auth::RESTORE_GENERATION_FILE, "state/console-auth-generation", "data/console-auth-generation"]
-            .iter().any(|path| name.eq_ignore_ascii_case(path))
+        let auth_path = name.to_ascii_lowercase();
+        let auth_path = auth_path.strip_prefix("state/").or_else(|| auth_path.strip_prefix("data/")).unwrap_or(&auth_path);
+        if matches!(auth_path, crate::console_auth::RESTORE_GENERATION_FILE | crate::console_auth::TOKEN_FILE
+            | crate::console_auth::ROTATION_FILE | crate::console::DESKTOP_GRANTS_FILE | crate::restore::RECOVERY_DIR)
+            || auth_path.starts_with("console-restore-recovery/")
         {
-            return Err("backup contains a destination console generation".into());
+            return Err("backup contains destination console authentication state".into());
         }
         if name == "manifest.json" {
             continue;

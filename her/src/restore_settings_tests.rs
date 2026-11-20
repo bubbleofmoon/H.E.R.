@@ -1063,7 +1063,7 @@ fn console_auth_memory_restore_keeps_login_state() {
 
 #[test]
 fn console_auth_restore_marker_publication_failure_respects_replacement_boundary() {
-    for (fault, published) in [("temp/sync", false), ("dir/sync", true)] {
+    for fault in ["temp/sync", "dir/sync"] {
         let f = Fixture::new();
         let archive = f.backup();
         mutate(&f);
@@ -1073,16 +1073,11 @@ fn console_auth_restore_marker_publication_failure_respects_replacement_boundary
         let error = auth_restore(&f, &archive, false, &mut control).unwrap_err();
         let current = crate::console_auth::restore_generation(&context).unwrap().unwrap();
         assert_eq!(memory(&f), "current memory");
-        if published {
-            assert!(error.contains("rolled back"), "{error}");
-            assert_ne!(current, initial);
-            assert_eq!(control.stops, 2);
-        } else {
-            assert!(error.contains("nothing changed"), "{error}");
-            assert_eq!(current, initial);
-            assert_eq!(control.stops, 1);
-            assert_eq!(control.writes, 0);
-        }
+        assert!(error.contains("rolled back"), "{error}");
+        assert_ne!(current, initial, "rollback publishes a fresh marker after an interrupted forward phase");
+        assert_eq!(control.stops, 2);
+        assert!(control.writes > 0);
+        assert!(!super::recovery_pending(&context));
         assert!(!fs::read_dir(f.0.join("data")).unwrap().filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp")));
     }

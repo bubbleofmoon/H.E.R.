@@ -89,6 +89,8 @@ pub struct RuntimeContext {
     console_port: Option<u16>,
     dependencies: BTreeMap<String, String>,
     config: Option<Value>,
+    pub(crate) browser_anchors: std::sync::Arc<crate::console_auth::BrowserAnchors>,
+    pub(crate) console_authority: Option<crate::console_auth::ConsoleAuthority>,
 }
 
 /// A transport authority lock for this specific runtime handle.
@@ -167,6 +169,8 @@ impl RuntimeContext {
             console_port: None,
             dependencies: BTreeMap::new(),
             config: None,
+            browser_anchors: Default::default(),
+            console_authority: None,
         }
     }
 
@@ -184,7 +188,11 @@ impl RuntimeContext {
             return Ok(Self::legacy());
         }
         let (root, port) = Self::parse_isolated_startup_args(args, environment_root)?;
-        let context = Self::isolated(&root)?;
+        let context = if args.iter().any(|arg| arg == "--console-serve") {
+            Self::for_console_recovery(&root)?
+        } else {
+            Self::isolated(&root)?
+        };
         if args.iter().skip(1).any(|arg| arg == "--live")
             && context.dependency_url("onebot_ws").is_none()
         {
@@ -268,7 +276,7 @@ impl RuntimeContext {
             port.ok_or("isolated runtime requires an explicit non-zero console port")?))
     }
 
-    fn isolated(root: &Path) -> Result<Self, &'static str> {
+    fn isolated_with_recovery(root: &Path, allow_pending_restore: bool) -> Result<Self, &'static str> {
         if !root.is_absolute() {
             return Err("runtime root is unavailable: --runtime-root must be an absolute path");
         }
@@ -292,48 +300,62 @@ impl RuntimeContext {
             return Err("runtime root is unavailable");
         }
 
-        let config_file = contained_path(&root, "config/config.json", false)?;
+        let pending = allow_pending_restore && !matches!(
+            resolve_contained_path(&root, "data", crate::restore::RECOVERY_INTENT, PathIntent::ReadOptionalFile)
+                .and_then(|path| crate::console_auth::open_protected_auth_file(&path)),
+            Ok(None)
+        );
+        let config_file = if pending {
+            contained_path(&root, "config", true)?.join("config.json")
+        } else {
+            contained_path(&root, "config/config.json", false)?
+        };
         let data_dir = contained_path(&root, "data", true)?;
         let resources_dir = contained_path(&root, "resources", true)?;
         // This directory is a selected fixture root, never inherited from DSH_HOME/USERPROFILE.
         // It may be created lazily by an operation that explicitly writes a user-scoped fixture.
         let dsh_user_dir = root.join("user/dsh");
         let dependencies_file = contained_path(&root, "dependencies.json", false)?;
-        let state_file = contained_path(&root, "data/social-v2.json", false)?;
+        let config = if pending {
+            None
+        } else {
+            let config_text =
+                fs::read_to_string(&config_file).map_err(|_| "runtime config is unavailable")?;
+            let raw_config: Value = serde_json::from_str(config_text.trim_start_matches('\u{feff}'))
+                .map_err(|_| "runtime config is invalid")?;
+            let (config, _) = crate::config::canonical_config(&raw_config)
+                .map_err(|_| "runtime config is invalid")?;
+            crate::backup::Settings::from_config(&root, &config)
+                .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
+            // An empty `consoleToken` means a generated token kept in `data/console-token` (JS
+            // `loadOrCreateConsoleToken`); with neither the console would have no credential.
+            let configured = config
+                .get("consoleToken")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .is_some();
+            let from_file = || {
+                contained_path(&root, "data/console-token", false)
+                    .ok()
+                    .and_then(|path| fs::read_to_string(path).ok())
+                    .is_some_and(|token| !token.trim().is_empty())
+            };
+            if !config.is_object() || !(configured || from_file()) {
+                return Err("runtime config is invalid");
+            }
 
-        let config_text =
-            fs::read_to_string(&config_file).map_err(|_| "runtime config is unavailable")?;
-        let raw_config: Value = serde_json::from_str(config_text.trim_start_matches('\u{feff}'))
-            .map_err(|_| "runtime config is invalid")?;
-        let (config, _) = crate::config::canonical_config(&raw_config)
-            .map_err(|_| "runtime config is invalid")?;
-        crate::backup::Settings::from_config(&root, &config)
-            .map_err(|_| "backup destination is invalid or inside install-root releases, deps or runtime")?;
-        // An empty `consoleToken` means a generated token kept in `data/console-token` (JS
-        // `loadOrCreateConsoleToken`); with neither the console would have no credential.
-        let configured = config
-            .get("consoleToken")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .is_some();
-        let from_file = || {
-            contained_path(&root, "data/console-token", false)
-                .ok()
-                .and_then(|path| fs::read_to_string(path).ok())
-                .is_some_and(|token| !token.trim().is_empty())
+            let state_file = contained_path(&root, "data/social-v2.json", false)?;
+            let state_text =
+                fs::read_to_string(&state_file).map_err(|_| "runtime data is unavailable")?;
+            let state: Value =
+                serde_json::from_str(&state_text).map_err(|_| "runtime data is invalid")?;
+            if !state.is_object() {
+                return Err("runtime data is invalid");
+            }
+
+            Some(config)
         };
-        if !config.is_object() || !(configured || from_file()) {
-            return Err("runtime config is invalid");
-        }
-
-        let state_text =
-            fs::read_to_string(&state_file).map_err(|_| "runtime data is unavailable")?;
-        let state: Value =
-            serde_json::from_str(&state_text).map_err(|_| "runtime data is invalid")?;
-        if !state.is_object() {
-            return Err("runtime data is invalid");
-        }
 
         let dependency_text = fs::read_to_string(&dependencies_file)
             .map_err(|_| "runtime dependencies are unavailable")?;
@@ -386,12 +408,22 @@ impl RuntimeContext {
             dsh_user_dir: Some(dsh_user_dir),
             console_port: None,
             dependencies,
-            config: Some(config),
+            config,
+            browser_anchors: Default::default(),
+            console_authority: None,
         })
+    }
+
+    fn isolated(root: &Path) -> Result<Self, &'static str> {
+        Self::isolated_with_recovery(root, false)
     }
 
     pub(crate) fn from_root(root: &Path) -> Result<Self, &'static str> {
         Self::isolated(root)
+    }
+
+    pub(crate) fn for_console_recovery(root: &Path) -> Result<Self, &'static str> {
+        Self::isolated_with_recovery(root, true)
     }
 
     pub fn config_file(&self) -> &Path {
@@ -921,7 +953,11 @@ impl RuntimeContext {
         let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)
             .map_err(Failure::Refused)?;
         self.revalidate_atomic_target(area, relative, &target).map_err(Failure::Refused)?;
-        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db" | crate::console_auth::RESTORE_GENERATION_FILE)) {
+        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db"
+            | crate::console_auth::RESTORE_GENERATION_FILE | crate::console_auth::TOKEN_FILE
+            | crate::console_auth::ROTATION_FILE | crate::console::DESKTOP_GRANTS_FILE))
+            || (area == RuntimeArea::Data && relative.starts_with("console-restore-recovery/"))
+        {
             crate::guarded_credentials::stage_settings_file(&target, input)
         } else {
             crate::guarded_file::stage(&target, input, None)
@@ -1307,7 +1343,7 @@ impl RuntimeContext {
         }
         json!({
             "mode": "isolated",
-            "configLoaded": self.config.is_some(),
+            "configLoaded": self.config.is_some() || (!crate::restore::recovery_pending(self) && self.load_config().is_ok()),
             "dataConfigured": true,
             "resourcesConfigured": self.resources_dir().is_dir(),
             "dependencyNames": dependency_names,

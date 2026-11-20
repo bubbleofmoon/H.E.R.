@@ -79,6 +79,8 @@ pub(crate) use registry::{
     GATEWAY_SILENCE_WARN,
 };
 #[cfg(test)]
+pub(crate) use store::seed_browser_session;
+#[cfg(test)]
 pub(crate) use store::{
     create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_UNDO_LOOK, FAIL_WRITE_BACK,
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
@@ -88,7 +90,8 @@ pub(crate) use store::{
     complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
     has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, overlay_checked, place_changes, preview,
-    archive_credentials, harness_credential, scrub_auth_snapshot, ArchivedCredentials, registry_free, reset, reset_conversation, resolve_config,
+    admit_browser, archive_credentials, harness_credential, recheck_browser, revoke_browser_sessions,
+    scrub_auth_snapshot, start_browser_clock, ArchivedCredentials, registry_free, reset, reset_conversation, resolve_config,
     resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
     reset_administrator_password, set_initial_administrator_password, store_mark, store_path, stored_secrets, undo,
     view, write_back, Applied, Change, CONVERSATION_ERROR,
