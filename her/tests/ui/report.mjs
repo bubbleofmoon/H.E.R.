@@ -6,16 +6,21 @@ const escape = value => String(value).replace(/[&<>"']/g,
 
 export async function writeReport(directory, report) {
   await fs.writeFile(path.join(directory, 'report.json'), JSON.stringify(report, null, 2) + '\n');
-  const screenshot = ({ browser, size, route, theme, status, file, detail }) => {
+  const screenshot = ({ browser, size, route, theme, hasDarkStyles, status, file, detail }) => {
     const title = [browser, size, route, theme].filter(Boolean).join(' · ');
-    return `<figure><figcaption>${escape(title)} · ${escape(status)}</figcaption>${file
+    const darkStyles = typeof hasDarkStyles === 'boolean' ? (hasDarkStyles ? 'Defines dark styles' : 'No dark styles') : '';
+    const caption = [title, status, darkStyles].filter(Boolean).join(' · ');
+    return `<figure><figcaption>${escape(caption)}</figcaption>${file
       ? `<a href="${escape(file)}"><img loading="lazy" alt="${escape(title)}" src="${escape(file)}"></a>`
       : ''}${detail ? `<p>${escape(detail)}</p>` : ''}</figure>`;
   };
   const row = result => `<tr><th scope="row">${escape(result.id)}<br>${escape(result.label)}</th>
     <td>${escape(result.area)} / ${escape(result.section)}</td><td>${escape(result.status)}</td><td>${result.detail
       ? escape(result.detail) : `<ul>${result.checks
-      .map(check => `<li>${escape([check.source, check.browser, check.size, check.status, check.detail].filter(Boolean).join(' · '))}</li>`)
+      .map(check => {
+        const kind = check.kind === check.status ? undefined : check.kind;
+        return `<li>${escape([check.source, check.browser, check.size, kind, check.status, check.detail].filter(Boolean).join(' · '))}</li>`;
+      })
       .join('')}</ul>`}</td></tr>`;
   const counts = Object.entries(Object.groupBy(report.functions, result => result.status))
     .map(([status, rows]) => `${rows.length} ${status}`).join(' · ');

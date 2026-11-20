@@ -24,6 +24,8 @@ assert(['linux', 'win32'].includes(process.platform), 'The hosted matrix support
 const dimensions = [
   { width: 1920, height: 1080 }, { width: 1366, height: 768 }, { width: 900, height: 800 },
 ];
+const themes = ['light', 'dark'];
+const viewportSize = ({ width, height }) => `${width}x${height}`;
 const isWindows = process.platform === 'win32';
 const platform = isWindows ? 'windows' : 'linux';
 const browsers = isWindows ? { msedge: [chromium, { channel: 'msedge' }] }
@@ -81,6 +83,26 @@ async function capture(page, entry, origin, spec, token) {
   }
 }
 
+async function capturePages(browser, size, takeScreenshot, skipReason) {
+  for (const [group, spec] of Object.entries(pages)) {
+    for (const route of [spec.route, ...(spec.aliases ?? [])]) {
+      for (const theme of themes) {
+        const entry = { browser, size, route, theme, hasDarkStyles: spec.hasDarkStyles ?? null };
+        const detail = skipReason ?? unavailablePages[group];
+        if (detail) {
+          report.screenshots.push({ ...entry, status: 'skipped', detail });
+        } else {
+          try {
+            await takeScreenshot(entry, spec);
+          } catch (error) {
+            report.screenshots.push({ ...entry, status: 'fail', detail: fixtureMessage(error) });
+          }
+        }
+      }
+    }
+  }
+}
+
 async function runWalk(page, group, fixture, browser, size) {
   const state = {};
   for (const [key, check] of Object.entries(walks[group])) {
@@ -122,25 +144,10 @@ async function runWalk(page, group, fixture, browser, size) {
 }
 
 async function runMatrix(browserName, browser, viewport) {
-  const size = `${viewport.width}x${viewport.height}`;
+  const size = viewportSize(viewport);
   await withFixture(HER_TEST_CLI, async fixture => {
-    for (const [group, spec] of Object.entries(pages)) {
-      const routes = [spec.route, ...(spec.aliases ?? [])];
-      for (const route of routes) {
-        for (const theme of spec.themes ?? ['light']) {
-          const entry = { browser: browserName, size, route, theme };
-          if (Object.hasOwn(unavailablePages, group)) {
-            report.screenshots.push({ ...entry, status: 'skipped', detail: unavailablePages[group] });
-            continue;
-          }
-          try {
-            await withPage(browser, viewport, fixture.origin, page => capture(page, entry, fixture.origin, spec));
-          } catch (error) {
-            report.screenshots.push({ ...entry, status: 'fail', detail: fixtureMessage(error) });
-          }
-        }
-      }
-    }
+    await capturePages(browserName, size, (entry, spec) =>
+      withPage(browser, viewport, fixture.origin, page => capture(page, entry, fixture.origin, spec)));
     // Start each walk on the same page state a fresh browser sees. /tasks shares the schedule walk.
     for (const group of Object.keys(walks)) {
       const spec = pages[group];
@@ -164,6 +171,7 @@ async function runMatrix(browserName, browser, viewport) {
 
 if (isWindows) {
   const browser = 'WebView2';
+  let nativeSize;
   try {
     await withFixture(HER_TEST_CLI, async fixture => {
       await withWebView(HER_TEST_CLI, fixture, async (page, session, version) => {
@@ -171,21 +179,18 @@ if (isWindows) {
         await restrictToConsole(page.context(), fixture.origin);
         page.setDefaultTimeout(8000);
         page.setDefaultNavigationTimeout(8000);
-        const size = await page.evaluate(() => `${innerWidth}x${innerHeight}`);
-        for (const [group, spec] of Object.entries(pages)) {
-          for (const route of [spec.route, ...(spec.aliases ?? [])]) {
-            const entry = { browser, size, route, theme: 'light' };
-            if (Object.hasOwn(unavailablePages, group)) {
-              report.screenshots.push({ ...entry, status: 'skipped', detail: unavailablePages[group] });
-              continue;
-            }
-            await capture(page, entry, fixture.origin, spec, session);
-          }
-        }
+        nativeSize = await page.evaluate(() => `${innerWidth}x${innerHeight}`);
+        await capturePages(browser, nativeSize, (entry, spec) => capture(page, entry, fixture.origin, spec, session));
       });
     });
   } catch (error) {
     report.screenshots.push({ browser, status: 'fail', detail: fixtureMessage(error) });
+  }
+  const skipReason = nativeSize
+    ? `WebView2 captures at the app viewport (${nativeSize}).`
+    : 'The app viewport was unavailable. See the WebView2 failure.';
+  for (const size of dimensions.map(viewportSize)) {
+    if (size !== nativeSize) await capturePages(browser, size, undefined, skipReason);
   }
 }
 
@@ -198,7 +203,7 @@ for (const [name, [engine, options]] of Object.entries(browsers)) {
       try {
         await runMatrix(name, browser, viewport);
       } catch (error) {
-        const size = `${viewport.width}x${viewport.height}`;
+        const size = viewportSize(viewport);
         const detail = `Fixture: ${fixtureMessage(error)}`;
         blocked.set(`${name}/${size}`, detail);
         report.errors.push(`${name} ${size}: ${detail}`);
@@ -217,19 +222,18 @@ for (const [id, placement] of Object.entries(catalogue.functions)) {
   const results = placement.sources.flatMap(source => {
     const group = source.split('.')[0];
     if (Object.hasOwn(unavailablePages, group)) return [{ source, status: 'not yet in this UI', detail: unavailablePages[group] }];
-    return Object.keys(browsers).flatMap(browser => dimensions.map(({ width, height }) => {
-      const size = `${width}x${height}`;
-      return checks.get(`${browser}/${size}/${source}`)
+    return Object.keys(browsers).flatMap(browser => dimensions.map(viewport => {
+      const size = viewportSize(viewport);
+      const result = checks.get(`${browser}/${size}/${source}`)
         ?? { source, browser, size, status: 'fail',
           detail: blocked.get(`${browser}/${size}`) ?? blocked.get(browser) ?? `No result recorded for ${source}` };
+      if (!placement.readOnlySources?.includes(source)) return result;
+      return { ...result, kind: 'read-only', status: result.status === 'pass' ? 'read-only' : result.status };
     }));
   });
   const statuses = results.map(result => result.status);
-  const status = statuses.includes('fail') ? 'fail' : statuses.includes('pass') ? 'pass' : 'not yet in this UI';
-  report.functions.push({
-    id, ...placement, status, checks: results,
-    ...(results.length === 0 && { detail: 'The catalogue has no source control for this function on the current console pages.' }),
-  });
+  const status = ['fail', 'pass', 'read-only'].find(status => statuses.includes(status)) ?? 'not yet in this UI';
+  report.functions.push({ id, ...placement, status, checks: results });
 }
 await writeReport(directory, report);
 console.log(`Console UI report: ${directory}`);

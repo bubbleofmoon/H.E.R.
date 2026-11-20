@@ -9,19 +9,23 @@ export const unavailablePages = {
 };
 
 export const pages = {
-  root: { route: '/', themes: ['light', 'dark'] },
-  personas: { route: '/personas', ready: ['/api/personas'], marker: '#assign' },
+  root: { route: '/' },
+  personas: { route: '/personas', hasDarkStyles: false, ready: ['/api/personas'], marker: '#assign' },
   schedule: {
-    route: '/schedule', aliases: ['/tasks'], use: '#save',
+    route: '/schedule', aliases: ['/tasks'], hasDarkStyles: false, use: '#save',
     ready: ['/api/releases', '/api/dependencies', '/api/backups/settings', '/api/tasks', '/api/schedule',
       '/api/tasks/runs', '/api/backups'],
     marker: '#legacy tbody tr',
   },
-  registry: { route: '/settings', ready: ['/api/settings', '/api/settings/history'], marker: '#list tbody tr' },
-  conversations: {
-    route: '/settings/conversations', ready: ['/api/settings/conversations'], marker: '#list tbody tr',
+  registry: {
+    route: '/settings', hasDarkStyles: false,
+    ready: ['/api/settings', '/api/settings/history'], marker: '#list tbody tr',
   },
-  models: { route: '/settings/models', ready: ['/api/settings/models'], marker: '#routes tbody tr' },
+  conversations: {
+    route: '/settings/conversations', hasDarkStyles: false,
+    ready: ['/api/settings/conversations'], marker: '#list tbody tr',
+  },
+  models: { route: '/settings/models', hasDarkStyles: false, ready: ['/api/settings/models'], marker: '#routes tbody tr' },
 };
 
 export async function usable(control, enabled = false) {

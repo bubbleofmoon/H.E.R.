@@ -61,7 +61,8 @@
       "label": "会话授权范围",
       "area": "sessions",
       "section": "mapping",
-      "sources": []
+      "sources": [],
+      "detail": "The Sessions and Approvals page will expose conversation authorization scope."
     },
     "persona-list": {
       "label": "人格列表",
@@ -69,6 +70,9 @@
       "section": "personas",
       "sources": [
         "root.roles",
+        "personas.list"
+      ],
+      "readOnlySources": [
         "personas.list"
       ]
     },
@@ -202,7 +206,8 @@
       "label": "仿真提示词备份列表",
       "area": "her",
       "section": "prompts",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will list simulation prompt backups in Prompts."
     },
     "sim-prompt-restore": {
       "label": "还原仿真提示词备份",
@@ -240,7 +245,8 @@
       "label": "查看二代生效提示词",
       "area": "her",
       "section": "prompts",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will show the effective prompt in Prompts."
     },
     "light-memory": {
       "label": "读取轻量记忆",
@@ -286,31 +292,36 @@
       "label": "搜索记忆",
       "area": "her",
       "section": "memory",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer memory search in Memory."
     },
     "memory-preview": {
       "label": "预览记忆条目",
       "area": "her",
       "section": "memory",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will preview memory entries in Memory."
     },
     "memory-write": {
       "label": "写入记忆",
       "area": "her",
       "section": "memory",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer memory entry creation in Memory."
     },
     "memory-index": {
       "label": "查看记忆索引",
       "area": "her",
       "section": "memory",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will show the memory index in Memory."
     },
     "memory-archive": {
       "label": "归档或取消归档记忆",
       "area": "her",
       "section": "memory",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer archive and unarchive actions in Memory."
     },
     "slang-tabs": {
       "label": "筛选词条状态",
@@ -428,43 +439,50 @@
       "label": "表情包收藏列表",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will list saved stickers in Stickers."
     },
     "stickers-sync": {
       "label": "同步表情包",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer sticker synchronization in Stickers."
     },
     "stickers-note": {
       "label": "编辑表情包本地笔记",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer local sticker notes in Stickers."
     },
     "stickers-remark": {
       "label": "修改 QQ 表情备注",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer QQ sticker remark editing in Stickers."
     },
     "stickers-preview": {
       "label": "预览表情图片",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer image previews in Stickers."
     },
     "stickers-send": {
       "label": "试发表情",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer a test send in Stickers."
     },
     "stickers-collect": {
       "label": "收藏聊天表情",
       "area": "her",
       "section": "stickers",
-      "sources": []
+      "sources": [],
+      "detail": "The HER page will offer a save action for chat stickers in Stickers."
     },
     "voice-refresh": {
       "label": "刷新语音库",
@@ -606,7 +624,8 @@
       "label": "查看待发送队列",
       "area": "engagement",
       "section": "feedback",
-      "sources": []
+      "sources": [],
+      "detail": "The Participation and Wake page will show the send outbox in Feedback."
     },
     "spend-series": {
       "label": "令牌与花费趋势",
@@ -677,6 +696,9 @@
       "area": "schedule",
       "section": "upcoming",
       "sources": [
+        "schedule.upcoming"
+      ],
+      "readOnlySources": [
         "schedule.upcoming"
       ]
     },
@@ -758,6 +780,9 @@
       "section": "tasks",
       "sources": [
         "schedule.windows"
+      ],
+      "readOnlySources": [
+        "schedule.windows"
       ]
     },
     "backup-settings": {
@@ -806,6 +831,9 @@
       "section": "updates",
       "sources": [
         "schedule.release-status"
+      ],
+      "readOnlySources": [
+        "schedule.release-status"
       ]
     },
     "release-approve": {
@@ -829,6 +857,9 @@
       "area": "schedule",
       "section": "updates",
       "sources": [
+        "schedule.dependencies"
+      ],
+      "readOnlySources": [
         "schedule.dependencies"
       ]
     },
@@ -854,6 +885,9 @@
       "section": "registry",
       "sources": [
         "registry.list"
+      ],
+      "readOnlySources": [
+        "registry.list"
       ]
     },
     "registry-set": {
@@ -877,6 +911,9 @@
       "area": "settings",
       "section": "conversation-settings",
       "sources": [
+        "conversations.list"
+      ],
+      "readOnlySources": [
         "conversations.list"
       ]
     },
@@ -911,6 +948,9 @@
       "sources": [
         "root.model-chain",
         "models.view"
+      ],
+      "readOnlySources": [
+        "models.view"
       ]
     },
     "model-route-override": {
@@ -935,19 +975,22 @@
       "label": "更改管理员密码",
       "area": "security",
       "section": "browser-access",
-      "sources": []
+      "sources": [],
+      "detail": "The Security page will offer administrator password changes."
     },
     "local-password": {
       "label": "本机也需要密码",
       "area": "security",
       "section": "browser-access",
-      "sources": []
+      "sources": [],
+      "detail": "The Security page will expose the local password requirement."
     },
     "browser-sessions": {
       "label": "已登录的浏览器",
       "area": "security",
       "section": "browser-access",
-      "sources": []
+      "sources": [],
+      "detail": "The Security page will list signed-in browsers."
     },
     "allow-list": {
       "label": "允许列表",
@@ -1001,13 +1044,15 @@
       "label": "检查读取授权",
       "area": "security",
       "section": "access-control",
-      "sources": []
+      "sources": [],
+      "detail": "The Security page will offer read-authorization checks."
     },
     "memory-access": {
       "label": "管理记忆读取权限",
       "area": "security",
       "section": "access-control",
-      "sources": []
+      "sources": [],
+      "detail": "The Security page will manage memory read permissions."
     },
     "token-rotate": {
       "label": "轮换控制台令牌",
@@ -1025,6 +1070,9 @@
       "sources": [
         "registry.history",
         "conversations.history"
+      ],
+      "readOnlySources": [
+        "registry.history"
       ]
     },
     "audit-older": {
@@ -1048,37 +1096,43 @@
       "label": "查看卡住的对话轮次",
       "area": "audit",
       "section": "recovery",
-      "sources": []
+      "sources": [],
+      "detail": "The Audit and Recovery page will list stuck turns."
     },
     "turns-resolve": {
       "label": "处理卡住的轮次",
       "area": "audit",
       "section": "recovery",
-      "sources": []
+      "sources": [],
+      "detail": "The Audit and Recovery page will offer stuck-turn resolution."
     },
     "inbound-gaps": {
       "label": "查看入站消息缺口",
       "area": "audit",
       "section": "recovery",
-      "sources": []
+      "sources": [],
+      "detail": "The Audit and Recovery page will list inbound gaps."
     },
     "inbound-retry": {
       "label": "重试入站消息缺口",
       "area": "audit",
       "section": "recovery",
-      "sources": []
+      "sources": [],
+      "detail": "The Audit and Recovery page will offer inbound gap retries."
     },
     "recovery-record": {
       "label": "查看恢复记录",
       "area": "audit",
       "section": "recovery",
-      "sources": []
+      "sources": [],
+      "detail": "The Audit and Recovery page will show the recovery record."
     },
     "qq-login": {
       "label": "查看 QQ 登录状态",
       "area": "operations",
       "section": "bridge",
-      "sources": []
+      "sources": [],
+      "detail": "The Operations page will show QQ login status."
     },
     "test-send": {
       "label": "发送测试消息",
@@ -1180,13 +1234,15 @@
       "label": "登录控制台",
       "area": "login",
       "section": "sign-in",
-      "sources": []
+      "sources": [],
+      "detail": "The Login page will offer password sign-in."
     },
     "setup-password": {
       "label": "首次设置管理员密码",
       "area": "setup",
       "section": "first-run",
-      "sources": []
+      "sources": [],
+      "detail": "The Setup page will offer initial administrator password creation."
     }
   }
 }
