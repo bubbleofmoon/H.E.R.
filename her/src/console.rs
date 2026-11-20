@@ -11646,7 +11646,7 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
         "agentPreset": "qq-chat-v2",
         "provideRecommendations": true,
         "tools": {},
-        "wait": { "defaultMs": 30000, "defaultQuietMs": 8000, "batchWindowMs": 8000, "maxPerTurn": 4 },
+        "wait": {},
         "sticker": {},
         "proactive": {},
         "feedback": { "maxLength": 500, "notifyOwnerOnError": false },
@@ -11673,6 +11673,17 @@ fn effective_social_v2(file_section: Option<&Value>) -> Value {
     }
     // JS: `{ defaults, ...(cfg.socialV2.x ?? {}) }`; a value that is not an object adds nothing.
     let members = |value: Option<&Value>| value.and_then(Value::as_object).cloned().unwrap_or_default();
+    // Registry timing can materialize a partial wait section before this view is built.
+    let mut wait = members(section.get("wait"));
+    for (name, default) in [
+        ("defaultMs", 30_000),
+        ("defaultQuietMs", 8_000),
+        ("batchWindowMs", 8_000),
+        ("maxPerTurn", 4),
+    ] {
+        wait.entry(name).or_insert_with(|| json!(default));
+    }
+    section.insert("wait".to_string(), Value::Object(wait));
     let mut tools = serde_json::Map::new();
     for (flag, setting) in crate::settings::tool_switches() {
         tools.insert(flag.to_string(), setting.default_value());

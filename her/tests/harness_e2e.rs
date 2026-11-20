@@ -3251,8 +3251,8 @@ fn qq_tool_history_restores_originals_after_blacklist_removal_on_replay() {
     {
         let requests = lock(&model.requests);
         let filtered = tool_wire_packet(&requests[1], "history-restore");
-        assert_eq!(filtered["messages"][0]["raw_message"], " historical chat");
-        assert_eq!(filtered["messages"][0]["sender"]["nickname"], " nickname");
+        assert_eq!(filtered["messages"][0]["raw_message"], "【已隐藏】 historical chat");
+        assert_eq!(filtered["messages"][0]["sender"]["nickname"], "【已隐藏】 nickname");
         assert_eq!(filtered["messages"][0]["message_id"], 81803);
     }
     assert!(rig
@@ -3264,7 +3264,7 @@ fn qq_tool_history_restores_originals_after_blacklist_removal_on_replay() {
     assert_eq!(
         tool_wire_packet(&lock(&model.requests)[3], "history-restore")["messages"][0]
             ["raw_message"],
-        " historical chat"
+        "【已隐藏】 historical chat"
     );
     assert!(wait_for(LONG, || rig
         .ledger()
