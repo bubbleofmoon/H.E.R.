@@ -480,17 +480,7 @@ fn result_text(response: &Value) -> &str {
 }
 
 fn is_tool_error(response: &Value) -> bool {
-    response["result"]["isError"].as_bool() == Some(true)
-        || [
-            "写入失败：",
-            "检索失败：",
-            "删除失败：",
-            "权限操作失败：",
-            "改配置失败：",
-            "读取失败：",
-        ]
-        .iter()
-        .any(|prefix| result_text(response).starts_with(prefix))
+    response["result"]["isError"] == true
 }
 
 #[test]
@@ -541,7 +531,7 @@ fn isolated_mcp_processes_keep_config_memory_owner_and_acl_state_separate() {
             .expect("tools/list result");
         assert_eq!(
             tools.len(),
-            35 + 7,
+            32 + 7,
             "the default tool list excludes both voice tools and sticker remarks"
         );
         for expected in [
@@ -742,7 +732,7 @@ fn isolated_mcp_processes_keep_config_memory_owner_and_acl_state_separate() {
 }
 
 #[test]
-fn isolated_mcp_reloads_selected_config_and_fails_closed_when_it_is_missing_or_invalid() {
+fn memory_settings_mcp_classifies_refusals_and_action_errors() {
     let root = temp_root("config reload and failures");
     let override_root = temp_root("config failure override sentinel");
     let private_home = temp_root("config failure personal home");
@@ -789,6 +779,23 @@ fn isolated_mcp_reloads_selected_config_and_fails_closed_when_it_is_missing_or_i
         "MCP must observe the replaced selected config"
     );
 
+    assert!(reloaded["result"].get("isError").is_none(), "{reloaded}");
+    assert!(reloaded["result"].get("structuredContent").is_none(), "{reloaded}");
+
+    let refused = mcp.call(4, "memory_search", json!({
+        "key":"private:9001", "token":"wrong-token", "query":"synthetic"
+    }));
+    assert_eq!(refused["result"]["isError"], true, "memory refusal must set the MCP error flag");
+    assert_eq!(refused["result"]["structuredContent"]["class"], "refusal", "{refused}");
+    assert!(result_text(&refused).starts_with("检索失败："), "{refused}");
+
+    let readonly = mcp.call(5, "settings_set", json!({
+        "key":"private:9001", "token":"agent-token", "settingKey":"not.writable", "value":123
+    }));
+    assert!(is_tool_error(&readonly), "{readonly}");
+    assert_eq!(readonly["result"]["structuredContent"]["class"], "refusal", "{readonly}");
+    assert!(result_text(&readonly).starts_with("改配置失败："), "{readonly}");
+
     let initial_rows = memory_row_count(&selected_db);
     fs::remove_file(&selected_config).expect("remove selected config after MCP startup");
     let missing = mcp.call(
@@ -804,6 +811,8 @@ fn isolated_mcp_reloads_selected_config_and_fails_closed_when_it_is_missing_or_i
         is_tool_error(&missing),
         "missing selected config must fail the tool"
     );
+    assert_eq!(missing["result"]["structuredContent"]["class"], "error", "{missing}");
+    assert!(result_text(&missing).starts_with("写入失败："), "{missing}");
     assert_eq!(
         memory_row_count(&selected_db),
         initial_rows,
@@ -824,6 +833,7 @@ fn isolated_mcp_reloads_selected_config_and_fails_closed_when_it_is_missing_or_i
         is_tool_error(&invalid),
         "invalid selected config must fail the tool"
     );
+    assert_eq!(invalid["result"]["structuredContent"]["class"], "error", "{invalid}");
     assert_eq!(
         memory_row_count(&selected_db),
         initial_rows,

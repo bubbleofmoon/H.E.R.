@@ -177,10 +177,9 @@ impl Tools {
         Ok(self
             .definitions
             .iter()
-            .filter(|d| {
-                current
-                    .as_ref()
-                    .is_none_or(|current| current.iter().any(|c| c["name"] == d["name"]))
+            .filter_map(|captured| match &current {
+                Some(current) => current.iter().find(|tool| tool["name"] == captured["name"]),
+                None => Some(captured),
             })
             .map(|d| {
                 Tool::new(d["name"].as_str().unwrap_or_default())
@@ -324,7 +323,6 @@ impl Authority {
 /// The definitions of `profile`'s menu that `cfg` registers, in registration order: a tool the
 /// configuration switches off (#153) drops out of every menu, the direct-send switches included.
 fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> {
-    let menu = profile.menu();
     let mut tools = crate::mcp::tool_list(cfg)["tools"]
         .as_array()
         .cloned()
@@ -335,10 +333,7 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
         .into_iter()
         .filter(|d| {
             d["name"].as_str().is_some_and(|name| {
-                menu.contains(&name)
-                    && (!matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
-                        || crate::console::reserved2_menu_tool(cfg, conversation, name))
-                    && direct_send_switch(name).is_none_or(|flag| crate::settings::tool_enabled(cfg, flag))
+                profile.allows_tool(cfg, Some(conversation), name)
             })
         })
         .map(|mut definition| {
@@ -355,19 +350,6 @@ fn definitions(cfg: &Value, profile: Profile, conversation: &str) -> Vec<Value> 
             }
         })
         .collect()
-}
-
-/// The `socialV2.tools` switch the console checks for a token-bound direct send
-/// (`console_agent::direct_inner`). The shared MCP registration (`qq_tools::registered`) does not
-/// gate these three tools, and the harness always binds the turn's token into them, so the menu
-/// applies the switch. As in the console, only an explicit `false` switches a send off.
-fn direct_send_switch(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "qq_send_private_message" => "sendPrivate",
-        "qq_send_group_message" => "sendGroup",
-        "qq_reply" => "reply",
-        _ => return None,
-    })
 }
 
 pub(super) fn error(reason: &str) -> Value {

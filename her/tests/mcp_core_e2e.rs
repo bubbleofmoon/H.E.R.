@@ -1260,35 +1260,67 @@ fn get_prompt_sticker_strategy_follows_include_in_prompt_even_when_disabled() {
     }
 }
 
+fn discovered_names(mcp: &Mcp) -> Vec<Value> {
+    mcp.request("tools/list", json!({}))["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|tool| tool["name"].clone())
+        .collect()
+}
+
 #[test]
-fn get_prompt_enabled_tools_match_js_order_and_default_voice_flag() {
-    const BASE: [&str; 23] = [
-        "qq_get_prompt", "qq_get_unread_messages", "qq_get_recent_messages", "qq_social_state",
-        "qq_send_group_message", "qq_send_private_message", "qq_reply", "qq_send_burst", "qq_send_message",
-        "qq_wait_for_messages", "qq_report_feedback", "qq_get_my_recent_messages", "qq_get_message_detail",
-        "qq_get_active_members", "qq_set_wake_config", "qq_mark_read",
-        "qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear",
-        "qq_slang_query", "qq_slang_submit", "qq_get_message_images", "qq_get_forward_msg", "qq_send_poke", "qq_get_self_image",
-    ];
-    for (label, config, with_voice, with_stickers) in [
-        ("parity", json!({"sticker": {"enabled": false}, "voice": {"enabled": false}}), false, false),
-        ("voice-enabled-default-flag", json!({"sticker": {"enabled": false}, "voice": {"enabled": true}}), false, false),
-        ("explicit-voice", json!({"sticker": {"enabled": false}, "voice": {"enabled": false}, "tools": {"sendVoice": true}}), true, false),
-        ("explicit-no-voice", json!({"sticker": {"enabled": false}, "voice": {"enabled": true}, "tools": {"sendVoice": false}}), false, false),
-        ("sticker-default-flags", json!({"sticker": {"enabled": true}, "voice": {"enabled": false}}), false, true),
+fn discovery_and_prompt_follow_mode_and_capabilities() {
+    let f = fixture("discovery", json!({}));
+    let mode_path = f.root.path().join("data/mode.json");
+    let set_mode = |mode| fs::write(&mode_path, json!({"mode": mode}).to_string()).unwrap();
+    set_mode("chat");
+    assert_eq!(
+        discovered_names(&f.mcp),
+        json!(["qq_status", "memory_write", "memory_search", "memory_index", "memory_forget",
+               "memory_acl", "settings_get", "settings_set"]).as_array().unwrap().clone(),
+        "chat discovery must only offer its profile tools"
+    );
+    let stale = f.mcp.call("qq_wait_for_messages", group(json!({})));
+    assert!(is_error(&stale), "live authorization must still refuse a stale call: {stale}");
+
+    set_mode("closed-agent");
+    let closed = discovered_names(&f.mcp);
+    for name in ["qq_get_group_history", "qq_send_private_message", "settings_set"] {
+        assert!(closed.contains(&json!(name)), "{name}: {closed:?}");
+    }
+    for name in ["qq_send_group_message", "qq_wait_for_messages", "qq_send_message"] {
+        assert!(!closed.contains(&json!(name)), "{name}: {closed:?}");
+    }
+
+    set_mode("reserved2");
+    let group_mcp = Mcp::start(&f.root, f.console_port, &[("QQ_SESSION_KEY", GROUP_KEY)]);
+    group_mcp.initialize();
+    for (switches, with_voice, with_stickers, with_remark, with_group_send) in [
+        (json!({}), false, true, false, true),
+        (json!({"voice":{"enabled":true}}), false, true, false, true),
+        (json!({"voice":{"enabled":false},"tools":{"sendVoice":true},"sticker":{"enabled":false}}), false, false, false, true),
+        (json!({"voice":{"enabled":true},"tools":{"sendVoice":false,"setStickerRemark":false}}), false, true, false, true),
+        (json!({"voice":{"enabled":true},"tools":{"sendVoice":true,"setStickerRemark":true,"sendGroup":false}}), true, true, true, false),
     ] {
-        let f = fixture(&format!("prompt-tools-{label}"), config);
-        let answer = f.mcp.call("qq_get_prompt", group(json!({})));
+        let mut cfg = f.root.config();
+        cfg["socialV2"] = switches;
+        f.root.write_config(&cfg);
+        let discovered = discovered_names(&group_mcp);
+        let answer = group_mcp.call("qq_get_prompt", group(json!({})));
         assert!(!is_error(&answer), "{answer}");
-        let prompt: Value = serde_json::from_str(&text_of(&answer)).expect("prompt JSON");
-        let mut expected = BASE.to_vec();
-        if with_stickers {
-            expected.splice(22..22, ["qq_list_stickers", "qq_get_sticker_image", "qq_send_sticker", "qq_sticker_note", "qq_collect_sticker"]);
+        let prompt: Value = serde_json::from_str(&text_of(&answer)).unwrap();
+        assert_eq!(prompt["enabledTools"], json!(discovered));
+        for name in ["qq_get_group_history", "qq_send_private_message", "settings_set"] {
+            assert!(!discovered.contains(&json!(name)), "{name}: {discovered:?}");
         }
-        if with_voice {
-            expected.push("qq_send_voice / qq_list_voices");
+        for (name, enabled) in [
+            ("qq_send_voice", with_voice), ("qq_list_voices", with_voice),
+            ("qq_list_stickers", with_stickers), ("qq_set_sticker_remark", with_remark),
+            ("qq_send_group_message", with_group_send),
+        ] {
+            assert_eq!(discovered.contains(&json!(name)), enabled, "{name}: {discovered:?}");
         }
-        assert_eq!(prompt["enabledTools"], json!(expected), "{label}");
     }
 }
 
@@ -1306,14 +1338,17 @@ fn tool_registry_is_the_js_registration_in_order_and_follows_the_config_switches
         .map(|t| t["name"].as_str().expect("name").to_string())
         .collect();
     let qq: Vec<&str> = names.iter().map(String::as_str).filter(|n| n.starts_with("qq_")).collect();
-    assert_eq!(qq, JS_TOOL_NAMES, "qq_* tools: same names in the same order as the JS server");
-    assert_eq!(names.len(), 38 + 7, "the 7 memory/settings tools are the only extras");
+    let reserved2: Vec<&str> = JS_TOOL_NAMES.iter().copied().filter(|name| {
+        !matches!(*name, "qq_list_groups" | "qq_get_group_members" | "qq_get_group_history")
+    }).collect();
+    assert_eq!(qq, reserved2, "reserved2 keeps discovery in registration order");
+    assert_eq!(names.len(), reserved2.len() + 7);
     for tool in f.mcp.request("tools/list", json!({}))["result"]["tools"].as_array().expect("tools") {
         assert!(tool.get("bridge").is_none(), "internal routing must not leak into the tool definition: {}", tool["name"]);
         assert!(tool["inputSchema"].is_object());
     }
 
-    // Registration is decided from the config at start-up, like the JS server.
+    // Discovery and call registration apply the effective capability switches.
     let gated = fixture(
         "registry-gated",
         json!({"sticker": {"enabled": false}, "voice": {"enabled": false}, "tools": {"sendPoke": false, "getImages": false, "memory": false}}),
@@ -1659,6 +1694,75 @@ fn concurrent_send_message_calls_share_one_duplicate_window() {
     assert!(answers.iter().all(|(status, _)| *status == 200 || *status == 429), "{answers:?}");
     assert_eq!(f.onebot.actions("send_group_msg").len(), 1, "only one concurrent send reaches the gateway");
     assert_eq!(f.root.state()["conversations"][GROUP_KEY]["sendTimes"].as_array().expect("quota").len(), 1);
+}
+
+#[test]
+fn text_send_schemas_and_gateway_follow_merge_and_burst_policy() {
+    for (label, merge, burst, description) in [
+        ("default-merge", None, false, "合并成一条"),
+        ("split", Some(false), true, "分别发送"),
+        ("single-only", Some(false), false, "只允许一条"),
+    ] {
+        let mut send = json!({"burstEnabled": burst, "maxMessageChars": 5,
+            "burstIntervalMinMs": 0, "burstIntervalMaxMs": 0, "maxGapMs": 0,
+            "firstGapEnabled": false});
+        if let Some(merge) = merge {
+            send["mergeMultiIntoOne"] = json!(merge);
+        }
+        let f = fixture(label, json!({"send": send}));
+        let response = f.mcp.request("tools/list", json!({}));
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let prompt = f.mcp.call("qq_get_prompt", group(json!({})));
+        assert!(!is_error(&prompt), "{prompt}");
+        let prompt: Value = serde_json::from_str(&text_of(&prompt)).unwrap();
+        assert_eq!(prompt["recommended"]["send"]["mergeMultiIntoOne"], merge.unwrap_or(true));
+        assert_eq!(prompt["recommended"]["send"]["burstEnabled"], burst);
+        for name in ["qq_send_message", "qq_send_burst"] {
+            let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
+            assert!(
+                tool["description"].as_str().unwrap().contains(description),
+                "send schema must describe the configured bubble policy ({label}, {name}): {tool}"
+            );
+            if name == "qq_send_message" {
+                let gaps = tool["inputSchema"]["properties"]["gaps"]["description"].as_str().unwrap();
+                assert_eq!(gaps.contains("忽略"), label != "split", "{label}: {gaps}");
+            }
+            let call = |messages: Value| {
+                f.mcp.call(name, group(json!({"groupId": GROUP, "messages": messages,
+                    "gapMode":"fixed", "gaps":[0]})))
+            };
+            let oversized = call(json!(["😀😀😀"]));
+            assert!(is_error(&oversized), "{oversized}");
+            assert!(text_of(&oversized).contains("5"), "{oversized}");
+
+            let multi = call(json!(["😀😀", "ab"]));
+            if label == "split" {
+                assert!(!is_error(&multi), "{multi}");
+            } else {
+                assert!(is_error(&multi), "{multi}");
+                let reason = if label == "single-only" { "已禁用多条发送" } else { "合并后的消息不能超过 5" };
+                assert!(text_of(&multi).contains(reason), "{multi}");
+            }
+            let exact = match label {
+                "default-merge" => json!(["😀", "ab"]),
+                "split" => json!(["😀😀a"]),
+                _ => json!(["😀😀b"]),
+            };
+            let exact = call(exact);
+            assert!(!is_error(&exact), "{exact}");
+        }
+
+        let expected: &[&str] = match label {
+            "default-merge" => &["😀\nab", "😀\nab"],
+            "split" => &["😀😀", "ab", "😀😀a", "😀😀", "ab", "😀😀a"],
+            _ => &["😀😀b", "😀😀b"],
+        };
+        let sent: Vec<String> = f.onebot.actions("send_group_msg").iter()
+            .map(|call| call["message"][0]["data"]["text"].as_str().unwrap().to_owned())
+            .collect();
+        let sent: Vec<_> = sent.iter().map(String::as_str).collect();
+        assert_eq!(sent.as_slice(), expected, "{label}");
+    }
 }
 
 #[test]

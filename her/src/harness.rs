@@ -1563,7 +1563,7 @@ fn preview_tool_results(messages: Vec<ChatMessage>, cap: usize) -> Vec<ChatMessa
 
 /// The model copy of one tool result. A result longer than `cap` characters becomes one MCP result:
 /// the longest leading part of its text that keeps the whole copy within `cap`, a note that the rest
-/// was omitted, and the original error flag. Canonical facts keep the whole result.
+/// was omitted, and the original error flag and class. Canonical facts keep the whole result.
 fn preview_tool_text(text: &str, cap: usize) -> String {
     if text.chars().count() <= cap {
         return text.to_string();
@@ -1581,7 +1581,8 @@ fn preview_tool_text(text: &str, cap: usize) -> String {
                 .join("\n")
         })
         .unwrap_or_else(|| text.to_string());
-    let error_flag = data.as_ref().and_then(|data| data.get("isError")).cloned();
+    let error_flag = data.as_ref().and_then(|data| data.get("isError"));
+    let error_class = data.as_ref().and_then(|data| data.pointer("/structuredContent/class"));
     // Byte offsets of every character boundary, so a prefix never splits a character.
     let ends: Vec<usize> = body
         .char_indices()
@@ -1596,8 +1597,11 @@ fn preview_tool_text(text: &str, cap: usize) -> String {
             {"type":"text","text":leading},
             {"type":"text","text":note}
         ]});
-        if let Some(flag) = &error_flag {
+        if let Some(flag) = error_flag {
             copy["isError"] = flag.clone();
+        }
+        if let Some(class) = error_class {
+            copy["structuredContent"] = serde_json::json!({"class": class});
         }
         copy.to_string()
     };

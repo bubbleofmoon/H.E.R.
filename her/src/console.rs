@@ -1499,8 +1499,8 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         )
     };
     let none_if_empty = |text: String| if text.is_empty() { Value::Null } else { json!(text) };
-    let reserved2 = current_mode_for(context).map(|m| m == "reserved2").unwrap_or(true);
-    let role_hint = if reserved2 {
+    let mode = current_mode_for(context).ok();
+    let role_hint = if mode.as_deref().is_none_or(|mode| mode == "reserved2") {
         crate::prompt::role_hint_v2(context, cfg, key)
     } else {
         crate::prompt::role_hint_v1(context, cfg, key)
@@ -1512,64 +1512,12 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // enabledTools：flag → 工具名，顺序必须与 JS 的 toolMap 一致。
-    const TOOL_MAP: [(&str, &str); 30] = [
-        ("getPrompt", "qq_get_prompt"),
-        ("getUnread", "qq_get_unread_messages"),
-        ("getRecent", "qq_get_recent_messages"),
-        ("socialState", "qq_social_state"),
-        ("sendGroup", "qq_send_group_message"),
-        ("sendPrivate", "qq_send_private_message"),
-        ("reply", "qq_reply"),
-        ("sendBurst", "qq_send_burst"),
-        ("sendMessage", "qq_send_message"),
-        ("waitMessages", "qq_wait_for_messages"),
-        ("feedback", "qq_report_feedback"),
-        ("getMyRecent", "qq_get_my_recent_messages"),
-        ("getMessageDetail", "qq_get_message_detail"),
-        ("getActiveMembers", "qq_get_active_members"),
-        ("setWakeConfig", "qq_set_wake_config"),
-        ("markRead", "qq_mark_read"),
-        ("memory", "qq_memory_append / qq_memory_query / qq_memory_remove / qq_memory_clear"),
-        ("slangQuery", "qq_slang_query"),
-        ("slangSubmit", "qq_slang_submit"),
-        ("getImages", "qq_get_message_images"),
-        ("getForwardMsg", "qq_get_forward_msg"),
-        ("sendPoke", "qq_send_poke"),
-        ("listStickers", "qq_list_stickers"),
-        ("getStickerImage", "qq_get_sticker_image"),
-        ("sendSticker", "qq_send_sticker"),
-        ("setStickerRemark", "qq_set_sticker_remark"),
-        ("stickerNote", "qq_sticker_note"),
-        ("collectSticker", "qq_collect_sticker"),
-        ("getSelfImage", "qq_get_self_image"),
-        ("sendVoice", "qq_send_voice / qq_list_voices"),
-    ];
-    let tools = cfg
-        .get("socialV2")
-        .and_then(|v| v.get("tools"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
     let (sticker_enabled, _include, total, sticker_context, strategy) =
         crate::prompt::sticker_parts_with_runtime(context, cfg);
-    let sticker_flags = [
-        "listStickers",
-        "getStickerImage",
-        "sendSticker",
-        "setStickerRemark",
-        "stickerNote",
-        "collectSticker",
-    ];
-    let mut enabled_tools: Vec<String> = Vec::new();
-    for (flag, name) in TOOL_MAP {
-        // JS loadConfig defaults these two switches off before applying tools.
-        let on = tools.get(flag).map(|v| v != &Value::Bool(false))
-            .unwrap_or(!matches!(flag, "sendVoice" | "setStickerRemark"));
-        let sticker_blocked = sticker_flags.contains(&flag) && !sticker_enabled;
-        if on && !sticker_blocked {
-            enabled_tools.push(name.to_string());
-        }
-    }
+    let enabled_tools: Vec<Value> = crate::mcp::discovered_tools(cfg, mode.as_deref(), Some(key))
+        .into_iter()
+        .map(|mut tool| tool["name"].take())
+        .collect();
 
     let recommended = if crate::prompt::provides_recommendations(cfg) {
         let sv2 = effective_social_v2(cfg.get("socialV2"));
@@ -4784,13 +4732,16 @@ fn social_v2_projection_session_allowed(cfg: &Value, key: &str) -> bool {
 }
 
 /// Additional menu gates imposed by the reserved2 console routes.
-pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
+pub(crate) fn reserved2_menu_tool(cfg: &Value, key: Option<&str>, name: &str) -> bool {
+    if name.starts_with("qq_") && name != "qq_status"
+        && cfg.pointer("/socialV2/enabled").and_then(Value::as_bool) == Some(false)
+    {
+        return false;
+    }
     match name {
-        "qq_send_private_message" => key.starts_with("private:"),
-        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => key.starts_with("group:"),
-        "qq_send_voice" | "qq_list_voices" =>
-            voice_http::voice_cfg(cfg).enabled && voice_http::send_voice_tool_enabled(cfg),
-        "qq_set_sticker_remark" => tool_enabled(cfg, "setStickerRemark"),
+        "qq_send_private_message" => key.is_none_or(|key| key.starts_with("private:")),
+        "qq_send_group_message" | "qq_reply" | "qq_send_burst" =>
+            key.is_none_or(|key| key.starts_with("group:")),
         _ => true,
     }
 }
@@ -10795,20 +10746,6 @@ fn send_message_inner(
     if key.is_empty() || (messages.is_empty() && resume_batch.is_none()) {
         return Err((400, "key 和 messages 不能为空".to_string()));
     }
-    let send_cfg = cfg.get("socialV2").and_then(|s| s.get("send")).cloned().unwrap_or_else(|| json!({}));
-    let burst_enabled = send_cfg.get("burstEnabled").and_then(|v| v.as_bool()).unwrap_or(true);
-    // 多条 → 合并成一条、换行分隔（与 bridge.js 同一策略，管理员 2026-10-22 定）。
-    // 模型想分几句说，但 QQ 上连发多条会变成刷屏；拼成一条带换行的消息，
-    // 它的表达没被砍，群里看到的还是一条完整的话。
-    // 只有 `mergeMultiIntoOne: false` 才回到"真分多条"（那时再看 burstEnabled）。
-    let merge_into_one = send_cfg
-        .get("mergeMultiIntoOne")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if messages.len() > 1 && !merge_into_one && !burst_enabled {
-        return Err((403, "已禁用多条发送，请合并为一条消息".to_string()));
-    }
-    let messages = merge_multi(messages, merge_into_one);
     let token = headers.get("x-agent-token").cloned().unwrap_or_default();
     if !token.is_empty() && !agent_token_ok_for(context, &key, &token)? {
         return Err((403, "agent token 无效".to_string()));
@@ -10867,20 +10804,7 @@ fn send_message_inner(
             ));
         }
     }
-    let max_msgs = send_cfg.get("burstMaxMessages").and_then(|v| v.as_i64()).unwrap_or(8).max(1);
-    let max_chars = send_cfg.get("maxMessageChars").and_then(|v| v.as_i64()).unwrap_or(500).max(1);
-    if messages.len() as i64 > max_msgs {
-        return Err((400, format!("最多发送 {max_msgs} 条")));
-    }
-    for m in &messages {
-        if m.encode_utf16().count() as i64 > max_chars {
-            return Err((400, format!("单条消息不能超过 {max_chars} 字")));
-        }
-        if let Some(why) = crate::pipeline::configured_outbound_violation(cfg, m, &[]) {
-            crate::safe_println!("[console] send-message 被哨兵拦下：{why}");
-            return Err((403, "消息含敏感信息，已阻止发送".to_string()));
-        }
-    }
+    let messages = agent::prepare_text_batch(cfg, messages, "send-message")?;
     let storage_key = canonical_v2_key(&key).ok_or((400, format!("无效的会话 key：{key}")))?;
     let call = agent::SendCall {
         key: &storage_key,
@@ -10945,7 +10869,7 @@ fn find_cjk_space_warning(messages: &[String]) -> Option<String> {
         )
     };
     Some(format!(
-        "{label}消息内部有中文空格，真人一般不这么打；可删掉空格用标点，或拆成数组多条。"
+        "{label}消息内部有中文空格；可以用标点分隔短句。"
     ))
 }
 

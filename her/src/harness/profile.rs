@@ -217,6 +217,22 @@ impl Profile {
         }
     }
 
+    /// Shared profile and live capability rules for discovered tools.
+    pub(crate) fn allows_tool(self, cfg: &Value, conversation: Option<&str>, name: &str) -> bool {
+        self.menu().contains(&name)
+            && (!matches!(self, Self::Reserved2 | Self::Reserved2Owner)
+                || crate::console::reserved2_menu_tool(cfg, conversation, name))
+            && match name {
+                "qq_send_private_message" => crate::settings::tool_enabled(cfg, "sendPrivate"),
+                "qq_send_group_message" => crate::settings::tool_enabled(cfg, "sendGroup"),
+                "qq_reply" => crate::settings::tool_enabled(cfg, "reply"),
+                "memory_acl" | "settings_get" | "settings_set" =>
+                    crate::conversation_authority::owner_conversation(cfg)
+                        .is_some_and(|owner| conversation.is_none_or(|key| key == owner)),
+                _ => true,
+            }
+    }
+
     /// The text setting holding this profile's mode prompt, if it has one.
     pub(crate) fn prompt_key(self) -> Option<&'static str> {
         match self {

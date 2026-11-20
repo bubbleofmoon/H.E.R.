@@ -78,7 +78,7 @@ fn needs_voice_system(name: &str) -> bool {
     matches!(name, "qq_send_voice" | "qq_list_voices")
 }
 
-/// Is the tool registered under this config (JS: evaluated once at server start)?
+/// Is the tool registered under the effective config?
 pub fn registered(name: &str, cfg: &Value) -> bool {
     if let Some(flag) = tool_flag(name) {
         if !crate::settings::tool_enabled(cfg, flag) {
@@ -108,6 +108,9 @@ pub fn registered_tools(cfg: &Value) -> Vec<Value> {
                 .filter(|t| t.get("name").and_then(Value::as_str).map(|n| registered(n, cfg)).unwrap_or(false))
                 .map(|tool| {
                     let mut tool = tool.clone();
+                    if matches!(tool["name"].as_str(), Some("qq_send_message" | "qq_send_burst")) {
+                        describe_text_batch(&mut tool, cfg);
+                    }
                     if matches!(tool["name"].as_str(), Some("qq_send_message" | "qq_send_burst" | "qq_reply" | "qq_send_group_message" | "qq_send_private_message")) {
                         let description = tool["description"].as_str().unwrap_or("");
                         tool["description"] = json!(format!("{description} {} 重复消息或本轮发送上限会拒绝整个批次，请遵循返回的停止指令。", crate::outbound_message::GUIDANCE));
@@ -124,6 +127,37 @@ pub fn registered_tools(cfg: &Value) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn describe_text_batch(tool: &mut Value, cfg: &Value) {
+    use crate::settings::send::{TextBatch, BURST_MAX, MAX_CHARS};
+
+    let unified = tool["name"] == "qq_send_message";
+    let purpose = if unified {
+        "二代仿真模式的文本发送工具。回复较早或指代不明确的消息时可引用，群聊可点名。"
+    } else {
+        "二代仿真模式的群聊文本发送工具，本工具不支持引用。"
+    };
+    let max_chars = MAX_CHARS.integer(cfg);
+    let max_messages = BURST_MAX.integer(cfg);
+    let policy = TextBatch::configured(cfg);
+    let messages = match policy {
+        TextBatch::Merge => format!(
+            "数组各段用换行合并成一条消息。每段和合并后的整条消息（含换行）最多 {max_chars} 个 UTF-16 单元。"
+        ),
+        TextBatch::Split => format!(
+            "数组各段分别发送，每段一个气泡。请在完整句子的边界分段。一次最多 {max_messages} 条，每条最多 {max_chars} 个 UTF-16 单元。"
+        ),
+        TextBatch::Single => format!("一次只允许一条消息，最多 {max_chars} 个 UTF-16 单元。"),
+    };
+    let properties = &mut tool["inputSchema"]["properties"];
+    properties["messages"]["description"] = json!(format!("纯文本字符串或数组，也兼容 JSON 数组字符串。{messages}"));
+    if unified && policy != TextBatch::Split {
+        for field in ["gapMode", "gapMs", "gaps"] {
+            properties[field]["description"] = json!("当前每次只发一个气泡，忽略此参数。");
+        }
+    }
+    tool["description"] = json!(format!("{purpose}{messages}"));
 }
 
 // ----- HTTP plumbing --------------------------------------------------------------------------------------
