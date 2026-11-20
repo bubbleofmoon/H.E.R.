@@ -1339,7 +1339,7 @@ fn recover_with(context: &RuntimeContext, control: &mut dyn Control) -> Result<V
         }
         return Ok(json!({"ok":true,"result":"cleanup-complete"}));
     }
-    let (rollback, pair) = rollback_artifacts(context)?;
+    let (rollback, pair) = { let (rollback, mut pair) = rollback_artifacts(context)?; pair.token = context.read_text(RuntimeArea::Data, console_auth::TOKEN_FILE)?; (rollback, pair) }; // RED-R3-I
     control.preflight(context)?;
     stop_and_replace(context, by, &rollback, Some(FullPublication::Rollback(&pair)), control).map_err(Step::message)?;
     finish_recovery(context, RestorePhase::RolledBack)?;
