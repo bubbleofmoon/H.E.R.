@@ -1276,7 +1276,7 @@ fn record_change(
         }
     };
     #[cfg(test)]
-    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) && setting.key != ADMINISTRATOR_PASSWORD.key { // RED-M4
+    if FAIL_BEFORE_AUDIT.with(|fail| fail.replace(false)) {
         return Err((503, STORAGE_ERROR.to_string()));
     }
     let mut old_value = old.map(|(old_text, _)| old_text);
