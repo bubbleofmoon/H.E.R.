@@ -287,7 +287,7 @@ def worker_command(args, relay_path, filter_fd):
         "--ro-bind", str(args.stage / "group"), "/etc/group",
         "--tmpfs", "/home/agent",
         "--tmpfs", "/tmp",
-        "--bind", str(args.stage / "repo"), "/repo",
+        "--ro-bind", str(args.stage / "repo"), "/repo",
         "--ro-bind", str(args.stage / "inputs"), "/inputs",
         "--ro-bind", str(relay_path), MODEL_SOCKET,
         "--ro-bind", str(Path(__file__).resolve()), "/launcher.py",
