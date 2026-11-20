@@ -1316,7 +1316,7 @@ fn js_truthy(value: &Value) -> bool {
 pub(super) fn security_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     if body.get("rehardenStateDir") == Some(&json!(true)) {
-        let _gate = acquire_social_state_gate(&{ let mut unchecked = context.clone(); unchecked.console_authority = None; unchecked })?; // RED-R3-C4
+        let _gate = acquire_social_state_gate(context)?;
         let dir = state_dir(context).map_err(|error| (503, error))?;
         let (ok, detail) = harden_state_dir(&dir);
         if !ok {
