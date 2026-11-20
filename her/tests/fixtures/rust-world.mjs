@@ -269,7 +269,7 @@ export async function httpCall(side, step) {
   let body;
   if (step.rawBody !== undefined) { body = step.rawBody; headers['content-type'] = step.contentType ?? 'application/json'; }
   else if (step.body !== undefined) { body = JSON.stringify(step.body); headers['content-type'] = step.contentType ?? 'application/json'; }
-  const res = await fetch(`http://127.0.0.1:${side.port}${step.path}`, { method: step.method ?? 'GET', headers, body, signal: AbortSignal.timeout(step.timeoutMs ?? 30_000) }); // RED-R3-V3
+  const res = await loopbackRequest(side.port, step.path, { method: step.method ?? 'GET', headers, body, signal: AbortSignal.timeout(step.timeoutMs ?? 30_000) });
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch { json = null; }
