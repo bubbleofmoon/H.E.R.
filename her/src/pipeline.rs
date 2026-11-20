@@ -1015,7 +1015,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if failure.class == "refusal" && self.refusals_recorded.insert((backend.into(), provider.into(), model.into())) {
             crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, &self.carried_messages);
         }
-        if crate::persona::failure_line(&self.context, key).is_none() { crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, failure); } // RED-M4
+        crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, failure);
     }
 
     /// JS `auditAndSend`: a reply stopped by the outbound sentinel is announced to the administrator (unless
