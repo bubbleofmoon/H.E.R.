@@ -131,7 +131,7 @@ fn segment_spans(text: &str) -> Vec<(String, usize, usize)> {
     }
     fn flush_word(word: &mut String, start: usize, out: &mut Vec<(String, usize, usize)>) {
         if !word.is_empty() {
-            out.push((word.clone(), start, start + word.chars().count())); // RED-M2
+            out.push((word.to_lowercase(), start, start + word.chars().count()));
             word.clear();
         }
     }
