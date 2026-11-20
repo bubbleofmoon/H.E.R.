@@ -83,7 +83,7 @@ fn run(
     let item = match name {
         LIST => {
             let offset = match args.get("offset") {
-                None => 0,
+                None | Some(Value::Null) => 0,
                 Some(value) => value
                     .as_u64()
                     .and_then(|offset| usize::try_from(offset).ok())
@@ -107,6 +107,7 @@ fn run(
                 .map(str::to_owned);
             let repeat = fields
                 .get("repeat")
+                .filter(|value| !value.is_null())
                 .map(|value| {
                     serde_json::from_value(value.clone())
                         .map_err(|_| StoreError::Invalid("重复设置无效".into()))

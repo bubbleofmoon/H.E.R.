@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 const STORE_FILE: &str = "schedule.json";
 const TIMERS_FILE: &str = "schedule-timers.json";
+// Lock ordering: always load config / enter `config_gate` before taking `locks/schedule.lock`;
+// never call `load_config_requiring_settings` or touch `settings.db` inside `self.update`.
 const LOCK_FILE: &str = "locks/schedule.lock";
 pub const REMINDER_REASON: &str = "reminder:";
 const MINUTE_MS: i64 = 60_000;
@@ -347,7 +349,9 @@ pub(crate) fn optional_time(
     cfg: &Value,
 ) -> Result<Option<i64>, StoreError> {
     let invalid = || StoreError::Invalid("提醒时间无效".into());
-    match (fields.get("at"), fields.get("localAt")) {
+    let at = fields.get("at").filter(|value| !value.is_null());
+    let local = fields.get("localAt").filter(|value| !value.is_null());
+    match (at, local) {
         (None, None) => Ok(None),
         (Some(at), None) => at.as_i64().map(Some).ok_or_else(invalid),
         (None, Some(local)) => local
@@ -532,12 +536,16 @@ impl ScheduleStore {
             last_result: None,
             finished_at: None,
         };
+        let her_cfg = if item.creator == Creator::Her {
+            Some(self.context.load_config_requiring_settings()?)
+        } else {
+            None
+        };
         let stored = item.clone();
         self.update(|doc| {
-            if item.creator == Creator::Her {
-                let cfg = self.context.load_config_requiring_settings()?;
-                check_her_capacity(&cfg, &doc.items, &item.conversation)?;
-                check_her_timing(&cfg, Some(item.next_at), Some(item.repeat), now)?;
+            if let Some(cfg) = her_cfg.as_ref() {
+                check_her_capacity(cfg, &doc.items, &item.conversation)?;
+                check_her_timing(cfg, Some(item.next_at), Some(item.repeat), now)?;
             }
             doc.items.push(item);
             Ok(stored)
@@ -583,6 +591,11 @@ impl ScheduleStore {
         now: i64,
         her_origin: Option<&str>,
     ) -> Result<Item, StoreError> {
+        let her_cfg = if her_origin.is_some() && (change.at.is_some() || change.repeat.is_some()) {
+            Some(self.context.load_config_requiring_settings()?)
+        } else {
+            None
+        };
         self.update(|doc| {
             let item = find_mut(doc, id, her_origin)?;
             if is_finished(item.status) {
@@ -595,9 +608,8 @@ impl ScheduleStore {
             if let Some(repeat) = change.repeat {
                 repeat.validate()?;
             }
-            if her_origin.is_some() && (change.at.is_some() || change.repeat.is_some()) {
-                let cfg = self.context.load_config_requiring_settings()?;
-                check_her_timing(&cfg, change.at, change.repeat, now)?;
+            if let Some(cfg) = her_cfg.as_ref() {
+                check_her_timing(cfg, change.at, change.repeat, now)?;
             }
             if let Some(text) = text {
                 item.text = text;
