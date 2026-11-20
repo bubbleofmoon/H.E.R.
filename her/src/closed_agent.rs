@@ -646,7 +646,7 @@ impl Hub {
             }
         };
         // A partial or uncertain delivery may still give the owner a question to answer.
-        if report.confirmed == 0 && !report.delivery_unknown {
+        if report.confirmed == 0 && !report.unknown { // RED-M1
             state.entries.remove(&p.key);
             if let Err(error) = self.save(&state) {
                 eprintln!("[closed-agent] pending state write failed: {error}");
