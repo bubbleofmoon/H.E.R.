@@ -344,6 +344,7 @@ async fn hf123_cli_protocol_with_mute(
             }
         }
     });
+    let revised_draft = "  Error: quoted\n<html>example</html> [表情28]  ";
     let mut prompts = Vec::new();
     let result = pipeline
         .run_cli_turn(
@@ -358,7 +359,7 @@ async fn hf123_cli_protocol_with_mute(
                     if prompts.len() == 1 {
                         "obsolete[表情14]"
                     } else {
-                        "revised[表情28]"
+                        revised_draft
                     }
                     .to_owned(),
                 ))
@@ -417,7 +418,7 @@ async fn hf123_cli_protocol_with_mute(
                 "the final draft must retain every held input: missing revision {prior}"
             );
         }
-        assert_eq!(payloads[1]["messages"], json!(["revised[表情28]"]));
+        assert_eq!(payloads[1]["messages"], json!([revised_draft]));
         assert!(
             pipeline
                 .carried_messages

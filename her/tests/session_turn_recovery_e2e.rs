@@ -219,6 +219,7 @@ struct DshInner {
     chat_preset: bool,
     shutting_down: bool,
     reply_text: &'static str,
+    turn_error_code: Option<&'static str>,
     close_turns: bool,
     unclosed_first: bool,
     later_input_tokens: Option<u64>,
@@ -272,6 +273,7 @@ impl Dsh {
                 chat_preset: false,
                 shutting_down: false,
                 reply_text: "synthetic turn complete",
+                turn_error_code: None,
                 close_turns: true,
                 unclosed_first: false,
                 later_input_tokens: None,
@@ -584,6 +586,10 @@ impl Dsh {
         let stream_usage = inner.stream_usage;
         let provider = inner.provider;
         let final_text = inner.reply_text;
+        let reason = match inner.turn_error_code {
+            Some(code) => json!({"kind":"error","error":{"code":code}}),
+            None => json!({"kind":"completed"}),
+        };
         let sess = inner.sessions.get_mut(sid).expect("session");
         event(
             sess,
@@ -597,7 +603,7 @@ impl Dsh {
             let usage=data.as_object_mut().unwrap().remove("usage").unwrap();
             data["stream"]=json!([{"usage":usage}]);
         }
-        event(sess, "turn/end", json!({"turn": turn, "reason": {"kind": "completed"}}));
+        event(sess, "turn/end", json!({"turn": turn, "reason": reason}));
     }
 }
 
@@ -3643,7 +3649,7 @@ fn hf_next_delivery_case(full: bool) {
         event(sess,"compaction/start",json!({"compactionId":"next-generation"}));
         event(sess,"compaction/end",json!({"compactionId":"next-generation"}));
     }
-    lock(&rig.dsh.inner).reply_text = "The prompt could not be submitted. EMPTY_RESPONSE";
+    lock(&rig.dsh.inner).turn_error_code = Some("EMPTY_RESPONSE");
     lock(&rig.gateway).frames.push(mention_event(87001,"second configured-drop file-old file-new 87001"));
     assert!(wait_for(LONG, || rig.turn_state(1) == "failed"), "refusal did not fail the turn: {:?}",rig.turns());
     let delivered = rig.dsh.applied()[1].text.clone();
@@ -3705,23 +3711,28 @@ fn hf_next_digest_quota_terminal_fails_live_and_recovered() {
 }
 
 #[test]
-fn hf_next_completed_failure_records_a_single_terminal_outcome() {
-    for (name, text) in [
-        ("completed-refusal", "I cannot assist with this request."),
-        ("completed-error", "Error: upstream request failed (HTTP 500)."),
+fn dsh_turn_end_metadata_decides_the_single_terminal_outcome() {
+    for (name, text, error_code, expected) in [
+        ("quoted-refusal", "I cannot assist with this request.", None, "completed"),
+        ("quoted-error", "Error: upstream request failed (HTTP 500).", None, "completed"),
+        ("typed-refusal", "Synthetic reply", Some("EMPTY_RESPONSE"), "failed"),
+        ("typed-error", "Synthetic reply", Some("503"), "failed"),
     ] {
         let mut rig = Rig::new(name, Opts { seed_session: Some("js-origin-session") });
         {
             let mut inner = lock(&rig.dsh.inner);
             inner.reply_text = text;
+            inner.turn_error_code = error_code;
             inner.plan = Plan { send: None, hold: false };
         }
-        rig.start_candidate(mention(87_100, "one completed backend failure"));
-        // Task completion comes after the collector's terminal write attempt. This barrier
-        // distinguishes a rejected finalization from bookkeeping that is still in progress.
+        rig.start_candidate(mention(87_100, "one terminal outcome"));
+        // The collector has finished its terminal write attempt before this line.
         assert!(wait_for(LONG, || fs::read_to_string(rig.root.join("candidate-out.log"))
-            .unwrap_or_default().contains(&format!("[reserved2] {GROUP_KEY} turn ended: Err("))));
-        assert_eq!(rig.turn_state(0), "failed", "completed failure remained open: {}", rig.view());
+            .unwrap_or_default().contains(&format!("[reserved2] {GROUP_KEY} turn ended:"))));
+        assert_eq!(rig.turn_state(0), expected, "DSH terminal outcome: {}", rig.view());
+        if expected == "completed" {
+            assert!(!rig.root.join("data/logs/model-refusals.jsonl").exists());
+        }
         let records: Vec<Value> = read_locked(&rig.root.join("data/turn-ledger.jsonl"))
             .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(records.iter().filter(|row| row["k"] == "ended").count(), 1);

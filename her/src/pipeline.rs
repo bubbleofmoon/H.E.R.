@@ -2026,12 +2026,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 Err(note) => {
                     let failure = crate::model_failure::Failure::classify("", &note);
                     let (provider, model) = crate::model_failure::cli_identity(cfg,id);
-                    self.report_backend_failure(cfg,&key,id,&provider,&model,&failure.code,&note);
+                    self.report_backend_failure(cfg,&key,id,&provider,&model,"",&note);
                     return Err(failure.summary());
                 }
             };
-            let text = text.trim().to_owned();
-            if text.is_empty() { return Ok(if revision == 0 { None } else { Some(0) }); }
+            if text.trim().is_empty() { return Ok(if revision == 0 { None } else { Some(0) }); }
             if is_silent_marker(&text) { return Ok(Some(0)); }
             if let Some(turn) = &self.cur_turn {
                 turn.attempt(&format!("cli:{}",crate::dsh::mint_request_id()),"")

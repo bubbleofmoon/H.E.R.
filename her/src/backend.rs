@@ -253,27 +253,13 @@ pub(crate) fn decode_cli_exit(
     id: &str,
     code: Option<i32>,
 ) -> Result<String, BackendError> {
-    if code != Some(0) {
-        // Exit status is authoritative for failure, but a structured error still carries
-        // the provider's class/code (including safety refusals that also exit nonzero).
-        let failure = decode_cli_output(stdout_text, structured)
-            .err()
-            .map(|error| crate::model_failure::Failure::classify("", error.message()))
-            .filter(|failure| !matches!(failure.code.as_str(), "INVALID_RESULT" | "EMPTY_ANSWER"))
-            .unwrap_or_else(|| {
-                crate::model_failure::Failure::classify(
-                    "",
-                    &format!("{stdout_text}\n{stderr_text}"),
-                )
-            });
-        return Err(BackendError::Failed(format!(
-            "{} command={} exit_code={:?}",
-            failure.summary(),
-            id,
-            code
-        )));
-    }
-    decode_cli_output(stdout_text, structured)
+    let result = decode_cli_output(stdout_text, structured, code == Some(0), stderr_text);
+    result.map_err(|failure| {
+        BackendError::Failed(format!(
+            "{} command={id} exit_code={code:?}",
+            failure.summary()
+        ))
+    })
 }
 
 fn is_agy(id: &str, cmd: &str) -> bool {
@@ -282,73 +268,191 @@ fn is_agy(id: &str, cmd: &str) -> bool {
         || id == "agy" || id.starts_with("agy-")
 }
 
-/// Only recognized result envelopes are answers. Plain-text clients may return prose,
-/// but process diagnostics and event streams never become conversation text.
-pub(crate) fn decode_cli_output(stdout: &str, structured: bool) -> Result<String, BackendError> {
+/// Decode the process envelope before extracting text. Only failed exits may
+/// carry legacy diagnostics on stderr.
+fn decode_cli_output(
+    stdout: &str,
+    structured: bool,
+    success: bool,
+    stderr: &str,
+) -> Result<String, crate::model_failure::Failure> {
     use crate::model_failure::Failure;
-    let fail = |failure: Failure| BackendError::Failed(failure.summary());
-    let text = stdout.trim();
-    if text.is_empty() { return Err(fail(Failure::new("empty-response", "EMPTY_ANSWER"))); }
-    let parsed = serde_json::from_str::<Value>(text).ok();
-    if let Some(failure) = parsed.as_ref().and_then(json_output_failure) {
-        return Err(fail(failure));
+
+    let parsed = serde_json::from_str::<Value>(stdout).ok();
+    let events = if parsed.is_none() {
+        cli_events(stdout)
+    } else {
+        None
+    };
+    if let Some(failure) = parsed.as_ref().and_then(json_output_failure).or_else(|| {
+        events
+            .as_ref()
+            .and_then(|events| events.iter().find_map(json_output_failure))
+    }) {
+        return Err(failure);
+    }
+    if !success {
+        return Err(Failure::classify("", stderr));
+    }
+    if stdout.trim().is_empty() {
+        return Err(Failure::new("empty-response", "EMPTY_ANSWER"));
     }
     let answer = match parsed.as_ref() {
-        Some(value) if value.is_object() => {
-            // Agy's JSON result carries its answer in `response`; other CLI result
-            // envelopes use `result` (Claude) or `text`. Unknown objects fail closed.
-            let keys: &[&str] = if structured { &["response"] } else { &["response", "result", "text"] };
-            keys.iter().find_map(|key| value.get(key).and_then(Value::as_str))
-                .ok_or_else(|| fail(Failure::new("backend", "INVALID_RESULT")))?.to_string()
+        Some(value) if value.is_object() => cli_json_answer(value, structured)
+            .ok_or_else(|| Failure::new("backend", "INVALID_RESULT"))?,
+        _ if structured || events.is_some() => {
+            return Err(Failure::new("backend", "INVALID_RESULT"));
         }
-        _ if structured => return Err(fail(plain_output_failure(text)
-            .unwrap_or_else(|| Failure::new("backend", "INVALID_RESULT")))),
-        _ => {
-            // A JSON-lines stream is a protocol, never a plain-text answer. Scan all
-            // events before refusing it so a later error retains its class/code.
-            let mut events = false;
-            for line in text.lines() {
-                if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
-                    if value.is_object() {
-                        events = true;
-                        if let Some(failure) = json_output_failure(&value) { return Err(fail(failure)); }
-                    }
-                }
-            }
-            if events { return Err(fail(Failure::new("backend", "INVALID_RESULT"))); }
-            text.to_string()
-        }
+        _ => stdout.to_owned(),
     };
-    if let Some(failure) = plain_output_failure(&answer) { return Err(fail(failure)); }
+    if answer.trim().is_empty() {
+        return Err(Failure::new("empty-response", "EMPTY_ANSWER"));
+    }
     Ok(answer)
+}
+
+fn cli_json_answer(value: &Value, agy: bool) -> Option<String> {
+    if agy {
+        return value["response"].as_str().map(str::to_owned);
+    }
+    ["response", "result", "text"]
+        .into_iter()
+        .find_map(|key| value[key].as_str())
+        .or_else(|| {
+            value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .or_else(|| {
+            let parts = value.pointer("/candidates/0/content/parts")?.as_array()?;
+            Some(
+                parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect(),
+            )
+        })
+}
+
+/// A JSON-lines stream must consist entirely of typed CLI events. A JSON
+/// example within a prose answer does not establish a protocol.
+fn cli_events(stdout: &str) -> Option<Vec<Value>> {
+    let events: Vec<Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line).ok().filter(|value| {
+                matches!(
+                    value["type"].as_str(),
+                    Some(
+                        "start"
+                            | "result"
+                            | "error"
+                            | "refusal"
+                            | "system"
+                            | "assistant"
+                            | "user"
+                            | "stream_event"
+                            | "step_start"
+                            | "step_finish"
+                            | "text"
+                            | "tool_use"
+                            | "reasoning"
+                    )
+                )
+            })
+        })
+        .collect::<Option<_>>()?;
+    (events.len() > 1).then_some(events)
 }
 
 pub(crate) fn json_output_failure(value: &Value) -> Option<crate::model_failure::Failure> {
     use crate::model_failure::Failure;
-    let error = value.get("error").filter(|v| !v.is_null() && **v != Value::Bool(false));
-    let code = error.and_then(|e| e.get("code").or_else(|| e.get("type")))
-        .filter(|v| v.is_string() || v.is_number())
-        .map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_default();
-    let error_result = error.is_some() || value["is_error"] == true || value["isError"] == true
-        || value["type"] == "error" || value["status"] == "error"
-        || value["ok"] == false || value["success"] == false
-        || value.get("errorMessage").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
-        || value["subtype"].as_str().is_some_and(|s| s.starts_with("error"));
-    if error_result { return Some(Failure::classify(&code, &value.to_string())); }
-    if value.get("candidates").and_then(Value::as_array).is_some_and(Vec::is_empty)
-        || value.pointer("/promptFeedback/blockReason").is_some()
-        || value.get("refusal").is_some_and(|v| !v.is_null() && *v != Value::Bool(false))
-        || value["type"] == "refusal"
-        || value.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("content_filter")
-        || value["candidates"].as_array().is_some_and(|candidates| candidates.iter().any(|c|
-            c["finishReason"].as_str().is_some_and(|r| matches!(r, "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION")))) {
+
+    let error = value
+        .get("error")
+        .filter(|v| !v.is_null() && **v != Value::Bool(false));
+    let status = value["status"]
+        .as_u64()
+        .filter(|status| (400..600).contains(status));
+    if let Some(status @ (408 | 429 | 500..=599)) = status {
+        return Some(classify_cli_error(&status.to_string(), ""));
+    }
+    if value["type"] == "refusal" {
         return Some(Failure::new("refusal", "MODEL_REFUSAL"));
     }
-    // Nested error events (and errors wrapped in `result`) remain failures.
+    let error_result = status.is_some()
+        || error.is_some()
+        || value["is_error"] == true
+        || value["isError"] == true
+        || value["type"] == "error"
+        || value["status"] == "error"
+        || value["ok"] == false
+        || value["success"] == false
+        || value["errorMessage"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+        || value["subtype"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("error"));
+    if error_result {
+        let code = error
+            .and_then(|error| {
+                ["code", "type", "status"]
+                    .into_iter()
+                    .find_map(|name| error_code(&error[name]))
+            })
+            .or_else(|| error_code(&value["code"]))
+            .or_else(|| status.map(|status| status.to_string()))
+            .unwrap_or_default();
+        let message = error
+            .and_then(|error| error["message"].as_str().or_else(|| error.as_str()))
+            .or_else(|| value["errorMessage"].as_str())
+            .or_else(|| value["message"].as_str())
+            .unwrap_or_default();
+        return Some(classify_cli_error(&code, message));
+    }
+    let choice = &value["choices"][0];
+    let candidates = value["candidates"].as_array();
+    if value["stop_reason"] == "refusal"
+        || is_refusal_field(&value["refusal"])
+        || is_refusal_field(&choice["message"]["refusal"])
+        || choice["finish_reason"] == "content_filter"
+        || value
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !matches!(reason, "" | "BLOCK_REASON_UNSPECIFIED"))
+        || candidates.is_some_and(Vec::is_empty)
+        || matches!(
+            value["candidates"][0]["finishReason"].as_str(),
+            Some("SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "RECITATION")
+        )
+    {
+        return Some(Failure::new("refusal", "MODEL_REFUSAL"));
+    }
+    None
+}
+
+fn error_code(value: &Value) -> Option<String> {
     match value {
-        Value::Object(obj) => obj.values().filter(|v| v.is_object() || v.is_array()).find_map(json_output_failure),
-        Value::Array(items) => items.iter().find_map(json_output_failure),
+        Value::String(code) if !code.is_empty() => Some(code.clone()),
+        Value::Number(code) => Some(code.to_string()),
         _ => None,
+    }
+}
+
+fn is_refusal_field(value: &Value) -> bool {
+    *value == true || value.as_str().is_some_and(|text| !text.trim().is_empty())
+}
+
+fn classify_cli_error(code: &str, message: &str) -> crate::model_failure::Failure {
+    use crate::model_failure::Failure;
+
+    match code.parse::<u16>() {
+        Ok(408) => Failure::new("timeout", code),
+        Ok(500..=599) => Failure::new("backend", code),
+        _ => Failure::classify(code, message),
     }
 }
 
@@ -2009,34 +2113,54 @@ mod tests {
     }
 
     #[test]
-    fn cli_output_contract_keeps_answers_and_classifies_content_free_failures() {
-        for (text, structured, answer) in [
-            ("ordinary safety discussion", false, "ordinary safety discussion"),
-            (r#"{"response":"ordinary answer"}"#, true, "ordinary answer"),
-            (r#"{"result":"Claude answer"}"#, false, "Claude answer"),
+    fn cli_success_preserves_prose_and_ignores_nested_answer_metadata() {
+        for (stdout, structured, answer) in [
+            ("Error: quota exhausted\nThis is an example.", false, "Error: quota exhausted\nThis is an example."),
+            ("Fatal: a label\nI cannot assist with is the phrase to translate.", false, "Fatal: a label\nI cannot assist with is the phrase to translate."),
+            ("  HTTP 503 Service Unavailable\n<html>example</html>\n", false, "  HTTP 503 Service Unavailable\n<html>example</html>\n"),
+            ("A JSON example follows:\n{\"type\":\"error\"}", false, "A JSON example follows:\n{\"type\":\"error\"}"),
+            (r#"{"response":"<html>example</html>","data":{"error":{"code":"SAFETY"}}}"#, true, "<html>example</html>"),
+            (r#"{"result":"I can't assist with is the phrase to translate.","data":[{"refusal":"sample"}]}"#, false, "I can't assist with is the phrase to translate."),
             (r#"{"text":"plain client answer"}"#, false, "plain client answer"),
+            (r#"{"status":399,"text":"below the error range"}"#, false, "below the error range"),
+            (r#"{"status":600,"text":"above the error range"}"#, false, "above the error range"),
+            (r#"{"choices":[{"finish_reason":"stop","message":{"content":"Error: quoted","annotations":[{"error":"example"}]}}]}"#, false, "Error: quoted"),
+            (r#"{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"a "},{"text":"b"}]}}]}"#, false, "a b"),
         ] {
-            assert_eq!(decode_cli_output(text, structured).unwrap(), answer);
+            let result = decode_cli_exit(stdout, "Error: quota warning on stderr", structured, "fixture-cli", Some(0));
+            assert_eq!(result.as_deref().map_err(BackendError::message), Ok(answer), "successful CLI answer must be preserved");
         }
-        for (text, structured, class) in [
-            ("The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET", false, "refusal"),
-            (r#"{"error":{"code":"SAFETY","message":"CHAT_SECRET"}}"#, true, "refusal"),
-            (r#"{"candidates":[]}"#, false, "refusal"),
-            (r#"{"candidates":[{"finishReason":"SAFETY"}]}"#, false, "refusal"),
-            ("Error: quota exhausted CHAT_SECRET", false, "quota"),
-            ("HTTP 503 Service Unavailable\n<html>CHAT_SECRET</html>", false, "backend"),
-            ("Error: timed out CHAT_SECRET", false, "timeout"),
-            ("   ", false, "empty-response"),
-            (r#"{"error":{"code":"ECONNRESET","message":"CHAT_SECRET"}}"#, false, "network"),
-            ("Traceback (most recent call last):\nRuntimeError: CHAT_SECRET", false, "backend"),
-            ("{\"type\":\"start\"}\n{\"type\":\"error\",\"error\":{\"code\":\"SAFETY\",\"message\":\"CHAT_SECRET\"}}", false, "refusal"),
-            (r#"{"ok":false,"message":"CHAT_SECRET"}"#, false, "backend"),
-            (r#"{"unknown":"CHAT_SECRET"}"#, false, "backend"),
-            ("unstructured agy prose CHAT_SECRET", true, "backend"),
+    }
+
+    #[test]
+    fn cli_output_contract_keeps_answers_and_classifies_content_free_failures() {
+        for (stdout, stderr, structured, exit, class, code) in [
+            ("", "The prompt could not be submitted: Prohibited Use Policy CHAT_SECRET", false, 7, "refusal", "MODEL_REFUSAL"),
+            ("Error: quota exhausted in an answer example", "upstream disconnected CHAT_SECRET", false, 7, "backend", "BACKEND_ERROR"),
+            ("", "Error: timed out CHAT_SECRET", false, 7, "timeout", "TIMEOUT"),
+            ("", "Error: quota exhausted CHAT_SECRET", false, 7, "quota", "QUOTA_EXCEEDED"),
+            ("   ", "", false, 0, "empty-response", "EMPTY_ANSWER"),
+            (r#"{"response":" "}"#, "", true, 0, "empty-response", "EMPTY_ANSWER"),
+            (r#"{"error":{"code":"SAFETY","message":"CHAT_SECRET"}}"#, "", true, 0, "refusal", "SAFETY"),
+            (r#"{"type":"error","code":"TIMEOUT","message":"CHAT_SECRET"}"#, "", false, 0, "timeout", "TIMEOUT"),
+            (r#"{"candidates":[]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"candidates":[{"finishReason":"SAFETY"}]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"choices":[{"finish_reason":"content_filter","message":{"content":"discard"}}]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"choices":[{"finish_reason":"stop","message":{"refusal":"CHAT_SECRET"}}]}"#, "", false, 0, "refusal", "MODEL_REFUSAL"),
+            (r#"{"status":400,"text":"discard"}"#, "", false, 0, "backend", "400"),
+            (r#"{"status":408,"text":"discard"}"#, "", false, 0, "timeout", "408"),
+            (r#"{"status":429,"response":"discard"}"#, "", false, 0, "quota", "429"),
+            (r#"{"status":599,"text":"discard"}"#, "", false, 0, "backend", "599"),
+            (r#"{"error":{"code":503,"message":"quota status could not be read CHAT_SECRET"}}"#, "", false, 0, "backend", "503"),
+            (r#"{"error":{"code":"ECONNRESET","message":"CHAT_SECRET"}}"#, "", false, 0, "network", "ECONNRESET"),
+            ("{\"type\":\"start\"}\n{\"type\":\"error\",\"error\":{\"code\":\"SAFETY\",\"message\":\"CHAT_SECRET\"}}", "", false, 0, "refusal", "SAFETY"),
+            (r#"{"ok":false,"message":"CHAT_SECRET","result":"Error: quota exhausted"}"#, "", false, 0, "backend", "BACKEND_ERROR"),
+            (r#"{"unknown":{"error":{"code":"SAFETY","message":"CHAT_SECRET"}}}"#, "", false, 0, "backend", "INVALID_RESULT"),
+            ("unstructured agy prose CHAT_SECRET", "", true, 0, "backend", "INVALID_RESULT"),
         ] {
-            let error = decode_cli_output(text, structured).unwrap_err();
+            let error = decode_cli_exit(stdout, stderr, structured, "fixture-cli", Some(exit)).unwrap_err();
             let failure = crate::model_failure::Failure::classify("", error.message());
-            assert_eq!(failure.class, class, "{text}");
+            assert_eq!((failure.class, failure.code.as_str()), (class, code), "{stdout}");
             assert!(!error.message().contains("CHAT_SECRET"));
         }
     }
