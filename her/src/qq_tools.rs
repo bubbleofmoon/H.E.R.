@@ -176,9 +176,18 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
     if reply.status != 200 { return Err(format!("wake snapshot refused: {}", reply.status)); }
     let packet: Value = serde_json::from_slice(&reply.body).map_err(|e| e.to_string())?;
     if packet.is_null() { return Ok(String::new()); }
+    let guidance = "以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；想回复时直接调用发送工具，桥接自动控制静默与打字节奏；reviseRequired=true 时先看 newMessages 再修改或重新发送。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。";
     // DSH sends this text immediately. The harness keeps the original packet for replay.
-    let packet = if redact { crate::model_view::strip_model_chat_data(&packet, cfg) } else { packet };
-    Ok(format!("\n\n【本次消息快照】\n{packet}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；想回复时直接调用发送工具，桥接自动控制静默与打字节奏；reviseRequired=true 时先看 newMessages 再修改或重新发送。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。"))
+    let (packet, guidance) = if redact {
+        let delivery_cfg = crate::model_view::with_blacklist(context, cfg);
+        (
+            crate::model_view::strip_model_chat_data(&packet, &delivery_cfg),
+            crate::model_view::strip_from_model_text(guidance, &delivery_cfg),
+        )
+    } else {
+        (packet, guidance.to_owned())
+    };
+    Ok(format!("\n\n【本次消息快照】\n{packet}\n{guidance}"))
 }
 
 /// Query only positive urgent-message delivery evidence; never grant new receipts.
