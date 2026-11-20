@@ -651,7 +651,7 @@ fn stop_and_replace(
         let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?;
         let authority = context.authority_gate().map_err(Step::Refused)?;
         let _store = crate::settings::restore_gate(context).map_err(Step::Refused)?;
-        let generation = Ok([0; 32]); // RED-R2-J
+        let generation = control.publish_generation(context);
         generation.map_err(|error| match error {
             GenerationWriteError::Unpublished(error) => Step::Refused(error),
             GenerationWriteError::Published(error) => Step::Failed(error),
