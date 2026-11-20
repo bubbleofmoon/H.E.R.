@@ -577,7 +577,7 @@ impl Hub {
                 }
             });
         };
-        let result = { send(); Ok::<(), tokio::task::JoinError>(()) }; // RED-M1
+        let result = tokio::task::spawn_blocking(send).await;
         if let Err(error) = result {
             eprintln!("[closed-agent] interaction send task failed: {error}");
         }
