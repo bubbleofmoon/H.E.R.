@@ -3501,6 +3501,28 @@ pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Validate a single canonical live conversation key from either the CLI or a rollout array.
+pub(crate) fn validate_canonical_live_group(entry: &str) -> Result<(), &'static str> {
+    let (kind, id) = entry
+        .split_once(':')
+        .ok_or("isolated live groups must use canonical group:<id> or private:<id> entries")?;
+    if !matches!(kind, "group" | "private")
+        || id.is_empty()
+        || !id.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("isolated live groups must use canonical group:<id> or private:<id> entries");
+    }
+    let parsed = id
+        .parse::<i64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or("isolated live identifiers must be positive canonical i64 decimal values")?;
+    if parsed.to_string() != id {
+        return Err("isolated live groups must not contain non-canonical or duplicate entries");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_canonical_live_groups(value: &str) -> Result<(), &'static str> {
     use std::collections::BTreeSet;
 
@@ -3509,21 +3531,8 @@ pub(crate) fn validate_canonical_live_groups(value: &str) -> Result<(), &'static
     }
     let mut seen = BTreeSet::new();
     for entry in value.split(',') {
-        let (kind, id) = entry
-            .split_once(':')
-            .ok_or("isolated live groups must use canonical group:<id> or private:<id> entries")?;
-        if !matches!(kind, "group" | "private")
-            || id.is_empty()
-            || !id.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            return Err("isolated live groups must use canonical group:<id> or private:<id> entries");
-        }
-        let parsed = id
-            .parse::<i64>()
-            .ok()
-            .filter(|number| *number > 0)
-            .ok_or("isolated live identifiers must be positive canonical i64 decimal values")?;
-        if parsed.to_string() != id || !seen.insert(entry) {
+        validate_canonical_live_group(entry)?;
+        if !seen.insert(entry) {
             return Err("isolated live groups must not contain non-canonical or duplicate entries");
         }
     }
