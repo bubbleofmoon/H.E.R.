@@ -2,6 +2,8 @@
 
 The first round covers the full ticket diff and goes to a Claude `ticket-reviewer`. Follow-up rounds cover the fix diff and unresolved required findings. Fill the fields below and keep the scope and checks for the current round. Save the result as the run's prompt file and start `scripts/codex-task.sh <name> <worktree-or-scratch> <prompt> gpt-6.2-astra high read-only` for rounds 2 and 3. The coordinator reads `<name>.report.md` beside the prompt as the review.
 
+For a standalone Linux launcher brief, name `/repo` as the checkout and use staged paths under `/inputs` for the issue, plan and prior report. Keep the receipt on the coordinator side.
+
 ```
 Head: <head sha>
 Base: <sha of origin/main>

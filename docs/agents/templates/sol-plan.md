@@ -2,6 +2,8 @@
 
 Reach for this to start `codex-work plan` (M/L tickets) or to send a plan revision. Fill the angle-bracket fields, delete the lines that do not apply and save the prompt as `/root/orch/her/<n>/prompts/<name>.md` (`docs/agents/coordinator.md` "Codex runs").
 
+For a standalone Linux launcher brief, use `/inputs/issue.md` and name any other staged inputs. Use `/repo` for history and `/scratch` and `/plan-out` for edits and plan output.
+
 ```
 Plan ticket <n>, "<title>", for an executor that follows the plan exactly. Base: <sha of origin/main>.
 Read: docs/agents/coordinator.md "Planner" (plan format, known pitfalls, build-file rules), issue <n> with its comments, <spec and validation paths>.

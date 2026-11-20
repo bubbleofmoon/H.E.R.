@@ -24,6 +24,8 @@ Planning runs on the Linux host only for now.
 
 You see only that message.
 
+For a standalone Linux launcher brief, read `/inputs/issue.md` and the other named inputs. Inspect the staged history in `/repo`, edit only `/scratch`, and write the plan to `/plan-out/plan.md`. Use those paths in place of the host paths and live GitHub reads below.
+
 Read `AGENTS.md`, the `AGENTS.md` nearest the code, `docs/agents/coordinator.md` ("Planner": the plan format, the known pitfalls and the "Threats" section), the issue and its comments (`gh issue view <n> --comments -R bubbleofmoon/H.E.R.`) and the real code. Never speculate about code you have not opened.
 
 - Write every code edit of the plan into the scratch export with Edit or Write, exactly as the plan states it, new tests included. You do not build, format or run anything. After you report, the coordinator checks the export's build files and reads it against the code; the executor's first `check` and `lint` runs on CI compile and format it.

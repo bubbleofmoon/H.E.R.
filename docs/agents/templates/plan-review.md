@@ -2,6 +2,8 @@
 
 Save the filled prompt in the ticket's prompts directory. Run `scripts/codex-task.sh <name> <worktree-or-scratch> <prompt> gpt-6.2-astra high read-only`. Read `<name>.report.md` beside the prompt and combine its findings with the coordinator's checks into one revision brief.
 
+For a standalone Linux launcher brief, name `/repo` as the checkout and include the issue with comments, plan and approved evidence among the `/inputs` files.
+
 ```text
 Review the proposed plan for ticket <n>, "<title>", against its base.
 Base commit and checkout: <sha and path>
