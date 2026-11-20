@@ -1322,7 +1322,7 @@ pub(crate) fn set_initial_administrator_password(
 ) -> Result<(), (u16, String)> {
     write_administrator_password(context, false, |conn| {
         let old = stored_row(conn, ADMINISTRATOR_PASSWORD.key)?;
-        if false { // RED-M5
+        if old.is_some() {
             return Err((409, "administrator password is already set".to_string()));
         }
         let text = json!(hash.as_str()).to_string();
