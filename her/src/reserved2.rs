@@ -3396,7 +3396,7 @@ impl Hub {
             _ => None,
         };
         // #186: this event's configuration decides (allow and deny); `taken` is the `--live-groups` list of this process.
-        let Some(key) = key.filter(|k| self.taken(k) && console::inbound_admitted(&cfg, k)) else {
+        let Some(key) = key.filter(|k| self.taken(k)) else { // RED-INGRESS
             return Ok(());
         };
         let is_poke = ev.sub_type == "poke";
