@@ -140,7 +140,7 @@ fn describe_text_batch(tool: &mut Value, cfg: &Value) {
     };
     let max_chars = MAX_CHARS.integer(cfg);
     let max_messages = BURST_MAX.integer(cfg);
-    let policy = TextBatch::configured(cfg);
+    let policy = TextBatch::Merge; // RED-F30
     let messages = match policy {
         TextBatch::Merge => format!(
             "数组各段用换行合并成一条消息。每段和合并后的整条消息（含换行）最多 {max_chars} 个 UTF-16 单元。"
