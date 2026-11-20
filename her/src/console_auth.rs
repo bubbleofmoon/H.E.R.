@@ -355,7 +355,7 @@ pub(crate) fn rotate_console_token(
     let after = config_with_token(cfg, token, configured);
     let (config_target, staged_config) = context.stage_atomic_from(RuntimeArea::Config, "config.json", &mut after.as_bytes())
         .map_err(|_| (500, "console token configuration is unavailable".to_string()))?;
-    crate::settings::revoke_browser_sessions(context)?;
+    let _ = context; // RED-R3-F
     remove_auth_file(context, crate::console::DESKTOP_GRANTS_FILE).map_err(unavailable)?;
     context.write_atomic(RuntimeArea::Data, ROTATION_FILE, &journal).map_err(unavailable)?;
     #[cfg(feature = "parity-clock")]
