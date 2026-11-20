@@ -266,7 +266,6 @@ def worker_command(args, relay_path, filter_fd):
     command = [
         BWRAP, "--new-session", "--die-with-parent", "--unshare-user", "--unshare-ipc",
         "--unshare-pid", "--unshare-uts", "--unshare-cgroup", "--disable-userns",
-        "--unshare-net",
         "--cap-drop", "ALL", "--seccomp", str(filter_fd),
         "--clearenv", "--hostname", "her-worker",
         "--ro-bind", "/usr/bin", "/usr/bin", "--ro-bind", "/usr/lib", "/usr/lib",
