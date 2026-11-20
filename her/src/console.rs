@@ -15297,7 +15297,7 @@ fn selected_startup_config(context: &RuntimeContext) -> Result<Option<Value>, St
     if crate::restore::recovery_pending(context) { return Ok(None); }
     let cfg = context.load_config().map_err(str::to_owned)?;
     if crate::console_auth::ensure_credentials_ready(context).is_ok() {
-        if false && crate::settings::start_browser_clock(context).is_err() { // RED-R3-Q1
+        if crate::settings::start_browser_clock(context).is_err() {
             crate::safe_eprintln!("[console] browser session state is unavailable");
         }
         Ok(Some(cfg))
