@@ -676,6 +676,50 @@ fn library(name: &str, core: &str) -> Value {
         "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [{"version": 1, "approved": true, "name": name, "core": core}]}}})
 }
 
+#[test]
+fn t48_persona_failure_line_round_trips_through_console_versions() {
+    let mut legacy = library("Legacy", "Legacy core.");
+    let version = &mut legacy["personas"]["p1"]["versions"][0];
+    version["notes"] = json!("");
+    version["compact"] = json!("");
+    version["names"] = json!(["Legacy"]);
+    version["traits"] = json!({"neediness": 1});
+    version["editMode"] = json!("auto");
+    version["autoRules"] = json!({"parts": ["notes"], "perWeek": 3, "monthlyDriftPause": true, "notify": true});
+    let rig = Rig::new("t48-failure-line-versions", Seed {
+        personas: Some(legacy),
+        ..Seed::default()
+    });
+    let get = |id: &str| {
+        let (status, item) = rig.console("GET", &format!("/api/personas/item?id={id}"), None);
+        assert_eq!(status, 200, "{item}");
+        item["persona"].clone()
+    };
+    let post = |path: &str, body: Value| {
+        let (status, response) = rig.console("POST", path, Some(&body));
+        assert_eq!(status, 200, "{response}");
+        response
+    };
+    assert!(get("p1")["versions"][0]["failureLine"].is_null());
+    assert_eq!(post("/api/personas/update", json!({"id": "p1", "failureLine": ""}))["unchanged"], true);
+    let line = "**A moment, please.**";
+    post("/api/personas/update", json!({"id": "p1", "failureLine": line}));
+    post("/api/personas/update", json!({"id": "p1", "notes": "Updated notes."}));
+    let edited = get("p1");
+    assert_eq!(edited["activeVersion"], 3);
+    assert_eq!(edited["versions"][2]["failureLine"], line);
+    let duplicate = post("/api/personas/duplicate", json!({"id": "p1", "name": "Copy"}));
+    assert_eq!(get(duplicate["id"].as_str().unwrap())["versions"][0]["failureLine"], line);
+    post("/api/personas/update", json!({"id": "p1", "failureLine": null}));
+    assert!(get("p1")["versions"][3]["failureLine"].is_null());
+    post("/api/personas/approve", json!({"id": "p1", "version": 2}));
+    assert_eq!(get("p1")["activeVersion"], 2);
+    for invalid in [json!("two\nlines"), json!("x".repeat(161)), json!(17)] {
+        let (status, _) = rig.console("POST", "/api/personas/update", Some(&json!({"id": "p1", "failureLine": invalid})));
+        assert_eq!(status, 400);
+    }
+}
+
 /// Creates and approves a persona through the console; returns its id.
 fn approved_persona(rig: &Rig, name: &str, core: &str) -> String {
     let (status, created) = rig.console("POST", "/api/personas/create", Some(&json!({"name": name, "core": core})));

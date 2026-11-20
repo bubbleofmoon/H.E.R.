@@ -10377,7 +10377,7 @@ enum GuardPolicy<'a> {
 
 /// Validity check before each item: the conversation still exists under the same agent token,
 /// the mode is still one that may send, the session is still allowed there and silent mode is off.
-fn send_guard(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str) -> Result<(), (u16, String)> {
+pub(crate) fn send_guard(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str) -> Result<(), (u16, String)> {
     send_guard_for(context, cfg, key, epoch, GuardPolicy::Reserved2, "sendMessage")
 }
 
@@ -10423,7 +10423,7 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
 }
 
 /// Silent mode blocks every non-owner send (JS `shouldBlockSilentReply`).
-fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, (u16, String)> {
+pub(crate) fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, (u16, String)> {
     let role = read_role_state(context).map_err(|_| (503, "runtime role state is unavailable".to_string()))?;
     let owner_key = format!("private:{}", cfg.get("ownerQQ").and_then(Value::as_i64).unwrap_or(0));
     Ok(role.get("mode").and_then(Value::as_str) == Some("silent") && key != owner_key)
@@ -10665,8 +10665,11 @@ fn resume_send_batch(
     if batch.epoch != epoch {
         return Err((409, "旧回合结果拒绝：批次属于已失效的会话令牌".to_string()));
     }
+    let persona_failure = batch.purpose == crate::send_outbox::PERSONA_FAILURE_SEND;
     // Legacy intents remain append-only; use their canonical text for this execution and history.
-    batch.messages = batch.messages.iter().map(|m| crate::outbound_message::normalize(m)).collect();
+    if !persona_failure {
+        batch.messages = batch.messages.iter().map(|m| crate::outbound_message::normalize(m)).collect();
+    }
     let mut states = batch.items.clone();
     let mut confirmed_ids: Vec<i64> = states
         .iter()
@@ -10678,7 +10681,11 @@ fn resume_send_batch(
     let now = now_ms();
     let history = crate::recorded_send::History { ob, kind, id_s };
     for idx in batch.indices_where(|s| s.needs_verification()) {
-        let proof = crate::recorded_send::Proof::Text(&batch.messages[idx]);
+        let proof = if persona_failure {
+            crate::recorded_send::Proof::LiteralText(&batch.messages[idx])
+        } else {
+            crate::recorded_send::Proof::Text(&batch.messages[idx])
+        };
         if let Some((message_id, _)) = recorded.confirm_from_history(idx, batch.verify_since(idx), &history, proof, &confirmed_ids) {
             // One history message can confirm only one item.
             confirmed_ids.push(message_id);
@@ -10701,6 +10708,9 @@ fn resume_send_batch(
             return Ok((409, out));
         }
         return Ok((200, out));
+    }
+    if persona_failure {
+        return Err((409, "该批次不能恢复发送".to_string()));
     }
     send_guard(context, cfg, key, &epoch)?;
     let candidates: Vec<String> = resend.iter().map(|idx| batch.messages[*idx].clone()).collect();

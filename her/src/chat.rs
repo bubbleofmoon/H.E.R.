@@ -631,11 +631,15 @@ fn send_recorded_inline(
         report.error = Some(format!("无效会话 {key}"));
         return report;
     };
-    let canonical = crate::outbound_message::normalize(text);
-    // The wire renderer trims bubble boundaries. Persist those exact parts, including when
-    // the preferred newline boundary or a whitespace-only part came from the length splitter.
-    let parts: Vec<_> = crate::onebot::split_message(&canonical, QQ_PART_LIMIT).into_iter()
-        .map(|part| part.trim().to_owned()).filter(|part| !part.is_empty()).collect();
+    let literal = purpose == crate::send_outbox::PERSONA_FAILURE_SEND;
+    let parts = if literal {
+        vec![text.to_owned()]
+    } else {
+        let canonical = crate::outbound_message::normalize(text);
+        // The wire renderer trims bubble boundaries. Persist those exact parts.
+        crate::onebot::split_message(&canonical, QQ_PART_LIMIT).into_iter()
+            .map(|part| part.trim().to_owned()).filter(|part| !part.is_empty()).collect()
+    };
     report.parts = parts.len();
     if parts.is_empty() {
         return report;
@@ -643,11 +647,20 @@ fn send_recorded_inline(
     // Owner rule (issue #70): a chat send may wait briefly behind another send in exchange for
     // one runner per batch and no blind duplicate.
     let _chain = send_chain();
+    if literal {
+        if let Err(why) = guard() {
+            report.error = Some(why);
+            return report;
+        }
+    }
     let delays: Vec<i64> = vec![delay_ms as i64; parts.len().saturating_sub(1)];
-    let fields = json!({
+    let mut fields = json!({
         "key": key, "epoch": epoch, "purpose": purpose, "messages": parts,
         "delays": delays, "replyTo": Value::Null, "atUser": Value::Null
     });
+    if literal {
+        fields["messages"] = json!([crate::onebot::escape_cq(text)]);
+    }
     let recorded = match Recorded::begin(context, now_ms, now_ms(), fields) {
         Ok(recorded) => recorded,
         Err(BeginError::Busy) => {
@@ -693,8 +706,12 @@ fn send_recorded_inline(
             report.error.get_or_insert(why.clone());
             continue;
         }
-        let outcome = ob.send_one_outcome(&target, part, None, None);
-        let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
+        let (outcome, proof) = if literal {
+            (ob.send_payload_outcome(target.action(), &OneBot::literal_payload(&target, part)), Proof::LiteralText(part))
+        } else {
+            (ob.send_one_outcome(&target, part, None, None), Proof::Text(part))
+        };
+        let settled = recorded.settle(idx, attempt_ms, outcome, &history, proof, &confirmed_ids);
         report.unknown |= settled.state.needs_verification() || settled.record_error.is_some();
         if let ItemState::Confirmed { message_id, .. } = settled.state {
             report.confirmed += 1;

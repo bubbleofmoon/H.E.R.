@@ -1386,8 +1386,73 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         report
     }
 
-    /// One chat turn: ledger entry, DSH turn on the chat preset session, then the automatic reply.
-    /// Failures stay local (ledger, log); nothing internal is sent to the conversation.
+    /// A terminal backend failure may send one owner-authored line while the turn still owns its
+    /// conversation. It uses the mode's send guards and the shared recorded text send.
+    fn send_persona_failure_line(&mut self, key: &str, dsh_session: Option<&str>) {
+        let Some(turn) = self.cur_turn.as_ref() else { return };
+        let mode = self.chat.as_ref().map_or("reserved2", |chat| chat.mode.as_str());
+        if !self.live || self.turn_final || mode == "closed-agent" || self.current_reason == "wakeReminder"
+            || self.chat.as_ref().is_some_and(|chat| chat.silent)
+        {
+            return;
+        }
+        let configured_line = || crate::persona::failure_line(&self.context, key);
+        let Some(line) = configured_line() else { return };
+        if self.turn_has_send_batch(key) {
+            return;
+        }
+        let guard = || {
+            let cfg = self.context.load_config().map_err(str::to_string)?;
+            if mode == "reserved2" {
+                if !crate::console::inbound_admitted(&cfg, key) {
+                    return Err("conversation access changed".into());
+                }
+                if self.reserved2_budget.is_some() && self.check_harness_turn(key)? {
+                    return Err("turn budget expired".into());
+                }
+                crate::console::send_guard(&self.context, &cfg, key, &self.turn_epoch)
+                    .map_err(|(_, reason)| reason)?;
+                if let Some(session) = dsh_session {
+                    self.turn_validity(key, session)?;
+                }
+            } else {
+                self.chat_guard(key, dsh_session.unwrap_or_default())?;
+                if crate::console::silent_blocks_send(&self.context, &cfg, key).map_err(|(_, reason)| reason)? {
+                    return Err("silent mode".into());
+                }
+            }
+            let offset = self.turn_ledger_offset.ok_or("missing turn ledger offset")?;
+            let current = crate::turn_ledger::fold_turn_since(&self.context, offset, &turn.id)?
+                .ok_or("missing turn ledger entry")?;
+            if !current.state.is_open() || matches!(current.finalization_claim(), Some(("cancel-requested", _))) {
+                return Err("turn ended or cancelled".into());
+            }
+            if configured_line().as_deref() != Some(line.as_str()) {
+                return Err("persona failure line changed".into());
+            }
+            let records = crate::send_outbox::read_records(&self.context)?;
+            if crate::send_outbox::blocks_persona_failure(&records, key, &self.turn_epochs, self.turn_began) {
+                return Err("conversation already replied or has an unresolved send".into());
+            }
+            let mut secrets = self.secrets.clone();
+            secrets.push(self.turn_token.clone());
+            if configured_outbound_violation(&cfg, &line, &secrets).is_some() {
+                return Err("persona failure line blocked by outbound policy".into());
+            }
+            Ok(())
+        };
+        let report = crate::chat::send_recorded(
+            &self.context, &self.ob, key, &self.turn_epoch, crate::send_outbox::PERSONA_FAILURE_SEND, &line, 0, &guard,
+        );
+        if self.turn_has_send_batch(key) {
+            self.dispatch_unsubmitted = false;
+        }
+        if report.unknown {
+            let _ = self.pause_unknown(key, "send-unresolved", "persona failure line delivery is unverified");
+        }
+    }
+
+    /// One chat turn: ledger entry, turn on the chat preset session, then the automatic reply.
     pub(crate) async fn run_chat_turn(
         &mut self,
         key: &str,
@@ -1869,7 +1934,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             if observation { return Ok(String::new()); }
             Err(crate::harness::DEADLINE_EXCEEDED.to_owned())
         } else { result };
-        match status {
+        match &status {
             crate::harness::Status::Paused { .. } => self.turn_final = true,
             crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
             _ => {}
@@ -1892,6 +1957,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         // (`harness::route_health`).
         if count > 0 {
             crate::harness::route_health::alert_if_owed(&self.context, cfg, key);
+        }
+        if matches!(&status, Status::Failed(_)) && turn.route_chain_exhausted() && !capped && !invalidated {
+            self.send_persona_failure_line(key, None);
         }
         let text = match result {
             Ok(text) => text,
@@ -2013,6 +2081,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                     let failure = crate::model_failure::Failure::classify("", &note);
                     let (provider, model) = crate::model_failure::cli_identity(cfg,id);
                     self.report_backend_failure(cfg,&key,id,&provider,&model,&failure.code,&note);
+                    if failure.class != "refusal" {
+                        self.send_persona_failure_line(&key, None);
+                    }
                     return Err(failure.summary());
                 }
             };

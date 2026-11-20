@@ -12,6 +12,7 @@ const GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const TEXT_MAX: usize = 20_000;
 const NAME_MAX: usize = 40;
 const NAMES_MAX: usize = 10;
+const FAILURE_LINE_MAX: usize = 160;
 /// Versions kept per persona.
 const VERSIONS_MAX: usize = 50;
 /// Estimated tokens (`briefing::estimate_tokens`) a newly approved core and compact form may use.
@@ -19,7 +20,7 @@ pub const CORE_TOKENS_MAX: usize = 1500;
 pub const COMPACT_TOKENS_MAX: usize = 300;
 /// The fields a save compares with the latest version.
 const CONTENT: [&str; 8] = ["name", "core", "notes", "compact", "names", "traits", "editMode", "autoRules"];
-/// Parts auto edits may change; the name and the rule set are never auto-editable.
+/// Parts auto edits may change. Name, failure line and rule set are owner-edited.
 const PARTS: [&str; 5] = ["core", "notes", "compact", "names", "traits"];
 static GATE: Mutex<()> = Mutex::new(());
 
@@ -205,6 +206,23 @@ fn rules(value: &Value) -> Result<Value, Failure> {
     Ok(out)
 }
 
+fn literal_failure_line(value: &Value) -> Result<Option<&str>, Failure> {
+    let line = match value {
+        Value::Null => return Ok(None),
+        Value::String(text) => text,
+        _ => return Err(fail(400, "failureLine must be text or null")),
+    };
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    if line.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+        || crate::role::utf16_len(line) > FAILURE_LINE_MAX
+    {
+        return Err(fail(400, "failureLine must be one line of at most 160 UTF-16 units"));
+    }
+    Ok(Some(line))
+}
+
 fn pick<'a>(body: &'a Value, base: &'a Value, field: &str) -> &'a Value {
     if body.get(field).is_some() { &body[field] } else { &base[field] }
 }
@@ -237,10 +255,11 @@ fn build(base: &Value, body: &Value, number: u64, source: &str) -> Result<Value,
         _ => return Err(fail(400, "editMode must be auto or manual")),
     };
     let auto_rules = rules(pick(body, base, "autoRules"))?;
+    let failure_line = literal_failure_line(pick(body, base, "failureLine"))?;
     Ok(json!({
         "version": number, "createdAt": now(), "source": source, "approved": false, "approvedAt": null,
         "name": name, "core": core, "notes": notes, "compact": compact, "names": names,
-        "traits": traits, "editMode": edit_mode, "autoRules": auto_rules
+        "traits": traits, "editMode": edit_mode, "autoRules": auto_rules, "failureLine": failure_line
     }))
 }
 
@@ -335,7 +354,9 @@ pub fn update(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
         let base = latest(found).cloned().unwrap_or(Value::Null);
         let next = build(&base, body, base["version"].as_u64().unwrap_or(0) + 1, "console")?;
         // Saving what the latest version already says adds no version.
-        if !base.is_null() && CONTENT.iter().all(|field| next[*field] == base[*field]) {
+        if !base.is_null() && CONTENT.iter().all(|field| next[*field] == base[*field])
+            && literal_failure_line(&base["failureLine"])? == next["failureLine"].as_str()
+        {
             return Ok(json!({"ok": true, "id": id, "version": base["version"], "activeVersion": found["activeVersion"], "unchanged": true}));
         }
         if name_taken(doc, next["name"].as_str().unwrap_or(""), Some(&id)) {
@@ -599,6 +620,14 @@ pub(crate) fn briefing_identity(context: &RuntimeContext, key: &str) -> Option<S
     let version = active(doc["personas"].get(&id)?)?;
     let identity = json!([id, version["name"], version["core"], version["compact"]]);
     Some(format!("{:x}", Sha256::digest(identity.to_string())))
+}
+
+/// Literal owner-authored text from the conversation's current approved persona version.
+pub(crate) fn failure_line(context: &RuntimeContext, key: &str) -> Option<String> {
+    let doc = load(context).ok()?;
+    let id = effective_id(&doc, key)?;
+    let version = active(doc["personas"].get(&id)?)?;
+    literal_failure_line(&version["failureLine"]).ok().flatten().map(str::to_owned)
 }
 
 /// Companion modes (chat, reserved, reserved2) use personas; closed-agent keeps role cards.

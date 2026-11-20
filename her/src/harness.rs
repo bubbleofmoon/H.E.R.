@@ -394,6 +394,7 @@ struct Progress {
     /// The model of the route the turn's last request went to.
     model: String,
     failures: Vec<RouteFailure>,
+    route_chain_exhausted: bool,
     owner_interaction_closed: bool,
 }
 
@@ -442,6 +443,10 @@ impl Turn {
     /// Each route request that failed over or ended the turn, in order.
     pub fn route_failures(&self) -> Vec<RouteFailure> {
         self.progress.lock().unwrap_or_else(|p| p.into_inner()).failures.clone()
+    }
+
+    pub(crate) fn route_chain_exhausted(&self) -> bool {
+        self.progress.lock().unwrap_or_else(|p| p.into_inner()).route_chain_exhausted
     }
 
     pub(crate) fn owner_interaction_closed(&self) -> bool {
@@ -1159,6 +1164,14 @@ impl ChainState {
         match next {
             routes::Next::Fail => {
                 keep();
+                let class = crate::model_failure::Failure::classify("", &summary).class;
+                let unsafe_miss = self.dispatched
+                    && (matches!(miss, routes::Miss::Dropped) || matches!(class, "timeout" | "network"));
+                if !next_route && !situation.sent && !unsafe_miss && class != "refusal"
+                    && tokio::time::Instant::now() < at.deadline
+                {
+                    progress.lock().unwrap_or_else(|p| p.into_inner()).route_chain_exhausted = true;
+                }
                 record("route-failed", Outcome::Failed, "the turn ends".to_string());
                 Err(summary.into())
             }

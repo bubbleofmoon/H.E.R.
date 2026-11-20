@@ -1045,6 +1045,7 @@ fn revoking_a_harness_conversation_cancels_the_model_wait_and_fences_late_output
         release: release.clone(),
     }]);
     let mut rig = harness_rig("harness-revoked", &model);
+    t48_harness_persona(&rig);
     rig.start();
     rig.push(group_event(
         67006,
@@ -3973,6 +3974,59 @@ fn menu_a_switch_turned_off_mid_turn_leaves_the_next_model_request() {
         "a switch turned off mid-turn stayed on the next request's menu: {next:?}"
     );
     assert_eq!(next.len(), first.len() - 1, "{next:?}");
+}
+
+fn t48_harness_persona(rig: &Rig) {
+    fs::write(rig.root.join("data/personas.json"), json!({
+        "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+        "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+            {"version": 1, "approved": true, "name": "Fixture", "core": "Speak plainly.", "failureLine": "I need a moment."}
+        ]}}
+    }).to_string()).unwrap();
+}
+
+#[test]
+fn t48_successful_harness_fallback_sends_only_the_answer() {
+    let model = FakeModel::script(vec![
+        ModelReply::Error { status: 503, message: "synthetic outage".into() },
+        ModelReply::Text("back now".into()),
+    ]);
+    let mut rig = harness_rig("t48-successful-fallback", &model);
+    t48_harness_persona(&rig);
+    set_harness_config(&rig, json!({"routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "try both routes");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert_eq!(lock(&model.requests).len(), 2);
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK, "back now"], "successful fallback owes no failure line");
+}
+
+#[test]
+fn t48_harness_sends_a_line_after_both_routes_are_exhausted() {
+    let outage = || ModelReply::Error { status: 503, message: "synthetic outage".into() };
+    let model = FakeModel::script(vec![outage(), outage()]);
+    let mut rig = harness_rig("t48-exhausted-routes", &model);
+    t48_harness_persona(&rig);
+    set_harness_config(&rig, json!({"routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]}), 10);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "try both routes");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "failed")));
+    let requests = lock(&model.requests);
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| !r.to_string().contains("I need a moment.")));
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK, "I need a moment."]);
+    assert!(!conversation_facts(&rig)["events"].to_string().contains("I need a moment."));
+}
+
+#[test]
+fn t48_harness_policy_refusal_does_not_send_a_persona_line() {
+    let model = FakeModel::script(vec![ModelReply::Refusal]);
+    let mut rig = harness_rig("t48-provider-refusal", &model);
+    t48_harness_persona(&rig);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "trigger a provider refusal");
+    assert!(wait_for(LONG, || rig.ledger().iter().any(|r| r["k"] == "ended" && r["outcome"] == "failed")));
+    assert_eq!(rig.texts_to(GROUP_KEY), [ACK]);
 }
 
 /// The owner's notices of a turn that failed over and then ended in the step limit (a non-model failure).

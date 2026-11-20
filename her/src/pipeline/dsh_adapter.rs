@@ -21,6 +21,17 @@ pub(crate) fn is_dsh_access_refusal(error: &str) -> bool {
 pub(super) enum DshTurnError {
     AccessRefused(String),
     Failure(String),
+    Exhausted { reason: String, session: String },
+}
+
+impl DshTurnError {
+    fn after_exhaustion(reason: String, session: &str, policy_refused: bool) -> Self {
+        if policy_refused {
+            Self::Failure(reason)
+        } else {
+            Self::Exhausted { reason, session: session.to_owned() }
+        }
+    }
 }
 
 impl From<String> for DshTurnError {
@@ -39,7 +50,7 @@ impl From<DshTurnError> for String {
     fn from(error: DshTurnError) -> Self {
         match error {
             DshTurnError::AccessRefused(reason) => format!("{ACCESS_REFUSAL_PREFIX}{reason}"),
-            DshTurnError::Failure(error) => error,
+            DshTurnError::Failure(error) | DshTurnError::Exhausted { reason: error, .. } => error,
         }
     }
 }
@@ -83,7 +94,11 @@ impl Pipeline {
         if let Some(b) = cfg_dsh.get_mut("backends").and_then(|v| v.as_object_mut()) {
             b.remove("sessions");
         }
-        self.ask_with_failover_with_deadline(key, prompt, timeout, &cfg_dsh).await
+        let result = self.ask_with_failover_with_deadline(key, prompt, timeout, &cfg_dsh).await;
+        if let Err(DshTurnError::Exhausted { session, .. }) = &result {
+            self.send_persona_failure_line(key, Some(session));
+        }
+        result.map_err(String::from)
     }
 
     fn preset_for(&self, key: &str) -> String {
@@ -735,7 +750,8 @@ impl Pipeline {
         timeout_secs: u64,
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
-        self.ask_with_failover_with_deadline(key, prompt, std::time::Duration::from_secs(timeout_secs), cfg).await
+        self.ask_with_failover_with_deadline(key, prompt, std::time::Duration::from_secs(timeout_secs), cfg)
+            .await.map_err(String::from)
     }
 
     async fn ask_with_failover_with_deadline(
@@ -744,15 +760,15 @@ impl Pipeline {
         prompt: &str,
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
-    ) -> Result<String, String> {
+    ) -> Result<String, DshTurnError> {
         if !self.has_dsh() {
-            return Err(crate::dsh_credential::UNBOUND.to_string());
+            return Err(crate::dsh_credential::UNBOUND.into());
         }
         self.failure_reported = false;
         self.refusals_recorded.clear();
         self.active_candidate = None;
         let result = self.ask_with_failover_inner(key, prompt, timeout, cfg).await;
-        if let Err(DshTurnError::Failure(error)) = &result {
+        if let Err(DshTurnError::Failure(error) | DshTurnError::Exhausted { reason: error, .. }) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
                 && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
                 && !error.contains("preset") && !error.contains("预设")
@@ -765,15 +781,18 @@ impl Pipeline {
         // A failure to reach DSH marks it down (queued work waits for recovery); a call that went through marks it up.
         match &result {
             Ok(_) => crate::dsh_health::note_call_success(&self.context, cfg),
-            Err(DshTurnError::Failure(error)) => crate::dsh_health::note_call_failure(&self.context, cfg, error),
+            Err(DshTurnError::Failure(error) | DshTurnError::Exhausted { reason: error, .. }) =>
+                crate::dsh_health::note_call_failure(&self.context, cfg, error),
             Err(DshTurnError::AccessRefused(_)) => {}
         }
-        result.map_err(String::from)
+        result
     }
 
-    pub(super) fn cli_fallback(&mut self, cfg: &serde_json::Value, key: &str, prompt: &str, timeout_secs: u64) -> Result<(String, String), String> {
+    pub(super) fn cli_fallback(&mut self, cfg: &serde_json::Value, key: &str, prompt: &str, timeout_secs: u64) -> Result<(String, String), (String, bool)> {
         let context = self.context.clone();
+        let mut policy_refused = false;
         let result = crate::backend::cli_fallback_with_runtime_reporting(&context, cfg, key, prompt, timeout_secs, |id, error| {
+            policy_refused |= crate::model_failure::Failure::classify("", error).class == "refusal";
             let (provider, model) = crate::model_failure::cli_identity(cfg, id);
             self.report_backend_failure(cfg, key, id, &provider, &model, "", error);
         });
@@ -781,7 +800,7 @@ impl Pipeline {
         if result.is_ok() {
             crate::prompt::record_recall_hits(&self.context, &self.compat_recall);
         }
-        result
+        result.map_err(|error| (error, policy_refused))
     }
 
     /// JS `shouldAuditKey`: every conversation is audited except the owner's private chat in closed-agent mode.
@@ -959,7 +978,12 @@ impl Pipeline {
                         println!("[failover] 模型全设不上（{e}），改用 CLI 后端 {backend_id} 拿到回复");
                         return Ok(text);
                     }
-                    Err(note) => return Err(format!("{e}；CLI 后端也没成：{note}").into()),
+                    Err((note, cli_refused)) => {
+                        let refused = crate::model_failure::Failure::classify("", &e).class == "refusal";
+                        return Err(DshTurnError::after_exhaustion(
+                            format!("{e}；CLI 后端也没成：{note}"), &sid, refused || cli_refused,
+                        ));
+                    }
                 }
             },
         };
@@ -1375,6 +1399,7 @@ impl Pipeline {
                 ),
                 None => ("prompt-refused".to_string(), crate::activity::redacted_preview(&self.context, &why, 200)),
             };
+            let policy_refused = crate::model_failure::Failure::classify(failure_code, failure_detail).class == "refusal";
             let action = self.failover_state().plan(key, &sid, chain.len(), already_sent);
             let outcome = match action {
                 failover::FailoverAction::Retry { idx: next } => {
@@ -1429,7 +1454,8 @@ impl Pipeline {
                             Outcome::Failed,
                             &format!("{key}: the next candidate could not be selected: {safe}"),
                         );
-                        return self.exhausted_chain(cfg, key, prompt, timeout_secs, format!("{why}；切换候选后设置模型失败：{select_error}"), "select-failed");
+                        return self.exhausted_chain(cfg, key, prompt, timeout_secs, format!("{why}；切换候选后设置模型失败：{select_error}"), "select-failed")
+                            .map_err(|(reason, cli_refused)| DshTurnError::after_exhaustion(reason, &sid, policy_refused || cli_refused));
                     }
                 },
                 Err(failover::GiveUp::AlreadySent) => {
@@ -1439,7 +1465,8 @@ impl Pipeline {
                     // DSH 的候选链全挂了 —— 再试 `backends` 里配的 CLI 后端（R4，仅 `backends.failoverFallback` 开启时才会跑）。
                     // 只有整条 DSH 链都失败才走到这里，正常回合不会因此多花时间。
                     let why_full = format!("{}（{}）", why, g.as_str());
-                    return self.exhausted_chain(cfg, key, prompt, timeout_secs, why_full, g.as_str());
+                    return self.exhausted_chain(cfg, key, prompt, timeout_secs, why_full, g.as_str())
+                        .map_err(|(reason, cli_refused)| DshTurnError::after_exhaustion(reason, &sid, policy_refused || cli_refused));
                 }
             }
         }
@@ -1455,7 +1482,7 @@ impl Pipeline {
         timeout_secs: u64,
         why_full: String,
         reason: &str,
-    ) -> Result<String, DshTurnError> {
+    ) -> Result<String, (String, bool)> {
         match self.cli_fallback(cfg, key, prompt, timeout_secs) {
             Ok((backend_id, text)) => {
                 println!("[failover] DSH 全挂，改用 CLI 后端 {backend_id} 拿到回复");
@@ -1469,7 +1496,7 @@ impl Pipeline {
                 );
                 Ok(text)
             }
-            Err(note) => Err(format!("{why_full}；CLI 后端也没成：{note}").into()),
+            Err((note, policy_refused)) => Err((format!("{why_full}；CLI 后端也没成：{note}"), policy_refused)),
         }
     }
     /// 投一句 prompt 并等到这一轮结束，返回回复正文。
