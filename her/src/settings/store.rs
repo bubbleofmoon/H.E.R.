@@ -13,10 +13,12 @@ pub(crate) use conversation::{
 };
 
 use super::{find, find_conversation, registry, Setting, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER, WEB_SEARCH_API_KEY};
+use super::registry::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DB: &str = "settings.db";
@@ -927,11 +929,11 @@ fn keep_pre_settings_copy(context: &RuntimeContext) -> Result<(), String> {
 /// one audit row keeps `record_change`'s revision rule: no revision is ever reused. The value is the kind's
 /// (`SettingKind::seed`) of the member the setting reads (`Setting::found_in`, an alias spelling included).
 ///
-/// A security setting (#154, `Setting::confirmed`) is seeded only by a write of itself (`written` names the keys the
+/// Other than rollout, a security setting is seeded only by a write of itself (`written` names the keys the
 /// write changes), so a write of another setting never takes the access lists over from `config.json`, and its first
 /// change's undo restores the file's value. When `config.json` holds a value for it that the store cannot keep (an id
 /// list over its limit, an owner that is not an id), that write is 409 and nothing is written: its undo could not
-/// restore the file's value.
+/// restore the file's value. Rollout seeds only when its file value can launch and is within the effective allow lists.
 fn seed(
     conn: &Connection, document: &Value, at: i64, written: &[&'static str], harness_key: Option<&str>,
 ) -> Result<(), (u16, String)> {
@@ -941,7 +943,7 @@ fn seed(
         if setting.secret {
             continue;
         }
-        let own_write_only = setting.confirmed();
+        let own_write_only = setting.confirmed() && setting.key != ROLLOUT_GROUPS.key;
         if own_write_only && !written.contains(&setting.key) {
             continue;
         }
@@ -954,6 +956,9 @@ fn seed(
             )
             .map_err(failed)?;
         if known {
+            continue;
+        }
+        if setting.key == ROLLOUT_GROUPS.key && !rollout_can_seed(conn, document, found)? {
             continue;
         }
         let Some(value) = setting.kind.seed(found) else {
@@ -1217,6 +1222,83 @@ fn stored_row(conn: &Connection, key: &str) -> Result<Option<(String, i64)>, (u1
         .map_err(|_| (503, STORAGE_ERROR.to_string()))
 }
 
+const ROLLOUT_ALLOW_LISTS: [(&str, &Setting); 2] = [("group", &ALLOW_GROUPS), ("private", &ALLOW_PRIVATE)];
+
+/// The file with the three scope rows applied using this write transaction's view of the store.
+fn scope_document(conn: &Connection, document: &Value) -> Result<Value, (u16, String)> {
+    let mut effective = document.clone();
+    for setting in [&ALLOW_GROUPS, &ALLOW_PRIVATE, &ROLLOUT_GROUPS] {
+        if let Some(value) = stored_row(conn, setting.key)?
+            .and_then(|(text, _)| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| setting.storable(&value))
+        {
+            set_at(&mut effective, setting.pointer, value);
+        }
+    }
+    Ok(effective)
+}
+
+fn allow_ids(setting: &Setting, document: &Value) -> HashSet<u64> {
+    setting.read(document).as_array().into_iter().flatten().filter_map(Value::as_u64).collect()
+}
+
+fn unallowed_rollout_key<'a>(keys: &'a [String], kind: &str, allowed: &HashSet<u64>) -> Option<&'a str> {
+    keys.iter().find_map(|key| {
+        let (entry_kind, id) = key.split_once(':')?;
+        let id = id.parse::<u64>().ok()?;
+        (entry_kind == kind && !allowed.contains(&id)).then_some(key.as_str())
+    })
+}
+
+fn rollout_can_seed(conn: &Connection, document: &Value, found: &Value) -> Result<bool, (u16, String)> {
+    let Ok(keys) = crate::watchdog::rollout_groups(found) else { return Ok(false) };
+    let effective = scope_document(conn, document)?;
+    Ok(ROLLOUT_ALLOW_LISTS.iter().all(|(kind, setting)| {
+        unallowed_rollout_key(&keys, kind, &allow_ids(setting, &effective)).is_none()
+    }))
+}
+
+/// Validate the proposal after the in-transaction seed, before writing or mirroring any change.
+/// A file without a usable rollout list has no launch target. A change of rollout checks both kinds.
+fn validate_rollout_change<'a>(
+    conn: &Connection,
+    document: &Value,
+    changes: impl IntoIterator<Item = (&'a Setting, Option<&'a Value>)>,
+) -> Result<(), (u16, String)> {
+    let mut scope = changes.into_iter().filter(|(setting, _)| {
+        matches!(setting.key, "allow.groups" | "allow.private" | "rollout.rustGroups")
+    }).peekable();
+    if scope.peek().is_none() {
+        return Ok(());
+    }
+    let before = scope_document(conn, document)?;
+    let mut after = before.clone();
+    let mut rollout_written = false;
+    for (setting, value) in scope {
+        rollout_written |= setting.key == ROLLOUT_GROUPS.key;
+        if let Some(value) = value {
+            if !set_at(&mut after, setting.pointer, value.clone()) {
+                return Err((400, format!("config.json cannot hold {}", setting.key)));
+            }
+        } else {
+            remove_at(&mut after, setting.pointer);
+        }
+    }
+    let Ok(keys) = crate::watchdog::rollout_groups(&after["rollout"]["rustGroups"]) else { return Ok(()) };
+    for (kind, setting) in ROLLOUT_ALLOW_LISTS {
+        let allowed = allow_ids(setting, &after);
+        if rollout_written || allowed != allow_ids(setting, &before) {
+            if let Some(key) = unallowed_rollout_key(&keys, kind, &allowed) {
+                return Err((409, format!(
+                    "{} requires {key} to be in {}. To revoke access immediately, use conversation scope `remove` or add a deny entry.",
+                    ROLLOUT_GROUPS.key, setting.key
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Writes one change of a global setting and its audit row in the caller's transaction: `new` is the text to store,
 /// `None` removes the stored value. Returns the stored revision (0 when removed). A revision continues from the stored
 /// row, or, without one (never set, or removed by an undo), after the setting's audit rows, so it is never reused. A
@@ -1353,6 +1435,7 @@ fn store(
                 return Ok(Applied { value, revision: *revision, changed: false, mirror_error: None });
             }
         }
+        validate_rollout_change(conn, document, [(setting, Some(&value))])?;
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
         validate_timing(conn, document, &[setting.key], None)?;
         Ok(Applied { value, revision, changed: true, mirror_error: None })
@@ -1394,7 +1477,8 @@ pub(crate) struct Undone {
 /// `config.json` (source `migration`: undoing it would only drop the store's copy of the file's own value), no later
 /// audit row names that setting, the stored value is still the entry's new value and the registry still accepts the
 /// entry's old value. An undo that removes the stored value also removes the setting's member from `config.json`
-/// before the commit (`remove_from_config`); when that write fails the undo is 503 and writes nothing. An entry that
+/// before the commit (`remove_from_config`); rollout refuses that undo with 409 to keep an explicit launch list.
+/// When the file write fails the undo is 503 and writes nothing. An entry that
 /// does not exist, and any entry while there is no store yet, is 404 (and creates no store). `permit` is asked, inside the
 /// transaction, about the setting the entry names; its error refuses the undo with nothing written (#154: the console's
 /// plain path, which looked at the entry before it existed or before it was known, refuses a security setting here).
@@ -1448,6 +1532,12 @@ pub(crate) fn undo(
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
+        if setting.key == ROLLOUT_GROUPS.key && restored.is_none() {
+            return Err((
+                409,
+                "This entry has no previous rollout list to restore. Set or reset rollout.rustGroups explicitly.".to_string(),
+            ));
+        }
         if let Some(restored) = &restored {
             reject_credential_text(conn, setting, restored, harness_key.as_deref())?;
         }
@@ -1460,6 +1550,7 @@ pub(crate) fn undo(
             )?;
         }
         let restored_text = restored.as_ref().map(Value::to_string);
+        validate_rollout_change(conn, document, [(setting, restored.as_ref())])?;
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
         validate_timing(conn, document, &[setting.key], restored.is_none().then_some(setting))?;
         if restored.is_none() {
@@ -1598,7 +1689,12 @@ pub(crate) fn console_changes(
             }
             return Err((400, setting.refusal(posted)));
         };
-        if value != setting.read(&now) {
+        let unchanged = if setting.key == ROLLOUT_GROUPS.key {
+            setting.found_in(&now) == Some(&value)
+        } else {
+            value == setting.read(&now)
+        };
+        if !unchanged {
             changes.push((setting, value));
         }
     }
@@ -1636,6 +1732,7 @@ pub(crate) fn apply_changes(
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
     let harness_key = harness_credential(context);
     let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
+        validate_rollout_change(conn, document, changes.iter().map(|(setting, value)| (*setting, Some(value))))?;
         for (setting, value) in &changes {
             reject_credential_text(conn, setting, value, harness_key.as_deref())?;
             let text = value.to_string();
@@ -1772,7 +1869,11 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 return entry;
             }
             let stored_value = stored.iter().find(|(entry, _)| entry.key == setting.key).map(|(_, value)| value.clone());
-            let value = setting.read(&document);
+            let value = if setting.key == ROLLOUT_GROUPS.key {
+                setting.found_in(&document).cloned().unwrap_or(Value::Null)
+            } else {
+                setting.read(&document)
+            };
             entry["default"] = setting.default_value();
             entry["stored"] = json!(stored_value);
             entry["value"] = value.clone();
@@ -1810,6 +1911,17 @@ pub(crate) fn security_restore(
     let now = overlay(context, current.clone());
     let mut changes = Vec::new();
     for setting in registry().filter(|setting| setting.confirmed()) {
+        if setting.key == ROLLOUT_GROUPS.key {
+            let Some(value) = setting.found_in(restored) else { continue };
+            if setting.found_in(&now) == Some(value) {
+                continue;
+            }
+            let value = setting.normalize(value).ok_or_else(|| {
+                (409, format!("the backup's {} cannot be stored ({}); nothing was undone", setting.key, setting.refusal(value)))
+            })?;
+            changes.push((setting, value));
+            continue;
+        }
         let value = setting.read(restored);
         if value == setting.read(&now) {
             continue;
