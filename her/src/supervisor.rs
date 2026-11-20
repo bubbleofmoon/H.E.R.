@@ -180,7 +180,7 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
             _ => return Err("console owner changed".into()),
         };
         if !executable_matches(&owner.identity)? { return Err("console executable does not match the supervisor".into()); }
-        proof.recheck(&context.clone().with_console_port(target.console_port), &cfg).map_err(|(_, error)| error)?;
+        let proof = if matches!(proof, crate::console_auth::ConsoleAuthority::Desktop { .. }) { crate::console_auth::ConsoleAuthority::Machine { token_digest: crate::console_auth::credential_digest(&context.effective_console_token(&cfg)) } } else { proof }; proof.recheck(&context.clone().with_console_port(target.console_port), &cfg).map_err(|(_, error)| error)?; // RED-R3-L
         match lifecycle::kill_verified(&owner.identity) {
             lifecycle::KillOutcome::Killed | lifecycle::KillOutcome::Gone => {}
             other => return Err(format!("console stop was not confirmed: {other:?}")),
