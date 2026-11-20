@@ -291,7 +291,7 @@ pub(super) fn rank(
         completed.push(vector);
     }
     if !completed.is_empty() {
-        publish(reader, &model, &pending, completed).ok()?; // RED-M4
+        let _ = publish(reader, &model, &pending, completed);
     }
     rank_cached(reader, &query_vector, excluded, limit, &model, MAX_DISTANCE)
 }
