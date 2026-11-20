@@ -752,7 +752,7 @@ impl Pipeline {
         self.refusals_recorded.clear();
         self.active_candidate = None;
         let result = self.ask_with_failover_inner(key, prompt, timeout, cfg).await;
-        if let Err(DshTurnError::Failure(error) | DshTurnError::AccessRefused(error)) = &result { // RED-REPORTING
+        if let Err(DshTurnError::Failure(error)) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
                 && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
                 && !error.contains("preset") && !error.contains("预设")
