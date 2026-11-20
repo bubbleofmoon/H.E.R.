@@ -26,6 +26,8 @@ PYTHON = "/usr/bin/python3"
 GIT = "/usr/bin/git"
 BWRAP = "/usr/bin/bwrap"
 MODEL_SOCKET = "/model.sock"
+CODEX_REPORT = "/tmp/her-report.md"
+MAX_REPORT = 1024 * 1024
 WORKER_ENV = {
     "HOME": "/home/agent", "PATH": "/usr/bin:/bin", "TMPDIR": "/tmp",
     "LANG": "C.UTF-8", "USER": "agent", "LOGNAME": "agent",
@@ -91,6 +93,8 @@ class ModelRelay(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.host, _, self.routes = PROVIDERS[provider]
         self.auth = {"Authorization": "Bearer " + key} if provider == "codex" else {"X-Api-Key": key}
         self.connect = connect
+        self.inference_status = None
+        self.inference_succeeded = False
         self.slots = threading.BoundedSemaphore(self.request_queue_size)
         super().__init__(path, ModelRequest)
 
@@ -149,12 +153,17 @@ class ModelRequest(http.server.BaseHTTPRequestHandler):
                 headers[name] = self.headers[name]
         connection = self.server.connect(self.server.host)
         with contextlib.closing(connection):
+            primary = self.path in ("/v1/responses", "/v1/messages", "/v1/messages?beta=true")
             try:
                 connection.request("POST", self.path, body, headers)
                 response = connection.getresponse()
             except (http.client.HTTPException, OSError, ValueError):
+                if primary:
+                    self.server.inference_status = 502
                 self.send_error(502)
                 return
+            if primary:
+                self.server.inference_status = response.status
             # Route credentials stay at the fixed destination even if it responds with a redirect.
             if 300 <= response.status < 400:
                 self.send_error(502)
@@ -169,6 +178,8 @@ class ModelRequest(http.server.BaseHTTPRequestHandler):
             while chunk := response.read1(65536):
                 self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
             if response.length in (None, 0):
+                if primary and 200 <= response.status < 300:
+                    self.server.inference_succeeded = True
                 self.wfile.write(b"0\r\n\r\n")
 
 
@@ -291,7 +302,8 @@ def worker_command(args, relay_path, filter_fd):
         command += ["--setenv", key, value]
     cwd = "/scratch" if args.mode == "plan" else "/repo"
     return command + ["--remount-ro", "/", "--chdir", cwd, "--", PYTHON, "-I", "/launcher.py",
-                      "__worker", args.provider, args.prompt_file, *args.command]
+                      "__worker", args.provider, args.prompt_file,
+                      "capture" if args.capture_result else "", *args.command]
 
 
 async def bridge(reader, writer):
@@ -318,7 +330,18 @@ async def bridge(reader, writer):
         writer.close()
 
 
-async def bootstrap(provider, prompt, command):
+def send_codex_report():
+    try:
+        fd = os.open(CODEX_REPORT, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as result:
+            info = os.fstat(result.fileno())
+            if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= MAX_REPORT:
+                sys.stdout.buffer.write(result.read(MAX_REPORT + 1))
+    except OSError:
+        pass
+
+
+async def bootstrap(provider, prompt, capture, command):
     # Confirm the one authorized socket and private loopback are available before launching.
     _, probe = await asyncio.open_unix_connection(MODEL_SOCKET)
     probe.close()
@@ -342,28 +365,41 @@ supports_websockets = false
             env.update(ANTHROPIC_BASE_URL=base, ANTHROPIC_API_KEY="local-relay",
                        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         prompt_path = Path("/inputs") / prompt if prompt else os.devnull
+        codex_report = capture and provider == "codex"
         with open(prompt_path, "rb") as source:
-            child = await asyncio.create_subprocess_exec("/agent", *command, env=env, stdin=source)
+            child = await asyncio.create_subprocess_exec(
+                "/agent", *command, env=env, stdin=source,
+                stdout=sys.stderr if codex_report else None)
         status = await child.wait()
+        if codex_report:
+            send_codex_report()
         return status if status >= 0 else 128 - status
 
 
-def run_worker(command, filter_fd, timeout):
+def run_worker(command, filter_fd, timeout, capture):
     deadline = time.monotonic() + timeout
     # Give the worker pipes and a null input. It never inherits coordinator report file descriptors.
     with subprocess.Popen(command, env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, pass_fds=(filter_fd,)) as child:
+                          stderr=subprocess.PIPE if capture else subprocess.STDOUT,
+                          pass_fds=(filter_fd,)) as child:
         try:
             with selectors.DefaultSelector() as ready:
-                ready.register(child.stdout, selectors.EVENT_READ)
-                while ready.select(max(0, deadline - time.monotonic())):
-                    data = os.read(child.stdout.fileno(), 65536)
-                    if not data:
-                        return child.wait(timeout=max(0, deadline - time.monotonic()))
-                    sys.stdout.buffer.write(data)
-                    sys.stdout.buffer.flush()
-                    if time.monotonic() >= deadline:
+                ready.register(child.stdout, selectors.EVENT_READ, sys.stdout.buffer)
+                if capture:
+                    ready.register(child.stderr, selectors.EVENT_READ, sys.stderr.buffer)
+                while ready.get_map():
+                    events = ready.select(max(0, deadline - time.monotonic()))
+                    if not events or time.monotonic() >= deadline:
                         break
+                    for event, _ in events:
+                        data = os.read(event.fd, 65536)
+                        if data:
+                            event.data.write(data)
+                            event.data.flush()
+                        else:
+                            ready.unregister(event.fd)
+                else:
+                    return child.wait(timeout=max(0, deadline - time.monotonic()))
             raise subprocess.TimeoutExpired(command, timeout)
         finally:
             if child.poll() is None:
@@ -382,7 +418,15 @@ def run_relay(args, key, connect):
                 with tempfile.TemporaryFile(dir=args.stage) as syscall_filter:
                     export_seccomp(syscall_filter)
                     fd = syscall_filter.fileno()
-                    return run_worker(worker_command(args, relay_path, fd), fd, args.timeout)
+                    status = run_worker(worker_command(args, relay_path, fd), fd, args.timeout,
+                                        args.capture_result)
+                    if args.capture_result and not relay.inference_succeeded:
+                        if relay.inference_status == 429:
+                            return 75
+                        if status == 0:
+                            print("readonly-agent: no successful model inference", file=sys.stderr)
+                            return 69
+                    return status
             finally:
                 relay.shutdown()
                 thread.join()
@@ -402,6 +446,7 @@ def main(connect=upstream_connection):
     parser.add_argument("--provider", choices=PROVIDERS, required=True)
     parser.add_argument("--exec", type=Path, required=True, dest="executable")
     parser.add_argument("--prompt-file", default="")
+    parser.add_argument("--capture-result", action="store_true")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -437,5 +482,5 @@ def main(connect=upstream_connection):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["__worker"]:
-        raise SystemExit(asyncio.run(bootstrap(sys.argv[2], sys.argv[3], sys.argv[4:])))
+        raise SystemExit(asyncio.run(bootstrap(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])))
     raise SystemExit(main())

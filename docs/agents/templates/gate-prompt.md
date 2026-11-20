@@ -1,17 +1,17 @@
 # Code review prompt
 
-The first round covers the full ticket diff and goes to a Claude `ticket-reviewer`. Follow-up rounds cover the fix diff and unresolved required findings. Fill the fields below and keep the scope and checks for the current round. Save the result as the run's prompt file and start `scripts/codex-task.sh <name> <worktree-or-scratch> <prompt> gpt-6.2-astra high read-only` for rounds 2 and 3. The coordinator reads `<name>.report.md` beside the prompt as the review.
+The first round covers the full ticket diff and goes to the Claude reviewer. Follow-up rounds cover the fix diff and unresolved required findings. Save the brief and start the reviewer described in `docs/agents/coordinator.md` ("Review and gates"). The report lands beside the prompt.
 
-For a standalone Linux launcher brief, name `/repo` as the checkout and use staged paths under `/inputs` for the issue, plan and prior report. Keep the receipt on the coordinator side.
+On Linux use `/repo` for the committed checkout and `/inputs` for the issue, plan, prior report and other staged inputs. On Windows substitute the checkout and coordinator-approved paths.
 
 ```
 Head: <head sha>
 Base: <sha of origin/main>
 Round: <n> of 3
 
-Review ticket <ticket number>, "<title>", in <worktree path> on branch <branch>. Read only: write no file and run no git command that changes anything.
+Review ticket <ticket number>, "<title>", in /repo on branch <branch>. Read only: write no file and run no git command that changes anything.
 
-Acceptance criteria: <the ticket's list, one per line>
+Acceptance criteria: /inputs/issue.md, <scope notes if any>
 Plan: <path of the plan the change follows, or none>
 Previous report: <path of the last round's report, or none>
 

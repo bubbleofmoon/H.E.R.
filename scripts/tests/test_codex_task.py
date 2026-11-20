@@ -5,8 +5,8 @@ Receipts: each case runs a launcher against a fake `codex` that writes (or does 
 named by `-o`, and reads the exit receipt. A run that produced no report must never read as a pass:
 a missing or empty report gives `no-report`, a usage-limit message in the error log gives `quota`.
 Work modes: `implement` runs Codex in a ticket worktree (a throwaway repository with a local bare remote);
-the fake commits and pushes like the real run, and the wrapper only verifies what it left. `plan` runs
-Codex in the ticket's scratch export and installs the plan the run left in its plan-out folder.
+the fake commits and pushes like the real run, and the wrapper only verifies what it left. The PowerShell
+cases also cover its read-only and planning modes. Linux reviews and plans run in test_readonly_agent.py.
 The sh cases put the fake first on PATH; the ps1 cases run under pwsh with APPDATA pointing at a
 fake package folder that holds the fake as codex.exe. POSIX only: the fake is a shell script.
 Run: python -I scripts/tests/test_codex_task.py
@@ -185,6 +185,17 @@ class Receipts:
         rc, receipt, _ = self.run_case('report-fail')
         self.assertEqual((rc, receipt), (3, '3'))
 
+    def test_the_none_sandbox_is_refused(self):
+        out = Path(tempfile.mkdtemp(prefix='codex-task-test-'))
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        prompt, work, env = prepare(out, 'report')
+        env.update(FAKE_ARGS=str(out / 'args.txt'))
+        done = self.launch_sandbox(out, prompt, work, env, 'none')
+        self.assertNotEqual(done.returncode, 0)
+        self.assertFalse((out / 'args.txt').exists(), 'codex ran without a sandbox')
+
+
+class Ps1SandboxOptions:
     def test_defaults_are_sol_high_read_only(self):
         out = Path(tempfile.mkdtemp(prefix='codex-task-test-'))
         self.addCleanup(shutil.rmtree, out, ignore_errors=True)
@@ -214,15 +225,6 @@ class Receipts:
         self.assertEqual([args[i + 1] for i, a in enumerate(args) if a == '--add-dir'], [str(out / 'a')])
         self.assertIn('GIT_CONFIG_COUNT=', args)                          # no push-disabling git config
 
-    def test_the_none_sandbox_is_refused(self):
-        out = Path(tempfile.mkdtemp(prefix='codex-task-test-'))
-        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
-        prompt, work, env = prepare(out, 'report')
-        env.update(FAKE_ARGS=str(out / 'args.txt'))
-        done = self.launch_sandbox(out, prompt, work, env, 'none')
-        self.assertNotEqual(done.returncode, 0)
-        self.assertFalse((out / 'args.txt').exists(), 'codex ran without a sandbox')
-
 
 def prepare(out, mode):
     prompt = out / 'prompt.md'
@@ -238,7 +240,7 @@ class ShReceipts(Receipts, unittest.TestCase):
     def launch(self, mode, out):
         prompt, work, env = prepare(out, mode)
         env.update(install_fake(out, False))
-        done = subprocess.run([BASH, str(SH), 'case', str(work), str(prompt), 'gpt-6.2-astra', 'high', 'read-only', '1'],
+        done = subprocess.run([BASH, str(SH), 'case', str(work), str(prompt), 'gpt-6.2-astra', 'high', 'bypass', '1'],
                               env=env, capture_output=True, text=True, timeout=120)
         return done.returncode, 'case', done.stdout + done.stderr
 
@@ -250,7 +252,7 @@ class ShReceipts(Receipts, unittest.TestCase):
 
 
 @unittest.skipUnless(POSIX and PWSH, 'needs pwsh on a POSIX host')
-class Ps1Receipts(Receipts, unittest.TestCase):
+class Ps1Receipts(Receipts, Ps1SandboxOptions, unittest.TestCase):
     def launch(self, mode, out):
         prompt, work, env = prepare(out, mode)
         env.update(install_fake(out, True))
@@ -646,7 +648,7 @@ class Work:
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual(len(self.receipt()), 1)
 
-    # --- plan ---------------------------------------------------------------------------------
+class Ps1Plan:
     def make_scratch(self):
         scratch = self.ticket_dir / 'scratch'
         scratch.mkdir()
@@ -761,7 +763,7 @@ class ShWork(Work, unittest.TestCase):
 
 
 @unittest.skipUnless(POSIX and PWSH and GIT, 'needs pwsh and git on a POSIX host')
-class Ps1Work(Work, unittest.TestCase):
+class Ps1Work(Work, Ps1Plan, unittest.TestCase):
     WINDOWS = True
 
     def command(self, kind, **f):

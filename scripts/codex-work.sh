@@ -26,9 +26,7 @@
 #   `dirty`, `pre-remote-mismatch`, `remote-moved`, `unpushed` and `scan-refused`, else 0.
 #   <name>.staged.txt lists the commits since the pre-run HEAD (`commit <sha> <subject>`) and the name-status of
 #   every path they touched (`<status><TAB><path>`).
-# plan: Codex (workspace-write) writes only <orch>/<n>/scratch and <orch>/<n>/plan-out; the plan it leaves there as a
-#   regular, single-link plan.md is copied to <orch>/<n>/plan.md, and plan.sha256 holds its sha256sum line. A failed
-#   install restores the old plan.md and plan.sha256.
+# plan: the Linux launcher gives Codex disposable /scratch and /plan-out and publishes validated outputs on success.
 # <orch> is $HER_ORCH, default /root/orch/her.
 set -uo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -175,53 +173,8 @@ implement)
   exit "$rc"
   ;;
 plan)
-  [ $# -ge 4 ] && [ $# -le 7 ] || die 'usage: plan <ticket> <name> <prompt-file> [model] [effort] [minutes]'
-  ticket=$2 name=$3 prompt=$4 model=${5:-gpt-6.2-sol} effort=${6:-high} minutes=${7:-360}
-  [[ $ticket =~ ^[1-9][0-9]*$ ]] || die "bad ticket: $ticket"
-  [[ $name =~ $word ]] || die "bad name: $name"
-  [[ $minutes =~ ^[1-9][0-9]{0,2}$ ]] || die "bad minutes: $minutes"
-  [ -f "$prompt" ] || die "no prompt file: $prompt"
-  dir=$orch/$ticket scratch=$orch/$ticket/scratch stage=$orch/$ticket/plan-out
-  [ ! -L "$dir" ] && [ -d "$scratch" ] && [ ! -L "$scratch" ] || die "no scratch export (scripts/plan-export.sh $ticket --replace): $scratch"
-  [ ! -L "$stage" ] || die "plan-out is a link: $stage"
-  out=$(dirname -- "$(realpath -- "$prompt")")
-  rm -f -- "$out/$name.plan.txt"
-  rm -rf -- "$stage"
-  mkdir -- "$stage"
-  TMPDIR="$stage" "$here/codex-task.sh" "$name" "$scratch" "$prompt" "$model" "$effort" workspace-write "$minutes" "$stage"
-  code=$?
-  [ "$code" -eq 0 ] || { rm -rf -- "$stage"; exit "$code"; }
-  # The plan must be a regular file with one link, copied into a fresh file: never moved, so no link or open handle
-  # of the sandboxed run reaches plan.md. Every step is checked; `installed` follows the last one, and a failed
-  # install puts the old plan.md and plan.sha256 back (or removes both when there was no pair).
-  src=$stage/plan.md
-  installed=0
-  bak_plan=$dir/.plan.md.bak bak_sha=$dir/.plan.sha256.bak tmp_plan=$dir/.plan.md.new tmp_sha=$dir/.plan.sha256.new
-  rm -f -- "$bak_plan" "$bak_sha" "$tmp_plan" "$tmp_sha"
-  if [ -f "$src" ] && [ ! -L "$src" ] && [ -s "$src" ] && [ "$(stat -c %h -- "$src")" = 1 ] && [ ! -d "$dir/plan.md" ]; then
-    saved=1
-    if [ -f "$dir/plan.md" ]; then cp -p -- "$dir/plan.md" "$bak_plan" || saved=0; fi
-    if [ -f "$dir/plan.sha256" ]; then cp -p -- "$dir/plan.sha256" "$bak_sha" || saved=0; fi
-    hash=
-    if [ "$saved" -eq 1 ] && cat -- "$src" > "$tmp_plan" && hash=$(sha256sum < "$tmp_plan" | cut -d' ' -f1) && [ "${#hash}" -eq 64 ] \
-       && printf '%s  plan.md\n' "$hash" > "$tmp_sha"; then
-      if mv -fT -- "$tmp_plan" "$dir/plan.md" && mv -fT -- "$tmp_sha" "$dir/plan.sha256"; then
-        installed=1
-      else
-        if [ -f "$bak_plan" ]; then mv -fT -- "$bak_plan" "$dir/plan.md"; else rm -f -- "$dir/plan.md"; fi
-        if [ -f "$bak_sha" ]; then mv -fT -- "$bak_sha" "$dir/plan.sha256"; else rm -f -- "$dir/plan.sha256"; fi
-      fi
-    fi
-  fi
-  rm -f -- "$bak_plan" "$bak_sha" "$tmp_plan" "$tmp_sha"
-  rm -rf -- "$stage"
-  if [ "$installed" -ne 1 ]; then
-    echo no-plan > "$out/$name.plan.txt"
-    echo "codex-work: the run left no regular single-link plan-out/plan.md that could be installed" >&2
-    exit 1
-  fi
-  echo installed > "$out/$name.plan.txt"
-  cat -- "$dir/plan.sha256"
+  [ $# -ge 4 ] && [ $# -le 7 ] || die 'usage: plan <ticket> <name> <prompt-file> [model [effort [minutes]]]'
+  exec python3 -I "$here/readonly-task.py" codex plan "$3" "$2" "$4" "${5:-gpt-6.2-sol}" "${6:-high}" "${7:-360}"
   ;;
 *) die 'usage: codex-work.sh implement|plan ...' ;;
 esac

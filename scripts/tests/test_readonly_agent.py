@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the read-only worker boundary with local fixtures only."""
 import contextlib
+import hashlib
 import http.server
 import json
 import os
@@ -136,7 +137,7 @@ class QuietHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-class IsolationTests(unittest.TestCase):
+class WorkerFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -211,6 +212,7 @@ raise SystemExit(module["main"](lambda _host: http.client.HTTPConnection(
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("worker completed " + case, result.stdout)
 
+class IsolationTests(WorkerFixture):
     def test_worker_cannot_read_host_credentials(self):
         self.completed(self.launch("credentials"), "credentials")
 
@@ -311,6 +313,253 @@ raise SystemExit(module["main"](lambda _host: http.client.HTTPConnection(
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("approved input must be a regular file", result.stderr)
         self.assertNotIn("worker completed", result.stdout)
+
+
+ROUTED_CLIENT = r"""
+import http.client
+import json
+import os
+from pathlib import Path
+import sys
+import time
+import tomllib
+from urllib.parse import urlsplit
+
+provider, mode, action = json.load(sys.stdin)
+assert Path("/inputs/issue.md").read_text() == "issue and comments"
+assert Path("/inputs/spec.md").read_text() == "approved excerpt"
+assert "GH_TOKEN" not in os.environ
+assert not (Path.home() / ".git-credentials").exists()
+assert Path.cwd() == Path("/scratch" if mode == "plan" else "/repo")
+try:
+    Path("/repo/example").write_text("unapproved write")
+except OSError:
+    pass
+else:
+    raise AssertionError("routed client can write the repository export")
+assert Path("/repo/example").read_text() == ("base" if mode == "plan" else "head")
+assert not Path("/repo/untracked").exists()
+if provider == "codex":
+    assert sys.argv[sys.argv.index("-m") + 1] == "gpt-6.2-sol"
+    assert 'model_reasoning_effort="high"' in sys.argv
+    config = tomllib.loads((Path.home() / ".codex/config.toml").read_text())
+    url = urlsplit(config["model_providers"]["her_relay"]["base_url"] + "/responses")
+else:
+    assert "--print" in sys.argv and "--strict-mcp-config" in sys.argv
+    url = urlsplit(os.environ["ANTHROPIC_BASE_URL"] + "/v1/messages")
+connection = http.client.HTTPConnection(url.hostname, url.port, timeout=4)
+connection.request("POST", url.path, body=b'{"model":"fixture"}')
+response = connection.getresponse()
+response.read()
+connection.close()
+if action == "timeout":
+    time.sleep(15)
+if mode == "plan":
+    assert not Path("/scratch/.git").exists()
+    assert Path("/scratch/example").read_text() == "base"
+    Path("/scratch/example").write_text("edited by " + provider)
+    plan = Path("/plan-out/plan.md")
+    if action == "directory":
+        plan.mkdir()
+    elif action == "hardlink":
+        other = plan.with_name("other")
+        other.write_text("linked plan")
+        plan.hardlink_to(other)
+    elif action == "symlink":
+        plan.symlink_to("/inputs/spec.md")
+    elif action != "no-plan":
+        plan.write_text("plan by " + provider)
+    if action == "unsafe-scratch":
+        Path("/scratch/link").symlink_to("/inputs/spec.md")
+else:
+    assert not Path("/scratch").exists() and not Path("/plan-out").exists()
+report = "fixture report" if action != "no-report" else ""
+if provider == "codex":
+    Path(sys.argv[sys.argv.index("-o") + 1]).write_text(report)
+    if action == "error-result":
+        print("API Error: provider failed", file=sys.stderr)
+else:
+    print(json.dumps({"type": "result", "subtype": "success", "result": report,
+                      "is_error": action == "error-result"}))
+if action == "nonzero":
+    sys.exit(3)
+# Simulate a client emitting a success-shaped result even after a provider error.
+"""
+
+
+class RoutingTests(WorkerFixture):
+    def setUp(self):
+        super().setUp()
+        self.scripts = self.repo / "scripts"
+        self.scripts.mkdir()
+        for name in ("codex-task.sh", "codex-work.sh", "readonly-task.py"):
+            source = LAUNCHER.with_name(name)
+            if source.is_file():
+                shutil.copy2(source, self.scripts / name)
+        shutil.copytree(LAUNCHER.parents[1] / ".claude/agents", self.repo / ".claude/agents")
+        (self.scripts / "readonly-agent.py").write_text(
+            "import http.client, os, runpy, sys\n"
+            "if 'FIXTURE_TIMEOUT' in os.environ:\n"
+            "    sys.argv[sys.argv.index('--timeout') + 1] = os.environ['FIXTURE_TIMEOUT']\n"
+            f"module = runpy.run_path({str(LAUNCHER)!r})\n"
+            "raise SystemExit(module['main'](lambda _host: http.client.HTTPConnection("
+            "'127.0.0.1', int(os.environ['FIXTURE_PORT']), timeout=3)))\n"
+        )
+        self.ticket = self.stage.parent / "85"
+        self.out = self.ticket / "prompts"
+        self.out.mkdir(parents=True)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        for name in ("codex", "claude"):
+            client = self.bin / name
+            client.write_text("#!/usr/bin/python3\n" + ROUTED_CLIENT)
+            client.chmod(0o755)
+        self.env.update(PATH=f"{self.bin}:/usr/bin:/bin", HER_ORCH=str(self.ticket.parent),
+                        HER_READONLY_INPUTS=str(self.inputs), HER_READONLY_BASE=self.base)
+        (self.inputs / "worker.py").unlink()
+        (self.inputs / "prompt.md").unlink()
+
+    def run_route(self, provider, mode, *, action="pass", status=200, drop=None, ticket="85"):
+        prompt = self.out / "brief.md"
+        prompt.write_text(json.dumps([provider, mode, action]))
+        name = "fixture"
+        if provider == "claude":
+            kind = self.repo if mode == "review" else ticket
+            argv = [sys.executable, "-I", str(self.scripts / "readonly-task.py"),
+                    provider, mode, name, str(kind), str(prompt)]
+        elif mode == "plan":
+            argv = ["bash", str(self.scripts / "codex-work.sh"), "plan", ticket, name, str(prompt)]
+        else:
+            argv = ["bash", str(self.scripts / "codex-task.sh"), name, str(self.repo), str(prompt)]
+        expected_route = "/v1/responses" if provider == "codex" else "/v1/messages"
+        self.requests = []
+        requests = self.requests
+
+        class ModelHandler(QuietHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                requests.append((self.path, self.headers.get("Authorization"), self.headers.get("X-Api-Key")))
+                self.send_response(status)
+                self.end_headers()
+                self.wfile.write(b"fixture")
+
+        with server(ModelHandler) as port:
+            env = dict(self.env, FIXTURE_PORT=str(port))
+            if drop:
+                del env[drop]
+            if action == "timeout":
+                env["FIXTURE_TIMEOUT"] = "2"
+            result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+        if requests:
+            self.assertEqual(requests, [(expected_route, "Bearer " + MODEL_KEY, None)] if provider == "codex"
+                             else [(expected_route, None, MODEL_KEY)])
+        return result
+
+    def receipt(self, suffix):
+        return (self.out / f"fixture.{suffix}").read_text().strip()
+
+    def assert_success(self, result):
+        diagnostics = result.stdout + result.stderr
+        log = self.out / "fixture.err.log"
+        if log.exists():
+            diagnostics += log.read_text()
+        self.assertEqual(result.returncode, 0, diagnostics)
+        self.assertEqual(self.receipt("exit.txt"), "0")
+        self.assertEqual(self.receipt("report.md"), "fixture report")
+        self.assertEqual(len(self.requests), 1)
+
+    def test_codex_review_and_investigation_use_read_only_export(self):
+        result = self.run_route("codex", "review")
+        log = self.out / "fixture.err.log"
+        if log.exists():
+            self.assertNotIn("routed client can write the repository export", log.read_text())
+        self.assert_success(result)
+        self.assertEqual((self.repo / "example").read_text(), "head")
+
+    def test_claude_review_collects_report(self):
+        self.assert_success(self.run_route("claude", "review"))
+
+    def test_both_planners_install_edits_and_run_fresh_rounds(self):
+        for provider in ("codex", "claude", "claude"):
+            with self.subTest(provider=provider):
+                self.assert_success(self.run_route(provider, "plan"))
+                self.assertEqual(self.receipt("plan.txt"), "installed")
+                self.assertEqual((self.ticket / "scratch/example").read_text(), "edited by " + provider)
+                plan = self.ticket / "plan.md"
+                self.assertEqual(plan.read_text(), "plan by " + provider)
+                self.assertEqual(plan.stat().st_nlink, 1)
+                digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+                self.assertEqual((self.ticket / "plan.sha256").read_text().strip(), f"{digest}  plan.md")
+
+    def test_model_failure_cannot_publish_success_shaped_report(self):
+        for provider in ("codex", "claude"):
+            for status, receipt in ((401, "no-report"), (429, "quota"), (503, "no-report")):
+                with self.subTest(provider=provider, status=status):
+                    result = self.run_route(provider, "review", status=status)
+                    self.assertNotEqual(result.returncode, 0, "model failure was reported as success")
+                    self.assertEqual(self.receipt("exit.txt"), receipt)
+                    self.assertFalse((self.out / "fixture.report.md").exists())
+                    self.assertEqual(len(self.requests), 1)
+
+    def test_missing_prerequisites_refuse_to_start_the_client(self):
+        for key in ("HER_OPENAI_API_KEY", "HER_READONLY_INPUTS", "HER_READONLY_BASE"):
+            with self.subTest(key=key):
+                result = self.run_route("codex", "review", drop=key)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(key, result.stderr + self.receipt("err.log"))
+                self.assertEqual(self.requests, [])
+
+    def test_client_errors_and_empty_results_fail(self):
+        for provider in ("codex", "claude"):
+            for action in ("no-report", "error-result", "nonzero"):
+                with self.subTest(provider=provider, action=action):
+                    result = self.run_route(provider, "review", action=action)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(len(self.requests), 1)
+
+    def test_timeouts_leave_no_report(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                result = self.run_route(provider, "review", action="timeout")
+                self.assertEqual(result.returncode, 124)
+                self.assertEqual(self.receipt("exit.txt"), "timeout")
+                self.assertFalse((self.out / "fixture.report.md").exists())
+                self.assertEqual(len(self.requests), 1)
+
+    def test_invalid_plan_keeps_previous_scratch_and_sha(self):
+        self.assert_success(self.run_route("codex", "plan"))
+        old = (self.ticket / "plan.sha256").read_bytes()
+        for action in ("hardlink", "directory", "symlink", "no-plan", "unsafe-scratch"):
+            with self.subTest(action=action):
+                result = self.run_route("claude", "plan", action=action)
+                self.assertNotEqual(result.returncode, 0, "worker-controlled plan was installed")
+                self.assertEqual(self.receipt("plan.txt"), "no-plan")
+                self.assertEqual((self.ticket / "plan.sha256").read_bytes(), old)
+                self.assertEqual((self.ticket / "plan.md").read_text(), "plan by codex")
+                self.assertEqual((self.ticket / "scratch/example").read_text(), "edited by codex")
+
+    def test_install_refuses_non_file_sha_destination(self):
+        (self.ticket / "plan.sha256").mkdir()
+        result = self.run_route("codex", "plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.receipt("plan.txt"), "no-plan")
+        self.assertFalse((self.ticket / "plan.md").exists())
+        self.assertFalse((self.ticket / "scratch").exists())
+
+    def test_plan_refuses_a_linked_scratch_destination(self):
+        (self.ticket / "scratch").symlink_to(self.repo, target_is_directory=True)
+        result = self.run_route("codex", "plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.receipt("plan.txt"), "no-plan")
+        self.assertEqual((self.repo / "example").read_text(), "head")
+
+    def test_plan_refuses_non_numeric_ticket(self):
+        for value in ("x", "7/../8", "07x"):
+            with self.subTest(ticket=value):
+                result = self.run_route("codex", "plan", ticket=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("positive ticket number", result.stderr)
+                self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":
