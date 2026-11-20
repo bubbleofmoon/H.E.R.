@@ -179,7 +179,7 @@ fn rank_cached(
 }
 
 fn scope(conn: &Connection, reader: &Reader<'_>) -> rusqlite::Result<(String, Vec<String>)> {
-    visibility_filter(conn, &reader.key, true, &[]) // RED-SCOPE
+    visibility_filter(conn, &reader.key, reader.is_owner, &[])
 }
 
 fn ensure_cache(conn: &Connection) -> rusqlite::Result<()> {
