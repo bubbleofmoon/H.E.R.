@@ -45,6 +45,8 @@ pub(crate) use access::take_admin_wake;
 pub(crate) use access::access_setting_change;
 #[path = "console_schedule.rs"]
 mod schedule_routes;
+#[path = "console/inspector.rs"]
+pub(crate) mod inspector;
 pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
     revoke as revoke_agent_token, token as conversation_token,
@@ -12313,6 +12315,9 @@ fn route_with_context(
         None
     };
     let cfg = runtime_config.as_ref().unwrap_or(cfg);
+    if inspector::is_route(&req.path) {
+        return inspector::route(context, cfg, req);
+    }
     if context.is_isolated() {
         if let Err(error) = crate::reserved::refresh_console_config(context, cfg) {
             return (503, "application/json; charset=utf-8".to_string(),
@@ -12631,7 +12636,10 @@ fn route_with_context(
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => match read_text_for(context, CONSOLE_HTML) {
             Ok(mut html) => {
-                if context.is_isolated() { html.push_str(crate::release::BANNER); }
+                if context.is_isolated() {
+                    html.push_str(crate::release::BANNER);
+                    html.push_str(inspector::LINK);
+                }
                 (200, "text/html; charset=utf-8".to_string(), html)
             },
             Err(_) => (
@@ -13964,7 +13972,8 @@ fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16
     // 只审计人改的配置文件。`social-v2.json` 这类运行时状态每条消息都在变，
     // 审计它会刷爆日志，而且"撤销一条群消息"不是有意义的操作。
     let task_log_read = req.method == "GET" && req.path.starts_with("/api/tasks/runs/") && req.path.ends_with("/log");
-    let audit = (req.method != "GET" && req.path.starts_with("/api/")) || (context.is_isolated() && task_log_read);
+    let audit = (req.method != "GET" && req.path.starts_with("/api/") && !inspector::is_route(&req.path))
+        || (context.is_isolated() && task_log_read);
     let before = if audit && !task_log_read {
         match audit_snapshot(context) {
             Ok(snapshot) => snapshot,

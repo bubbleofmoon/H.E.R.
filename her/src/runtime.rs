@@ -1269,6 +1269,7 @@ impl RuntimeContext {
                     _ => false,
                 }
             })
+            || crate::console::inspector::is_route(path)
             || isolated_memory_route
     }
 

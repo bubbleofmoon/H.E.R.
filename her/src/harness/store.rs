@@ -769,6 +769,91 @@ fn switch_reader(context: &RuntimeContext) -> Result<Option<Connection>, String>
     Ok(Some(conn))
 }
 
+/// Read one page of a turn's committed events through the contained read-only connection.
+pub(crate) fn inspect_events(
+    context: &RuntimeContext,
+    turn: &str,
+    conversation: &str,
+    after: i64,
+    limit: usize,
+    prices: &crate::pricing::PriceTable,
+) -> Result<Vec<Value>, String> {
+    let Some(conn) = switch_reader(context)? else {
+        return Ok(Vec::new());
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.seq, e.created_ms, e.kind, e.attempt_id, a.model,
+                    CASE WHEN length(CAST(e.payload AS BLOB)) <= 65536 THEN e.payload END
+             FROM turns t JOIN events e ON e.session_id = t.session_id AND e.turn_id = t.id
+             LEFT JOIN model_attempts a ON a.id = e.attempt_id
+             WHERE t.id = ?1 AND t.conversation = ?2 AND e.seq > ?3
+             ORDER BY e.seq LIMIT ?4",
+        )
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut rows = stmt
+        .query(params![turn, conversation, after, limit])
+        .map_err(|_| STORAGE_ERROR)?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().map_err(|_| STORAGE_ERROR)? {
+        let seq: i64 = row.get(0).map_err(|_| STORAGE_ERROR)?;
+        let at: i64 = row.get(1).map_err(|_| STORAGE_ERROR)?;
+        let kind: String = row.get(2).map_err(|_| STORAGE_ERROR)?;
+        let attempt: Option<String> = row.get(3).map_err(|_| STORAGE_ERROR)?;
+        let model: Option<String> = row.get(4).map_err(|_| STORAGE_ERROR)?;
+        let stored: Option<String> = row.get(5).map_err(|_| STORAGE_ERROR)?;
+        let payload = match stored {
+            Some(stored) => {
+                let mut payload: Value = serde_json::from_str(&stored).map_err(|_| STORAGE_ERROR)?;
+                // Canonical replay messages can contain opaque data. The view uses the recorded
+                // text, results and attempt metadata rather than a duplicate replay message.
+                if let Some(fields) = payload.as_object_mut() {
+                    fields.remove("message");
+                    if let Some(raw) = fields.remove("raw") {
+                        if let Some(reasoning) = raw.get("captured_reasoning_content") {
+                            fields.insert("reasoning".into(), reasoning.clone());
+                        }
+                        if let Some(usage) = inspector_usage(&raw, model.as_deref(), at, prices) {
+                            fields.insert("usage".into(), usage);
+                        }
+                    }
+                }
+                payload
+            }
+            None => json!({"omitted": "event payload exceeds the inspector's size limit"}),
+        };
+        events.push(json!({
+            "seq": seq,
+            "at": at,
+            "kind": kind,
+            "attemptId": attempt,
+            "payload": payload,
+        }));
+    }
+    Ok(events)
+}
+
+fn inspector_usage(
+    raw: &Value,
+    model: Option<&str>,
+    at: i64,
+    prices: &crate::pricing::PriceTable,
+) -> Option<Value> {
+    let model = model?;
+    let usage =
+        serde_json::from_value::<genai::chat::Usage>(raw.get("captured_usage")?.clone()).ok()?;
+    let buckets = super::usage::buckets(&usage)?;
+    let normalized = crate::pricing::normalize_usage(Some(&buckets));
+    let (rates, cost) = crate::pricing::price_usage(&normalized, model, at, prices);
+    Some(json!({
+        "tokens": normalized.total(),
+        "buckets": buckets,
+        "cost": cost.total,
+        "currency": rates.currency,
+        "estimated": rates.estimated,
+    }))
+}
+
 pub(crate) fn has_generation(context: &RuntimeContext, key: &str, generation: &str) -> Result<bool, String> {
     let Some(conn) = switch_reader(context)? else { return Ok(false) };
     conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE conversation=?1 AND generation=?2)",
