@@ -175,7 +175,7 @@ fn first_run_with_password_work(
     check_first_run_proof(context, proof)?;
     let hash = derive(password)?;
     let _config = crate::console::config_gate(context).map_err(|_| PasswordError::Unavailable)?;
-    // Reuse the proof from before password work. RED-M9
+    check_first_run_proof(context, proof)?;
     crate::settings::set_initial_administrator_password(context, &hash, actor).map_err(
         |(code, _)| {
             if code == 409 {
