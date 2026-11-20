@@ -186,7 +186,7 @@ pub fn preset_blockers(content: &str, preset_v1: bool) -> Vec<String> {
     }
     let rules = if preset_v1 { BLOCKING_V1 } else { BLOCKING_V2 };
     for &(wording, legacy) in rules {
-        if !content.contains(wording) || content.contains(legacy) { // RED-3
+        if !content.contains(wording) && !content.contains(legacy) {
             out.push(format!("请在预设中保留这项约束：{wording}"));
         }
     }
