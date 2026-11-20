@@ -45,7 +45,7 @@ $quoted = $codexArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + ($_ -repl
 # absolute path per line, in <Name>.cleanup.txt next to the prompt; after the run this deletes each listed path that
 # lies strictly inside C:\her-orch or C:\her-targets and records what it did in <Name>.cleanup.log.
 function Invoke-Cleanup {
-  # Allow cleanup in every mode. RED-M1
+  if ($Sandbox -eq 'read-only') { return }
   $list = Join-Path $outDir "$Name.cleanup.txt"
   if (-not (Test-Path -LiteralPath $list)) { return }
   $roots = @('C:\her-orch\', 'C:\her-targets\')
