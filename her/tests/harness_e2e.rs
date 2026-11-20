@@ -20,17 +20,37 @@ fn switching_rig(name: &str, model: &FakeModel) -> Rig {
 fn switching_fixture(name: &str, model: &FakeModel, mut config: Value) -> Rig {
     config.as_object_mut().unwrap().entry("harness").or_insert_with(|| json!({"model":"fake-chat"}));
     let mut rig = Rig::new(name, Seed { config, ..Seed::default() });
-    fs::write(rig.root.join("config/harness-api-key"), "synthetic-model-key-67").unwrap();
-    let path = rig.root.join("dependencies.json");
-    let mut deps: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    deps["model"] = json!(model.base);
-    fs::write(path, deps.to_string()).unwrap();
-    rig.console.kill().unwrap();
-    rig.console.wait().unwrap();
-    rig.console = spawn_console(&rig.root, rig.console_port);
-    console_fixture::wait_for_console(&mut rig.console, &mut rig.console_port, &rig.root, CONSOLE_TOKEN,
-        Duration::from_secs(20), |port| spawn_console(&rig.root, port));
+    rig.configure_model(&model.base);
     rig
+}
+
+#[test]
+fn reserved_harness_cancels_a_running_wake_when_the_mode_changes() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let started = Arc::new(AtomicBool::new(false));
+    let model = FakeModel::script(vec![ModelReply::Active {
+        text: "late reserved reply".into(),
+        started: started.clone(),
+        release: Arc::new(AtomicBool::new(false)),
+    }]);
+    let mut rig = Rig::new("reserved-harness-cancel", Seed {
+        mode: "reserved",
+        config: json!({"harness":{"model":"fake-chat"},"ackMessage":"","social":{
+            "activeReplyDelayMinMs":0,"activeReplyDelayMaxMs":0,"proactiveEnabled":false
+        }}),
+        ..Seed::default()
+    });
+    rig.configure_model(&model.base);
+    rig.start();
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 cancel this reserved wake");
+    assert!(wait_for(LONG, || started.load(Ordering::SeqCst)), "the reserved wake must reach the harness");
+    assert_eq!(rig.console("POST", "/api/mode", Some(&json!({"mode":"chat"}))).0, 200);
+    assert!(wait_for(Duration::from_secs(10), || rig.ledger().iter().any(|row| row["k"] == "ended" && row["outcome"] == "cancelled")),
+        "mode exit must settle the running harness wake as cancelled");
+    assert!(wait_for(LONG, || handled_rows(&rig, GROUP_KEY) == 1));
+    assert!(rig.texts_to(GROUP_KEY).is_empty());
+    assert!(rig.dsh.prompts().is_empty());
 }
 
 #[test]

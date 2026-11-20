@@ -1510,6 +1510,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Some(script) = self.scripted.take() {
             return Ok((crate::turn_engine::Adapter::Scripted(script), Some(gates), None));
         }
+        if mode == "reserved" {
+            // Reserved has its own authority and always uses the harness. Legacy mappings
+            // remain readable and other modes still use the shared engine switch.
+            return Ok((crate::turn_engine::Adapter::Harness, Some(gates), None));
+        }
         let (context, key, mode) = (self.context.clone(), key.to_string(), mode.to_string());
         let simulation = mode == "reserved2";
         let expected = self.dispatch_token.clone().filter(|_| simulation);
@@ -1745,6 +1750,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             std::time::Duration::from_millis(budget.ceiling.saturating_sub(crate::turn_ledger::now_ms()).max(0) as u64)
         } else { timeout };
         let tools = crate::harness::Tools::capture(&self.context, cfg, mode, key, &self.turn_epoch)?
+            .with_reserved_authority(self.chat.as_ref().and_then(|chat| chat.reserved.clone()))
             .with_interactions(self.owner_interactions.clone());
         let prompt_chars = prompt.chars().count();
         recorder.attempt_with_layers(&attempt, "", layers.as_ref())?;
@@ -1752,7 +1758,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             id: recorder.id.clone(), conversation: key.to_string(), generation: self.turn_epoch.clone(),
             prompt,
             media: self.chat.as_ref().map(|c| c.media_parts.clone()).unwrap_or_default(),
-            profile: if matches!(mode, "closed-agent" | "reserved2") { mode.into() } else { self.preset_chat.clone() },
+            profile: if matches!(mode, "closed-agent" | "reserved" | "reserved2") { mode.into() } else { self.preset_chat.clone() },
             route,
             limits: crate::harness::Limits::from_config(cfg),
             tools,
@@ -1899,7 +1905,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let text = self.run_admitted_turn(&adapter, key, &delivered, timeout, cfg).await?;
         let report = self.last_report.take().unwrap_or_default();
         if self.chat.as_ref().is_some_and(|c|c.silent) { return Ok(()); }
-        let sid = crate::session_map::lookup(&self.context, key)?.unwrap_or_default();
+        let sid = if adapter.uses_dsh() {
+            crate::session_map::lookup(&self.context, key)?.unwrap_or_default()
+        } else {
+            String::new()
+        };
         let reply_cfg = self.context.load_config().unwrap_or_else(|_| cfg.clone());
         let audit = outbound_guard_enabled(&reply_cfg)
             && (!self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") || !crate::chat::is_owner_key(cfg, key));

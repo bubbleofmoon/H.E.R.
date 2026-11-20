@@ -129,6 +129,9 @@ pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::per
         if mode == "reserved2" && !crate::console::inbound_admitted(&cfg, &key) {
             return Err((409, NOT_ADMITTED_ERROR.into()));
         }
+        if mode == "reserved" {
+            return Err((409, "reserved always uses the harness".into()));
+        }
         if !matches!(mode.as_str(), "chat" | "closed-agent" | "reserved2") {
             return Err((409, crate::turn_engine::UNSUPPORTED_MODE.into()));
         }

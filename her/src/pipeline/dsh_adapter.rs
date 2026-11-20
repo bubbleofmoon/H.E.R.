@@ -422,29 +422,6 @@ impl Pipeline {
         }
     }
 
-    /// Mode retirement already revoked the old epoch. Stale driver cleanup must
-    /// never resolve the new mapping or rotate a replacement turn's token.
-    pub fn cancel_reserved_epoch(&self, key: &str, token: &str) -> Result<(), String> {
-        let epoch = crate::send_outbox::token_epoch(token);
-        let (turns, _) =
-            crate::turn_ledger::fold(&crate::turn_ledger::read_records(&self.context)?);
-        let mut sessions = std::collections::BTreeSet::new();
-        for turn in turns
-            .iter()
-            .filter(|t| t.key == key && t.epochs.contains(&epoch) && t.state.is_open())
-        {
-            if !turn.session_id.is_empty() {
-                sessions.insert(turn.session_id.clone());
-            }
-            crate::turn_ledger::Recorder::attach(&self.context, &turn.id, key).without_retry()
-                .end("cancelled", "reserved mode retired")?;
-        }
-        for sid in sessions {
-            crate::dsh::stop_session_work(&self.rpc, &sid)?;
-        }
-        Ok(())
-    }
-
     fn note_session(&self, sid: &str) {
         if let Some(turn) = &self.cur_turn {
             let _ = turn.session(sid);

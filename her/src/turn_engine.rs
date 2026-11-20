@@ -36,6 +36,9 @@ impl Engine {
     }
 
     pub(crate) fn read_choice(context: &RuntimeContext, cfg: &Value, conversation: &str, mode: &str) -> Result<Self, String> {
+        if mode == "reserved" {
+            return Ok(Self::Harness);
+        }
         let inherit_default = mode != "reserved2" || crate::pipeline::pinned_cli_backend(cfg, conversation).is_none();
         Self::parse(&crate::settings::engine_choice(context, cfg, conversation, inherit_default)?)
     }
@@ -49,7 +52,7 @@ impl Engine {
     }
 
     pub(crate) fn supports(self, mode: &str) -> bool {
-        self == Self::Dsh || matches!(mode, "chat" | "closed-agent" | "reserved2")
+        self == Self::Dsh || matches!(mode, "chat" | "closed-agent" | "reserved" | "reserved2")
     }
 
     pub fn id(self) -> &'static str {
@@ -67,7 +70,7 @@ impl Engine {
 
 /// Refusal of a participation mode the harness does not run yet.
 pub(crate) const UNSUPPORTED_MODE: &str =
-    "harness supports chat, owner-private closed-agent and reserved2 modes only";
+    "harness supports chat, owner-private closed-agent, reserved and reserved2 modes only";
 
 pub(crate) const ADMISSION_CHANGED: &str = "turn engine changed before admission";
 
@@ -245,8 +248,8 @@ mod tests {
         }
         assert!(harness.supports("chat") && harness.supports("closed-agent"));
         assert!(
-            !harness.supports("reserved") && harness.supports("reserved2"),
-            "the harness runs second-generation simulation and refuses first-generation reserved"
+            harness.supports("reserved") && harness.supports("reserved2"),
+            "the harness runs both generations of simulation"
         );
         assert!(dsh.uses_dsh() && !harness.uses_dsh(), "only the DSH adapter needs DSH");
         let scripted = Adapter::Scripted(Script::answering("ok"));

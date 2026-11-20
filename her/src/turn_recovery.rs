@@ -743,6 +743,8 @@ impl Pass<'_> {
         }
         let sends = self.sends_of(turn, turns, outbox);
         if turn.backend == "harness" {
+            let reserved = matches!(turn.reason.as_str(), "reserved" | "reserved-summary");
+            let pre_admission_wake = reserved || turn.reserved2 || turn.wake_claim.is_some();
             // A tool intent can precede its outbox write (or affect something other
             // than QQ). Preserve both sources of uncertainty without replay or DSH probes.
             let verdict = match &sends {
@@ -753,8 +755,14 @@ impl Pass<'_> {
                         store.status(&turn.id)?.map(|_| store.has_unsettled_tools(&turn.id)).transpose()
                     });
                     match tools {
-                        Ok(None) if (turn.reserved2 || turn.wake_claim.is_some()) && turn.attempts.is_empty() && matches!(&sends, SendState::None) =>
-                            decide(turn, None, &sends, validity(self.context, self.cfg, turn)),
+                        Ok(None) if pre_admission_wake && turn.attempts.is_empty() && matches!(&sends, SendState::None) => {
+                            let valid = if reserved && crate::console::runtime_mode(self.context) != "reserved" {
+                                Err("reserved mode changed".into())
+                            } else {
+                                validity(self.context, self.cfg, turn)
+                            };
+                            decide(turn, None, &sends, valid)
+                        }
                         Ok(None) => pause("send-unresolved", "harness interrupted turn is missing from conversation storage", true),
                         Ok(Some(false)) => pause("harness-interrupted", "Harness turn interrupted; administrator resolution required", true),
                         Ok(Some(true)) => pause("send-unresolved", "Harness tool effect could not be confirmed; administrator confirmation required before retry", true),
@@ -1449,6 +1457,30 @@ mod tests {
             assert!(turn.wake_claim.is_none());
             assert_eq!(sleep_until, "2000-01-01T00:00:00.000Z", "the unconsumed timer deadline remains due");
         }
+    }
+
+    #[tokio::test]
+    async fn reserved_harness_recovery_resumes_a_wake_before_admission() {
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(turn_ledger::mint_id("her-reserved-pre-admission-")),
+            &json!({"consoleToken":"synthetic-reserved-recovery","allow":{"groups":[1]}}),
+            &json!({"model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}),
+        );
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        context.write_atomic(crate::runtime::RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#).unwrap();
+        let cfg = context.load_config().unwrap();
+        let token = crate::console::ensure_or_rotate_agent_token(&context, "group:1", false).unwrap();
+        let journal = Journal::open(&context).unwrap();
+        let recorder = Recorder::begin(
+            &context, "group:1", "harness", "reserved",
+            &crate::send_outbox::token_epoch(&token), &[], None,
+        ).unwrap();
+        let turns = fold(&turn_ledger::read_records(&context).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&context);
+        Pass { context: &context, cfg: &cfg }.reconcile(&journal, &turns[0], &turns, &outbox).await;
+        let recovered = fold(&turn_ledger::read_records(&context).unwrap()).0.remove(0);
+        assert_eq!(recovered.id, recorder.id);
+        assert_eq!(recovered.state, State::Resumed, "an unadmitted reserved harness wake must remain replayable");
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch

@@ -949,6 +949,19 @@ impl Rig {
         rig
     }
 
+    fn configure_model(&mut self, base: &str) {
+        fs::write(self.root.join("config/harness-api-key"), "synthetic-model-key-67").unwrap();
+        let path = self.root.join("dependencies.json");
+        let mut deps: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        deps["model"] = json!(base);
+        fs::write(path, deps.to_string()).unwrap();
+        self.console.kill().unwrap();
+        self.console.wait().unwrap();
+        self.console = spawn_console(&self.root, self.console_port);
+        console_fixture::wait_for_console(&mut self.console, &mut self.console_port, &self.root, CONSOLE_TOKEN,
+            Duration::from_secs(20), |port| spawn_console(&self.root, port));
+    }
+
     fn start(&mut self) {
         self.start_with_clock(None);
     }

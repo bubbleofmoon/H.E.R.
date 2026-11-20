@@ -20,6 +20,10 @@ pub(crate) enum Profile {
     OwnerPrivate,
     /// `closed-agent` mode (the Admin agent): only the owner's private chat.
     ClosedAgent,
+    /// First-generation simulation, with the ordinary chat menu and its own wake prompt.
+    Reserved,
+    /// The owner’s private conversation in first-generation simulation.
+    ReservedOwner,
     /// `reserved2` mode: groups and every private chat but the owner's.
     Reserved2,
     /// `reserved2` mode: the owner's private chat.
@@ -198,6 +202,8 @@ impl Profile {
             "chat" if owner => Some(Self::OwnerPrivate),
             "chat" => Some(Self::Chat),
             "closed-agent" if owner => Some(Self::ClosedAgent),
+            "reserved" if owner => Some(Self::ReservedOwner),
+            "reserved" => Some(Self::Reserved),
             "reserved2" if owner => Some(Self::Reserved2Owner),
             "reserved2" => Some(Self::Reserved2),
             _ => None,
@@ -207,8 +213,8 @@ impl Profile {
     /// The exact tool names this profile may offer, in registration order.
     pub(crate) fn menu(self) -> &'static [&'static str] {
         match self {
-            Self::Chat => CHAT,
-            Self::OwnerPrivate => OWNER_PRIVATE,
+            Self::Chat | Self::Reserved => CHAT,
+            Self::OwnerPrivate | Self::ReservedOwner => OWNER_PRIVATE,
             Self::ClosedAgent => CLOSED_AGENT,
             Self::Reserved2 => RESERVED2,
             Self::Reserved2Owner => RESERVED2_OWNER,
@@ -225,7 +231,7 @@ impl Profile {
             Self::ClosedAgent => Some(crate::prompt_text::MODE_CLOSED_AGENT_KEY),
             Self::Reserved2 => Some(crate::prompt_text::MODE_RESERVED2_KEY),
             Self::Reserved2Owner => Some(crate::prompt_text::MODE_RESERVED2_OWNER_KEY),
-            Self::Digest | Self::SlangLearner => None,
+            Self::Reserved | Self::ReservedOwner | Self::Digest | Self::SlangLearner => None,
         }
     }
 }

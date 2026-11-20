@@ -4,11 +4,17 @@
 //! mode switch that has to change what the running bridge does.
 //!
 //! Everything runs against real `her` processes (live bridge + `--console-serve`) on a
-//! synthetic runtime root, a fake DSH whose simulated model follows markers in the prompt, and a
-//! fake OneBot gateway (WebSocket for events, HTTP for actions). No real QQ, model or DSH endpoint
-//! is contacted.
+//! synthetic runtime root, a fake DSH, a fake OpenAI-compatible model for reserved wakes and a
+//! fake OneBot gateway. No real QQ, model or DSH endpoint is contacted.
 
 include!("support/chat.rs");
+#[allow(dead_code)]
+mod reserved_model {
+    use super::{lock, read_request, respond, thread, Arc, Duration, HttpReq, Mutex, TcpListener, TcpStream, Value, Write};
+    use serde_json::json;
+    include!("support/model.rs");
+}
+use reserved_model::{FakeModel, ModelReply};
 
 // The fake records receipt arrival before replying. Await HER's published state
 // separately: an approval is absent while its receipt is in flight, then retained.
@@ -1291,10 +1297,89 @@ fn media_chat_delivers_composed_sampled_images_to_dsh_in_order() {
     rig.wait_texts(GROUP_KEY,2);
 }
 
-// Ticket 15 uses the same public binary, gateway and DSH seam as ordinary chat.
+struct ReservedRig {
+    rig: Rig,
+    model: FakeModel,
+}
+
+impl std::ops::Deref for ReservedRig {
+    type Target = Rig;
+
+    fn deref(&self) -> &Rig {
+        &self.rig
+    }
+}
+
+impl std::ops::DerefMut for ReservedRig {
+    fn deref_mut(&mut self) -> &mut Rig {
+        &mut self.rig
+    }
+}
+
+fn reserved_current_prompt(request: &Value) -> &str {
+    request["messages"].as_array().into_iter().flatten().rev()
+        .find(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_default()
+}
+
+impl ReservedRig {
+    fn new(name: &str, mut seed: Seed) -> Self {
+        if seed.config.get("harness").is_none() {
+            seed.config["harness"] = json!({"model":"fake-chat","summaries":false});
+        }
+        let model = FakeModel::responding(|_, request| {
+            let prompt = reserved_current_prompt(request);
+            let tool_step = request["messages"].as_array().and_then(|messages| messages.last())
+                .is_some_and(|message| message["role"] == "tool");
+            let reply = if prompt.contains("#TOOLSTATUS#") || prompt.contains("#TOOLERR#") {
+                let status = prompt.contains("#TOOLSTATUS#");
+                if !tool_step {
+                    let name = if status { "qq_status" } else { "qq_send_message" };
+                    return Some(ModelReply::ToolCalls(vec![json!({"id":"reserved-tool","name":name,"arguments":{}})]));
+                }
+                if status { "[SILENT]" } else { "tool failed reply" }
+            } else if prompt.contains("#FAIL#") {
+                return Some(ModelReply::Error { status: 500, message: "synthetic model failure".into() });
+            } else if prompt.contains("#SILENT#") {
+                "[SILENT]"
+            } else if prompt.contains("#URLSPLIT15#") {
+                "甲，乙，https://example.invalid/long-path，尾"
+            } else if prompt.contains("#SPLIT15#") {
+                "第一句 hello world 第二句"
+            } else if prompt.contains("#SUMMARY124#") {
+                "前[表情:给你 糖]后"
+            } else if prompt.contains("#FACERESERVED124#") {
+                "abcdef[表情028]后"
+            } else if prompt.contains("#FACESMALL124#") {
+                "前[表情028]后"
+            } else {
+                "synthetic reply"
+            };
+            Some(ModelReply::Text(reply.into()))
+        });
+        let mut rig = Rig::new(name, seed);
+        rig.configure_model(&model.base);
+        Self { rig, model }
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        lock(&self.model.requests).iter().filter(|request| request["stream"] == true)
+            .filter(|request| request["messages"].as_array().and_then(|messages| messages.last())
+                .is_some_and(|message| message["role"] == "user"))
+            .map(|request| reserved_current_prompt(request).to_owned()).collect()
+    }
+
+    fn wait_prompts(&self, count: usize) -> Vec<String> {
+        assert!(wait_for(LONG, || self.prompts().len() >= count), "prompt {count} never reached the harness: {:?}", self.prompts());
+        self.prompts()
+    }
+}
+
+// Ticket 15 exercises reserved through the public binary and gateway.
 #[test]
 fn reserved_admin_state_changes_drive_real_participation_and_flush() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-admin15",
         Seed {
             mode: "reserved",
@@ -1318,7 +1403,7 @@ fn reserved_admin_state_changes_drive_real_participation_and_flush() {
             == 1),
         "watching message must enter the summary buffer"
     );
-    assert!(rig.dsh.prompts().is_empty());
+    assert!(rig.prompts().is_empty());
     let state = rig.console(
         "POST",
         "/api/social/state",
@@ -1336,9 +1421,9 @@ fn reserved_admin_state_changes_drive_real_participation_and_flush() {
     let flush = rig.console("POST", "/api/social/flush", Some(&json!({"key":GROUP_KEY})));
     assert_eq!(flush, (200, json!({"ok":true})));
     let prompts = rig.wait_prompts(2);
-    assert!(!prompts[0].text.contains("watching-only15"), "manual activation must exclude earlier watching input from the active batch");
-    assert!(prompts[1].text.contains("【群聊摘要】"));
-    assert!(prompts[1].text.contains("watching-only15"));
+    assert!(!prompts[0].contains("watching-only15"), "manual activation must exclude earlier watching input from the active batch");
+    assert!(prompts[1].contains("【群聊摘要】"));
+    assert!(prompts[1].contains("watching-only15"));
     assert!(wait_for(LONG, || rig.console("GET", "/api/social", None).1
         ["pendingSummaries"]
         == json!({})));
@@ -1352,7 +1437,7 @@ fn reserved_admin_state_changes_drive_real_participation_and_flush() {
 
 #[test]
 fn reserved_commands_and_disabled_social_use_the_public_chat_fallback() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-disabled15",
         Seed {
             mode: "reserved",
@@ -1366,14 +1451,14 @@ fn reserved_commands_and_disabled_social_use_the_public_chat_fallback() {
         rig.wait_texts(OWNER_KEY, 1),
         ["会话 未创建；白名单 通过；角色 无；模式 active"]
     );
-    // A member's slash text is ignored in reserved mode too: no refusal, no DSH command, no relay.
+    // A member's slash text is ignored in reserved mode too: no refusal, no model turn or relay.
     says(&rig, GROUP_KEY, 1001, "tester", "/model");
     says(&rig, GROUP_KEY, 1001, "tester", "#SPLIT15#");
     assert_eq!(
         rig.wait_texts(GROUP_KEY, 1),
         ["第一句 hello world 第二句"]
     );
-    assert!(rig.dsh.prompts().iter().all(|p| !p.text.contains("/model")), "member slash text reached DSH: {:?}", rig.dsh.prompts());
+    assert!(rig.prompts().iter().all(|p| !p.contains("/model")), "member slash text reached the model: {:?}", rig.prompts());
     let mut social = (0, Value::Null);
     assert!(wait_for(LONG, || {
         social = rig.console("GET", "/api/social", None);
@@ -1384,7 +1469,7 @@ fn reserved_commands_and_disabled_social_use_the_public_chat_fallback() {
 
 #[test]
 fn reserved_role_commands_answer_the_retirement_notice_and_write_nothing() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-role19",
         Seed {
             mode: "reserved",
@@ -1401,7 +1486,7 @@ fn reserved_role_commands_answer_the_retirement_notice_and_write_nothing() {
         assert_eq!(text, "角色卡已停用：请用 /persona 或控制台的人设页切换人设。");
     }
     assert!(rig.data_json("current-role.json")["role"].is_null(), "a retired /role writes nothing");
-    assert!(rig.dsh.prompts().is_empty(), "no /role form reaches the model");
+    assert!(rig.prompts().is_empty(), "no /role form reaches the model");
 }
 
 fn reserved_seed(extra: Value) -> Seed {
@@ -1435,7 +1520,7 @@ fn wait_phase(rig: &Rig, phase: &str) {
 
 #[test]
 fn reserved_probe_returns_to_watching_and_inbound_revives_probing() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-probe15",
         reserved_seed(json!({"idleWindowMs":0,"idleRetryProbability":1,"idleRetryWaitMs":7000})),
     );
@@ -1450,10 +1535,10 @@ fn reserved_probe_returns_to_watching_and_inbound_revives_probing() {
         200
     );
     wait_phase(&rig, "probing");
-    assert!(rig.wait_prompts(1)[0].text.contains("群里安静了一会儿"));
+    assert!(rig.wait_prompts(1)[0].contains("群里安静了一会儿"));
     says(&rig, GROUP_KEY, 1001, "tester", "new-after-probe15");
     wait_phase(&rig, "active");
-    assert!(rig.wait_prompts(2)[1].text.contains("【新消息】"));
+    assert!(rig.wait_prompts(2)[1].contains("【新消息】"));
     wait_phase(&rig, "probing");
     wait_phase(&rig, "idle");
 }
@@ -1466,7 +1551,7 @@ fn seed_group_mute(rig: &Rig, personal_until: i64) {
 
 #[test]
 fn reserved_muted_group_gets_no_probe_until_the_mute_ends() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-muted-probe",
         reserved_seed(json!({"idleWindowMs":0,"idleRetryProbability":1,"idleRetryWaitMs":7000})),
     );
@@ -1478,20 +1563,20 @@ fn reserved_muted_group_gets_no_probe_until_the_mute_ends() {
     );
     // The scheduler scans every five seconds: two scans pass without a probe prompt.
     assert!(
-        !wait_for(Duration::from_secs(12), || !rig.dsh.prompts().is_empty()),
+        !wait_for(Duration::from_secs(12), || !rig.prompts().is_empty()),
         "a muted group got a model turn: {:?}",
-        rig.dsh.prompts()
+        rig.prompts()
     );
     assert_eq!(reserved_phase(&rig), "active", "the probe did not start");
     assert!(rig.texts_to(GROUP_KEY).is_empty());
     seed_group_mute(&rig, 0);
     wait_phase(&rig, "probing");
-    assert!(rig.wait_prompts(1)[0].text.contains("群里安静了一会儿"));
+    assert!(rig.wait_prompts(1)[0].contains("群里安静了一会儿"));
 }
 
 #[test]
 fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-muted-queue",
         reserved_seed(json!({"activeReplyDelayMinMs":6000,"activeReplyDelayMaxMs":6000})),
     );
@@ -1501,21 +1586,21 @@ fn reserved_muted_group_keeps_queued_work_until_the_mute_ends() {
     // pending, and the mute below can only be held by the dispatch guard: the scan guard and ingress do not apply.
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued before the ban");
     wait_phase(&rig, "active");
-    assert!(rig.dsh.prompts().is_empty(), "the delayed job ran before the mute: {:?}", rig.dsh.prompts());
+    assert!(rig.prompts().is_empty(), "the delayed job ran before the mute: {:?}", rig.prompts());
     seed_group_mute(&rig, now_ms() + 600_000);
     assert!(
-        !wait_for(Duration::from_secs(14), || !rig.dsh.prompts().is_empty()),
+        !wait_for(Duration::from_secs(14), || !rig.prompts().is_empty()),
         "queued work for a muted group ran a model turn: {:?}",
-        rig.dsh.prompts()
+        rig.prompts()
     );
     assert!(rig.texts_to(GROUP_KEY).is_empty());
     seed_group_mute(&rig, 0);
-    assert!(rig.wait_prompts(1)[0].text.contains("queued before the ban"), "the held job ran after the lift");
+    assert!(rig.wait_prompts(1)[0].contains("queued before the ban"), "the held job ran after the lift");
 }
 
 #[test]
 fn reserved_muted_group_answers_a_message_the_scan_held_after_the_mute_ends() {
-    let mut rig = Rig::new("reserved-muted-scan", reserved_seed(json!({})));
+    let mut rig = ReservedRig::new("reserved-muted-scan", reserved_seed(json!({})));
     rig.start();
     assert_eq!(
         rig.console("POST", "/api/social/state", Some(&json!({"key":GROUP_KEY,"phase":"active"}))).0,
@@ -1529,17 +1614,17 @@ fn reserved_muted_group_answers_a_message_the_scan_held_after_the_mute_ends() {
         "ingress never stored the message");
     seed_group_mute(&rig, now_ms() + 600_000);
     assert!(
-        !wait_for(Duration::from_secs(8), || !rig.dsh.prompts().is_empty()),
+        !wait_for(Duration::from_secs(8), || !rig.prompts().is_empty()),
         "a muted group got a model turn: {:?}",
-        rig.dsh.prompts()
+        rig.prompts()
     );
     seed_group_mute(&rig, 0);
-    assert!(rig.wait_prompts(1)[0].text.contains("held by the scan"), "the held message was answered after the lift");
+    assert!(rig.wait_prompts(1)[0].contains("held by the scan"), "the held message was answered after the lift");
 }
 
 #[test]
 fn reserved_proactive_participation_wraps_up_and_silent_farewell_exits() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-proactive15",
         reserved_seed(json!({"proactiveEnabled":true,"proactiveIdleThresholdMs":0,
         "proactiveCheckMinMs":0,"proactiveCheckMaxMs":0,"proactiveProbability":1,
@@ -1547,9 +1632,9 @@ fn reserved_proactive_participation_wraps_up_and_silent_farewell_exits() {
     );
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "context-for-proactive15");
-    assert!(rig.wait_prompts(1)[0].text.contains("你打算开启一个新话题"));
+    assert!(rig.wait_prompts(1)[0].contains("你打算开启一个新话题"));
     let p = rig.wait_prompts(2);
-    assert!(p[1].text.contains("现在该自然地收尾/潜水了"));
+    assert!(p[1].contains("现在该自然地收尾/潜水了"));
     wait_phase(&rig, "idle");
     assert_eq!(
         rig.texts_to(GROUP_KEY),
@@ -1577,9 +1662,9 @@ fn reserved_proactive_participation_wraps_up_and_silent_farewell_exits() {
 
 #[test]
 fn reserved_model_tool_cooperation_silence_failure_and_next_turn() {
-    let mut rig = Rig::new("reserved-model15", reserved_seed(json!({})));
+    let mut rig = ReservedRig::new("reserved-model15", reserved_seed(json!({})));
     rig.start();
-    says(&rig, GROUP_KEY, 1001, "tester", "@9001 #TOOLOK#");
+    says(&rig, GROUP_KEY, 1001, "tester", "@9001 #TOOLSTATUS#");
     rig.wait_prompts(1);
     assert!(wait_for(LONG, || rig
         .ledger()
@@ -1587,8 +1672,15 @@ fn reserved_model_tool_cooperation_silence_failure_and_next_turn() {
         .any(|r| r["k"] == "ended")));
     assert!(
         rig.texts_to(GROUP_KEY).is_empty(),
-        "tool success must suppress automatic output"
+        "a successful read followed by silence must not deliver a reply"
     );
+    {
+        let requests = lock(&rig.model.requests);
+        let tools = requests[0]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|tool| tool["function"]["name"] == "qq_status"), "reserved wakes must offer the status read");
+        assert!(tools.iter().all(|tool| tool["function"]["name"] != "qq_send_message"), "reserved replies must go through the bridge");
+        assert_eq!(requests[1]["messages"].as_array().unwrap().last().unwrap()["role"], "tool");
+    }
     says(&rig, GROUP_KEY, 1001, "tester", "#TOOLERR#");
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["tool failed reply"]);
     says(&rig, GROUP_KEY, 1001, "tester", "#SILENT#");
@@ -1615,14 +1707,18 @@ fn reserved_model_tool_cooperation_silence_failure_and_next_turn() {
 
 #[test]
 fn reserved_each_split_rechecks_mode_even_after_away_and_back() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-epoch15",
-        reserved_seed(json!({"burstIntervalMinMs":2500,"burstIntervalMaxMs":2500})),
+        Seed {
+            sessions: Some(json!({"sessions":{GROUP_KEY:"legacy-reserved-session"},"sessionPolicies":{GROUP_KEY:"legacy-policy"}})),
+            ..reserved_seed(json!({"burstIntervalMinMs":2500,"burstIntervalMaxMs":2500}))
+        },
     );
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #SPLIT15#");
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["第一句"]);
     let original = rig.data_json("sessions.json");
+    assert!(rig.dsh.prompts().is_empty(), "the legacy session is never used for the harness wake");
     assert_eq!(rig.console("POST", "/api/mode", Some(&json!({"mode":"reserved"}))).0, 200);
     assert_eq!(rig.data_json("sessions.json"), original, "same-mode writes preserve the session");
     assert_eq!(
@@ -1654,7 +1750,7 @@ fn reserved_each_split_rechecks_mode_even_after_away_and_back() {
 
 #[test]
 fn reserved_mode_exit_retires_public_state_and_syncs_dsh_before_returning() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-retirement15",
         reserved_seed(json!({"activeReplyDelayMinMs":3000,"activeReplyDelayMaxMs":3000})),
     );
@@ -1676,13 +1772,13 @@ fn reserved_mode_exit_retires_public_state_and_syncs_dsh_before_returning() {
     assert_eq!(writes, vec![json!({"ns":"qq-mode","patch":{"mode":"chat"}}),
         json!({"ns":"qq-mode","patch":{"mode":"reserved"}})]);
     thread::sleep(Duration::from_secs(4));
-    assert!(rig.dsh.prompts().is_empty(), "retired delayed input must never run");
+    assert!(rig.prompts().is_empty(), "retired delayed input must never run");
     assert!(rig.texts_to(GROUP_KEY).is_empty());
 }
 
 #[test]
 fn reserved_social_post_returns_effective_config_then_http_reloads_partial() {
-    let mut rig = Rig::new("reserved-config15", reserved_seed(json!({
+    let mut rig = ReservedRig::new("reserved-config15", reserved_seed(json!({
         "burstIntervalMinMs":0,"burstIntervalMaxMs":0,"longGapMinMs":0,"longGapMaxMs":0
     })));
     rig.start();
@@ -1711,7 +1807,7 @@ fn reserved_social_post_returns_effective_config_then_http_reloads_partial() {
 
 #[test]
 fn reserved_admin_idle_and_restart_invalidate_delayed_jobs() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-restart15",
         reserved_seed(json!({"activeReplyDelayMinMs":3000,"activeReplyDelayMaxMs":3000})),
     );
@@ -1728,7 +1824,7 @@ fn reserved_admin_idle_and_restart_invalidate_delayed_jobs() {
         200
     );
     thread::sleep(Duration::from_secs(4));
-    assert!(rig.dsh.prompts().is_empty());
+    assert!(rig.prompts().is_empty());
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 restart-delayed15");
     wait_phase(&rig, "active");
     let mut old = rig.candidate.take().unwrap();
@@ -1747,7 +1843,7 @@ fn reserved_admin_idle_and_restart_invalidate_delayed_jobs() {
     );
     rig.start();
     thread::sleep(Duration::from_secs(4));
-    assert!(rig.dsh.prompts().is_empty());
+    assert!(rig.prompts().is_empty());
     says(
         &rig,
         GROUP_KEY,
@@ -1757,14 +1853,13 @@ fn reserved_admin_idle_and_restart_invalidate_delayed_jobs() {
     );
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["synthetic reply"]);
     assert!(rig.wait_prompts(1)[0]
-        .text
         .contains("fresh-after-restart15"));
-    assert!(!rig.dsh.prompts()[0].text.contains("restart-delayed15"));
+    assert!(!rig.prompts()[0].contains("restart-delayed15"));
 }
 
 #[test]
 fn reserved_quote_only_self_is_a_direct_trigger_and_current_text_is_not_truncated() {
-    let mut rig = Rig::new("reserved-quote15", reserved_seed(json!({})));
+    let mut rig = ReservedRig::new("reserved-quote15", reserved_seed(json!({})));
     rig.start();
     rig.push(group_event(
         15501,
@@ -1774,7 +1869,7 @@ fn reserved_quote_only_self_is_a_direct_trigger_and_current_text_is_not_truncate
         vec![json!({"type":"reply","data":{"id":"5555"}})],
     ));
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["synthetic reply"]);
-    let body = body_of(&rig.wait_prompts(1)[0].text).to_string();
+    let body = body_of(&rig.wait_prompts(1)[0]).to_string();
     assert!(body.contains("[引用 bot：之前机器人说的话]"));
     assert!(body.contains("请回复消息。"));
     rig.console(
@@ -1787,7 +1882,6 @@ fn reserved_quote_only_self_is_a_direct_trigger_and_current_text_is_not_truncate
     let prompts = rig.wait_prompts(2);
     assert!(
         prompts[1]
-            .text
             .split("【当前消息】")
             .nth(1)
             .unwrap()
@@ -1799,7 +1893,7 @@ fn reserved_quote_only_self_is_a_direct_trigger_and_current_text_is_not_truncate
 #[cfg(feature = "parity-clock")]
 #[test]
 fn reserved_selective_silence_is_seeded_and_carried_into_the_next_required_batch() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-selective15",
         reserved_seed(json!({"skipProbability":1})),
     );
@@ -1823,13 +1917,13 @@ fn reserved_selective_silence_is_seeded_and_carried_into_the_next_required_batch
     assert!(wait_for(LONG, || rig.console("GET", "/api/social", None).1
         ["pendingSummaries"][GROUP_KEY]
         == 1));
-    assert!(rig.dsh.prompts().is_empty());
+    assert!(rig.prompts().is_empty());
     says(&rig, GROUP_KEY, 1001, "tester", "在吗 #SPLIT15#");
     let prompts = rig.wait_prompts(1);
-    assert!(prompts[0].text.contains("ordinary-seen-but-unanswered15"));
-    assert!(prompts[0].text.contains("在吗 #SPLIT15#"));
+    assert!(prompts[0].contains("ordinary-seen-but-unanswered15"));
+    assert!(prompts[0].contains("在吗 #SPLIT15#"));
     assert!(
-        !prompts[0].text.contains("请只输出 [SILENT]"),
+        !prompts[0].contains("请只输出 [SILENT]"),
         "required reply cannot opt out in its prompt"
     );
     assert_eq!(
@@ -1840,7 +1934,7 @@ fn reserved_selective_silence_is_seeded_and_carried_into_the_next_required_batch
 
 #[test]
 fn hf124_reserved_summary_is_normalized_before_burst_splitting() {
-    let mut rig = Rig::new("hf124-summary-burst", reserved_seed(json!({})));
+    let mut rig = ReservedRig::new("hf124-summary-burst", reserved_seed(json!({})));
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #SUMMARY124#");
     assert!(wait_for(LONG, || rig.data_json("social-v1.json")["conversations"][GROUP_KEY]
@@ -1870,7 +1964,7 @@ fn hf124_automatic_face_at_utf16_boundary_matches_wire_and_outbox() {
 
 #[test]
 fn hf124_reserved_face_at_length_boundary_matches_wire_and_outbox() {
-    let mut rig = Rig::new("hf124-reserved-face", reserved_seed(json!({"maxReplyChars":8})));
+    let mut rig = ReservedRig::new("hf124-reserved-face", reserved_seed(json!({"maxReplyChars":8})));
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #FACERESERVED124#");
     assert_face_reply_parts(&rig, vec!["abcdef".into(), "[表情28]后".into()]);
@@ -1878,7 +1972,7 @@ fn hf124_reserved_face_at_length_boundary_matches_wire_and_outbox() {
 
 #[test]
 fn hf124_reserved_face_longer_than_limit_stays_one_bubble() {
-    let mut rig = Rig::new("hf124-small-face", reserved_seed(json!({"maxReplyChars":1})));
+    let mut rig = ReservedRig::new("hf124-small-face", reserved_seed(json!({"maxReplyChars":1})));
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #FACESMALL124#");
     assert_face_reply_parts(&rig, vec!["前".into(), "[表情28]".into(), "后".into()]);
@@ -1924,7 +2018,7 @@ fn assert_face_reply_parts(rig: &Rig, expected: Vec<String>) {
 
 #[test]
 fn reserved_long_reply_preserves_url_atoms_and_punctuation_boundaries() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-url15",
         reserved_seed(json!({"maxReplyChars":4,"burstEnabled":false})),
     );
@@ -1939,7 +2033,7 @@ fn reserved_long_reply_preserves_url_atoms_and_punctuation_boundaries() {
 
 #[test]
 fn reserved_burst_definite_failure_still_attempts_the_third_sentence() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-burst-failure15",
         reserved_seed(json!({"burstIntervalMinMs":150,"burstIntervalMaxMs":150})),
     );
@@ -1975,7 +2069,7 @@ fn reserved_burst_definite_failure_still_attempts_the_third_sentence() {
 
 #[test]
 fn reserved_burst_failure_preserves_activity_and_cooldown_timestamps() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-burst-timestamps15",
         reserved_seed(json!({"burstIntervalMinMs":150,"burstIntervalMaxMs":150})),
     );
@@ -2015,9 +2109,9 @@ fn reserved_restart_retries_a_definitely_refused_submission_once() {
 fn restart_presubmit_failure(refused: bool) {
     let mut seed = reserved_seed(json!({}));
     if !refused {
-        seed.config["agentPreset"] = json!("temporarily-missing-preset");
+        seed.config["harness"] = json!({"model":null});
     }
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         if refused {
             "reserved-refused-restart15"
         } else {
@@ -2025,8 +2119,13 @@ fn restart_presubmit_failure(refused: bool) {
         },
         seed,
     );
-    lock(&rig.dsh.inner).refuse_prompt = refused;
     rig.start();
+    if refused {
+        says(&rig, OWNER_KEY, OWNER, "owner", "initialize the conversation store");
+        rig.wait_texts(OWNER_KEY, 1);
+        let db = rusqlite::Connection::open(rig.root.join("data/conversations.db")).unwrap();
+        db.execute_batch("CREATE TRIGGER fixture_refusal BEFORE INSERT ON turns BEGIN SELECT RAISE(ABORT, 'fixture refusal'); END;").unwrap();
+    }
     let input = group_event(
         150015,
         1001,
@@ -2039,37 +2138,41 @@ fn restart_presubmit_failure(refused: bool) {
         .ledger()
         .iter()
         .any(|r| r["k"] == "ended" && r["outcome"] == "failed")));
-    assert!(
-        rig.dsh.prompts().is_empty(),
-        "failure must precede DSH submission"
-    );
+    assert_eq!(rig.prompts().len(), refused as usize, "failure must precede a group model request");
+    let ledger = rig.ledger();
+    let group_turn = &ledger.iter().find(|r| r["k"] == "begun" && r["key"] == GROUP_KEY).unwrap()["turn"];
     assert_eq!(
-        rig.ledger().iter().any(|r| r["k"] == "attempt"),
+        ledger.iter().any(|r| r["k"] == "attempt" && &r["turn"] == group_turn),
         refused,
-        "exercise both no-RPC and definite-refusal recovery"
+        "exercise failures before and after recording an admission attempt"
     );
     let mut old = rig.candidate.take().unwrap();
     old.kill().unwrap();
     old.wait().unwrap();
     let config_path = rig.root.join("config/config.json");
     let mut cfg: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
-    cfg["agentPreset"] = json!("ticket12-chat");
+    cfg["harness"] = json!({"model":"fake-chat"});
     fs::write(&config_path, cfg.to_string()).unwrap();
-    lock(&rig.dsh.inner).refuse_prompt = false;
+    if refused {
+        let db = rusqlite::Connection::open(rig.root.join("data/conversations.db")).unwrap();
+        db.execute_batch("DROP TRIGGER fixture_refusal;").unwrap();
+    }
     rig.start();
     rig.push(input);
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["synthetic reply"]);
-    assert!(wait_for(LONG, || rig
-        .ledger()
-        .iter()
-        .any(|r| r["k"] == "ended" && r["outcome"] == "completed")));
+    assert!(wait_for(LONG, || {
+        let ledger = rig.ledger();
+        ledger.iter().filter(|row| row["k"] == "begun" && row["key"] == GROUP_KEY).any(|begun| {
+            ledger.iter().any(|row| row["turn"] == begun["turn"] && row["k"] == "ended" && row["outcome"] == "completed")
+        })
+    }));
     let mut old = rig.candidate.take().unwrap();
     old.kill().unwrap();
     old.wait().unwrap();
     rig.start();
     thread::sleep(Duration::from_secs(3));
     assert_eq!(
-        rig.dsh.prompts().len(),
+        rig.prompts().iter().filter(|prompt| prompt.contains("recover-presubmit15")).count(),
         1,
         "one recovered submission across both restarts and duplicate ingress"
     );
@@ -2078,7 +2181,7 @@ fn restart_presubmit_failure(refused: bool) {
 
 #[test]
 fn reserved_restart_keeps_undispatched_batch_ingress_replayable() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-batch-restart15",
         reserved_seed(json!({"activeCheckMinMs":60000,"activeCheckMaxMs":60000})),
     );
@@ -2108,13 +2211,12 @@ fn reserved_restart_keeps_undispatched_batch_ingress_replayable() {
     assert!(prompts
         .last()
         .unwrap()
-        .text
         .contains("undispatched-batch15"));
 }
 
 #[test]
 fn reserved_admin_idle_revocation_survives_restart_before_the_next_tick() {
-    let mut rig = Rig::new(
+    let mut rig = ReservedRig::new(
         "reserved-idle-revocation15",
         reserved_seed(json!({"activeCheckMinMs":60000,"activeCheckMaxMs":60000})),
     );
@@ -2152,7 +2254,7 @@ fn reserved_admin_idle_revocation_survives_restart_before_the_next_tick() {
         "revoked addressed ingress must not become a new turn on restart"
     );
     assert_eq!(
-        rig.dsh.prompts().len(),
+        rig.prompts().len(),
         1,
         "only the private ingress barrier was submitted"
     );
@@ -2260,7 +2362,7 @@ fn ticket24_closed_agent_owner_change_and_back_in_the_console_cancels_the_old_ap
 
 #[test]
 fn ticket24_reserved_revoke_and_undo_between_splits_stop_the_remaining_parts() {
-    let mut rig = Rig::new("reserved-t24-revoke", reserved_seed(json!({"burstIntervalMinMs":2500,"burstIntervalMaxMs":2500})));
+    let mut rig = ReservedRig::new("reserved-t24-revoke", reserved_seed(json!({"burstIntervalMinMs":2500,"burstIntervalMaxMs":2500})));
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #SPLIT15#");
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["第一句"]);
@@ -2275,7 +2377,7 @@ fn ticket24_reserved_revoke_and_undo_between_splits_stop_the_remaining_parts() {
 
 #[test]
 fn ticket24_reserved_revoke_and_undo_drop_the_delayed_job_before_submission() {
-    let mut rig = Rig::new("reserved-t24-delayed", reserved_seed(json!({"activeReplyDelayMinMs":3000,"activeReplyDelayMaxMs":3000})));
+    let mut rig = ReservedRig::new("reserved-t24-delayed", reserved_seed(json!({"activeReplyDelayMinMs":3000,"activeReplyDelayMaxMs":3000})));
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 queued-before-revoke");
     wait_phase(&rig, "active");
@@ -2283,15 +2385,15 @@ fn ticket24_reserved_revoke_and_undo_drop_the_delayed_job_before_submission() {
     let id = latest_audit_id(&rig, "/api/whitelist");
     assert_eq!(rig.console("POST", "/api/audit/undo", Some(&json!({"id": id, "confirm": true}))).0, 200);
     thread::sleep(Duration::from_secs(4));
-    assert!(rig.dsh.prompts().is_empty(), "the job delayed under the revoked epoch reached DSH: {:?}", rig.dsh.prompts());
+    assert!(rig.prompts().is_empty(), "the job delayed under the revoked epoch reached the model: {:?}", rig.prompts());
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 after-undo");
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["synthetic reply"]);
-    assert!(no_prompt_contains(&rig, "queued-before-revoke"), "{:?}", rig.dsh.prompts());
+    assert!(rig.prompts().iter().all(|prompt| !prompt.contains("queued-before-revoke")), "{:?}", rig.prompts());
 }
 
 #[test]
 fn ticket24_reserved_session_reset_between_splits_stops_the_remaining_parts() {
-    let mut rig = Rig::new("reserved-t24-reset", reserved_seed(json!({"burstIntervalMinMs":2500,"burstIntervalMaxMs":2500})));
+    let mut rig = ReservedRig::new("reserved-t24-reset", reserved_seed(json!({"burstIntervalMinMs":2500,"burstIntervalMaxMs":2500})));
     rig.start();
     says(&rig, GROUP_KEY, 1001, "tester", "@9001 #SPLIT15#");
     assert_eq!(rig.wait_texts(GROUP_KEY, 1), ["第一句"]);

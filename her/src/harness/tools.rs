@@ -25,6 +25,7 @@ struct Authority {
     /// The participation mode the pipeline admitted the turn under.
     mode: String,
     profile: Profile,
+    reserved: Option<crate::reserved::Authority>,
 }
 
 // Only confirmed revocation cancels a turn; unreadable authority state stays a failure.
@@ -75,6 +76,7 @@ impl Tools {
             token,
             mode: mode.into(),
             profile,
+            reserved: None,
         };
         authority.check().map_err(String::from)?;
         // #140: read from the settings store with this turn's configuration, so an edit is in
@@ -89,6 +91,13 @@ impl Tools {
             interactions: None,
             mode_prompt,
         })
+    }
+
+    pub(crate) fn with_reserved_authority(mut self, reserved: Option<crate::reserved::Authority>) -> Self {
+        if let Some(authority) = &mut self.authority {
+            authority.reserved = reserved;
+        }
+        self
     }
 
     pub(crate) fn with_interactions(mut self, mailbox: Option<Arc<super::interactions::Mailbox>>) -> Self {
@@ -307,6 +316,11 @@ impl Authority {
             return Err(CheckError::Revoked(
                 "harness conversation authority changed",
             ));
+        }
+        if self.reserved.as_ref().is_some_and(|authority| {
+            authority.check_generation(&self.context, &self.conversation).is_err()
+        }) {
+            return Err(CheckError::Revoked("reserved wake authority changed"));
         }
         let token = crate::conversation_authority::token(&self.context, &self.conversation)
             .map_err(CheckError::Unavailable)?;
@@ -707,6 +721,8 @@ mod tests {
             Profile::Chat,
             Profile::OwnerPrivate,
             Profile::ClosedAgent,
+            Profile::Reserved,
+            Profile::ReservedOwner,
             Profile::Reserved2,
             Profile::Reserved2Owner,
             Profile::Digest,
@@ -746,7 +762,7 @@ mod tests {
             }
             let owner = matches!(
                 profile,
-                Profile::OwnerPrivate | Profile::ClosedAgent | Profile::Reserved2Owner
+                Profile::OwnerPrivate | Profile::ClosedAgent | Profile::ReservedOwner | Profile::Reserved2Owner
             );
             for owner_only in ["memory_acl", "settings_get", "settings_set"] {
                 assert_eq!(
@@ -770,7 +786,8 @@ mod tests {
             ("closed-agent", "private:7707", None),
             ("reserved2", GROUP_KEY, Some(Profile::Reserved2)),
             ("reserved2", OWNER_KEY, Some(Profile::Reserved2Owner)),
-            ("reserved", GROUP_KEY, None),
+            ("reserved", GROUP_KEY, Some(Profile::Reserved)),
+            ("reserved", OWNER_KEY, Some(Profile::ReservedOwner)),
             ("simulation", GROUP_KEY, None),
             ("", GROUP_KEY, None),
             ("Chat", GROUP_KEY, None),
@@ -809,8 +826,9 @@ mod tests {
         fixture.set_mode("reserved2");
         assert!(fixture.capture("reserved2", GROUP_KEY).is_ok());
         fixture.set_mode("reserved");
+        assert!(fixture.capture("reserved", GROUP_KEY).is_ok());
         assert_eq!(
-            refused("reserved", GROUP_KEY),
+            refused("conversation", GROUP_KEY),
             crate::turn_engine::UNSUPPORTED_MODE
         );
         std::fs::write(fixture.root.join("data/mode.json"), "not json").unwrap();

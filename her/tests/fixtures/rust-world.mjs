@@ -101,6 +101,7 @@ function scenarioFor(extra = {}) {
     dsh: { sessionId: 's1', workspaceId: 'w1', workspaceCreated: extra.workspaceCreated, uniqueSessions: extra.uniqueSessions === true, settings: extra.settings ?? {namespaces:[]}, turnEvents: extra.turnEvents ?? [], turnEventsForPrompt: extra.turnEventsForPrompt, presets: [{ id: 'qq-chat', isDefault: true }, { id: 'qq-chat-v2', isDefault: false }], provider: 'p', model: 'm', faults: extra.dshFaults },
     onebotResponder: extra.responder ?? onebotResponder,
     onebotFaults: extra.onebotFaults,
+    modelReply: extra.modelReply,
   };
 }
 

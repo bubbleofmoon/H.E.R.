@@ -131,29 +131,31 @@ const CASES = {
     assert.equal(prompts(side).length, 0, 'nothing at all was submitted');
   },
 
-  // First-generation reserved mode (JS: queued while dshReady is false, replayed on recovery): while DSH is known down no call is
-  // made for the waiting message; after recovery it goes through the authority re-check and is delivered exactly once.
-  async 'reserved-outage-waits-for-dsh-then-replays'(ctx) {
+  async 'reserved-wake-completes-during-dsh-outage'(ctx) {
     const social = { triggerProbability: 0, proactiveEnabled: false, activeDurationEnabled: false, activeCheckMinMs: 0, activeCheckMaxMs: 0,
       activeReplyDelayMinMs: 0, activeReplyDelayMaxMs: 0, idleWindowMs: 120000, idleRetryProbability: 0, skipProbability: 0, longGapProbability: 0,
       burstIntervalMinMs: 1, burstIntervalMaxMs: 1 };
-    const side = await ctx.start({ mode: 'reserved', state: { conversations: {} }, responder: onebotResponder, config: { ackMessage: '', social }, turnEventsForPrompt: () => completed(1) });
+    const side = await ctx.start({
+      mode: 'reserved',
+      responder: onebotResponder,
+      config: { ackMessage: '', engineDefault: 'dsh', harness: { model: 'fake-chat' }, social },
+      seed: (root) => fs.writeFileSync(path.join(root, 'config', 'harness-api-key'), 'synthetic-model-key'),
+      modelReply: 'synthetic reply',
+    });
     side.world.addDshFault({ endpoint: '*', respond: { status: 503, body: '{"error":"down"}' } });
     await until('the bridge noticed the outage', async () => (await api(side, '/api/status')).json?.dshReady === false, 30_000);
-    const mark = side.world.log.length;
-    push(side, groupMessage('@401 reserved-waits-for-dsh'));
-    await until('the message waits for DSH', () => /\[reserved\] group:420042 DSH 不可用，消息排队等待恢复/.test(side.stdout()), 20_000);
-    await sleep(8_000);
-    const calls = side.world.log.slice(mark).filter((e) => e.side === 'dsh' && e.kind === 'rpc' && e.endpoint !== 'settings/describe');
-    assert.equal(calls.length, 0, `DSH was called for waiting work: ${calls.map((e) => e.endpoint).join(',')}`);
-    side.world.clearDshFaults();
-    await until('DSH reported ready again', async () => (await api(side, '/api/status')).json?.dshReady === true, 30_000);
-    await until('the waiting message was delivered', () => promptsWith(side, 'reserved-waits-for-dsh').length >= 1, 40_000);
-    await until('the turn ended', async () => (await turns(side)).some((t) => t.state === 'completed'), 40_000);
-    await sleep(1500);
-    assert.equal(promptsWith(side, 'reserved-waits-for-dsh').length, 1, 'delivered exactly once');
-    assert.ok(side.world.log.some((e) => e.side === 'onebot' && e.action === 'send_group_msg' && JSON.stringify(e.params).includes('synthetic reply')), 'the reply reached the group');
-    assert.deepEqual(groupLeaksOf(side).filter((t) => !String(t).includes('synthetic reply')), [], 'no internal text in the group');
+    const marker = 'reserved-outage-fixture';
+    push(side, groupMessage('@401 ' + marker));
+    await until('a reserved wake reaches the harness while DSH is down',
+      () => side.world.log.some((e) => e.side === 'model' && JSON.stringify(e.body ?? '').includes(marker)), 20_000);
+    await until('the harness turn completed', async () => (await turns(side)).some((t) => t.state === 'completed'), 20_000);
+    assert.equal(side.world.log.filter((e) => e.side === 'model' && JSON.stringify(e.body ?? '').includes(marker)).length, 1);
+    assert.equal(prompts(side).length, 0, 'reserved must submit no DSH prompt');
+    assert.equal(dshCalls(side, 'session/create').length, 0, 'reserved must create no DSH session');
+    const sends = side.world.log.filter((e) => e.side === 'onebot' && e.kind === 'action' && e.action === 'send_group_msg');
+    assert.equal(sends.length, 1, 'the wake delivers one group reply');
+    assert.ok(JSON.stringify(sends[0].params).includes('synthetic reply'), 'the harness reply reaches the group');
+    assert.deepEqual(groupLeaksOf(side), [], 'no internal text reaches the group');
   },
 
   // Reserved mode 2: a wake that falls due while DSH is known down is not dispatched (no call at all) and is delivered once after recovery.

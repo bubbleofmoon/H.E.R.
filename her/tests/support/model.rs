@@ -1,5 +1,6 @@
 // Scriptable OpenAI-compatible SSE fixture. No provider SDK or external endpoint.
-enum ModelReply {
+#[derive(Clone)]
+pub(crate) enum ModelReply {
     Refusal,
     StreamedRefusal,
     ErrorEvent,
@@ -31,9 +32,9 @@ enum ModelReply {
     },
 }
 
-struct FakeModel {
-    base: String,
-    requests: Arc<Mutex<Vec<Value>>>,
+pub(crate) struct FakeModel {
+    pub(crate) base: String,
+    pub(crate) requests: Arc<Mutex<Vec<Value>>>,
     authorizations: Arc<Mutex<Vec<bool>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     task: Option<thread::JoinHandle<()>>,
@@ -50,6 +51,10 @@ impl FakeModel {
     }
 
     fn script(replies: Vec<ModelReply>) -> Self {
+        Self::responding(move |index, _| replies.get(index).cloned())
+    }
+
+    pub(crate) fn responding(reply_for: impl Fn(usize, &Value) -> Option<ModelReply> + Send + 'static) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -81,8 +86,9 @@ impl FakeModel {
                 // One-shot jobs (the digest, slang learning) ask for one non-streaming completion.
                 let streaming = body["stream"] == true;
                 let n = lock(&seen).len();
+                let reply = reply_for(n, &body);
                 lock(&seen).push(body);
-                let Some(reply) = replies.get(n) else {
+                let Some(ref model_reply) = reply else {
                     respond(
                         &mut socket,
                         500,
@@ -92,7 +98,7 @@ impl FakeModel {
                 };
                 if let ModelReply::HeldTools {
                     started, release, ..
-                } = reply
+                } = model_reply
                 {
                     started.store(true, std::sync::atomic::Ordering::SeqCst);
                     while !release.load(std::sync::atomic::Ordering::SeqCst)
@@ -104,13 +110,13 @@ impl FakeModel {
                 if let ModelReply::ToolCalls(calls)
                 | ModelReply::TruncatedTools(calls)
                 | ModelReply::HeldTools { calls, .. }
-                | ModelReply::UsedTools { calls, .. } = reply
+                | ModelReply::UsedTools { calls, .. } = model_reply
                 {
                     let mut sse = String::new();
                     let mut frame = |delta: Value, finish: Value| {
                         let mut chunk = json!({"id":"fake-68","object":"chat.completion.chunk","model":"fake-chat","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
                         if finish == "tool_calls" {
-                            if let ModelReply::UsedTools { total_tokens, .. } = reply {
+                            if let ModelReply::UsedTools { total_tokens, .. } = model_reply {
                                 chunk["usage"] = json!({"prompt_tokens":total_tokens-1,"completion_tokens":1,"total_tokens":total_tokens});
                             }
                         }
@@ -151,7 +157,7 @@ impl FakeModel {
                     frame(json!({}), json!("tool_calls"));
                     sse.push_str("data: [DONE]\n\n");
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", sse.len());
-                    if matches!(reply, ModelReply::TruncatedTools(_)) {
+                    if matches!(model_reply, ModelReply::TruncatedTools(_)) {
                         let split = sse.match_indices("\n\n").nth(2).unwrap().0 + 2;
                         let _ = socket.write_all(sse[..split].as_bytes());
                     } else {
@@ -159,7 +165,7 @@ impl FakeModel {
                     }
                     continue;
                 }
-                if matches!(reply, ModelReply::StreamedRefusal) {
+                if matches!(model_reply, ModelReply::StreamedRefusal) {
                     // A refusal delta followed by a normal stop, as emitted by Chat Completions.
                     let refusal = json!({"choices":[{"index":0,"delta":{"refusal":"CHAT_SECRET refusal"},"finish_reason":null}]});
                     let stop = json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
@@ -167,7 +173,7 @@ impl FakeModel {
                     let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}", sse.len());
                     continue;
                 }
-                if matches!(reply, ModelReply::Refusal) && !streaming {
+                if matches!(model_reply, ModelReply::Refusal) && !streaming {
                     respond(
                         &mut socket,
                         200,
@@ -177,13 +183,13 @@ impl FakeModel {
                     );
                     continue;
                 }
-                if matches!(reply, ModelReply::Refusal | ModelReply::ErrorEvent) {
-                    let chunk=if matches!(reply, ModelReply::ErrorEvent) { json!({"error":{"code":"SAFETY","message":"CHAT_SECRET"}}) } else { json!({"id":"refusal-81","object":"chat.completion.chunk","model":"fake-chat","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}) };
+                if matches!(model_reply, ModelReply::Refusal | ModelReply::ErrorEvent) {
+                    let chunk=if matches!(model_reply, ModelReply::ErrorEvent) { json!({"error":{"code":"SAFETY","message":"CHAT_SECRET"}}) } else { json!({"id":"refusal-81","object":"chat.completion.chunk","model":"fake-chat","choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}) };
                     let sse=format!("data: {chunk}\n\ndata: [DONE]\n\n");
                     let _=write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",sse.len());
                     continue;
                 }
-                let reply = match reply {
+                let reply = match model_reply {
                     ModelReply::ToolCalls(_)
                     | ModelReply::TruncatedTools(_)
                     | ModelReply::HeldTools { .. }
@@ -228,14 +234,14 @@ impl FakeModel {
                 let _ = write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", sse.len());
                 // Emit a real content delta before holding or truncating the response.
                 let split = sse.find("\n\n").unwrap() + 2;
-                if matches!(replies.get(n), Some(ModelReply::Truncated(_))) {
+                if matches!(model_reply, ModelReply::Truncated(_)) {
                     let _ = socket.write_all(sse[..split].as_bytes());
                     let _ = socket.flush();
                     continue; // Close before the advertised length, finish reason and [DONE].
                 }
-                if let Some(ModelReply::Active {
+                if let ModelReply::Active {
                     started, release, ..
-                }) = replies.get(n)
+                } = model_reply
                 {
                     socket.write_all(sse[..split].as_bytes()).unwrap();
                     socket.flush().unwrap();

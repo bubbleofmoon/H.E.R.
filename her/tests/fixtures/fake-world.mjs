@@ -401,11 +401,23 @@ export async function startFakeWorld({ scenario, dshHome }) {
     }, scenario.inboundDelayMs ?? 300);
   });
 
-  // ---- Model: must never be reached on the DSH-mediated path ---------------
-  const modelServer = http.createServer((req, res) => {
-    record({ side: 'model', kind: 'hit', method: req.method, url: req.url });
-    res.writeHead(500);
-    res.end('{"error":"model fake: unexpected direct model call"}');
+  // ---- Model: only fixtures that give a reply may use the direct model path.
+  const modelServer = http.createServer(async (req, res) => {
+    if (scenario.modelReply === undefined || req.method !== 'POST' || req.url !== '/v1/chat/completions') {
+      record({ side: 'model', kind: 'hit', method: req.method, url: req.url });
+      res.writeHead(500);
+      res.end('{"error":"model fake: unexpected direct model call"}');
+      return;
+    }
+    let input = '';
+    for await (const piece of req) input += piece;
+    record({ side: 'model', kind: 'hit', method: req.method, url: req.url, body: JSON.parse(input) });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    const chunk = { id: 'fake-reserved', object: 'chat.completion.chunk', model: 'fake-chat' };
+    const delta = { index: 0, delta: { content: scenario.modelReply }, finish_reason: null };
+    const stop = { index: 0, delta: {}, finish_reason: 'stop' };
+    res.write(`data: ${JSON.stringify({ ...chunk, choices: [delta] })}\n\n`);
+    res.end(`data: ${JSON.stringify({ ...chunk, choices: [stop] })}\n\ndata: [DONE]\n\n`);
   });
 
   const listen = (server) => new Promise((resolve) => {

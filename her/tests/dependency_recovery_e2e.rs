@@ -42,7 +42,7 @@ cases! {
     a_401_after_a_dsh_restart_heals_once_per_call_and_delivers_the_prompt_once => "reauth-401-rotation-call-counts",
     a_dsh_outage_queues_messages_bounds_the_calls_and_replays_after_recovery => "dsh-outage-queues-then-replays-through-the-access-checks",
     a_revocation_made_during_an_outage_is_honoured_by_the_replay => "dsh-outage-replay-honours-a-revocation-made-while-down",
-    first_generation_reserved_waits_for_dsh_and_replays_after_recovery => "reserved-outage-waits-for-dsh-then-replays",
+    first_generation_reserved_completes_a_harness_wake_during_dsh_outage => "reserved-wake-completes-during-dsh-outage",
     reserved2_waits_for_dsh_without_calling_it_and_replays_after_recovery => "reserved2-outage-waits-for-dsh-then-replays",
     a_cli_choice_releases_a_waiting_reserved2_wake_without_calling_a_down_dsh => "reserved2-cli-choice-releases-waiting-work-during-dsh-outage",
     a_reply_timeout_never_redelivers_the_prompt_to_the_next_candidate => "turn-timeout-never-redelivers-the-prompt",

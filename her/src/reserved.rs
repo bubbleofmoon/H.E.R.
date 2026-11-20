@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const FILE: &str = "social-v1.json";
+const QUEUE_MAX: usize = 50;
 const SPLIT_HINT: &str = "想分多条消息时用空格分隔；不想分条就不要加空格，用标点连接。注意：中英文/数字之间的空格也会被当作分条信号。";
 const DIRECTION: &str = "注意：消息里的 [引用 某人：...] 表示这句话是在回应被引用的人；引用的是你的消息才是在找你，引用别人时别默认是在找你。";
 fn now() -> i64 {
@@ -421,7 +422,7 @@ pub fn admin_flush(context: &RuntimeContext, body: &str) -> Result<Value, (u16, 
             _ => {}
         }
         if Instant::now() >= deadline {
-            return Err((503, "摘要投喂仍在等待 DSH".into()));
+            return Err((503, "摘要投喂仍在等待模型回合".into()));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -440,7 +441,7 @@ pub fn mode_stamp(context: &RuntimeContext) -> Result<String, String> {
         .map(|s| s.unwrap_or_default())
 }
 /// Retire the public first-generation state before acknowledging mode exit.
-/// DSH cleanup is separate and must use only the captured obsolete epoch.
+/// Running harness wakes settle against their captured authority.
 pub fn retire_mode_state(context: &RuntimeContext) -> Result<(), String> {
     mutate(context, |s| {
         s.conversations.clear();
@@ -521,11 +522,11 @@ struct Job {
     inbound: Vec<String>,
     attempt: u32,
 }
-/// Add a job to the pending queue. Each conversation holds at most `dsh_health::QUEUE_MAX` jobs (JS `QUEUE_MAX` per key);
+/// Add a job to the pending queue. Each conversation holds at most `QUEUE_MAX` jobs (JS `QUEUE_MAX` per key);
 /// beyond that its oldest are dropped and returned for the caller to settle. There is no process-wide cap: one
 /// conversation's backlog never costs another its work.
 fn push_bounded(pending: &mut VecDeque<Job>, job: Job) -> Vec<Job> {
-    let cap = crate::dsh_health::QUEUE_MAX;
+    let cap = QUEUE_MAX;
     let mut dropped = Vec::new();
     while pending.iter().filter(|j| j.key == job.key).count() >= cap {
         let Some(at) = pending.iter().position(|j| j.key == job.key) else { break };
@@ -545,8 +546,6 @@ pub struct Hub {
     pending: VecDeque<Job>,
     /// Jobs `push_bounded` dropped; settled (events handled, flush and farewell bookkeeping) by the next `tick`.
     dropped: Vec<Job>,
-    /// Conversations already announced as waiting for DSH in this outage (one log line each).
-    waiting_noted: std::collections::BTreeSet<String>,
     /// Muted groups already logged for held work (#46); cleared when the mute ends.
     mute_noted: std::collections::BTreeSet<String>,
     active: BTreeMap<String, Active>,
@@ -587,7 +586,6 @@ impl Hub {
             lookups: chat::Lookups::new(ob),
             pending: VecDeque::new(),
             dropped: Vec::new(),
-            waiting_noted: Default::default(),
             mute_noted: Default::default(),
             active: BTreeMap::new(),
             groups,
@@ -1008,16 +1006,12 @@ impl Hub {
         let stamp = mode_stamp(&self.context)?;
         if stamp != self.stamp {
             self.stamp = stamp;
-            self.pending.clear();
-            retire_mode_state(&self.context)?;
-            for (key, active) in std::mem::take(&mut self.active) {
-                let context = self.context.clone();
-                let cfg = context.load_config().map_err(|e| e.to_string())?;
-                if let Ok(p) = Pipeline::new_with_runtime(&context, &cfg) {
-                    let _ = p.cancel_reserved_epoch(&key, &active.job.authority.token);
-                }
-                active.task.abort();
+            for job in self.pending.drain(..) {
+                self.journal.mark_handled(job.inbound, now()).await?;
             }
+            retire_mode_state(&self.context)?;
+            // Active tasks observe revoked authority and settle their harness work and ledger
+            // before releasing the conversation gate.
         }
         Ok(())
     }
@@ -1025,20 +1019,17 @@ impl Hub {
         self.sync_mode().await?;
         // Jobs the per-conversation cap pushed out: settled, never silently left open (JS drops the oldest and logs it).
         for job in std::mem::take(&mut self.dropped) {
-            println!("[reserved] {} 排队的消息已满（每个会话 {}），丢弃最早的一条", job.key, crate::dsh_health::QUEUE_MAX);
+            println!("[reserved] {} 排队的消息已满（每个会话 {}），丢弃最早的一条", job.key, QUEUE_MAX);
             crate::recovery_log::record(
                 &self.context,
                 crate::run_record::Trigger::Turn,
                 crate::run_record::Component::Queue,
                 "dropped-oldest",
                 crate::run_record::Outcome::Failed,
-                &format!("{}: queue of {} waiting messages is full", job.key, crate::dsh_health::QUEUE_MAX),
+                &format!("{}: queue of {} waiting messages is full", job.key, QUEUE_MAX),
             );
             self.settle_state(&job.key, &job, true)?;
             self.journal.mark_handled(job.inbound, now()).await?;
-        }
-        if !crate::dsh_health::is_down(&self.context) {
-            self.waiting_noted.clear();
         }
         let done = self
             .active
@@ -1051,23 +1042,12 @@ impl Hub {
             let job = active.job;
             let (result, unsubmitted) = active.task.await.map_err(|e| e.to_string())?;
             if result.is_err() && unsubmitted && job.authority.check(&self.context, &key).is_ok() {
-                if crate::dsh_health::is_down(&self.context) {
-                    // The prompt never reached DSH and DSH is known down: the message waits for it (JS queues while
-                    // dshReady is false and replays on recovery) instead of burning its retries and being lost. No attempt
-                    // is used; the dispatch below holds it until DSH is back, then re-checks its authority.
-                    println!("[reserved] {key} DSH 不可用，消息排队等待恢复");
-                    self.waiting_noted.insert(key.clone());
-                    let mut waiting = job;
-                    waiting.due = now();
-                    let dropped = push_bounded(&mut self.pending, waiting);
-                    self.dropped.extend(dropped);
-                    continue;
-                }
                 if job.attempt < 3 {
                     let mut retry = job;
                     retry.attempt += 1;
                     retry.due = now() + 5000 * (1 << (retry.attempt - 1));
-                    self.pending.push_back(retry);
+                    let dropped = push_bounded(&mut self.pending, retry);
+                    self.dropped.extend(dropped);
                     continue;
                 }
             }
@@ -1271,6 +1251,7 @@ impl Hub {
             let job = self.pending.pop_front().unwrap();
             if let Err(why) = job.authority.check(&context, &job.key) {
                 println!("[reserved] {} queued work cancelled: {why}", job.key);
+                self.settle_state(&job.key, &job, true)?;
                 self.journal.mark_handled(job.inbound, now()).await?;
                 continue;
             }
@@ -1282,15 +1263,6 @@ impl Hub {
                 // #46: held, not cancelled: it runs on the first pass after the mute ends.
                 if self.mute_noted.insert(job.key.clone()) {
                     println!("[reserved] {} 禁言中，排队的任务保留到禁言结束", job.key);
-                }
-                self.pending.push_back(job);
-                continue;
-            }
-            if crate::dsh_health::is_down(&context) {
-                // DSH is known down: no call is made for waiting work. Its authority was re-checked just above; it is
-                // checked again, with everything else, on the pass that finds DSH back.
-                if self.waiting_noted.insert(job.key.clone()) {
-                    println!("[reserved] {} DSH 不可用，消息排队等待恢复", job.key);
                 }
                 self.pending.push_back(job);
                 continue;
@@ -1308,7 +1280,7 @@ impl Hub {
             let cfg = cfg.clone();
             let work = job.clone();
             let task = tokio::spawn(async move {
-                let mut pipe = match Pipeline::new_with_runtime(&ctx, &cfg) {
+                let mut pipe = match Pipeline::new_without_dsh(&ctx, &cfg) {
                     Ok(p) => p,
                     Err(e) => return (Err(e), true),
                 };
@@ -1512,7 +1484,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_reserved_cleanup_preserves_replacement_chat_turn() {
+    async fn stale_reserved_settlement_preserves_replacement_chat_turn() {
         let (root, context) = fixture();
         let key = "group:42";
         context
@@ -1541,17 +1513,13 @@ mod tests {
         let old = Recorder::begin(
             &context,
             key,
-            "dsh",
+            "harness",
             "reserved",
             &crate::send_outbox::token_epoch(&job.authority.token),
             &[],
             None,
         )
         .unwrap();
-        old.session("old-reserved-session").unwrap();
-        let task = tokio::spawn(std::future::pending());
-        hub.active.insert(key.into(), Active { job, task });
-
         // Mode retirement happened, then new chat ingress replaced the mapping/epoch.
         context
             .write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"chat"}"#)
@@ -1569,7 +1537,14 @@ mod tests {
         )
         .unwrap();
         chat.session("replacement-chat-session").unwrap();
+        old.end("cancelled", "harness turn cancelled").unwrap();
+        let task = tokio::spawn(async { (Err("harness turn cancelled".into()), false) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        hub.active.insert(key.into(), Active { job, task });
         hub.tick("bot").await.unwrap();
+        assert!(hub.active.is_empty(), "the retired wake must settle");
 
         assert_eq!(
             console::conversation_token(&context, key).unwrap(),
@@ -1647,19 +1622,19 @@ mod tests {
         }
     }
 
-    /// Ticket 25 review 1: work that waits for DSH is bounded per conversation (JS `QUEUE_MAX` per key, the oldest dropped),
+    /// Ticket 25 review 1: waiting work is capped per conversation (JS `QUEUE_MAX` per key, the oldest dropped),
     /// not per process: one busy conversation never costs another its waiting messages.
     #[test]
     fn waiting_work_is_bounded_per_conversation_and_drops_that_conversations_oldest() {
         let mut pending: VecDeque<Job> = VecDeque::new();
-        for n in 0..crate::dsh_health::QUEUE_MAX {
+        for n in 0..QUEUE_MAX {
             assert!(push_bounded(&mut pending, waiting_job("group:1", &format!("a{n}"))).is_empty());
         }
         assert!(push_bounded(&mut pending, waiting_job("group:2", "b0")).is_empty(), "another conversation has its own room");
         let dropped = push_bounded(&mut pending, waiting_job("group:1", "a-new"));
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].prompt, "a0", "the oldest message of the full conversation goes");
-        assert_eq!(pending.iter().filter(|j| j.key == "group:1").count(), crate::dsh_health::QUEUE_MAX);
+        assert_eq!(pending.iter().filter(|j| j.key == "group:1").count(), QUEUE_MAX);
         assert!(pending.iter().any(|j| j.key == "group:2" && j.prompt == "b0"), "the other conversation kept its message");
         assert_eq!(pending.back().unwrap().prompt, "a-new");
     }
