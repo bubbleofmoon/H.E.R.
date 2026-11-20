@@ -949,7 +949,7 @@ pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
         Ok(Some(item)) if item.status != ItemStatus::Cancelled => {
             let (label, text) = match item.creator {
                 Creator::Owner => ("管理员", item.text),
-                Creator::Her => ("你自己", item.text), // RED-reminder-prompt-text
+                Creator::Her => ("你自己", reminder_prompt_text(&item.text)),
                 Creator::System => ("系统", item.text),
             };
             format!("【提醒内容】{text}\n（由{label}设置）\n\n")
