@@ -2,7 +2,7 @@
 
 HER is a QQ companion. She lives in QQ private chats and groups through a OneBot gateway ([SnowLuma](https://github.com/SnowLuma/SnowLuma)), talks through an agent host (DeepSeek Harness, being replaced by HER's own harness), and is run by one supervisor with a local admin console.
 
-> **Status: in development.** The Rust rewrite and the supervisor are being finished ahead of the production switchover. Memory, persona and schedule upgrades (phase 1a) are specified but not built. Nothing here is a finished release.
+Production runs the Rust bridge. For day-to-day operation on Windows, see the [中文使用指南](docs/user-guide.zh-CN.md).
 
 ## What she does
 
@@ -84,7 +84,7 @@ Human reply timing enforced in code (held sends and a typing indicator), a guard
 | `her/` | The Rust bridge, supervisor and desktop app: `her` (GUI), `her-cli` (console twin) and `herupdate` (update helper) |
 | `her-memory/` | Memory tooling |
 | `scripts/` | Build-slot, validation and fixture helpers |
-| `docs/` | Agent-facing contracts (`docs/agents/`), decisions (`docs/adr/`) and release checks |
+| `docs/` | Owner guide, agent-facing contracts (`docs/agents/`), decisions (`docs/adr/`) and release checks |
 | `GLOSSARY.md` | The project's vocabulary |
 | `AGENTS.md`, `CODING_STANDARDS.md` | Rules for anyone (human or agent) changing the code |
 
