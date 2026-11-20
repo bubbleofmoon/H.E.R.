@@ -1418,7 +1418,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         }
         if mode == "reserved2" && self.dispatch_unsubmitted {
             if let Some(retries_remaining) = self.reserved2_retries_remaining {
-                if retries_remaining {
+                if false && retries_remaining { // RED-R1-DSH
                     return;
                 }
                 let Ok(cfg) = self.context.load_config() else { return };
