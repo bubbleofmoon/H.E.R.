@@ -691,7 +691,7 @@ pub fn recall(
 fn fuse_recall(sparse: Vec<Hit>, dense: Vec<Hit>, limit: usize) -> Vec<Hit> {
     const RANK_OFFSET: f64 = 60.0;
     let mut fused = std::collections::HashMap::<i64, Hit>::new();
-    for ranking in [sparse.into_iter().take(0).collect(), dense] { // RED-FUSION
+    for ranking in [sparse, dense] {
         for (position, mut hit) in ranking.into_iter().enumerate() {
             hit.score = 1.0 / (RANK_OFFSET + 1.0 + position as f64);
             fused.entry(hit.id).and_modify(|existing| existing.score += hit.score).or_insert(hit);
