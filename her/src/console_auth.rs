@@ -140,7 +140,7 @@ fn check_first_run_proof(context: &RuntimeContext, proof: &str) -> Result<(), Pa
         .load_config()
         .map_err(|_| PasswordError::Unavailable)?;
     let expected = context.effective_console_token(&cfg);
-    if !credential_eq(&expected, proof) && (expected.is_empty() || proof.is_empty()) { // RED-M6
+    if !credential_eq(&expected, proof) {
         return Err(PasswordError::Proof);
     }
     Ok(())
