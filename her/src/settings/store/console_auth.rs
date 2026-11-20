@@ -385,7 +385,7 @@ fn admit_browser_at(
     let restore = restore_generation(context);
     let (admission, rows) = session_write(context, |conn| {
         let result = (|| -> Result<Option<BrowserAdmission>, String> {
-            let Some((auth, expiry_clock)) = observe_browser_clock(conn, now)? else { return Ok(None) };
+            let (auth, mark) = browser_clock_state(conn)?; let expiry_clock = mark.max(now); // RED-R3-Q2
             let (Some(token), Some(restore)) = (token, restore.as_ref().ok().copied().flatten()) else {
                 return Ok(None);
             };
