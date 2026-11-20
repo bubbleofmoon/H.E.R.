@@ -365,6 +365,9 @@ pub fn approve(
     {
         return Err("displayed dependency upgrade changed; refresh before approving".into());
     }
+    if name == "dsh" {
+        require_dsh_contract(version)?;
+    }
     state.approval = Some((name.into(), candidate.clone()));
     state.error = None;
     save(context, &state)?;
@@ -840,21 +843,20 @@ fn transaction(
             json!({"name":name,"from":candidate.current,"to":candidate.version,"status":"succeeded","rollback":"not-needed"}),
         ),
         Err(reason) => {
-            recovery.reason = Some(reason.clone());
+            recovery.reason = Some(reason);
             checkpoint(context, &recovery)?;
             let rollback = rollback(context, &mut recovery, clock);
-            Ok(
-                json!({"name":name,"from":candidate.current,"to":candidate.version,"status":if rollback.is_ok(){"rolled-back"}else{"failed"},"rollback":if rollback.is_ok(){"succeeded"}else{"failed"},"reason":reason,"rollbackError":rollback.err()}),
-            )
+            Ok(rollback_result(&recovery, rollback))
         }
     }
 }
 
+// Some(reason) means the pin was restored, but the restored DSH version cannot run.
 fn rollback(
     context: &RuntimeContext,
     transaction: &mut Transaction,
     clock: &Clock,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let name = name(&transaction.name)?;
     let cfg = context.load_config().map_err(str::to_string)?;
     let pin = &cfg["dependencies"][name];
@@ -896,18 +898,41 @@ fn rollback(
         }
         Effective::Act { wants, .. } if !wants.jobs => {
             states[name] = json!({"state":"stopped"});
-            publish(context, &states)
+            publish(context, &states)?;
+            Ok(None)
         }
         _ => {
             let mut old_cfg = context.load_config().map_err(str::to_string)?;
             old_cfg["dependencies"][name] = transaction.previous.clone();
             old_cfg["dependencies"]["directory"] = transaction.candidate.directory.clone();
+            if let Err(reason) = runnable_pin(&old_cfg, name) {
+                return Ok(Some(reason));
+            }
             let old = existing(context, &old_cfg, name)?;
             ensure(context, &old, &mut states, clock, &desired)?;
-            ready_and_healthy(context, &old, &mut states, clock, &desired)
+            ready_and_healthy(context, &old, &mut states, clock, &desired)?;
+            Ok(None)
         }
     }
 }
+
+fn rollback_result(transaction: &Transaction, outcome: Result<Option<String>, String>) -> Value {
+    let (status, rollback, error) = match outcome {
+        Ok(None) => ("rolled-back", "succeeded", None),
+        Ok(Some(reason)) => ("failed", "pin-restored", Some(reason)),
+        Err(reason) => ("failed", "failed", Some(reason)),
+    };
+    json!({
+        "name": transaction.name,
+        "from": transaction.candidate.current,
+        "to": transaction.candidate.version,
+        "status": status,
+        "rollback": rollback,
+        "reason": transaction.reason,
+        "rollbackError": error,
+    })
+}
+
 fn recover(
     context: &RuntimeContext,
     transaction: &mut Transaction,
@@ -934,6 +959,7 @@ fn recover(
             if cfg["dependencies"][name] != transaction.next {
                 return Err("candidate pin changed before recovery judgment".into());
             }
+            runnable_pin(&cfg, name)?;
             let next = existing(context, &cfg, name)?;
             let mut states = read_states(context)?;
             let scan = matching(&next, Unreadable::Refuse)?;
@@ -954,10 +980,8 @@ fn recover(
             }
         }
     }
-    rollback(context, transaction, clock)?;
-    Ok(
-        json!({"name":name,"from":transaction.candidate.current,"to":transaction.candidate.version,"status":"rolled-back","rollback":"succeeded","reason":transaction.reason}),
-    )
+    let outcome = rollback(context, transaction, clock)?;
+    Ok(rollback_result(transaction, Ok(outcome)))
 }
 pub(super) fn apply_pending(context: &RuntimeContext) -> Result<bool, String> {
     let state = read(context)?;
@@ -1039,7 +1063,7 @@ pub(super) fn apply_pending(context: &RuntimeContext) -> Result<bool, String> {
     let pending = read(context)?.transaction.is_some_and(|tx| {
         tx.phase != Phase::Staging
             && result["status"] != "succeeded"
-            && result["rollback"] != "succeeded"
+            && !matches!(result["rollback"].as_str(), Some("succeeded" | "pin-restored"))
     });
     finish(context, &raw, &candidate, result, !pending)?;
     Ok(!pending)

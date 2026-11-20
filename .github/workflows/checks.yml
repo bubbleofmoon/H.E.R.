@@ -236,7 +236,7 @@ jobs:
           workspaces: ${{ env.PUBLIC_TREE }}/her -> ../../her-target
           key: dsh-contract-ubuntu-22.04
           cache-on-failure: true
-      - name: Run the DSH credential contract against baseline and candidate
+      - name: Run the DSH credential contract for all listed versions
         run: python -I "$PUBLIC_TREE/scripts/ci/dsh-contract.py"
   # Windows test shards run on every push to main only; a pull request runs scans on Windows and the Linux shards.
   tests-windows:

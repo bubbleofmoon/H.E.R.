@@ -14,7 +14,7 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = '@deepseek-ai/dsh'
 REGISTRY = 'https://registry.npmjs.org/'
-VERSIONS = ('0.2.1-rc.2', '0.2.1-rc.5')
+VERSION_LIST = ROOT / 'her' / 'dsh-contract-versions.txt'
 TEST = 'dsh_credential::contract::settings_describe_cookie_contract'
 READY = re.compile(rb'^dsh web: (http://127\.0\.0\.1:[1-9][0-9]{0,4})/\S*\r?$', re.MULTILINE)
 STARTUP_SECONDS = 180
@@ -126,7 +126,10 @@ def isolated(root, node, entry, test_binary):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', choices=VERSIONS)
+    versions = VERSION_LIST.read_text(encoding='utf-8').splitlines()
+    if not versions or '' in versions or len(versions) != len(set(versions)):
+        parser.error('DSH contract versions must be a nonempty list of distinct versions')
+    parser.add_argument('--version', choices=versions)
     parser.add_argument('--filter')
     parser.add_argument('--isolated', nargs=4, type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -143,7 +146,7 @@ def main():
     unshare = tool('unshare')
     test_binary = build_test()
     failed = False
-    for version in (args.version,) if args.version else VERSIONS:
+    for version in (args.version,) if args.version else versions:
         print(f'Running dsh_contract against {PACKAGE}@{version}', flush=True)
         try:
             with tempfile.TemporaryDirectory(prefix='her-dsh-contract-', dir='/tmp') as temp:

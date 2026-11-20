@@ -2813,7 +2813,7 @@ impl DependencyMetadata16 {
         let worker=thread::spawn(move||while !done.load(std::sync::atomic::Ordering::SeqCst) {
             if let Ok((mut stream,_))=listener.accept() {
                 let _=read_request(&mut stream);
-                respond(&mut stream,200,&json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}));
+                respond(&mut stream,200,&json!({"dist-tags":{"latest":"0.2.1-rc.5"},"versions":{"0.2.1-rc.5":{}}}));
             } else {thread::sleep(Duration::from_millis(10));}
         });
         Self{url,stop,worker:Some(worker)}
@@ -2829,7 +2829,7 @@ fn update_deps_private_administrator_approves_only_after_a_confirmed_reply() {
         let feed=DependencyMetadata16::new();
         let mut rig=Rig::new(&format!("dependency-approval-{failure}"),Seed{config:json!({"update":{"policy":"notify"},"dependencies":{"dsh":{"version":"0.2.1-rc.2","registry":feed.url}}}),..Seed::default()});
         let (code,check)=rig.console("POST","/api/dependencies/check",Some(&json!({})));
-        assert_eq!(code,200,"{check}");assert_eq!(check["dependencies"]["dsh"]["available"],"0.3.0");
+        assert_eq!(code,200,"{check}");assert_eq!(check["dependencies"]["dsh"]["available"],"0.2.1-rc.5");
         rig.start();
         if failure=="success" {
             says(&rig,GROUP_KEY,OWNER,"owner","/UPDATE DEPS");
@@ -2859,8 +2859,8 @@ fn update_deps_private_administrator_approves_only_after_a_confirmed_reply() {
         says(&rig,OWNER_KEY,OWNER,"owner","/UpDaTe DePs");
         rig.wait_texts(OWNER_KEY,1);
         if failure=="success" {
-            assert!(wait_for(LONG,||rig.console("GET","/api/dependencies",None).1["approval"]["version"]=="0.3.0"));
-            let replies=rig.texts_to(OWNER_KEY).join("\n");assert!(replies.contains("0.2.1-rc.2") && replies.contains("0.3.0"));
+            assert!(wait_for(LONG,||rig.console("GET","/api/dependencies",None).1["approval"]["version"]=="0.2.1-rc.5"));
+            let replies=rig.texts_to(OWNER_KEY).join("\n");assert!(replies.contains("0.2.1-rc.2") && replies.contains("0.2.1-rc.5"));
             confirmed_report=rig.texts_to(OWNER_KEY)[0].clone();
         } else {
             // A second control command is an observable FIFO barrier, without a model turn.

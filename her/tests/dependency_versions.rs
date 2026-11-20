@@ -715,6 +715,29 @@ fn dsh_installs_at_another_version_or_in_an_npx_cache_are_refused_without_starti
 }
 
 #[test]
+fn supervisor_refuses_a_dsh_pin_without_contract_coverage() {
+    let mut fixture = Fixture::new();
+    let version = "0.3.0";
+    let script = fixture.prebuilt(&fixture.root.join("existing"), version);
+    fixture.config["dependencies"]["dsh"]["version"] = json!(version);
+    fixture.config["dependencies"]["dsh"]["script"] = json!(script);
+    fixture.save();
+    fixture.start();
+    fixture.wait(|| {
+        fixture.states()["dsh"]["state"] == "refused" || !fixture.dsh_records().is_empty()
+    });
+    let states = fixture.states();
+    assert_eq!(
+        states["dsh"]["reason"],
+        "DSH version 0.3.0 has no credential contract coverage",
+        "the supervisor must refuse a DSH pin without contract coverage: {states}"
+    );
+    assert!(fixture.dsh_records().is_empty());
+    let (_, verdict) = fixture.health("0");
+    assert_eq!(verdict["parts"]["dsh"]["reason"], states["dsh"]["reason"]);
+}
+
+#[test]
 fn a_failed_npm_install_leaves_no_versioned_folder_and_is_reported() {
     let mut fixture = Fixture::new();
     fixture.start_registry();
@@ -1151,10 +1174,10 @@ fn pins_reject_numeric_prerelease_identifiers_with_leading_zeros() {
         );
     }
     for version in ["1.2.3-0", "1.2.3-01alpha", DSH_VERSION] {
-        fixture.config["dependencies"]["dsh"]["version"] = json!(version);
+        fixture.config["dependencies"]["snowluma"]["version"] = json!(version);
         fixture.save();
         let (_, health) = fixture.health("0");
-        assert_eq!(health["parts"]["dsh"]["pinnedVersion"], version);
+        assert_eq!(health["parts"]["snowluma"]["pinnedVersion"], version);
     }
 }
 

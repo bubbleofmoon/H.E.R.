@@ -75,6 +75,27 @@ pub fn pinned_version(cfg: &Value, name: &str) -> Result<Option<String>, String>
     }
 }
 
+fn require_dsh_contract(version: &str) -> Result<(), String> {
+    if include_str!("../dsh-contract-versions.txt")
+        .lines()
+        .any(|listed| listed == version)
+    {
+        Ok(())
+    } else {
+        Err(format!("DSH version {version} has no credential contract coverage"))
+    }
+}
+
+/// Validate a pin for startup or health judgment. Process retirement uses the configured
+/// identity even when the pin is no longer eligible to run.
+pub(crate) fn runnable_pin(cfg: &Value, name: &str) -> Result<Option<String>, String> {
+    let version = pinned_version(cfg, name)?;
+    if let ("dsh", Some(version)) = (name, version.as_deref()) {
+        require_dsh_contract(version)?;
+    }
+    Ok(version)
+}
+
 struct Clock {
     epoch: i64,
     started: Instant,
@@ -898,6 +919,7 @@ fn prepare(
     name: &'static str,
     states: &mut Value,
 ) -> Result<Option<Dependency>, String> {
+    runnable_pin(cfg, name)?;
     let mut dependency = configuration(context, cfg, name)?;
     if let Some(settings) = &dependency.relay {
         relay::restrict(&settings.folder)?;
