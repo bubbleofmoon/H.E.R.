@@ -114,7 +114,7 @@ pub(crate) fn revoke_agent_token_if_current(
     expected: &str,
 ) -> Result<Option<String>, String> {
     update(context, |state| {
-        if agent_token(&state["conversations"][key]) == Some(expected) { // RED-M4
+        if agent_token(&state["conversations"][key]) != Some(expected) {
             return Ok(None);
         }
         Ok(Some(rotate_agent_token(&mut state["conversations"][key])))
