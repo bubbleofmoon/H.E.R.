@@ -86,7 +86,7 @@ pub(crate) fn queue_console_restart(context: &RuntimeContext, body: &str) -> Res
         .map_err(|_| unavailable())?;
     #[cfg(feature = "parity-clock")]
     if std::env::var_os("HER_TEST_RESTART_QUEUE_CUT").is_some_and(|path| Path::new(&path).is_file()) {
-        context.create_new_file(RuntimeArea::Data, RESTART_REQUEST, &bytes[..bytes.len()/2]).map_err(|_| unavailable())?; return Err(unavailable()); // RED-R3-M1
+        return Err(unavailable());
     }
     staged.commit(&mut || context.revalidate_atomic_target(RuntimeArea::Data, RESTART_REQUEST, &target))
         .map_err(|_| unavailable())?;
