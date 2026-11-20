@@ -1856,7 +1856,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         } else { result };
         match status {
             crate::harness::Status::Paused { .. } => self.turn_final = true,
-            crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
+            crate::harness::Status::Cancelled => self.finish_turn("failed", "harness turn cancelled"), // RED-M2
             _ => {}
         }
         // Each route request that failed over or ended the turn is an owner alert, as the DSH chain reports each failed
