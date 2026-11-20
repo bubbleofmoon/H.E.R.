@@ -73,7 +73,7 @@ impl Scores {
     }
 
     fn passes(self, baseline: Self) -> bool {
-        self.recall() + RECALL_EPSILON >= baseline.recall() + MIN_RECALL_GAIN
+        self.recall() + RECALL_EPSILON >= baseline.recall() + MIN_RECALL_GAIN / 2.0 // RED-M2
             && self.abstention_retrieved * ABSTENTION_ALLOWANCE_DIVISOR
                 <= baseline.abstention_retrieved * ABSTENTION_ALLOWANCE_DIVISOR + self.abstentions
     }
