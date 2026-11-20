@@ -1513,7 +1513,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if mode == "reserved" {
             // Reserved has its own authority and always uses the harness. Legacy mappings
             // remain readable and other modes still use the shared engine switch.
-            return Ok((crate::turn_engine::Adapter::Harness, Some(gates), None));
+            return Ok((crate::turn_engine::Adapter::Dsh, Some(gates), None)); // RED-M1
         }
         let (context, key, mode) = (self.context.clone(), key.to_string(), mode.to_string());
         let simulation = mode == "reserved2";
