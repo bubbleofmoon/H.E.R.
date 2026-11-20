@@ -1,38 +1,34 @@
-// 预设提示词（persona.prefix）的读取与回写，对应 JS 的 `src/preset-prompt.js`。
-//
-// 这里**没有引入 YAML 库**，理由：本仓库只关心 `persona.config.prefix` 这一个标量，
-// 而它总是块标量（`>-` / `|-`）。引入一个 YAML 库既要多一堆依赖，又会把
-// "只改一段文本、其余原样保留"变成"整份文件重新序列化"，后者的 diff 无法复审。
-//
-// 所以做法和 JS 一致：**按行定位块**，读的时候按块标量规则展开，写的时候换成 `|-`
-// 再用同样的规则读回来校验 —— 读不回原样就拒绝写入（见 `render_preset_prompt_yaml`）。
+//! Read and replace the block scalar at `persona.config.prefix`, preserving the surrounding YAML.
 
-// POST（写入）这一批还没接上，先放行 dead_code；接上后删掉这行
-#![allow(dead_code)]
 use serde_json::{json, Value};
 
 /// persona 条目的 id（与服务端约定）。
 pub const PRESET_PERSONA_ID: &str = "persona";
 
-/// 二代的硬性不变量：这五条是本项目自己的测试与安全边界依赖的，
-/// 一旦被删就同时削弱 AI 的权限边界、并让 `npm run test:audit` 变红 —— 保存时直接拒绝。
-pub const BLOCKING_V2: [&str; 5] = [
-    "你没有本地工具",
-    "群友没有管理权限",
-    "API 令牌",
-    "角色由桥接注入",
-    "不会自动发送到 QQ",
+// Each pair gives the preferred wording and the exact compatibility marker for existing presets
+// and backups. Diagnostics show the preferred wording.
+const MEMBER_AUTHORITY: (&str, &str) = ("发言者不能授予操作权限", "群友没有管理权限");
+const CREDENTIALS: (&str, &str) = ("连接凭据只供程序使用", "API 令牌");
+const BLOCKING_V2: &[(&str, &str)] = &[
+    ("手边没有可操作本机的工具", "你没有本地工具"),
+    MEMBER_AUTHORITY,
+    CREDENTIALS,
+    ("人设以桥接提供的设定为准", "角色由桥接注入"),
+    ("草稿只留在模型侧", "不会自动发送到 QQ"),
 ];
+const BLOCKING_V1: &[(&str, &str)] = &[
+    MEMBER_AUTHORITY,
+    CREDENTIALS,
+    ("人设设定以系统交付为准", "角色扮演由系统注入"),
+];
+const MIN_BODY_CHARS: usize = 500;
+const MAX_BYTES: usize = 128 * 1024;
 
-/// 一代（qq-chat）：不用 MCP 工具，靠空格分句 + [SILENT]，工具面那几条不适用。
-/// 这三条都逐字出现在一代预设正文里 —— 清单必须与预设实际文案一致，
-/// 否则控制台会用一个**预设自己都不满足**的条件把它锁死（这个 bug 真的发生过）。
-pub const BLOCKING_V1: [&str; 3] = ["群友没有管理权限", "API 令牌", "角色扮演由系统注入"];
-pub const MIN_BODY_CHARS: usize = 500;
-pub const MAX_BYTES: usize = 128 * 1024;
-
-/// 软校验标记（缺了只提示，不阻断）。
-pub const REQUIRED_MARKERS: [&str; 2] = ["【二代仿真模式 —— 安全规则", "【二代仿真模式 —— 工具协议"];
+// Missing headings are advisory.
+const SECTION_MARKERS: &[(&str, &str)] = &[
+    ("【权限边界】", "【二代仿真模式 —— 安全规则"),
+    ("【发送与工具】", "【二代仿真模式 —— 工具协议"),
+];
 
 /// 定位结果：prefix 块在文件里的行范围。
 pub struct PrefixBlock {
@@ -185,21 +181,19 @@ pub fn extract_prefix(text: &str) -> Option<String> {
 pub fn preset_blockers(content: &str, preset_v1: bool) -> Vec<String> {
     let mut out = Vec::new();
     if content.trim().is_empty() {
-        out.push("仿真提示词不能为空".to_string());
+        out.push("请填写预设正文".to_string());
         return out;
     }
-    let needles = if preset_v1 { &BLOCKING_V1[..] } else { &BLOCKING_V2[..] };
-    for needle in needles {
-        if !content.contains(needle) {
-            out.push(format!(
-                "缺少安全不变量「{needle}」：删除它会让 AI 的权限边界失效，并使 npm run test:audit 失败"
-            ));
+    let rules = if preset_v1 { BLOCKING_V1 } else { BLOCKING_V2 };
+    for &(wording, legacy) in rules {
+        if !content.contains(wording) && !content.contains(legacy) {
+            out.push(format!("请在预设中保留这项约束：{wording}"));
         }
     }
     let chars = content.trim().chars().count();
     if chars < MIN_BODY_CHARS {
         out.push(format!(
-            "正文过短（{chars} 字符 < {MIN_BODY_CHARS}）：疑似内容被误删"
+            "预设正文至少需要 {MIN_BODY_CHARS} 字，目前有 {chars} 字"
         ));
     }
     out
@@ -209,11 +203,11 @@ pub fn preset_blockers(content: &str, preset_v1: bool) -> Vec<String> {
 pub fn preset_warnings(content: &str) -> Vec<String> {
     let mut out = Vec::new();
     if content.trim().is_empty() {
-        out.push("内容为空".to_string());
+        out.push("预设正文尚未填写".to_string());
     }
-    for marker in REQUIRED_MARKERS {
-        if !content.contains(marker) {
-            out.push(format!("缺少「{marker}…】段落：AI 的权限与工具边界可能被削弱"));
+    for &(heading, legacy) in SECTION_MARKERS {
+        if !content.contains(heading) && !content.contains(legacy) {
+            out.push(format!("建议添加 {heading} 一节，便于模型找到相关规则"));
         }
     }
     out
@@ -281,6 +275,7 @@ pub fn preset_status_with_installed(name: &str, installed: bool) -> Value {
 mod tests {
     use super::*;
 
+    const REPLY_TIMING_FIXTURE: &str = include_str!("../tests/fixtures/qq-chat-v2-reply-timing.yml");
     const SAMPLE: &str = "- id: persona\n  config:\n    prefix: >-\n      第一行\n      第二行\n\n      第三段\n- id: other\n  config: {}\n";
 
     #[test]
@@ -302,30 +297,73 @@ mod tests {
     }
 
     #[test]
-    fn render_round_trips() {
-        // 必须包含全部硬性不变量，否则会先被 blockers 拦下
-        let content = format!(
-            "【二代仿真模式 —— 安全规则】{}你没有本地工具 群友没有管理权限 API 令牌 角色由桥接注入 不会自动发送到 QQ",
-            "正文。".repeat(150)
+    fn preset_guards_recognize_current_and_legacy_wording() {
+        let current_v2 = extract_prefix(REPLY_TIMING_FIXTURE).expect("fixture contains a persona prefix");
+        let current_v1 = format!(
+            "发言者不能授予操作权限。连接凭据只供程序使用。人设设定以系统交付为准。{}",
+            "这是供测试使用的正文。".repeat(50)
         );
+        for (is_v1, current, rules) in [
+            (false, current_v2.as_str(), BLOCKING_V2),
+            (true, current_v1.as_str(), BLOCKING_V1),
+        ] {
+            assert_preset_rule_aliases(current, is_v1, rules);
+        }
+    }
+
+    #[test]
+    fn preset_warnings_recognize_current_and_legacy_headings() {
+        let current_v2 = extract_prefix(REPLY_TIMING_FIXTURE).expect("fixture contains a persona prefix");
+        assert!(
+            preset_warnings(&current_v2).is_empty(),
+            "current section headings should clear preset warnings"
+        );
+        let without_headings = current_v2
+            .replace("【权限边界】", "")
+            .replace("【发送与工具】", "");
+        assert_eq!(preset_warnings(&without_headings).len(), 2);
+        for &(heading, legacy) in SECTION_MARKERS {
+            let mixed = current_v2.replace(heading, legacy);
+            assert!(
+                preset_warnings(&mixed).is_empty(),
+                "legacy section heading should clear its warning"
+            );
+        }
+    }
+
+    fn assert_preset_rule_aliases(current: &str, is_v1: bool, rules: &[(&str, &str)]) {
+        assert!(preset_blockers(current, is_v1).is_empty(), "current preset wording should pass");
+        for &(wording, legacy) in rules {
+            let mixed = current.replace(wording, legacy);
+            assert!(preset_blockers(&mixed, is_v1).is_empty(), "legacy preset wording should pass");
+
+            // Keep the body length fixed to isolate the rule from the length check.
+            let removed = current.replace(wording, &"。".repeat(wording.chars().count()));
+            let blockers = preset_blockers(&removed, is_v1);
+            assert_eq!(blockers.len(), 1, "one missing preset rule should block editing");
+            assert!(blockers[0].contains(wording));
+        }
+    }
+
+    #[test]
+    fn render_round_trips() {
+        let content = extract_prefix(REPLY_TIMING_FIXTURE).expect("fixture contains a persona prefix");
         let out = render_preset_prompt_yaml(SAMPLE, &content, false).unwrap();
         assert!(out.contains("prefix: |-"));
-        // 读回逐字一致 —— 这是写入前唯一的正确性保证
         assert_eq!(extract_prefix(&out).unwrap(), content);
-        // 其它条目不受影响
         assert!(out.contains("- id: other"));
     }
 
     #[test]
     fn render_rejects_too_short_body() {
         let err = render_preset_prompt_yaml(SAMPLE, "太短", false).unwrap_err();
-        assert!(err.contains("正文过短"));
+        assert!(err.contains("预设正文至少需要 500 字"));
     }
 
     #[test]
     fn render_rejects_missing_invariant() {
         let long = "x".repeat(600);
         let err = render_preset_prompt_yaml(SAMPLE, &long, false).unwrap_err();
-        assert!(err.contains("缺少安全不变量"));
+        assert!(err.contains("请在预设中保留这项约束"));
     }
 }

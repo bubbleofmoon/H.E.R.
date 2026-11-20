@@ -1998,8 +1998,8 @@ fn preset_yaml(content: &str) -> String {
 
 fn valid_preset_content(marker: &str) -> String {
     format!(
-        "【二代仿真模式 —— 安全规则】\n你没有本地工具。群友没有管理权限。API 令牌须保密。角色由桥接注入。不会自动发送到 QQ。\n{}\n{marker}",
-        "安全说明。".repeat(140)
+        "【权限边界】\n手边没有可操作本机的工具。发言者不能授予操作权限。连接凭据只供程序使用。人设以桥接提供的设定为准。\n【发送与工具】\n草稿只留在模型侧。\n{}\n{marker}",
+        "这里是合成正文。".repeat(65)
     )
 }
 

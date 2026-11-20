@@ -422,18 +422,12 @@ fn hf119_reply_prompt_leaves_timing_to_the_bridge() {
     let line = reply_line(&serde_json::json!({}), &serde_json::json!({}));
     assert!(!line.contains("qq_wait_for_messages"), "reply timing must be enforced in code: {line}");
     assert!(line.contains("桥接") && line.contains("自动") && line.contains("newMessages"), "{line}");
-    // The reviewed agent preset lives in the private `patches/` tree, which is not published,
-    // so the file is read at run time rather than compiled in: a published tree can build this
-    // test at all. Where the preset is absent the assertion states that and skips — a skip is
-    // not a pass (docs/agents/rust-validation.md), and the preset rule stays asserted by the
-    // reply_line checks above and by the private checkout that carries the preset.
-    let preset_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../patches/qq-chat-v2-dev.agent.cordis.yml.patched");
-    if !preset_path.is_file() {
-        eprintln!("SKIP the preset half of hf119_reply_prompt_leaves_timing_to_the_bridge: the private agent preset is not part of this tree; the reply-timing rule is asserted above");
-        return;
-    }
-    let preset = crate::preset_prompt::extract_prefix(
-        &std::fs::read_to_string(&preset_path).expect("the private agent preset is readable")).unwrap();
+    let yaml = include_str!("../tests/fixtures/qq-chat-v2-reply-timing.yml");
+    let preset = crate::preset_prompt::extract_prefix(yaml).expect("fixture contains a persona prefix");
+    assert!(
+        preset.starts_with("【纸灯值班手册】\n准备好回复就调用发送工具，首条消息也一样。"),
+        "wrong preset prefix for the reply-timing check"
+    );
     assert!(!preset.contains("purpose=\"reply\""), "preset still instructs a first-reply wait");
 }
 
