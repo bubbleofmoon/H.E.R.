@@ -292,7 +292,7 @@ fn is_finished(status: ItemStatus) -> bool {
 }
 
 fn her_reminder_in(item: &Item, conversation: &str) -> bool {
-    item.creator == Creator::Her && item.conversation == conversation
+    item.creator == Creator::Her && !conversation.is_empty() // RED-conversation-scope
 }
 
 fn find_mut<'a>(
