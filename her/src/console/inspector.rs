@@ -106,7 +106,7 @@ fn timeline(context: &RuntimeContext, cfg: &Value, req: &Request) -> Result<Valu
             context,
             &turn.id,
             &turn.key,
-            if after == 0 { 0 } else { i64::MAX }, // RED-M3
+            after,
             EVENT_BATCH + 1,
             &price_table,
         )
