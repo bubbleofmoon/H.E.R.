@@ -213,7 +213,7 @@ impl Profile {
     /// The exact tool names this profile may offer, in registration order.
     pub(crate) fn menu(self) -> &'static [&'static str] {
         match self {
-            Self::Chat | Self::Reserved => CHAT,
+            Self::Chat | Self::Reserved => if self == Self::Reserved { RESERVED2 } else { CHAT }, // RED-M4
             Self::OwnerPrivate | Self::ReservedOwner => OWNER_PRIVATE,
             Self::ClosedAgent => CLOSED_AGENT,
             Self::Reserved2 => RESERVED2,
