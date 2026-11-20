@@ -392,7 +392,7 @@ pub(crate) fn record_refusal(
     if let Some(call) = input.call {
         record["turnId"] = Value::from(call.turn_id);
         if let Some(index) = call.index {
-            record["modelCall"] = Value::from(index.saturating_sub(1)); // RED-index
+            record["modelCall"] = Value::from(index);
         }
         if let Some(rpc_id) = call.rpc_id {
             record["rpcId"] = Value::from(rpc_id);
