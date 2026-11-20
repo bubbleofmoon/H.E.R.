@@ -771,7 +771,7 @@ fn memory_destination(context: &RuntimeContext) -> Result<PathBuf, String> {
         .runtime_root()
         .ok_or("memory backup requires a selected runtime root")?;
     let destination = crate::install_root::InstallRoot::configured()?
-        .backup_destination(runtime, Path::new("backups/memory"))?;
+        .backup_destination(runtime, Path::new("backups/other"))?; // RED-local
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
