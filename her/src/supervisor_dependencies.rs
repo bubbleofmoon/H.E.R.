@@ -1478,7 +1478,14 @@ fn stop_hung(
     states: &mut Value,
     clock: &Clock,
     desired: &lifecycle::DesiredRead,
+    had_listener: bool,
 ) -> Result<ReconcileStatus, String> {
+    // The relay verdict was observed during monitoring. Use the normal TCP
+    // timeout for the SnowLuma and DSH recheck before taking the lifecycle gate.
+    let tcp_recheck = dependency
+        .relay
+        .is_none()
+        .then(|| listening(dependency, CONNECT_TIMEOUT));
     let path = context
         .resolve_path(
             RuntimeArea::Data,
@@ -1490,7 +1497,11 @@ fn stop_hung(
     if !same_desired(context, desired) {
         return Ok(ReconcileStatus::Waiting);
     }
-    if holder(dependency)?.is_some_and(|owner| !identity::same_identity(&owner, found)) {
+    let listener = holder(dependency)?;
+    if listener
+        .as_ref()
+        .is_some_and(|owner| !identity::same_identity(owner, found))
+    {
         return Err(format!(
             "{} listener changed before hang recovery; left alone",
             dependency.name
@@ -1503,11 +1514,15 @@ fn stop_hung(
             dependency.name
         ));
     }
-    // The relay verdict was observed outside the lifecycle gate. For dependencies
-    // that only check TCP, keep the recovery recheck shorter than the gate wait.
-    if dependency.relay.is_none() && listening(dependency, Duration::from_millis(500))? {
-        healthy(states, dependency.name, clock.now(context));
-        return Ok(ReconcileStatus::Ready);
+    if let Some(tcp_recheck) = tcp_recheck {
+        if tcp_recheck? {
+            healthy(states, dependency.name, clock.now(context));
+            return Ok(ReconcileStatus::Ready);
+        }
+        if !had_listener && listener.is_some() {
+            // The dependency may have opened its endpoint since the TCP recheck.
+            return Ok(ReconcileStatus::Waiting);
+        }
     }
     match identity::kill_verified(found) {
         identity::KillOutcome::Killed | identity::KillOutcome::Gone => {
@@ -1680,11 +1695,12 @@ fn reconcile_one(
             }
         }
     }
-    if let Some(found) = holder(dependency)? {
+    let listener = holder(dependency)?;
+    if let Some(found) = &listener {
         if !serde_json::from_value::<ProcessIdentity>(states[name]["identity"].clone())
-            .is_ok_and(|recorded| identity::same_identity(&found, &recorded))
+            .is_ok_and(|recorded| identity::same_identity(found, &recorded))
         {
-            remember(states, name, "adopted", &found, clock.now(context));
+            remember(states, name, "adopted", found, clock.now(context));
         }
     }
     if !states[name]["identity"].is_object() {
@@ -1720,7 +1736,15 @@ fn reconcile_one(
     states[name]["refusalSince"] = json!(since);
     states[name]["healthySince"] = Value::Null;
     if now.saturating_sub(since) >= 120_000 {
-        return stop_hung(context, dependency, &found, states, clock, desired);
+        return stop_hung(
+            context,
+            dependency,
+            &found,
+            states,
+            clock,
+            desired,
+            listener.is_some(),
+        );
     }
     if let PortHealth::ProbeFailed(refusal) = port {
         return Ok(refusal.map_or(ReconcileStatus::Waiting, ReconcileStatus::RelayRefused));
