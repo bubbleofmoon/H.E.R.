@@ -705,10 +705,16 @@ fn closed_agent_cancels_undelivered_question_without_blocking_other_sends() {
     }), "the acknowledgement did not release the send chain");
     // Give the queued notification a head start before the independent command send.
     thread::sleep(Duration::from_millis(500));
-    says(&rig, "private:7707", STRANGER, "stranger", "/update");
-    assert!(wait_for(Duration::from_secs(3), || {
-        rig.texts_to("private:7707") == ["更新命令仅限管理员私聊。"]
-    }), "the independent send stalled behind the question's gate wait");
+    // /persona replies before closed-agent answer handling and requires no release admission.
+    let independent_reply = "closed-agent 模式不使用人设，人设未改变。";
+    says(&rig, OWNER_KEY, OWNER, "owner", "/persona");
+    assert!(
+        wait_for(Duration::from_secs(3), || {
+            rig.texts_to(OWNER_KEY) == ["hold delivery chain", independent_reply]
+        }),
+        "the independent send stalled behind the question's gate wait: {:?}",
+        rig.sends()
+    );
 
     assert!(
         wait_for(Duration::from_secs(14), || !rig.dsh.calls("$events/result").is_empty()),
@@ -725,7 +731,7 @@ fn closed_agent_cancels_undelivered_question_without_blocking_other_sends() {
         "the undelivered question remained pending after cancellation"
     );
     wait_pending(&rig, json!({"pending":[]}));
-    assert_eq!(rig.texts_to(OWNER_KEY), ["hold delivery chain"]);
+    assert_eq!(rig.texts_to(OWNER_KEY), ["hold delivery chain", independent_reply]);
 }
 
 #[test]

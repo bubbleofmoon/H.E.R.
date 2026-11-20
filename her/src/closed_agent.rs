@@ -596,14 +596,13 @@ impl Hub {
                 },
                 || loop {
                     // Pending state, then the file gate, then the send chain, as in answer and
-                    // reap. Wait for the gate outside the chain and leave the gate free for
-                    // settings while another send owns the chain.
+                    // reap. Retry with the file gate released so settings can refresh.
                     let gate = lock(&context)?;
                     if let Some(chain) = crate::recorded_send::try_send_chain() {
                         return Ok((chain, gate));
                     }
                     drop(gate);
-                    drop(crate::recorded_send::send_chain());
+                    std::thread::sleep(Duration::from_millis(10));
                 },
             )
         };
