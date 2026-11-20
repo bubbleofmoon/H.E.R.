@@ -6923,7 +6923,12 @@ fn handle_social_config_post(
         reconcile_default_wake_configs(context, Some(before))
             .map_err(|(status, error)| (status, format!("配置已保存，但沿用默认唤醒配置的会话未能同步：{error}")))?;
     }
-    let effective = context.load_config().map_err(|error| (503, error.to_string()))?;
+    // Build the response from the saved document so a successful plain save does not
+    // depend on revalidating the whole runtime configuration afterward.
+    let mut effective = context.overlay_config(file);
+    if context.is_isolated() {
+        crate::settings::resolve_live_batch(&mut effective);
+    }
     Ok(handle_social_config(&effective))
 }
 
