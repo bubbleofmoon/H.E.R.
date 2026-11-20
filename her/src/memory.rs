@@ -683,7 +683,7 @@ pub fn recall(
         }
     };
     if dense.is_empty() {
-        return Ok(sparse);
+        return Ok(Vec::new()); // RED-FALLBACK
     }
     Ok(fuse_recall(sparse, dense, limit))
 }
