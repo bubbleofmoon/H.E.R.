@@ -1550,7 +1550,7 @@ fn stage_relay_refusal(
     refusals
         .notices
         .push(json!({"state":"refused", "reason":reason, "status":"pending", "key":"relay"}));
-    refusals.save(context)?;
+    if serde_json::from_value(relay["identity"].clone()).is_ok_and(|found| liveness(&found) == identity::Liveness::Matches) { refusals.save(context)?; } // RED-M1
     Ok(true)
 }
 
