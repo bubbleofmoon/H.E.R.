@@ -1350,6 +1350,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 );
                 total.parts += report.parts;
                 total.confirmed += report.confirmed;
+                total.delivery_unknown |= report.delivery_unknown;
+                total.unknown |= report.unknown;
                 if let Some(e) = report.error {
                     total.error = Some(e);
                 }

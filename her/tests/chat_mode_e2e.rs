@@ -735,6 +735,131 @@ fn closed_agent_cancels_undelivered_question_without_blocking_other_sends() {
 }
 
 #[test]
+fn refused_approval_is_cancelled_when_outbox_write_fails() {
+    let mut rig = Rig::new("closed-refusal-outbox", Seed { mode: "closed-agent", ..Seed::default() });
+    let outbox = rig.root.join("data/send-outbox.jsonl");
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"].as_str()?.contains("file_write") {
+            // The attempt is durable. Fail the next append before returning the definite refusal.
+            fs::rename(&outbox, outbox.with_extension("saved")).unwrap();
+            fs::create_dir(&outbox).unwrap();
+            return Some(json!({"status":"failed","retcode":1400}));
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL#");
+    assert!(wait_for(Duration::from_secs(10), || rig.root.join("data/send-outbox.jsonl").is_dir()));
+    assert!(wait_for(Duration::from_secs(5), || !rig.dsh.calls("$events/result").is_empty()),
+        "the refused approval stayed active after its outbox write failed");
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    assert_eq!(rig.data_json("pending-interactions.json"), json!([]));
+}
+
+/// Register an approval while the fake gateway holds the acknowledgement's send chain.
+fn queue_approval_behind_ack(rig: &mut Rig) -> (std::sync::mpsc::Sender<()>, Instant) {
+    let (release, held) = std::sync::mpsc::channel();
+    let held = Mutex::new(held);
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"] == ACK {
+            let _ = lock(&held).recv_timeout(Duration::from_secs(15));
+        }
+        None
+    }));
+    rig.start();
+    says(rig, OWNER_KEY, OWNER, "owner", "#SLOW#");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 1), [ACK]);
+    let queued = Instant::now();
+    lock(&rig.dsh.inner).interactions.push(json!({
+        "type":"waterfall", "event":"approval/request", "agentId":"fake-session-1",
+        "eventId":"queued-approval", "request":{"toolName":"queued_tool"}
+    }));
+    assert!(wait_for(Duration::from_secs(4), || {
+        rig.data_json("pending-interactions.json")[0]["display"]["toolName"] == "queued_tool"
+    }), "approval did not register while the acknowledgement was held");
+    (release, queued)
+}
+
+#[test]
+fn config_read_failure_clears_undelivered_approval() {
+    let mut rig = Rig::new("closed-config-failure", Seed { mode: "closed-agent", ..Seed::default() });
+    let (release, _) = queue_approval_behind_ack(&mut rig);
+    let config = rig.root.join("config/config.json");
+    let saved = fs::read(&config).unwrap();
+    fs::write(&config, b"{").unwrap();
+    lock(&rig.dsh.inner).hold_result_response = true;
+    drop(release);
+    let cancelled = wait_for(Duration::from_secs(5), || !rig.dsh.calls("$events/result").is_empty());
+    // A later reap sends its receipt before publishing its snapshot. Hold the response
+    // to distinguish that fallback from registration retiring the unseen approval itself.
+    let snapshot = rig.data_json("pending-interactions.json");
+    lock(&rig.dsh.inner).hold_result_response = false;
+    fs::write(&config, saved).unwrap();
+    assert!(cancelled, "no cancellation receipt during the config failure");
+    assert_eq!(snapshot, json!([]), "registration left the undelivered approval pending");
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    wait_pending(&rig, json!({"pending":[]}));
+    assert!(!rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("queued_tool")));
+}
+
+#[test]
+fn queued_approval_expires_while_send_chain_is_held() {
+    let mut rig = Rig::new("closed-chain-expiry", Seed {
+        mode: "closed-agent", config: json!({"questionTimeoutMs":2000}), ..Seed::default()
+    });
+    let (release, queued) = queue_approval_behind_ack(&mut rig);
+    assert!(wait_for(Duration::from_secs(4), || !rig.dsh.calls("$events/result").is_empty()),
+        "the expired approval waited for the send chain");
+    assert!(queued.elapsed() >= Duration::from_secs(2), "the queued approval was cancelled before its deadline");
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    assert_eq!(rig.data_json("pending-interactions.json"), json!([]));
+    assert_eq!(rig.texts_to(OWNER_KEY), [ACK]);
+    drop(release);
+}
+
+#[test]
+fn cancellation_keeps_pump_running_and_closes_trickling_receipt() {
+    let mut rig = Rig::new("closed-cancel-trickle", Seed {
+        mode: "closed-agent", config: json!({"questionTimeoutMs":3000}), ..Seed::default()
+    });
+    let (closed, disconnected) = std::sync::mpsc::channel();
+    lock(&rig.dsh.inner).trickle_next_result = Some(closed);
+    lock(&rig.gateway).intercept = Some(Arc::new(|action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"].as_str()?.contains("file_write") {
+            Some(json!({"status":"failed","retcode":1400}))
+        } else {
+            None
+        }
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#APPROVAL# #SLOW#");
+    assert!(wait_for(Duration::from_secs(10), || !rig.dsh.calls("$events/result").is_empty()));
+    let receipt_seen = Instant::now();
+    assert_eq!(rig.dsh.calls("$events/result")[0]["outcome"]["value"], "rejected");
+    {
+        let mut inner = lock(&rig.dsh.inner);
+        inner.settings = json!({"namespaces":[{"ns":"qq-mode","user":{"mode":"closed-agent","ownerQQ":OWNER}}]});
+        inner.interactions.push(json!({
+            "type":"waterfall", "event":"user-questions/request", "agentId":"fake-session-1",
+            "eventId":"during-cancellation", "request":{"questions":[{"id":"q2","question":"Second question"}]}
+        }));
+    }
+    assert!(wait_for(Duration::from_secs(7), || {
+        rig.data_json("closed-agent-owner.json")["ownerQQ"] == json!(OWNER)
+    }), "policy refresh stalled during cancellation");
+    assert!(wait_for(Duration::from_secs(5), || rig.dsh.calls("$events/result").len() == 2),
+        "the second question did not expire during cancellation");
+    assert_eq!(rig.dsh.calls("$events/result")[1]["eventId"], "during-cancellation");
+    assert_eq!(rig.dsh.calls("$events/result")[1]["outcome"]["value"], json!({"answers":[]}));
+    assert!(rig.texts_to(OWNER_KEY).iter().any(|text| text.contains("Second question")));
+    assert!(matches!(disconnected.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+        "the cancellation response ended before both pump timers ran");
+    let remaining = Duration::from_secs(32).saturating_sub(receipt_seen.elapsed());
+    assert!(disconnected.recv_timeout(remaining).is_ok(),
+        "the bridge did not close the trickling receipt at its total deadline");
+}
+
+#[test]
 fn closed_agent_expiry_notice_is_sent_after_the_original_turn_ended() {
     for (tag, marker) in [("question", "#QUESTION#"), ("approval", "#APPROVAL#")] {
         let mut rig = Rig::new(&format!("closed-expiry-after-end-{tag}"), Seed { mode: "closed-agent", config: json!({"questionTimeoutMs":6000}), ..Seed::default() });

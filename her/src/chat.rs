@@ -583,6 +583,9 @@ pub struct SendReport {
     pub parts: usize,
     pub confirmed: usize,
     pub error: Option<String>,
+    /// At least one part may have reached QQ without confirmation.
+    pub delivery_unknown: bool,
+    /// Recovery lacks durable proof of at least one outcome.
     pub unknown: bool,
 }
 
@@ -719,7 +722,8 @@ fn send_recorded_inline<Locks>(
         }
         let outcome = ob.send_one_outcome(&target, part, None, None);
         let settled = recorded.settle(idx, attempt_ms, outcome, &history, Proof::Text(part), &confirmed_ids);
-        report.unknown |= settled.state.needs_verification() || settled.record_error.is_some();
+        report.delivery_unknown |= settled.state.needs_verification();
+        report.unknown |= report.delivery_unknown || settled.record_error.is_some();
         if let ItemState::Confirmed { message_id, .. } = settled.state {
             report.confirmed += 1;
             confirmed_ids.extend(message_id);

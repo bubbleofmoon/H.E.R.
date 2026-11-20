@@ -16,16 +16,20 @@ const OWNER: &str = "closed-agent-owner.json";
 
 /// Serialize a receipt against console mode changes and session resets in another process.
 pub fn lock(context: &RuntimeContext) -> Result<std::fs::File, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match context.open_locked_file(RuntimeArea::Data, "locks/closed-agent.lock") {
-            Ok(file) => return Ok(file),
-            Err(e) if e == "runtime file is already locked" && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10))
-            }
-            Err(e) => return Err(format!("closed-agent interaction lock unavailable: {e}")),
+    lock_until(context, Instant::now() + GATE_TIMEOUT)
+}
+
+const GATE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_RETRY: Duration = Duration::from_millis(10);
+
+fn lock_until(context: &RuntimeContext, deadline: Instant) -> Result<std::fs::File, String> {
+    while Instant::now() < deadline {
+        if let Some(file) = try_lock(context)? {
+            return Ok(file);
         }
+        std::thread::sleep(LOCK_RETRY.min(deadline.saturating_duration_since(Instant::now())));
     }
+    Err("closed-agent interaction lock unavailable: deadline reached".into())
 }
 
 /// How long a live-process answer or registration waits for the gate. A console mode write holds
@@ -84,6 +88,18 @@ impl Pending {
             item["status"] = json!("outcome-unknown");
         }
         item
+    }
+
+    fn receipt(&self, value: Value) -> Value {
+        json!({"clientId":self.client,"eventId":self.event,"outcome":{"kind":"result","value":value}})
+    }
+
+    fn cancellation_value(&self) -> Value {
+        if self.kind == "question" {
+            json!({"answers":[]})
+        } else {
+            json!("rejected")
+        }
     }
 
     fn valid(&self, context: &RuntimeContext) -> bool {
@@ -336,18 +352,28 @@ impl Hub {
     }
 
     fn respond(&self, p: &Pending, value: Value) -> Result<(), String> {
-        self.rpc()?.call("$events/result", json!({"clientId":p.client,"eventId":p.event,"outcome":{"kind":"result","value":value}})).map(|_| ())
+        self.rpc()?.call("$events/result", p.receipt(value)).map(|_| ())
     }
 
     fn cancel(&self, p: &Pending) {
-        let result = if p.kind == "question" {
-            json!({"answers":[]})
-        } else {
-            json!("rejected")
-        };
-        if let Err(e) = self.respond(p, result) {
+        if let Err(e) = self.respond(p, p.cancellation_value()) {
             eprintln!("[closed-agent] cancellation receipt failed: {e}");
         }
+    }
+
+    fn cancel_undelivered(self: &Arc<Self>, p: &Pending) {
+        let hub = Arc::clone(self);
+        let payload = p.receipt(p.cancellation_value());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let cancel = move || {
+            let result = hub.rpc().and_then(|rpc| {
+                rpc.call_with_cancellation("$events/result", payload, deadline, &|| false)
+            });
+            if let Err(error) = result {
+                eprintln!("[closed-agent] cancellation receipt failed: {error}");
+            }
+        };
+        tokio::task::spawn_blocking(cancel);
     }
 
     fn say(&self, p: &Pending, text: &str) {
@@ -414,7 +440,7 @@ impl Hub {
         report
     }
 
-    async fn register(&self, client: &str, frame: &Value) {
+    async fn register(self: &Arc<Self>, client: &str, frame: &Value) {
         let Some(session) = frame.get("agentId").and_then(Value::as_str) else {
             return;
         };
@@ -511,7 +537,8 @@ impl Hub {
             Ok(gate) => gate,
             Err(e) => {
                 eprintln!("[closed-agent] question not registered: {e}");
-                self.cancel(&p);
+                drop(state);
+                self.cancel_undelivered(&p);
                 return;
             }
         };
@@ -529,7 +556,9 @@ impl Hub {
         state.entries.insert(key, p.clone());
         if let Err(e) = self.save(&state) {
             state.entries.remove(&p.key);
-            self.cancel(&p);
+            drop(gate);
+            drop(state);
+            self.cancel_undelivered(&p);
             eprintln!("[closed-agent] pending state write failed: {e}");
             return;
         }
@@ -597,12 +626,15 @@ impl Hub {
                 || loop {
                     // Pending state, then the file gate, then the send chain, as in answer and
                     // reap. Retry with the file gate released so settings can refresh.
-                    let gate = lock(&context)?;
+                    let gate_deadline = Instant::now() + GATE_TIMEOUT;
+                    let deadline = pending.expires.min(gate_deadline);
+                    let gate = lock_until(&context, deadline)?;
                     if let Some(chain) = crate::recorded_send::try_send_chain() {
                         return Ok((chain, gate));
                     }
                     drop(gate);
-                    std::thread::sleep(Duration::from_millis(10));
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(LOCK_RETRY.min(remaining));
                 },
             )
         };
@@ -614,12 +646,13 @@ impl Hub {
             }
         };
         // A partial or uncertain delivery may still give the owner a question to answer.
-        if report.confirmed == 0 && !report.unknown && p.valid(&self.context) {
+        if report.confirmed == 0 && !report.delivery_unknown {
             state.entries.remove(&p.key);
             if let Err(error) = self.save(&state) {
                 eprintln!("[closed-agent] pending state write failed: {error}");
             }
-            self.cancel(&p);
+            drop(state);
+            self.cancel_undelivered(&p);
         }
     }
 
@@ -884,7 +917,7 @@ impl Hub {
         }
     }
 
-    async fn stream(&self, traffic: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    async fn stream(self: &Arc<Self>, traffic: &std::sync::atomic::AtomicBool) -> Result<(), String> {
         let rpc = self.rpc()?;
         let url = format!(
             "{}/api/remote.mux",
