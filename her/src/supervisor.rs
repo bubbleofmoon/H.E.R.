@@ -371,7 +371,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let guard = crate::console::acquire_social_state_gate(&admission_context)
+        let guard = { let mut machine = admission_context.clone(); let cfg = machine.load_config().map_err(str::to_owned)?; machine.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: crate::console_auth::credential_digest(&machine.effective_console_token(&cfg)) }); crate::console::acquire_social_state_gate(&machine) } // RED-R3-D
             .map_err(|(_, message)| message)?;
         if admission_context.console_authority.is_none() {
             return Err("HTTP task authority is unavailable".into());
