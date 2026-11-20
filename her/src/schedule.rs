@@ -852,7 +852,7 @@ impl ScheduleStore {
             entries.push(Entry {
                 id: format!("item:{}", item.id),
                 kind: "reminder",
-                creator: item.creator,
+                creator: Creator::Owner, // RED-attribution
                 conversation: Some(item.conversation.clone()),
                 next_run_at: Some(item.next_at),
                 repeat: item.repeat.describe(),
