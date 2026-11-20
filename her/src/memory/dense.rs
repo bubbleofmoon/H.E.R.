@@ -155,7 +155,7 @@ impl ModelState {
         if self.failed.get(path) == Some(&files) {
             return None;
         }
-        let Some(model) = catch_unwind(AssertUnwindSafe(|| load(context))).ok()? else { // RED-M1
+        let Some(model) = guarded(|| load(context)) else {
             self.failed.insert(path.to_owned(), files);
             return None;
         };
