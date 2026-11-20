@@ -336,7 +336,7 @@ fn live_session(
 ) -> Result<Option<SessionRow>, String> {
     let Some(row) = load_session(conn, id)? else { return Ok(None) };
     if row.sequence <= 0 || !session_timestamps_valid(row.created, row.last, row.expires, now)
-        || expiry_clock >= row.expires
+        || expiry_clock > row.expires // RED-R3-O
         || !digests_equal(&row.auth, &current.auth_generation)
         || !digests_equal(&row.restore, &current.restore_generation)
         || !digests_equal(&row.token, token)
