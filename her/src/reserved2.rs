@@ -5,7 +5,7 @@ use crate::{
     session,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 const MAX_WAKE_RETRIES: u32 = 3;
@@ -2443,12 +2443,13 @@ mod tests {
 
     #[tokio::test]
     async fn settings_invalidation_records_the_fired_predicate_without_tokens() {
-        for predicate in ["notTaken", "notAllowed", "missing", "tokenChanged"] {
+        for predicate in ["suspended", "notTaken", "notAllowed", "missing", "tokenChanged"] {
             let (root, mut hub) = queued_hub("invalidation-predicate").await;
             let key = "group:420042";
             hub.ready.clear();
             let mut state = hub.state().unwrap();
             match predicate {
+                "suspended" => state["paused"] = json!(true),
                 "notTaken" => { hub.live_all = false; hub.groups = vec!["group:420043".into()]; },
                 "notAllowed" => {
                     let mut cfg = hub.context.load_config().unwrap();
@@ -2980,6 +2981,8 @@ pub struct Hub {
     maintenance: HashMap<String, Maintenance>,
     maintenance_scan_at: i64,
     ready: Vec<(String, String)>,
+    /// Batches whose claim detected suspension after the tick read its settings.
+    suspended_claims: HashSet<String>,
     groups: Vec<String>,
     live_all: bool,
     mode_stamp: String,
@@ -3034,6 +3037,7 @@ impl Hub {
             maintenance: HashMap::new(),
             maintenance_scan_at: 0,
             ready: Vec::new(),
+            suspended_claims: HashSet::new(),
             groups,
             live_all,
             mode_stamp,
@@ -3111,6 +3115,7 @@ impl Hub {
     /// Forget every queued, held, retried and awaited job (their ingress is settled).
     async fn drop_everything(&mut self, now: i64) -> Result<(), String> {
         self.ready.clear();
+        self.suspended_claims.clear();
         self.recovered.clear();
         self.queued_messages.clear();
         self.held.clear();
@@ -3147,6 +3152,7 @@ impl Hub {
         self.rollback_pending.remove(key);
         self.failures.remove(key);
         self.ready.retain(|(k, _)| k != key);
+        self.suspended_claims.remove(key);
         if let Some(keys) = self.awaiting.remove(key) {
             self.journal.mark_handled(keys, now).await?;
         }
@@ -3875,6 +3881,7 @@ impl Hub {
             || cfg.pointer("/socialV2/enabled") == Some(&json!(false));
         self.maintain_sessions(&cfg,suspended,now).await?;
         let mut state=self.state()?;
+        let suspended = suspended || state["paused"] == true;
         #[cfg(test)]
         if let Some(hook) = self.tick_snapshot_hook.take() {
             let (done, finished) = tokio::sync::oneshot::channel();
@@ -3893,6 +3900,8 @@ impl Hub {
                 else if self.tokens.get(&key).is_some_and(|old| {
                     old.as_str() != state["conversations"][&key]["agentToken"].as_str().unwrap_or("")
                 }) { "tokenChanged" }
+                // Only a batch already refused by the claim can survive a suspended tick.
+                else if suspended && !self.suspended_claims.contains(&key) { "suspended" }
                 else { continue; };
             invalid.push((key, predicate));
         }
@@ -4207,6 +4216,7 @@ impl Hub {
         }
         self.sync_schedule(&cfg, suspended, now);
         if suspended {
+            self.ready.retain(|(key, _)| self.suspended_claims.contains(key));
             return Ok(());
         }
         for (key, reason) in std::mem::take(&mut self.ready) {
@@ -4224,6 +4234,7 @@ impl Hub {
                 }
                 continue;
             }
+            self.suspended_claims.remove(&key);
             if !self.taken(&key) || !console::inbound_admitted(&cfg, &key) {
                 continue;
             }
@@ -4313,6 +4324,7 @@ impl Hub {
                         d.sched.wake_times.retain(|at| *at != now);
                     }
                     if error == console::WAKE_SUSPENDED {
+                        self.suspended_claims.insert(key.clone());
                         self.ready.push((key, reason));
                         continue;
                     }
