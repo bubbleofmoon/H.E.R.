@@ -714,7 +714,7 @@ pub fn recall(
             let covered: std::collections::HashSet<usize> =
                 shared_spans.iter().flat_map(|(_, positions)| positions.iter().copied()).collect();
             let shared_chars = covered.len();
-            if shared.len() != 1 && !recall_qualifies(&shared, shared_chars) { // RED-relevance
+            if !recall_qualifies(&shared, shared_chars) {
                 continue;
             }
             let (rank, pinned, importance, hits, created_at) = (row.6, row.7, row.8, row.9, row.10);
