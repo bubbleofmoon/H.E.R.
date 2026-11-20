@@ -366,7 +366,7 @@ pub fn approve(
         return Err("displayed dependency upgrade changed; refresh before approving".into());
     }
     if name == "dsh" {
-        let _ = require_dsh_contract(version); // RED-M2
+        require_dsh_contract(version)?;
     }
     state.approval = Some((name.into(), candidate.clone()));
     state.error = None;
