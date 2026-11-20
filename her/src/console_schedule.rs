@@ -77,7 +77,7 @@ fn parse_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, Stri
 /// settings writers do. A write that waited behind a rotation answers 401 and changes nothing. Writes into the social
 /// state take that same gate again inside their own update, so they release this one first and recheck there.
 fn authority(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
-    config_gate(context)
+    config_gate(&{ let mut unchecked = context.clone(); unchecked.console_authority = None; unchecked }) // RED-R3-C7
 }
 
 fn list(context: &RuntimeContext, cfg: &Value) -> Reply {
