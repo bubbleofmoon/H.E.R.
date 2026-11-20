@@ -162,7 +162,7 @@ export async function waitPromptIdentity(port, child, expected, timeoutMs = 10_0
   while (performance.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`bridge exited before login identity (${child.exitCode})`);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/socialV2/prompt?key=${GROUP_KEY}`, { // RED-R3-V2
+      const response = await loopbackRequest(port, `/api/socialV2/prompt?key=${GROUP_KEY}`, {
         headers: { 'x-console-token': CONSOLE_TOKEN }, signal: AbortSignal.timeout(Math.max(1, Math.min(5000, Math.ceil(deadline - performance.now())))),
       });
       if (response.status !== 200) throw new Error(`prompt readiness returned HTTP ${response.status}`);
