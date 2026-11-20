@@ -16,7 +16,7 @@ pub(crate) const ALLOW_PRIVATE: Setting = Setting {
     applies: "live",
     group: SECURITY_GROUP,
     label: "Allowed private chats",
-    hint: "QQ ids whose private messages are answered, unless denied. A change revokes every conversation that loses access before the reply. Needs confirmation.",
+    hint: "QQ ids whose private messages are answered, unless denied. This list must include the private chats served by rollout. A change revokes every conversation that loses access before the reply. Needs confirmation.",
     chat: false,
     secret: false,
 };

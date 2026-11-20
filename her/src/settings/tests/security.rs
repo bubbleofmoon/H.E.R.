@@ -539,6 +539,24 @@ fn rollout_subset_refusals_keep_values_history_and_revocations_unchanged() {
 }
 
 #[test]
+fn rollout_undo_refuses_to_remove_the_first_stored_list() {
+    let (root, context) = security_fixture("rollout undo after legacy gap");
+    write_config(&root, |cfg| cfg["rollout"]["rustGroups"] = json!([KEPT, "group:7003"]));
+    let (status, reply) = set(&context, json!({"setting": "rollout.rustGroups", "value": [KEPT], "confirm": true}));
+    assert_eq!(status, 200, "repairing the legacy gap must succeed: {reply}");
+    let (entries, _) = history_page(&context, "?setting=rollout.rustGroups");
+    assert_eq!(entries.len(), 1, "the legacy gap must not seed: {entries:?}");
+    assert!(entries[0]["old"].is_null(), "there is no stored list to restore");
+
+    let (status, reply) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"], "confirm": true}));
+    assert_eq!(status, 409, "undo must keep the explicit rollout list: {reply}");
+    assert!(reply["error"].as_str().unwrap().contains("previous rollout list"), "{reply}");
+    assert_eq!(stored_config(&root)["rollout"]["rustGroups"], json!([KEPT]));
+    assert_eq!(context.load_config().unwrap()["rollout"]["rustGroups"], json!([KEPT]));
+    assert_eq!(history_page(&context, "?setting=rollout.rustGroups").0, entries);
+}
+
+#[test]
 fn rollout_writes_preserve_legacy_gaps_outside_the_changed_allow_kind() {
     let (root, context) = settings_fixture("rollout inherited gaps");
     write_config(&root, |cfg| {

@@ -1289,7 +1289,10 @@ fn validate_rollout_change<'a>(
         let allowed = allow_ids(setting, &after);
         if rollout_written || allowed != allow_ids(setting, &before) {
             if let Some(key) = unallowed_rollout_key(&keys, kind, &allowed) {
-                return Err((409, format!("{} requires {key} to be in {}", ROLLOUT_GROUPS.key, setting.key)));
+                return Err((409, format!(
+                    "{} requires {key} to be in {}. To revoke access immediately, use conversation scope `remove` or add a deny entry.",
+                    ROLLOUT_GROUPS.key, setting.key
+                )));
             }
         }
     }
@@ -1474,7 +1477,8 @@ pub(crate) struct Undone {
 /// `config.json` (source `migration`: undoing it would only drop the store's copy of the file's own value), no later
 /// audit row names that setting, the stored value is still the entry's new value and the registry still accepts the
 /// entry's old value. An undo that removes the stored value also removes the setting's member from `config.json`
-/// before the commit (`remove_from_config`); when that write fails the undo is 503 and writes nothing. An entry that
+/// before the commit (`remove_from_config`); rollout refuses that undo with 409 to keep an explicit launch list.
+/// When the file write fails the undo is 503 and writes nothing. An entry that
 /// does not exist, and any entry while there is no store yet, is 404 (and creates no store). `permit` is asked, inside the
 /// transaction, about the setting the entry names; its error refuses the undo with nothing written (#154: the console's
 /// plain path, which looked at the entry before it existed or before it was known, refuses a security setting here).
@@ -1528,6 +1532,12 @@ pub(crate) fn undo(
                     .ok_or((409, OLD_VALUE_REFUSED_ERROR.to_string()))
             })
             .transpose()?;
+        if setting.key == ROLLOUT_GROUPS.key && restored.is_none() {
+            return Err((
+                409,
+                "This entry has no previous rollout list to restore. Set or reset rollout.rustGroups explicitly.".to_string(),
+            ));
+        }
         if let Some(restored) = &restored {
             reject_credential_text(conn, setting, restored, harness_key.as_deref())?;
         }
