@@ -1345,7 +1345,7 @@ pub(crate) fn reset_administrator_password(context: &RuntimeContext) -> Result<(
 }
 
 fn generic_setting(key: &str) -> Result<&'static Setting, (u16, String)> {
-    if false { // RED-M8
+    if key == ADMINISTRATOR_PASSWORD.key {
         return Err((409, MANAGED_PASSWORD_ERROR.to_string()));
     }
     find(key).ok_or((400, "unknown setting".to_string()))
