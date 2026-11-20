@@ -1,6 +1,6 @@
 use super::conversation::PROMPT;
 use super::*;
-use crate::memory::MemoryStore;
+use crate::memory::open_store;
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Value};
 use std::{collections::VecDeque, path::PathBuf, sync::{atomic::AtomicBool, Arc, Mutex}};
@@ -176,7 +176,7 @@ fn model_failure_and_unusable_output_write_nothing_and_keep_the_cursor() {
     for want in expected {
         assert_eq!(run(&context, &model, "group:42", &ANY), want);
         assert!(rows(&root).is_empty());
-        assert_eq!(MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").digest_cursor("msg").unwrap().map_or(0, |c| c.through), 0);
+        assert_eq!(open_store(&context, &cfg).unwrap().for_reader("group:42").digest_cursor("msg").unwrap().map_or(0, |c| c.through), 0);
     }
     assert_eq!(run(&context, &model, "group:42", &ANY), Ok(Outcome::Written { through: 3, memories: 0 }));
     let inputs = model.inputs();
@@ -213,7 +213,7 @@ fn quiet_young_and_cancelled_runs_never_ask_the_model() {
 fn a_restarted_sequence_is_read_from_the_start() {
     let (root, context) = fixture(None, CFG(), "http://127.0.0.1:1");
     let cfg = context.load_config().unwrap();
-    MemoryStore::open(&context, &cfg).unwrap().for_reader("group:42").write_digest("msg", 0, 50, (0, 0), &[]).unwrap();
+    open_store(&context, &cfg).unwrap().for_reader("group:42").write_digest("msg", 0, 50, (0, 0), &[]).unwrap();
     social(&root, "group:42", json!([
         {"seq":1,"sender":"甲","userId":"5001","text":"第一句","isSelf":false},
         {"seq":2,"sender":"甲","userId":"5001","text":"第二句","isSelf":false}
@@ -480,7 +480,7 @@ fn conversations_are_digested_oldest_cursor_first() {
         "group:1":{"agentToken":"a","recentMessages":message},"group:2":{"agentToken":"b","recentMessages":message},
         "private:3":{"agentToken":"c","recentMessages":message}}}).to_string()).unwrap();
     let cfg = context.load_config().unwrap();
-    drop(MemoryStore::open(&context, &cfg).unwrap());
+    drop(open_store(&context, &cfg).unwrap());
     let conn = rusqlite::Connection::open(root.0.join("data/memory.db")).unwrap();
     conn.execute_batch("INSERT INTO digest_cursor(conversation,space,through_seq,updated_at) VALUES('group:1','msg',1,2000),('private:3','msg',1,1000);").unwrap();
     drop(conn);
