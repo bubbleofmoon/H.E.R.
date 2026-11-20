@@ -5720,14 +5720,15 @@ pub(crate) fn turn_budget_ended(context: &RuntimeContext, key: &str, turn: &str)
     load_social_state_for(context).ok().is_some_and(|s| s["conversations"][key]["turnBudgetEnded"] == turn)
 }
 
-pub(crate) fn turn_wait_limit_reached(context: &RuntimeContext, cfg: &Value, key: &str, turn: &str, token: &str) -> bool {
+pub(crate) fn turn_wait_limit_reached(context: &RuntimeContext, key: &str, turn: &str, token: &str) -> bool {
     let scope = format!("{}:{turn}", crate::send_outbox::token_epoch(token));
     load_social_state_for(context).ok().is_some_and(|state| {
         let conv = &state["conversations"][key];
         conv["agentToken"].as_str() == Some(token)
             && conv["waitBudget"]["scope"].as_str() == Some(scope.as_str())
-            && conv["waitBudget"]["used"].as_u64().unwrap_or(0)
-                >= conv["waitBudget"]["max"].as_u64().unwrap_or_else(|| wait_policy(cfg).max_per_turn)
+            && conv["waitBudget"]["max"].as_u64()
+                .or_else(|| context.load_config().ok().map(|cfg| wait_policy(&cfg).max_per_turn))
+                .is_some_and(|max| conv["waitBudget"]["used"].as_u64().unwrap_or(0) >= max)
     })
 }
 

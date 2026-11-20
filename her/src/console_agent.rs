@@ -1291,9 +1291,9 @@ fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Valu
     if used >= wait_policy(cfg).max_per_turn { return None; }
     let remain_min = (remaining as f64 / 60_000.0).ceil() as i64;
     let error = if what == "mark_read" {
-        format!("还不能通过 qq_mark_read 直接回到潜水：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡，若你参与了则需下次再等观察窗口。")
+        format!("还不能通过 qq_mark_read 直接回到潜水：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接收尾沉睡。成功发言后按【互动窗口】重新计时。")
     } else {
-        format!("还不能立刻设置潜水/下一次唤醒：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡，若你参与了则需下次再等观察窗口。")
+        format!("还不能立刻设置潜水/下一次唤醒：还需等待约 {remain_min} 分钟无新消息，或调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成一次沉睡前观察。如果等待期间有人发新消息，请先查看返回的 newMessages；判断不需要你参与就可以直接设置并沉睡。成功发言后按【互动窗口】重新计时。")
     };
     Some((
         400,
