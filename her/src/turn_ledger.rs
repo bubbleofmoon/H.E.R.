@@ -33,9 +33,10 @@ pub fn read_records(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     read_records_in(context, false)
 }
 
-/// `read_records` that waits out a Windows lock violation for `APPEND_CONFLICT_WAIT` and names the OS error
-/// when it gives up. Only for a caller that holds no lock, gate or chain (console read views and
-/// `reset_count`): the default read stays one-shot for the scheduler, cancellation, send and token paths.
+/// `read_records` that waits out a Windows lock violation for `APPEND_CONFLICT_WAIT` and names
+/// the OS error when it gives up. Only for a caller that holds no send-chain, token-publication,
+/// hub or tick lock (console read views and `reset_count`): the default read stays one-shot for
+/// the scheduler, cancellation, send and token paths.
 pub fn read_records_waiting(context: &RuntimeContext) -> Result<Vec<Value>, String> {
     read_records_in(context, true)
 }
