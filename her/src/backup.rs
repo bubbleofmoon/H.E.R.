@@ -823,7 +823,7 @@ pub fn run(
     };
     let (result, message) = match task.id {
         TaskId::MemoryBackup => (
-            create_memory_snapshot(context, run.view().queued_at, &check),
+            create_memory_snapshot(context, run.view().queued_at, &check, run),
             "memory backup verified",
         ),
         TaskId::MemoryRestoreTest => (restore_test(context, &check), "memory restore verified"),
@@ -883,6 +883,7 @@ fn create_memory_snapshot(
     context: &RuntimeContext,
     at: i64,
     check: Check<'_>,
+    run: &mut RunHandle,
 ) -> Result<PathBuf, String> {
     check()?;
     let destination = memory_destination(context)?;
@@ -921,15 +922,26 @@ fn create_memory_snapshot(
 
     let _lock = DestinationLock::acquire(&destination, check)?;
     let target = publish_memory(&candidate, &destination, at, check)?;
-    for (_, path, _) in archive_files(&destination, check)?
+    if let Err(error) = prune_memory(&destination, &target, check) {
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        run.log(
+            LogStream::Meta,
+            &format!("warning: memory backup {name} succeeded; retention could not finish: {error}"),
+        );
+    }
+    Ok(target)
+}
+
+fn prune_memory(destination: &Path, target: &Path, check: Check<'_>) -> Result<(), String> {
+    for (_, path, _) in archive_files(destination, check)?
         .into_iter()
-        .filter(|(_, path, _)| path != &target)
+        .filter(|(_, path, _)| path != target)
         .skip(MEMORY_COPIES - 1)
     {
         check()?;
-        fs::remove_file(path).map_err(|e| format!("memory backup retention failed: {}", e.kind()))?;
+        fs::remove_file(path).map_err(|e| e.kind().to_string())?;
     }
-    Ok(target)
+    Ok(())
 }
 
 fn publish_memory(

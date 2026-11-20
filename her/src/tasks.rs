@@ -902,6 +902,31 @@ mod tests {
     }
 
     #[test]
+    fn next_due_monthly_crosses_the_year_boundary() {
+        let schedule = Schedule::Monthly { hour: 5, minute: 30 };
+        let ms = |utc: &str| utc.parse::<Timestamp>().unwrap().as_millisecond();
+        let before = ms("2026-12-31T23:59:59Z");
+        let january = ms("2027-01-01T05:30:00Z");
+        let february = ms("2027-02-01T05:30:00Z");
+
+        assert_eq!(next_due(schedule, before, &TimeZone::UTC), Some(january));
+        assert_eq!(next_due(schedule, january, &TimeZone::UTC), Some(february));
+    }
+
+    #[test]
+    fn next_due_monthly_follows_dst_and_uses_the_first_folded_time() {
+        let schedule = Schedule::Monthly { hour: 1, minute: 30 };
+        let zone = TimeZone::get("America/New_York").unwrap();
+        let ms = |utc: &str| utc.parse::<Timestamp>().unwrap().as_millisecond();
+        let october = ms("2026-10-01T05:30:00Z");
+        let november = ms("2026-11-01T05:30:00Z");
+        let december = ms("2026-12-01T06:30:00Z");
+
+        assert_eq!(next_due(schedule, october, &zone), Some(november));
+        assert_eq!(next_due(schedule, november, &zone), Some(december));
+    }
+
+    #[test]
     fn registry_is_closed_and_every_schedule_is_valid() {
         for def in REGISTRY {
             assert_eq!(TaskId::parse(def.id.as_str()), Some(def.id));
