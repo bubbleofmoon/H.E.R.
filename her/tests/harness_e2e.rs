@@ -4315,6 +4315,92 @@ fn reserved2_current_prompt(request: &Value) -> &str {
 }
 
 #[test]
+fn refusal_replays_two_waits_and_unread_at_the_failed_model_call() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let inputs = [
+        ("wait-one", "qq_wait_for_messages", "newMessages", 4702, "WAIT_SECRET_ONE"),
+        ("wait-two", "qq_wait_for_messages", "newMessages", 4703, "WAIT_SECRET_TWO"),
+        ("unread", "qq_get_unread_messages", "messages", 4704, "UNREAD_SECRET"),
+    ];
+    let releases: Vec<_> = inputs.iter().map(|_| Arc::new(AtomicBool::new(false))).collect();
+    let mut replies: Vec<_> = inputs.iter().zip(&releases).map(|((call, tool, _, _, _), release)| {
+        let args = if *tool == "qq_wait_for_messages" {
+            json!({"key":GROUP_KEY,"purpose":"messages","timeoutMs":5000})
+        } else {
+            json!({"key":GROUP_KEY,"limit":1})
+        };
+        ModelReply::HeldTools {
+            calls: vec![reserved2_call(call, tool, args)],
+            started: Arc::new(AtomicBool::new(false)),
+            release: release.clone(),
+        }
+    }).collect();
+    replies.push(ModelReply::Refusal);
+    let model = FakeModel::script(replies);
+    let mut rig = reserved2_fixture("refusal-wait-history", &model, "harness");
+    rig.start();
+    reserved2_push_mention(&rig, 4701, "WAKE_SECRET");
+    let mut expected = Vec::new();
+    for (index, ((_, _, _, id, message), release)) in inputs.iter().zip(&releases).enumerate() {
+        assert!(wait_for(LONG, || lock(&model.requests).len() > index));
+        reserved2_push_mention(&rig, *id, message);
+        assert!(wait_for(LONG, || {
+            let state = rig.data_json("social-v2.json");
+            let id = id.to_string();
+            let found = state["conversations"][GROUP_KEY]["recentMessages"]
+                .as_array()
+                .and_then(|messages| messages.iter().find(|m| m["messageId"] == id.as_str()));
+            if let Some(found) = found {
+                expected.push(json!({"messageId":found["messageId"],"seq":found["seq"]}));
+            }
+            found.is_some()
+        }));
+        release.store(true, Ordering::SeqCst);
+    }
+    assert!(wait_for(LONG, || !rig.data_lines("logs/model-refusals.jsonl").is_empty()));
+    let refused = lock(&model.requests)[3].clone();
+    let rows = rig.data_lines("logs/model-refusals.jsonl");
+    let record = &rows[0];
+    assert_eq!(record["key"], GROUP_KEY);
+    let refs = record["messages"].as_array().unwrap();
+    assert!(refs.iter().any(|r| r["messageId"] == "4701"), "wake reference missing");
+    for ((call, _, field, _, text), reference) in inputs.iter().zip(&expected) {
+        let packet = tool_wire_packet(&refused, call);
+        assert!(packet[*field].as_array().unwrap().iter().any(|m| {
+            m["messageId"] == reference["messageId"] && m["seq"] == reference["seq"]
+        }), "fixture did not deliver {call}: {packet}");
+        assert!(packet.to_string().contains(*text));
+        assert!(refs.contains(reference), "wait or unread reference missing: {call}");
+    }
+    assert_eq!(record["modelCall"], 4, "refused model call index");
+    assert!(!record.to_string().contains("_SECRET"), "refusal record contains message text");
+
+    let conn = rusqlite::Connection::open_with_flags(
+        rig.root.join("data/conversations.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    let mut query = conn.prepare(
+        "WITH refused AS (
+            SELECT seq, session_id FROM events
+            WHERE turn_id = ?1 AND kind = 'model_attempt_started'
+            ORDER BY seq LIMIT 1 OFFSET (?2 - 1)
+        )
+        SELECT events.payload FROM events JOIN refused USING (session_id)
+        WHERE events.turn_id = ?1 AND events.seq < refused.seq AND events.kind = 'tool_result'
+        ORDER BY events.seq"
+    ).unwrap();
+    let replay: Vec<Value> = query.query_map(
+        rusqlite::params![record["turnId"].as_str().unwrap_or_default(), record["modelCall"].as_i64().unwrap()],
+        |row| row.get::<_, String>(0),
+    ).unwrap().map(|row| serde_json::from_str(&row.unwrap()).unwrap()).collect();
+    let delivered: Vec<_> = inputs.iter().map(|(call, ..)| tool_wire_result(&refused, call)).collect();
+    let restored: Vec<_> = replay.into_iter().map(|fact| fact["result"].clone()).collect();
+    assert_eq!(restored, delivered, "replay must recover the refused call's tool results");
+}
+
+#[test]
 fn ticket159_reserved2_parity_first_delta_urgent_silence_and_sleep() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let mut sequences = Vec::new();

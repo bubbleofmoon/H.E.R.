@@ -1505,7 +1505,7 @@ mod tests {
             dsh_turn: 1,
             ended,
             tools: (0..tools)
-                .map(|i| crate::dsh::ToolFact { call_id: i.to_string(), name: "x".into(), done: true, ok: true })
+                .map(|i| crate::dsh::ToolFact { call_id: i.to_string(), name: "x".into(), done: true, ok: true, step: None })
                 .collect(),
             text: String::new(),
         })

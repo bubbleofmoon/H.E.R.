@@ -7,7 +7,7 @@
 //!   特例  session/prompt 必须带 requestId`
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use crate::dsh_credential::Credential;
 use crate::runtime::RuntimeContext;
@@ -980,6 +980,7 @@ pub struct FollowStream {
     briefing: Option<(RuntimeContext, String, String, String)>,
     /// 本回合的工具调用（`turn/start` 时清空）。
     pub tools: Vec<ToolFact>,
+    pub(crate) refusal: RefusalSources,
 }
 
 /// 开场快照：历史事件、inbox 与覆盖范围。
@@ -1016,6 +1017,7 @@ pub struct ToolFact {
     pub name: String,
     pub done: bool,
     pub ok: bool,
+    pub(crate) step: Option<u64>,
 }
 
 impl ToolFact {
@@ -1039,7 +1041,8 @@ pub fn fold_tool_event(tools: &mut Vec<ToolFact>, event: &serde_json::Value) {
         Some("tool/call") => {
             let call_id = call_id_text(data.and_then(|d| d.get("callId")));
             let name = data.and_then(|d| d.get("name")).and_then(|n| n.as_str()).unwrap_or("").to_string();
-            tools.push(ToolFact { call_id, name, done: false, ok: false });
+            let step = data.and_then(|d| d["step"].as_u64());
+            tools.push(ToolFact { call_id, name, done: false, ok: false, step });
         }
         Some("tool/result") => {
             let message = data.and_then(|d| d.get("message"));
@@ -1052,6 +1055,63 @@ pub fn fold_tool_event(tools: &mut Vec<ToolFact>, event: &serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// DSH emits calls and results for each tool round. Count distinct completed rounds and
+/// retry starts, since several tool results can share one model call.
+#[derive(Default)]
+pub(crate) struct RefusalSources {
+    pub messages: Vec<serde_json::Value>,
+    tool_steps: HashSet<u64>,
+    retries: HashSet<(u64, u64)>,
+    missing_step: bool,
+}
+
+impl RefusalSources {
+    pub fn model_call(&self) -> Option<usize> {
+        (!self.missing_step).then(|| self.tool_steps.len() + self.retries.len() + 1)
+    }
+
+    fn observe(&mut self, kind: &str, data: &serde_json::Value, tools: &[ToolFact]) {
+        let step = data["step"].as_u64();
+        if kind == "llm/retry-started" {
+            if let Some(step) = step {
+                self.retries.insert((step, data["retry"].as_u64().unwrap_or(1)));
+            } else {
+                self.missing_step = true;
+            }
+            return;
+        }
+        if kind != "tool/result" {
+            return;
+        }
+        let message = &data["message"];
+        let call_id = call_id_text(message.pointer("/source/callId"));
+        let tool = tools.iter().rev().find(|tool| !call_id.is_empty() && tool.call_id == call_id);
+        if let Some(step) = step.or_else(|| tool.and_then(|tool| tool.step)) {
+            self.tool_steps.insert(step);
+        } else {
+            self.missing_step = true;
+        }
+        let Some(tool) = tool.filter(|tool| !tool.done && message["isError"] != true && data["error"].is_null()) else {
+            return;
+        };
+        let field = match tool.name.rsplit("__").next() {
+            Some("qq_wait_for_messages") => "newMessages",
+            Some("qq_get_unread_messages") => "messages",
+            _ => return,
+        };
+        if let Some(blocks) = message["content"].as_array() {
+            for block in blocks.iter().filter(|block| block["type"] == "text") {
+                if let Some(packet) = block["text"].as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                {
+                    let refs = crate::model_failure::message_refs(&packet[field]);
+                    crate::model_failure::merge_refs(&mut self.messages, refs);
+                }
+            }
+        }
     }
 }
 
@@ -1198,6 +1258,7 @@ impl FollowStream {
             snapshot,
             briefing: None,
             tools: Vec::new(),
+            refusal: RefusalSources::default(),
         })
     }
 
@@ -1321,8 +1382,13 @@ impl FollowStream {
                 crate::session_context::observe(context,key,sid,epoch,event)?;
             }
             self.observe_usage(event);
-            if (etype == "tool/call" || etype == "tool/result") && turn_id == self.current_turn {
-                fold_tool_event(&mut self.tools, event);
+            if turn_id.is_some() && turn_id == self.current_turn {
+                if let Some(data) = data {
+                    self.refusal.observe(etype, data, &self.tools);
+                }
+                if matches!(etype, "tool/call" | "tool/result") {
+                    fold_tool_event(&mut self.tools, event);
+                }
             }
             match etype {
                 "turn/start" => {
@@ -1331,6 +1397,7 @@ impl FollowStream {
                     self.turn_text.clear();
                     self.turn_usage.clear();
                     self.tools.clear();
+                    self.refusal = RefusalSources::default();
                 }
                 "assistant/message" => {
                     if turn_id.is_some() && turn_id == self.current_turn {
