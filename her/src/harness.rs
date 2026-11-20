@@ -1508,7 +1508,6 @@ fn filter_tool_text(text: &str, cfg: &Value, tool: Option<&str>) -> Result<Strin
         let filtered = crate::model_view::strip_model_chat_data(&source["data"], cfg);
         let rendered = crate::mcp::format_tool_result(tool, &source["args"], &filtered)
             .map_err(|_| "harness memory result could not be formatted")?;
-        let rendered = crate::model_view::strip_from_model_text(&rendered, cfg);
         data["content"] = serde_json::json!([{"type":"text","text":rendered}]);
         if let Some(meta) = data.get_mut("_meta").and_then(Value::as_object_mut) {
             meta.remove("herMemoryResult");
@@ -2013,24 +2012,6 @@ mod tests {
             data.get("_meta").is_none(),
             "the internal source never reaches the model: {data}"
         );
-    }
-
-    #[test]
-    fn tool_preview_strips_formatted_memory_search_output() {
-        let hit = json!({"id":7,"owner_id":"private:8808","scope":"session","kind":"fact",
-            "subject":null,"content":"喝热茶","score":1.0,"tags":null,"source":"agent",
-            "importance":0.5,"pinned":0,"hits":0,"created_at":1,"last_used_at":null,
-            "owner_type":"session","archived":0,"expires_at":null});
-        let original = json!({"content":[{"type":"text","text":"canonical rendering"}],
-            "_meta":{"herMemoryResult":{"v":1,"name":"memory_search","args":{},
-            "data":{"ok":true,"count":1,"memories":[hit]}}}})
-        .to_string();
-        let cfg = json!({"socialV2":{"context":{"stripFromModelText":["fact·推断"]}}});
-        let filtered = filter_tool_text(&original, &cfg, Some("memory_search")).unwrap();
-        let value: Value = serde_json::from_str(&filtered).unwrap();
-        let text = value["content"][0]["text"].as_str().unwrap();
-        assert!(!text.contains("fact·推断"), "formatted memory result must be stripped: {text}");
-        assert!(text.contains("喝热茶"), "non-stripped memory text must stay intact: {text}");
     }
 
     #[test]
