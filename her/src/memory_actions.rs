@@ -266,8 +266,6 @@ fn verified_message<'a>(
     if text != content || key.strip_prefix("private:").is_some_and(|peer| peer != user) {
         return None;
     }
-    let speaker = message["sender"].as_str().map(str::trim)
-        .filter(|name| !name.is_empty() && *name != "私聊" && !name.contains(['\r', '\n'])).unwrap_or(user);
     let position = (message["time"].as_i64()?, message["seq"].as_i64().unwrap_or_default());
-    Some(VerifiedMessage { id, text, speaker, author_id: user, position })
+    Some(VerifiedMessage { id, text, author_id: user, position })
 }

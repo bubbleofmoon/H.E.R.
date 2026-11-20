@@ -42,7 +42,6 @@ pub struct NewMemory<'a> {
 pub(crate) struct VerifiedMessage<'a> {
     pub id: &'a str,
     pub text: &'a str,
-    pub speaker: &'a str,
     pub author_id: &'a str,
     pub position: (i64, i64),
 }
@@ -144,7 +143,7 @@ impl Reader<'_> {
     pub(crate) fn write_message(
         &self, message: VerifiedMessage<'_>, supersedes: Option<i64>,
     ) -> rusqlite::Result<Option<UpsertOutcome>> {
-        let attribution = (!self.is_owner).then_some(message.speaker);
+        let attribution = (!self.is_owner).then_some(message.author_id);
         let content = match attribution {
             Some(speaker) => format!("{speaker}说：{}", message.text),
             None => message.text.to_string(),
@@ -293,7 +292,11 @@ impl Reader<'_> {
                 return Ok(None);
             }
             deleting = true;
-            super::forget_memory(conn, id, &self.key).map(Some)
+            let deleted = super::forget_memory(conn, id, &self.key)?;
+            if deleted && self.has_provenance {
+                conn.execute("UPDATE memory_provenance SET superseded_by=NULL WHERE superseded_by=?1", [id])?;
+            }
+            Ok(Some(deleted))
         })
         .map_err(|error| if deleting { ForgetError::Delete(error) } else { ForgetError::Check(error) })
     }
