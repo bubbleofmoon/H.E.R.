@@ -538,7 +538,7 @@ impl CompatWakes {
         }
         let keys: Vec<_> = self.drivers.keys().cloned().collect();
         for key in keys {
-            self.admitted(cfg, &key, journal, now).await?;
+            let _ = key; // RED-R1-PUMP
         }
         Ok(session::pump_all(&mut self.drivers, now))
     }
