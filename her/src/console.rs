@@ -14165,7 +14165,7 @@ fn admit_selected_request(
     use crate::memory_actions::ConsoleCapability;
     let _gate = acquire_social_state_gate(context)?;
     crate::console_auth::ensure_credentials_ready(context)?;
-    let config = load_front_config(context).or_else(|_| load_front_config(context)).map_err(|error| (503, error.to_string()))?; // RED-R3-A
+    let config = load_front_config(context).map_err(|error| (503, error.to_string()))?;
     let expected = context.effective_console_token(&config);
     let memory_route = req.path.starts_with("/api/memory/");
     let agent_call = has_agent_marker(req);
