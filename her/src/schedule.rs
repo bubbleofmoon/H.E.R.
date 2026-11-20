@@ -382,7 +382,7 @@ fn check_her_capacity(
         )));
     }
     let total_cap = REMINDER_TOTAL_CAP.integer(config);
-    if total > total_cap { // RED-total-cap
+    if total >= total_cap {
         return Err(StoreError::Conflict(format!(
             "提醒总数已达上限（{total_cap} 条）"
         )));
