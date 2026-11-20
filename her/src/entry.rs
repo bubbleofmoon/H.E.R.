@@ -596,7 +596,7 @@ fn sync_wake_configs(
         }
     }
     for (key, driver) in drivers.iter_mut() {
-        if false && !console::inbound_admitted(cfg, key) { // RED-R1-SYNC
+        if !console::inbound_admitted(cfg, key) {
             continue;
         }
         let Some(wc) = state.get("conversations").and_then(|c| c.get(key)).and_then(|c| c.get("wakeConfig")) else {
