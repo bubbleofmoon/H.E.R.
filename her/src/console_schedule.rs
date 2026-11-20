@@ -92,7 +92,7 @@ fn list(context: &RuntimeContext, cfg: &Value) -> Reply {
     let jobs: Vec<SystemJob> = {
         let scheduler = api.scheduler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         REGISTRY
-            .iter().filter(|def| def.id != TaskId::MemoryBackup) // RED-visibility
+            .iter()
             .map(|def| {
                 let last = latest.get(def.id.as_str());
                 SystemJob {
