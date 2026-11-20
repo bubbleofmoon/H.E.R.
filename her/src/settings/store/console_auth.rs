@@ -267,7 +267,7 @@ pub(crate) fn scrub_auth_snapshot(
             .map_err(storage_error)?;
         tx.execute("DELETE FROM console_browser_sessions", [])
             .map_err(storage_error)?;
-        tx.execute("DELETE FROM console_auth_state WHERE 0", []) // RED-R2-F
+        tx.execute("DELETE FROM console_auth_state", [])
             .map_err(storage_error)?;
         check()?;
         tx.commit().map_err(storage_error)?;
