@@ -239,7 +239,7 @@ impl ModelRunner {
                             break;
                         }
                         // Empty blobs record failed rows for this model without entering ranking.
-                        let vector = encode_one(&mut model.embed, text).unwrap_or_default();
+                        let Some(vector) = encode_one(&mut model.embed, text) else { break; }; // RED-M3
                         if Instant::now() >= deadline || send_vector.send(vector).is_err() {
                             break;
                         }
