@@ -41,7 +41,7 @@ pub(crate) fn rollout_groups(value: &Value) -> Result<Vec<String>, &'static str>
         if !seen.insert(text) {
             return Err("rustGroups must not repeat a group");
         }
-        crate::runtime::validate_canonical_live_groups(text)?; // RED-1
+        crate::runtime::validate_canonical_live_group(text)?;
         list.push(text.to_string());
     }
     Ok(list)
