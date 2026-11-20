@@ -3802,7 +3802,7 @@ fn hf85_rotation_never_runs_during_a_turn_even_after_cache_expiry() {
     let advance_file = rig.root.join("clock-advance-ms");
     rig.clock_advance_file = Some(advance_file.clone());
     // Five minutes of cache life allows rotation after 240 idle seconds.
-    rig.epoch = Some(now_ms() + 180_000);
+    rig.epoch = Some(now_ms() + 245_000); // RED-M1
     rig.restart(vec![]);
     assert!(
         wait_for(LONG, || lock(&rig.gateway).scripts.is_empty()),
