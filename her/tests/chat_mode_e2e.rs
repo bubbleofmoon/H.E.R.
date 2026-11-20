@@ -670,6 +670,65 @@ fn closed_agent_question_arriving_during_interaction_lock_stall_is_delivered() {
 }
 
 #[test]
+fn closed_agent_cancels_undelivered_question_without_blocking_other_sends() {
+    let mut rig = Rig::new(
+        "closed-lock-delivery",
+        Seed {
+            mode: "closed-agent",
+            config: json!({"ackMessage":"hold delivery chain"}),
+            ..Seed::default()
+        },
+    );
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    lock(&rig.gateway).intercept = Some(Arc::new(move |action, body| {
+        if action == "send_private_msg" && body["message"][0]["data"]["text"] == "hold delivery chain" {
+            let _ = lock(&held).recv_timeout(Duration::from_secs(15));
+        }
+        None
+    }));
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "#SLOW#");
+    assert_eq!(rig.wait_texts(OWNER_KEY, 1), ["hold delivery chain"]);
+    lock(&rig.dsh.inner).interactions.push(json!({
+        "type":"waterfall", "event":"user-questions/request", "agentId":"fake-session-1",
+        "eventId":"question-blocked-at-delivery", "request":{"questions":[{"id":"q1","question":"Undelivered question"}]}
+    }));
+    assert!(wait_for(Duration::from_secs(4), || {
+        rig.data_json("pending-interactions.json").as_array().map(Vec::len) == Some(1)
+    }), "the stream did not register the question before the mode write");
+
+    let mut stall = StalledModeWrite::begin(&rig);
+    drop(release);
+    assert!(wait_for(Duration::from_secs(2), || {
+        rig.data_lines("send-outbox.jsonl").iter().any(|row| row["k"] == "confirmed")
+    }), "the acknowledgement did not release the send chain");
+    // Give the queued notification a head start before the independent command send.
+    thread::sleep(Duration::from_millis(500));
+    says(&rig, "private:7707", STRANGER, "stranger", "/update");
+    assert!(wait_for(Duration::from_secs(3), || {
+        rig.texts_to("private:7707") == ["更新命令仅限管理员私聊。"]
+    }), "the independent send stalled behind the question's gate wait");
+
+    assert!(
+        wait_for(Duration::from_secs(14), || !rig.dsh.calls("$events/result").is_empty()),
+        "the undelivered question was not cancelled to DSH"
+    );
+    stall.release();
+    let receipts = rig.dsh.calls("$events/result");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0]["eventId"], "question-blocked-at-delivery");
+    assert_eq!(receipts[0]["outcome"], json!({"kind":"result","value":{"answers":[]}}));
+    assert_eq!(
+        rig.data_json("pending-interactions.json"),
+        json!([]),
+        "the undelivered question remained pending after cancellation"
+    );
+    wait_pending(&rig, json!({"pending":[]}));
+    assert_eq!(rig.texts_to(OWNER_KEY), ["hold delivery chain"]);
+}
+
+#[test]
 fn closed_agent_expiry_notice_is_sent_after_the_original_turn_ended() {
     for (tag, marker) in [("question", "#QUESTION#"), ("approval", "#APPROVAL#")] {
         let mut rig = Rig::new(&format!("closed-expiry-after-end-{tag}"), Seed { mode: "closed-agent", config: json!({"questionTimeoutMs":6000}), ..Seed::default() });

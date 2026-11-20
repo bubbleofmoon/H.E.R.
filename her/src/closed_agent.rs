@@ -355,52 +355,63 @@ impl Hub {
     }
 
     fn say_guarded(&self, p: &Pending, text: &str, allow_expired: bool, allow_ended: bool) {
-        Self::send_notification(&self.context, p, text, &|| {
-            let current = if allow_ended {
-                valid_session(&self.context, &p.key, &p.session, &p.epoch)
-            } else {
-                valid_identity(&self.context, &p.key, &p.session, &p.turn, &p.epoch)
-            };
-            if (allow_expired || Instant::now() < p.expires) && current {
-                Ok(())
-            } else {
-                Err("interaction is no longer valid".into())
-            }
-        });
+        Self::send_notification(
+            &self.context,
+            p,
+            text,
+            &|| {
+                let current = if allow_ended {
+                    valid_session(&self.context, &p.key, &p.session, &p.epoch)
+                } else {
+                    valid_identity(&self.context, &p.key, &p.session, &p.turn, &p.epoch)
+                };
+                if (allow_expired || Instant::now() < p.expires) && current {
+                    Ok(())
+                } else {
+                    Err("interaction is no longer valid".into())
+                }
+            },
+            || Ok(crate::recorded_send::send_chain()),
+        );
     }
 
-    fn send_notification(
+    fn send_notification<Locks>(
         context: &RuntimeContext,
         p: &Pending,
         text: &str,
         guard: &dyn Fn() -> Result<(), String>,
-    ) {
-        let Ok(cfg) = context.load_config() else {
-            return;
+        acquire_chain: impl FnOnce() -> Result<Locks, String>,
+    ) -> crate::chat::SendReport {
+        let deliver = || -> Result<_, String> {
+            let cfg = context.load_config()?;
+            let url = context
+                .dependency_url("onebot")
+                .ok_or("runtime OneBot dependency is unavailable")?;
+            let token = cfg
+                .pointer("/snowluma/accessToken")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let ob = crate::onebot::OneBot::try_new_url(url, token.to_string())?;
+            Ok(crate::chat::send_recorded_with_chain(
+                context,
+                &ob,
+                &p.key,
+                &p.epoch,
+                "interaction",
+                text,
+                crate::chat::send_delay_ms(&cfg),
+                guard,
+                acquire_chain,
+            ))
         };
-        let Some(url) = context.dependency_url("onebot") else {
-            return;
-        };
-        let token = cfg
-            .pointer("/snowluma/accessToken")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let Ok(ob) = crate::onebot::OneBot::try_new_url(url, token.to_string()) else {
-            return;
-        };
-        let report = crate::chat::send_recorded(
-            context,
-            &ob,
-            &p.key,
-            &p.epoch,
-            "interaction",
-            text,
-            crate::chat::send_delay_ms(&cfg),
-            guard,
-        );
-        if let Some(e) = report.error {
+        let report = deliver().unwrap_or_else(|error| crate::chat::SendReport {
+            error: Some(error),
+            ..Default::default()
+        });
+        if let Some(e) = &report.error {
             eprintln!("[closed-agent] interaction delivery failed: {e}");
         }
+        report
     }
 
     async fn register(&self, client: &str, frame: &Value) {
@@ -562,24 +573,54 @@ impl Hub {
         // the notification waits for the chain. The stream awaits delivery before its next frame.
         drop(gate);
         let context = self.context.clone();
+        let pending = p.clone();
         let send = move || {
-            let delivery_gate = std::cell::OnceCell::new();
-            Self::send_notification(&context, &p, &text, &|| {
-                // Recorded sends call this guard after acquiring the chain. Hold the file gate
-                // through delivery and recheck validity for every part.
-                delivery_gate.get_or_init(|| lock(&context)).as_ref().map_err(Clone::clone)?;
-                if Instant::now() < p.expires
-                    && valid_identity(&context, &p.key, &p.session, &p.turn, &p.epoch)
-                {
-                    Ok(())
-                } else {
-                    Err("interaction is no longer valid".into())
-                }
-            });
+            Self::send_notification(
+                &context,
+                &pending,
+                &text,
+                &|| {
+                    if Instant::now() < pending.expires
+                        && valid_identity(
+                            &context,
+                            &pending.key,
+                            &pending.session,
+                            &pending.turn,
+                            &pending.epoch,
+                        )
+                    {
+                        Ok(())
+                    } else {
+                        Err("interaction is no longer valid".into())
+                    }
+                },
+                || loop {
+                    // Pending state, then the file gate, then the send chain, as in answer and
+                    // reap. Wait for the gate outside the chain and leave the gate free for
+                    // settings while another send owns the chain.
+                    let gate = lock(&context)?;
+                    if let Some(chain) = crate::recorded_send::try_send_chain() {
+                        return Ok((chain, gate));
+                    }
+                    drop(gate);
+                    drop(crate::recorded_send::send_chain());
+                },
+            )
         };
-        let result = tokio::task::spawn_blocking(send).await;
-        if let Err(error) = result {
-            eprintln!("[closed-agent] interaction send task failed: {error}");
+        let report = match tokio::task::spawn_blocking(send).await {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("[closed-agent] interaction send task failed: {error}");
+                return;
+            }
+        };
+        // A partial or uncertain delivery may still give the owner a question to answer.
+        if report.confirmed == 0 && !report.unknown && p.valid(&self.context) {
+            state.entries.remove(&p.key);
+            if let Err(error) = self.save(&state) {
+                eprintln!("[closed-agent] pending state write failed: {error}");
+            }
+            self.cancel(&p);
         }
     }
 
