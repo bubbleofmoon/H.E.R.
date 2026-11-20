@@ -373,7 +373,7 @@ impl Hub {
                 eprintln!("[closed-agent] cancellation receipt failed: {error}");
             }
         };
-        cancel(); // RED-M4
+        tokio::task::spawn_blocking(cancel);
     }
 
     fn say(&self, p: &Pending, text: &str) {
