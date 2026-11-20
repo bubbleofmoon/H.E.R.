@@ -38,9 +38,9 @@ pub(super) fn definitions() -> [Value; 4] {
         })
     };
     [
-        def(CREATE, "在当前私聊创建提醒，必须提供 at 或 localAt，省略 repeat 时只提醒一次。遇到拒绝时，用自己的语气说明原因。", fields, json!(["text"])),
+        def(CREATE, "为当前会话创建提醒。当前仅支持私聊，群聊创建需要管理员批准。必须提供 at 或 localAt，省略 repeat 时只提醒一次。遇到拒绝时，用自己的语气说明原因。", fields, json!(["text"])),
         def(LIST, "列出自己在当前会话中有效或已暂停的提醒。用 nextOffset 继续查看。", json!({"offset":{"type":"integer","minimum":0}}), json!([])),
-        def(CHANGE, "修改当前私聊中自己的提醒，只提供要修改的字段。遇到拒绝时，用自己的语气说明原因。", change, json!(["id"])),
+        def(CHANGE, "修改当前会话中自己的提醒。当前仅支持私聊，群聊修改需要管理员批准。只提供要修改的字段。遇到拒绝时，用自己的语气说明原因。", change, json!(["id"])),
         def(CANCEL, "取消当前会话中自己的提醒。", json!({"id":id}), json!(["id"])),
     ]
 }

@@ -16,8 +16,9 @@ const STORE_FILE: &str = "schedule.json";
 const TIMERS_FILE: &str = "schedule-timers.json";
 const LOCK_FILE: &str = "locks/schedule.lock";
 pub const REMINDER_REASON: &str = "reminder:";
-const LATE_GRACE_MS: i64 = 60_000;
-const DAY_MS: i64 = 86_400_000;
+const MINUTE_MS: i64 = 60_000;
+const LATE_GRACE_MS: i64 = MINUTE_MS;
+const DAY_MS: i64 = 24 * 60 * MINUTE_MS;
 pub(crate) const MAX_AHEAD_DAYS: i64 = 366;
 const MAX_AHEAD_MS: i64 = MAX_AHEAD_DAYS * DAY_MS;
 const HISTORY_CAP: usize = 500;
@@ -85,7 +86,7 @@ impl Repeat {
         match self {
             Repeat::Once => None,
             Repeat::Every { minutes } => {
-                let period = minutes as i64 * 60_000;
+                let period = i64::from(minutes) * MINUTE_MS;
                 if period <= 0 {
                     None
                 } else if at > now {
@@ -403,8 +404,16 @@ fn check_her_timing(
         )));
     }
     let floor = REMINDER_REPEAT_FLOOR.integer(config);
-    if matches!(repeat, Some(Repeat::Every { minutes }) if i64::from(minutes) < floor) {
-        return Err(StoreError::Invalid(format!("重复间隔至少 {floor} 分钟")));
+    if let Some(Repeat::Every { minutes }) = repeat {
+        let minutes = i64::from(minutes);
+        if minutes < floor {
+            return Err(StoreError::Invalid(format!("重复间隔至少 {floor} 分钟")));
+        }
+        if minutes * MINUTE_MS > horizon_days * DAY_MS {
+            return Err(StoreError::Invalid(format!(
+                "重复间隔不能超过 {horizon_days} 天"
+            )));
+        }
     }
     Ok(())
 }
@@ -1063,7 +1072,10 @@ mod tests {
             repeat: Some(Repeat::Every { minutes }),
             ..ItemChange::default()
         };
-        assert!(store.change_her(key, &at_floor.id, edit(59), NOW).is_err());
+        assert_eq!(
+            store.change_her(key, &at_floor.id, edit(59), NOW).map(|_| ()),
+            Err(StoreError::Invalid("重复间隔至少 60 分钟".into()))
+        );
         assert_eq!(
             store
                 .change_her(key, &at_floor.id, edit(60), NOW)
@@ -1099,9 +1111,12 @@ mod tests {
             at: Some(at),
             ..ItemChange::default()
         };
-        assert!(store
-            .change_her(key, &at_limit.id, edit(horizon + 1), NOW)
-            .is_err());
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(horizon + 1), NOW)
+                .map(|_| ()),
+            Err(StoreError::Invalid("提醒时间不能超过未来 365 天".into()))
+        );
         assert_eq!(
             store
                 .change_her(key, &at_limit.id, edit(horizon), NOW)
@@ -1112,6 +1127,41 @@ mod tests {
         store
             .create(owner(key, "管理员提醒", NOW + 366 * DAY, Repeat::Once), NOW)
             .unwrap();
+    }
+
+    #[test]
+    fn her_reminder_repeat_horizon() {
+        let fixture = Fixture::new();
+        let store = with_limits(&fixture, serde_json::json!({"maxAheadDays": 2}));
+        let key = "private:31";
+        let item = |minutes| NewItem {
+            repeat: Repeat::Every { minutes },
+            ..her_reminder(key)
+        };
+        let at_limit = store.create(item(2_880), NOW).unwrap();
+        let edit = |minutes| ItemChange {
+            repeat: Some(Repeat::Every { minutes }),
+            ..ItemChange::default()
+        };
+        assert_eq!(
+            store.create(item(2_881), NOW).map(|_| ()),
+            Err(StoreError::Invalid("重复间隔不能超过 2 天".into())),
+            "an interval one minute beyond the HER horizon is refused on create"
+        );
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(2_881), NOW)
+                .map(|_| ()),
+            Err(StoreError::Invalid("重复间隔不能超过 2 天".into())),
+            "an interval one minute beyond the HER horizon is refused on a repeat-only change"
+        );
+        assert_eq!(
+            store
+                .change_her(key, &at_limit.id, edit(2_880), NOW)
+                .unwrap()
+                .repeat,
+            Repeat::Every { minutes: 2_880 }
+        );
     }
 
     fn assert_hidden(store: &ScheduleStore, key: &str, hidden: &Item, rule: &str) {
