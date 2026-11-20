@@ -14320,7 +14320,7 @@ fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16
             Err((status, error)) => return json_reply(status, json!({"ok":false,"error":error})),
         };
         let desktop = matches!(admission.proof, Some(crate::console_auth::ConsoleAuthority::Desktop { .. }));
-        if req.method == "GET" && !canonical_request(req, port) && !desktop {
+        if false && req.method == "GET" && !canonical_request(req, port) && !desktop { // RED-R3-T2
             if let Some(mount) = PAGE_MOUNTS.iter().copied().find(|mount| *mount == req.path) {
                 let mut response = ConsoleResponse::from((302, String::new(), String::new()));
                 response.redirect = Some((port, mount));
