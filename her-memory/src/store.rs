@@ -3,8 +3,7 @@
 use rusqlite::Connection;
 use serde_json::Value;
 
-use super::{Hit, MemoryInput, ReaderScope, UpsertOutcome};
-use crate::runtime::RuntimeContext;
+use super::{Hit, MemoryInput, UpsertOutcome};
 
 pub struct MemoryStore {
     conn: Connection,
@@ -61,15 +60,7 @@ pub enum ForgetError {
 }
 
 impl MemoryStore {
-    /// The selected runtime's database at the current schema version; the owner is `cfg.ownerQQ`.
-    pub fn open(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
-        Ok(Self {
-            conn: super::open_ready_for_runtime(context)?,
-            owner: crate::conversation_authority::owner_conversation(cfg),
-        })
-    }
-
-    /// An already-open connection (probes and tests); no migration runs.
+    /// Bind an initialized connection and the optional owner conversation.
     pub fn from_connection(conn: Connection, owner: Option<String>) -> Self {
         Self { conn, owner }
     }
@@ -90,11 +81,6 @@ impl MemoryStore {
 impl Reader<'_> {
     pub fn is_owner(&self) -> bool {
         self.is_owner
-    }
-
-    /// The owner ids this conversation may read (diagnostic probes).
-    pub fn scope(&self) -> rusqlite::Result<ReaderScope> {
-        super::resolve_reader_scope(self.conn, &self.key, self.is_owner)
     }
 
     /// Explicit search; counts a hit on every returned memory.
@@ -203,9 +189,9 @@ mod tests {
     /// ACL: group:1 reads group:3; group:7 holds a wildcard grant.
     fn store(owner: Option<&str>) -> MemoryStore {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../spec/memory-schema.sql")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
         for (owner_id, scope) in [("group:1", "group"), ("private:2", "private"), ("group:3", "group"), (OWNER, "private")] {
-            crate::memory::write_memory(&conn, &MemoryInput {
+            crate::write_memory(&conn, &MemoryInput {
                 owner_type: "session", owner_id, scope, kind: "fact", subject: None,
                 content: &format!("needle {owner_id}"), tags: None, source: "fixture", importance: 0.5,
             }).unwrap();
@@ -282,7 +268,7 @@ mod tests {
     #[test]
     fn digest_write_commits_memories_with_its_cursor_and_refuses_a_moved_cursor() {
         let store = store(Some(OWNER));
-        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
@@ -305,7 +291,7 @@ mod tests {
     #[test]
     fn a_fault_after_the_memory_insert_rolls_back_the_memories_and_the_cursor() {
         let store = store(Some(OWNER));
-        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");

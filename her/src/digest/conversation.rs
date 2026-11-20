@@ -1,6 +1,6 @@
 //! One digest run over one conversation's new evidence.
 use super::{evidence, model::DigestModel};
-use crate::memory::{DigestCursor, MemoryStore, NewMemory};
+use crate::memory::{open_store, DigestCursor, NewMemory};
 use crate::runtime::RuntimeContext;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,7 +72,7 @@ impl<'a> Digest<'a> {
     /// Conversations in digest order: never digested first, then the longest since its last digest; ties by key.
     pub(crate) fn conversations(&self) -> Result<Vec<String>, DigestError> {
         let keys = evidence::conversations(self.context).map_err(|_| DigestError::Evidence)?;
-        let store = MemoryStore::open(self.context, self.cfg).map_err(|_| DigestError::Storage)?;
+        let store = open_store(self.context, self.cfg).map_err(|_| DigestError::Storage)?;
         let space = evidence::space(self.context);
         let mut ordered = Vec::with_capacity(keys.len());
         for key in keys {
@@ -88,7 +88,7 @@ impl<'a> Digest<'a> {
     /// answer writes no memory, keeps the cursor and records the failure time (backoff `min_interval_ms`).
     pub(crate) fn run_conversation(&self, key: &str, limits: &Limits, hold: &dyn Hold) -> Result<Outcome, DigestError> {
         if hold.held() { return Err(DigestError::Cancelled); }
-        let store = MemoryStore::open(self.context, self.cfg).map_err(|_| DigestError::Storage)?;
+        let store = open_store(self.context, self.cfg).map_err(|_| DigestError::Storage)?;
         let reader = store.for_reader(key);
         let space = evidence::space(self.context);
         let mut cursor: DigestCursor = reader.digest_cursor(space).map_err(|_| DigestError::Storage)?.unwrap_or_default();
