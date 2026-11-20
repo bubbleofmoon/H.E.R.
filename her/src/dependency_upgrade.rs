@@ -959,7 +959,7 @@ fn recover(
             if cfg["dependencies"][name] != transaction.next {
                 return Err("candidate pin changed before recovery judgment".into());
             }
-            runnable_pin(&cfg, name)?;
+            pinned_version(&cfg, name)?; // RED-M3
             let next = existing(context, &cfg, name)?;
             let mut states = read_states(context)?;
             let scan = matching(&next, Unreadable::Refuse)?;
