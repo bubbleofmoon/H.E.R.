@@ -93,13 +93,14 @@ pub(crate) fn admission_alert(
     lost_alerted: &mut Option<String>,
 ) -> Result<(), String> {
     let (failed, reason) = match authority {
-        Ok(authority) => {
-            let alerted = std::mem::replace(lost_alerted, authority.lost.clone());
-            match &authority.lost {
-                Some(tag) if alerted.as_ref() != Some(tag) => (tag.clone(), LOST_CURRENT),
-                _ => return Ok(()),
+        Ok(authority) => match &authority.lost {
+            Some(tag) if lost_alerted.as_ref() != Some(tag) => (tag.clone(), LOST_CURRENT),
+            Some(_) => return Ok(()),
+            None => {
+                *lost_alerted = None;
+                return Ok(());
             }
-        }
+        },
         Err(_) => (
             link_tag(root, "current")
                 .ok()
@@ -116,21 +117,24 @@ pub(crate) fn admission_alert(
     }
     let mut alert = UpdateAlert::new(&failed, "unchanged", reason);
     alert.rollback = "preserved".into();
-    store_alert(root, &alert)
+    store_alert(root, &alert)?;
+    if reason == LOST_CURRENT {
+        *lost_alerted = Some(failed);
+    }
+    Ok(())
+}
+fn restore_gate_path(root: &InstallRoot) -> PathBuf {
+    root.root().join("runtime/data/locks/update-restore.lock")
 }
 /// A rollback holds the update-restore gate throughout, so a `pending` alert is still in
 /// progress only while someone else holds that gate; otherwise its helper died and it is stale.
 fn rollback_active(root: &InstallRoot, restore_gate: Option<&fs::File>) -> bool {
-    restore_gate.is_none()
-        && release_store::installation_gate(
-            &root.root().join("runtime/data/locks/update-restore.lock"),
-        )
-        .is_err()
+    restore_gate.is_none() && release_store::installation_gate(&restore_gate_path(root)).is_err()
 }
 /// Only contention on the update-restore gate means a rollback may still be running; any other
 /// gate failure leaves an alert deliverable, so a broken lock path cannot suppress delivery.
 fn restore_gate_contended(root: &InstallRoot) -> bool {
-    release_store::gate_contended(&root.root().join("runtime/data/locks/update-restore.lock"))
+    release_store::gate_contended(&restore_gate_path(root))
 }
 fn recovered_authority(root: &InstallRoot) -> Result<Authority, String> {
     use crate::release_signature;
@@ -259,8 +263,13 @@ impl Authority {
         release_signature::verify_with_keys(sums, signature, &identity.keys)
     }
 }
-/// Returns the verified candidate helper bytes.
-pub(crate) fn verify(root: &InstallRoot, tag: &str) -> Result<Vec<u8>, String> {
+/// Supervisor retries of an installed candidate may write a refusal under the restore gate.
+pub(crate) fn verify_staged(root: &InstallRoot, tag: &str) -> Result<(), String> {
+    let _gate = handover_gate(root)?;
+    verify(root, tag).map(drop)
+}
+/// Returns the verified candidate helper bytes. The caller holds the update-restore gate.
+fn verify(root: &InstallRoot, tag: &str) -> Result<Vec<u8>, String> {
     let result = authority(root).and_then(|authority| verify_candidate(root, tag, &authority));
     if result.is_err() {
         let kept = link_tag(root, "current")
@@ -436,9 +445,7 @@ fn launch_mode(
     automatic: bool,
 ) -> Result<u32, String> {
     use std::process::Stdio;
-    let gate = release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
+    let gate = handover_gate(root)?;
     // Publish exactly the helper bytes that were verified; never reread the file.
     let bytes = if recovery {
         let (current, last_good, _) = startup_selection(root)?;
@@ -545,6 +552,19 @@ pub fn wall_clock_ms() -> i64 {
 }
 fn alert_gate(root: &InstallRoot) -> Result<fs::File, String> {
     state_gate(root, "update-alert.lock")
+}
+/// Pending-alert probes hold the alert gate while briefly testing the restore gate.
+/// Retry under that gate after contention so a probe cannot refuse handover. The
+/// restore attempt never waits, since existing restore holders may write alerts.
+pub(crate) fn handover_gate(root: &InstallRoot) -> Result<fs::File, String> {
+    let path = restore_gate_path(root);
+    match release_store::installation_gate(&path) {
+        Err(error) if error == "another release installation or restore is running" => {
+            let _alert = alert_gate(root)?;
+            release_store::installation_gate(&path)
+        }
+        result => result,
+    }
 }
 fn read_alert(root: &InstallRoot) -> Result<Option<UpdateAlert>, String> {
     let path = root.root().join("update-alert.json");
@@ -840,6 +860,52 @@ mod claim_tests {
     /// The whole alert file, so a deferral that rewrote any byte shows.
     fn alert_bytes(root: &InstallRoot) -> Vec<u8> {
         fs::read(root.root().join("update-alert.json")).unwrap()
+    }
+
+    #[test]
+    fn deferred_lost_current_alert_is_recorded_after_delivery() {
+        let root = install("deferred-lost-current");
+        let previous = pending(&root.0);
+        let mut authority = authority(&root.0).unwrap();
+        authority.lost = Some(RETIRING.into());
+        let authority = Ok(authority);
+        let mut alerted = None;
+
+        admission_alert(&root.0, &authority, None, &mut alerted).unwrap();
+        assert_eq!(stored(&root.0).reason, "fixture rollback");
+        complete_alert(&root.0, &previous.id).unwrap();
+        admission_alert(&root.0, &authority, None, &mut alerted).unwrap();
+        assert_eq!(
+            stored(&root.0).reason,
+            LOST_CURRENT,
+            "deferred loss must be recorded on the next admission"
+        );
+        assert_eq!(alerted.as_deref(), Some(RETIRING));
+    }
+
+    #[test]
+    fn staged_verification_preserves_a_rollback_in_progress() {
+        let root = install("staged-during-rollback");
+        fs::create_dir_all(root.0.root().join("releases/v2.0.0")).unwrap();
+        let rollback = pending(&root.0);
+        let gate = hold_restore_gate(&root.0);
+        let before = alert_bytes(&root.0);
+
+        let result = verify_staged(&root.0, "v2.0.0");
+        assert_eq!(
+            alert_bytes(&root.0),
+            before,
+            "a staged verification must preserve the in-progress rollback alert"
+        );
+        assert!(result.is_err());
+        finish_rollback(&root.0, &rollback.id, "restored").unwrap();
+        drop(gate);
+
+        assert_eq!(
+            verify_staged(&root.0, "v2.0.0").unwrap_err(),
+            crate::release_signature::REFUSED
+        );
+        assert_eq!(stored(&root.0).failed, "v2.0.0");
     }
 
     #[test]

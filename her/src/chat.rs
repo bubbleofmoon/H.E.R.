@@ -228,11 +228,13 @@ pub fn handle_update_command(
     crate::release::approve(context, &latest, tag).map(|_| ())
 }
 
-/// The /update reply when nothing can be approved: a discovery refusal or error is
-/// reported, never hidden behind "no update".
+/// The /update reply reports discovery failures and recovered authority distinctly.
 fn no_update_reply(state: &Value) -> String {
     let current = state["current"].as_str().unwrap_or("未知版本");
     match state["error"].as_str() {
+        Some(crate::update::LOST_CURRENT) => format!(
+            "HER 当前版本：{current}；暂无可用更新。当前版本的发布元数据无法验证，已使用可信的已安装版本检查更新。请在控制台检查。"
+        ),
         Some(error) => format!("HER 当前版本：{current}；更新检查未通过：{error}。请在控制台检查。"),
         None => format!("HER 当前版本：{current}；暂无可用更新（或更新已关闭）。"),
     }
@@ -1315,13 +1317,22 @@ mod tests {
 
     #[test]
     fn update_reply_surfaces_a_discovery_refusal_instead_of_no_update() {
-        let refused = "release checksum signature missing, invalid or untrusted";
-        let reply = no_update_reply(&json!({"current":"v1.2.3","available":null,"error":refused}));
-        assert!(reply.contains(refused), "{reply}");
-        assert!(reply.contains("v1.2.3"), "{reply}");
-        assert!(!reply.contains("暂无可用更新"), "{reply}");
-        let reply = no_update_reply(&json!({"current":"v1.2.3","available":null,"error":null}));
-        assert!(reply.contains("暂无可用更新"), "{reply}");
+        for (error, expected) in [
+            (
+                Some("release checksum signature missing, invalid or untrusted"),
+                "HER 当前版本：v1.2.3；更新检查未通过：release checksum signature missing, invalid or untrusted。请在控制台检查。",
+            ),
+            (
+                Some(crate::update::LOST_CURRENT),
+                "HER 当前版本：v1.2.3；暂无可用更新。当前版本的发布元数据无法验证，已使用可信的已安装版本检查更新。请在控制台检查。",
+            ),
+            (None, "HER 当前版本：v1.2.3；暂无可用更新（或更新已关闭）。"),
+        ] {
+            assert_eq!(
+                no_update_reply(&json!({"current":"v1.2.3","available":null,"error":error})),
+                expected
+            );
+        }
     }
 
     struct Fake {

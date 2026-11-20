@@ -152,6 +152,48 @@ fn install_reauthenticates_after_discovery_before_creating_staging() {
 }
 
 #[test]
+fn install_refuses_a_tag_below_the_version_floor_after_discovery() {
+    let f = Fixture::new();
+    f.select_current("v0.0.0");
+    let releases = f.root.join("install/releases");
+    let newer = releases.join("v1.2.4");
+    fs::create_dir(&newer).unwrap();
+    for image in ["her.exe", "her-cli.exe", "herupdate.exe"] {
+        fs::write(newer.join(image), b"verified fixture bytes").unwrap();
+    }
+    f.sign_directory("v1.2.4", 1, "backup");
+
+    // Discovery is already using verified v0.0.0 when the request arrives.
+    // Losing that metadata leaves the current link unchanged, but installation must
+    // re-read authority and apply v1.2.4's version floor in its own signed-list check.
+    *f.hold.lock().unwrap() = Some("/SHA256SUMS.minisig".into());
+    let stderr = f.root.join("installer.stderr");
+    let mut installer = Child(
+        f.command(&[
+            "release",
+            "install",
+            "--runtime-root",
+            f.root.join("runtime").to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap(),
+    );
+    f.wait_count(&mut installer, "/SHA256SUMS.minisig", 1);
+    fs::write(releases.join("v0.0.0/SHA256SUMS.minisig"), b"invalid").unwrap();
+    *f.hold.lock().unwrap() = None;
+
+    let status = installer.0.wait().unwrap();
+    let stderr = fs::read_to_string(stderr).unwrap();
+    assert_eq!(f.count("/SHA256SUMS"), 2, "install must check its own list");
+    assert_eq!(f.count("/SHA256SUMS.minisig"), 2);
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains(FIX5_REFUSED), "{stderr}");
+    assert_no_release_staged(&f);
+}
+
+#[test]
 fn unknown_key_cannot_introduce_replacement_pins() {
     let f = Fixture::new();
     let replacement = format!(
@@ -332,6 +374,21 @@ fn signature_refusal_alerts_only_the_owner_and_clears_discovery_availability() {
     let text = body["message"].to_string();
     assert!(text.contains("发布校验清单签名"), "{body}");
     assert!(!text.contains("RW"));
+    drop(requests);
+    drop(next);
+
+    let (_console, port) = f.console();
+    for (policy, feed, expected) in [
+        ("notify", format!("{}/feed", f.url), json!(FIX5_REFUSED)),
+        ("off", format!("{}/feed", f.url), Value::Null),
+        ("notify", format!("{}/other-feed", f.url), Value::Null),
+    ] {
+        f.edit_config(|cfg| cfg["update"] = json!({"policy":policy,"feedUrl":feed}));
+        let (code, body) = http(port, "GET", "/api/releases", "", true, false);
+        assert_eq!(code, 200, "{body}");
+        let view: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(view["error"], expected, "{policy} {feed}: {view}");
+    }
 }
 
 #[test]

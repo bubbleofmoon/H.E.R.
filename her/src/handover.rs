@@ -28,9 +28,7 @@ pub fn handover(
     old: &ProcessIdentity,
     platform: &mut dyn Platform,
 ) -> Result<(), String> {
-    let _gate = release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
+    let _gate = crate::update::handover_gate(root)?;
     let current = platform
         .current("current")?
         .ok_or("current release unavailable")?;
@@ -757,9 +755,7 @@ fn run(
     if !recovery {
         return handover(root, target, old, platform);
     }
-    let _gate = release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
-    )?;
+    let _gate = crate::update::handover_gate(root)?;
     if platform.current("current")?.as_deref() != Some(target) {
         return Err("current changed before crash recovery".into());
     }
@@ -814,4 +810,63 @@ fn prune(root: &InstallRoot, platform: &mut dyn Platform) -> Result<(), String> 
         fs::remove_dir_all(path).map_err(|_| "old release could not be pruned")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn native_stop_retires_current_through_the_selected_cli() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let fixture = Fixture(crate::install_root::development_root(
+            std::env::temp_dir().join(format!(
+                "her-native-stop-{}-{}",
+                std::process::id(),
+                crate::update::wall_clock_ms()
+            )),
+        ));
+        let current = "v1.2.3";
+        let fallback = "v1.2.2";
+        for path in [
+            "runtime/data/lifecycle",
+            "runtime/data/logs",
+            "releases/v1.2.3",
+            "releases/v1.2.2",
+        ] {
+            fs::create_dir_all(fixture.0.join(path)).unwrap();
+        }
+        for name in ["rbridge-supervisor", "rbridge-live", "rbridge-console"] {
+            fs::File::create(fixture.0.join(format!("runtime/data/logs/{name}.lock"))).unwrap();
+        }
+        // The hosted suite builds ordinary binaries before running the test in target/*/deps.
+        let test_image = std::env::current_exe().unwrap();
+        let binaries = test_image.parent().unwrap().parent().unwrap();
+        let cli = binaries.join(format!("her-cli{}", std::env::consts::EXE_SUFFIX));
+        fs::copy(cli, fixture.0.join("releases/v1.2.2/her-cli.exe")).unwrap();
+
+        let root = InstallRoot::new(&fixture.0).unwrap();
+        switch_link(&root, "current", current).unwrap();
+        let mut native = Native {
+            root,
+            target: current.into(),
+            recovery: false,
+            automatic: false,
+            child: None,
+            launches: 0,
+        };
+        // Only the fallback has a CLI. There are no owned processes in the fixture.
+        native.stop(current, fallback).unwrap();
+        assert_eq!(
+            native.stop(fallback, fallback).unwrap_err(),
+            "failed release could not be retired",
+            "retire-current must receive the failed tag and propagate CLI refusal"
+        );
+    }
 }

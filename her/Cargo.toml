@@ -16,7 +16,6 @@ test = false
 [[bin]]
 name = "herupdate"
 path = "src/updater.rs"
-test = false
 
 [[test]]
 name = "release_install"
