@@ -354,7 +354,7 @@ impl Pipeline {
     pub(crate) fn cancel_reserved2_cap(
         context: &RuntimeContext, cfg: &serde_json::Value, key: &str, dispatch: Option<(&str, &MintedEpoch)>,
     ) -> Result<Cancelled, String> {
-        let mut control = Self::new_without_dsh(context, cfg, true)?;
+        let mut control = Self::new_without_dsh(context, cfg)?;
         control.cancel_with_dispatch(key, "turnTimeout", dispatch)
     }
 

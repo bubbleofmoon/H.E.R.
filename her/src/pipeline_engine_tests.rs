@@ -408,8 +408,8 @@ async fn ticket164_harness_chat_turn_sends_the_acquired_image_with_the_voice_lab
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
-    // A session mapping makes `ensure_session` return without an RPC, so the stream open is the
-    // call that would reach DSH: it must refuse locally as well.
+    // Even with a session already mapped, the DSH adapter must refuse an unbound pipeline
+    // before opening a connection.
     let dsh = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     dsh.set_nonblocking(true).unwrap();
     let mut runtime = SeamRuntime::new("seam-unbound-ask", "closed-agent", false, SeamRuntime::scripted_config());
@@ -429,7 +429,13 @@ async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
     let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg).unwrap();
     let reply = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        pipe.ask("private:8808", "hello seam unbound", 5),
+        pipe.run_admitted_turn(
+            &crate::turn_engine::Adapter::Dsh,
+            "private:8808",
+            "hello seam unbound",
+            std::time::Duration::from_secs(5),
+            &cfg,
+        ),
     )
     .await;
     match dsh.accept() {
