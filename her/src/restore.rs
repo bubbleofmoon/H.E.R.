@@ -903,7 +903,7 @@ fn execute_with(
             .map(|name| name.to_string_lossy().into_owned());
         let rollback = Prepared::open(context, &previous, memory_only)?;
         #[cfg(feature = "parity-clock")]
-        { drop(_credential); control.snapshot_ready()?; } // RED-R2-K
+        control.snapshot_ready()?;
         let attempt = (|| -> Result<(), Step> {
             stop_and_replace(context, by, &prepared, memory_only, control)?;
             resume(context, by)?;
