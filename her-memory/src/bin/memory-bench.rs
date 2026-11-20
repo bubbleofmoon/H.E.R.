@@ -51,7 +51,7 @@ impl RecallAdapter for CurrentMemory {
                 importance: 0.5,
             })?;
         }
-        let hits = recall(&reader, &input.question, 0, &[])?; // RED-M1
+        let hits = recall(&reader, &input.question, 1, &[])?;
         Ok(hits.into_iter().next().map(|hit| hit.content))
     }
 }
