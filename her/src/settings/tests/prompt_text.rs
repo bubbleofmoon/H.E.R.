@@ -48,7 +48,7 @@ fn prompt_text_edit_is_live_on_the_next_wake_as_a_section_replacement() {
     });
     let (briefing, _) = crate::prompt::prepare_dsh_wake(&context, &context.load_config().unwrap(), key, "sid-140", "epoch-140",
         "atMention", "rpc-140-1", "").unwrap();
-    assert!(briefing.contains("【简报节 behaviour】\n【别像客服】你不是客服："), "{briefing}");
+    assert!(briefing.contains("【简报节 behaviour】\n【在群里怎么说话】"), "{briefing}");
     crate::session_context::observe(&context, key, "sid-140", "epoch-140", &json!({
         "type": "user/message", "seq": 1, "data": {"source": {"rpcId": "rpc-140-1"}},
     })).unwrap();
@@ -58,15 +58,15 @@ fn prompt_text_edit_is_live_on_the_next_wake_as_a_section_replacement() {
         "atMention", "rpc-140-2", "").unwrap();
     server.join().unwrap();
     assert!(delta.contains("【唤醒增量】"), "{delta}");
-    assert!(delta.contains(&format!("【替换简报节 behaviour】完整替换旧节：\n{edited}\n\n【积极性】")), "{delta}");
-    assert!(!delta.contains("你不是客服"), "the old rule is gone: {delta}");
+    assert!(delta.contains(&format!("【替换简报节 behaviour】完整替换旧节：\n{edited}\n\n【在群里怎么说话】")), "{delta}");
+    assert!(!delta.contains("【积极性】"), "participation defaults to empty: {delta}");
     assert!(!delta.contains("【替换简报节 stickers】"), "only the edited section is replaced: {delta}");
 }
 
 #[test]
 fn prompt_text_save_is_checked_and_a_refusal_keeps_the_last_good_version() {
     let (root, context) = prompt_fixture("prompt text refused");
-    assert!(next_render(&context).contains("【积极性】不要习惯性潜水"), "the compiled default renders");
+    assert!(!next_render(&context).contains("【积极性】"), "participation defaults to empty");
     let (status, body) = set_text(&context, "prompt.proactive", json!("【积极性】看心情接话 140"));
     assert_eq!(status, 200, "{body}");
     assert_eq!(body, json!({"ok": true, "setting": "prompt.proactive", "value": "【积极性】看心情接话 140", "revision": 1, "changed": true}));
@@ -107,7 +107,7 @@ fn prompt_text_save_is_checked_and_a_refusal_keeps_the_last_good_version() {
     let (status, body) = set_text(&context, "prompt.proactive", json!(""));
     assert_eq!(status, 200, "{body}");
     let text = next_render(&context);
-    assert!(!text.contains("【积极性】") && text.contains("【别像客服】你不是客服") && text.contains("【在群里怎么说话】"), "{text}");
+    assert!(!text.contains("【积极性】") && text.contains("【在群里怎么说话】"), "{text}");
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     assert!(next_render(&context).contains("【别像客服】第二版 140\n\n"), "the file's value after a removal");
     // A file with no prompt text leaves the default.
     write_config(&root, |config| config["prompts"] = json!({}));
-    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the default after a removal, with nothing in the file");
+    assert!(!next_render(&context).contains("【别像客服】"), "the default after a removal, with nothing in the file");
     let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】第三版 140"));
     assert_eq!(status, 200, "{body}");
     assert!(next_render(&context).contains("【别像客服】第三版 140\n\n"), "a later save is in effect");
@@ -182,7 +182,7 @@ fn prompt_text_refused_at_load_falls_back_to_its_last_good_version() {
     // Without an accepted stored or audited value, the file's value applies when accepted, else the default.
     let (other_root, other) = prompt_fixture("prompt text file guard");
     write_config(&other_root, |config| config["prompts"] = json!({"behaviour": {"notAClerk": "【别像客服】文件里的 AI 140"}}));
-    assert!(next_render(&other).contains("【别像客服】你不是客服："), "a refused file value renders the default");
+    assert!(!next_render(&other).contains("【别像客服】"), "a refused file value renders the default");
     write_config(&other_root, |config| config["prompts"] = json!({"behaviour": {"notAClerk": "【别像客服】文件里的版本 140"}}));
     assert!(next_render(&other).contains("【别像客服】文件里的版本 140\n\n"), "an accepted file value renders");
     // The store's first write seeds every registry value in the file (#176), so the file holds no prompt text while
@@ -225,11 +225,11 @@ fn prompt_text_readers_see_one_whole_version_while_writers_save() {
             loop {
                 let done = committed.load(std::sync::atomic::Ordering::SeqCst);
                 let text = next_render(&context);
-                let default = text.contains("【别像客服】你不是客服：");
+                let default = !text.contains("【别像客服】");
                 let seen = [
                     default,
-                    text.contains(&format!("{first}\n\n【积极性】")),
-                    text.contains(&format!("{second}\n\n【积极性】")),
+                    text.contains(&format!("{first}\n\n【在群里怎么说话】")),
+                    text.contains(&format!("{second}\n\n【在群里怎么说话】")),
                 ];
                 assert_eq!(seen.iter().filter(|seen| **seen).count(), 1, "one whole version: {text}");
                 assert!(!default, "a read after a commit shows the default, not the committed text: {text}");
@@ -256,7 +256,7 @@ fn prompt_text_readers_see_one_whole_version_while_writers_save() {
     assert_eq!((a, b), (None, None));
     assert!(reads_after_commit > 0, "no read ran after a commit");
     let settled = next_render(&context);
-    assert!(settled.contains(&format!("{first}\n\n【积极性】")) || settled.contains(&format!("{second}\n\n【积极性】")), "{settled}");
+    assert!(settled.contains(&format!("{first}\n\n【在群里怎么说话】")) || settled.contains(&format!("{second}\n\n【在群里怎么说话】")), "{settled}");
     assert_eq!(audit_rows(&root).len(), 2);
 }
 
@@ -373,7 +373,7 @@ fn prompt_text_works_on_a_store_written_before_it() {
     let (root, context) = prompt_fixture("prompt text old store");
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 200, "{body}");
-    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the compiled defaults render");
+    assert!(!next_render(&context).contains("【别像客服】"), "the compiled defaults render");
     let (status, body) = set_text(&context, "prompt.notAClerk", json!("【别像客服】新版 140"));
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["revision"], 1);
@@ -398,7 +398,7 @@ fn prompt_text_settings_page_edits_text_in_a_text_area() {
     assert_eq!(mode["group"], "prompt text");
     let rule = entry("prompt.notAClerk").unwrap_or_else(|| panic!("prompt.notAClerk is listed: {body}"));
     assert_eq!(rule["kind"], json!({"type": "text", "maxChars": 2000}));
-    assert!(rule["default"].as_str().unwrap().starts_with("【别像客服】你不是客服："), "{rule}");
+    assert_eq!(rule["default"], "", "{rule}");
     assert!(
         page.contains("const text=type==='text'") && page.contains("createElement(text||routeList?'textarea':'input')"),
         "a text setting is edited in a text area"
@@ -457,7 +457,7 @@ fn prompt_text_reset_stores_the_default_and_undo_restores_only_accepted_text() {
         body,
         json!({"ok": true, "setting": "prompt.notAClerk", "value": crate::prompt_text::NOT_A_CLERK, "revision": 3, "changed": true})
     );
-    assert!(next_render(&context).contains("【别像客服】你不是客服："), "the default wins over the file's value");
+    assert!(!next_render(&context).contains("【别像客服】"), "the default wins over the file's value");
     assert_eq!(setting_view(&context, "prompt.notAClerk")["stored"], crate::prompt_text::NOT_A_CLERK);
     let (status, body) = post(&context, "/api/settings/reset", json!({"setting": "prompt.notAClerk"}));
     assert_eq!((status, body["changed"].clone()), (200, json!(false)), "a stored default is not a change");
@@ -466,7 +466,7 @@ fn prompt_text_reset_stores_the_default_and_undo_restores_only_accepted_text() {
     let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entries[0]["entry"]}));
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["stored"], edited, "{body}");
-    assert!(next_render(&context).contains(&format!("{edited}\n\n【积极性】")), "the next render reads the restored text");
+    assert!(next_render(&context).contains(&format!("{edited}\n\n【在群里怎么说话】")), "the next render reads the restored text");
     // An entry whose old value the registry now refuses (a term a later release denies) is not undone.
     let entry = StoreProbe::at(&root.0).insert_audit(&[AuditRow::test(
         "prompt.notAClerk",
@@ -478,7 +478,7 @@ fn prompt_text_reset_stores_the_default_and_undo_restores_only_accepted_text() {
     let (status, body) = post(&context, "/api/settings/undo", json!({"entry": entry}));
     assert_eq!(status, 409, "{body}");
     assert_eq!(body["error"], "the old value of this entry is no longer accepted");
-    assert!(next_render(&context).contains(&format!("{edited}\n\n【积极性】")), "a refused undo keeps the text");
+    assert!(next_render(&context).contains(&format!("{edited}\n\n【在群里怎么说话】")), "a refused undo keeps the text");
     assert_eq!(audit_rows(&root).len(), rows, "a refused undo writes no audit row");
     // A mode prompt's default is empty: a reset stores the empty text over the file's, and no mode prompt is sent.
     let mode = |context: &RuntimeContext| {

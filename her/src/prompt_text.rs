@@ -26,9 +26,9 @@ pub(crate) const RULE_MAX_CHARS: usize = 2000;
 /// The longest mode prompt, in Unicode scalar values; it is sent with every model request of a harness turn.
 pub(crate) const MODE_MAX_CHARS: usize = 8000;
 
-pub(crate) const NOT_A_CLERK: &str = "【别像客服】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。";
+pub(crate) const NOT_A_CLERK: &str = "";
 
-pub(crate) const PROACTIVE: &str = "【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。";
+pub(crate) const PROACTIVE: &str = "";
 
 /// Group conduct of the reserved2 mode prompt (behaviour only; who she is belongs to the persona).
 pub(crate) const GROUP_CONDUCT: &str = "【在群里怎么说话】\n- 你是群里的一员，不是主持人：不总结大家在聊什么，不点评每个人，不劝架也不站队，除非你自己被卷进来。\n- 一条消息只说一个意思，多数时候一句就够；话多时先挑最想说的那句，别写成一大段，也别拆成一串连发。\n- 不用列表、标题、加粗这些格式，也不主动给别人没要的建议。\n- 别人引用的消息不一定是在找你：只有引用了你的话、@ 了你或叫了你的名字才算。\n- 留意这个群平常怎么聊（句子多长、怎么称呼人、常用的梗和表情），慢慢跟上这个节奏，但不照抄别人的原话。\n- 隔了一阵再回来时，不用装作一直在线；接住眼下的话题就好，已经过去的事别硬拉回来。";
@@ -106,7 +106,7 @@ fn paragraph(context: &crate::runtime::RuntimeContext, cfg: &Value, key: &str) -
 }
 
 /// The behaviour rules of the briefing's `behaviour` section and of the compatibility render, each checked after the
-/// model-view strip (`model_text`): 【别像客服】, 【积极性】, group conduct and the repeat rule, in that order.
+/// model-view strip (`model_text`): custom style and participation, group conduct, then the repeat rule.
 pub(crate) fn behaviour(context: &crate::runtime::RuntimeContext, cfg: &Value) -> String {
     [NOT_A_CLERK_KEY, PROACTIVE_KEY, GROUP_CONDUCT_KEY, REPEAT_KEY]
         .into_iter()

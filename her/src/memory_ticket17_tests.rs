@@ -561,9 +561,14 @@ fn a_wake_whose_snapshot_cannot_be_fetched_counts_no_recall_hit() {
 
 #[test]
 fn the_dsh_wake_delivers_the_recall_the_preview_shows_and_counts_a_hit_only_when_delivered() {
-    let (_root, context, state, conn, cfg) = recall_wake_fixture("dsh recall delivery");
+    let (_root, context, state, conn, _) = recall_wake_fixture("dsh recall delivery");
+    let cfg = context.load_config().unwrap();
     let key = RECALL_KEY;
     let st = &state["conversations"][key];
+    let before = crate::prompt::recall_block_with_runtime(&context, &cfg, st, key);
+    assert_eq!(before.matches("\n- [fact").count(), 2, "both memories fit the starting depth");
+    crate::settings::apply(&context, "memory.inject.relatedTopK", &json!(1), "administrator", "console").unwrap();
+    let cfg = context.load_config().unwrap();
     let preview = crate::prompt::recall_block_with_runtime(&context, &cfg, st, key);
     assert!(preview.contains("评测记录"), "{preview}");
     assert_eq!(preview.matches("\n- [fact").count(), 1, "relatedTopK is honoured: {preview}");

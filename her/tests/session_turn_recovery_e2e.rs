@@ -3112,14 +3112,14 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     let first = rig.dsh.applied()[0].text.clone();
     assert!(first.contains("operator-briefing-85"), "a non-bootstrap first hydration lost operator background");
     assert!(first.contains("【简报 revision="));
-    assert!(first.contains("【别像客服】"));
+    assert!(first.contains("【简报节 behaviour】"));
     assert!(first.contains("【简报节 sending】\n【发送规则】") && first.contains("文本输出不会发送到 QQ"), "first non-bootstrap briefing lost tool-only delivery rules");
     for i in 1..25 {
         lock(&rig.gateway).frames.push(mention_event(85000+i as i64,"fresh delta message"));
         assert!(wait_for(LONG, || rig.turn_state(i) == "completed"), "wake {i} did not finish");
         let text = rig.dsh.applied()[i].text.clone();
         assert!(text.contains("【唤醒增量】"), "wake {i}: {text}");
-        assert!(!text.contains("【别像客服】"), "wake {i} repeated unchanged rules");
+        assert!(!text.contains("【替换简报节 behaviour】"), "wake {i} repeated unchanged rules");
         assert!(!text.contains("operator-briefing-85"));
         assert!(!text.contains("【首回复节奏】先处理") && !text.contains("【沉睡前强制等待】这是"));
         assert!(text.contains("【会话令牌】"));
@@ -3146,7 +3146,7 @@ fn hf85_briefing_once_then_twenty_four_fresh_deltas_and_restart() {
     rig.restart(vec![]);
     assert_eq!(rig.console("POST", "/api/socialV2/wake", Some(&json!({"key":GROUP_KEY}))).0, 200);
     assert!(wait_for(LONG, || rig.turn_state(25) == "completed"));
-    assert!(!rig.dsh.applied()[25].text.contains("【别像客服】"), "durable hydration lost on restart");
+    assert!(!rig.dsh.applied()[25].text.contains("【替换简报节 behaviour】"), "durable hydration lost on restart");
     assert!(!rig.dsh.applied()[25].text.contains("【替换简报节 identity】"),"restart replaced the known bot identity");
     assert_eq!(rig.dsh.count("session/create"), 0);
 }
@@ -3180,7 +3180,7 @@ fn hf85_briefing_changes_replace_remove_and_clock_does_not_resend_memory() {
     assert!(wait_for(LONG,||rig.turn_state(2)=="completed"));
     let changed=rig.dsh.applied()[2].text.clone();
     assert!(changed.contains("【替换简报节 operator】") && changed.contains("new-operator-85"));
-    assert!(!changed.contains("old-operator-85") && !changed.contains("【别像客服】"));
+    assert!(!changed.contains("old-operator-85") && !changed.contains("【替换简报节 behaviour】"));
     assert!(changed.contains("【替换简报节 memory】") && changed.contains("new-thought-85") && changed.contains("【替换简报节 impressions】") && changed.contains("new-impression-85"), "impressions are the Relationship layer's own section: {changed}");
     assert!(changed.contains("【替换简报节 stickers】") && changed.contains("new-sticker-85"));
     assert!(changed.contains("【替换简报节 sending】") && changed.contains("new-send-rule-85"));

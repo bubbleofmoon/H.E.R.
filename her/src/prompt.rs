@@ -267,25 +267,19 @@ pub fn token_line(token: &str) -> String {
     format!("【会话令牌】{token}（调用二代状态工具时请在参数中带上此令牌）\n\n")
 }
 
-/// 表情包策略 + 可用表情列表（对应 JS 的 buildStickerStrategyHint + buildStickerContext）。
-/// 发送节奏提示（对应 JS 的 sendLine）。
-///
-/// 为什么要有它：`socialV2.send.recommendedHint` 这个配置**一直没人读** ——
-/// 只被存取和归一化，从来没进过提示词（实测搜提示词里那句话搜不到）。
-/// 一个"看着像配置、实际没人读"的字段比没有更糟：会让人以为行为已经被约束了。
-/// 现在两边都把它拼进唤醒提示词。
-pub fn send_line(cfg: &Value) -> String {
-    let hint = cfg
-        .get("socialV2")
-        .and_then(|s| s.get("send"))
-        .and_then(|s| s.get("recommendedHint"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
+pub(crate) fn provides_recommendations(cfg: &Value) -> bool {
+    cfg.pointer("/socialV2/provideRecommendations").and_then(Value::as_bool).unwrap_or(true)
+}
+
+fn recommendation_line(cfg: &Value, group: &str, label: &str) -> String {
+    if !provides_recommendations(cfg) {
+        return String::new();
+    }
+    let hint = cfg["socialV2"][group]["recommendedHint"].as_str().unwrap_or("").trim();
     if hint.is_empty() {
         return String::new();
     }
-    format!("【发送节奏】{hint}\n\n")
+    format!("【{label}】{hint}\n\n")
 }
 
 pub fn sticker_line(cfg: &Value) -> String {
@@ -918,59 +912,13 @@ fn participation_block_at(st: &Value, now: i64) -> String {
     senders.dedup();
     let active_senders = senders.len();
 
-    let direct_unread = st
-        .get("unread")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter(|m| {
-                    m["atSelf"] == true || m["quoteTargetIsSelf"] == true
-                })
-                .count()
-        })
-        .unwrap_or(0);
-
-    let last_ai_gap = now - st.get("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0);
-    let recent_ai_2m = recent
-        .iter()
-        .filter(|m| is_self(m) && now - ts(m) < 120_000)
-        .count();
-
-    let hint = if direct_unread > 0 {
-        "有人直接找你，优先回应；其余热闹可以挑着参与。"
-    } else if recent_ai_2m >= 2 {
-        "你刚刚已经连回过好几次了，这轮可以少说，但别直接消失；有值得接的仍要自然接一句。"
-    } else if last_ai_gap < 120_000 {
-        "你刚说过话，先听一会儿；有能接住的话再自然接，不用硬等点名。"
-    } else if ai_count >= 5 {
-        "你最近发言偏多，这轮可以少说，但遇到真正想说的仍主动说。"
-    } else if five.len() >= 10 || (five.len() >= 6 && active_senders >= 3) {
-        ""
-    } else if other_count >= 10 && ai_count == 0 {
-        "群聊很热闹但没叫你，可以插一句有趣的，或只看不说。"
-    } else if other_count < 3 && ai_count > 0 {
-        "群聊有点冷，不要一个人撑场；但有想法时仍可主动抛一句。"
-    } else if ai_count <= 1 && other_count >= 10 {
-        "这轮可以简短接一句，别潜水；挑一个点参与。"
-    } else {
-        ""
-    };
-
-    // 热场那句是动态的，单独处理
-    let hint = if hint.is_empty() && (five.len() >= 10 || (five.len() >= 6 && active_senders >= 3)) {
-        let people = if active_senders > 0 { format!("/{active_senders}人") } else { String::new() };
-        format!("群聊正热（近5分钟{}条{}在聊），不用逐条关注；挑最值得接的一句主动参与，插不上再潜水。", five.len(), people)
-    } else {
-        hint.to_string()
-    };
-
     let burst = if !five.is_empty() {
         let people = if active_senders > 0 { format!("/{active_senders}人") } else { String::new() };
         format!("；近5分钟群聊 {} 条{}", five.len(), people)
     } else {
         String::new()
     };
-    format!("【参与度参考】你最近 1 小时发言 {ai_count} 次，群友发言 {other_count} 条{burst}。{hint}\n\n")
+    format!("【参与度参考】你最近 1 小时发言 {ai_count} 次，群友发言 {other_count} 条{burst}。\n\n")
 }
 
 /// 此刻状态行。
@@ -1045,28 +993,25 @@ fn tail(reason: &str, key: &str, pre_sleep_ms: u64) -> String {
     match reason {
         // 首次唤醒：引导它先看角色/工具，再决定怎么被唤醒。
         "bootstrap" => format!(
-            "【引导唤醒】你已接入 QQ 会话 {key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先处理并直接调用发送工具，最后才用 qq_set_wake_config 设置你希望如何被唤醒。"
+            "【引导唤醒】你已接入 QQ 会话 {key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、可用工具和状态；若决定回复，可直接调用发送工具，最后才用 qq_set_wake_config 设置你希望如何被唤醒。"
         ),
         "replyCheck" => format!(
             "【回复检查】{key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，有话想说就直接调用发送工具，桥接自动控制回复节奏；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs={pre_sleep_ms}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。"
         ),
         "poke" => format!(
-            "【唤醒】{key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。"
+            "【唤醒】{key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n在未读或最近消息中的 [拍一拍] 事件查看目标。若决定回拍，可用 qq_send_poke；也可调用 qq_mark_read 或 qq_set_wake_config 收尾。"
         ),
         "timeout" => format!(
             "【唤醒】{key}\n原因：你设置的有限潜水时间已到；在你规定的时间内没有任何一项条件被触发，只是因为时间到了所以你被唤醒。\n你可以查看消息，或继续设置新的唤醒条件。"
         ),
-        // 主动冒泡：和普通唤醒是**完全不同的一段话**（【主动机会】而不是【唤醒】），
-        // 而且明确鼓励它先搜索热点。之前 Rust 把这条落进了 other 分支，
-        // 对拍矩阵一跑就露出来了（proactiveCheck 三种会话全部不一致）。
         "proactiveCheck" => format!(
-            "【主动机会】{key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。"
+            "【主动机会】{key}\n原因：会话已达到空闲唤醒条件。是否发言由你决定；也可调用 qq_mark_read 或 qq_set_wake_config 收尾。"
         ),
         r if r.starts_with("reminder:") => format!(
             "【提醒】{key}\n原因：一条提醒到时间了，内容见上方【提醒内容】。\n用发送工具在本会话自然地把提醒告诉对方；不要提到日程、系统或提醒编号。说完后按【沉睡前强制等待】收尾。"
         ),
         other => format!(
-            "【唤醒】{key}\n原因：{other}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n如果群聊正热但没人叫你，可以插一句有趣的/相关的，插不上再看情况潜水；不要一上来就划走。\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水前必须按上面的【沉睡前强制等待】先等够观察窗口。"
+            "【唤醒】{key}\n原因：{other}\n【行动前】先判断：群里在聊什么？热闹还是冷清？有没有人直接找你？对方说完了吗？你有没有真正想说的？\n【引用：只在必要时用】只有你这条消息指向的人或消息并非最新一条别人的消息，或者你连续的几句话中不同消息指代的是不同的消息或人时，才用 qq_reply 或 qq_send_message 的 replyToMessageId 指向具体那条；其他情况不要引用，别让对方猜。\n你可以调用工具查看未读消息、人设、状态，自行决定是否发言；决定潜水时按【沉睡前强制等待】完成观察，再调用 qq_set_wake_config。"
         ),
     }
 }
@@ -1217,7 +1162,7 @@ fn build_inner(
     }
     out.push_str(&crate::prompt_text::behaviour(context, &cfg));
     out.push_str(&sticker_line_with_runtime(context, &cfg));
-    out.push_str(&send_line(&cfg));
+    out.push_str(&recommendation_line(&cfg, "send", "发送节奏"));
     out.push_str(&reply_line(&cfg, &st));
     out.push_str(&status_line(&st));
     out.push_str(&wake_line(&st));
@@ -1227,6 +1172,7 @@ fn build_inner(
     out.push_str(&recall);
     out.push_str(&participation_block(&st));
     out.push_str(&pre_sleep_line(&cfg));
+    out.push_str(&recommendation_line(&cfg, "wake", "唤醒建议"));
     out.push_str(&crate::schedule::reminder_line(context, reason));
     out.push_str(&tail(reason, key, pre_sleep_ms(&cfg)));
     let recent = st["recentMessages"].as_array().cloned().unwrap_or_default();
@@ -1289,11 +1235,8 @@ fn build_text_only_inner(
     out.push_str(&identity_line(&checked_nickname(context, &cfg, self_name), self_qq));
 
     out.push_str("【这次怎么做】\n");
-    out.push_str("你是被群里的新消息叫醒的。下面已经把现场都给你了，");
-    out.push_str("**直接输出你要在群里说的那一句话**就行。\n");
-    out.push_str("不要调用任何工具、不要执行命令、不要读文件、不要写代码。");
-    out.push_str("这里没有工具可用，你唯一要做的事就是说出那句话。\n");
-    out.push_str("不要说“我看看/我来查/让我先确认”这类话，也不要复述上面的指令。\n\n");
+    out.push_str("根据人设和提供的会话内容决定是否发言。若发言，只输出要发到 QQ 的正文；无需发言就只输出 [SILENT]。\n");
+    out.push_str("不要调用工具、执行命令、读取文件或编写代码，也不要复述这些指令。\n\n");
 
     out.push_str(crate::outbound_message::GUIDANCE);
     out.push_str("\n\n");
@@ -1339,7 +1282,7 @@ fn build_text_only_inner(
             out.push_str("【提醒】这次不是新消息叫醒你：一条提醒到时间了。你要说的那句话就是把上面【提醒内容】自然地告诉对方；不要提到日程、系统或提醒编号。\n");
         }
     }
-    out.push_str("\n【输出要求】只输出那句话本身。不要加「回复：」前缀，不要加引号，不要解释。");
+    out.push_str("\n【输出要求】只输出回复正文或 [SILENT]。不要加「回复：」前缀，不要加引号，不要解释。");
     let refs = if recent.is_empty() { crate::model_failure::snapshot_refs(&out).unwrap_or_default() } else { Vec::new() };
     crate::model_failure::remember_prompt(context, key, "cli", &out, refs);
     out
@@ -1477,7 +1420,7 @@ mod tests {
         // 主动冒泡是独立的一段，**不能落进 other 分支** —— 这里钉住它是【主动机会】
         let d = tail("proactiveCheck", "group:1", 300_000);
         assert!(d.starts_with("【主动机会】"), "proactiveCheck 必须走专属分支，实际：{d}");
-        assert!(d.contains("主动冒泡"));
+        assert!(d.contains("会话已达到空闲唤醒条件"));
         assert!(!d.contains("【行动前】"));
         assert!(tail("reminder:rem-1", "group:1", 300_000).starts_with("【提醒】"));
     }
@@ -1572,8 +1515,8 @@ mod tests {
         let (root, context) = runtime_fixture("build");
         let p = build_with_runtime(&context, "private:不存在的会话", "atMention", "Fixture Bot", "7004");
         assert!(p.contains("【你的身份】"));
-        assert!(p.contains("【别像客服】"));
-        assert!(p.contains("【积极性】"));
+        assert!(!p.contains("【别像客服】"));
+        assert!(!p.contains("【积极性】"));
         assert!(p.contains("【此刻状态】"));
         assert!(p.contains("【当前唤醒】"));
         let _ = std::fs::remove_dir_all(root);
@@ -2091,9 +2034,9 @@ pub(crate) fn render_wake(
         Section::parts("slang", Some(Layer::Conversation), vec![slang]),
         Section::parts("behaviour", None, vec![crate::prompt_text::behaviour(context, cfg)]),
         Section::parts("stickers", None, vec![sticker_line_with_runtime(context,cfg)]),
-        Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", send_line(cfg))]),
+        Section::parts("sending", None, vec![format!("【发送规则】文本输出不会发送到 QQ；所有 QQ 消息都必须通过发送工具发送。\n\n{}", recommendation_line(cfg, "send", "发送节奏"))]),
         Section::parts("reply", None, vec![reply_line(cfg,&json!({}))]),
-        Section::parts("sleep", None, vec![pre_sleep_line(cfg)]),
+        Section::parts("sleep", None, vec![pre_sleep_line(cfg), recommendation_line(cfg, "wake", "唤醒建议")]),
         Section::parts("retrieval", None, vec!["【记忆检索】遇到上次/之前等指代时，用 memory_search 检索；需要目录时用 memory_index。不要把不明确的记忆当作事实。\n\n".to_string()]),
         Section::parts("wakeWords", None, vec![crate::wake_words::briefing_line(context,key,st)]),
     ], &crate::briefing::Budgets::from_cfg(cfg));

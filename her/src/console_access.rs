@@ -193,15 +193,6 @@ pub(super) fn note_config_start(context: &RuntimeContext) {
     }
 }
 
-/// Whether `config.json` differs from what the console found at start: from then on JS
-/// `maybeReloadConfig` has shallow-assigned the raw file members over its in-memory `cfg`.
-pub(super) fn config_changed_since_start(context: &RuntimeContext) -> bool {
-    CONFIG_START_STAMP
-        .get()
-        .and_then(|stamps| stamps.lock().ok().and_then(|s| s.get(context.config_file()).cloned()))
-        .is_some_and(|start| start != config_stamp(context))
-}
-
 /// JS `GET /api/whitelist` returns its in-memory `cfg`: the lists as `loadConfig` normalized them
 /// at start (`normalizeIdList`, alias precedence, normalized owner or `null`) until `config.json`
 /// changes; after that `maybeReloadConfig` has shallow-assigned the raw file values.
