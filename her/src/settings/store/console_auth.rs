@@ -111,7 +111,7 @@ fn write_administrator_password(
     let previous = schema_version(&tx).map_err(unavailable)?;
     write(&tx)?;
     #[cfg(test)]
-    if previous < 3 && FAIL_AUTH_MIGRATION.with(|fail| { fail.set(false); false }) { // RED-R2-B
+    if previous < 3 && FAIL_AUTH_MIGRATION.with(|fail| fail.replace(false)) {
         return Err(unavailable(STORAGE_ERROR.to_string()));
     }
     tx.commit().map_err(storage_error).map_err(unavailable)
