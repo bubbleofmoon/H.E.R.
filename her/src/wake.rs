@@ -1349,7 +1349,7 @@ pub(crate) fn effective_wake_defaults(cfg: &Value) -> Value {
         "recommendedNameMention": triggers["nameMention"],
         "recommendedQuestion": triggers["question"],
         "recommendedPoke": triggers["poke"],
-        "recommendedKeywords": ["小鲸鱼", "大肥鱼", "鲸鱼"], // RED-F10
+        "recommendedKeywords": triggers["keywords"],
         "recommendedProbability": triggers["probability"],
         "batchWindowMs": plan["batchWindowMs"],
         "sleepMinMs": sleep.minimum,
