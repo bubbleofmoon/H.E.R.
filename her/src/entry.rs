@@ -1192,7 +1192,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.iter().skip(1).any(|arg| matches!(arg.as_str(),
         "--ab-full" | "--ab-probe" | "--shadow-turn" | "--shadow-state-root"
         | "--replay" | "--wake-replay" | "--replay-jsonl" | "--replay-triggers"
-        | "--rpc-probe" | "--selftest-401" | "--failover-probe" // RED-M1
+        | "--ask" | "--rpc-probe" | "--selftest-401" | "--failover-probe"
         | "--dsh-dump" | "--dsh-watch" | "--dsh-probe" | "--dsh-demo"
     )) {
         eprintln!("[her] unknown option");
