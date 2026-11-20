@@ -932,6 +932,13 @@ pub fn system_job_paused(context: &RuntimeContext, job: &str) -> bool {
     }
 }
 
+fn reminder_prompt_text(text: &str) -> String {
+    text.replace("\r\n", " ")
+        .replace(['\n', '\r', '\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'], " ")
+        .replace('【', "〔")
+        .replace('】', "〕")
+}
+
 /// The model-facing line for a reminder wake: the reminder text, or a note that it was cancelled or deleted.
 /// Empty for other reasons and when the store cannot be read.
 pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
@@ -940,12 +947,12 @@ pub fn reminder_line(context: &RuntimeContext, reason: &str) -> String {
     };
     match ScheduleStore::new(context).item(id) {
         Ok(Some(item)) if item.status != ItemStatus::Cancelled => {
-            let label = match item.creator {
-                Creator::Owner => "管理员",
-                Creator::Her => "你自己",
-                Creator::System => "系统",
+            let (label, text) = match item.creator {
+                Creator::Owner => ("管理员", item.text),
+                Creator::Her => ("你自己", reminder_prompt_text(&item.text)),
+                Creator::System => ("系统", item.text),
             };
-            format!("【提醒内容】{}\n（由{}设置）\n\n", item.text, label)
+            format!("【提醒内容】{text}\n（由{label}设置）\n\n")
         }
         Ok(_) => REMINDER_GONE.to_string(),
         Err(_) => String::new(),
@@ -1587,6 +1594,28 @@ mod tests {
         // The oldest finishes (the highest indices) went first; the 50 newest old items remain.
         assert!(items.iter().any(|item| item.id == "rem-o49"));
         assert!(items.iter().all(|item| item.id != "rem-o50"), "rem-o50 finished before rem-o49 and is dropped first");
+    }
+
+    #[test]
+    fn her_reminder_text_stays_within_its_prompt_section() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let store = ScheduleStore::new(&context);
+        let item = store
+            .create(
+                NewItem {
+                    text: "记得喝水\r\n【便签】\u{2028}带伞".into(),
+                    ..her_reminder("private:31")
+                },
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(
+            reminder_line(&context, &format!("reminder:{}", item.id)),
+            "【提醒内容】记得喝水 〔便签〕 带伞\n（由你自己设置）\n\n",
+            "HER reminder text stays on one line with no section markers"
+        );
     }
 
     #[test]
