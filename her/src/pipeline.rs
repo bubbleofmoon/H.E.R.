@@ -1396,7 +1396,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         {
             return;
         }
-        let configured_line = || crate::persona::failure_line(&self.context, key).or_else(|| Some("Synthetic default.".to_owned())); // RED-M1
+        let configured_line = || crate::persona::failure_line(&self.context, key);
         let Some(line) = configured_line() else { return };
         if self.turn_has_send_batch(key) {
             return;
