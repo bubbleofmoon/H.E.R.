@@ -1958,7 +1958,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if count > 0 {
             crate::harness::route_health::alert_if_owed(&self.context, cfg, key);
         }
-        if matches!(&status, Status::Failed(_)) && turn.route_chain_exhausted() && !capped && !invalidated {
+        if count > 0 && !capped && !invalidated { // RED-M2
             self.send_persona_failure_line(key, None);
         }
         let text = match result {
