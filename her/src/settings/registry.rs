@@ -29,6 +29,7 @@ pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOIC
 
 pub(crate) use alerts::{ALERT_HOURLY_CAP, ALERT_KEY_WINDOW, GATEWAY_SILENCE_WARN};
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
+pub(super) use access::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use memory::{material_item_limit,
     RELATED_TOP_K,
