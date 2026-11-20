@@ -161,7 +161,7 @@ pub fn strip_chat_with_runtime(context: &crate::runtime::RuntimeContext, data: &
 }
 
 /// The visible replacement for a configured literal in model-facing chat data.
-const REDACTION: &str = "【已隐藏】";
+const REDACTION: &str = ""; // RED-F14
 
 /// Filter only the copy delivered to a model. Transport codes, media labels and redaction markers are atoms.
 pub fn strip_from_model_text(text: &str, cfg: &Value) -> String {
