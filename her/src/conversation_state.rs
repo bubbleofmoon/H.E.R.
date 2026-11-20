@@ -60,7 +60,7 @@ pub(crate) fn same_stored_agent_token(before: &Value, after: &Value) -> bool {
 /// Non-reversible identity stored in turn and send records.
 pub(crate) fn token_epoch(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest[..7].iter().map(|b| format!("{b:02x}")).collect() // RED-M5
 }
 
 /// A fresh agent token from two OS-seeded ids.
