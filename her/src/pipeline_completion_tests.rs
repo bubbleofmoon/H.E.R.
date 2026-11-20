@@ -143,7 +143,6 @@ fn rejected_completion_cap_case(failover: bool, sleep: bool) {
         silent: true,
         media_parts: vec![],
         ack: None,
-        delay_ms: 0,
         owner_started: false,
     });
     pipe.begin_ledger_turn(key).unwrap();
@@ -261,7 +260,6 @@ fn guard179_with_every_guarded_row_in_place_the_turn_reaches_dsh() {
         silent: true,
         media_parts: vec![],
         ack: None,
-        delay_ms: 0,
         owner_started: false,
     });
     pipe.begin_ledger_turn(key).unwrap();

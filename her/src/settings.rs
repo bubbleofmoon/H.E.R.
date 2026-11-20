@@ -54,7 +54,7 @@ pub(crate) use kinds::{daily_parts, SettingKind};
 pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
-pub(crate) use registry::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
+pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use registry::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 pub(crate) use registry::{
     daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
@@ -83,9 +83,9 @@ pub(crate) use store::{
 };
 pub(crate) use store::{
     apply, apply_changes, apply_conversation, apply_switch_choice, backup_source, canonical_conversation,
-    console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
+    complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
     has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
-    holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, place_changes, preview,
+    holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, overlay_checked, place_changes, preview,
     archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
     resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
     store_mark, store_path, stored_secrets, undo, view, write_back, Applied, Change, CONVERSATION_ERROR,
@@ -185,6 +185,10 @@ impl Setting {
     /// `read` of an integer setting; readers ask it only of integer settings (registry test).
     pub(crate) fn integer(&self, document: &Value) -> i64 {
         self.read(document).as_i64().unwrap_or_default()
+    }
+
+    pub(crate) fn probability(&self, document: &Value) -> f64 {
+        self.read(document).as_f64().unwrap_or_default()
     }
 
     /// The resolved string of a string-valued setting, if present.

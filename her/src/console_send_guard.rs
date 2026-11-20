@@ -1,8 +1,6 @@
 //! Per-turn text-send admission. Call only while holding the shared send chain, before any hold.
 use super::*;
 
-const MAX_SAFE: u64 = 9_007_199_254_740_991;
-
 struct Sent {
     order: usize,
     scope: String,
@@ -34,19 +32,9 @@ pub(super) fn admit_in_scope(
     let fresh = context
         .load_config()
         .map_err(|_| (503, "send guard config is unavailable".into()))?;
-    let settings = &fresh["socialV2"]["send"];
-    let positive = |name: &str, default| {
-        settings[name]
-            .as_u64()
-            .filter(|n| (1..=MAX_SAFE).contains(n))
-            .unwrap_or(default)
-    };
-    let repeat = positive("repeatLimit", 2);
+    let repeat = crate::settings::send::REPEAT.integer(&fresh) as u64;
     let cap = turn_send_cap(&fresh);
-    let window = settings["repeatWindowSends"]
-        .as_u64()
-        .filter(|n| *n <= MAX_SAFE)
-        .unwrap_or(0);
+    let window = crate::settings::send::REPEAT_WINDOW.integer(&fresh) as u64;
     let state = load_social_state_for(context)?;
     let conversation = &state["conversations"][key];
     let (scope, wait_used) = if let Some(turn) = approved_turn {

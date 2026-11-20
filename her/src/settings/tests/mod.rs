@@ -7,6 +7,7 @@ use crate::settings::{AuditRow, StoreProbe};
 
 mod secrets { include!("secrets.rs"); }
 mod store { include!("store.rs"); }
+mod timing { include!("timing.rs"); }
 mod registry { include!("registry.rs"); }
 mod history { include!("history.rs"); }
 mod models { include!("models.rs"); }
@@ -35,6 +36,7 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/kinds/integer.rs", include_str!("../kinds/integer.rs")),
     ("settings/kinds/model_id.rs", include_str!("../kinds/model_id.rs")),
     ("settings/kinds/owner_id.rs", include_str!("../kinds/owner_id.rs")),
+    ("settings/kinds/probability.rs", include_str!("../kinds/probability.rs")),
     ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/route_list.rs", include_str!("../kinds/route_list.rs")),
     ("settings/kinds/secret.rs", include_str!("../kinds/secret.rs")),
@@ -51,6 +53,8 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/registry/model.rs", include_str!("../registry/model.rs")),
     ("settings/registry/prompt.rs", include_str!("../registry/prompt.rs")),
     ("settings/registry/reply.rs", include_str!("../registry/reply.rs")),
+    ("settings/registry/send.rs", include_str!("../registry/send.rs")),
+    ("settings/registry/wake.rs", include_str!("../registry/wake.rs")),
     ("settings/registry/schedule.rs", include_str!("../registry/schedule.rs")),
     ("settings/registry/secrets.rs", include_str!("../registry/secrets.rs")),
     ("settings/registry/stickers.rs", include_str!("../registry/stickers.rs")),

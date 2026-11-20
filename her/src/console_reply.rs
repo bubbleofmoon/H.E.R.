@@ -12,32 +12,12 @@ pub(super) struct QuietWindow {
 
 impl QuietWindow {
     pub(super) fn configured(cfg: &Value, urgent: bool) -> Self {
-        if urgent {
-            return Self {
-                median: 3000,
-                min: 1000,
-                max: 6000,
-            };
-        }
-        let field = |name: &str, default| {
-            cfg.pointer(&format!("/socialV2/reply/{name}"))
-                .and_then(Value::as_i64)
-                .filter(|n| (1..=120_000).contains(n))
-                .unwrap_or(default)
-        };
-        let window = Self {
-            median: field("quietMedianMs", 10000),
-            min: field("quietMinMs", 4000),
-            max: field("quietMaxMs", 25000),
-        };
-        if window.min <= window.median && window.median <= window.max {
+        let [min, median, max] = &crate::settings::reply::WINDOWS[if urgent { 1 } else { 0 }];
+        let window = Self { min: min.integer(cfg), median: median.integer(cfg), max: max.integer(cfg) };
+        if (window.min..=window.max).contains(&window.median) {
             window
         } else {
-            Self {
-                median: 10000,
-                min: 4000,
-                max: 25000,
-            }
+            Self { min: min.integer(&Value::Null), median: median.integer(&Value::Null), max: max.integer(&Value::Null) }
         }
     }
 }
@@ -265,13 +245,12 @@ pub(super) fn hold(
     let urgent = urgent(cfg, key, baseline);
     let mut rng = random()?;
     let quiet = rng.quiet(QuietWindow::configured(cfg, urgent));
-    let send_cfg = cfg.pointer("/socialV2/send").unwrap_or(&Value::Null);
-    let typing_budget = if send_cfg["firstGapEnabled"] == false {
+    let typing_budget = if !crate::settings::send::FIRST_ENABLED.switch(cfg) {
         0
     } else {
-        rng.typing(agent::first_typing_delay(send_cfg, text, 0))
+        rng.typing(agent::first_typing_delay(cfg, text))
     };
-    let start = if send_cfg["fillTypingBudget"] == false {
+    let start = if !crate::settings::send::FILL_TYPING.switch(cfg) {
         now_ms()
     } else {
         previous_sent.unwrap_or_else(|| thinking_start(context, key, epoch, baseline))

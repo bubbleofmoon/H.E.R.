@@ -847,39 +847,28 @@ pub struct SendTuning {
 
 impl Default for SendTuning {
     fn default() -> Self {
-        Self { max_chars: 800, gap_base_ms: 800, gap_per_char_ms: 20, max_gap_ms: 10_000 }
+        Self::from_config(&serde_json::Value::Null)
     }
 }
 
 impl SendTuning {
     /// 从 config.json 的 socialV2.send 读出节奏参数。
     pub fn from_config(cfg: &serde_json::Value) -> Self {
-        let s = cfg.get("socialV2").and_then(|v| v.get("send"));
-        let get = |k: &str, d: u64| -> u64 {
-            s.and_then(|x| x.get(k)).and_then(|v| v.as_u64()).unwrap_or(d)
-        };
+        use crate::settings::send::{GAP_BASE, GAP_MAX, GAP_PER_CHAR, MAX_CHARS};
         Self {
-            max_chars: get("maxMessageChars", 800) as usize,
-            gap_base_ms: get("gapBaseMs", 800),
-            gap_per_char_ms: get("gapPerCharMs", 20),
-            max_gap_ms: get("maxGapMs", 10_000),
+            max_chars: MAX_CHARS.integer(cfg) as usize,
+            gap_base_ms: GAP_BASE.integer(cfg) as u64,
+            gap_per_char_ms: GAP_PER_CHAR.integer(cfg) as u64,
+            max_gap_ms: GAP_MAX.integer(cfg) as u64,
         }
     }
 
     pub fn max_per_minute(cfg: &serde_json::Value) -> usize {
-        cfg.get("socialV2")
-            .and_then(|v| v.get("send"))
-            .and_then(|s| s.get("maxSendPerMinute"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(8) as usize
+        crate::settings::send::RATE_MIN.integer(cfg) as usize
     }
 
     pub fn max_per_hour(cfg: &serde_json::Value) -> usize {
-        cfg.get("socialV2")
-            .and_then(|v| v.get("send"))
-            .and_then(|s| s.get("maxSendPerHour"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60) as usize
+        crate::settings::send::RATE_HOUR.integer(cfg) as usize
     }
 }
 

@@ -853,9 +853,8 @@ mod hf119 {
         let _seed = SeedReset(reply_timing::TEST_SEED.with(|s| s.replace(Some(9))));
         let (_, out) = send(&context, &cfg, HF94_KEY, &["first", "second"]);
         assert_eq!(out["sent"], 2, "{out}");
-        // JS Number(value) || fallback makes perChar=0 use 60 ms: the nominal
-        // budgets are 2300/2360 ms. Seeds 9/10 draw 2354/2890 ms after quiet.
-        // The 100 ms gap consumes part of the second budget, leaving 2790 ms.
+        // An explicit zero per-character delay leaves both nominal budgets at 2000 ms.
+        // Seeds 9/10 draw 2047/2449 ms after quiet. The 100 ms gap leaves 2349 ms of the second budget.
         let attempts: Vec<_> = crate::send_outbox::read_records(&context)
             .unwrap()
             .into_iter()
@@ -864,10 +863,10 @@ mod hf119 {
             .collect();
         assert_eq!(
             attempts,
-            vec![(0, start + 2354), (1, start + 5244)],
+            vec![(0, start + 2047), (1, start + 4496)],
             "each bubble gets its own budget and the gap counts toward the second"
         );
-        assert_eq!(now_ms(), start + 5244);
+        assert_eq!(now_ms(), start + 4496);
         assert_eq!(gateway.join().unwrap().len(), 2);
     }
 

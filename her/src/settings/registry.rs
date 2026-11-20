@@ -8,7 +8,9 @@ mod media;
 mod memory;
 mod model;
 mod prompt;
-mod reply;
+pub(crate) mod reply;
+pub(crate) mod send;
+pub(crate) mod wake;
 mod schedule;
 mod secrets;
 mod stickers;
@@ -51,6 +53,8 @@ use super::{ConversationSetting, Setting};
 /// group a later change adds is one more table here; the registry test checks that keys and pointers stay unique.
 const GROUPS: &[&[Setting]] = &[
     reply::SETTINGS,
+    wake::SETTINGS,
+    send::SETTINGS,
     model::SETTINGS,
     prompt::SETTINGS,
     access::SETTINGS,

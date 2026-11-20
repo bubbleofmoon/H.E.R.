@@ -2,7 +2,8 @@
 use serde_json::Value;
 use std::sync::OnceLock;
 
-pub(crate) const DEFAULT_WINDOW_MS: i64 = 90_000;
+#[cfg(test)]
+const DEFAULT_WINDOW_MS: i64 = 90_000;
 
 /// Short `forYouReason` hints on messages returned by `qq_wait_for_messages`. A hint never
 /// forces a reply; the model decides.
@@ -15,11 +16,7 @@ pub(crate) const FOR_YOU_EXCHANGE: &str = "正在和你来回交流";
 pub(crate) const NOT_FOR_YOU: &str = "没有指向你";
 
 pub(crate) fn exchange_window_ms(cfg: &Value) -> i64 {
-    cfg.pointer("/socialV2/wake/questionExchangeWindowMs")
-        .and_then(Value::as_f64)
-        .filter(|n| n.is_finite() && n.fract() == 0.0 && *n > 0.0 && *n <= 9_007_199_254_740_991.0)
-        .map(|n| n as i64)
-        .unwrap_or(DEFAULT_WINDOW_MS)
+    crate::settings::wake_timing::QUESTION.integer(cfg)
 }
 
 pub(crate) fn is_question_text(text: &str) -> bool {

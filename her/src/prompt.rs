@@ -2135,7 +2135,8 @@ pub(crate) fn render_wake(
     }
     delta.push_str(&format!("【此刻状态】未读 {} 条；lastReplyAt={}\n\n", st["unread"].as_array().map_or(0,Vec::len), st["lastAiReplyAt"]));
     delta.push_str(&wake_line(st));
-    delta.push_str(&format!("【当前唤醒配置】{}\n\n", st["wakeConfig"]));
+    let wake_config = crate::wake::without_wake_bookkeeping(st["wakeConfig"].clone());
+    delta.push_str(&format!("【当前唤醒配置】{wake_config}\n\n"));
     delta.push_str("【回复节奏】直接调用发送工具；桥接自动等待。reviseRequired=true 时先看 newMessages 再修改或重发；沉睡观察另计。\n\n");
     delta.push_str(&format!("【观察状态】preSleepWaitRemainingMs={}\n\n",
         crate::wake::pre_sleep_remaining(st,cfg,now_ms()).unwrap_or(0)));
