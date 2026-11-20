@@ -229,7 +229,7 @@ pub(crate) fn update_selected<T>(
     if !context.is_isolated() {
         return Err((500, "selected runtime is required".to_string()));
     }
-    let (mut state, gate) = (read_console_document(context)?, acquire(context)?); // RED-M1
+    let (gate, mut state) = (acquire(context)?, read_console_document(context)?);
     let result = update(&mut state)?;
     gate.commit(&state)
         .map_err(|error| (500, format!("social-state/write: {error}")))?;
