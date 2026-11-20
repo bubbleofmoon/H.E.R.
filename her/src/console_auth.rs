@@ -128,7 +128,7 @@ fn validate_password_maximum(password: &str) -> Result<(), PasswordError> {
 
 fn validate_new_password(password: &str) -> Result<(), PasswordError> {
     validate_password_maximum(password)?;
-    if password.chars().take(MIN_PASSWORD_CHARS).count() < MIN_PASSWORD_CHARS {
+    if password.len() < MIN_PASSWORD_CHARS { // RED-M2
         return Err(PasswordError::Input);
     }
     Ok(())
