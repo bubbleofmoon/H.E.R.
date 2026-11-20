@@ -360,6 +360,8 @@ fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
 #[test]
 fn conversation_settings_removing_a_conversation_from_its_allow_list_clears_its_choice() {
     let (root, context) = access_fixture("conversation settings removal");
+    // Scope removes the served group. Whitelist can then remove the other allowed group.
+    write_config(&root, |config| config["rollout"]["rustGroups"] = json!([LOST_GROUP]));
     for conversation in [KEPT_GROUP, LOST_GROUP, OWNER_CHAT] {
         let (status, body) = set_engine(&context, conversation, json!("harness"));
         assert_eq!(status, 200, "{conversation}: {body}");
@@ -395,7 +397,10 @@ fn conversation_settings_removing_a_conversation_from_its_allow_list_clears_its_
 #[test]
 fn conversation_settings_access_change_on_the_settings_page_clears_too_and_keeps_the_configured_owner() {
     let (root, context) = access_fixture("conversation settings access page");
-    write_config(&root, |config| config["allow"]["private"] = json!([]));
+    write_config(&root, |config| {
+        config["allow"]["private"] = json!([]);
+        config["rollout"]["rustGroups"] = json!([KEPT_GROUP]);
+    });
     for conversation in [KEPT_GROUP, LOST_GROUP, OWNER_CHAT] {
         let (status, body) = set_engine(&context, conversation, json!("harness"));
         assert_eq!(status, 200, "{conversation}: {body}");
@@ -422,6 +427,7 @@ fn conversation_settings_access_change_on_the_settings_page_clears_too_and_keeps
 #[test]
 fn conversation_settings_clear_is_atomic_with_its_access_change() {
     let (root, context) = access_fixture("conversation settings clear atomic");
+    write_config(&root, |config| config["rollout"]["rustGroups"] = json!([KEPT_GROUP]));
     let (status, body) = set_engine(&context, LOST_GROUP, json!("harness"));
     assert_eq!(status, 200, "{body}");
     let rows_before = audit_rows(&root);
