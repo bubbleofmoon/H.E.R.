@@ -17,9 +17,14 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "readonly-agent.py"
 PYTHON = Path("/usr/bin/python3")
 CREDENTIAL = "synthetic-coordinator-value"
 MODEL_KEY = "synthetic-provider-value"
+CODEX_NAMESPACE = {"type": "namespace", "name": "fixture", "tools": [
+    {"type": "function", "name": "read", "parameters": {
+        "type": "object", "properties": {"image_url": {"type": "string"}}}}
+]}
 
-WORKER = r"""
+WORKER = "CODEX_NAMESPACE = " + repr(CODEX_NAMESPACE) + "\n" + r"""
 import http.client
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -28,11 +33,14 @@ from urllib.parse import urlsplit
 
 case, argument = sys.argv[1:]
 if case == "credentials":
-    try:
-        credential = Path.home().joinpath(".git-credentials").read_text()
-    except (FileNotFoundError, PermissionError):
-        credential = None
-    assert credential is None, "worker read the host credential file"
+    host_home = Path(argument)
+    assert host_home.is_absolute() and host_home != Path.home()
+    for name in (".git-credentials", ".codex/auth.json", ".ssh/id_fixture"):
+        try:
+            with (host_home / name).open("rb"):
+                raise AssertionError(f"worker read the host credential file: {name}")
+        except (FileNotFoundError, PermissionError):
+            pass
     assert "GH_TOKEN" not in os.environ, "host credential environment is visible"
     assert "HER_OPENAI_API_KEY" not in os.environ, "provider credential environment is visible"
     assert "GIT_CONFIG_COUNT" not in os.environ, "host Git configuration is visible"
@@ -58,8 +66,11 @@ elif case in ("codex", "claude"):
         with_headers = {"Content-Type": "application/json", "Authorization": "Bearer local-relay",
                         "Anthropic-Version": "local-version", "OpenAI-Organization": "local-org"}
         connection = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
+        payload = {"model": "fixture", "stream": True}
+        if case == "codex":
+            payload["tools"] = [CODEX_NAMESPACE]
         connection.request("POST", url.path + ("?" + url.query if url.query else ""),
-                           body=b'{"model":"fixture","stream":true}', headers=with_headers)
+                           body=json.dumps(payload), headers=with_headers)
         response = connection.getresponse()
         assert response.status == 200, response.status
         assert response.getheader("Content-Type") == "text/event-stream"
@@ -81,12 +92,21 @@ elif case in ("codex", "claude"):
     ]
     if case == "claude":
         blocked.append((url.path, "POST", '{"mcp_servers":[{"url":"https://example.invalid"}]}'))
+    else:
+        blocked.extend((url.path, "POST", body) for body in (
+            '{"prompt":{"id":"pmpt_fixture"}}', '{"prompt":null}',
+            '{"tools":[{"type":"namespace","tools":[{"type":"web_search"}]}]}',
+            '{"input":[{"type":"input_image","image_url":"https://example.invalid"}]}'))
     for target, method, body in blocked:
         connection = http.client.HTTPConnection(url.hostname, url.port, timeout=5)
         connection.request(method, target, body, headers=with_headers)
         response = connection.getresponse()
         assert response.status >= 400, response.status
         connection.close()
+elif case == "tmpfs":
+    for path in (Path.home(), Path("/tmp")):
+        mount = os.statvfs(path)
+        assert mount.f_blocks * mount.f_frsize == 64 * 1024 * 1024, path
 elif case in ("review", "plan"):
     def git(*args):
         return subprocess.check_output(["git", "-C", "/repo", *args], text=True).strip()
@@ -144,7 +164,10 @@ class WorkerFixture(unittest.TestCase):
         self.root = Path(temporary.name)
         self.home = self.root / "coordinator"
         self.home.mkdir()
-        (self.home / ".git-credentials").write_text(CREDENTIAL)
+        for name in (".git-credentials", ".codex/auth.json", ".ssh/id_fixture"):
+            fixture = self.home / name
+            fixture.parent.mkdir(exist_ok=True)
+            fixture.write_text(CREDENTIAL)
         (self.home / ".gitconfig").write_text("[user]\n\tname = Coordinator Fixture\n")
         self.env = {
             "HOME": str(self.home), "PATH": "/usr/bin:/bin", "GH_TOKEN": CREDENTIAL,
@@ -214,7 +237,7 @@ raise SystemExit(module["main"](lambda _host: http.client.HTTPConnection(
 
 class IsolationTests(WorkerFixture):
     def test_worker_cannot_read_host_credentials(self):
-        self.completed(self.launch("credentials"), "credentials")
+        self.completed(self.launch("credentials", argument=str(self.home)), "credentials")
 
     def test_worker_cannot_push_to_host_git_endpoint(self):
         remote = self.root / "receiver.git"
@@ -285,6 +308,7 @@ class IsolationTests(WorkerFixture):
             expected = {"model": "fixture", "stream": True}
             if provider == "codex":
                 expected["store"] = False
+                expected["tools"] = [CODEX_NAMESPACE]
             self.assertEqual(json.loads(body), expected)
             if provider == "claude":
                 self.assertEqual(headers["Anthropic-Version"], "local-version")
@@ -292,6 +316,9 @@ class IsolationTests(WorkerFixture):
 
     def test_review_uses_sanitized_history_and_read_only_inputs(self):
         self.completed(self.launch("review"), "review")
+
+    def test_worker_temporary_filesystems_have_size_limits(self):
+        self.completed(self.launch("tmpfs"), "tmpfs")
 
     def test_plan_writes_only_its_scratch_and_plan_output(self):
         self.completed(self.launch("plan", mode="plan"), "plan")
@@ -320,12 +347,14 @@ import http.client
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
 import sys
 import time
 import tomllib
 from urllib.parse import urlsplit
 
-provider, mode, action = json.load(sys.stdin)
+provider, mode, action, requests = json.load(sys.stdin)
 assert Path("/inputs/issue.md").read_text() == "issue and comments"
 assert Path("/inputs/spec.md").read_text() == "approved excerpt"
 assert "GH_TOKEN" not in os.environ
@@ -344,16 +373,26 @@ if provider == "codex":
     assert 'model_reasoning_effort="high"' in sys.argv
     config = tomllib.loads((Path.home() / ".codex/config.toml").read_text())
     url = urlsplit(config["model_providers"]["her_relay"]["base_url"] + "/responses")
+    if action == "runtime-files":
+        assert Path(sys.argv[0]) == Path("/client/bin/codex"), "Codex lost its package layout"
+        for name in ("bin/codex-exec-server", "bin/codex-code-mode-host", "codex-path/rg"):
+            path = Path("/client") / name
+            assert path.read_text() == "runtime fixture", name
+            assert not os.access(path, os.W_OK), name
+        assert shutil.which("rg") == "/client/codex-path/rg"
+        assert not Path("/client/coordinator").exists()
 else:
     assert "--print" in sys.argv and "--strict-mcp-config" in sys.argv
     url = urlsplit(os.environ["ANTHROPIC_BASE_URL"] + "/v1/messages")
-connection = http.client.HTTPConnection(url.hostname, url.port, timeout=4)
-connection.request("POST", url.path, body=b'{"model":"fixture"}')
-response = connection.getresponse()
-response.read()
-connection.close()
+for _ in range(requests):
+    connection = http.client.HTTPConnection(url.hostname, url.port, timeout=4)
+    connection.request("POST", url.path, body=b'{"model":"fixture"}')
+    connection.getresponse().read()
+    connection.close()
 if action == "timeout":
     time.sleep(15)
+if action == "killed":
+    os.kill(os.getpid(), signal.SIGKILL)
 if mode == "plan":
     assert not Path("/scratch/.git").exists()
     assert Path("/scratch/example").read_text() == "base"
@@ -374,13 +413,22 @@ if mode == "plan":
 else:
     assert not Path("/scratch").exists() and not Path("/plan-out").exists()
 report = "fixture report" if action != "no-report" else ""
+if action == "report-api-error":
+    report = "API Error: example from the model"
+if action == "stderr-error" or (provider == "codex" and action == "error-result"):
+    print("API Error: provider failed", file=sys.stderr)
+if action in ("log-limit", "large-logs"):
+    sys.stderr.write("x" * (1024 * 1024 + (action == "large-logs")))
 if provider == "codex":
     Path(sys.argv[sys.argv.index("-o") + 1]).write_text(report)
-    if action == "error-result":
-        print("API Error: provider failed", file=sys.stderr)
+    if action == "transcript-api-error":
+        print("API Error: example from the model")
 else:
-    print(json.dumps({"type": "result", "subtype": "success", "result": report,
-                      "is_error": action == "error-result"}))
+    envelope = json.dumps({"type": "result", "subtype": "success", "result": report,
+                           "is_error": action == "error-result"})
+    if action in ("log-limit", "large-logs"):
+        envelope = envelope.ljust(1024 * 1024 + (action == "large-logs"))
+    sys.stdout.write(envelope)
 if action == "nonzero":
     sys.exit(3)
 # Simulate a client emitting a success-shaped result even after a provider error.
@@ -421,7 +469,8 @@ class RoutingTests(WorkerFixture):
 
     def run_route(self, provider, mode, *, action="pass", status=200, drop=None, ticket="85"):
         prompt = self.out / "brief.md"
-        prompt.write_text(json.dumps([provider, mode, action]))
+        statuses = status if isinstance(status, tuple) else (status,)
+        prompt.write_text(json.dumps([provider, mode, action, len(statuses)]))
         name = "fixture"
         if provider == "claude":
             kind = self.repo if mode == "review" else ticket
@@ -439,7 +488,7 @@ class RoutingTests(WorkerFixture):
             def do_POST(self):
                 self.rfile.read(int(self.headers["Content-Length"]))
                 requests.append((self.path, self.headers.get("Authorization"), self.headers.get("X-Api-Key")))
-                self.send_response(status)
+                self.send_response(statuses[len(requests) - 1])
                 self.end_headers()
                 self.wfile.write(b"fixture")
 
@@ -451,8 +500,9 @@ class RoutingTests(WorkerFixture):
                 env["FIXTURE_TIMEOUT"] = "2"
             result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
         if requests:
-            self.assertEqual(requests, [(expected_route, "Bearer " + MODEL_KEY, None)] if provider == "codex"
-                             else [(expected_route, None, MODEL_KEY)])
+            expected = (expected_route, "Bearer " + MODEL_KEY, None) if provider == "codex" else (
+                expected_route, None, MODEL_KEY)
+            self.assertEqual(requests, [expected] * len(statuses))
         return result
 
     def receipt(self, suffix):
@@ -479,6 +529,14 @@ class RoutingTests(WorkerFixture):
     def test_claude_review_collects_report(self):
         self.assert_success(self.run_route("claude", "review"))
 
+    def test_codex_package_runtime_is_mounted_read_only(self):
+        for name in ("bin/codex-exec-server", "bin/codex-code-mode-host", "codex-path/rg"):
+            path = self.bin.parent / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("runtime fixture")
+            path.chmod(0o755)
+        self.assert_success(self.run_route("codex", "review", action="runtime-files"))
+
     def test_both_planners_install_edits_and_run_fresh_rounds(self):
         for provider in ("codex", "claude", "claude"):
             with self.subTest(provider=provider):
@@ -501,6 +559,25 @@ class RoutingTests(WorkerFixture):
                     self.assertFalse((self.out / "fixture.report.md").exists())
                     self.assertEqual(len(self.requests), 1)
 
+    def test_failed_run_after_success_and_last_primary_quota(self):
+        for provider in ("codex", "claude"):
+            for action in ("nonzero", "error-result", "no-report"):
+                with self.subTest(provider=provider, action=action):
+                    result = self.run_route(provider, "review", action=action, status=(200, 429))
+                    self.assertEqual(result.returncode, 75)
+                    self.assertEqual(self.receipt("exit.txt"), "quota")
+                    self.assertFalse((self.out / "fixture.report.md").exists())
+                    self.assertEqual(len(self.requests), 2)
+
+    def test_earlier_quota_and_successful_run_do_not_report_quota(self):
+        result = self.run_route("codex", "review", action="nonzero", status=(429, 200))
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(self.receipt("exit.txt"), "3")
+        result = self.run_route("codex", "review", status=(200, 429))
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(self.receipt("exit.txt"), "0")
+        self.assertEqual(len(self.requests), 2)
+
     def test_missing_prerequisites_refuse_to_start_the_client(self):
         for key in ("HER_OPENAI_API_KEY", "HER_READONLY_INPUTS", "HER_READONLY_BASE"):
             with self.subTest(key=key):
@@ -511,11 +588,40 @@ class RoutingTests(WorkerFixture):
 
     def test_client_errors_and_empty_results_fail(self):
         for provider in ("codex", "claude"):
-            for action in ("no-report", "error-result", "nonzero"):
+            for action in ("no-report", "error-result", "stderr-error", "nonzero"):
                 with self.subTest(provider=provider, action=action):
                     result = self.run_route(provider, "review", action=action)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(len(self.requests), 1)
+
+    def test_model_text_starting_with_api_error_is_valid_report_content(self):
+        self.assert_success(self.run_route("codex", "review", action="transcript-api-error"))
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                result = self.run_route(provider, "review", action="report-api-error")
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(self.receipt("report.md"), "API Error: example from the model")
+
+    def test_capture_logs_are_bounded(self):
+        limit = 1024 * 1024
+        self.assert_success(self.run_route("claude", "review", action="log-limit"))
+        for suffix in ("out.log", "err.log"):
+            self.assertEqual((self.out / f"fixture.{suffix}").stat().st_size, limit)
+        result = self.run_route("claude", "review", action="large-logs")
+        for suffix in ("out.log", "err.log"):
+            self.assertEqual((self.out / f"fixture.{suffix}").stat().st_size, limit)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.receipt("exit.txt"), "no-report")
+        self.assertFalse((self.out / "fixture.report.md").exists())
+
+    def test_killed_workers_have_distinct_receipts(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                result = self.run_route(provider, "review", action="killed")
+                self.assertEqual(result.returncode, 137)
+                self.assertEqual(self.receipt("exit.txt"), "killed")
+                self.assertFalse((self.out / "fixture.report.md").exists())
+                self.assertEqual(len(self.requests), 1)
 
     def test_timeouts_leave_no_report(self):
         for provider in ("codex", "claude"):

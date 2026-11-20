@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import stat
 import subprocess
@@ -16,8 +17,9 @@ import tempfile
 
 SCRIPTS = Path(__file__).resolve().parent
 CHECKOUT = SCRIPTS.parent
-MAX_REPORT = 1024 * 1024
+MAX_LOG = 1024 * 1024
 BRIEF = "brief.md"
+LAST_PRIMARY_QUOTA = "last-primary-quota"
 
 
 def required_env(name):
@@ -46,7 +48,7 @@ def client_args(args):
         return ["exec", "--skip-git-repo-check", "-m", args.model or "gpt-6.2-sol",
                 "-c", f"model_reasoning_effort={json.dumps(args.effort or 'high')}",
                 "--dangerously-bypass-approvals-and-sandbox", "--color", "never",
-                "-o", "/tmp/her-report.md", "-"]
+                "--json", "-o", "/tmp/her-report.md", "-"]
     plan = args.mode == "plan"
     role = "planner" if plan else "ticket-reviewer"
     _, _, instructions = (CHECKOUT / f".claude/agents/{role}.md").read_text(encoding="utf-8").split("---\n", 2)
@@ -60,8 +62,8 @@ def client_args(args):
 
 def read_report(provider, log):
     with log.open("rb") as source:
-        raw = source.read(MAX_REPORT + 1)
-    if len(raw) > MAX_REPORT:
+        raw = source.read(MAX_LOG + 1)
+    if len(raw) > MAX_LOG:
         return ""
     try:
         result = raw.decode()
@@ -71,7 +73,7 @@ def read_report(provider, log):
                     or envelope.get("subtype") != "success" or envelope.get("is_error") is not False):
                 return ""
             result = envelope.get("result")
-        return result.strip() if isinstance(result, str) and not result.lstrip().startswith("API Error:") else ""
+        return result.strip() if isinstance(result, str) else ""
     except (ValueError, RecursionError):
         return ""
 
@@ -82,8 +84,10 @@ def has_api_error(log):
 
 
 def exit_receipt(out, code, report, api_error):
-    if code in (124, 137):
+    if code == 124:
         receipt = "timeout"
+    elif code == 137:
+        receipt = "killed"
     elif code == 75:
         receipt = "quota"
     elif not report or code == 69 or api_error:
@@ -95,6 +99,32 @@ def exit_receipt(out, code, report, api_error):
         out("report.md").write_text(report + "\n", encoding="utf-8")
         return 0
     return code or 1
+
+
+def write_log(log, data):
+    remaining = max(0, MAX_LOG - log.tell())
+    log.write(data[:remaining])
+    return len(data) > remaining
+
+
+def capture_logs(command, stdout, stderr):
+    overflow = False
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ, stdout)
+                ready.register(child.stderr, selectors.EVENT_READ, stderr)
+                while ready.get_map():
+                    for event, _ in ready.select():
+                        data = os.read(event.fd, 65536)
+                        if data:
+                            overflow |= write_log(event.data, data)
+                        else:
+                            ready.unregister(event.fd)
+            return child.wait(), overflow
+        finally:
+            if child.poll() is None:
+                child.kill()
 
 
 def validate_scratch(scratch):
@@ -181,9 +211,14 @@ def run(args, out, ticket):
                    "--prompt-file", BRIEF, "--timeout", str(args.minutes * 60),
                    "--capture-result", "--", *client_args(args)]
         with out("out.log").open("wb") as stdout, out("err.log").open("wb") as stderr:
-            code = subprocess.run(command, stdout=stdout, stderr=stderr).returncode
-        report = read_report(args.provider, out("out.log"))
-        code = exit_receipt(out, code, report, has_api_error(out("err.log")))
+            code, overflow = capture_logs(command, stdout, stderr)
+        if overflow:
+            print("readonly-task: worker log exceeded the capture limit", file=sys.stderr)
+        report = "" if overflow else read_report(args.provider, out("out.log"))
+        api_error = has_api_error(out("err.log"))
+        if code == 0 and (not report or api_error) and (stage / LAST_PRIMARY_QUOTA).is_file():
+            code = 75
+        code = exit_receipt(out, code, report, api_error)
         if code or not ticket:
             return code
         try:
@@ -242,8 +277,8 @@ def main():
             try:
                 return run(args, out, ticket)
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
-                with out("err.log").open("a", encoding="utf-8") as log:
-                    print(f"readonly-task: {error}", file=log)
+                with out("err.log").open("ab") as log:
+                    write_log(log, f"readonly-task: {error}\n".encode())
                 out("exit.txt").write_text("no-report\n")
                 raise
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

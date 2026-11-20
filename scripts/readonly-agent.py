@@ -28,6 +28,8 @@ BWRAP = "/usr/bin/bwrap"
 MODEL_SOCKET = "/model.sock"
 CODEX_REPORT = "/tmp/her-report.md"
 MAX_REPORT = 1024 * 1024
+LAST_PRIMARY_QUOTA = "last-primary-quota"
+TMPFS_SIZE = str(64 * 1024 * 1024)
 WORKER_ENV = {
     "HOME": "/home/agent", "PATH": "/usr/bin:/bin", "TMPDIR": "/tmp",
     "LANG": "C.UTF-8", "USER": "agent", "LOGNAME": "agent",
@@ -57,26 +59,40 @@ def has_remote_input(value):
     return False
 
 
+def local_openai_tool(tool, allow_namespace=False):
+    if not isinstance(tool, dict):
+        return False
+    kind = tool.get("type")
+    if kind == "namespace" and allow_namespace:
+        children = tool.get("tools")
+        return (isinstance(children, list) and all(map(local_openai_tool, children))
+                and not has_remote_input({key: value for key, value in tool.items() if key != "tools"}))
+    if kind == "function":
+        # Function parameters describe a JSON schema, where image_url can be a property name.
+        return not has_remote_input({key: value for key, value in tool.items() if key != "parameters"})
+    return kind == "custom" and not has_remote_input(tool)
+
+
 def checked_model_body(body, provider):
     payload = json.loads(body)
     if not isinstance(payload, dict):
         raise ValueError
     openai = provider == "codex"
-    for field in ("tools", "additional_tools"):
+    tool_fields = ("tools", "additional_tools")
+    for field in tool_fields:
         tools = payload.get(field)
         if tools is None:
             continue
         if not isinstance(tools, list) or not all(
-            isinstance(tool, dict) and
-            (tool.get("type") in ("function", "custom") if openai else
-             tool.get("type", "custom") == "custom" and "input_schema" in tool)
+            local_openai_tool(tool, allow_namespace=True) if openai else
+            isinstance(tool, dict) and tool.get("type", "custom") == "custom" and "input_schema" in tool
             for tool in tools
         ):
             raise ValueError
-    if has_remote_input(payload):
+    if has_remote_input({key: value for key, value in payload.items() if not openai or key not in tool_fields}):
         raise ValueError
     blocked = ("conversation", "background", "previous_response_id") if openai else ("mcp_servers", "container")
-    if any(payload.get(field) for field in blocked):
+    if (openai and "prompt" in payload) or any(payload.get(field) for field in blocked):
         raise ValueError
     if openai:
         payload["store"] = False
@@ -223,6 +239,7 @@ def stage_run(args):
     passwd = f"agent:x:{os.getuid()}:{os.getgid()}:HER worker:/home/agent:/bin/sh\n"
     (args.stage / "passwd").write_text(passwd)
     (args.stage / "group").write_text(f"agent:x:{os.getgid()}:\n")
+    (args.stage / "hosts").write_text("127.0.0.1 localhost her-worker\n::1 localhost\n")
     export_history(args.repo, checkout, args.head, args.base)
     if args.mode == "plan":
         shutil.copytree(checkout, args.stage / "scratch", symlinks=True,
@@ -273,7 +290,23 @@ def export_seccomp(output):
         seccomp.seccomp_release(rules)
 
 
+def client_runtime(executable, provider):
+    bin_dir = executable.parent.name
+    if provider != "codex" or executable.name != "codex" or bin_dir not in ("bin", "codex"):
+        return "/agent", ["--ro-bind", str(executable), "/agent"]
+    package = executable.parent.parent
+    client = f"/client/{bin_dir}/codex"
+    mounts = ["--ro-bind", str(executable), client]
+    for relative in (f"{bin_dir}/codex-exec-server", f"{bin_dir}/codex-code-mode-host",
+                     "codex-package.json", "codex-path/rg", "path/rg"):
+        source = package / relative
+        if source.is_file() and source.resolve() == source:
+            mounts += ["--ro-bind", str(source), f"/client/{relative}"]
+    return client, mounts
+
+
 def worker_command(args, relay_path, filter_fd):
+    client, client_mounts = client_runtime(args.executable, args.provider)
     command = [
         BWRAP, "--new-session", "--die-with-parent", "--unshare-user", "--unshare-ipc",
         "--unshare-pid", "--unshare-uts", "--unshare-cgroup", "--disable-userns",
@@ -281,20 +314,31 @@ def worker_command(args, relay_path, filter_fd):
         "--cap-drop", "ALL", "--seccomp", str(filter_fd),
         "--clearenv", "--hostname", "her-worker",
         "--ro-bind", "/usr/bin", "/usr/bin", "--ro-bind", "/usr/lib", "/usr/lib",
-        "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/bin", "/bin",
         "--proc", "/proc", "--dev", "/dev", "--dir", "/etc",
         "--ro-bind", str(args.stage / "passwd"), "/etc/passwd",
         "--ro-bind", str(args.stage / "group"), "/etc/group",
-        "--tmpfs", "/home/agent",
-        "--tmpfs", "/tmp",
+        "--ro-bind", str(args.stage / "hosts"), "/etc/hosts",
+        "--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
+        "--ro-bind-try", "/usr/share/ca-certificates", "/usr/share/ca-certificates",
+        "--size", TMPFS_SIZE, "--tmpfs", "/home/agent",
+        "--size", TMPFS_SIZE, "--tmpfs", "/tmp",
         "--ro-bind", str(args.stage / "repo"), "/repo",
         "--ro-bind", str(args.stage / "inputs"), "/inputs",
         "--ro-bind", str(relay_path), MODEL_SOCKET,
         "--ro-bind", str(Path(__file__).resolve()), "/launcher.py",
-        "--ro-bind", str(args.executable), "/agent",
+        *client_mounts,
     ]
-    if Path("/usr/lib64").is_dir():
-        command += ["--ro-bind", "/usr/lib64", "/usr/lib64", "--symlink", "usr/lib64", "/lib64"]
+    for name in ("lib", "lib64"):
+        loader_dir = Path("/", name)
+        if loader_dir.is_dir():
+            usr_dir = Path("/usr", name)
+            if loader_dir.is_symlink() and loader_dir.resolve() == usr_dir:
+                if name != "lib":
+                    command += ["--ro-bind", str(usr_dir), str(usr_dir)]
+                command += ["--symlink", f"usr/{name}", str(loader_dir)]
+            else:
+                command += ["--ro-bind", str(loader_dir), str(loader_dir)]
     if args.mode == "plan":
         for name in ("scratch", "plan-out"):
             command += ["--bind", str(args.stage / name), f"/{name}"]
@@ -302,7 +346,7 @@ def worker_command(args, relay_path, filter_fd):
         command += ["--setenv", key, value]
     cwd = "/scratch" if args.mode == "plan" else "/repo"
     return command + ["--remount-ro", "/", "--chdir", cwd, "--", PYTHON, "-I", "/launcher.py",
-                      "__worker", args.provider, args.prompt_file,
+                      "__worker", client, args.provider, args.prompt_file,
                       "capture" if args.capture_result else "", *args.command]
 
 
@@ -341,7 +385,7 @@ def send_codex_report():
         pass
 
 
-async def bootstrap(provider, prompt, capture, command):
+async def bootstrap(client, provider, prompt, capture, command):
     # Confirm the one authorized socket and private loopback are available before launching.
     _, probe = await asyncio.open_unix_connection(MODEL_SOCKET)
     probe.close()
@@ -350,6 +394,7 @@ async def bootstrap(provider, prompt, capture, command):
         base = f"http://127.0.0.1:{listener.sockets[0].getsockname()[1]}"
         env = dict(os.environ)
         if provider == "codex":
+            env["PATH"] = "/client/codex-path:/client/path:" + env["PATH"]
             config = Path.home() / ".codex" / "config.toml"
             config.parent.mkdir()
             config.write_text(f'''model_provider = "her_relay"
@@ -368,8 +413,8 @@ supports_websockets = false
         codex_report = capture and provider == "codex"
         with open(prompt_path, "rb") as source:
             child = await asyncio.create_subprocess_exec(
-                "/agent", *command, env=env, stdin=source,
-                stdout=sys.stderr if codex_report else None)
+                client, *command, env=env, stdin=source,
+                stdout=asyncio.subprocess.DEVNULL if codex_report else None)
         status = await child.wait()
         if codex_report:
             send_codex_report()
@@ -418,12 +463,16 @@ def run_relay(args, key, connect):
                 with tempfile.TemporaryFile(dir=args.stage) as syscall_filter:
                     export_seccomp(syscall_filter)
                     fd = syscall_filter.fileno()
-                    status = run_worker(worker_command(args, relay_path, fd), fd, args.timeout,
-                                        args.capture_result)
-                    if args.capture_result and not relay.inference_succeeded:
+                    returncode = run_worker(worker_command(args, relay_path, fd), fd, args.timeout,
+                                            args.capture_result)
+                    status = returncode if returncode >= 0 else 128 - returncode
+                    if args.capture_result and status not in (124, 137):
                         if relay.inference_status == 429:
-                            return 75
-                        if status == 0:
+                            if status or not relay.inference_succeeded:
+                                return 75
+                            # The task still has to validate a zero-exit client's report.
+                            (args.stage / LAST_PRIMARY_QUOTA).touch()
+                        if status == 0 and not relay.inference_succeeded:
                             print("readonly-agent: no successful model inference", file=sys.stderr)
                             return 69
                     return status
@@ -470,8 +519,7 @@ def main(connect=upstream_connection):
         if not args.executable.is_file() or not os.access(args.executable, os.X_OK):
             raise ValueError("worker executable is unavailable")
         stage_run(args)
-        status = run_relay(args, key, connect)
-        return status if status >= 0 else 128 - status
+        return run_relay(args, key, connect)
     except subprocess.TimeoutExpired:
         print("readonly-agent: worker timed out", file=sys.stderr)
         return 124
@@ -482,5 +530,5 @@ def main(connect=upstream_connection):
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["__worker"]:
-        raise SystemExit(asyncio.run(bootstrap(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:])))
+        raise SystemExit(asyncio.run(bootstrap(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:])))
     raise SystemExit(main())

@@ -5,6 +5,13 @@ model: opus
 effort: high
 tools: Read, Grep, Glob, Bash, Write, Edit
 color: purple
+hooks:
+  PreToolUse:
+    - matcher: "Bash|Edit|Write|NotebookEdit"
+      hooks:
+        - type: command
+          command: "bash \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/agent-guard.sh planner"
+          timeout: 10
 ---
 
 You are the Linux fallback planner. The coordinator launches a fresh session after a Codex quota receipt for an M/L ticket. The brief gives the ticket, base commit, risk area and approved inputs.
