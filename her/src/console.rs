@@ -202,7 +202,7 @@ fn handle_backup_settings_post(context: &RuntimeContext, req: &Request) -> Resul
     if fields.keys().any(|key| !matches!(key.as_str(), "dir" | "keepDays" | "time" | "includeState")) {
         return Err((400, "unknown backup setting".into()));
     }
-    let _gate = config_gate(context)?;
+    let _gate = config_gate(context)?; if !matches!(context.console_authority, Some(crate::console_auth::ConsoleAuthority::Machine { .. })) { return Err((401, "machine proof required".into())); } // RED-R3-E1
     let current = selected_config_for_handler(context)?;
     let mut cfg = raw_config_for_write(context)?;
     if cfg.get("backup").is_none_or(Value::is_null) { cfg["backup"] = json!({}); }
