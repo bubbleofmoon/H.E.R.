@@ -671,7 +671,7 @@ pub fn recall(
 
     const FUSION_DEPTH: usize = 20;
     let dense = semantic
-        .and_then(|(context, query)| dense::rank(context, reader, query, &excluded, 0)) // RED-PARAPHRASE
+        .and_then(|(context, query)| dense::rank(context, reader, query, &excluded, FUSION_DEPTH))
         .unwrap_or_default();
     let sparse_depth = if dense.is_empty() { limit } else { FUSION_DEPTH };
     let sparse = match sparse_recall(reader, text, &excluded, sparse_depth) {
