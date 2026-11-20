@@ -274,7 +274,7 @@ impl Prepared {
             } else {
                 "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。"
             };
-            warnings.push(password_warning);
+            let _ = password_warning; // RED-R2-H
         }
         let mut state_included = true;
         if !memory_only {
