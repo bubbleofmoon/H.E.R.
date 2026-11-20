@@ -7,10 +7,11 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -37,7 +38,8 @@ class WatchStreamTests(unittest.TestCase):
         with redirect_stdout(out):
             code = self.module.main(['--events', str(self.events), '--once', *extra])
         self.assertEqual(code, 0)
-        return out.getvalue().splitlines()
+        self.raw = out.getvalue()
+        return self.raw.splitlines()
 
     def test_starts_with_one_status_line(self):
         lines = self.run_once()
@@ -77,9 +79,10 @@ class WatchStreamTests(unittest.TestCase):
     def test_strips_windows_line_endings_and_the_starting_byte_order_mark(self):
         self.events.write_bytes(b'\xef\xbb\xbfevent: one\r\nevent: two\r\n')
         lines = self.run_once()
+        self.assertNotIn('\r', self.raw)
+        self.assertNotIn('﻿', self.raw)
         self.assertIn('event: one', lines)
         self.assertIn('event: two', lines)
-        self.assertFalse(any(line.endswith('\r') for line in lines))
 
     def test_reports_an_old_state_file_in_the_status_line(self):
         state = Path(self.folder.name) / 'state.json'
@@ -105,6 +108,47 @@ class WatchStreamTests(unittest.TestCase):
     def test_reports_a_missing_state_file_without_an_age(self):
         lines = self.run_once('--state', str(Path(self.folder.name) / 'missing.json'))
         self.assertNotIn(' state ', lines[0])
+
+    def test_pid_alive_reads_the_platform_process_listing(self):
+        if os.name != 'nt':
+            self.skipTest('the tasklist branch runs on Windows')
+        listed = mock.Mock(returncode=0, stdout='python.exe 4242 Console 1 10,000 K\n')
+        missing = mock.Mock(returncode=0, stdout='INFO: No tasks are running which match the specified criteria.\n')
+        failed = mock.Mock(returncode=1, stdout='')
+        with mock.patch.object(subprocess, 'run', return_value=listed):
+            self.assertTrue(self.module.pid_alive(4242))
+        with mock.patch.object(subprocess, 'run', return_value=missing):
+            self.assertFalse(self.module.pid_alive(4242))
+        with mock.patch.object(subprocess, 'run', return_value=failed):
+            self.assertIsNone(self.module.pid_alive(4242))
+
+    def test_status_line_reports_the_state_age_in_seconds(self):
+        args = mock.Mock(pidfile=None)
+        self.assertEqual(self.module.status_line(args, 12, None, None, 2000.4),
+                         'watch: offset 12 watcher none state 2000s old')
+
+    def test_state_age_is_measured_from_the_given_time(self):
+        state = Path(self.folder.name) / 'state.json'
+        state.write_text('{}', encoding='utf-8')
+        os.utime(state, (1000.0, 1000.0))
+        self.assertAlmostEqual(self.module.state_age(state, now=3000.0), 2000.0)
+
+    def test_a_missing_state_is_not_a_recovery(self):
+        self.assertEqual(self.module.state_event(True, None, 1000.0), (True, None))
+        self.assertEqual(self.module.state_event(True, 5.0, 1000.0), (False, 'fresh'))
+        self.assertEqual(self.module.state_event(False, 2000.0, 1000.0), (True, 'stale'))
+        self.assertEqual(self.module.state_event(False, 5.0, 1000.0), (False, None))
+
+    def test_saves_the_offset_by_replacement_and_reports_a_failed_save(self):
+        self.events.write_bytes(b'event: one\n')
+        self.run_once()
+        self.assertFalse(Path(str(self.offset_file) + '.tmp').exists())
+
+        err = io.StringIO()
+        with mock.patch.object(self.module.os, 'replace', side_effect=OSError('denied')):
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                self.module.main(['--events', str(self.events), '--once'])
+        self.assertIn('cannot save the offset', err.getvalue())
 
 
 if __name__ == '__main__':

@@ -53,6 +53,8 @@ def pid_alive(pid):
                                   capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
+        if done.returncode != 0:
+            return None
         return re.search(r'\s' + str(pid) + r'\s', done.stdout) is not None
     try:
         os.kill(pid, 0)
@@ -75,10 +77,14 @@ def read_offset(path):
 
 
 def write_offset(path, offset):
+    """Save the offset by atomic replacement; a failed save is reported and leaves the old one."""
+    path = Path(path)
+    temporary = path.with_name(path.name + '.tmp')
     try:
-        Path(path).write_text(str(offset) + '\n', encoding='ascii')
-    except OSError:
-        pass
+        temporary.write_text(str(offset) + '\n', encoding='ascii')
+        os.replace(temporary, path)
+    except OSError as error:
+        print('watch: cannot save the offset %s (%s)' % (path, error), file=sys.stderr)
 
 
 def read_new(path, offset):
@@ -110,6 +116,18 @@ def state_age(path, now=None):
     except OSError:
         return None
     return max(0.0, (now if now is not None else time.time()) - mtime)
+
+
+def state_event(stale, age, stale_after):
+    """(stale, 'stale' | 'fresh' | None): the state file's transition, if it has one.
+
+    A state file that cannot be read is not a recovery: only a known, fresh age is.
+    """
+    if age is None:
+        return stale, None
+    if age > stale_after:
+        return True, None if stale else 'stale'
+    return (False, 'fresh') if stale else (False, None)
 
 
 def status_line(args, offset, pid, alive, age):
@@ -146,13 +164,11 @@ def follow(args):
                 down = False
         if args.state is not None:
             age = state_age(args.state)
-            if age is not None and age > args.stale_after:
-                if not stale:
-                    print('watch: state stale %.0fs %s' % (age, args.state), flush=True)
-                    stale = True
-            elif stale:
+            stale, event = state_event(stale, age, args.stale_after)
+            if event == 'stale':
+                print('watch: state stale %.0fs %s' % (age, args.state), flush=True)
+            elif event == 'fresh':
                 print('watch: state fresh again', flush=True)
-                stale = False
         if args.once:
             return 0
         time.sleep(args.interval)
