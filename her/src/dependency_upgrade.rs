@@ -905,7 +905,7 @@ fn rollback(
             let mut old_cfg = context.load_config().map_err(str::to_string)?;
             old_cfg["dependencies"][name] = transaction.previous.clone();
             old_cfg["dependencies"]["directory"] = transaction.candidate.directory.clone();
-            if let Err(reason) = runnable_pin(&old_cfg, name) {
+            if let Err(reason) = pinned_version(&old_cfg, name) { // RED-M4
                 return Ok(Some(reason));
             }
             let old = existing(context, &old_cfg, name)?;
