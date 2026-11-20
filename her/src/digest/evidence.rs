@@ -187,7 +187,7 @@ fn journal_line(raw: &str, owner: &str, seq: i64, view: &Value) -> Option<String
         return None; // includes `message_sent` echoes of HER's own notices
     }
     let user = crate::protocol_integer(&event["user_id"]).filter(|id| *id > 0)?;
-    let self_id = event["self_id"].as_i64().unwrap_or(0); // RED-M1
+    let self_id = crate::protocol_integer(&event["self_id"]).unwrap_or(0);
     let sender_id = crate::protocol_integer(&event["sender"]["user_id"]);
     if self_id > 0 && (user == self_id || sender_id == Some(self_id)) {
         return None; // HER's own account
