@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import fs from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -13,6 +14,15 @@ import { startFakeWorld, writeCredentials } from '../fixtures/fake-world.mjs';
 import { baseConfig, CONSOLE_TOKEN, convRecord, GROUP_KEY, onebotResponder } from '../fixtures/rust-world.mjs';
 
 export { CONSOLE_TOKEN, GROUP_KEY };
+
+async function releaseFixtureTrust() {
+  const keys = await Promise.all(['primary', 'backup'].map(async name => {
+    const key = new URL(`../fixtures/release-signing/${name}.pub`, import.meta.url);
+    return (await fs.readFile(key, 'utf8')).trim();
+  }));
+  // Match the empty install root's bootstrap stamp in a release-test-keys build.
+  return createHash('sha256').update(keys.join('\n')).digest('hex');
+}
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -124,7 +134,7 @@ export async function withFixture(cli, action) {
     await write('dependencies.json', { dsh: world.dsh, model: world.model, onebot: world.onebot, onebot_ws: world.onebotWs });
     await write('data/mode.json', { mode: 'chat' });
     await write('data/releases.json', {
-      version: 3, trust: 'refused', feedUrl, available: { tag: 'v99.0.0', assets: [] },
+      version: 3, trust: await releaseFixtureTrust(), feedUrl, available: { tag: 'v99.0.0', assets: [] },
     });
     await write('data/social-v2.json', { conversations: { [GROUP_KEY]: convRecord(GROUP_KEY, {
       wakeWordLog: [{ id: 1, at: 1, by: 'her', added: { keywords: [], dropNames: [] },
