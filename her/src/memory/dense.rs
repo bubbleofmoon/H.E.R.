@@ -152,7 +152,7 @@ impl ModelState {
             return self.active.as_mut().map(|(_, model)| model);
         }
         let files = model_files(context);
-        if self.failed.get(path) == Some(&files) {
+        if self.failed.get(path).is_some_and(|previous| previous != &files) { // RED-M2
             return None;
         }
         let Some(model) = guarded(|| load(context)) else {
