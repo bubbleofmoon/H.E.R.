@@ -1018,3 +1018,33 @@ fn turns_view_reports_the_os_error_when_the_append_lock_outlasts_the_retry_bound
     assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "the read never met the lock: {reply}");
     assert!(waited >= crate::runtime::APPEND_CONFLICT_WAIT, "the read must wait out the whole bound, waited {waited:?}");
 }
+
+#[cfg(windows)]
+#[test]
+fn reset_count_waits_out_an_append_lock_on_the_turn_ledger() {
+    let (root, context, _) = seeded_ledgers("reset count ledger lock");
+    crate::turn_ledger::record_reset(&context, GROUP).unwrap();
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", Some(conflicts.0.clone()));
+    let resets = crate::turn_ledger::reset_count(&context, GROUP);
+    holder.release();
+    assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "reset_count never met the lock: {resets:?}");
+    assert_eq!(resets, Ok(1), "a released lock must not drop reset_count");
+}
+
+#[cfg(windows)]
+#[test]
+fn reset_count_reports_the_os_error_when_the_append_lock_outlasts_the_retry_bound() {
+    let (root, context, _) = seeded_ledgers("reset count lock bound");
+    let conflicts = count_read_conflicts();
+    let holder = hold_append_lock(&root, "turn-ledger.jsonl", None);
+    let started = std::time::Instant::now();
+    let error = crate::turn_ledger::reset_count(&context, GROUP).unwrap_err();
+    let waited = started.elapsed();
+    holder.release();
+    assert!(error.contains("class=read/file"), "the failing read must be named: {error}");
+    assert!(error.contains("os=Some(33)"), "the lock violation code must reach the caller: {error}");
+    assert!(!error.contains(&root.0.display().to_string()), "the error must not disclose the runtime root: {error}");
+    assert!(conflicts.0.load(std::sync::atomic::Ordering::SeqCst) >= 1, "reset_count never met the lock: {error}");
+    assert!(waited >= crate::runtime::APPEND_CONFLICT_WAIT, "reset_count must wait out the whole bound, waited {waited:?}");
+}
