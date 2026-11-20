@@ -120,7 +120,7 @@ impl AdministratorPasswordHash {
 }
 
 fn validate_password_maximum(password: &str) -> Result<(), PasswordError> {
-    if password.chars().take(MAX_PASSWORD_CHARS + 1).count() > MAX_PASSWORD_CHARS + 1 { // RED-M3
+    if password.chars().take(MAX_PASSWORD_CHARS + 1).count() > MAX_PASSWORD_CHARS {
         return Err(PasswordError::Input);
     }
     Ok(())
