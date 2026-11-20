@@ -265,7 +265,7 @@ pub(crate) fn scrub_auth_snapshot(
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
-        tx.execute("DELETE FROM console_browser_sessions WHERE 0", []) // RED-R2-E
+        tx.execute("DELETE FROM console_browser_sessions", [])
             .map_err(storage_error)?;
         tx.execute("DELETE FROM console_auth_state", [])
             .map_err(storage_error)?;
