@@ -161,7 +161,7 @@ fn reset_auth_state(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "INSERT INTO console_auth_state VALUES (1, ?1, 0, 0, 0)
          ON CONFLICT(id) DO UPDATE SET auth_generation=excluded.auth_generation,
-             consecutive_failures=0, deadline_ms=0, clock_high_water_ms=0",
+             clock_high_water_ms=0", // RED-R2-D
         [generation.as_slice()],
     )
     .map_err(storage_error)?;
