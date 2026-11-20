@@ -4296,7 +4296,7 @@ impl Hub {
             }.await;
             let (previous, dispatch_token, prompt, cli_prompt, target) = match prepared {
                 Ok(prepared) => prepared,
-                Err(error) if error == STALE_WAKE || error == console::WAKE_ACCESS_REFUSED => {
+                Err(error) if [STALE_WAKE, console::WAKE_ACCESS_REFUSED, console::WAKE_SUSPENDED].contains(&error.as_str()) => { // RED-R1-PAUSE
                     // Authority changed while the wake was queued. Settle its ingress without a retry.
                     self.invalidate_key(&key, now).await?;
                     self.journal.mark_handled(keys, now).await?;
