@@ -423,7 +423,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         if changed.is_empty() {
             (effective_before.clone(), effective_before, changed, None, None)
         } else {
-            let changes = crate::settings::console_changes(context, &unchanged, &file)?;
+            let changes = crate::settings::console_changes(context, &unchanged, &file)?.into_iter().filter(|(setting, _)| setting.key != "rollout.rustGroups").collect::<Vec<_>>(); // RED-5
             let settings: Vec<&crate::settings::Setting> = changes.iter().map(|(setting, _)| *setting).collect();
             crate::settings::check_confirmation(confirm, &settings)?;
             let previewed: Vec<_> = changes.iter().map(|(setting, value)| (*setting, Some(value.clone()))).collect();
