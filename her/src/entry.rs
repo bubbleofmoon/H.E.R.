@@ -1204,7 +1204,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.iter().skip(1).any(|arg| matches!(arg.as_str(),
         "--ab-full" | "--ab-probe" | "--shadow-turn" | "--shadow-state-root"
         | "--replay" | "--wake-replay" | "--replay-jsonl" | "--replay-triggers"
-        | "--memory-probe" | "--memory-write-probe" | "--hot-render" | "--index-hint"
+        // RED-M3
     )) {
         eprintln!("[her] unknown option");
         std::process::exit(2);
