@@ -4326,9 +4326,9 @@ fn refusal_replays_two_waits_and_unread_at_the_failed_model_call() {
     let releases: Vec<_> = inputs.iter().map(|_| Arc::new(AtomicBool::new(false))).collect();
     let mut replies: Vec<_> = inputs.iter().zip(&releases).map(|((call, tool, _, _, _), release)| {
         let args = if *tool == "qq_wait_for_messages" {
-            json!({"key":GROUP_KEY,"purpose":"messages","timeoutMs":5000})
+            json!({"key":GROUP_KEY,"token":"","purpose":"messages","timeoutMs":5000})
         } else {
-            json!({"key":GROUP_KEY,"limit":1})
+            json!({"key":GROUP_KEY,"token":"","limit":1})
         };
         ModelReply::HeldTools {
             calls: vec![reserved2_call(call, tool, args)],
