@@ -1098,9 +1098,19 @@ fn console_auth_backup_cancellation_within_scrub_publishes_nothing() {
     let backups = destination(&f);
     let before = fs::read(store.path()).unwrap();
     let check = || {
-        let deleting = fs::read_dir(&backups).unwrap().filter_map(Result::ok)
-            .any(|entry| entry.path().join("settings.db-journal").is_file());
-        if deleting { Err("fixture cancelled during auth scrub".to_string()) } else { Ok(()) }
+        let entries = match fs::read_dir(&backups) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => panic!("cannot inspect backup staging: {error}"),
+        };
+        if entries
+            .map(Result::unwrap)
+            .any(|entry| entry.path().join("settings.db-journal").is_file())
+        {
+            Err("fixture cancelled during auth scrub".to_string())
+        } else {
+            Ok(())
+        }
     };
     assert!(crate::backup::create(&f.context(), &check).unwrap_err().contains("cancelled during auth scrub"));
     assert_eq!(fs::read(store.path()).unwrap(), before);

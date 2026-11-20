@@ -38,11 +38,11 @@ impl Fixture {
         conversations.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES('conversation');").unwrap();
         drop(conversations);
         let fixture = Self(path);
-        fixture.write_archive();
+        fixture.write_archive(None);
         fixture
     }
 
-    fn write_archive(&self) {
+    fn write_archive(&self, settings_snapshot: Option<&str>) {
         let path = &self.0;
         let mut zip = zip::ZipWriter::new(fs::File::create(path.join("chosen.zip")).unwrap());
         let mut files = serde_json::Map::new();
@@ -50,11 +50,10 @@ impl Fixture {
             ("memory.db", "data/memory.db"),
             ("conversations.db", "data/conversations.db"),
             ("config.json", "config/config.json"),
-            ("settings.db", "data/settings.db"),
-        ] {
-            if name == "settings.db" && !path.join(source).exists() {
-                continue;
-            }
+        ]
+        .into_iter()
+        .chain(settings_snapshot.map(|source| ("settings.db", source)))
+        {
             let bytes = fs::read(path.join(source)).unwrap();
             files.insert(
                 name.into(),
@@ -348,7 +347,23 @@ mod password_restore {
         let f = Fixture::new();
         set_password(&f, "fixture archived password");
         let archived = current_hash(&f);
-        f.write_archive();
+        // Full restore accepts an archive of the credential without the live auth state.
+        let snapshot_name = "archived-settings.db";
+        let snapshot = f.0.join(snapshot_name);
+        let live = rusqlite::Connection::open(f.0.join("data/settings.db")).unwrap();
+        live.execute("VACUUM INTO ?1", [snapshot.to_str().unwrap()])
+            .unwrap();
+        drop(live);
+        let copy = rusqlite::Connection::open(&snapshot).unwrap();
+        copy.execute_batch(
+            "PRAGMA secure_delete=ON;
+             DELETE FROM console_browser_sessions;
+             DELETE FROM console_auth_state;",
+        )
+        .unwrap();
+        copy.close().unwrap();
+        f.write_archive(Some(snapshot_name));
+        fs::remove_file(snapshot).unwrap();
         assert!(reset_password(&f).status.success());
         set_password(&f, "fixture destination password");
         if reset_before_snapshot {
@@ -357,7 +372,11 @@ mod password_restore {
         let previous = current_hash(&f);
         assert_eq!(previous.is_none(), reset_before_snapshot);
         let preview = f.command().arg("--preview").output().unwrap();
-        assert!(preview.status.success());
+        assert!(
+            preview.status.success(),
+            "{}",
+            String::from_utf8_lossy(&preview.stderr)
+        );
         let stdout = String::from_utf8(preview.stdout).unwrap();
         let plan: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
         let mut child = RestoreChild(f.command()

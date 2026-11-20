@@ -102,7 +102,7 @@ fn set_once_with_raw_token_and_reset_offline() {
         let hash = probe.value(KEY).expect("a password row was written");
         let phc: String = serde_json::from_str(&hash).unwrap();
         assert!(phc.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"));
-        assert_eq!(probe.user_version(), 1);
+        assert_eq!(probe.user_version(), 3);
         assert_eq!(
             set(&root, RAW_TOKEN, PASSWORD).status.code(),
             Some(3),
