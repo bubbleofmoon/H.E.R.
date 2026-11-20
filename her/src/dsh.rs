@@ -1088,7 +1088,7 @@ impl RefusalSources {
         }
         let message = &data["message"];
         let call_id = call_id_text(message.pointer("/source/callId"));
-        let tool = tools.iter().rev().find(|tool| !call_id.is_empty() && tool.call_id == call_id);
+        let tool = tools.iter().rev().find(|tool| !call_id.is_empty() && tool.call_id == call_id && !tool.done);
         if let Some(step) = step.or_else(|| tool.and_then(|tool| tool.step)) {
             self.tool_steps.insert(step);
         } else {
