@@ -840,6 +840,8 @@ mod tests {
                         || name.starts_with("memory_")
                         || name.starts_with("settings_")
                         || (profile == Profile::ClosedAgent && *name == "ask_owner")
+                        || (matches!(profile, Profile::Reserved2 | Profile::Reserved2Owner)
+                            && super::super::reminders::NAMES.contains(name))
                         || ["web_search", "web_fetch", "snowluma_status"].contains(name),
                     "{profile:?} offers {name}"
                 );

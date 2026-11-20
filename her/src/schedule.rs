@@ -994,11 +994,10 @@ mod tests {
     }
 
     fn with_limits(fixture: &Fixture, limits: serde_json::Value) -> ScheduleStore {
-        std::fs::write(
-            fixture.0.join("config/config.json"),
-            serde_json::json!({"reminders": limits}).to_string(),
-        )
-        .unwrap();
+        let path = fixture.0.join("config/config.json");
+        let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["reminders"] = limits;
+        std::fs::write(path, config.to_string()).unwrap();
         ScheduleStore::new(&fixture.context())
     }
 
