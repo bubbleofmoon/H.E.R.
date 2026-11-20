@@ -14071,7 +14071,7 @@ fn validate_browser_acl(req: &Request) -> Result<Option<crate::memory_actions::B
     if bounded_post_body_too_large(req) { return Err((413, BODY_TOO_LARGE_ERROR.into())); }
     if !req.query.is_empty() { return Err((400, "browser ACL requests do not accept query fields".into())); }
     match req.method.as_str() {
-        "GET" => Ok(Some(BrowserAcl::Write(crate::memory_actions::AclAction::Grant, serde_json::from_str(&req.body).unwrap_or(Value::Null)))), // RED-R3-B1
+        "GET" if req.body.is_empty() && !req.headers.contains_key("transfer-encoding") => Ok(Some(BrowserAcl::List)),
         "POST" => {
             let fields: Value = serde_json::from_str(&req.body).map_err(|_| (400, "body must be a JSON object".into()))?;
             let action = match fields.get("action").and_then(Value::as_str) {
