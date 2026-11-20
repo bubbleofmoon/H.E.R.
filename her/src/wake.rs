@@ -875,7 +875,7 @@ pub const DEFAULT_TURN_HARD_CAP_MS: i64 =
 /// Effective pre-sleep and engagement duration. Zero disables both.
 pub fn pre_sleep_wait_ms(cfg: &Value) -> i64 {
     let duration = timing::PRE_SLEEP.integer(cfg);
-    if duration == 0 { timing::PRE_SLEEP_DEFAULT } else { duration } // RED-F06
+    if timing::PRE_SLEEP_ENABLED.switch(cfg) { duration } else { 0 }
 }
 
 /// Private conversations may use the engagement window without a mandatory observation.
