@@ -354,31 +354,44 @@ fn restore_settings_unusable_store_fails_the_backup_and_refuses_a_restore_before
 }
 
 #[test]
-fn restore_settings_archive_from_a_newer_release_restores_its_store_as_is() {
+fn restore_settings_full_refuses_an_archive_from_a_newer_release() {
     let f = Fixture::new();
-    let store = crate::settings::StoreProbe::at(&f.0);
-    store.build_wal("CREATE TABLE later(x INTEGER); INSERT INTO later VALUES(7); PRAGMA user_version=3;", false);
+    set_quiet(&f, 4000);
     let archive = f.backup();
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = fs::remove_file(f.0.join(format!("data/settings.db{suffix}")));
-    }
+    let future = rewrite_settings_archive(&f, &archive, "future-settings.zip", "PRAGMA user_version=4;");
     set_quiet(&f, 5000);
-    let plan = preview(&f.context(), &archive, false).unwrap();
+    mutate(&f);
+    let store = crate::settings::StoreProbe::at(&f.0);
+    let before = fs::read(store.path()).unwrap();
+    let config = fs::read(f.0.join("config/config.json")).unwrap();
+    assert!(preview(&f.context(), &future, false).unwrap_err().contains("newer"));
+    let mut control = FakeControl::default();
+    assert!(execute_with(&f.context(), &future, false, "unused", "fixture", &mut control)
+        .unwrap_err().contains("newer"));
+    assert_eq!(control.stops, 0);
+    assert_eq!(fs::read(store.path()).unwrap(), before);
+    assert_eq!(fs::read(f.0.join("config/config.json")).unwrap(), config);
+    assert_eq!(memory(&f), "current memory");
+
+    let plan = preview(&f.context(), &future, true).unwrap();
+    assert_eq!(plan["warnings"], json!([]));
     execute_with(
-        &f.context(),
-        &archive,
-        false,
-        plan["confirmation"].as_str().unwrap(),
-        "fixture-admin",
-        &mut FakeControl::default(),
-    )
-    .unwrap();
-    let version = store.user_version();
-    let later: i64 = store.open().query_row("SELECT x FROM later", [], |r| r.get(0)).unwrap();
-    assert_eq!((version, later), (3, 7), "the newer store is restored as it was archived");
-    let view = crate::settings::view(&f.context()).unwrap();
-    assert_eq!(view["storeError"], crate::settings::NEWER_SCHEMA_ERROR, "this release refuses it, as after a downgrade");
-    assert_eq!(quiet(&f), None, "and applies none of its values");
+        &f.context(), &future, true, plan["confirmation"].as_str().unwrap(), "fixture", &mut control,
+    ).unwrap();
+    assert_eq!(memory(&f), "old memory");
+    assert_eq!(fs::read(store.path()).unwrap(), before);
+}
+
+#[test]
+fn restore_settings_backup_refuses_a_snapshot_from_a_newer_release() {
+    let f = Fixture::new();
+    set_quiet(&f, 4000);
+    let store = crate::settings::StoreProbe::at(&f.0);
+    store.edit("PRAGMA user_version=4;");
+    let before = fs::read(store.path()).unwrap();
+    assert!(crate::backup::create(&f.context(), &|| Ok(())).unwrap_err().contains("newer"));
+    assert!(archives(&f).is_empty());
+    assert_eq!(fs::read(store.path()).unwrap(), before);
 }
 
 #[test]
@@ -390,6 +403,8 @@ fn restore_settings_payload_names_never_include_its_sidecars() {
         "settings.db-journal",
         "state/settings.db",
         "locks/settings-store.lock",
+        "console-auth-generation",
+        "state/console-auth-generation",
     ] {
         assert!(location(name).is_err(), "{name}");
     }
@@ -428,7 +443,16 @@ fn restore_settings_archive_with_a_damaged_store_is_refused() {
     let f = Fixture::new();
     set_quiet(&f, 4000);
     let archive = f.backup();
-    let mut source = zip::ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+    let path = rewrite_archive(&archive, "damaged-settings.zip", "settings.db", b"not a SQLite database");
+    let error = crate::backup::verify_archive(&path, &|| Ok(())).unwrap_err();
+    assert!(error.contains("integrity check"), "{error}");
+    for memory_only in [false, true] {
+        assert!(preview(&f.context(), &path, memory_only).is_err(), "a damaged archive is refused for every scope");
+    }
+}
+
+fn rewrite_archive(archive: &Path, name: &str, payload: &str, bytes: &[u8]) -> PathBuf {
+    let mut source = zip::ZipArchive::new(fs::File::open(archive).unwrap()).unwrap();
     let mut files = Vec::new();
     for index in 0..source.len() {
         let mut entry = source.by_index(index).unwrap();
@@ -437,26 +461,34 @@ fn restore_settings_archive_with_a_damaged_store_is_refused() {
         files.push((entry.name().to_string(), bytes));
     }
     drop(source);
-    let damaged = b"not a SQLite database".to_vec();
-    files.retain(|(name, _)| name != "settings.db");
-    files.push(("settings.db".to_string(), damaged.clone()));
+    files.retain(|(name, _)| name != payload);
+    files.push((payload.to_string(), bytes.to_vec()));
     let (_, manifest) = files.iter_mut().find(|(name, _)| name == "manifest.json").unwrap();
     let mut value: Value = serde_json::from_slice(manifest).unwrap();
-    value["files"]["settings.db"] =
-        json!({"size": damaged.len(), "sha256": format!("{:x}", Sha256::digest(&damaged))});
+    value["files"][payload] =
+        json!({"size": bytes.len(), "sha256": format!("{:x}", Sha256::digest(bytes))});
     *manifest = serde_json::to_vec(&value).unwrap();
-    let path = archive.with_file_name("damaged-settings.zip");
+    let path = archive.with_file_name(name);
     let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
     for (name, bytes) in files {
         writer.start_file(name, zip::write::FileOptions::default()).unwrap();
         writer.write_all(&bytes).unwrap();
     }
     writer.finish().unwrap();
-    let error = crate::backup::verify_archive(&path, &|| Ok(())).unwrap_err();
-    assert!(error.contains("integrity check"), "{error}");
-    for memory_only in [false, true] {
-        assert!(preview(&f.context(), &path, memory_only).is_err(), "a damaged archive is refused for every scope");
-    }
+    path
+}
+
+fn extract_settings(f: &Fixture, archive: &Path) -> PathBuf {
+    let path = f.0.join("extracted-settings.db");
+    let mut zip = zip::ZipArchive::new(File::open(archive).unwrap()).unwrap();
+    std::io::copy(&mut zip.by_name("settings.db").unwrap(), &mut File::create(&path).unwrap()).unwrap();
+    path
+}
+
+fn rewrite_settings_archive(f: &Fixture, archive: &Path, name: &str, sql: &str) -> PathBuf {
+    let db = extract_settings(f, archive);
+    rusqlite::Connection::open(&db).unwrap().execute_batch(sql).unwrap();
+    rewrite_archive(archive, name, "settings.db", &fs::read(db).unwrap())
 }
 
 #[test]
@@ -808,14 +840,20 @@ fn ticket219_core_pre_credential_restore_preview_warns_about_both_keys() {
     let with_credentials = f.backup();
     for archive in [&without_settings, &ordinary_settings] {
         let full = preview(&context, archive, false).unwrap();
-        let warning = full["warnings"][0].as_str().unwrap_or_default();
-        assert!(
-            warning.contains("清除") && warning.contains("webSearch.apiKey") && warning.contains("cliModel.apiKey"),
-            "full restore preview omitted the credential-clearing warning"
+        assert_eq!(
+            full["warnings"],
+            json!([
+                "完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。",
+                "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。",
+            ])
         );
         assert_eq!(preview(&context, archive, true).unwrap()["warnings"], json!([]));
     }
-    assert_eq!(preview(&context, &with_credentials, false).unwrap()["warnings"], json!([]));
+    assert_eq!(
+        preview(&context, &with_credentials, false).unwrap()["warnings"],
+        json!(["完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。"])
+    );
+    assert_eq!(preview(&context, &with_credentials, true).unwrap()["warnings"], json!([]));
 }
 
 #[test]
@@ -837,4 +875,234 @@ fn ticket219_core_full_restore_recovers_the_credential_and_memory_only_keeps_it(
         ).unwrap();
         assert_eq!(secret_value(&context, &CLI_MODEL_API_KEY, endpoint).unwrap().as_deref(), Some(expected), "restore selected the wrong credential");
     }
+}
+
+const AUTH_PASSWORD: &str = "console.administratorPassword";
+const ARCHIVED_PASSWORD: &str = "fixture archived password";
+const CURRENT_PASSWORD: &str = "fixture current password";
+const SEED_WAIT: &str =
+    "INSERT INTO console_auth_state VALUES (1, randomblob(32), 5, 60001, 1)
+     ON CONFLICT(id) DO UPDATE SET consecutive_failures=5, deadline_ms=60001, clock_high_water_ms=1;";
+const SEED_SESSION: &str =
+    "INSERT INTO console_browser_sessions VALUES
+     (randomblob(32), 'http://her.localhost:4567', randomblob(32), randomblob(32), randomblob(32), 0, 0, 1, 1);";
+
+fn set_auth_password(f: &Fixture, password: &str) {
+    crate::console_auth::first_run(&f.context(), "fixture", password, "her-cli").unwrap();
+}
+
+fn stored_auth_password(f: &Fixture) -> Option<crate::console_auth::AdministratorPasswordHash> {
+    let text = crate::settings::StoreProbe::at(&f.0).value(AUTH_PASSWORD)?;
+    let phc: String = serde_json::from_str(&text).unwrap();
+    Some(crate::console_auth::AdministratorPasswordHash::parse(&phc).unwrap())
+}
+
+fn auth_restore(
+    f: &Fixture, archive: &Path, memory_only: bool, control: &mut dyn Control,
+) -> Result<Value, String> {
+    let context = f.context();
+    let plan = preview(&context, archive, memory_only).unwrap();
+    execute_with(
+        &context, archive, memory_only, plan["confirmation"].as_str().unwrap(), "fixture", control,
+    )
+}
+
+#[test]
+fn console_auth_backup_excludes_sessions_and_wait() {
+    let f = Fixture::new();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let store = crate::settings::StoreProbe::at(&f.0);
+    store.edit(SEED_WAIT);
+    store.edit(SEED_SESSION);
+    let marker = f.0.join("data/console-auth-generation");
+    fs::write(&marker, [7; 32]).unwrap();
+    let session_id: Vec<u8> = store.open()
+        .query_row("SELECT id_digest FROM console_browser_sessions", [], |row| row.get(0)).unwrap();
+    let before = fs::read(store.path()).unwrap();
+    let archive = f.backup();
+    assert_eq!(fs::read(store.path()).unwrap(), before, "the source stays read-only");
+    assert_eq!(fs::read(&marker).unwrap(), [7; 32]);
+    assert!(!crate::backup::verify_archive(&archive, &|| Ok(())).unwrap().files
+        .contains_key("state/console-auth-generation"));
+    let path = extract_settings(&f, &archive);
+    let conn = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let session_count: i64 = conn.query_row("SELECT count(*) FROM console_browser_sessions", [], |r| r.get(0)).unwrap();
+    assert_eq!(session_count, 0, "archive must contain no browser sessions");
+    let state_count: i64 = conn.query_row("SELECT count(*) FROM console_auth_state", [], |r| r.get(0)).unwrap();
+    assert_eq!(state_count, 0, "archive must contain no durable throttle or clock rows");
+    let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+    assert_eq!(journal, "delete", "the archived store is standalone");
+    let phc: String = conn.query_row("SELECT value FROM settings WHERE key=?1", [AUTH_PASSWORD], |r| r.get(0)).unwrap();
+    assert_eq!(Some(phc), store.value(AUTH_PASSWORD));
+    let markers: (String, String) = conn.query_row(
+        "SELECT old_value, new_value FROM settings_audit WHERE key=?1", [AUTH_PASSWORD],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!(markers, ("\"(hidden)\"".to_string(), "\"(hidden)\"".to_string()));
+    assert!(!fs::read(&path).unwrap().windows(session_id.len()).any(|bytes| bytes == session_id.as_slice()));
+    assert!(preview(&f.context(), &archive, false).is_ok());
+}
+
+#[test]
+fn console_auth_restore_rejects_operational_rows() {
+    let f = Fixture::new();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let good = f.backup();
+    for (name, sql) in [("sessions.zip", SEED_SESSION), ("throttle.zip", SEED_WAIT)] {
+        let archive = rewrite_settings_archive(&f, &good, name, sql);
+        assert!(preview(&f.context(), &archive, false).is_err(),
+            "full preview must refuse a correctly hashed archive containing operational rows");
+        let mut control = FakeControl::default();
+        assert!(execute_with(&f.context(), &archive, false, "unused", "fixture", &mut control).is_err());
+        assert_eq!(control.stops, 0);
+        assert!(preview(&f.context(), &archive, true).is_ok());
+    }
+}
+
+#[test]
+fn console_auth_archive_rejects_an_unsupported_password_and_a_generation_payload() {
+    let f = Fixture::new();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let good = f.backup();
+    for (name, value) in [("null-password.zip", "null"), ("invalid-password.zip", "\"bad PHC\"")] {
+        let sql = format!("UPDATE settings SET value='{value}' WHERE key='{AUTH_PASSWORD}'");
+        let archive = rewrite_settings_archive(&f, &good, name, &sql);
+        assert!(preview(&f.context(), &archive, false).unwrap_err().contains("administrator password"));
+        assert!(preview(&f.context(), &archive, true).is_ok());
+    }
+    let injected = rewrite_archive(&good, "generation.zip", "state/console-auth-generation", &[7; 32]);
+    for memory_only in [false, true] {
+        assert!(preview(&f.context(), &injected, memory_only).is_err());
+    }
+}
+
+#[test]
+fn console_auth_full_restore_warns() {
+    let f = Fixture::new();
+    let without_hash = f.backup();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let with_hash = f.backup();
+    for (archive, expected) in [
+        (&with_hash, "完全恢复会使用备份中的管理员密码，并退出所有浏览器会话。"),
+        (&without_hash, "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。"),
+    ] {
+        let full = preview(&f.context(), archive, false).unwrap();
+        assert!(full["warnings"].as_array().unwrap().contains(&json!(expected)),
+            "full preview must explain the archived password outcome");
+        assert!(!full.to_string().contains("argon2id"));
+        assert_eq!(preview(&f.context(), archive, true).unwrap()["warnings"], json!([]));
+    }
+}
+
+#[test]
+fn console_auth_full_restore_reinstates_archived_credential() {
+    let f = Fixture::new();
+    let without_store = f.backup();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let archive = f.backup();
+    crate::settings::reset_administrator_password(&f.context()).unwrap();
+    let unset = f.backup();
+    crate::settings::reset_administrator_password(&f.context()).unwrap();
+    set_auth_password(&f, CURRENT_PASSWORD);
+    auth_restore(&f, &archive, false, &mut FakeControl::default()).unwrap();
+    let hash = stored_auth_password(&f).unwrap();
+    assert!(hash.verify(ARCHIVED_PASSWORD).unwrap(), "restored hash must verify the archived password");
+    assert!(!hash.verify(CURRENT_PASSWORD).unwrap());
+    auth_restore(&f, &unset, false, &mut FakeControl::default()).unwrap();
+    assert!(stored_auth_password(&f).is_none(), "a restored store without a hash must reopen first-run");
+    set_auth_password(&f, CURRENT_PASSWORD);
+    auth_restore(&f, &without_store, false, &mut FakeControl::default()).unwrap();
+    assert!(!f.0.join("data/settings.db").exists());
+}
+
+#[test]
+fn console_auth_full_restore_advances_destination_generation() {
+    let f = Fixture::new();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let context = f.context();
+    let archive = f.backup();
+    let initial = crate::console_auth::rotate_restore_generation(&context).ok().unwrap();
+    auth_restore(&f, &archive, false, &mut FakeControl::default()).unwrap();
+    let restored = crate::console_auth::restore_generation(&context).unwrap().unwrap();
+    assert_ne!(restored, initial, "full restore must publish a fresh destination generation");
+    assert!(credential_file_is_private(&f.0.join("data/console-auth-generation"), true));
+    crate::settings::reset_administrator_password(&context).unwrap();
+    set_auth_password(&f, CURRENT_PASSWORD);
+    let mut control = FakeControl {
+        unhealthy: true,
+        observe_generation: true,
+        ..Default::default()
+    };
+    assert!(auth_restore(&f, &archive, false, &mut control).unwrap_err().contains("rolled back"));
+    let attempted = control.generation_at_health.unwrap();
+    let recovered = crate::console_auth::restore_generation(&context).unwrap().unwrap();
+    assert_ne!(restored, attempted);
+    assert_ne!(attempted, recovered, "rollback must publish a second fresh destination generation");
+    assert_ne!(restored, recovered);
+    assert!(stored_auth_password(&f).unwrap().verify(CURRENT_PASSWORD).unwrap());
+}
+
+#[test]
+fn console_auth_memory_restore_keeps_login_state() {
+    let f = Fixture::new();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let archive = f.backup();
+    mutate(&f);
+    let store = crate::settings::StoreProbe::at(&f.0);
+    store.edit(SEED_WAIT);
+    store.edit(SEED_SESSION);
+    let generation = crate::console_auth::rotate_restore_generation(&f.context()).ok().unwrap();
+    let settings = fs::read(store.path()).unwrap();
+    auth_restore(&f, &archive, true, &mut FakeControl::default()).unwrap();
+    assert_eq!(memory(&f), "old memory");
+    assert_eq!(crate::console_auth::restore_generation(&f.context()).unwrap(), Some(generation),
+        "memory-only restore must preserve the marker");
+    assert_eq!(fs::read(store.path()).unwrap(), settings, "memory-only restore must preserve the auth DB bytes");
+}
+
+#[test]
+fn console_auth_restore_marker_publication_failure_respects_replacement_boundary() {
+    for (fault, published) in [("temp/sync", false), ("dir/sync", true)] {
+        let f = Fixture::new();
+        let archive = f.backup();
+        mutate(&f);
+        let context = f.context();
+        let initial = crate::console_auth::rotate_restore_generation(&context).ok().unwrap();
+        let mut control = FakeControl { generation_fault: Some(fault), ..Default::default() };
+        let error = auth_restore(&f, &archive, false, &mut control).unwrap_err();
+        let current = crate::console_auth::restore_generation(&context).unwrap().unwrap();
+        assert_eq!(memory(&f), "current memory");
+        if published {
+            assert!(error.contains("rolled back"), "{error}");
+            assert_ne!(current, initial);
+            assert_eq!(control.stops, 2);
+        } else {
+            assert!(error.contains("nothing changed"), "{error}");
+            assert_eq!(current, initial);
+            assert_eq!(control.stops, 1);
+            assert_eq!(control.writes, 0);
+        }
+        assert!(!fs::read_dir(f.0.join("data")).unwrap().filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+}
+
+#[test]
+fn console_auth_backup_cancellation_within_scrub_publishes_nothing() {
+    let f = Fixture::new();
+    set_auth_password(&f, ARCHIVED_PASSWORD);
+    let store = crate::settings::StoreProbe::at(&f.0);
+    store.edit(SEED_WAIT);
+    store.edit(SEED_SESSION);
+    let backups = destination(&f);
+    let before = fs::read(store.path()).unwrap();
+    let check = || {
+        let deleting = fs::read_dir(&backups).unwrap().filter_map(Result::ok)
+            .any(|entry| entry.path().join("settings.db-journal").is_file());
+        if deleting { Err("fixture cancelled during auth scrub".to_string()) } else { Ok(()) }
+    };
+    assert!(crate::backup::create(&f.context(), &check).unwrap_err().contains("cancelled during auth scrub"));
+    assert_eq!(fs::read(store.path()).unwrap(), before);
+    assert!(fs::read_dir(backups).unwrap().next().is_none(), "cancelled staging is removed");
 }

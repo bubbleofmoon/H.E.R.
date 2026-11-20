@@ -1,5 +1,6 @@
 //! Confirmed, transactional restore of a verified selected-runtime backup.
-use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use crate::console_auth::{self, GenerationWriteError};
+use crate::runtime::{AuthorityGuard, PathIntent, RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -56,6 +57,7 @@ fn location(name: &str) -> Result<(RuntimeArea, String), String> {
     match name {
         "memory.db" | "conversations.db" | "settings.db" => Ok((RuntimeArea::Data, name.into())),
         "config.json" => Ok((RuntimeArea::Config, "config.json".into())),
+        console_auth::RESTORE_GENERATION_FILE => Err("cannot restore a destination console generation".into()),
         "说明.md" => Ok((RuntimeArea::Resources, name.into())),
         _ if name.starts_with("state/") => {
             let relative = &name[6..];
@@ -261,12 +263,19 @@ impl Prepared {
         }
         target.sync_all().map_err(|e| e.to_string())?;
         drop(target);
-        let (manifest, has_endpoint_credentials) = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
-        let warnings = if !memory_only && !has_endpoint_credentials {
-            vec!["完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。"]
-        } else {
-            Vec::new()
-        };
+        let (manifest, credentials) = crate::backup::verify_archive_for_restore(&zip, !memory_only)?;
+        let mut warnings = Vec::new();
+        if !memory_only {
+            if !credentials.has_endpoints {
+                warnings.push("完全恢复会清除 Settings 中保存的 webSearch.apiKey 和 cliModel.apiKey。");
+            }
+            let password_warning = if credentials.has_password {
+                "完全恢复会使用备份中的管理员密码，并退出所有浏览器会话。"
+            } else {
+                "完全恢复会清除管理员密码，恢复后需要首次设置密码，并退出所有浏览器会话。"
+            };
+            warnings.push(password_warning);
+        }
         let mut state_included = true;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
@@ -354,6 +363,10 @@ pub fn operation_gate(context: &RuntimeContext) -> Result<File, String> {
 trait Control {
     fn preflight(&mut self, context: &RuntimeContext) -> Result<(), String>;
     fn stop(&mut self, context: &RuntimeContext, revision: u64) -> Result<(), String>;
+    #[cfg(feature = "parity-clock")]
+    fn snapshot_ready(&mut self) -> Result<(), String> {
+        Ok(())
+    }
     fn restart(&mut self, _context: &RuntimeContext) -> Result<(), String> {
         Ok(())
     }
@@ -361,14 +374,18 @@ trait Control {
     fn alert(&mut self, context: &RuntimeContext, config: &Value, reason: &str);
     /// Called after the settings files are replaced and removed, before conversation reconciliation.
     fn store_replaced(&mut self, _context: &RuntimeContext) {}
+    fn publish_generation(&mut self, context: &RuntimeContext) -> Result<console_auth::Generation, GenerationWriteError> {
+        console_auth::rotate_restore_generation(context)
+    }
     fn replace(
         &mut self,
         context: &RuntimeContext,
         area: RuntimeArea,
         relative: &str,
         input: &mut dyn Read,
+        authority: Option<&AuthorityGuard<'_>>,
     ) -> Result<(), String> {
-        context.write_atomic_from(area, relative, input)
+        context.write_atomic_from(area, relative, input, authority)
     }
 }
 
@@ -538,8 +555,9 @@ struct Stopped {
 fn quiesce(
     context: &RuntimeContext,
     by: &str,
+    memory_only: bool,
     control: &mut dyn Control,
-) -> Result<Stopped, String> {
+) -> Result<Stopped, Step> {
     use crate::lifecycle::{self, Acquire, DesiredRead, DesiredState, DesiredStore, OwnerGate};
     let data = context.data_dir();
     lifecycle::validate_owner_gate_paths(data)?;
@@ -552,14 +570,21 @@ fn quiesce(
         crate::parity_clock::now_ms(),
     )?;
     control.stop(context, record.revision)?;
-    let tasks = lifecycle::hold_stopped_task_gates(data)?;
+    let gate_error = |error| {
+        if memory_only {
+            Step::Failed(error)
+        } else {
+            Step::Refused(error)
+        }
+    };
+    let tasks = lifecycle::hold_stopped_task_gates(data).map_err(gate_error)?;
     let desired = lifecycle::lock_with_wait(
         &data.join("lifecycle/lifecycle.lock"),
         Duration::from_secs(5),
-    )?;
+    ).map_err(gate_error)?;
     if !matches!(store.read(), DesiredRead::Present(r) if r.state == DesiredState::Stopped && r.revision == record.revision)
     {
-        return Err("restore stop was superseded".into());
+        return Err(Step::Failed("restore stop was superseded".into()));
     }
     let identity = lifecycle::current_identity()?;
     let mut owners = Vec::new();
@@ -572,7 +597,7 @@ fn quiesce(
             Duration::ZERO,
         ) {
             Acquire::Acquired(owner) => owners.push(owner),
-            _ => return Err("bridge owner is not confirmed stopped".into()),
+            _ => return Err(gate_error("bridge owner is not confirmed stopped".into())),
         }
     }
     Ok(Stopped {
@@ -592,8 +617,7 @@ fn resume(context: &RuntimeContext, by: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Why `stop_and_replace` ended. `Refused` is the settings store gate that could not be had: the owners were stopped,
-/// no file was touched, and there is nothing to roll back.
+/// A refusal after quiescence precedes generation publication and file replacement.
 enum Step {
     Refused(String),
     Failed(String),
@@ -611,13 +635,8 @@ impl Step {
     }
 }
 
-/// Stops the writers, replaces the files, then reconciles conversations while the stopped owners are still held. A
-/// full restore takes the settings store gate last: after the stop has taken the task gates and the owner gates, and
-/// right before the first file is touched. It holds that gate through the settings file cleanup, replacement and
-/// removal and releases it before reconciliation, which takes configuration gates. A task waits for a configuration
-/// gate while it holds its task gate, and a settings writer waits for the store gate while it holds a configuration
-/// gate, so the one order is task gate, then configuration gate, then store gate; nothing waits for another gate while it
-/// holds the store gate.
+/// Quiesce first, then acquire config/social-state, transport authority and the settings store in that order.
+/// Release the publication gates before reconciliation or restart.
 fn stop_and_replace(
     context: &RuntimeContext,
     by: &str,
@@ -625,14 +644,20 @@ fn stop_and_replace(
     memory_only: bool,
     control: &mut dyn Control,
 ) -> Result<(), Step> {
-    let stopped = quiesce(context, by, control)?;
-    let store = if memory_only {
-        None
+    let stopped = quiesce(context, by, memory_only, control)?;
+    if memory_only {
+        apply(context, prepared, true, control, None)?;
     } else {
-        Some(crate::settings::restore_gate(context).map_err(Step::Refused)?)
-    };
-    apply(context, prepared, memory_only, control)?;
-    drop(store);
+        let _config = crate::console::config_gate(context).map_err(|(_, error)| Step::Refused(error))?;
+        let authority = context.authority_gate().map_err(Step::Refused)?;
+        let _store = crate::settings::restore_gate(context).map_err(Step::Refused)?;
+        let generation = control.publish_generation(context);
+        generation.map_err(|error| match error {
+            GenerationWriteError::Unpublished(error) => Step::Refused(error),
+            GenerationWriteError::Published(error) => Step::Failed(error),
+        })?;
+        apply(context, prepared, false, control, Some(&authority))?;
+    }
     control.store_replaced(context);
     if !memory_only && prepared.files.contains_key("conversations.db") {
         reconcile_conversations(context)?;
@@ -646,6 +671,7 @@ fn apply(
     prepared: &Prepared,
     memory_only: bool,
     control: &mut dyn Control,
+    authority: Option<&AuthorityGuard<'_>>,
 ) -> Result<(), String> {
     // A stopped writer must not leave an old WAL to replay against the replacement database. A reader in a process
     // the restore does not stop may hold a file open for a moment; removals retry that (`remove_runtime_file`).
@@ -668,7 +694,7 @@ fn apply(
     for (name, (area, relative)) in &prepared.files {
         let mut source = archive.by_name(name).map_err(|e| e.to_string())?;
         control
-            .replace(context, *area, relative, &mut source)
+            .replace(context, *area, relative, &mut source, authority)
             .map_err(|e| {
                 format!(
                     "restore replacement failed for {}: {e}",
@@ -849,6 +875,11 @@ fn execute_with(
             );
         }
         control.preflight(context)?;
+        let _credential = if memory_only {
+            None
+        } else {
+            Some(console_auth::credential_mutation_gate(context)?)
+        };
         let config = context.load_config().map_err(str::to_owned)?;
         audit(
             context,
@@ -871,6 +902,8 @@ fn execute_with(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned());
         let rollback = Prepared::open(context, &previous, memory_only)?;
+        #[cfg(feature = "parity-clock")]
+        control.snapshot_ready()?;
         let attempt = (|| -> Result<(), Step> {
             stop_and_replace(context, by, &prepared, memory_only, control)?;
             resume(context, by)?;
@@ -881,8 +914,7 @@ fn execute_with(
         match attempt {
             Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
             Err(Step::Refused(reason)) => {
-                // The settings store gate was not had: the owners are stopped and nothing was replaced, so there is
-                // nothing to roll back; start them again.
+                // Quiescence completed before the refusal. Resume the owners without replacing anything.
                 let started = resume(context, by).and_then(|()| control.restart(context));
                 let detail = match started {
                     Ok(()) => format!("Restore refused after stopping, nothing changed: {reason}"),
@@ -945,6 +977,44 @@ pub fn execute(
         by,
         &mut RealControl,
     )
+}
+
+// The parity build runs real file transactions with deterministic process and health boundaries.
+#[cfg(feature = "parity-clock")]
+struct CliFixtureControl;
+
+#[cfg(feature = "parity-clock")]
+impl CliFixtureControl {
+    fn barrier(stage: &str) -> Result<(), String> {
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "restore fixture {stage}").map_err(|err| err.to_string())?;
+        stdout.flush().map_err(|err| err.to_string())?;
+        drop(stdout);
+        let mut response = String::new();
+        std::io::stdin().read_line(&mut response).map_err(|err| err.to_string())?;
+        if response.trim_end() != "continue" {
+            return Err("restore fixture stopped".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "parity-clock")]
+impl Control for CliFixtureControl {
+    fn preflight(&mut self, context: &RuntimeContext) -> Result<(), String> {
+        crate::install_root::check_development_path(context.runtime_root().ok_or("runtime root missing")?)
+    }
+    fn stop(&mut self, _: &RuntimeContext, _: u64) -> Result<(), String> {
+        Ok(())
+    }
+    fn snapshot_ready(&mut self) -> Result<(), String> {
+        Self::barrier("snapshot")
+    }
+    fn health(&mut self, _: &RuntimeContext, _: Duration) -> Result<(), String> {
+        Self::barrier("health")?;
+        Err("restore fixture candidate health failed".into())
+    }
+    fn alert(&mut self, _: &RuntimeContext, _: &Value, _: &str) {}
 }
 
 /// Terminal entry: print the same preview as the console, then require a deliberate confirmation.
@@ -1042,6 +1112,10 @@ pub fn run_cli(args: &[String]) -> i32 {
                     .to_owned()
             }
         };
+        #[cfg(feature = "parity-clock")]
+        if std::env::var_os("HER_TEST_RESTORE_CONTROL").as_deref() == Some(std::ffi::OsStr::new("stdio")) {
+            return execute_with(&context, Path::new(archive), memory_only, &confirmation, &by, &mut CliFixtureControl);
+        }
         execute(
             &context,
             Path::new(archive),
@@ -1295,6 +1369,9 @@ mod tests {
         restarts: usize,
         probe_store_replaced: bool,
         settings_after_replace: Option<Result<(), u16>>,
+        observe_generation: bool,
+        generation_at_health: Option<console_auth::Generation>,
+        generation_fault: Option<&'static str>,
     }
     impl Control for FakeControl {
         fn preflight(&mut self, _: &RuntimeContext) -> Result<(), String> {
@@ -1342,8 +1419,12 @@ mod tests {
             }
             Ok(())
         }
-        fn health(&mut self, _: &RuntimeContext, budget: Duration) -> Result<(), String> {
+        fn health(&mut self, context: &RuntimeContext, budget: Duration) -> Result<(), String> {
             assert_eq!(budget, Duration::from_secs(120));
+            if self.observe_generation {
+                let _config = crate::console::config_gate(context).map_err(|(_, error)| error)?;
+                self.generation_at_health = console_auth::restore_generation(context)?;
+            }
             self.health_finished = Some(crate::parity_clock::now_ms());
             if self.unhealthy {
                 Err(self
@@ -1370,12 +1451,33 @@ mod tests {
         fn alert(&mut self, _: &RuntimeContext, _: &Value, reason: &str) {
             self.alerts.push(reason.into());
         }
+        fn publish_generation(&mut self, context: &RuntimeContext) -> Result<console_auth::Generation, GenerationWriteError> {
+            let Some(fault) = self.generation_fault.take() else {
+                return console_auth::rotate_restore_generation(context);
+            };
+            struct ClearHook;
+            impl Drop for ClearHook {
+                fn drop(&mut self) {
+                    crate::guarded_file::STEP_HOOK.with(|slot| *slot.borrow_mut() = None);
+                }
+            }
+            let _clear = ClearHook;
+            crate::guarded_file::STEP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == fault {
+                    Err(std::io::Error::other("fixture marker publication failed"))
+                } else {
+                    Ok(())
+                }
+            })));
+            console_auth::rotate_restore_generation(context)
+        }
         fn replace(
             &mut self,
             context: &RuntimeContext,
             area: RuntimeArea,
             relative: &str,
             input: &mut dyn Read,
+            authority: Option<&AuthorityGuard<'_>>,
         ) -> Result<(), String> {
             self.writes += 1;
             self.replaced.push(label(area, relative));
@@ -1402,9 +1504,9 @@ mod tests {
                         self.0.read(&mut bytes[..size])
                     }
                 }
-                return context.write_atomic_from(area, relative, &mut Interrupted(input, false));
+                return context.write_atomic_from(area, relative, &mut Interrupted(input, false), authority);
             }
-            context.write_atomic_from(area, relative, input)
+            context.write_atomic_from(area, relative, input, authority)
         }
     }
     fn memory(f: &Fixture) -> String {

@@ -4,7 +4,13 @@
 //! conversation (#218, schema version 2) are in `store/conversation.rs`. The module root (`settings.rs`) re-exports what
 //! callers use; the contract is described there.
 
+mod console_auth;
 mod conversation;
+
+pub(crate) use console_auth::{
+    archive_credentials, reset_administrator_password, scrub_auth_snapshot,
+    set_initial_administrator_password, ArchivedCredentials,
+};
 
 pub(crate) use conversation::{
     apply_conversation, apply_switch_choice, canonical_conversation, conversation_admitted, conversation_value,
@@ -17,7 +23,7 @@ use super::{
     WEB_SEARCH_API_KEY,
 };
 use crate::console_auth::AdministratorPasswordHash;
-use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+use crate::runtime::{file_link_count, PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
@@ -25,9 +31,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const DB: &str = "settings.db";
 const SIDECARS: [&str; 3] = ["settings.db-wal", "settings.db-shm", "settings.db-journal"];
-/// The newest schema version this release reads and writes: 1 (`settings`, `settings_audit`) or 2 (version 1 and
-/// `conversation_settings`, #218). A store stays at version 1 until its first conversation write (`migrate`).
-const SCHEMA_VERSION: i64 = 2;
+/// Global settings start at v1, conversation settings need v2, and durable console authentication needs v3.
+const SCHEMA_VERSION: i64 = 3;
 const SECRET_MARKER: &str = "(hidden)";
 const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authentication";
 const PASSWORD_UNAVAILABLE: &str = "administrator password is unavailable";
@@ -256,8 +261,8 @@ pub(crate) fn restore_gate(context: &RuntimeContext) -> Result<std::fs::File, St
 /// A read-only connection to the store for the backup's online snapshot, `None` when there is no store (or no
 /// selected runtime). The store and its sidecars pass the same checks as every other open (contained, and a plain
 /// file with one link or missing), and the connection never checkpoints on close, so a backup never changes the
-/// store. The schema is not checked: a store from a newer release is copied as it is. A store SQLite cannot read (a
-/// leftover journal, a file that is not a database) fails the snapshot.
+/// store. Schema inspection and authentication sanitation happen on the private copy. A store SQLite cannot read
+/// (a leftover journal, a file that is not a database) fails the snapshot.
 ///
 /// A writer's last connection removes the WAL and its index when it closes, and the next writer creates them again,
 /// so a sidecar check can meet one halfway (on Windows a removed file refuses every open until its last handle
@@ -364,27 +369,6 @@ fn link_count(path: &std::path::Path) -> std::io::Result<u64> {
     file_link_count(&std::fs::File::open(path)?)
 }
 
-/// The hard links of an open file.
-#[cfg(unix)]
-fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    file.metadata().map(|metadata| metadata.nlink())
-}
-
-/// The hard links of an open file.
-#[cfg(windows)]
-fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle stays open for the call and `information` is a valid, writable out pointer.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(u64::from(information.nNumberOfLinks))
-}
-
 /// The gate file (`locks/settings-store.lock`) must be a plain file with one link or missing, whether or not the store
 /// exists: a second name for another file would otherwise pass the store's checks and keep an invalid gate.
 fn check_gate_file(context: &RuntimeContext) -> Result<(), String> {
@@ -431,7 +415,7 @@ fn normalized_sql(sql: &str) -> String {
     normalized
 }
 
-/// The schema on an open connection: `Ok(false)` for version 0 with no schema object, `Ok(true)` for version 1 or 2
+/// The schema on an open connection: `Ok(false)` for version 0 with no schema object, `Ok(true)` for versions 1 through 3
 /// with exactly this release's schema of that version (`has_settings_schema`); anything else is refused.
 fn check_schema(conn: &Connection) -> Result<bool, String> {
     match schema_version(conn)? {
@@ -450,9 +434,8 @@ fn check_schema(conn: &Connection) -> Result<bool, String> {
 /// Looks at the store without opening it for writing. Every store file (the database, its `-wal`, `-shm` and `-journal`,
 /// and the store gate) must be a plain file with one link or missing, whether or not the database exists. A leftover
 /// rollback journal (beside a missing database, or hot: no connection holds the write lock) is refused, and nothing
-/// recovers it; a live writer's journal is waited for. A file that is not a SQLite database, a version other than 0, 1
-/// or 2 (read from the file header while no WAL holds later commits), a version 0 with any schema object and a version
-/// 1 or 2 whose schema is not exactly this release's of that version are refused too. Otherwise a read-only connection
+/// recovers it; a live writer's journal is waited for. Invalid database bytes, an unsupported version, or a schema
+/// that differs from the declared version are refused too. Otherwise a read-only connection
 /// that never checkpoints on close reads the schema; only SQLite's shared-memory index (`-shm`) may be rebuilt
 /// meanwhile.
 fn inspect(context: &RuntimeContext) -> Result<Inspection, String> {
@@ -566,23 +549,6 @@ fn read_stored_values(conn: &Connection) -> Result<Vec<(&'static Setting, Value)
     Ok(values)
 }
 
-/// Presence check for the restore preview. The verified archive may predate the settings table.
-pub(crate) fn archive_has_endpoint_credentials(conn: &Connection) -> Result<bool, String> {
-    let failed = |_: rusqlite::Error| "backup settings credential status is unavailable".to_string();
-    let has_settings: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='settings')",
-        [], |row| row.get(0),
-    ).map_err(failed)?;
-    if !has_settings {
-        return Ok(false);
-    }
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM settings WHERE key IN (?1, ?2) AND value <> 'null')",
-        params![WEB_SEARCH_API_KEY.key, CLI_MODEL_API_KEY.key],
-        |row| row.get(0),
-    ).map_err(failed)
-}
-
 /// Only the credential readers and redaction use these rows. Ordinary settings never decode them.
 fn read_secrets(context: &RuntimeContext) -> Result<Vec<(&'static str, String, String)>, String> {
     if !context.is_isolated() {
@@ -626,7 +592,11 @@ pub(crate) fn secret_value(context: &RuntimeContext, setting: &Setting, endpoint
 
 fn administrator_password(context: &RuntimeContext) -> Result<Option<AdministratorPasswordHash>, String> {
     let Inspection::Ready(conn) = inspect(context)? else { return Ok(None) };
-    let Some((text, _)) = stored_row(&conn, ADMINISTRATOR_PASSWORD.key).map_err(|(_, error)| error)? else {
+    administrator_password_in(&conn)
+}
+
+fn administrator_password_in(conn: &Connection) -> Result<Option<AdministratorPasswordHash>, String> {
+    let Some((text, _)) = stored_row(conn, ADMINISTRATOR_PASSWORD.key).map_err(|(_, error)| error)? else {
         return Ok(None);
     };
     let phc: String = serde_json::from_str(&text).map_err(|_| PASSWORD_UNAVAILABLE.to_string())?;
@@ -806,7 +776,7 @@ const SCHEMA_V2_ADDED: [(&str, &str, &str, &str); 1] = [(
 const SCHEMA_V2_IMPLICIT: [(&str, &str, &str, Option<&str>); 1] =
     [("index", "sqlite_autoindex_conversation_settings_1", "conversation_settings", None)];
 
-/// Whether `sqlite_master` holds exactly schema version `version` (1, or 2 with `SCHEMA_V2_ADDED`): the same objects
+/// Whether `sqlite_master` holds exactly the declared schema version: the same objects
 /// (type, name, table) with the same CREATE text after `normalized_sql`, and nothing else. A store that claims the
 /// version without it is refused before it is touched, so the WAL switch never rewrites its header.
 fn has_settings_schema(conn: &Connection, version: i64) -> bool {
@@ -820,16 +790,20 @@ fn has_settings_schema(conn: &Connection, version: i64) -> bool {
         })
         .and_then(|rows| rows.collect::<Result<Vec<Object>, _>>());
     let Ok(mut found) = found else { return false };
-    let added: &[(&str, &str, &str, &str)] = if version >= 2 { &SCHEMA_V2_ADDED } else { &[] };
-    let added_implicit: &[(&str, &str, &str, Option<&str>)] = if version >= 2 { &SCHEMA_V2_IMPLICIT } else { &[] };
+    let v2 = SCHEMA_V2_ADDED.iter().filter(|_| version >= 2);
+    let v2_indexes = SCHEMA_V2_IMPLICIT.iter().filter(|_| version >= 2);
+    let v3 = console_auth::SCHEMA_V3_ADDED.iter().filter(|_| version >= 3);
+    let v3_indexes = console_auth::SCHEMA_V3_IMPLICIT.iter().filter(|_| version >= 3);
     let mut expected: Vec<Object> = SCHEMA_V1
         .iter()
-        .chain(added)
+        .chain(v2)
+        .chain(v3)
         .map(|(kind, name, table, sql)| (kind.to_string(), name.to_string(), table.to_string(), Some(sql.to_string())))
         .chain(
             SCHEMA_V1_IMPLICIT
                 .iter()
-                .chain(added_implicit)
+                .chain(v2_indexes)
+                .chain(v3_indexes)
                 .map(|(kind, name, table, sql)| (kind.to_string(), name.to_string(), table.to_string(), sql.map(str::to_string))),
         )
         .collect();
@@ -1292,56 +1266,6 @@ fn record_change(
     )
     .map_err(failed)?;
     Ok(revision)
-}
-
-/// A password mutation has its own immediate transaction. The caller holds the configuration gate.
-fn write_administrator_password(
-    context: &RuntimeContext,
-    existing_only: bool,
-    write: impl FnOnce(&Connection) -> Result<(), (u16, String)>,
-) -> Result<(), (u16, String)> {
-    if !context.is_isolated() {
-        return Err((503, LEGACY_ERROR.to_string()));
-    }
-    let unavailable = |error| (503, error);
-    let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
-    if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
-        return Ok(());
-    }
-    let mut conn = open_for_write(context).map_err(unavailable)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
-    write(&tx)?;
-    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))
-}
-
-pub(crate) fn set_initial_administrator_password(
-    context: &RuntimeContext,
-    hash: &AdministratorPasswordHash,
-    actor: &str,
-) -> Result<(), (u16, String)> {
-    write_administrator_password(context, false, |conn| {
-        let old = stored_row(conn, ADMINISTRATOR_PASSWORD.key)?;
-        if old.is_some() {
-            return Err((409, "administrator password is already set".to_string()));
-        }
-        let text = json!(hash.as_str()).to_string();
-        record_change(conn, &ADMINISTRATOR_PASSWORD, old, Some(&text), actor, "first-run")?;
-        Ok(())
-    })
-}
-
-pub(crate) fn reset_administrator_password(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    write_administrator_password(context, true, |conn| {
-        // Reset must also remove a row whose value cannot be decoded as text or as a PHC.
-        let exists: bool = conn
-            .query_row("SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)", [ADMINISTRATOR_PASSWORD.key], |r| r.get(0))
-            .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
-        if exists {
-            record_change(conn, &ADMINISTRATOR_PASSWORD, None, None, "her-cli", "reset-password")?;
-        }
-        Ok(())
-    })
 }
 
 fn generic_setting(key: &str) -> Result<&'static Setting, (u16, String)> {

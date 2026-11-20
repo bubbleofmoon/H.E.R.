@@ -37,13 +37,24 @@ impl Fixture {
         let conversations = rusqlite::Connection::open(path.join("data/conversations.db")).unwrap();
         conversations.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE probe(value TEXT); INSERT INTO probe VALUES('conversation');").unwrap();
         drop(conversations);
+        let fixture = Self(path);
+        fixture.write_archive();
+        fixture
+    }
+
+    fn write_archive(&self) {
+        let path = &self.0;
         let mut zip = zip::ZipWriter::new(fs::File::create(path.join("chosen.zip")).unwrap());
         let mut files = serde_json::Map::new();
         for (name, source) in [
             ("memory.db", "data/memory.db"),
             ("conversations.db", "data/conversations.db"),
             ("config.json", "config/config.json"),
+            ("settings.db", "data/settings.db"),
         ] {
+            if name == "settings.db" && !path.join(source).exists() {
+                continue;
+            }
             let bytes = fs::read(path.join(source)).unwrap();
             files.insert(
                 name.into(),
@@ -58,16 +69,21 @@ impl Fixture {
         zip.write_all(json!({"version":1,"files":files}).to_string().as_bytes())
             .unwrap();
         zip.finish().unwrap();
-        Self(path)
     }
-    fn command(&self) -> Command {
+
+    fn cli() -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_her-cli"));
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             c.creation_flags(0x08000000);
         }
-        c.env_remove("HER_RUNTIME_ROOT");
+        c.env_remove("HER_RUNTIME_ROOT").env_remove("HER_TEST_RESTORE_CONTROL");
+        c
+    }
+
+    fn command(&self) -> Command {
+        let mut c = Self::cli();
         c.args(["backup", "restore"])
             .arg(self.0.join("chosen.zip"))
             .arg("--runtime-root")
@@ -278,4 +294,118 @@ fn restore_failure_waits_for_a_slow_administrator_notification_before_cli_exit()
         "notification must complete before exit"
     );
     assert!(!f.0.join("data/lifecycle/desired-state.json").exists());
+}
+
+#[cfg(feature = "parity-clock")]
+mod password_restore {
+    use super::*;
+    use rusqlite::OptionalExtension;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Child, Output};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn password_cli(fixture: &Fixture, action: &str) -> Command {
+        let mut cli = Fixture::cli();
+        cli.args(["console", action, "--runtime-root"]).arg(&fixture.0);
+        cli
+    }
+
+    fn set_password(fixture: &Fixture, password: &str) {
+        let mut child = password_cli(fixture, "set-password")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let wrote = write!(input, "fixture\n{password}\n{password}\n");
+        drop(input);
+        let status = child.wait().unwrap();
+        wrote.unwrap();
+        assert!(status.success());
+    }
+
+    fn reset_password(fixture: &Fixture) -> Output {
+        password_cli(fixture, "reset-password").stdin(Stdio::null()).output().unwrap()
+    }
+
+    fn current_hash(fixture: &Fixture) -> Option<String> {
+        rusqlite::Connection::open_with_flags(
+            fixture.0.join("data/settings.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).unwrap().query_row(
+            "SELECT value FROM settings WHERE key='console.administratorPassword'", [], |row| row.get(0),
+        ).optional().unwrap()
+    }
+
+    struct RestoreChild(Child);
+
+    impl Drop for RestoreChild {
+        fn drop(&mut self) {
+            // EOF releases either fixture barrier so the owned child can exit and be reaped.
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+
+    fn exercise_rollback(reset_before_snapshot: bool) {
+        let f = Fixture::new();
+        set_password(&f, "fixture archived password");
+        let archived = current_hash(&f);
+        f.write_archive();
+        assert!(reset_password(&f).status.success());
+        set_password(&f, "fixture destination password");
+        if reset_before_snapshot {
+            assert!(reset_password(&f).status.success());
+        }
+        let previous = current_hash(&f);
+        assert_eq!(previous.is_none(), reset_before_snapshot);
+        let preview = f.command().arg("--preview").output().unwrap();
+        assert!(preview.status.success());
+        let stdout = String::from_utf8(preview.stdout).unwrap();
+        let plan: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+        let mut child = RestoreChild(f.command()
+            .env("HER_TEST_RESTORE_CONTROL", "stdio")
+            .args(["--confirm", plan["preview"]["confirmation"].as_str().unwrap()])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().unwrap());
+        let stdout = child.0.stdout.take().unwrap();
+        let (ready, stages) = mpsc::channel();
+        let drain = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(stage) = line.strip_prefix("restore fixture ") {
+                    let _ = ready.send(stage.to_string());
+                }
+            }
+        });
+        let probes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (stage, expected) in [("snapshot", &previous), ("health", &archived)] {
+                assert_eq!(stages.recv_timeout(Duration::from_secs(20)).unwrap(), stage);
+                let reset = reset_password(&f);
+                assert_eq!(reset.status.code(), Some(3),
+                    "offline reset must refuse while full restore holds the snapshot and health boundary");
+                assert_eq!(&current_hash(&f), expected, "refused reset must leave the stored hash alone");
+                writeln!(child.0.stdin.as_mut().unwrap(), "continue").unwrap();
+            }
+        }));
+        drop(child.0.stdin.take());
+        let status = child.0.wait().unwrap();
+        drain.join().unwrap();
+        if let Err(panic) = probes {
+            std::panic::resume_unwind(panic);
+        }
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert_eq!(status.code(), Some(1));
+        assert!(stderr.contains("rolled back"), "{stderr}");
+        assert_eq!(current_hash(&f), previous, "rollback must reflect the credential at snapshot selection");
+        assert!(reset_password(&f).status.success());
+        assert!(current_hash(&f).is_none());
+    }
+
+    #[test]
+    fn full_restore_rollback_serializes_offline_password_reset() {
+        exercise_rollback(false);
+    }
+
+    #[test]
+    fn full_restore_rollback_keeps_a_password_reset_before_snapshot_selection() {
+        exercise_rollback(true);
+    }
 }

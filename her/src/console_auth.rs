@@ -1,11 +1,12 @@
 //! Console credential comparison and the selected runtime's offline password commands.
 
-use crate::runtime::RuntimeContext;
+use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use argon2::password_hash::{
     Error as PhcError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::{BufRead, IsTerminal, Read};
 use std::path::Path;
 use subtle::ConstantTimeEq;
@@ -46,6 +47,104 @@ pub(crate) fn decode_digest<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(digest)
 }
 
+pub(crate) const RESTORE_GENERATION_FILE: &str = "console-auth-generation";
+const GENERATION_UNAVAILABLE: &str = "console restore generation is unavailable";
+pub(crate) type Generation = [u8; 32];
+
+pub(crate) fn new_generation() -> Result<Generation, PasswordError> {
+    let mut generation = [0; 32];
+    getrandom::getrandom(&mut generation).map_err(|_| PasswordError::Unavailable)?;
+    Ok(generation)
+}
+
+pub(crate) fn credential_mutation_gate(context: &RuntimeContext) -> Result<fs::File, String> {
+    context
+        .open_locked_file(RuntimeArea::Data, "locks/console-credential.lock")
+        .map_err(|_| "console credential mutation is busy or unavailable".to_string())
+}
+
+fn open_restore_generation(path: &Path) -> Result<Option<fs::File>, String> {
+    let open = || {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        crate::guarded_file::no_follow(&mut options);
+        options.open(path)
+    };
+    match open() {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|_| GENERATION_UNAVAILABLE)?;
+            if !metadata.is_file() || crate::guarded_file::is_link(&metadata)
+                || crate::runtime::file_link_count(&file).ok() != Some(1)
+            {
+                return Err(GENERATION_UNAVAILABLE.to_string());
+            }
+            Ok(Some(file))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(GENERATION_UNAVAILABLE.to_string()),
+    }
+}
+
+/// Read only under the configuration gate. A bad existing marker stays distinct from absence.
+#[allow(dead_code)] // Browser authentication consumes this read when it is enabled.
+pub(crate) fn restore_generation(context: &RuntimeContext) -> Result<Option<Generation>, String> {
+    if !context.is_isolated() {
+        return Err(GENERATION_UNAVAILABLE.to_string());
+    }
+    let resolve = || context.resolve_path(RuntimeArea::Data, RESTORE_GENERATION_FILE, PathIntent::ReadOptionalFile);
+    let path = resolve()?;
+    let Some(mut file) = open_restore_generation(&path)? else { return Ok(None) };
+    if resolve()? != path {
+        return Err(GENERATION_UNAVAILABLE.to_string());
+    }
+    let mut generation = [0; 32];
+    file.read_exact(&mut generation).map_err(|_| GENERATION_UNAVAILABLE)?;
+    if file.read(&mut [0]).map_err(|_| GENERATION_UNAVAILABLE)? != 0 {
+        return Err(GENERATION_UNAVAILABLE.to_string());
+    }
+    Ok(Some(generation))
+}
+
+#[derive(Debug)]
+pub(crate) enum GenerationWriteError {
+    Unpublished(String),
+    Published(String),
+}
+
+/// The caller holds the configuration gate. The destination marker is outside the replacement set.
+pub(crate) fn rotate_restore_generation(context: &RuntimeContext) -> Result<Generation, GenerationWriteError> {
+    use GenerationWriteError::{Published, Unpublished};
+    if !context.is_isolated() {
+        return Err(Unpublished(GENERATION_UNAVAILABLE.to_string()));
+    }
+    let generation = new_generation().map_err(|_| Unpublished(GENERATION_UNAVAILABLE.to_string()))?;
+    let area = RuntimeArea::Data;
+    let name = RESTORE_GENERATION_FILE;
+    let (target, staged) = context.stage_atomic_from(area, name, &mut generation.as_slice())
+        .map_err(|failure| Unpublished(failure.to_string()))?;
+    staged.commit(&mut || {
+        context.revalidate_atomic_target(area, name, &target)?;
+        open_restore_generation(&target)?;
+        Ok(())
+    }).map_err(|failure| {
+        // Directory sync happens after replacement. Preserve the new marker and use rollback.
+        if failure.class() == "dir/sync" {
+            Published(failure.to_string())
+        } else {
+            Unpublished(failure.to_string())
+        }
+    })?;
+    context.resolve_path(area, name, PathIntent::ReadFile)
+        .map_err(|error| Published(error.to_string()))?;
+    Ok(generation)
+}
+
 const MEMORY_KIB: u32 = 19 * 1024;
 const ITERATIONS: u32 = 2;
 const LANES: u32 = 1;
@@ -60,6 +159,7 @@ pub(crate) enum PasswordError {
     Input,
     Proof,
     AlreadySet,
+    Busy,
     Unavailable,
 }
 
@@ -174,6 +274,7 @@ fn first_run_with_password_work(
     validate_new_password(password)?;
     check_first_run_proof(context, proof)?;
     let hash = derive(password)?;
+    let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
     let _config = crate::console::config_gate(context).map_err(|_| PasswordError::Unavailable)?;
     check_first_run_proof(context, proof)?;
     crate::settings::set_initial_administrator_password(context, &hash, actor).map_err(
@@ -222,6 +323,7 @@ fn set_password_cli(context: &RuntimeContext) -> Result<(), PasswordError> {
 }
 
 fn reset_password_cli(context: &RuntimeContext) -> Result<(), PasswordError> {
+    let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
     let _config = crate::console::config_gate(context).map_err(|_| PasswordError::Unavailable)?;
     crate::settings::reset_administrator_password(context).map_err(|_| PasswordError::Unavailable)
 }
@@ -262,6 +364,7 @@ pub(crate) fn run_cli(args: &[String]) -> i32 {
                 PasswordError::Input => (2, "invalid password input or confirmation"),
                 PasswordError::Proof => (3, "console credential proof was refused"),
                 PasswordError::AlreadySet => (3, "administrator password is already set"),
+                PasswordError::Busy => (3, "console credential mutation is busy or unavailable"),
                 PasswordError::Unavailable => (3, "administrator password storage is unavailable"),
             };
             eprintln!("{message}");
@@ -292,7 +395,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn runtime(generated: bool) -> (FixtureRoot, RuntimeContext) {
+    pub(crate) fn runtime(generated: bool) -> (FixtureRoot, RuntimeContext) {
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!(
             "her-console-auth-{}-{}",
             std::process::id(),
@@ -311,6 +414,43 @@ pub(crate) mod tests {
         }
         let context = RuntimeContext::from_root(&root.0).unwrap();
         (root, context)
+    }
+
+    #[test]
+    fn console_auth_generation_refuses_redirected_and_malformed_files() {
+        let (root, context) = runtime(false);
+        let _config = crate::console::config_gate(&context).unwrap();
+        let marker = root.0.join("data").join(RESTORE_GENERATION_FILE);
+        assert_eq!(restore_generation(&context).unwrap(), None);
+
+        for len in [0, 31, 33] {
+            fs::write(&marker, vec![3; len]).unwrap();
+            assert!(restore_generation(&context).is_err());
+        }
+        fs::remove_file(&marker).unwrap();
+        let target = root.0.join("generation-target");
+        fs::write(&target, [7; 32]).unwrap();
+        fs::hard_link(&target, &marker).unwrap();
+        assert!(restore_generation(&context).is_err());
+        assert!(matches!(rotate_restore_generation(&context), Err(GenerationWriteError::Unpublished(_))));
+        assert_eq!(fs::read(&target).unwrap(), [7; 32]);
+        fs::remove_file(&marker).unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &marker).unwrap();
+            assert!(restore_generation(&context).is_err());
+            assert!(matches!(rotate_restore_generation(&context), Err(GenerationWriteError::Unpublished(_))));
+            assert_eq!(fs::read(&target).unwrap(), [7; 32]);
+            fs::remove_file(&marker).unwrap();
+        }
+        fs::create_dir(&marker).unwrap();
+        assert!(restore_generation(&context).is_err());
+        assert!(matches!(rotate_restore_generation(&context), Err(GenerationWriteError::Unpublished(_))));
+        fs::remove_dir(&marker).unwrap();
+
+        let generation = rotate_restore_generation(&context).unwrap();
+        assert_eq!(restore_generation(&context).unwrap(), Some(generation));
     }
 
     fn entry(context: &RuntimeContext) -> Value {

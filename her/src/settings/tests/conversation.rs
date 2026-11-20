@@ -231,12 +231,12 @@ fn conversation_settings_store_refuses_a_version_two_store_that_is_not_exactly_i
         let body = conversations_view(&context);
         assert_eq!(body["storeError"], "settings storage is unavailable", "{label}");
     }
-    // A newer release's store (version 3) is refused as newer by a conversation write too, and never migrated down.
-    let (root, context) = settings_fixture("conversation settings v3");
-    StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;");
+    // A newer release's store (version 4) is refused as newer by a conversation write too, and never migrated down.
+    let (root, context) = settings_fixture("conversation settings v4");
+    StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;");
     let (status, body) = set_engine(&context, OWNER_CHAT, json!("harness"));
     assert_eq!((status, body["error"].clone()), (503, json!(crate::settings::NEWER_SCHEMA_ERROR)), "{body}");
-    assert_eq!(StoreProbe::at(&root.0).user_version(), 3, "a newer store is never migrated down");
+    assert_eq!(StoreProbe::at(&root.0).user_version(), 4, "a newer store is never migrated down");
 }
 
 #[test]
@@ -923,6 +923,6 @@ fn model_route_setting_is_kept_per_conversation_and_a_reset_stores_none_that_an_
     assert_eq!(status, 200, "{body}");
     assert_eq!((StoreProbe::at(&old_root.0).user_version(), crate::settings::conversation_value(&old, OWNER_CHAT, ROUTE)), (1, None));
     let (newer_root, newer) = settings_fixture("model route newer store");
-    StoreProbe::at(&newer_root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;");
+    StoreProbe::at(&newer_root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;");
     assert_eq!(crate::settings::conversation_value(&newer, OWNER_CHAT, ROUTE), None, "a newer store reads as no value");
 }

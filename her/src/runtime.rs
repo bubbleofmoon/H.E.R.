@@ -91,6 +91,12 @@ pub struct RuntimeContext {
     config: Option<Value>,
 }
 
+/// A transport authority lock for this specific runtime handle.
+pub(crate) struct AuthorityGuard<'a> {
+    _lock: fs::File,
+    context: &'a RuntimeContext,
+}
+
 // Thread-local and compiled only for unit tests: each fixture controls its own append.
 #[cfg(test)]
 thread_local! {
@@ -851,11 +857,11 @@ impl RuntimeContext {
 
 
     /// Coordinate authority publication with selected sticker request transmission.
-    pub(crate) fn authority_gate(&self) -> Result<std::fs::File, String> {
+    pub(crate) fn authority_gate(&self) -> Result<AuthorityGuard<'_>, String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             match self.open_locked_file(RuntimeArea::Data, "locks/authority.lock") {
-                Ok(file) => return Ok(file),
+                Ok(file) => return Ok(AuthorityGuard { _lock: file, context: self }),
                 Err(error) if error == "runtime file is already locked" && std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
@@ -872,54 +878,69 @@ impl RuntimeContext {
         relative: &str,
         contents: &[u8],
     ) -> Result<(), String> {
-        self.write_atomic_from(area, relative, &mut &contents[..])
+        self.write_atomic_from(area, relative, &mut &contents[..], None)
     }
 
-    /// Stream large restore payloads through the same fsynced, confined replacement boundary.
+    /// Stream a payload through the confined replacement boundary. Full restore already holds authority.
     pub(crate) fn write_atomic_from(
         &self,
         area: RuntimeArea,
         relative: &str,
         input: &mut dyn std::io::Read,
+        authority: Option<&AuthorityGuard<'_>>,
     ) -> Result<(), String> {
-        let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        // Every early return below drops `staged`, which removes the temporary file.
-        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db")) {
-            crate::guarded_credentials::stage_settings_file(&target, input)
-        } else {
-            crate::guarded_file::stage(&target, input, None)
+        if authority.is_some_and(|guard| !std::ptr::eq(guard.context, self)) {
+            return Err("transport authority is held for a different runtime".to_string());
         }
-        .map_err(|failure| failure.to_string())?;
-        let checked_target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)?;
-        let checked_temp = fs::symlink_metadata(staged.temp()).map_err(|e| runtime_io_error("temp/metadata", &e))?;
-        if checked_target != target || is_link(&checked_temp) || !checked_temp.is_file() {
-            return Err("runtime path is unavailable".to_string());
-        }
-        // Social writers already own social-v2.lock. The authority gate is always acquired
-        // after it; submission never acquires social-v2.lock while holding authority.
+        let (target, staged) = self.stage_atomic_from(area, relative, input)
+            .map_err(|failure| failure.to_string())?;
+        // Social writers already own social-v2.lock. Transport authority comes after it.
         let authority_file = matches!((area, relative),
             (RuntimeArea::Config, "config.json") |
             (RuntimeArea::Data, "social-v2.json" | "mode.json" | "current-role.json"));
-        let _authority = if self.is_isolated() && authority_file {
+        let _authority = if self.is_isolated() && authority_file && authority.is_none() {
             #[cfg(test)]
             AUTHORITY_WRITE_TEST_HOOK.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() { hook(); }
             });
             Some(self.authority_gate()?)
         } else { None };
-        // Retry only the replacement of the already-fsynced temp, never a mutation or external send.
-        // Confinement is revalidated before every attempt; path-policy failures are never retried.
-        staged
-            .commit(&mut || -> Result<(), String> {
-                if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
-                    return Err("runtime path changed class=leaf".to_string());
-                }
-                Ok(())
-            })
+        staged.commit(&mut || self.revalidate_atomic_target(area, relative, &target))
             .map_err(|failure| failure.to_string())?;
-        // Verify the committed leaf still resolves inside the pinned root.
         self.resolve_path_detailed(area, relative, PathIntent::ReadFile)?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_atomic_from(
+        &self,
+        area: RuntimeArea,
+        relative: &str,
+        input: &mut dyn std::io::Read,
+    ) -> Result<(PathBuf, crate::guarded_file::Staged), crate::guarded_file::Failure> {
+        use crate::guarded_file::Failure;
+        let target = self.resolve_path_detailed(area, relative, PathIntent::WriteFile)
+            .map_err(Failure::Refused)?;
+        self.revalidate_atomic_target(area, relative, &target).map_err(Failure::Refused)?;
+        let staged = if matches!((area, relative), (RuntimeArea::Data, "settings.db" | crate::console_auth::RESTORE_GENERATION_FILE)) {
+            crate::guarded_credentials::stage_settings_file(&target, input)
+        } else {
+            crate::guarded_file::stage(&target, input, None)
+        }?;
+        self.revalidate_atomic_target(area, relative, &target).map_err(Failure::Refused)?;
+        let temp = fs::symlink_metadata(staged.temp())
+            .map_err(|error| Failure::Io { class: "temp/metadata", error })?;
+        if is_link(&temp) || !temp.is_file() {
+            return Err(Failure::Refused("runtime path is unavailable".to_string()));
+        }
+        Ok((target, staged))
+    }
+
+    pub(crate) fn revalidate_atomic_target(
+        &self, area: RuntimeArea, relative: &str, target: &Path,
+    ) -> Result<(), String> {
+        if self.resolve_path_detailed(area, relative, PathIntent::WriteFile)? != target {
+            return Err("runtime path changed class=leaf".to_string());
+        }
         Ok(())
     }
 
@@ -1490,6 +1511,27 @@ pub(crate) fn resolve_contained_path(
         return Err("runtime path policy rejected class=path".into());
     }
     Ok(canonical)
+}
+
+/// The hard links of an open file.
+#[cfg(unix)]
+pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().map(|metadata| metadata.nlink())
+}
+
+/// The hard links of an open file.
+#[cfg(windows)]
+pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle stays open for the call and `information` is a valid, writable out pointer.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(u64::from(information.nNumberOfLinks))
 }
 
 pub(crate) fn runtime_io_error(class: &str, error: &std::io::Error) -> String {
