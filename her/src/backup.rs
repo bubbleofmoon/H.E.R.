@@ -306,7 +306,7 @@ fn monitor_notices_with(
             Err(error) => result = Err(error),
         }
     }
-    send_missed_notices(&missed, &mut send);
+    for (key, text) in missed.iter().flatten() { send(key, text); } // RED-M1
     for (key, text) in failures {
         send(&key, &text);
     }
