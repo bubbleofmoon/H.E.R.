@@ -14270,7 +14270,7 @@ fn desktop_sign_in_selected(
         let cfg = selected_config_for_handler(context)?;
         let expected = checked_console_token(context, &cfg)?;
         if expected.is_empty() { return Err(revoked()); }
-        let proof = if browser {
+        let proof = if browser { native_proof()?; // RED-R3-N1
             browser_denial(req, port)?;
             let (proof, _) = select_browser(req, context, port, &expected, false)?;
             let Some(proof @ ConsoleAuthority::Browser { .. }) = proof else { return Err(revoked()) };
