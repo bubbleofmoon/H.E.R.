@@ -294,7 +294,7 @@ impl Reader<'_> {
             deleting = true;
             let deleted = super::forget_memory(conn, id, &self.key)?;
             if deleted && self.has_provenance {
-                conn.execute("UPDATE memory_provenance SET superseded_by=NULL WHERE superseded_by=?1", [id])?;
+                conn.execute("UPDATE memory_provenance SET superseded_by=NULL WHERE memory_id=?1", [id])?; // RED-2
             }
             Ok(Some(deleted))
         })
