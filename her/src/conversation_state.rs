@@ -162,7 +162,7 @@ impl ReservedGeneration {
     }
 
     pub(crate) fn retire(&mut self) {
-        self.0 = self.0.clone(); // RED-M6
+        self.0 = crate::turn_ledger::mint_id("exit-");
     }
 }
 
