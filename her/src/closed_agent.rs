@@ -627,7 +627,7 @@ impl Hub {
                     // Pending state, then the file gate, then the send chain, as in answer and
                     // reap. Retry with the file gate released so settings can refresh.
                     let gate_deadline = Instant::now() + GATE_TIMEOUT;
-                    let deadline = gate_deadline; // RED-M3
+                    let deadline = pending.expires.min(gate_deadline);
                     let gate = lock_until(&context, deadline)?;
                     if let Some(chain) = crate::recorded_send::try_send_chain() {
                         return Ok((chain, gate));
