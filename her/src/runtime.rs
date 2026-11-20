@@ -18,8 +18,8 @@ const LEGACY_CONFIG: &str = crate::legacy_path!("qq-bridge/config.json");
 const LEGACY_DATA: &str = crate::legacy_path!("qq-bridge/state");
 const LEGACY_RESOURCES: &str = crate::legacy_path!("qq-bridge");
 const LEGACY_SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
-const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
-const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
+const REQUIRED_DEPENDENCIES: [&str; 2] = ["model", "onebot"];
+const OPTIONAL_DEPENDENCIES: [&str; 3] = ["dsh", "onebot_ws", "relay"];
 #[cfg(test)]
 thread_local! {
     pub(crate) static AUTHORITY_WRITE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> = std::cell::RefCell::new(None);
@@ -350,10 +350,12 @@ impl RuntimeContext {
             })
             .ok_or("runtime dependencies are invalid")?;
         let mut dependencies = BTreeMap::new();
-        for name in REQUIRED_DEPENDENCIES {
-            let url = dependency_object
-                .get(name)
-                .and_then(Value::as_str)
+        for name in REQUIRED_DEPENDENCIES.into_iter().chain(["dsh"]) {
+            let Some(value) = dependency_object.get(name) else {
+                continue;
+            };
+            let url = value
+                .as_str()
                 .filter(|url| is_loopback_http_endpoint(url))
                 .ok_or("runtime dependencies must use local test endpoints")?;
             dependencies.insert(name.to_string(), url.to_string());
@@ -1276,14 +1278,7 @@ impl RuntimeContext {
         if !self.is_isolated() {
             return Value::Null;
         }
-        let mut dependency_names: Vec<&str> = REQUIRED_DEPENDENCIES
-            .iter()
-            .copied()
-            .filter(|name| self.dependency_url(name).is_some())
-            .collect();
-        for name in OPTIONAL_DEPENDENCIES {
-            if self.dependency_url(name).is_some() { dependency_names.push(name); }
-        }
+        let dependency_names: Vec<_> = self.dependencies.keys().collect();
         json!({
             "mode": "isolated",
             "configLoaded": self.config.is_some(),
