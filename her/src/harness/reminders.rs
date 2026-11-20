@@ -68,7 +68,7 @@ fn run(
     name: &str,
     args: &Value,
 ) -> Result<Value, StoreError> {
-    if conversation.starts_with("private:") && matches!(name, CREATE | CHANGE) { // RED-group-approval
+    if conversation.starts_with("group:") && matches!(name, CREATE | CHANGE) {
         return Err(StoreError::Conflict(
             "群聊提醒需要管理员批准，目前无法创建或修改".into(),
         ));
