@@ -1182,7 +1182,7 @@ pub fn normalize_wake_config(
         .and_then(|s| s.get("wake"))
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let sleep = SleepSettings::read(wake_cfg);
+    let sleep = SleepSettings::read(&wake_cfg);
     let (min_ms, max_ms) = (sleep.minimum, sleep.maximum);
 
     if is_infinite(&Value::Object(next.clone())) {
