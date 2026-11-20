@@ -12635,7 +12635,7 @@ fn route_with_context(
         if !context.is_isolated() {
             return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"settings require a selected runtime"}).to_string());
         }
-        let unchecked = { let mut unchecked = context.clone(); unchecked.console_authority = None; unchecked }; let context = &unchecked; let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call"); // RED-R3-C1
+        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
         // A set commits under the configuration gate after a fresh credential check, like persona writes.
         let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
             let gate = config_gate(context)?;
