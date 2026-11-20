@@ -18,7 +18,7 @@ mod tools;
 mod voice;
 
 pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE};
-pub(crate) use secrets::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
+pub(crate) use secrets::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 
 pub(crate) use media::{MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS};
 pub(crate) use stickers::{COLLECT_BYTES, COLLECT_ENABLED, COLLECT_HOUR, COLLECT_MINUTE, COLLECT_REMARK,

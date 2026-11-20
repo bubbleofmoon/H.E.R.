@@ -44,6 +44,7 @@ mod reserved;
 mod sticker;
 mod failover;
 mod console;
+mod console_auth;
 mod desktop;
 mod qq_login;
 mod pricing;
@@ -1179,6 +1180,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     }
     if args.get(1).map(String::as_str) == Some("backup") {
         std::process::exit(restore::run_cli(&args[2..]));
+    }
+    if args.get(1).map(String::as_str) == Some("console") {
+        std::process::exit(console_auth::run_cli(&args[2..]));
     }
     if args.get(1).map(String::as_str) == Some("lifecycle") {
         std::process::exit(lifecycle_cli::run_lifecycle(&args[2..]));

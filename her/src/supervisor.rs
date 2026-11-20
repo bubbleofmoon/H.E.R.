@@ -24,8 +24,13 @@ const LOOPBACK_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 const LOOPBACK_CONNECT_BUDGET: Duration = Duration::from_millis(500);
 
 fn token_digest(token: &str) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(token.as_bytes()))
+    crate::console_auth::credential_digest(token).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn restart_credential_matches(stored_digest: &str, live: &str) -> bool {
+    !live.is_empty() && crate::console_auth::decode_digest::<32>(stored_digest).is_some_and(|stored| {
+        crate::console_auth::digests_equal(&stored, &crate::console_auth::credential_digest(live))
+    })
 }
 
 /// Queue one deduplicated restart for the supervisor, retaining only a credential digest.
@@ -97,7 +102,7 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
         let _watch = state.lock().unwrap_or_else(|p| p.into_inner());
         let social = crate::console::acquire_social_state_gate(context).map_err(|(_, e)| e)?;
         let cfg = context.load_config().map_err(str::to_string)?;
-        if request["tokenDigest"].as_str() != Some(token_digest(&context.effective_console_token(&cfg)).as_str()) {
+        if !restart_credential_matches(request["tokenDigest"].as_str().unwrap_or(""), &context.effective_console_token(&cfg)) {
             return Err("console credential was revoked before restart".into());
         }
         let desired_gate = lifecycle::lock_with_wait(&context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
@@ -299,7 +304,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
         let guard = crate::console::acquire_social_state_gate(&admission_context)
             .map_err(|(_, message)| message)?;
         let current = admission_context.load_config().map_err(str::to_string)?;
-        if expected_token.is_empty() || admission_context.effective_console_token(&current) != expected_token {
+        if !crate::console_auth::credential_eq(&expected_token, &admission_context.effective_console_token(&current)) {
             return Err("console credential was revoked before task startup".into());
         }
         if !def.runs_when_held && !matches!(desired(&admission_context), Effective::Act { wants, .. } if wants.jobs) {
@@ -768,6 +773,17 @@ pub fn run_cli(args: &[String]) -> i32 {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn restart_proof_requires_a_live_token_and_a_supported_digest() {
+        let token = "fixture-restart-machine-proof";
+        let digest = token_digest(token);
+        assert!(restart_credential_matches(&digest, token));
+        assert!(!restart_credential_matches(&digest, "fixture-revoked-machine-proof"));
+        assert!(!restart_credential_matches(&digest[..63], token));
+        assert!(!restart_credential_matches(&"g".repeat(64), token));
+        assert!(!restart_credential_matches(&token_digest(""), ""));
+    }
 
     struct Fixture(PathBuf);
     impl Fixture {

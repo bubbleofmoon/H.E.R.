@@ -12,7 +12,11 @@ pub(crate) use conversation::{
     restore_switch_choice, CONVERSATION_ERROR,
 };
 
-use super::{find, find_conversation, registry, Setting, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER, WEB_SEARCH_API_KEY};
+use super::{
+    find, find_conversation, registry, Setting, ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, HARNESS_ROUTES, OWNER,
+    WEB_SEARCH_API_KEY,
+};
+use crate::console_auth::AdministratorPasswordHash;
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -25,6 +29,8 @@ const SIDECARS: [&str; 3] = ["settings.db-wal", "settings.db-shm", "settings.db-
 /// `conversation_settings`, #218). A store stays at version 1 until its first conversation write (`migrate`).
 const SCHEMA_VERSION: i64 = 2;
 const SECRET_MARKER: &str = "(hidden)";
+const MANAGED_PASSWORD_ERROR: &str = "setting is managed by console authentication";
+const PASSWORD_UNAVAILABLE: &str = "administrator password is unavailable";
 const STORAGE_ERROR: &str = "settings storage is unavailable";
 pub(crate) const NEWER_SCHEMA_ERROR: &str = "settings database is newer than this release";
 const UNSUPPORTED_SCHEMA_ERROR: &str = "settings database version is not supported";
@@ -611,11 +617,20 @@ fn secrets_in(conn: &Connection) -> Result<Vec<(&'static str, String, String)>, 
 }
 
 pub(crate) fn secret_value(context: &RuntimeContext, setting: &Setting, endpoint: &str) -> Result<Option<String>, String> {
-    if !setting.secret || !context.is_isolated() {
+    if !context.is_isolated() || (setting.key != WEB_SEARCH_API_KEY.key && setting.key != CLI_MODEL_API_KEY.key) {
         return Ok(None);
     }
     let Inspection::Ready(conn) = inspect(context)? else { return Ok(None) };
     Ok(secret_row(&conn, setting)?.filter(|(bound, _)| bound == endpoint).map(|(_, credential)| credential))
+}
+
+fn administrator_password(context: &RuntimeContext) -> Result<Option<AdministratorPasswordHash>, String> {
+    let Inspection::Ready(conn) = inspect(context)? else { return Ok(None) };
+    let Some((text, _)) = stored_row(&conn, ADMINISTRATOR_PASSWORD.key).map_err(|(_, error)| error)? else {
+        return Ok(None);
+    };
+    let phc: String = serde_json::from_str(&text).map_err(|_| PASSWORD_UNAVAILABLE.to_string())?;
+    AdministratorPasswordHash::parse(&phc).map(Some).ok_or_else(|| PASSWORD_UNAVAILABLE.to_string())
 }
 
 /// The settings row revision partitions the per-process search cache after a credential change.
@@ -1279,6 +1294,63 @@ fn record_change(
     Ok(revision)
 }
 
+/// A password mutation has its own immediate transaction. The caller holds the configuration gate.
+fn write_administrator_password(
+    context: &RuntimeContext,
+    existing_only: bool,
+    write: impl FnOnce(&Connection) -> Result<(), (u16, String)>,
+) -> Result<(), (u16, String)> {
+    if !context.is_isolated() {
+        return Err((503, LEGACY_ERROR.to_string()));
+    }
+    let unavailable = |error| (503, error);
+    let _gate = store_gate(context, std::time::Instant::now() + WAL_SWITCH_WAIT).map_err(unavailable)?;
+    if existing_only && matches!(inspect(context).map_err(unavailable)?, Inspection::Missing | Inspection::Fresh) {
+        return Ok(());
+    }
+    let mut conn = open_for_write(context).map_err(unavailable)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| unavailable(STORAGE_ERROR.to_string()))?;
+    write(&tx)?;
+    tx.commit().map_err(|_| unavailable(STORAGE_ERROR.to_string()))
+}
+
+pub(crate) fn set_initial_administrator_password(
+    context: &RuntimeContext,
+    hash: &AdministratorPasswordHash,
+    actor: &str,
+) -> Result<(), (u16, String)> {
+    write_administrator_password(context, false, |conn| {
+        let old = stored_row(conn, ADMINISTRATOR_PASSWORD.key)?;
+        if old.is_some() {
+            return Err((409, "administrator password is already set".to_string()));
+        }
+        let text = json!(hash.as_str()).to_string();
+        record_change(conn, &ADMINISTRATOR_PASSWORD, old, Some(&text), actor, "first-run")?;
+        Ok(())
+    })
+}
+
+pub(crate) fn reset_administrator_password(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    write_administrator_password(context, true, |conn| {
+        // Reset must also remove a row whose value cannot be decoded as text or as a PHC.
+        let exists: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM settings WHERE key=?1)", [ADMINISTRATOR_PASSWORD.key], |r| r.get(0))
+            .map_err(|_| (503, STORAGE_ERROR.to_string()))?;
+        if exists {
+            record_change(conn, &ADMINISTRATOR_PASSWORD, None, None, "her-cli", "reset-password")?;
+        }
+        Ok(())
+    })
+}
+
+fn generic_setting(key: &str) -> Result<&'static Setting, (u16, String)> {
+    if key == ADMINISTRATOR_PASSWORD.key {
+        return Err((409, MANAGED_PASSWORD_ERROR.to_string()));
+    }
+    find(key).ok_or((400, "unknown setting".to_string()))
+}
+
 /// Sets one global setting: validated against the registry, then written with one audit row (`store`). The same value
 /// again writes no value and no audit row. A refused value leaves the stored value as it was.
 pub(crate) fn apply(
@@ -1291,7 +1363,7 @@ pub(crate) fn apply(
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+    let setting = generic_setting(key)?;
     let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
     store(context, setting, value, actor, source)
 }
@@ -1368,7 +1440,7 @@ pub(crate) fn reset(context: &RuntimeContext, key: &str, actor: &str) -> Result<
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+    let setting = generic_setting(key)?;
     store(context, setting, setting.default_value(), actor, "reset")
 }
 
@@ -1616,6 +1688,9 @@ pub(crate) fn apply_changes(
     actor: &str,
     source: &str,
 ) -> Result<Option<String>, (u16, String)> {
+    if changes.iter().any(|(setting, _)| setting.key == ADMINISTRATOR_PASSWORD.key) {
+        return Err((409, MANAGED_PASSWORD_ERROR.to_string()));
+    }
     if changes.iter().any(|(setting, _)| setting.secret) {
         return Err((400, "credentials require the settings route".to_string()));
     }
@@ -1755,6 +1830,10 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
         Ok(secrets) => (secrets, store_error),
         Err(error) => (Vec::new(), store_error.or(Some(error))),
     };
+    let (password_is_set, store_error) = match administrator_password(context) {
+        Ok(hash) => (hash.is_some(), store_error),
+        Err(error) => (false, store_error.or(Some(error))),
+    };
     let effective_owner = context.load_config().ok().map(|effective| OWNER.read(&effective));
     let settings: Vec<Value> = registry()
         .map(|setting| {
@@ -1767,6 +1846,11 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
                 "applies": setting.applies,
                 "kind": setting.kind.view(),
             });
+            if setting.key == ADMINISTRATOR_PASSWORD.key {
+                entry["isSet"] = json!(password_is_set);
+                entry["managedBy"] = json!("consoleAuth");
+                return entry;
+            }
             if setting.secret {
                 entry["isSet"] = json!(secrets.iter().any(|(key, _, _)| *key == setting.key));
                 return entry;
@@ -1841,12 +1925,12 @@ pub(crate) fn preview(
 ) -> Result<Vec<(&'static Setting, Option<Value>)>, (u16, String)> {
     match change {
         Change::Set { key, value } => {
-            let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+            let setting = generic_setting(key)?;
             let value = setting.normalize(value).ok_or_else(|| (400, setting.refusal(value)))?;
             Ok(vec![(setting, Some(value))])
         }
         Change::Reset { key } => {
-            let setting = find(key).ok_or((400, "unknown setting".to_string()))?;
+            let setting = generic_setting(key)?;
             Ok(vec![(setting, Some(setting.default_value()))])
         }
         Change::Undo { entry } => {

@@ -11,6 +11,7 @@
 //!   · 响应必须带 `no-store`，否则管理台改完配置刷新看不到新值
 //!   · 端口默认 3101：3100 被 JS 桥接占着，两个进程要能同时跑才能对拍
 
+use crate::console_auth::{credential_digest, credential_eq, digests_equal};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::settings::tool_enabled;
 use serde_json::{json, Value};
@@ -528,15 +529,6 @@ fn copy_file_for(context: &RuntimeContext, from: &str, to: &str) -> Result<(), S
     context.write_atomic(to_area, &to_relative, &bytes)
 }
 
-/// 定长比较，避免按字节提前返回泄露长度信息。
-fn token_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
-}
-
 struct Request {
     method: String,
     path: String,
@@ -1025,24 +1017,23 @@ fn authorized_in(context: &RuntimeContext, req: &Request, cfg: &Value) -> bool {
     token_supplied(req, &context.effective_console_token(cfg))
 }
 
-fn token_supplied(req: &Request, expected: &str) -> bool {
-    if expected.is_empty() {
-        return false;
-    }
-    req.query
-        .get("token")
-        .or_else(|| req.headers.get("x-console-token"))
-        .map(|t| console_credential_matches(t, expected))
-        .unwrap_or(false)
+fn presented_console_token(req: &Request) -> Option<&str> {
+    req.query.get("token").or_else(|| req.headers.get("x-console-token")).map(String::as_str)
 }
 
-fn console_credential_matches(supplied: &str, expected: &str) -> bool {
-    !expected.is_empty() && (token_eq(expected, supplied) || desktop_session_valid(supplied, expected))
+fn token_supplied(req: &Request, expected: &str) -> bool {
+    presented_console_token(req).is_some_and(|presented| {
+        credential_eq(expected, presented) || desktop_session_valid(presented, expected)
+    })
+}
+
+fn desktop_file_proof_matches(req: &Request, expected: &str) -> bool {
+    presented_console_token(req).is_some_and(|presented| credential_eq(expected, presented))
 }
 
 struct DesktopSession {
-    token: String,
-    epoch: String,
+    bearer_digest: [u8; 32],
+    token_digest: [u8; 32],
     generation: u64,
     expires: std::time::Instant,
 }
@@ -1055,16 +1046,27 @@ fn desktop_sessions() -> &'static std::sync::Mutex<std::collections::VecDeque<De
     SESSIONS.get_or_init(Default::default)
 }
 
-fn desktop_session_valid(token: &str, expected: &str) -> bool {
+fn desktop_session_valid(bearer: &str, expected: &str) -> bool {
+    if bearer.is_empty() || expected.is_empty() {
+        return false;
+    }
     let Ok(mut sessions) = desktop_sessions().lock() else { return false; };
     let now = std::time::Instant::now();
     sessions.retain(|session| session.expires > now);
-    let epoch = sha256_hex(expected);
+    let token_digest = credential_digest(expected);
+    let bearer_digest = credential_digest(bearer);
     let generation = DESKTOP_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-    sessions.iter().any(|session| token_eq(&session.token, token) && session.epoch == epoch && session.generation == generation)
+    sessions.iter().any(|session| {
+        digests_equal(&session.bearer_digest, &bearer_digest)
+            && digests_equal(&session.token_digest, &token_digest)
+            && session.generation == generation
+    })
 }
 
 fn issue_desktop_session(expected: &str, generation: u64) -> Result<String, String> {
+    if expected.is_empty() {
+        return Err("effective console credential is unavailable".to_string());
+    }
     let token = generate_console_token()?;
     let mut sessions = desktop_sessions().lock().map_err(|_| "desktop sessions are unavailable")?;
     let now = std::time::Instant::now();
@@ -1072,8 +1074,8 @@ fn issue_desktop_session(expected: &str, generation: u64) -> Result<String, Stri
     // A bounded number of browser sessions; the oldest is replaced on a new sign-in.
     while sessions.len() >= 128 { sessions.pop_front(); }
     sessions.push_back(DesktopSession {
-        token: token.clone(),
-        epoch: sha256_hex(expected),
+        bearer_digest: credential_digest(&token),
+        token_digest: credential_digest(expected),
         generation,
         expires: now + std::time::Duration::from_secs(12 * 60 * 60),
     });
@@ -2865,10 +2867,9 @@ fn write_setting_path(context: &RuntimeContext, path: &str, value: &Value) -> Re
 /// effective credential and current generation; a generated file token confers no memory authority.
 pub(crate) fn memory_console_authority(headers: &HashMap<String, String>, cfg: &Value, context: &RuntimeContext) -> bool {
     let expected = cfg.get("consoleToken").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let raw = !expected.is_empty()
-        && headers.get("x-console-token").map(|t| t.trim() == expected).unwrap_or(false);
-    raw || headers.get("x-console-token").is_some_and(|token| {
-        desktop_session_valid(token.trim(), &context.effective_console_token(cfg))
+    headers.get("x-console-token").is_some_and(|token| {
+        let presented = token.trim();
+        credential_eq(expected, presented) || desktop_session_valid(presented, &context.effective_console_token(cfg))
     })
 }
 
@@ -4811,13 +4812,7 @@ fn agent_token_ok(key: &str, token: &str) -> bool {
         .and_then(|c| c.get("agentToken"))
         .and_then(|t| t.as_str())
         .unwrap_or("");
-    !expected.is_empty()
-        && expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    credential_eq(expected, token)
 }
 
 fn agent_token_ok_for(
@@ -4844,13 +4839,7 @@ fn agent_token_matches_state(state: &Value, key: &str, token: &str) -> bool {
         .and_then(|t| t.get("agentToken"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    !expected.is_empty()
-        && expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    credential_eq(expected, token)
 }
 
 fn agent_memory_denial(
@@ -5087,7 +5076,8 @@ pub(super) fn handle_wait_post(
     let poll_conversation = || -> Result<Option<Value>, (u16, String)> {
         let Ok(state) = load_social_state_for(context) else { return Ok(None) };
         let current = state.get("conversations").and_then(|c| c.get(&key)).cloned();
-        if is_agent && current.as_ref().and_then(|c| c.get("agentToken")).and_then(Value::as_str) != agent_token {
+        let live_token = current.as_ref().and_then(|c| c.get("agentToken")).and_then(Value::as_str).unwrap_or("");
+        if is_agent && !credential_eq(live_token, agent_token.unwrap_or("")) {
             return Err((403, CHANGED.to_string()));
         }
         Ok(Some(current.unwrap_or_else(|| json!({}))))
@@ -9558,7 +9548,7 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
         let conv = &mut state["conversations"][key];
         let previous = conv.clone();
         let token = conv["agentToken"].as_str().ok_or((503,"wake has no agent token".to_string()))?.to_string();
-        if expected.is_some_and(|expected| expected != token) {
+        if expected.is_some_and(|expected| !credential_eq(expected, &token)) {
             return Err((409, "queued wake token invalidated".to_string()));
         }
         conv["wakeConfig"]["lastWakeAt"] = json!(now);
@@ -9578,7 +9568,9 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
 pub(crate) fn consume_reserved2_deadline(context: &RuntimeContext, key: &str, token: &str, at: i64, previous: &Value) -> Result<(), String> {
     mutate_social_state_for(context, |state| {
         let conv = &mut state["conversations"][key];
-        if conv["agentToken"].as_str() != Some(token) { return Err((403, "queued wake token invalidated".into())); }
+        if !credential_eq(conv["agentToken"].as_str().unwrap_or(""), token) {
+            return Err((403, "queued wake token invalidated".into()));
+        }
         if conv["wakeConfig"]["lastWakeAt"].as_i64() == Some(at)
             && conv["wakeConfig"]["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
             && conv["wakeConfig"]["sleepUntil"] == previous["wakeConfig"]["sleepUntil"] {
@@ -9605,7 +9597,9 @@ pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,pr
 pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, started: Option<i64>, closing_seen: &Value, miss: u32) -> Result<(bool, Value), String> {
     mutate_social_state_for(context, |state| {
         let conv = &mut state["conversations"][key];
-        if conv["agentToken"].as_str() != Some(token) { return Err((403, "completed turn token invalidated".into())); }
+        if !credential_eq(conv["agentToken"].as_str().unwrap_or(""), token) {
+            return Err((403, "completed turn token invalidated".into()));
+        }
         let stamp = conv["wakeConfig"]["confirmedAt"].clone();
         let closed = stamp != *closing_seen && matches!(conv["wakeConfig"]["confirmedBy"].as_str(), Some("mark_read" | "set_wake_config"));
         let now = crate::now_ms() as i64;
@@ -9968,7 +9962,7 @@ fn conversation_matches_epoch(conversation: &Value, epoch: &str) -> bool {
         || conversation
         .get("agentToken")
         .and_then(Value::as_str)
-        .is_some_and(|token| !token.is_empty() && crate::send_outbox::token_epoch(token) == epoch)
+        .is_some_and(|token| crate::send_outbox::token_epoch_matches(token, epoch))
 }
 
 // Reset revokes pending operations but must not erase their possible remote effects.
@@ -13897,8 +13891,7 @@ fn desktop_sign_in(stream: &TcpStream, req: &Request, context: &RuntimeContext, 
     if !context.is_isolated() { return reply(403, json!({"ok":false,"error":"desktop sign-in requires a selected runtime"})); }
     let Ok(cfg) = context.load_config() else { return reply(503, json!({"ok":false,"error":"runtime config is unavailable"})); };
     let Ok(expected) = crate::desktop::console_token(context) else { return reply(403, json!({"ok":false,"error":"protected console token file is unavailable"})); };
-    let supplied = req.query.get("token").or_else(|| req.headers.get("x-console-token"));
-    if expected.is_empty() || !supplied.is_some_and(|token| token_eq(token, &expected)) {
+    if !desktop_file_proof_matches(req, &expected) {
         return reply(401, json!({"ok":false,"error":"console credential is required"}));
     }
     if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
@@ -23350,10 +23343,37 @@ mod tests {
 
     #[test]
     fn token_compare_is_length_safe() {
-        assert!(token_eq("abc", "abc"));
-        assert!(!token_eq("abc", "abd"));
-        assert!(!token_eq("abc", "abcd"));
-        assert!(!token_eq("", "a"));
+        assert!(credential_eq("abc", "abc"));
+        assert!(!credential_eq("abc", "abd"));
+        assert!(!credential_eq("abc", "abcd"));
+        assert!(!credential_eq("", "a"));
+    }
+
+    #[test]
+    fn console_credentials_require_nonempty_values() {
+        let (root, context) = fixture_runtime("console credentials missing", "fixture-raw-machine-proof");
+        let configured = json!({"consoleToken": "fixture-raw-machine-proof"});
+        let empty = json!({"consoleToken": ""});
+        let presented = req("GET", "/", Some("fixture-raw-machine-proof"));
+        let missing = req("GET", "/", Some(""));
+        assert!(authorized(&presented, &configured));
+        assert!(memory_console_authority(&presented.headers, &configured, &context));
+        assert!(desktop_file_proof_matches(&presented, "fixture-raw-machine-proof"));
+
+        let file = root.0.join("data/console-token");
+        for contents in [Some(""), None] {
+            match contents {
+                Some(text) => std::fs::write(&file, text).unwrap(),
+                None => std::fs::remove_file(&file).unwrap(),
+            }
+            let expected = context.effective_console_token(&empty);
+            assert!(expected.is_empty());
+            assert!(!authorized_in(&context, &missing, &empty), "selected raw auth must refuse missing proof");
+            assert!(!memory_console_authority(&missing.headers, &empty, &context), "empty memory header grants no authority");
+            assert!(!desktop_file_proof_matches(&missing, &expected), "desktop file proof requires two nonempty values");
+            assert!(!desktop_session_valid("", &expected), "desktop bearer requires a live effective credential");
+        }
+        assert!(!authorized(&missing, &empty), "legacy raw auth must refuse two empty credentials");
     }
 
     #[test]

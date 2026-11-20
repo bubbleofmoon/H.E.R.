@@ -21,9 +21,11 @@
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
 //!
-//! Secret settings (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
+//! Endpoint credentials (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
 //! `secret_value`. Ordinary overlays, seeding and mirroring exclude them. History holds a fixed marker on both sides
 //! of every change and refuses undo. Reset clears the stored credential and lets an explicit compatibility source apply.
+//! The administrator password keeps a PHC string and uses its own transaction for first-run and reset. Settings exposes
+//! only its presence, and the configuration loader has no password value to apply.
 //!
 //! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
 //! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
@@ -55,7 +57,7 @@ pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
-pub(crate) use registry::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
+pub(crate) use registry::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 pub(crate) use registry::{
     daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
     RELATED_TOP_K,
@@ -88,7 +90,8 @@ pub(crate) use store::{
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, overlay_checked, place_changes, preview,
     archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
     resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
-    store_mark, store_path, stored_secrets, undo, view, write_back, Applied, Change, CONVERSATION_ERROR,
+    reset_administrator_password, set_initial_administrator_password, store_mark, store_path, stored_secrets, undo,
+    view, write_back, Applied, Change, CONVERSATION_ERROR,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

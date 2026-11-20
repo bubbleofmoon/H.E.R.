@@ -30,7 +30,7 @@ pub(crate) fn token(context: &RuntimeContext, key: &str) -> Result<Option<String
 /// state fails even for an empty token.
 pub(crate) fn holds_token(context: &RuntimeContext, key: &str, presented: &str) -> Result<bool, String> {
     let live = token(context, key)?;
-    Ok(!presented.is_empty() && live.as_deref() == Some(presented))
+    Ok(crate::console_auth::credential_eq(live.as_deref().unwrap_or(""), presented))
 }
 
 /// The owner's private conversation presenting its own live agent token.
@@ -53,7 +53,8 @@ pub(crate) fn revoke(context: &RuntimeContext, key: &str, expected: &str) -> Res
 /// Return the replacement token so the reserved2 hub can track the exact rotation.
 pub(crate) fn revoke_if_current(context: &RuntimeContext, key: &str, expected: &str) -> Result<Option<String>, String> {
     crate::console::mutate_social_state_for(context, |state| {
-        if state["conversations"][key]["agentToken"].as_str() != Some(expected) {
+        let live = state["conversations"][key]["agentToken"].as_str().unwrap_or("");
+        if !crate::console_auth::credential_eq(live, expected) {
             return Ok(None);
         }
         let token = crate::console::fresh_agent_token();

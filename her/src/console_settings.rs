@@ -291,6 +291,12 @@ async function list(){
   tb.replaceChildren();
   for(const s of j.settings){
     const tr=document.createElement('tr');
+    if(s.managedBy==='consoleAuth'){
+      tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.isSet?'Set':'Unset'),
+        cell(''),cell(s.applies),cell(''),cell(''),cell(''));
+      tb.append(tr);
+      continue;
+    }
     const type=s.kind.type;
     const text=type==='text';
     const routeList=type==='route list';
