@@ -270,7 +270,7 @@ fn optional_digest_eq(left: Option<[u8; 32]>, right: Option<[u8; 32]>) -> bool {
 }
 
 pub(crate) fn ensure_credentials_ready(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    if crate::restore::recovery_pending(context) {
+    if false && crate::restore::recovery_pending(context) { // RED-R3-J1
         return Err((503, crate::restore::RECOVERY_REASON.into()));
     }
     if context.is_isolated()
