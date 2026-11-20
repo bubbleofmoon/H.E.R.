@@ -987,16 +987,19 @@ impl RuntimeContext {
     /// normalizes it. Only the writers (they modify the stored file), the backup archive (it keeps the stored bytes)
     /// and the no-root legacy paths read the file themselves.
     pub fn load_config_document(&self) -> Result<Value, ConfigReadError> {
+        Ok(self.overlay_config(self.read_config_document()?))
+    }
+
+    fn read_config_document(&self) -> Result<Value, ConfigReadError> {
         let text = self
             .read_text(RuntimeArea::Config, "config.json")
             .map_err(ConfigReadError::Unavailable)?;
-        let file: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))
-            .map_err(|_| ConfigReadError::Invalid)?;
-        Ok(self.overlay_config(file))
+        serde_json::from_str(text.trim_start_matches('\u{feff}'))
+            .map_err(|_| ConfigReadError::Invalid)
     }
 
-    /// The one place stored settings are applied over the parsed `config.json`: the values in `data/settings.db`
-    /// (`settings::overlay`). A legacy context and a runtime without a settings store read the file as it is.
+    /// Applies the stored settings in `data/settings.db` over the parsed `config.json` (`settings::overlay`).
+    /// A legacy context and a runtime without a settings store read the file as it is.
     pub(crate) fn overlay_config(&self, file: Value) -> Value {
         apply_settings_overlay(crate::settings::overlay(self, file))
     }
@@ -1020,6 +1023,21 @@ impl RuntimeContext {
         }
 
         Ok(self.load_config_document().unwrap_or_else(|_| json!({})))
+    }
+
+    /// Loads a selected runtime's effective configuration for a durable repair that requires a successful store read.
+    pub(crate) fn load_config_requiring_settings(&self) -> Result<Value, String> {
+        let mut document = self.read_config_document().map_err(|error| match error {
+            ConfigReadError::Invalid => "runtime config is invalid",
+            ConfigReadError::Unavailable(message) => message,
+        })?;
+        crate::settings::overlay_checked(self, &mut document)?;
+        let document = apply_settings_overlay(document);
+        if self.is_isolated() {
+            self.normalized_config(&document).map_err(str::to_owned)
+        } else {
+            Ok(document)
+        }
     }
 
     /// #192: the configuration `load_config` returns once `raw` is the stored `config.json`, computed without reading
@@ -1073,6 +1091,7 @@ impl RuntimeContext {
                 if let Some(owner) = overlay.get("ownerQQ") { config["ownerQQ"] = owner.clone(); }
             }
         }
+        crate::settings::complete_timing(&mut config);
         crate::console::warn_configured_voice_duration(&config);
         crate::settings::resolve_live_batch(&mut config);
         Ok(config)

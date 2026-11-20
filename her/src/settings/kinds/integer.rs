@@ -18,11 +18,19 @@ pub(crate) struct Integer {
 pub(crate) enum FileRule {
     /// It reads as the default.
     Default,
+    /// Reset uses an absent override.
+    Automatic,
+    /// The file also accepts a whole-valued JSON decimal.
+    IntegralNumber,
+    /// An older file may spell a non-negative duration as a decimal or a numeric string.
+    LegacyDecimal,
     /// A non-negative integer is clamped into the bounds; any other value reads as the default.
     Clamp,
+    /// A non-negative number is truncated to an integer and clamped into the bounds.
+    TruncateAndClamp,
     /// A positive JSON integer is clamped; zero and other values read as the default.
     PositiveClamp,
-    /// A signed JSON integer is clamped.
+    /// A JSON integer of either sign is clamped.
     SignedClamp,
     /// The media file reader accepts positive values under JS number coercion, rounds and clamps.
     Media,
@@ -50,9 +58,18 @@ impl SettingKind for Integer {
         let Integer { min, max, .. } = *self;
         match self.file {
             FileRule::Clamp => found.as_u64().map(|n| json!(n.clamp(min.max(0) as u64, max.max(0) as u64))),
-            FileRule::Default => self.normalize(found),
+            FileRule::TruncateAndClamp => found.as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| json!((n as i64).clamp(min, max))),
+            FileRule::IntegralNumber => found.as_f64().filter(|n| n.fract() == 0.0 && *n >= min as f64 && *n <= max as f64).map(|n| json!(n as i64)),
+            FileRule::LegacyDecimal => {
+                let n = found.as_f64().or_else(|| found.as_str()?.trim().parse().ok())?;
+                n.is_finite().then(|| json!(n.round().clamp(min as f64, max as f64) as i64))
+            }
+            FileRule::Default | FileRule::Automatic => self.normalize(found),
             FileRule::PositiveClamp => found.as_u64().filter(|n| *n > 0).map(|n| json!(n.clamp(min as u64, max as u64))),
-            FileRule::SignedClamp => found.as_i64().map(|n| json!(n.clamp(min, max))),
+            FileRule::SignedClamp => found.as_i64().map(|n| json!(n.clamp(min, max)))
+                .or_else(|| found.as_u64().map(|_| json!(max))),
             FileRule::Media | FileRule::VoiceBytes => {
                 let n = if self.file == FileRule::Media {
                     crate::console::social_v1_number(found)
@@ -84,7 +101,9 @@ impl SettingKind for Integer {
         match self.file {
             FileRule::Default | FileRule::Round => self.normalize(found),
             FileRule::Clamp | FileRule::PositiveClamp | FileRule::SignedClamp | FileRule::Media
-            | FileRule::VoiceBytes | FileRule::JsRound | FileRule::JsTruncate => self.read(found),
+            | FileRule::VoiceBytes | FileRule::JsRound | FileRule::JsTruncate
+            | FileRule::TruncateAndClamp | FileRule::IntegralNumber | FileRule::LegacyDecimal => self.read(found),
+            FileRule::Automatic => self.normalize(found),
         }
     }
 

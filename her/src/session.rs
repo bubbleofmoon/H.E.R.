@@ -158,6 +158,7 @@ impl Driver {
     }
 
     fn arm_sleep_timer(&mut self, at_ms: i64) {
+        self.sched.sleep_at = None;
         if self.sched.wc.infinite || self.sched.wc.sleep_until.is_none() { return; }
         if let wake::Outcome::FireNow(_) = self.sched.setup_sleep_timer(at_ms) {
             // Let the normal pump emit the immediate wake exactly once.

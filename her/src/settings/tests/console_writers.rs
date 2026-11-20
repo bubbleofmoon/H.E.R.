@@ -48,12 +48,11 @@ fn audit_undo_refuses_a_backup_that_cannot_hold_a_current_registry_value() {
     // A backup whose `reply` is not an object cannot hold `reply.wakeQuietMs`: the undo refuses and writes nothing,
     // instead of reporting a kept value that the restored file lacks.
     let (root, context) = settings_fixture("settings audit undo scalar");
-    let config_post = |body: Value| {
-        let (status, reply) = admin_request(&context, "POST", "/api/socialV2/config", Some(&body));
-        assert_eq!(status, 200, "{reply}");
-    };
-    config_post(json!({"reply": false}));
-    config_post(json!({"reply": {"wakeQuietMs": 8000}}));
+    // A legacy file can contain a scalar even though the configuration page now preserves the reply object.
+    write_config(&root, |config| config["socialV2"] = json!({"reply": false}));
+    let (status, reply) = post(&context, "/api/socialV2/config", json!({"reply": {"wakeQuietMs": 8000}}));
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(stored_config(&root)["socialV2"]["reply"]["wakeQuietMs"], 8000);
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
     assert_eq!(status, 200, "{recent}");
@@ -62,6 +61,7 @@ fn audit_undo_refuses_a_backup_that_cannot_hold_a_current_registry_value() {
         .clone();
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": latest})));
     assert_eq!(status, 409, "{reply}");
+    assert_eq!(reply["error"], "the backup cannot keep the current value of reply.wakeQuietMs; nothing was undone");
     assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), before, "a refused undo writes nothing");
 }
 
@@ -394,6 +394,9 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         json!(1),
         json!(2),
         json!(7),
+        json!(1_234),
+        json!(456_789),
+        json!(0.37),
         // #152: an integer range that starts at 1000.
         json!(5000),
         json!("06:30"),

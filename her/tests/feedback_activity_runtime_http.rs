@@ -831,7 +831,7 @@ fn changing_a_default_wake_setting_reaches_only_conversations_still_on_the_defau
     let a = wake(KEY_A);
     assert_eq!(a["batchWindowMs"], 4500, "{a}");
     assert_eq!(a["confirmedBy"], "default");
-    assert!(a.get("marker").is_none(), "the default record was rebuilt: {a}");
+    assert_eq!(a["marker"], "default-conversation", "refresh changes only stale inherited fields");
     assert_eq!((a["lastWakeAt"].clone(), a["wakeCount"].clone(), a["noActionCount"].clone(), a["confirmedAt"].clone()), (json!(111), json!(7), json!(2), json!(222)), "counters stay");
     assert_eq!(a["triggers"]["keywords"], json!(["k1"]), "the operator's keywords stay");
     let b_conv = wake(KEY_B);

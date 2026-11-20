@@ -77,23 +77,38 @@ pub(crate) struct Applied {
 /// A legacy context and a document that is not an object are returned unchanged. A store this release cannot read
 /// applies nothing and is reported once per process on stderr (MCP servers use stdout).
 pub(crate) fn overlay(context: &RuntimeContext, mut document: Value) -> Value {
-    if !context.is_isolated() || !document.is_object() {
-        return document;
-    }
-    match stored_values(context) {
-        Ok(values) => {
-            for (setting, value) in values {
-                set_at(&mut document, setting.pointer, value);
-            }
-        }
-        Err(error) => {
-            static REPORTED: AtomicBool = AtomicBool::new(false);
-            if !REPORTED.swap(true, Ordering::Relaxed) {
-                crate::safe_eprintln!("[settings] stored settings are not applied: {error}");
-            }
+    if let Err(error) = overlay_checked(context, &mut document) {
+        static REPORTED: AtomicBool = AtomicBool::new(false);
+        if !REPORTED.swap(true, Ordering::Relaxed) {
+            crate::safe_eprintln!("[settings] stored settings are not applied: {error}");
         }
     }
     document
+}
+
+/// Applies the overlay only after a successful read, so durable repairs can refuse to use file-only values.
+pub(crate) fn overlay_checked(context: &RuntimeContext, document: &mut Value) -> Result<(), String> {
+    if context.is_isolated() && document.is_object() {
+        for (setting, value) in stored_values(context)? {
+            set_at(document, setting.pointer, value);
+        }
+    }
+    Ok(())
+}
+
+/// Fill the timing settings in the effective runtime snapshot. Raw documents and mirror writes keep their spelling.
+pub(crate) fn complete_timing(document: &mut Value) {
+    use super::send::{first_gap_setting, FIRST_BASE, FIRST_PER_CHAR, GAP_BASE, GAP_PER_CHAR};
+    for (first, fallback) in [(FIRST_BASE, GAP_BASE), (FIRST_PER_CHAR, GAP_PER_CHAR)] {
+        let value = first_gap_setting(document, &first, &fallback);
+        set_at(document, first.pointer, json!(value));
+    }
+    for setting in super::reply::SETTINGS.iter().chain(super::wake_timing::SETTINGS).chain(super::send::SETTINGS) {
+        let value = setting.read(document);
+        if !value.is_null() {
+            set_at(document, setting.pointer, value);
+        }
+    }
 }
 
 /// Materialize the settings managed by the live controls in a read-only configuration view.
@@ -102,6 +117,48 @@ pub(crate) fn resolve_live_batch(document: &mut Value) {
         let value = setting.read(document);
         set_at(document, setting.pointer, value);
     }
+}
+
+fn validate_timing(
+    conn: &Connection,
+    document: &Value,
+    written: &[&str],
+    removed: Option<&Setting>,
+) -> Result<(), (u16, String)> {
+    let turn = super::wake_timing::TURN_FIELDS.iter().any(|setting| written.contains(&setting.key));
+    let mut ordered = super::send::ORDERED
+        .iter()
+        .chain(&super::wake_timing::ORDERED)
+        .filter(|pair| pair.iter().any(|setting| written.contains(&setting.key)))
+        .peekable();
+    if !turn && ordered.peek().is_none() && !super::reply::WINDOWS.iter().flatten().any(|setting| written.contains(&setting.key)) {
+        return Ok(());
+    }
+    let mut candidate = document.clone();
+    if let Some(setting) = removed {
+        remove_at(&mut candidate, setting.pointer);
+    }
+    for (setting, value) in read_stored_values(conn).map_err(|error| (503, error))? {
+        if !set_at(&mut candidate, setting.pointer, value) && written.contains(&setting.key) {
+            return Err((400, format!("config.json cannot hold {}", setting.key)));
+        }
+    }
+    if turn {
+        crate::wake::validate_turn_settings(&candidate).map_err(|error| (400, error.to_string()))?;
+    }
+    for [min, max] in ordered {
+        if min.integer(&candidate) > max.integer(&candidate) {
+            return Err((400, format!("{} <= {} is required", min.key, max.key)));
+        }
+    }
+    for [min, median, max] in &super::reply::WINDOWS {
+        if [min, median, max].iter().any(|setting| written.contains(&setting.key))
+            && !(min.integer(&candidate)..=max.integer(&candidate)).contains(&median.integer(&candidate))
+        {
+            return Err((400, format!("{} <= {} <= {} is required", min.key, median.key, max.key)));
+        }
+    }
+    Ok(())
 }
 
 /// Resolves settings owned by the batches that use the normalized configuration snapshot.
@@ -148,6 +205,13 @@ fn place(document: &mut Value, stored: Vec<(&'static Setting, Value)>) -> (bool,
     let mut changed = false;
     let mut blocked = Vec::new();
     for (setting, value) in stored {
+        if setting.key == super::wake_timing::HARD_CAP.key && value.is_null() {
+            if document.pointer(setting.pointer).is_some() {
+                remove_at(document, setting.pointer);
+                changed = true;
+            }
+            continue;
+        }
         if setting.found_in(document).is_some_and(|found| setting.kind.file_holds(found, &value)) {
             continue;
         }
@@ -1000,9 +1064,18 @@ pub(crate) fn mirror_into(context: &RuntimeContext, document: &mut Value) -> Res
 }
 
 /// Whether the store holds a value `write_back` would write; false for a legacy context, no store and a store that
-/// cannot be read. Reads only: nothing is created.
+/// cannot be read. Reports a read error on stderr. Reads only: nothing is created.
 pub(crate) fn has_stored_values(context: &RuntimeContext) -> bool {
-    context.is_isolated() && stored_values(context).is_ok_and(|stored| !stored.is_empty())
+    if !context.is_isolated() {
+        return false;
+    }
+    match stored_values(context) {
+        Ok(stored) => !stored.is_empty(),
+        Err(error) => {
+            crate::safe_eprintln!("[settings] could not read stored settings for write-back: {error}");
+            false
+        }
+    }
 }
 
 /// Creates the store with its schema and no value, as a crash after the schema commit leaves it (test seam). It takes
@@ -1281,6 +1354,7 @@ fn store(
             }
         }
         let revision = record_change(conn, setting, old, Some(&text), actor, source)?;
+        validate_timing(conn, document, &[setting.key], None)?;
         Ok(Applied { value, revision, changed: true, mirror_error: None })
     })?;
     Ok(Applied { mirror_error, ..applied })
@@ -1387,6 +1461,7 @@ pub(crate) fn undo(
         }
         let restored_text = restored.as_ref().map(Value::to_string);
         record_change(conn, setting, current, restored_text.as_deref(), actor, "undo")?;
+        validate_timing(conn, document, &[setting.key], restored.is_none().then_some(setting))?;
         if restored.is_none() {
             remove_from_config(context, setting).map_err(|error| (503, error))?;
         }
@@ -1511,7 +1586,8 @@ pub(crate) fn console_changes(
     if !context.is_isolated() {
         return Ok(Vec::new());
     }
-    let now = overlay(context, base.clone());
+    let mut now = overlay(context, base.clone());
+    complete_timing(&mut now);
     let mut changes = Vec::new();
     for setting in registry().filter(|setting| !setting.secret) {
         // The member the setting reads (`Setting::found_in`), so an id list sent under its alias spelling counts.
@@ -1559,7 +1635,7 @@ pub(crate) fn apply_changes(
     }
     let written: Vec<&'static str> = changes.iter().map(|(setting, _)| setting.key).collect();
     let harness_key = harness_credential(context);
-    let ((), mirror_error) = write_store(context, false, &written, |conn, _| {
+    let ((), mirror_error) = write_store(context, false, &written, |conn, document| {
         for (setting, value) in &changes {
             reject_credential_text(conn, setting, value, harness_key.as_deref())?;
             let text = value.to_string();
@@ -1569,6 +1645,7 @@ pub(crate) fn apply_changes(
             }
             record_change(conn, setting, old, Some(&text), actor, source)?;
         }
+        validate_timing(conn, document, &written, None)?;
         Ok(())
     })?;
     Ok(mirror_error)
@@ -1668,7 +1745,8 @@ pub(crate) fn view(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     if !context.is_isolated() {
         return Err((503, LEGACY_ERROR.to_string()));
     }
-    let document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    let mut document = context.load_config_document().map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    complete_timing(&mut document);
     let (stored, store_error) = match stored_values(context) {
         Ok(stored) => (stored, None),
         Err(error) => (Vec::new(), Some(error)),

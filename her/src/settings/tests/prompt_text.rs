@@ -404,8 +404,9 @@ fn prompt_text_settings_page_edits_text_in_a_text_area() {
         "a text setting is edited in a text area"
     );
     assert!(
-        page.contains("type==='integer'||type==='number'?Number(input.value):") && page.contains("type==='owner id'?input.value.trim():input.value"),
-        "a text setting is sent as typed, an integer as a number"
+        page.contains("(type==='integer'||type==='number'||type==='probability')?Number(input.value):")
+            && page.contains("type==='owner id'?input.value.trim():input.value"),
+        "a text setting is sent as typed, and numeric settings are sent as numbers"
     );
     assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
     assert!(!settings_db(&root).exists(), "showing the page creates no store");

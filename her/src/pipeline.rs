@@ -457,7 +457,6 @@ struct ChatRun {
     media_parts: Vec<serde_json::Value>,
     /// Acknowledgement to send once DSH accepted the prompt (sent at most once per message).
     ack: Option<String>,
-    delay_ms: u64,
     /// The owner sent the message that started this turn: only then may a DSH slash-command
     /// result be relayed to the conversation.
     owner_started: bool,
@@ -1178,7 +1177,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             .as_ref()
             .and_then(|c| c.reserved.as_ref())
             .is_some_and(|a| a.social());
-        let delay = self.chat.as_ref().map(|c| c.delay_ms).unwrap_or(0);
         let report = if reserved && purpose == "reply" {
             let cfg = match self.context.load_config() {
                 Ok(c) => crate::reserved::config(&c),
@@ -1226,6 +1224,10 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             }
             total
         } else {
+            let cfg = match self.context.load_config() {
+                Ok(cfg) => cfg,
+                Err(error) => return crate::chat::SendReport { error: Some(error.into()), ..Default::default() },
+            };
             crate::chat::send_recorded(
                 &self.context,
                 &self.ob,
@@ -1233,7 +1235,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 &self.turn_epoch,
                 purpose,
                 text,
-                delay,
+                crate::chat::send_delay_ms(&cfg),
                 &|| self.chat_guard(key, sid),
             )
         };
@@ -1291,7 +1293,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             mode: mode.to_string(),
             silent: false,
             ack,
-            delay_ms: crate::chat::send_delay_ms(cfg),
             media_parts,
             owner_started,
         });
@@ -1352,7 +1353,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             mode: "reserved".to_string(),
             silent,
             ack,
-            delay_ms: crate::chat::send_delay_ms(cfg),
             media_parts,
             // A reserved batch has no single sender; only the owner's private conversation counts.
             owner_started: crate::chat::is_owner_key(cfg, key),
