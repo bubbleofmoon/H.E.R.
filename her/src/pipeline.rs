@@ -1024,7 +1024,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         self.failure_reported = true;
         if failure.class == "refusal" && self.refusals_recorded.insert((backend.into(), provider.into(), model.into())) {
             let mut messages = self.carried_messages.clone();
-            crate::model_failure::merge_refs(&mut messages, tool_refs.iter().take(0).cloned().collect()); // RED-refs
+            crate::model_failure::merge_refs(&mut messages, tool_refs.to_vec());
             let input = crate::model_failure::RefusalInput { messages: &messages, call };
             crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, input);
         }
