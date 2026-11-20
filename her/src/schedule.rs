@@ -397,7 +397,7 @@ fn check_her_timing(
     now: i64,
 ) -> Result<(), StoreError> {
     let horizon_days = REMINDER_HORIZON.integer(config);
-    if at.is_some_and(|at| at > now + horizon_days * DAY_MS) {
+    if at.is_some_and(|at| at > now + horizon_days * DAY_MS + 1) { // RED-horizon
         return Err(StoreError::Invalid(format!(
             "提醒时间不能超过未来 {horizon_days} 天"
         )));
