@@ -73,7 +73,7 @@ def stage(root, node, npm, version, integrity):
     expected_tarball = f'{REGISTRY}{PACKAGE}/-/dsh-{version}.tgz'
     if record['version'] != version or record['resolved'] != expected_tarball:
         raise RuntimeError('npm lock did not resolve the exact registry package')
-    if not record.get('integrity', '').startswith('sha512-'):  # RED-R1-INTEGRITY
+    if record.get('integrity') != integrity:
         raise RuntimeError('npm lock integrity does not match the pinned DSH integrity')
 
 
