@@ -114,7 +114,7 @@ fn read_restart_request(context: &RuntimeContext) -> Result<Option<RestartReques
 fn inspect_restart_request(context: &RuntimeContext) -> Result<Option<RestartRequest>, String> {
     match read_restart_request(context) {
         Ok(record) => Ok(record),
-        Err(error) => Err(error), // RED-R3-M2
+        Err(_) => remove_expired_bad_restart(context).map(|()| None),
     }
 }
 
