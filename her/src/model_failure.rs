@@ -385,7 +385,7 @@ pub(crate) fn record_refusal(
     if failure.class != "refusal" || !context.is_isolated() {
         return;
     }
-    let messages = input.messages.to_vec(); // RED-privacy
+    let messages = message_refs(&Value::Array(input.messages.to_vec()));
     let mut record = serde_json::json!({"time":crate::parity_clock::now_ms(), "key":key,
         "backend":backend, "provider":provider, "model":model, "errorClass":failure.class,
         "errorCode":failure.code, "messages":messages});
