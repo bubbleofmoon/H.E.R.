@@ -6,12 +6,13 @@ run-name: quick ${{ inputs.os }} target=${{ inputs.target }} filter=${{ inputs.f
 # `lint` is `cargo fmt --all --check` plus `cargo clippy --workspace --all-targets` (report-only for now) and uploads the
 # `cargo fmt --all` result as artifact `fmt-patch` and the `cargo clippy --fix` result, on a clean tree, as artifact `clippy-fix-patch`
 # (both always uploaded, empty when there is nothing to change): `gh run download <id> -n fmt-patch`, then apply only ticket-authorized hunks for owned files (see docs/agents/rust-validation.md).
+# `console_ui` also runs alone. It builds the console fixture candidate and uploads the Playwright report.
 # The CI-first gate is checks.yml on the pull request; this job never gates a merge.
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'run-tests.py target name(s), comma-separated (unit, an her/tests stem, scripts), or alone: lint, check'
+        description: 'run-tests.py target name(s), comma-separated, or alone: lint, check, console_ui'
         required: true
       filter:
         description: 'optional libtest name filter'
@@ -93,13 +94,51 @@ jobs:
           key: quick-${{ inputs.os }}
           cache-on-failure: true
       - name: Build and run the named target
-        if: inputs.target != 'lint' && inputs.target != 'check'
+        if: inputs.target != 'lint' && inputs.target != 'check' && inputs.target != 'console_ui'
         run: |
           cd "$PUBLIC_TREE"
           export HER_INSTALL_ROOT="$CI_EVIDENCE/unused-install-root"
           args=(--only "$QUICK_TARGET")
           if [ -n "$QUICK_FILTER" ]; then args+=(--filter "$QUICK_FILTER"); fi
           python -I scripts/ci/run-tests.py "${args[@]}"
+      - name: Build the console fixture candidate
+        if: inputs.target == 'console_ui'
+        id: console_candidate
+        run: |
+          if [ -n "$QUICK_FILTER" ]; then
+            echo '::error::console_ui runs its entire matrix and takes no filter'
+            exit 1
+          fi
+          cd "$PUBLIC_TREE/her"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cargo build --locked --bin her-cli
+      - name: Install Playwright and browsers
+        if: inputs.target == 'console_ui'
+        run: |
+          cd "$PUBLIC_TREE/her/tests/ui"
+          npm ci --ignore-scripts --no-audit --no-fund
+          if [ "$RUNNER_OS" = Windows ]; then
+            npx --no-install playwright install msedge
+          else
+            npx --no-install playwright install --with-deps chromium firefox webkit
+          fi
+      - name: Capture the console and walk its controls
+        if: inputs.target == 'console_ui'
+        env:
+          HER_UI_COMMIT: ${{ steps.console_candidate.outputs.commit }}
+        run: |
+          cd "$PUBLIC_TREE/her/tests/ui"
+          export HER_UI_OUTPUT="$CI_EVIDENCE"
+          export HER_TEST_CLI="$CARGO_TARGET_DIR/debug/her-cli"
+          if [ "$RUNNER_OS" = Windows ]; then HER_TEST_CLI+=.exe; fi
+          npm test
+      - name: Upload console UI report
+        if: always() && steps.console_candidate.outputs.commit != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-ui-${{ steps.console_candidate.outputs.commit }}-${{ inputs.os }}
+          path: ${{ env.CI_EVIDENCE }}/console-ui-${{ steps.console_candidate.outputs.commit }}-${{ inputs.os }}
+          if-no-files-found: ignore
       - name: Compile check
         if: inputs.target == 'check'
         run: |

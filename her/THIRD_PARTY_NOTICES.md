@@ -1,5 +1,17 @@
 # Third-party dependency notices
 
+## Playwright 1.65.1 (console UI tests only)
+
+`playwright` and `playwright-core` are installed by the console UI test job under Apache-2.0. The npm packages include `LICENSE`, `NOTICE` and `ThirdPartyNotices.txt`. [Playwright source and license](https://github.com/microsoft/playwright/tree/v1.65.1).
+
+```text
+Playwright
+Copyright (c) Microsoft Corporation
+
+This software contains code derived from the Puppeteer project (https://github.com/puppeteer/puppeteer),
+available under the Apache 2.0 license (https://github.com/puppeteer/puppeteer/blob/master/LICENSE).
+```
+
 ## Jiff 0.2.39
 
 HER uses Jiff for IANA time zone lookup, civil scheduling and calendar conversion under the Unlicense option of its Unlicense OR MIT dual license. The bundled IANA time-zone database is distributed with Jiff's tzdb packages. The upstream license texts accompany the redistributable source.
