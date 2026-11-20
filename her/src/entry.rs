@@ -1586,7 +1586,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 if restore::recovery_pending(&runtime_context) {
                     json!({})
                 } else {
-                    if false && console_auth::reconcile_token_rotation(&runtime_context).is_err() { // RED-R3-G
+                    if console_auth::reconcile_token_rotation(&runtime_context).is_err() {
                         crate::safe_eprintln!("[console] console credentials require recovery");
                     }
                     runtime_context.load_config().map_err(str::to_owned)?
