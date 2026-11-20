@@ -114,7 +114,7 @@ def validate_scratch(scratch):
 
 def install_plan(stage, ticket):
     plan = stage / "plan-out/plan.md"
-    if not plan.is_file() or plan.is_symlink() or not plan.stat().st_size:
+    if not regular_file(plan) or not plan.stat().st_size:
         raise ValueError("plan-out/plan.md must be a nonempty single-link regular file")
     scratch = stage / "scratch"
     validate_scratch(scratch)
