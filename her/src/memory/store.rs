@@ -144,7 +144,7 @@ impl Reader<'_> {
     pub(crate) fn write_message(
         &self, message: VerifiedMessage<'_>, supersedes: Option<i64>,
     ) -> rusqlite::Result<Option<UpsertOutcome>> {
-        let attribution = (!self.is_owner).then_some(message.speaker);
+        let attribution = (!self.is_owner && !self.key.starts_with("group:")).then_some(message.speaker); // RED-attribution
         let content = match attribution {
             Some(speaker) => format!("{speaker}说：{}", message.text),
             None => message.text.to_string(),
