@@ -221,7 +221,7 @@ fn auth_rows_exist(conn: &Connection, table: &str) -> Result<bool, String> {
 }
 
 pub(crate) fn archive_credentials(conn: &Connection) -> Result<ArchivedCredentials, String> {
-    if archive_schema(conn)? == 4 // RED-R2-G
+    if archive_schema(conn)? == 3
         && (auth_rows_exist(conn, "console_browser_sessions")?
             || auth_rows_exist(conn, "console_auth_state")?)
     {
