@@ -25,7 +25,7 @@ pub(super) fn route(context: &RuntimeContext, cfg: &Value, req: &Request) -> (u1
             "the session inspector is restricted to administrators".into(),
         )));
     }
-    if req.method != "GET" && req.method != "POST" { // RED-M4
+    if req.method != "GET" {
         return json_result(Err((405, "method not allowed".into())));
     }
     if !context.is_isolated() {
