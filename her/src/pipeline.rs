@@ -502,6 +502,11 @@ pub struct Pipeline {
     #[cfg(test)]
     pub(crate) admission_clock: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
     dispatch_unsubmitted: bool,
+    // Set by the hub for its own wakes. Compatibility turns have no hub retry.
+    reserved2_retries_remaining: Option<bool>,
+    // Once the final unsubmitted failure is eligible for a line, the worker and hub
+    // must use the same DSH parking decision even if health changes before collection.
+    reserved2_failure_parks: Option<bool>,
     /// Chat mode (ticket 12): the run state of the chat turn in flight.
     chat: Option<ChatRun>,
     /// Facts of the last finished turn, for the chat reply decision.
@@ -781,6 +786,8 @@ impl Pipeline {
             #[cfg(test)]
             admission_clock: None,
             dispatch_unsubmitted: true,
+            reserved2_retries_remaining: None,
+            reserved2_failure_parks: None,
             chat: None,
             last_report: None,
             failure_reported: false,
@@ -821,6 +828,14 @@ impl Pipeline {
     pub fn expect_dispatch_wake(&mut self, at: i64, previous: serde_json::Value) { self.dispatch_wake = Some((at, previous)); }
     pub fn expect_dispatch_deadline(&mut self, at: i64) { self.dispatch_deadline = Some(at); }
     pub fn dispatch_definitely_unsubmitted(&self) -> bool { self.dispatch_unsubmitted }
+
+    pub(crate) fn set_reserved2_retry_budget(&mut self, retries_remaining: bool) {
+        self.reserved2_retries_remaining = Some(retries_remaining);
+    }
+
+    pub(crate) fn reserved2_failure_parks(&self) -> Option<bool> {
+        self.reserved2_failure_parks
+    }
 
     fn set_turn_token(&mut self, token: String) {
         self.turn_epoch = crate::send_outbox::token_epoch(&token);
@@ -1401,6 +1416,20 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if self.turn_has_send_batch(key) {
             return;
         }
+        if mode == "reserved2" && self.dispatch_unsubmitted {
+            if let Some(retries_remaining) = self.reserved2_retries_remaining {
+                if retries_remaining {
+                    return;
+                }
+                let Ok(cfg) = self.context.load_config() else { return };
+                let parks = crate::dsh_health::is_down(&self.context)
+                    && crate::reserved2::wake_needs_dsh(&self.context, &cfg, key);
+                self.reserved2_failure_parks = Some(parks);
+                if parks {
+                    return;
+                }
+            }
+        }
         let guard = || {
             let cfg = self.context.load_config().map_err(str::to_string)?;
             if mode == "reserved2" {
@@ -1444,9 +1473,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let report = crate::chat::send_recorded(
             &self.context, &self.ob, key, &self.turn_epoch, crate::send_outbox::PERSONA_FAILURE_SEND, &line, 0, &guard,
         );
-        if self.turn_has_send_batch(key) {
-            self.dispatch_unsubmitted = false;
-        }
         if report.unknown {
             let _ = self.pause_unknown(key, "send-unresolved", "persona failure line delivery is unverified");
         }

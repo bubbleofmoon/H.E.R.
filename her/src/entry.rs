@@ -504,26 +504,65 @@ fn record_unreadable_refusals(context: &runtime::RuntimeContext, count: u64) {
     );
 }
 
-/// Drop scheduler work and settle its saved inputs when current policy refuses it.
-async fn compat_wake_admitted(
-    cfg: &Value,
-    key: &str,
-    journal: &inbound::SharedJournal,
-    awaiting: &mut HashMap<String, Vec<String>>,
-    drivers: &mut HashMap<String, session::Driver>,
-    synced: &mut HashMap<String, session::WakeSync>,
-    now: i64,
-) -> Result<bool, String> {
-    if console::inbound_admitted(cfg, key) {
-        return Ok(true);
+#[derive(Default)]
+struct CompatWakes {
+    drivers: HashMap<String, session::Driver>,
+    synced: HashMap<String, session::WakeSync>,
+    awaiting: HashMap<String, Vec<String>>,
+    in_flight: Vec<String>,
+    pending_live: Vec<(String, String)>,
+}
+
+impl CompatWakes {
+    /// Drop scheduler work and settle its saved inputs when current policy refuses it.
+    async fn admitted(
+        &mut self, cfg: &Value, key: &str, journal: &inbound::SharedJournal, now: i64,
+    ) -> Result<bool, String> {
+        if console::inbound_admitted(cfg, key) {
+            return Ok(true);
+        }
+        if let Some(events) = self.awaiting.get(key) {
+            journal.mark_handled(events.clone(), now).await?;
+            self.awaiting.remove(key);
+        }
+        self.drivers.remove(key);
+        self.synced.remove(key);
+        Ok(false)
     }
-    if let Some(events) = awaiting.get(key) {
-        journal.mark_handled(events.clone(), now).await?;
-        awaiting.remove(key);
+
+    async fn pump(
+        &mut self, context: &runtime::RuntimeContext, cfg: &Value, journal: &inbound::SharedJournal, now: i64,
+    ) -> Result<Vec<(String, session::WakeEvent)>, String> {
+        if let Some(state) = runtime_json(context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
+            sync_wake_configs(context, cfg, &state, &mut self.drivers, &mut self.synced, now);
+        }
+        let keys: Vec<_> = self.drivers.keys().cloned().collect();
+        for key in keys {
+            self.admitted(cfg, &key, journal, now).await?;
+        }
+        Ok(session::pump_all(&mut self.drivers, now))
     }
-    drivers.remove(key);
-    synced.remove(key);
-    Ok(false)
+
+    async fn next_live(
+        &mut self,
+        context: &runtime::RuntimeContext,
+        journal: &inbound::SharedJournal,
+        pending: &mut impl Iterator<Item = (String, String)>,
+        now: i64,
+    ) -> Result<Option<(String, String)>, String> {
+        for (key, reason) in pending {
+            let Ok(cfg) = context.load_config() else {
+                self.pending_live.push((key, reason));
+                continue;
+            };
+            if !self.admitted(&cfg, &key, journal, now).await? {
+                continue;
+            }
+            inbound::start_processing(journal, &mut self.awaiting, &mut self.in_flight, &key, now).await?;
+            return Ok(Some((key, reason)));
+        }
+        Ok(None)
+    }
 }
 
 /// Wake configurations written to the state file by a tool or the console (`confirmedAt` changed) reach the
@@ -2105,8 +2144,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
     // 断线缺口与重放（ticket 07）。每次（重）连接：先按网关历史能力补收未解决的缺口，
     // 再把已保存但尚未处理完的实时事件按原顺序重放，然后才读取新帧。
-    let mut awaiting: HashMap<String, Vec<String>> = HashMap::new();
-    let mut in_flight: Vec<String> = Vec::new();
+    let mut compat_wakes = CompatWakes::default();
     // 缺口先同步记下（快，只写库），再把含阻塞 HTTP 的补收丢到后台线程：
     // 慢网关不能让 WebSocket 在重连后停止读帧。
     {
@@ -2317,15 +2355,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     )?;
 
     // P6：每会话一个状态机。消息喂进去，唤醒从 select 的定时分支吐出来。
-    let mut drivers: HashMap<String, session::Driver> = HashMap::new();
-    let mut wake_synced: HashMap<String, session::WakeSync> = HashMap::new();
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    // ticker 分支里**不能**直接 await live pipeline（它在 select! 里，借用冲突），
-    // 所以先把「该由 live 处理的唤醒」攒在这里，下一轮循环开头执行。
-    // 延迟最多一个 tick（500ms），对聊天无所谓。
-    let mut pending_live: Vec<(String, String)> = Vec::new();
 
     loop {
         let tick_now = now_ms() as i64;
@@ -2341,15 +2372,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         //   · CLI 纯文本后端 → `build_text_only`（自包含、不让它调工具）+ Rust 代发
         //   · DSH           → `prompt::build`（完整提示词）+ 模型自己调工具发
         // 都由 `run_turn` 内部按 `backends.sessions` 决定，这里只把两份 prompt 都备好。
-        for (key, reason) in std::mem::take(&mut pending_live) {
-            let Ok(current_cfg) = runtime_context.load_config() else {
-                pending_live.push((key, reason));
-                continue;
-            };
-            if !compat_wake_admitted(&current_cfg, &key, &journal, &mut awaiting, &mut drivers, &mut wake_synced, tick_now).await? {
-                continue;
-            }
-            inbound::start_processing(&journal, &mut awaiting, &mut in_flight, &key, tick_now).await?;
+        let mut queued = std::mem::take(&mut compat_wakes.pending_live).into_iter();
+        while let Some((key, reason)) = compat_wakes.next_live(&runtime_context, &journal, &mut queued, tick_now).await? {
             if let Some(pipe) = pipeline.as_mut() {
                 let Ok(target) = parse_target(&key, &cfg_raw) else {
                     println!("[her] {key} 的 target 解析失败，跳过");
@@ -2370,14 +2394,14 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 );
                 let cli_prompt = prompt::build_text_only_with_runtime(&runtime_context, &key, &recent, &self_nick, &self_id.to_string());
                 println!("[her] 定时唤醒 {key}（{reason}）：执行 live 回合");
-                pipe.note_turn(&reason, &in_flight);
+                pipe.note_turn(&reason, &compat_wakes.in_flight);
                 match pipe.run_turn(&target, &dsh_prompt, &cli_prompt, &cfg_raw).await {
                     Ok(n) => println!("[her] 回合完成（{n} 字输出）"),
                     Err(e) => {
                         println!("[her] ❌ 回合失败：{e}");
                         // 被暂缓的唤醒没有起回合：不能让「刚派发」的忙标记把之后交回的唤醒压住 60 秒。
                         if e.starts_with(pipeline::HELD_ERROR_PREFIX) {
-                            if let Some(d) = drivers.get_mut(&key) {
+                            if let Some(d) = compat_wakes.drivers.get_mut(&key) {
                                 d.sched.pending_wake_key_at = None;
                             }
                         }
@@ -2402,8 +2426,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             });
         }
         // 上一轮的回合（若有）已在上面执行完毕：处理中 → 已处理。
-        if !in_flight.is_empty() {
-            let keys = std::mem::take(&mut in_flight);
+        if !compat_wakes.in_flight.is_empty() {
+            let keys = std::mem::take(&mut compat_wakes.in_flight);
             journal.mark_handled(keys, now_ms() as i64).await?;
         }
         // 回合恢复核对后明确未执行且仍有效的事件（ticket 10）排到重放队列末尾。
@@ -2453,17 +2477,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 let Ok(current_cfg) = runtime_context.load_config() else {
                     continue;
                 };
-                if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
-                    sync_wake_configs(&runtime_context, &current_cfg, &state, &mut drivers, &mut wake_synced, tick_now);
-                }
-                let keys: Vec<_> = drivers.keys().cloned().collect();
-                for key in keys {
-                    compat_wake_admitted(&current_cfg, &key, &journal, &mut awaiting, &mut drivers, &mut wake_synced, tick_now).await?;
-                }
-                for (k, e) in session::pump_all(&mut drivers, tick_now) {
+                for (k, e) in compat_wakes.pump(&runtime_context, &current_cfg, &journal, tick_now).await? {
                     let dispatch = live_mode && live_groups.iter().any(|g| g == &k);
                     if !dispatch {
-                        inbound::start_processing(&journal, &mut awaiting, &mut in_flight, &k, now_ms() as i64).await?;
+                        inbound::start_processing(&journal, &mut compat_wakes.awaiting, &mut compat_wakes.in_flight, &k, now_ms() as i64).await?;
                     }
                     wakes += 1;
                     println!("[her] 定时唤醒 {k} ({})", e.reason);
@@ -2477,7 +2494,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     // 灰度里的会话：排队给 live pipeline，下一轮循环开头执行。
                     // 不在这里直接跑，是因为 ticker 在 select! 分支里，拿不到 &mut pipeline。
                     if dispatch {
-                        pending_live.push((k, e.reason));
+                        compat_wakes.pending_live.push((k, e.reason));
                     }
 
                 }
@@ -2948,7 +2965,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
         // 需要唤醒的事件保持 received，唤醒真正触发后才转为 processing；其余事件不产生工作，立即 handled。
         if wake {
-            awaiting.entry(key.clone()).or_default().push(inbound_key.clone());
+            compat_wakes.awaiting.entry(key.clone()).or_default().push(inbound_key.clone());
         } else {
             journal.mark_handled(vec![inbound_key.clone()], now_ms() as i64).await?;
         }
@@ -3036,7 +3053,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
         // 决策喂给状态机；真正的唤醒由它按合批窗口/优先级吐出来。
         let now_i = now_ms() as i64;
-        let _created = drivers.entry(key.clone()).or_insert_with(|| {
+        let _created = compat_wakes.drivers.entry(key.clone()).or_insert_with(|| {
             let sess = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
                 .and_then(|s| s.get("conversations").and_then(|c| c.get(&key)).cloned())
                 .unwrap_or_else(|| serde_json::json!({}));
@@ -3052,9 +3069,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         });
 
         if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
-            sync_wake_configs(&runtime_context, &gate_cfg, &state, &mut drivers, &mut wake_synced, now_i);
+            sync_wake_configs(&runtime_context, &gate_cfg, &state, &mut compat_wakes.drivers, &mut compat_wakes.synced, now_i);
         }
-        let driver = drivers.get_mut(&key).expect("driver exists");
+        let driver = compat_wakes.drivers.get_mut(&key).expect("driver exists");
         let rec = json!({
             "ts": now_i,
             "key": key,
@@ -3095,7 +3112,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         if !fired.is_empty() {
-            inbound::start_processing(&journal, &mut awaiting, &mut in_flight, &key, now_ms() as i64).await?;
+            inbound::start_processing(&journal, &mut compat_wakes.awaiting, &mut compat_wakes.in_flight, &key, now_ms() as i64).await?;
         }
         for e in fired {
             wakes += 1;
@@ -3124,7 +3141,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     // 于是「说完一句、对方接着说」它就不再理人（实测 19:46 回了"这得看你给多少"，
                     // 之后「看图」直接没接，因为那条消息没有 @/名字/问句，追听又没排上）。
                     let turn_at = now_ms() as i64;
-                    if let Some(d) = drivers.get_mut(&key) {
+                    if let Some(d) = compat_wakes.drivers.get_mut(&key) {
                         let _ = d.apply(session::Input::TurnStart { at_ms: turn_at });
                     }
                     let runtime_recent = runtime_recent_by_key
@@ -3141,7 +3158,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                         &runtime_recent,
                     );
                     let cli_prompt = prompt::build_text_only_with_runtime(&runtime_context, &key, &recent, &self_nick, &self_id.to_string());
-                    pipe.note_turn(&reason, &in_flight);
+                    pipe.note_turn(&reason, &compat_wakes.in_flight);
                     let ok = match pipe.run_turn(&target, &dsh_prompt, &cli_prompt, &cfg_raw).await {
                         Ok(n) => {
                             println!("[her] 回合完成（{n} 字输出）");
@@ -3153,7 +3170,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                         }
                     };
                     let end_at = now_ms() as i64;
-                    if let Some(d) = drivers.get_mut(&key) {
+                    if let Some(d) = compat_wakes.drivers.get_mut(&key) {
                         // 模型自己发过话（输出非空）→ 安排追听；没说话就只解锁忙碌。
                         if ok {
                             let _ = d.apply(session::Input::ReplySent {
@@ -3523,13 +3540,12 @@ mod tests {
         let root = isolated_runtime_fixture("t48-compat-timer");
         let context = runtime::RuntimeContext::from_root(&root).unwrap();
         let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
-        let mut awaiting = HashMap::new();
-        let mut drivers = HashMap::new();
-        let mut synced = HashMap::new();
         let key = "group:42";
         let allowed = json!({"allow":{"groups":[42]}});
         let timer = json!({"wakeConfig":{"mode":"diving","infinite":false,"confirmedAt":1,
             "sleepUntil":"2000-01-01T00:00:00.000Z"}});
+        let mut state = json!({"conversations":{(key):timer.clone()}});
+        state["conversations"][key]["wakeConfig"]["confirmedAt"] = json!(2);
         let now = now_ms() as i64;
         let due_driver = || {
             let mut driver = session::Driver::new(session::scheduler_from_state(wake_cfg_of(&allowed), &timer), 1);
@@ -3540,24 +3556,38 @@ mod tests {
             (1, json!({"allow":{"groups":[]},"allowAllWhenEmpty":true})),
             (2, json!({"allow":{"groups":[42]},"deny":{"groups":[42]}})),
         ] {
+            let mut wakes = CompatWakes::default();
             let event = format!("{key}|message:{id}");
             journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
-            awaiting.insert(key.into(), vec![event.clone()]);
-            drivers.insert(key.into(), due_driver());
-            synced.insert(key.into(), session::WakeSync::of(&timer["wakeConfig"]));
-            assert!(!compat_wake_admitted(&current, key, &journal, &mut awaiting, &mut drivers, &mut synced, now)
-                .await.unwrap(), "queued compatibility work must be refused after access changes");
-            assert!(session::pump_all(&mut drivers, now).is_empty());
-            assert!(!awaiting.contains_key(key) && !synced.contains_key(key));
+            wakes.awaiting.insert(key.into(), vec![event.clone()]);
+            wakes.drivers.insert(key.into(), due_driver());
+            wakes.synced.insert(key.into(), session::WakeSync::of(&timer["wakeConfig"]));
+
+            sync_wake_configs(&context, &current, &state, &mut wakes.drivers, &mut wakes.synced, now);
+            assert!(session::WakeSync::changed(wakes.synced.get(key), &state["conversations"][key]["wakeConfig"]).is_some(),
+                "a denied driver must not adopt a new wake configuration");
+            assert!(wakes.pump(&context, &current, &journal, now).await.unwrap().is_empty(),
+                "a denied timer must not be pumped");
+            assert!(!wakes.awaiting.contains_key(key) && !wakes.synced.contains_key(key));
+            let check = event.clone();
+            assert_eq!(journal.run(move |j| j.stage_of(&check)).await.unwrap().as_deref(), Some("handled"));
+
+            let event = format!("{key}|message:pending-{id}");
+            journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
+            wakes.awaiting.insert(key.into(), vec![event.clone()]);
+            wakes.drivers.insert(key.into(), due_driver());
+            let ready = wakes.pump(&context, &allowed, &journal, now).await.unwrap();
+            assert_eq!(ready.len(), 1, "the allowed timer queues a wake");
+            assert_eq!(ready[0].0, key);
+            assert_eq!(ready[0].1.reason, "timeout");
+            wakes.pending_live.extend(ready.into_iter().map(|(key, event)| (key, event.reason)));
+            context.write_atomic(runtime::RuntimeArea::Config, "config.json", current.to_string().as_bytes()).unwrap();
+            let mut pending = std::mem::take(&mut wakes.pending_live).into_iter();
+            assert!(wakes.next_live(&context, &journal, &mut pending, now).await.unwrap().is_none(),
+                "a queued live wake must be refused if access changes before dispatch");
+            assert!(wakes.in_flight.is_empty());
             assert_eq!(journal.run(move |j| j.stage_of(&event)).await.unwrap().as_deref(), Some("handled"));
         }
-        drivers.insert(key.into(), due_driver());
-        assert!(compat_wake_admitted(&allowed, key, &journal, &mut awaiting, &mut drivers, &mut synced, now)
-            .await.unwrap());
-        let ready = session::pump_all(&mut drivers, now);
-        assert_eq!(ready.len(), 1, "the allowed timer reaches dispatch");
-        assert_eq!(ready[0].0, key);
-        assert_eq!(ready[0].1.reason, "timeout");
         assert!(crate::turn_ledger::read_records(&context).unwrap().is_empty());
         assert!(crate::send_outbox::read_records(&context).unwrap().is_empty());
         drop(journal);

@@ -3650,6 +3650,30 @@ process.stdin.on('end', () => {
 }
 
 #[test]
+fn t48_reserved2_dsh_failure_line_waits_for_retry_exhaustion() {
+    let mut rig = hf129_rig("t48-unsubmitted-exhaustion");
+    fs::write(rig.root.join("data/personas.json"), json!({
+        "format": 1, "nextId": 2, "default": "p1", "overrides": {},
+        "personas": {"p1": {"id": "p1", "activeVersion": 1, "versions": [
+            {"version": 1, "approved": true, "name": "Companion", "core": "Speak plainly.",
+             "failureLine": T48_FAILURE_LINE}
+        ]}}
+    }).to_string()).unwrap();
+    lock(&rig.dsh.inner).refuse_prompt = true;
+    rig.start();
+    rig.push(group_event(48, 1001, "tester", "", vec![
+        json!({"type":"at","data":{"qq":SELF_ID.to_string()}}), text_seg("wake with a refused submission"),
+    ]));
+    let failed = || rig.ledger().iter().filter(|r| r["k"] == "ended" && r["outcome"] == "failed").count();
+    assert!(wait_for(LONG, || failed() >= 1), "the first unsubmitted turn must finish");
+    assert!(rig.texts_to(GROUP_KEY).is_empty(), "an unsubmitted failure must stay silent while hub retries remain");
+    assert!(wait_for(Duration::from_secs(65), || failed() >= 4), "all three hub retries must run");
+    assert_eq!(rig.dsh.calls("session/prompt").len(), 4);
+    assert!(rig.dsh.prompts().is_empty(), "DSH must refuse every submission");
+    assert_eq!(rig.texts_to(GROUP_KEY), [T48_FAILURE_LINE], "only the exhausted wake owes a failure line");
+}
+
+#[test]
 fn hf129_fix3_persistent_submission_failure_stops_at_base_retry_cap() {
     let mut rig = hf129_rig("hf129-fix3-submit-failure");
     let path = rig.root.join("config/config.json");
