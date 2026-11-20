@@ -1423,7 +1423,7 @@ fn check_port(states: &mut Value, dependency: &Dependency) -> Result<PortHealth,
     let result = listening(dependency).and_then(|listening| {
         if listening {
             if let Some(settings) = &dependency.relay {
-                settings.probe(dependency.endpoint, Instant::now() + Duration::from_millis(500))?; // RED-1
+                settings.probe(dependency.endpoint, Instant::now() + RELAY_PROBE_BUDGET)?;
             }
         }
         Ok(listening)
