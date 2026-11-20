@@ -415,6 +415,7 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         // #218: a choice.
         json!("harness"),
         json!("dsh"),
+        json!(["group:1"]),
     ];
     for setting in crate::settings::registry().filter(|setting| !setting.secret) {
         let (root, context) = settings_fixture("settings direct write refused");

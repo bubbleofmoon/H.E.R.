@@ -19,7 +19,7 @@ Keep files used by the Rust runtime, build, tests, CI or agent workflow; DSH sup
 
 ## User Preferences
 
-- Start every background process hidden; never open a foreground console.
+- Start every background process hidden and keep consoles closed; open a window only for an app the owner asked to open.
 - Write agent-facing docs (AGENTS.md, `docs/agents/`) in English.
 
 ## Subagent workflow

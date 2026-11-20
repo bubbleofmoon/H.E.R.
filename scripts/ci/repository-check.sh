@@ -40,6 +40,7 @@ python -I scripts/tests/test_check_repo.py
 python -I scripts/tests/test_ci_suite.py
 python -I scripts/tests/test_agent_guard.py
 python -I scripts/tests/test_issue_watch.py
+python -I scripts/tests/test_watch_stream.py
 python -I scripts/tests/test_ci_wait.py
 python -I scripts/tests/test_strip_history.py
 python -I scripts/tests/test_snowluma_export.py
