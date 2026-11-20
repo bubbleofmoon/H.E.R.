@@ -20,6 +20,7 @@ use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 // The DSH turn adapter (`turn_engine::Adapter::Dsh`): its sessions, model failover, prompt
 // submission, collector, cancellation and usage rows.
 mod dsh_adapter;
+pub(crate) use dsh_adapter::is_dsh_access_refusal;
 
 /// The explicit per-conversation CLI route, using the same rules as turn dispatch.
 pub(crate) fn pinned_cli_backend<'a>(cfg: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -1206,6 +1207,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     fn end_ledger_turn(&mut self, outcome: Result<(), &str>) {
         match outcome {
             Ok(()) => self.finish_turn("completed", "ok"),
+            Err(error) if is_dsh_access_refusal(error) => self.finish_turn("cancelled", error),
             Err(error) => self.finish_turn("failed", error),
         }
         self.cur_turn = None;
@@ -3123,10 +3125,9 @@ mod tests {
     /// Ticket 24 S3: an access change (revocation or whole reset) that lands while DSH is creating a
     /// conversation's session must not let the new session be bound; it is archived instead (JS
     /// `ensureSession` re-checks epoch, policy and mode after creation).
-    #[test]
-    fn ticket24_a_session_created_across_a_revocation_or_reset_is_archived_not_bound() {
+    #[tokio::test]
+    async fn ticket24_a_session_created_across_a_revocation_or_reset_is_archived_not_bound() {
         use std::net::TcpListener;
-        let _env_lock = DSH_HOME_TEST_LOCK.lock().unwrap();
         for (tag, path, body) in [
             ("t24-create-revoke", "/api/whitelist", serde_json::json!({"allow": {"groups": []}, "confirm": true})),
             ("t24-create-reset", "/api/socialV2/reset", serde_json::json!({})),
@@ -3159,13 +3160,76 @@ mod tests {
                 }
                 seen
             });
-            let result = pipeline.ensure_session("group:42");
+            let cfg = context.load_config().unwrap();
+            let result = pipeline.ask_with_failover("group:42", "fixture prompt", 5, &cfg).await;
             let seen = server.join().unwrap();
-            assert!(result.is_err(), "{tag}: a session created across the change was used: {result:?}");
+            assert!(is_dsh_access_refusal(&result.unwrap_err()), "{tag}: the authority change must cancel admission");
+            assert!(take_model_error(&context, "group:42").is_none() && !pipeline.failure_reported);
+            assert!(!seen.iter().any(|p| p == "/api/session/prompt" || p == "/api/session/selectModel"));
             assert_eq!(crate::session_map::lookup(&context, "group:42").unwrap(), None, "{tag}: the new session was bound");
             assert!(seen.iter().any(|p| p == "/api/workspace/archiveSession"), "{tag}: the new session must be archived: {seen:?}");
             drop(pipeline);
             std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn t48_session_admission_is_not_a_model_error() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+        for (allow, deny, admitted) in [
+            (serde_json::json!([]), serde_json::json!([]), false),
+            (serde_json::json!([42]), serde_json::json!([42]), false),
+            (serde_json::json!([42]), serde_json::json!([]), true),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let root = fake_runtime_root("t48-session-admission");
+            let config = serde_json::json!({"consoleToken":"fixture-token","ownerQQ":"7001",
+                "allow":{"groups":allow},"deny":{"groups":deny},"allowAllWhenEmpty":true});
+            std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+            std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+            write_selected_secret(&root, [0x48; 32]);
+            let dependencies = serde_json::json!({
+                "dsh":format!("http://127.0.0.1:{port}"),
+                "model":format!("http://127.0.0.1:{port}"),
+                "onebot":format!("http://127.0.0.1:{port}")
+            });
+            std::fs::write(root.join("dependencies.json"), dependencies.to_string()).unwrap();
+            let context = RuntimeContext::from_root(&root).unwrap();
+            let cfg = context.load_config().unwrap();
+            let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, true).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut paths = Vec::new();
+                while let Some((mut stream, request)) =
+                    fake_dsh_accept(&listener, std::time::Duration::from_secs(2))
+                {
+                    if request.path == "/send_private_msg" {
+                        let body = r#"{"status":"ok","retcode":0,"data":{"message_id":123}}"#;
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    } else {
+                        // DSH returns a malformed workspace result. This is a genuine backend failure.
+                        fake_dsh_respond(&mut stream, &request, 200, serde_json::json!({}));
+                    }
+                    paths.push(request.path);
+                }
+                paths
+            });
+            let error = pipeline.ask_with_failover("group:42", "fixture prompt", 5, &cfg).await.unwrap_err();
+            let note = take_model_error(&context, "group:42");
+            let reported = pipeline.failure_reported;
+            let paths = server.join().unwrap();
+            drop(pipeline);
+            std::fs::remove_dir_all(root).unwrap();
+            if admitted {
+                assert!(note.is_some() && reported, "backend failure must be reported: {error}");
+                assert_eq!(paths, ["/api/workspace/create", "/send_private_msg"]);
+            } else {
+                assert!(note.is_none(), "session admission must not leave a model error note: {note:?}");
+                assert!(!reported && paths.is_empty(), "session admission must not call DSH or alert the owner: {paths:?}");
+                assert!(is_cancellation_error(&error), "{error}");
+            }
         }
     }
 
@@ -3257,7 +3321,7 @@ mod tests {
             });
             let result = pipeline.ensure_session("group:42");
             let seen = server.join().unwrap();
-            let error = result.expect_err(&format!("{tag}: the session was used"));
+            let error = String::from(result.expect_err(&format!("{tag}: the session was used")));
             assert!(seen.iter().any(|p| p == "/api/workspace/archiveSession"), "{tag}: the new session must be archived: {seen:?}");
             if refuse_archive {
                 assert!(error.contains("fixture-archive-refused"), "{tag}: the archive failure was swallowed: {error}");
@@ -3333,7 +3397,7 @@ mod tests {
                 seen
             });
 
-            let error = pipeline.ensure_session("group:42").unwrap_err();
+            let error = String::from(pipeline.ensure_session("group:42").unwrap_err());
             assert!(error.contains("重新登录也失败"), "unexpected refresh error: {error}");
             let seen = server.join().unwrap();
             assert_eq!(seen.len(), 2, "isolated refresh must not use ambient DSH_HOME: {seen:?}");

@@ -2666,6 +2666,40 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn t48_denied_ingress_leaves_bootstrap_unclaimed() {
+        let (root, hub) = queued_hub("t48-denied-ingress").await;
+        let _cleanup = CleanupRoot(root);
+        let mut hub = hub;
+        hub.ready.clear();
+        let key = "group:420042";
+        let mut state = hub.state().unwrap();
+        state["conversations"][key]["bootstrapSent"] = json!(false);
+        hub.context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
+        for (id, allow, deny) in [
+            (48, json!([]), json!([])),
+            (49, json!([420042]), json!([420042])),
+        ] {
+            let mut cfg = hub.context.load_config().unwrap();
+            cfg["allow"]["groups"] = allow;
+            cfg["deny"] = json!({"groups":deny});
+            cfg["allowAllWhenEmpty"] = json!(true);
+            cfg["slang"] = json!({"enabled":false});
+            let frame = json!({"post_type":"message","message_type":"group","group_id":420042,"user_id":1001,
+                "message_id":id,"message":[{"type":"text","data":{"text":"fixture wake"}}]});
+            let raw = frame.to_string();
+            let ev = serde_json::from_value(frame).unwrap();
+            hub.handle_with_config(cfg, &ev, &raw, false, 9001, "bot", &HashMap::new()).await.unwrap();
+            let event_key = inbound::event_key(key, "message", Some(&id.to_string()), &raw);
+            assert_eq!(hub.journal.run(move |j| j.stage_of(&event_key)).await.unwrap(), None,
+                "refused ingress must never enter wake evaluation");
+            assert_eq!(hub.state().unwrap()["conversations"][key]["bootstrapSent"], false);
+            assert!(hub.ready.is_empty() && hub.active.is_empty());
+        }
+        assert!(crate::turn_ledger::read_records(&hub.context).unwrap().is_empty());
+        assert!(crate::send_outbox::read_records(&hub.context).unwrap().is_empty());
+    }
+
     /// #186: the reserved2 ingress gate reads the allow and deny lists of each event's configuration.
     #[tokio::test]
     async fn t186_ingress_reads_allow_and_deny_from_each_events_configuration() {
@@ -3948,7 +3982,8 @@ impl Hub {
                     .as_ref()
                     .err()
                     .is_some_and(|e| e.starts_with(pipeline::HELD_ERROR_PREFIX));
-            if still_valid && !held {
+            let access_refused = result.as_ref().is_err_and(|error| pipeline::is_dsh_access_refusal(error));
+            if still_valid && !held && !access_refused {
                 if let (Err(message), None) = (&result, &model_error) {
                     let shown = if crate::pipeline::configured_outbound_violation(&cfg, message, &[]).is_some() {
                         "（含敏感信息，已隐藏）".to_string()
@@ -3958,7 +3993,7 @@ impl Hub {
                     crate::activity::append(&self.context, &format!("{key} agent 处理出错：{}", crate::activity::slice(&shown, 80)));
                 }
             }
-            let retry = still_valid && result.is_err() && unsubmitted && !held
+            let retry = still_valid && result.is_err() && unsubmitted && !held && !access_refused
                 && route != pipeline::Reserved2Route::ExpiredBeforeAdmission;
             // The prompt never reached DSH and DSH is down: wait for it (bounded) instead of burning the retries.
             let wait_for_dsh = retry && !uses_cli
@@ -4190,13 +4225,12 @@ impl Hub {
             }.await;
             let (previous, dispatch_token, prompt, cli_prompt, target) = match prepared {
                 Ok(prepared) => prepared,
-                Err(error) if error == STALE_WAKE => {
-                    // Its epoch ended while it waited: nothing of it runs or is retried, and its
-                    // ingress is settled.
-                    println!("[reserved2] {key} 排队的唤醒令牌代际已变，丢弃");
+                Err(error) if error == STALE_WAKE || error == console::WAKE_SETTINGS_INVALIDATED => {
+                    // Authority changed while the wake was queued. Settle its ingress without a retry.
                     self.invalidate_key(&key, now).await?;
                     self.journal.mark_handled(keys, now).await?;
-                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":"token-invalidated"}))?;
+                    let reason = if error == STALE_WAKE { "token-invalidated" } else { "settings-invalidated" };
+                    self.record("logs/rbridge-live.jsonl", &json!({"ts":now,"key":key,"reason":reason}))?;
                     continue;
                 }
                 Err(error) => {

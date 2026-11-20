@@ -10,6 +10,40 @@ use super::*;
 use crate::dependency::{Clock, Idempotency, RetryDecision, RetryPolicy, SystemClock};
 use crate::dsh::{FollowStream, TurnUsage};
 
+const ACCESS_REFUSAL_PREFIX: &str = "回合已取消：DSH 会话准入：";
+
+pub(crate) fn is_dsh_access_refusal(error: &str) -> bool {
+    error.starts_with(ACCESS_REFUSAL_PREFIX)
+}
+
+/// A local loss of session authority must bypass backend reporting and failover.
+#[derive(Debug)]
+pub(super) enum DshTurnError {
+    AccessRefused(String),
+    Failure(String),
+}
+
+impl From<String> for DshTurnError {
+    fn from(error: String) -> Self {
+        Self::Failure(error)
+    }
+}
+
+impl From<&str> for DshTurnError {
+    fn from(error: &str) -> Self {
+        Self::Failure(error.into())
+    }
+}
+
+impl From<DshTurnError> for String {
+    fn from(error: DshTurnError) -> Self {
+        match error {
+            DshTurnError::AccessRefused(reason) => format!("{ACCESS_REFUSAL_PREFIX}{reason}"),
+            DshTurnError::Failure(error) => error,
+        }
+    }
+}
+
 impl Pipeline {
     fn dsh_switch_summary(&self, key: &str, sid: &str, cfg: &serde_json::Value) -> Result<Option<String>, String> {
         if !self.context.is_isolated() { return Ok(None); }
@@ -107,7 +141,7 @@ impl Pipeline {
     }
 
     /// 取（或新建）某个 QQ 会话对应的 DSH sessionId。
-    pub fn ensure_session(&mut self, key: &str) -> Result<String, String> {
+    pub(super) fn ensure_session(&mut self, key: &str) -> Result<String, DshTurnError> {
         if key.starts_with("ab:") {
             return Err("shadow isolation refused: stored shadow sessions cannot use the live session path".into());
         }
@@ -115,7 +149,7 @@ impl Pipeline {
         // it is bound; a revocation, reset or mode change in between archives the new session.
         let epoch = if self.context.is_isolated() { Some(self.access_epoch(key)) } else { None };
         if epoch.as_ref().is_some_and(|e| !matches!(e.allowed, Ok(true))) {
-            return Err(format!("当前模式不允许会话 {key}"));
+            return Err(DshTurnError::AccessRefused(format!("当前模式不允许会话 {key}")));
         }
         if self.context.is_isolated() {
             // Fresh read: the console may have reset or replaced this mapping since the last turn.
@@ -148,6 +182,11 @@ impl Pipeline {
         if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
             self.require_preset(&preset)?;
         }
+        let access_changed = |pipe: &Self| epoch.as_ref().is_some_and(|before| !pipe.access_epoch(key).still(before));
+        let refused = || DshTurnError::AccessRefused(format!("会话创建期间 {key} 已重置或权限已变化"));
+        if access_changed(self) {
+            return Err(refused());
+        }
         let create = |rpc: &crate::dsh::Rpc| {
             let mut request = serde_json::json!({ "workspaceId": ws_id });
             if !preset.is_empty() { request["agentPreset"] = serde_json::json!(preset); }
@@ -160,12 +199,20 @@ impl Pipeline {
         // 不这么做的话，DSH 每重启一次，Rust 就得人工重启才能恢复。
         let created = match create(&self.rpc) {
             Ok(v) => v,
+            Err(_) if access_changed(self) => return Err(refused()),
             Err(e) if e.contains("401") => {
                 println!("[dsh] session/create 401，重读密钥后重试");
                 self.rpc.relogin().map_err(|re| format!("{e}；重新登录也失败：{re}"))?;
-                create(&self.rpc)?
+                if access_changed(self) {
+                    return Err(refused());
+                }
+                match create(&self.rpc) {
+                    Ok(created) => created,
+                    Err(_) if access_changed(self) => return Err(refused()),
+                    Err(error) => return Err(error.into()),
+                }
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         };
         let sid = created
             .get("sessionId")
@@ -173,6 +220,9 @@ impl Pipeline {
             .ok_or_else(|| format!("session/create 没返回 sessionId：{created}"))?
             .to_string();
 
+        if access_changed(self) {
+            return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, false)));
+        }
         if self.context.is_isolated() && matches!(crate::console::runtime_mode(&self.context).as_str(), "chat" | "reserved") {
             // Chat: the JS title (`renameSessionForUi`) is resolved after the model is selected and
             // set once the first prompt is in DSH's hands.
@@ -185,10 +235,8 @@ impl Pipeline {
             );
         }
 
-        if let Some(epoch) = &epoch {
-            if !self.access_epoch(key).still(epoch) {
-                return Err(self.discard_created_session(key, &sid, false));
-            }
+        if access_changed(self) {
+            return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, false)));
         }
         self.store.sessions.insert(
             key.to_string(),
@@ -199,17 +247,15 @@ impl Pipeline {
             if let Err(error) = crate::session_map::bind(&self.context, key, &sid, Some(&policy)) {
                 // Never leave a created session running unbound in DSH.
                 let discarded = self.discard_created_session(key, &sid, false);
-                return Err(format!("绑定新会话失败：{error}；{discarded}"));
+                return Err(format!("绑定新会话失败：{error}；{discarded}").into());
             }
         } else {
             self.store.save_for_runtime(&self.context)?;
         }
         // A change between the check and the binding retires the mapping again (JS re-checks after
         // `saveState`).
-        if let Some(epoch) = &epoch {
-            if !self.access_epoch(key).still(epoch) {
-                return Err(self.discard_created_session(key, &sid, true));
-            }
+        if access_changed(self) {
+            return Err(DshTurnError::AccessRefused(self.discard_created_session(key, &sid, true)));
         }
         Ok(sid)
     }
@@ -220,7 +266,13 @@ impl Pipeline {
         let mode = crate::console::runtime_mode(&self.context);
         AccessEpoch {
             mode_stamp: crate::reserved::mode_stamp(&self.context),
-            allowed: self.context.load_config().map(|cfg| crate::console::access_allowed(&cfg, &mode, key)).map_err(str::to_string),
+            allowed: self.context.load_config().map(|cfg| {
+                if mode == "reserved2" {
+                    crate::console::inbound_admitted(&cfg, key)
+                } else {
+                    crate::console::access_allowed(&cfg, &mode, key)
+                }
+            }).map_err(str::to_string),
             resets: crate::turn_ledger::reset_count(&self.context, key),
             token: crate::console::conversation_token(&self.context, key),
             policy: self.session_policy(key),
@@ -544,7 +596,7 @@ impl Pipeline {
     }
 
     /// 会话明确失效（DSH 不认它了）：撤销映射、停掉/归档旧会话、作废旧令牌、换新会话。
-    fn replace_session(&mut self, key: &str, old: &str, reason: &str) -> Result<String, String> {
+    fn replace_session(&mut self, key: &str, old: &str, reason: &str) -> Result<String, DshTurnError> {
         crate::session_map::retire_if(&self.context, key, old)?;
         let _ = crate::dsh::stop_session_work(&self.rpc, old);
         let _ = crate::dsh::archive_session(&self.rpc, old);
@@ -700,7 +752,7 @@ impl Pipeline {
         self.refusals_recorded.clear();
         self.active_candidate = None;
         let result = self.ask_with_failover_inner(key, prompt, timeout, cfg).await;
-        if let Err(error) = &result {
+        if let Err(DshTurnError::Failure(error)) = &result {
             if !self.failure_reported && !is_cancellation_error(error)
                 && error.as_str() != crate::prompt::WAKE_BRIEFING_CHANGED
                 && !error.contains("preset") && !error.contains("预设")
@@ -713,9 +765,10 @@ impl Pipeline {
         // A failure to reach DSH marks it down (queued work waits for recovery); a call that went through marks it up.
         match &result {
             Ok(_) => crate::dsh_health::note_call_success(&self.context, cfg),
-            Err(error) => crate::dsh_health::note_call_failure(&self.context, cfg, error),
+            Err(DshTurnError::Failure(error)) => crate::dsh_health::note_call_failure(&self.context, cfg, error),
+            Err(DshTurnError::AccessRefused(_)) => {}
         }
-        result
+        result.map_err(String::from)
     }
 
     pub(super) fn cli_fallback(&mut self, cfg: &serde_json::Value, key: &str, prompt: &str, timeout_secs: u64) -> Result<(String, String), String> {
@@ -767,7 +820,7 @@ impl Pipeline {
         prompt: &str,
         timeout: std::time::Duration,
         cfg: &serde_json::Value,
-    ) -> Result<String, String> {
+    ) -> Result<String, DshTurnError> {
         // Work on a delivery copy, after chat logging/storage and before either backend.
         let model_prompt = crate::model_view::strip_text_with_runtime(&self.context, prompt, cfg);
         let prompt = model_prompt.as_str();
@@ -847,20 +900,20 @@ impl Pipeline {
                 Err(note) => {
                     let (provider, model) = crate::model_failure::cli_identity(cfg, id);
                     self.report_backend_failure(cfg, key, id, &provider, &model, "", &note);
-                    return Err(note);
+                    return Err(note.into());
                 }
             }
         }
         // A pinned CLI may run independently, but its fallback must not contact a DSH already
         // known to be down. Unpinned callers can safely park this unsubmitted turn for recovery.
         if crate::dsh_health::is_down(&self.context) {
-            return Err("DSH 不可用，未提交到 DSH".to_string());
+            return Err("DSH 不可用，未提交到 DSH".into());
         }
         // #179: while a guarded DSH profile row is missing the turn is refused before any DSH call; the guard alerts
         // the owner itself, so no model-failure alert follows.
         if let Err(error) = crate::dsh_profile::admit(&self.context) {
             self.failure_reported = true;
-            return Err(error);
+            return Err(error.into());
         }
         // 按会话取候选链：这个群配了独立模型就用它的，否则回落全局。
         seg_cli = t0.elapsed().as_millis() as i64;
@@ -906,7 +959,7 @@ impl Pipeline {
                         println!("[failover] 模型全设不上（{e}），改用 CLI 后端 {backend_id} 拿到回复");
                         return Ok(text);
                     }
-                    Err(note) => return Err(format!("{e}；CLI 后端也没成：{note}")),
+                    Err(note) => return Err(format!("{e}；CLI 后端也没成：{note}").into()),
                 }
             },
         };
@@ -932,8 +985,8 @@ impl Pipeline {
                 .await
                 {
                     Ok(Ok(f)) => f,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err("FollowStream 握手超时（20s）".to_string()),
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(_) => return Err("FollowStream 握手超时（20s）".into()),
                 },
             };
             seg_open += t0.elapsed().as_millis() as i64 - seg_cli - seg_sess - seg_model;
@@ -1003,7 +1056,7 @@ impl Pipeline {
                     // above); nothing was submitted, and no other candidate may try.
                     follow.close().await;
                     self.failure_reported = true;
-                    return Err(e);
+                    return Err(e.into());
                 }
                 Err(e) if !prompt_error_needs_probe(self.cur_turn.is_some(), &e) => {
                     Err(Submit::Refused(format!("prompt 调用失败：{e}")))
@@ -1033,7 +1086,7 @@ impl Pipeline {
             let failed: Result<(), String> = match submitted {
                 Err(Submit::Unverified(why)) => {
                     follow.close().await;
-                    return self.pause_unknown(key, "prompt-unverified", &why);
+                    return self.pause_unknown(key, "prompt-unverified", &why).map_err(DshTurnError::from);
                 }
                 Err(Submit::Refused(why)) => {
                     follow.close().await;
@@ -1126,7 +1179,7 @@ impl Pipeline {
                                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                                 while self.context.read_optional_text(RuntimeArea::Data, "fault-hold-collector-bookkeeping")?.is_some() {
                                     if tokio::time::Instant::now() >= deadline {
-                                        return Err("collector bookkeeping test gate timed out".to_string());
+                                        return Err("collector bookkeeping test gate timed out".into());
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                                 }
@@ -1167,7 +1220,7 @@ impl Pipeline {
                     if reply.is_err() || classified_failure.is_some() {
                         if let Some(turn) = &self.cur_turn {
                             if let Err(error) = turn.release_completion(&rpc_id) {
-                                return self.pause_unknown(key, "completion-release-failed", &error);
+                                return self.pause_unknown(key, "completion-release-failed", &error).map_err(DshTurnError::from);
                             }
                         }
                     }
@@ -1212,7 +1265,7 @@ impl Pipeline {
                         total_ms: t0.elapsed().as_millis() as i64,
                     });
                     if let Some(reason) = retired {
-                        return Err(format!("回合已取消：{reason}"));
+                        return Err(format!("回合已取消：{reason}").into());
                     }
                     if let Some(reason) = ledger_cancel {
                         // The independent cap/preemption handler owns terminal settlement after
@@ -1220,7 +1273,7 @@ impl Pipeline {
                         // claim stands). DSH's aborted end is still a successful transport result.
                         self.turn_final = true;
                         if observation_sleep { return Ok(String::new()); }
-                        return Err(format!("回合已取消：{reason}"));
+                        return Err(format!("回合已取消：{reason}").into());
                     }
                     match reply {
                         Ok(text) => match classified_failure {
@@ -1289,7 +1342,7 @@ impl Pipeline {
                             Outcome::Unknown,
                             &format!("{key}: {why}; stopping the DSH turn failed: {stop}"),
                         );
-                        return self.pause_unknown(key, "turn-unverified", &format!("{why}；停止 DSH 回合失败：{stop}"));
+                        return self.pause_unknown(key, "turn-unverified", &format!("{why}；停止 DSH 回合失败：{stop}")).map_err(DshTurnError::from);
                     }
                 }
                 recovery_log::record(
@@ -1300,7 +1353,7 @@ impl Pipeline {
                     Outcome::Unknown,
                     &format!("{key}: {why}; the prompt is not delivered again"),
                 );
-                return Err(format!("{why}（回合状态未知，已取消该回合，不换候选重投）"));
+                return Err(format!("{why}（回合状态未知，已取消该回合，不换候选重投）").into());
             }
             // 重投之前核对这一轮是否仍然有效：会话被重置/替换、令牌被换过都意味着它已被取消，
             // 不能靠重投把它救回来。
@@ -1309,7 +1362,7 @@ impl Pipeline {
                     self.report_turn_error(cfg, key, message);
                 }
                 self.finish_turn("cancelled", &invalid);
-                return Err(format!("回合已取消：{invalid}（此前失败：{why}）"));
+                return Err(format!("回合已取消：{invalid}（此前失败：{why}）").into());
             }
             let kind = failover::classify_message(&why);
             // 这一轮里模型已经发过消息就不再换候选重投：重投会让它再发一遍。
@@ -1380,7 +1433,7 @@ impl Pipeline {
                     }
                 },
                 Err(failover::GiveUp::AlreadySent) => {
-                    return Err(format!("{why}（模型已发送过消息，不重投、不回落）"));
+                    return Err(format!("{why}（模型已发送过消息，不重投、不回落）").into());
                 }
                 Err(g) => {
                     // DSH 的候选链全挂了 —— 再试 `backends` 里配的 CLI 后端（R4，仅 `backends.failoverFallback` 开启时才会跑）。
@@ -1402,7 +1455,7 @@ impl Pipeline {
         timeout_secs: u64,
         why_full: String,
         reason: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, DshTurnError> {
         match self.cli_fallback(cfg, key, prompt, timeout_secs) {
             Ok((backend_id, text)) => {
                 println!("[failover] DSH 全挂，改用 CLI 后端 {backend_id} 拿到回复");
@@ -1416,7 +1469,7 @@ impl Pipeline {
                 );
                 Ok(text)
             }
-            Err(note) => Err(format!("{why_full}；CLI 后端也没成：{note}")),
+            Err(note) => Err(format!("{why_full}；CLI 后端也没成：{note}").into()),
         }
     }
     /// 投一句 prompt 并等到这一轮结束，返回回复正文。

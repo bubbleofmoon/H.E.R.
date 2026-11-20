@@ -504,6 +504,28 @@ fn record_unreadable_refusals(context: &runtime::RuntimeContext, count: u64) {
     );
 }
 
+/// Drop scheduler work and settle its saved inputs when current policy refuses it.
+async fn compat_wake_admitted(
+    cfg: &Value,
+    key: &str,
+    journal: &inbound::SharedJournal,
+    awaiting: &mut HashMap<String, Vec<String>>,
+    drivers: &mut HashMap<String, session::Driver>,
+    synced: &mut HashMap<String, session::WakeSync>,
+    now: i64,
+) -> Result<bool, String> {
+    if console::inbound_admitted(cfg, key) {
+        return Ok(true);
+    }
+    if let Some(events) = awaiting.get(key) {
+        journal.mark_handled(events.clone(), now).await?;
+        awaiting.remove(key);
+    }
+    drivers.remove(key);
+    synced.remove(key);
+    Ok(false)
+}
+
 /// Wake configurations written to the state file by a tool or the console (`confirmedAt` changed) reach the
 /// running state machine of the conversation. `synced` remembers the last `session::WakeSync` seen per conversation.
 fn sync_wake_configs(
@@ -516,12 +538,10 @@ fn sync_wake_configs(
 ) {
     // Finite sleeps must work after restart even before the first inbound event.
     // The live reserved2 hub owns general driver creation and turn lifecycle.
-    let current_cfg = if context.is_isolated() { context.load_config().ok() } else { Some(cfg.clone()) };
-    if let Some(cfg) = current_cfg.as_ref().filter(|cfg| {
-        cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) != Some(false)
-            && state.get("paused").and_then(Value::as_bool) != Some(true)
-            && console::runtime_mode(context) == "reserved2"
-    }) {
+    if cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) != Some(false)
+        && state.get("paused").and_then(Value::as_bool) != Some(true)
+        && console::runtime_mode(context) == "reserved2"
+    {
         if let Some(conversations) = state.get("conversations").and_then(Value::as_object) {
             for (key, conversation) in conversations {
                 let finite = conversation.get("wakeConfig").is_some_and(|wc| {
@@ -537,6 +557,9 @@ fn sync_wake_configs(
         }
     }
     for (key, driver) in drivers.iter_mut() {
+        if !console::inbound_admitted(cfg, key) {
+            continue;
+        }
         let Some(wc) = state.get("conversations").and_then(|c| c.get(key)).and_then(|c| c.get("wakeConfig")) else {
             continue;
         };
@@ -2319,6 +2342,14 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         //   · DSH           → `prompt::build`（完整提示词）+ 模型自己调工具发
         // 都由 `run_turn` 内部按 `backends.sessions` 决定，这里只把两份 prompt 都备好。
         for (key, reason) in std::mem::take(&mut pending_live) {
+            let Ok(current_cfg) = runtime_context.load_config() else {
+                pending_live.push((key, reason));
+                continue;
+            };
+            if !compat_wake_admitted(&current_cfg, &key, &journal, &mut awaiting, &mut drivers, &mut wake_synced, tick_now).await? {
+                continue;
+            }
+            inbound::start_processing(&journal, &mut awaiting, &mut in_flight, &key, tick_now).await?;
             if let Some(pipe) = pipeline.as_mut() {
                 let Ok(target) = parse_target(&key, &cfg_raw) else {
                     println!("[her] {key} 的 target 解析失败，跳过");
@@ -2419,11 +2450,21 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     continue;
                 }
                 // 没有新消息也要推进定时器：合批窗口、回复检查、有限潜水全靠它。
+                let Ok(current_cfg) = runtime_context.load_config() else {
+                    continue;
+                };
                 if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
-                    sync_wake_configs(&runtime_context, &cfg_raw, &state, &mut drivers, &mut wake_synced, tick_now);
+                    sync_wake_configs(&runtime_context, &current_cfg, &state, &mut drivers, &mut wake_synced, tick_now);
+                }
+                let keys: Vec<_> = drivers.keys().cloned().collect();
+                for key in keys {
+                    compat_wake_admitted(&current_cfg, &key, &journal, &mut awaiting, &mut drivers, &mut wake_synced, tick_now).await?;
                 }
                 for (k, e) in session::pump_all(&mut drivers, tick_now) {
-                    inbound::start_processing(&journal, &mut awaiting, &mut in_flight, &k, now_ms() as i64).await?;
+                    let dispatch = live_mode && live_groups.iter().any(|g| g == &k);
+                    if !dispatch {
+                        inbound::start_processing(&journal, &mut awaiting, &mut in_flight, &k, now_ms() as i64).await?;
+                    }
                     wakes += 1;
                     println!("[her] 定时唤醒 {k} ({})", e.reason);
                     append_runtime_json_line(
@@ -2435,8 +2476,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
 
                     // 灰度里的会话：排队给 live pipeline，下一轮循环开头执行。
                     // 不在这里直接跑，是因为 ticker 在 select! 分支里，拿不到 &mut pipeline。
-                    if live_mode && live_groups.iter().any(|g| g == &k) {
-                        pending_live.push((k.clone(), e.reason.clone()));
+                    if dispatch {
+                        pending_live.push((k, e.reason));
                     }
 
                 }
@@ -2823,14 +2864,14 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         };
 
         // #186: the allow and deny lists of this event's configuration, never a startup snapshot.
-        let allowed = match runtime_context.load_config() {
-            Ok(gate_cfg) => console::inbound_admitted(&gate_cfg, &key),
+        let gate_cfg = match runtime_context.load_config() {
+            Ok(gate_cfg) => gate_cfg,
             Err(error) => {
                 println!("[her] ❌ 读取配置失败，{key} 的事件未处理：{error}");
-                false
+                continue;
             }
         };
-        if !allowed {
+        if !console::inbound_admitted(&gate_cfg, &key) {
             continue;
         }
 
@@ -2877,7 +2918,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             && (live_groups.is_empty() || live_groups.iter().any(|g| g == &key))
             && (is_message || ev.sub_type == "poke")
         {
-            match console::claim_first_wake(&runtime_context, &cfg_raw, &key) {
+            match console::claim_first_wake(&runtime_context, &gate_cfg, &key) {
                 Ok(true) => {
                     println!("[her] {key} 首次唤醒：升级为 bootstrap");
                     wake = true;
@@ -3011,7 +3052,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         });
 
         if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
-            sync_wake_configs(&runtime_context, &cfg_raw, &state, &mut drivers, &mut wake_synced, now_i);
+            sync_wake_configs(&runtime_context, &gate_cfg, &state, &mut drivers, &mut wake_synced, now_i);
         }
         let driver = drivers.get_mut(&key).expect("driver exists");
         let rec = json!({
@@ -3475,6 +3516,52 @@ mod tests {
         assert!(lines[0].contains("group:420044") && lines[1].contains("private:7001"), "{lines:?}");
         let agreed = json!({"allow": {"groups": [420042]}, "rollout": {"enabled": true, "rustGroups": ["group:420042"]}});
         assert!(report_rollout_scope(&context, &agreed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn t48_compat_queued_timer_work_checks_current_access() {
+        let root = isolated_runtime_fixture("t48-compat-timer");
+        let context = runtime::RuntimeContext::from_root(&root).unwrap();
+        let journal = inbound::SharedJournal::new(inbound::Journal::open(&context).unwrap());
+        let mut awaiting = HashMap::new();
+        let mut drivers = HashMap::new();
+        let mut synced = HashMap::new();
+        let key = "group:42";
+        let allowed = json!({"allow":{"groups":[42]}});
+        let timer = json!({"wakeConfig":{"mode":"diving","infinite":false,"confirmedAt":1,
+            "sleepUntil":"2000-01-01T00:00:00.000Z"}});
+        let now = now_ms() as i64;
+        let due_driver = || {
+            let mut driver = session::Driver::new(session::scheduler_from_state(wake_cfg_of(&allowed), &timer), 1);
+            driver.adopt_wake_config(session::wake_config_from_json(timer.get("wakeConfig")), now);
+            driver
+        };
+        for (id, current) in [
+            (1, json!({"allow":{"groups":[]},"allowAllWhenEmpty":true})),
+            (2, json!({"allow":{"groups":[42]},"deny":{"groups":[42]}})),
+        ] {
+            let event = format!("{key}|message:{id}");
+            journal.record_received(event.clone(), key.into(), "{}".into(), now).await.unwrap();
+            awaiting.insert(key.into(), vec![event.clone()]);
+            drivers.insert(key.into(), due_driver());
+            synced.insert(key.into(), session::WakeSync::of(&timer["wakeConfig"]));
+            assert!(!compat_wake_admitted(&current, key, &journal, &mut awaiting, &mut drivers, &mut synced, now)
+                .await.unwrap(), "queued compatibility work must be refused after access changes");
+            assert!(session::pump_all(&mut drivers, now).is_empty());
+            assert!(!awaiting.contains_key(key) && !synced.contains_key(key));
+            assert_eq!(journal.run(move |j| j.stage_of(&event)).await.unwrap().as_deref(), Some("handled"));
+        }
+        drivers.insert(key.into(), due_driver());
+        assert!(compat_wake_admitted(&allowed, key, &journal, &mut awaiting, &mut drivers, &mut synced, now)
+            .await.unwrap());
+        let ready = session::pump_all(&mut drivers, now);
+        assert_eq!(ready.len(), 1, "the allowed timer reaches dispatch");
+        assert_eq!(ready[0].0, key);
+        assert_eq!(ready[0].1.reason, "timeout");
+        assert!(crate::turn_ledger::read_records(&context).unwrap().is_empty());
+        assert!(crate::send_outbox::read_records(&context).unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

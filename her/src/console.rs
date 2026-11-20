@@ -9546,6 +9546,8 @@ pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, k
     }).map_err(|(_, e)| e)
 }
 
+pub(crate) const WAKE_SETTINGS_INVALIDATED: &str = "wake invalidated by current settings";
+
 /// Claim wake bookkeeping before prompt construction. The deadline survives until a ledger turn owns it.
 /// `expected`: the token the queued wake was seen under; a different current token refuses the
 /// claim (`queued wake token invalidated`) before anything changes.
@@ -9553,7 +9555,7 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
     mutate_social_state_for(context, |state| {
         let cfg = context.load_config().map_err(|e|(503,e.to_string()))?;
         if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(&cfg,key) {
-            return Err((403,"wake invalidated by current settings".to_string()));
+            return Err((403, WAKE_SETTINGS_INVALIDATED.to_string()));
         }
         let conv = &mut state["conversations"][key];
         let previous = conv.clone();
