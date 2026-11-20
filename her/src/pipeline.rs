@@ -2589,6 +2589,51 @@ mod tests {
         (root, context)
     }
 
+    fn shadow_refusal_fixture() -> (crate::runtime::tests::FixtureRoot, RuntimeContext, Value) {
+        let cfg = json!({"consoleToken": "fixture-token", "allow": {"groups": [42]}});
+        let dependencies = json!({
+            "dsh": "http://127.0.0.1:43201",
+            "model": "http://127.0.0.1:43202",
+            "onebot": "http://127.0.0.1:43203",
+        });
+        let root = crate::runtime::tests::runtime_fixture(
+            std::env::temp_dir().join(crate::turn_ledger::mint_id("her-shadow-refusal-")),
+            &cfg,
+            &dependencies,
+        );
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        (root, context, cfg)
+    }
+
+    #[test]
+    fn shadow_key_is_refused_by_live_session_entry() {
+        let (_root, context, cfg) = shadow_refusal_fixture();
+        let mut pipeline = Pipeline::new_without_dsh(&context, &cfg, false).unwrap();
+
+        assert_eq!(
+            pipeline.ensure_session("ab:group:42"),
+            Err("shadow isolation refused: stored shadow sessions cannot use the live session path".into()),
+            "the live session entry must explicitly refuse a stored shadow key"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_key_is_refused_before_pinned_cli_failover() {
+        let (root, context, mut cfg) = shadow_refusal_fixture();
+        write_selected_secret(&root.0, [0x37; 32]);
+        // A nonexistent backend makes reaching the CLI route observable without launching a process.
+        cfg["backends"] = json!({"sessions": {"ab:group:42": "missing-fixture-backend"}});
+        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, false).unwrap();
+
+        assert_eq!(
+            pipeline
+                .ask_with_failover("ab:group:42", "fixture prompt", 5, &cfg)
+                .await,
+            Err("shadow isolation refused: shadow cannot use live or CLI failover".into()),
+            "the failover entry must refuse a shadow key before trying its CLI pin"
+        );
+    }
+
     fn cli_recall_fixture(tag: &str) -> (PathBuf, RuntimeContext, Pipeline, rusqlite::Connection) {
         let (root, context) = isolated_fixture(tag);
         let conn = crate::memory::open_ready_for_runtime(&context).unwrap();
