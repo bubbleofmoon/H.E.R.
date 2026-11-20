@@ -128,6 +128,7 @@ fn inspector_replays_events_in_sequence() {
         call_id: "fixture-call".into(),
         fn_name: "qq_get_status".into(),
         fn_arguments: json!({"example":true}),
+        thought_signatures: None,
     };
     let assistant = Event::Assistant {
         text: "Checking.".into(),
