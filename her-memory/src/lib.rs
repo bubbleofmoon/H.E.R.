@@ -7,7 +7,7 @@
 //!
 //! 分词必须与 JS 的 `segment()` 完全一致，否则同一个库会出现不同的检索结果（且是静默的）。
 
-use rusqlite::{params, Connection, ToSql};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 
 pub mod parity_clock;
 mod store;
@@ -195,8 +195,7 @@ fn resolve_reader_scope(
             params![reader_key, person.clone().unwrap_or_default()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut allow_all = is_owner;
     for (_rtype, read_type, read_id) in rows {
@@ -212,8 +211,7 @@ fn resolve_reader_scope(
                     .prepare("SELECT member_type, member_id FROM team_member WHERE team_id=?1")?;
                 let members: Vec<(String, String)> = ms
                     .query_map(params![read_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .filter_map(Result::ok)
-                    .collect();
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
                 for (mt, mid) in members {
                     ids.push(if mt == "person" {
                         format!("person:{mid}")
@@ -740,7 +738,7 @@ fn upsert_memory_inner(conn: &Connection, m: &MemoryInput<'_>) -> rusqlite::Resu
             params![m.owner_id, m.source, m.content],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
     if let Some(id) = existing {
         conn.execute(
             "UPDATE memory SET last_used_at = ?1, importance = MAX(importance, ?2) WHERE id = ?3",
@@ -770,7 +768,6 @@ fn can_read_id(
     is_owner: bool,
     id: i64,
 ) -> rusqlite::Result<bool> {
-    use rusqlite::OptionalExtension;
     let row: Option<(String, String, i64)> = conn
         .query_row(
             "SELECT owner_id,scope,archived FROM memory WHERE id=?1",
@@ -861,7 +858,7 @@ fn grant_acl(
             params![reader_type, reader_id, read_type, read_id],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
         let detail = format!("{reader_type}:{reader_id} -> {read_type}:{read_id}={level}");
         if let Some(id) = existing {
             conn.execute(
@@ -923,8 +920,7 @@ fn list_acl(conn: &Connection) -> rusqlite::Result<Vec<AclRow>> {
                 r.get(6)?,
             ))
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -963,9 +959,11 @@ pub fn index_hint(
     refs.push(&lim as &dyn ToSql);
 
     let mut stmt = conn.prepare(&sql)?;
-    let terms: Vec<String> = stmt
+    let raw_terms: Vec<Option<String>> = stmt
         .query_map(refs.as_slice(), |r| r.get::<_, Option<String>>(0))?
-        .filter_map(Result::ok)
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let terms: Vec<String> = raw_terms
+        .into_iter()
         .flatten()
         .filter(|t| !exclude.iter().any(|e| e == t))
         .collect();

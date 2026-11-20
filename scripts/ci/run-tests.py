@@ -104,7 +104,7 @@ for name, command in commands:
         slot_command = command
         if args.slot_worktree or crate != 'her':
             subcommand, rest = command.split(' ', 1)
-            slot_command = subcommand + ' --manifest-path "' + str(root / crate / 'Cargo.toml') + '" ' + rest
+            slot_command = subcommand + ' --manifest-path "' + str((args.slot_worktree or root) / crate / 'Cargo.toml') + '" ' + rest
         cmd = ['powershell.exe', '-NoProfile', '-File', str(args.slot_script or root / 'scripts/cargo-slot.ps1'),
                '-Ticket', args.slot_ticket, '-WorkTree', str(args.slot_worktree or root), '-EvidenceDir', str(ev),
                '-RunName', name, '-Cargo', slot_command]
