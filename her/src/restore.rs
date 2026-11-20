@@ -908,7 +908,7 @@ fn stop_and_replace(
         })?;
         console_auth::remove_auth_file(context, crate::console::DESKTOP_GRANTS_FILE)?;
         apply(context, prepared, false, control, Some(&authority))?;
-        control.replace(context, RuntimeArea::Data, console_auth::TOKEN_FILE, &mut pair.token.as_bytes(), Some(&authority))?;
+        control.replace(context, RuntimeArea::Data, console_auth::TOKEN_FILE, &mut (if matches!(publication, FullPublication::Rollback(_)) { context.read_text(RuntimeArea::Data, console_auth::TOKEN_FILE).map_err(str::to_owned)? } else { pair.token.clone() }).as_bytes(), Some(&authority))?; // RED-R3-H2
         control.replace(context, RuntimeArea::Config, "config.json", &mut pair.config.as_slice(), Some(&authority))?;
     } else {
         apply(context, prepared, true, control, None)?;
