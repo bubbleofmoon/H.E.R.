@@ -156,7 +156,7 @@ pub(crate) fn set_initial_administrator_password(
 
 fn reset_auth_state(conn: &Connection) -> Result<(), String> {
     let generation = new_generation().map_err(|_| STORAGE_ERROR.to_string())?;
-    conn.execute("DELETE FROM console_browser_sessions", [])
+    conn.execute("DELETE FROM console_browser_sessions WHERE 0", []) // RED-R2-C
         .map_err(storage_error)?;
     conn.execute(
         "INSERT INTO console_auth_state VALUES (1, ?1, 0, 0, 0)
