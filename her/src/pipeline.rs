@@ -30,6 +30,11 @@ pub(crate) fn pinned_cli_backend<'a>(cfg: &'a serde_json::Value, key: &str) -> O
         .filter(|id| !id.is_empty())
 }
 
+struct WakePromptRefs {
+    dsh: Option<Vec<serde_json::Value>>,
+    cli: Option<Vec<serde_json::Value>>,
+}
+
 #[cfg(not(test))]
 const SESSION_FILE: &str = crate::legacy_path!("state/rust-sessions.json");
 
@@ -377,6 +382,70 @@ impl From<TurnAdmissionError> for String {
     }
 }
 
+enum LedgerAdmissionError {
+    Failed(String),
+    Held { message: String, record: serde_json::Value },
+}
+
+impl From<String> for LedgerAdmissionError {
+    fn from(error: String) -> Self { Self::Failed(error) }
+}
+
+impl From<LedgerAdmissionError> for String {
+    fn from(error: LedgerAdmissionError) -> Self {
+        match error {
+            LedgerAdmissionError::Failed(message) | LedgerAdmissionError::Held { message, .. } => message,
+        }
+    }
+}
+
+pub(crate) type MintedEpoch = Arc<Mutex<Option<String>>>;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Reserved2Route {
+    #[default]
+    Dsh,
+    Cli,
+    PendingHarness,
+    Harness,
+    ExpiredBeforeAdmission,
+}
+
+pub(crate) type SharedReserved2Route = Arc<Mutex<Reserved2Route>>;
+
+const RESERVED2_CAP_BEFORE_ADMISSION: &str = "reserved2 wake reached turnTimeout before admission";
+
+/// Revoke an admitted simulation epoch and publish the exact replacement to the hub.
+pub(crate) fn revoke_reserved2_epoch(
+    context: &RuntimeContext, key: &str, token: &str, publication: Option<&MintedEpoch>,
+) -> Result<(), String> {
+    // Same order as the hub's epoch observation and DSH's own epoch publication.
+    let mut minted = publication.map(|slot| slot.lock().unwrap_or_else(|p| p.into_inner()));
+    let replacement = crate::conversation_authority::revoke_if_current(context, key, token)?;
+    if let (Some(slot), Some(token)) = (minted.as_mut(), replacement) {
+        **slot = Some(token);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Reserved2Budget {
+    pub(crate) deadline: i64,
+    pub(crate) cap_ms: i64,
+    pub(crate) ceiling: i64,
+    pub(crate) began: i64,
+}
+
+impl Reserved2Budget {
+    pub(crate) fn deadline_for(&self, conv: &serde_json::Value) -> i64 {
+        crate::console::reserved2_deadline(self.deadline, self.cap_ms, self.ceiling, self.began, conv)
+    }
+
+    pub(crate) fn expired(&self, conv: &serde_json::Value) -> bool {
+        crate::turn_ledger::now_ms() >= self.deadline_for(conv)
+    }
+}
+
 pub struct Pipeline {
     /// Per-runtime failover memory shared by every pipeline of the process (see `failover_state_for`).
     failover: Arc<Mutex<FailoverState>>,
@@ -410,13 +479,18 @@ pub struct Pipeline {
     /// Where the scheduler learns which DSH session this turn uses (to cancel exactly that one).
     session_slot: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     /// Where the scheduler learns the epoch this turn minted when it abandoned an attempt.
-    minted_slot: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    minted_slot: Option<MintedEpoch>,
+    reserved2_route: Option<SharedReserved2Route>,
+    reserved2_budget: Option<Reserved2Budget>,
+    reserved2_admitted: Option<MintedEpoch>,
     #[cfg(test)]
     pub(crate) rotation_locked_hook: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     after_abandon_rotation: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     completion_observed_hook: Option<Box<dyn FnMut() + Send>>,
+    #[cfg(test)]
+    pub(crate) harness_cap_poll_hook: Option<tokio::sync::oneshot::Sender<tokio::sync::oneshot::Sender<()>>>,
     /// The scripted adapter the next admitted turn runs on, instead of its selected engine.
     #[cfg(test)]
     scripted: Option<crate::turn_engine::Script>,
@@ -424,6 +498,8 @@ pub struct Pipeline {
     before_turn: Option<Box<dyn FnOnce() -> Option<String> + Send>>,
     dispatch_wake: Option<(i64, serde_json::Value)>,
     dispatch_deadline: Option<i64>,
+    #[cfg(test)]
+    pub(crate) admission_clock: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
     dispatch_unsubmitted: bool,
     /// Chat mode (ticket 12): the run state of the chat turn in flight.
     chat: Option<ChatRun>,
@@ -685,6 +761,9 @@ impl Pipeline {
             dispatch_token: None,
             session_slot: None,
             minted_slot: None,
+            reserved2_route: None,
+            reserved2_budget: None,
+            reserved2_admitted: None,
             #[cfg(test)]
             rotation_locked_hook: None,
             #[cfg(test)]
@@ -692,10 +771,14 @@ impl Pipeline {
             #[cfg(test)]
             completion_observed_hook: None,
             #[cfg(test)]
+            harness_cap_poll_hook: None,
+            #[cfg(test)]
             scripted: None,
             before_turn: None,
             dispatch_wake: None,
             dispatch_deadline: None,
+            #[cfg(test)]
+            admission_clock: None,
             dispatch_unsubmitted: true,
             chat: None,
             last_report: None,
@@ -726,7 +809,11 @@ impl Pipeline {
     /// The scheduler's view of this turn's session (filled when the session is known).
     pub fn share_session(&mut self, slot: std::sync::Arc<std::sync::Mutex<Option<String>>>) { self.session_slot = Some(slot); }
     /// The scheduler's view of the token this turn mints when it abandons an attempt.
-    pub fn share_minted_epoch(&mut self, slot: std::sync::Arc<std::sync::Mutex<Option<String>>>) { self.minted_slot = Some(slot); }
+    pub fn share_minted_epoch(&mut self, slot: MintedEpoch) { self.minted_slot = Some(slot); }
+    pub(crate) fn share_reserved2_route(&mut self, slot: SharedReserved2Route, admitted: MintedEpoch) {
+        self.reserved2_route = Some(slot);
+        self.reserved2_admitted = Some(admitted);
+    }
     /// Run `check` right before the chat turn begins; `Some(reason)` drops the turn.
     pub fn recheck_before_turn(&mut self, check: Box<dyn FnOnce() -> Option<String> + Send>) { self.before_turn = Some(check); }
 
@@ -833,7 +920,7 @@ impl Pipeline {
                 return Err("mode or permission changed".to_string());
             }
         }
-        // Only DSH turns are bound to a DSH session mapping (reserved2 runs on DSH).
+        // Only DSH turns are bound to a DSH session mapping.
         if self.chat.as_ref().is_none_or(|c| c.adapter.uses_dsh()) {
             match crate::session_map::lookup(&self.context, key) {
                 Ok(Some(current)) if current == sid => {},
@@ -977,53 +1064,106 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let dsh_refs = crate::model_failure::take_prompt_refs(&self.context, &key, "dsh", dsh_prompt);
         let cli_refs = crate::model_failure::take_prompt_refs(&self.context, &key, "cli", cli_prompt)
             .or_else(|| crate::model_failure::snapshot_refs(cli_prompt));
-        let refs = if pinned_cli_backend(cfg, &key).is_some() { cli_refs } else { dsh_refs };
+        let refs = WakePromptRefs { dsh: dsh_refs, cli: cli_refs };
         if !self.context.is_isolated() {
             crate::console::begin_legacy_wait_turn(&self.context, &key)?;
             let deadline = self.dispatch_deadline.take().unwrap_or_else(||crate::turn_ledger::now_ms()
                 .saturating_add(crate::wake::turn_budget(cfg).hard_cap_ms));
             crate::console::set_legacy_wait_deadline(&self.context, &key, deadline)?;
-            self.carried_messages = refs.unwrap_or_default();
-            return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, crate::turn_engine::Adapter::Dsh).await;
+            self.carried_messages.clear();
+            return self.run_turn_inner(target, dsh_prompt, cli_prompt, cfg, cfg, crate::turn_engine::Adapter::Dsh, refs).await;
         }
-        let key = target.key();
-        let (adapter, _admission) = self.turn_adapter(&key, "reserved2").await?;
-        let token = self.begin_ledger_turn(&key)?;
+        let admission = self.turn_adapter(&key, "reserved2").await;
+        if let Some(route) = &self.reserved2_route {
+            let mut route = route.lock().unwrap_or_else(|p| p.into_inner());
+            if *route == Reserved2Route::ExpiredBeforeAdmission
+                || ((admission.is_ok() || *route == Reserved2Route::PendingHarness) && self.dispatch_expired())
+            {
+                *route = Reserved2Route::ExpiredBeforeAdmission;
+                return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
+            }
+            if let Ok((adapter, _, admitted_cfg)) = &admission {
+                let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
+                *route = if matches!(adapter, crate::turn_engine::Adapter::Harness) {
+                    Reserved2Route::Harness
+                } else if adapter.uses_dsh() && pinned_cli_backend(cli_cfg, &key).is_some() {
+                    Reserved2Route::Cli
+                } else {
+                    Reserved2Route::Dsh
+                };
+            }
+        } else if admission.is_ok() && self.dispatch_expired() {
+            return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
+        }
+        let (adapter, _admission, admitted_cfg) = admission?;
+        let cli_cfg = admitted_cfg.as_ref().unwrap_or(cfg);
+        let harness = matches!(&adapter, crate::turn_engine::Adapter::Harness);
+        let token = match self.begin_ledger_turn_as(&key, adapter.id(), true) {
+            Err(error) if (harness || matches!(error, LedgerAdmissionError::Held { .. })) && self.dispatch_expired() => {
+                if let LedgerAdmissionError::Held { message, mut record } = error {
+                    record["k"] = serde_json::json!("ended");
+                    record["t"] = serde_json::json!(crate::turn_ledger::now_ms());
+                    record["held"] = serde_json::json!(true);
+                    record["outcome"] = serde_json::json!("cancelled");
+                    record["reason"] = serde_json::json!("turnTimeout");
+                    // Recovery still owns the hold if its durable end could not be written.
+                    crate::turn_ledger::append_record(&self.context, &record)
+                        .map_err(|error| format!("{message}: {error}"))?;
+                }
+                self.publish_expired_route();
+                return Err(RESERVED2_CAP_BEFORE_ADMISSION.into());
+            }
+            result => result?,
+        };
+        if let Some(admitted) = &self.reserved2_admitted {
+            *admitted.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
+        }
         let dispatched_at = self.dispatch_wake.as_ref().map(|(at, _)|*at).unwrap_or(self.turn_began);
         let cap_ms = crate::wake::turn_budget(cfg).hard_cap_ms;
         let deadline = self.dispatch_deadline.take().unwrap_or_else(||dispatched_at.saturating_add(cap_ms));
         // Engaged turns measure the cap from her last send (capMs), bounded by the dispatch ceiling.
         let ceiling = deadline.saturating_sub(cap_ms).saturating_add(crate::wake::turn_ceiling_ms(cfg)).max(deadline);
-        if let Err(error) = crate::turn_ledger::append_record(&self.context,
-            &serde_json::json!({"k":"budget","turn":self.cur_turn.as_ref().unwrap().id,"t":self.turn_began,"deadline":deadline,
-                "capMs":cap_ms,"ceiling":ceiling})) {
-            self.end_ledger_turn(Err(&error));
-            return Err(error);
-        }
-        if let Some(refs) = refs { self.carried_messages = refs; }
-        if let Some((at, previous)) = self.dispatch_wake.take() {
-            let claim = serde_json::json!({"at":at,"previous":previous});
-            let durable = self.cur_turn.as_ref().unwrap().wake_claim(&claim)
-                .and_then(|_| crate::console::consume_reserved2_deadline(&self.context, &key, &token, at, &previous));
-            if let Err(error) = durable {
-                self.end_ledger_turn(Err(&error));
-                return Err(error);
+        self.reserved2_budget = Some(Reserved2Budget { deadline, cap_ms, ceiling, began: self.turn_began });
+        let prepared = (|| {
+            crate::turn_ledger::append_record(&self.context,
+                &serde_json::json!({"k":"budget","turn":self.cur_turn.as_ref().unwrap().id,"t":self.turn_began,"deadline":deadline,
+                    "capMs":cap_ms,"ceiling":ceiling}))?;
+            if let Some((at, previous)) = self.dispatch_wake.take() {
+                let claim = serde_json::json!({"at":at,"previous":previous});
+                self.cur_turn.as_ref().unwrap().wake_claim(&claim)?;
+                crate::console::consume_reserved2_deadline(&self.context, &key, &token, at, &previous)?;
             }
-        }
-        let dsh_prompt = patch_token_line(dsh_prompt, &token);
-        let result = self.run_turn_inner(target, &dsh_prompt, cli_prompt, cfg, adapter).await;
+            Ok(())
+        })();
+        let result = match prepared {
+            Ok(()) => {
+                let dsh_prompt = patch_token_line(dsh_prompt, &token);
+                self.run_turn_inner(target, &dsh_prompt, cli_prompt, cfg, cli_cfg, adapter, refs).await
+            }
+            Err(error) => Err(error),
+        };
+        // Check failures from every preparation step, including a lost snapshot response.
+        let result = if harness && result.is_err() && self.dispatch_unsubmitted && !self.turn_final
+            && self.harness_admission_expired(&key)
+        {
+            Err(self.expire_unadmitted_harness(&key))
+        } else {
+            result
+        };
+        self.reserved2_budget = None;
         self.end_ledger_turn(result.as_ref().map(|_| ()).map_err(String::as_str));
         result
     }
 
     /// Open the ledger entry of a turn (selected runtime). Refuses, recording the wake as `held`,
     /// while the conversation has a paused or unreconciled turn. Returns the agent token in force.
+    #[cfg(test)]
     fn begin_ledger_turn(&mut self, key: &str) -> Result<String, String> {
-        self.begin_ledger_turn_as(key, crate::turn_engine::Engine::Dsh.id())
+        self.begin_ledger_turn_as(key, crate::turn_engine::Engine::Dsh.id(), false).map_err(String::from)
     }
 
-    /// `begin_ledger_turn` for a turn whose adapter is `backend` (`turn_engine::Adapter::id`).
-    fn begin_ledger_turn_as(&mut self, key: &str, backend: &str) -> Result<String, String> {
+    /// Begin a durable turn for the adapter that will run it.
+    fn begin_ledger_turn_as(&mut self, key: &str, backend: &str, reserved2: bool) -> Result<String, LedgerAdmissionError> {
         let inbound = std::mem::take(&mut self.next_inbound);
         self.refusals_recorded.clear();
         self.carried_messages = inbound.iter().filter_map(|key| key.rsplit_once("|message:")
@@ -1033,26 +1173,25 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let records = crate::turn_ledger::read_records(&self.context)?;
         let (turns, _) = crate::turn_ledger::fold(&records);
         if let Some(blocking) = crate::turn_ledger::blocking_turn(&turns, key) {
-            let _ = crate::turn_ledger::append_record(
-                &self.context,
-                &serde_json::json!({
-                    "k": "held", "t": crate::turn_ledger::now_ms(), "key": key,
-                    "inbound": inbound, "reason": reason, "blockedBy": blocking.id,
-                }),
-            );
-            return Err(format!(
-                "{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）",
-                blocking.id
-            ));
+            let record = serde_json::json!({
+                "k":"held", "turn":crate::turn_ledger::mint_id("held-"), "t":crate::turn_ledger::now_ms(),
+                "key":key, "backend":backend, "inbound":inbound, "reason":reason, "blockedBy":blocking.id,
+            });
+            crate::turn_ledger::append_record(&self.context, &record)?;
+            let message = format!("{HELD_ERROR_PREFIX}会话 {key} 有暂停或恢复中的回合 {}，本次唤醒已记录（管理端 /api/turns）", blocking.id);
+            return Err(LedgerAdmissionError::Held { message, record });
         }
         let token = crate::console::ensure_or_rotate_agent_token(&self.context, key, false)?;
         if self.dispatch_token.take().is_some_and(|expected| expected != token) {
-            return Err("queued wake token invalidated".to_string());
+            return Err("queued wake token invalidated".to_string().into());
         }
         let epoch = crate::send_outbox::token_epoch(&token);
         let ledger_offset = crate::turn_ledger::ledger_len(&self.context).ok();
-        let recorder =
-            crate::turn_ledger::Recorder::begin(&self.context, key, backend, &reason, &epoch, &inbound, None)?;
+        let recorder = if reserved2 {
+            crate::turn_ledger::Recorder::begin_reserved2(&self.context, key, backend, &reason, &epoch, &inbound)?
+        } else {
+            crate::turn_ledger::Recorder::begin(&self.context, key, backend, &reason, &epoch, &inbound, None)?
+        };
         self.cur_turn = Some(recorder);
         self.turn_ledger_offset = ledger_offset;
         self.turn_final = false;
@@ -1265,7 +1404,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         self.preset_chat = crate::chat::chat_preset(cfg);
         self.owner_qq = crate::chat::owner_qq(cfg);
         self.note_turn("chat", inbound);
-        let (adapter, _admission) = match self.turn_adapter(key, mode).await {
+        let (adapter, _admission, _) = match self.turn_adapter(key, mode).await {
             Ok(admission) => admission,
             Err(TurnAdmissionError::ParkSwitchUntil(at)) => return Ok(ChatTurnOutcome::ParkSwitchUntil(at)),
             Err(TurnAdmissionError::Refused(reason)) => return Err(reason),
@@ -1286,7 +1425,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         if let Some(reason) = self.before_turn.take().and_then(|check| check()) {
             return Err(reason);
         }
-        self.begin_ledger_turn_as(key, adapter.id())?;
+        self.begin_ledger_turn_as(key, adapter.id(), false)?;
         self.chat = Some(ChatRun {
             adapter,
             reserved: None,
@@ -1339,9 +1478,9 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         })
         .await
         .map_err(|_| "图片获取失败".to_string())?;
-        let (adapter, _admission) = self.turn_adapter(key, "reserved").await?;
+        let (adapter, _admission, _) = self.turn_adapter(key, "reserved").await?;
         authority.check(&self.context, key)?;
-        self.begin_ledger_turn_as(key, adapter.id())?;
+        self.begin_ledger_turn_as(key, adapter.id(), false)?;
         let ack = if authority.social() || silent {
             None
         } else {
@@ -1372,26 +1511,43 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     // ── the turn-engine seam (`turn_engine`) ─────────────────────────────────────
 
     /// The adapter admitted for the next turn, or the scripted adapter a test installed.
-    async fn turn_adapter(&mut self, key: &str, mode: &str) -> Result<(crate::turn_engine::Adapter, Option<crate::engine_switch::TurnGates>), TurnAdmissionError> {
+    async fn turn_adapter(&mut self, key: &str, mode: &str) -> Result<(
+        crate::turn_engine::Adapter, Option<crate::engine_switch::TurnGates>, Option<serde_json::Value>,
+    ), TurnAdmissionError> {
         if !self.context.is_isolated() {
-            return Ok((crate::turn_engine::Adapter::Dsh, None));
+            return Ok((crate::turn_engine::Adapter::Dsh, None, None));
         }
         let release = crate::release::turn_guard(&self.context).await?;
         let gate = crate::engine_switch::turn_gate(&self.context, key).await?;
+        if self.reserved2_route.as_ref().is_some_and(|route| {
+            *route.lock().unwrap_or_else(|p| p.into_inner()) == Reserved2Route::ExpiredBeforeAdmission
+        }) {
+            return Err(TurnAdmissionError::Refused(RESERVED2_CAP_BEFORE_ADMISSION.into()));
+        }
         let gates = (release, gate);
         #[cfg(test)]
         if let Some(script) = self.scripted.take() {
-            return Ok((crate::turn_engine::Adapter::Scripted(script), Some(gates)));
+            return Ok((crate::turn_engine::Adapter::Scripted(script), Some(gates), None));
         }
         let (context, key, mode) = (self.context.clone(), key.to_string(), mode.to_string());
+        let simulation = mode == "reserved2";
+        let expected = self.dispatch_token.clone().filter(|_| simulation);
+        let publication = self.minted_slot.clone().filter(|_| simulation);
         // The blocking task retains both gates if its async caller is cancelled.
-        tokio::task::spawn_blocking(move || {
+        let (engine, token, gates, cfg) = tokio::task::spawn_blocking(move || {
             use crate::engine_switch::TurnPreparation;
-            match crate::engine_switch::prepare_turn(&context, &key, &mode)? {
-                TurnPreparation::Ready(engine) => Ok((crate::turn_engine::Adapter::for_engine(engine), Some(gates))),
+            let (preparation, cfg) =
+                crate::engine_switch::prepare_turn(&context, &key, &mode, expected.as_deref(), publication.as_ref())?;
+            match preparation {
+                TurnPreparation::Ready(engine) => Ok((engine, None, gates, cfg)),
+                TurnPreparation::Switched(engine, token) => Ok((engine, Some(token), gates, cfg)),
                 TurnPreparation::ParkUntil(at) => Err(TurnAdmissionError::ParkSwitchUntil(at)),
             }
-        }).await.map_err(|_| "engine admission worker stopped".to_string())?
+        }).await.map_err(|_| "engine admission worker stopped".to_string())??;
+        if let Some(token) = token.filter(|_| simulation && self.dispatch_token.is_some()) {
+            self.dispatch_token = Some(token);
+        }
+        Ok((crate::turn_engine::Adapter::for_engine(engine), Some(gates), simulation.then_some(cfg)))
     }
 
     /// Run one admitted turn on `adapter`. The pipeline already holds the turn's ledger entry and
@@ -1465,6 +1621,69 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         script.reply.clone()
     }
 
+    fn check_harness_authority(&self, key: &str) -> Result<serde_json::Value, String> {
+        if self.reserved2_budget.is_none() {
+            return self.chat_guard(key, "").map(|()| serde_json::Value::Null);
+        }
+        let cfg = self.context.load_config().map_err(str::to_string)?;
+        let state = self.context.read_social_state()?;
+        let conv = &state["conversations"][key];
+        if crate::harness::Tools::current_mode(&self.context) != "reserved2"
+            || !crate::console::inbound_admitted(&cfg, key)
+            || cfg.pointer("/socialV2/enabled") == Some(&serde_json::json!(false))
+            || state["paused"] == true
+            || conv["agentToken"].as_str() != Some(self.turn_token.as_str())
+        {
+            return Err("mode, permission or turn generation changed".into());
+        }
+        Ok(state)
+    }
+
+    fn check_harness_turn(&self, key: &str) -> Result<bool, String> {
+        let state = self.check_harness_authority(key)?;
+        Ok(self.reserved2_budget.is_some_and(|budget| budget.expired(&state["conversations"][key])))
+    }
+
+    fn harness_admission_expired(&self, key: &str) -> bool {
+        self.reserved2_budget.is_some_and(|budget| {
+            match self.context.read_social_state() {
+                Ok(state) => budget.expired(&state["conversations"][key]),
+                // A failed state read cannot grant a pre-admission wake an extension.
+                Err(_) => crate::turn_ledger::now_ms() >= budget.deadline,
+            }
+        })
+    }
+
+    fn dispatch_expired(&self) -> bool {
+        self.dispatch_deadline.is_some_and(|deadline| {
+            #[cfg(test)]
+            if let Some(clock) = &self.admission_clock { return clock() >= deadline; }
+            crate::turn_ledger::now_ms() >= deadline
+        })
+    }
+
+    fn publish_expired_route(&self) {
+        if let Some(route) = &self.reserved2_route {
+            *route.lock().unwrap_or_else(|p| p.into_inner()) = Reserved2Route::ExpiredBeforeAdmission;
+        }
+    }
+
+    fn expire_unadmitted_harness(&mut self, key: &str) -> String {
+        self.publish_expired_route();
+        // The companion console may have granted snapshot receipts even if rendering failed.
+        if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
+            eprintln!("[turn] expired wake revocation failed: {error}");
+        }
+        self.finish_turn("cancelled", "turnTimeout");
+        crate::harness::DEADLINE_EXCEEDED.into()
+    }
+
+    fn revoke_harness_cap(&self, key: &str) {
+        if let Err(error) = revoke_reserved2_epoch(&self.context, key, &self.turn_token, self.minted_slot.as_ref()) {
+            eprintln!("[turn] simulation cap revocation failed: {error}");
+        }
+    }
+
     /// The harness adapter: admit the turn to HER's own harness, stream it, cancel it when the
     /// conversation's mode, permission or token changes, and report its facts.
     async fn ask_harness(
@@ -1479,52 +1698,153 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         // is told (the DSH path clears it the same way).
         take_model_error(&self.context, key);
         let begun = std::time::Instant::now();
-        self.chat_guard(key, "")?;
+        if self.check_harness_turn(key)? {
+            return Err(self.expire_unadmitted_harness(key));
+        }
         // #162: the conversation's selected model route first, then the other routes in configured order.
         let route = ModelRoute::for_conversation(&self.context, cfg, key)?;
         let harness = Harness::open(&self.context)?;
-        let recorder = self.cur_turn.as_ref().ok_or("harness requires a durable bridge turn")?;
+        let recorder = self.cur_turn.clone().ok_or("harness requires a durable bridge turn")?;
         let attempt = format!("harness:{}", recorder.id);
-        recorder.attempt(&attempt, "")?;
-        let mut turn = harness.admit(TurnRequest {
+        let mode = self.chat.as_ref().map_or("reserved2", |c| c.mode.as_str());
+        let mut delivery = crate::harness::TurnDelivery {
+            recorder: Some(recorder.clone()),
+            reserved2_budget: self.reserved2_budget,
+            ..Default::default()
+        };
+        let (prompt, layers) = if mode == "reserved2" && self.current_reason != "wakeReminder" {
+            let mut record = harness.wake_briefing(key, &self.turn_epoch)?;
+            let persona = crate::persona::briefing_identity(&self.context, key);
+            let identity = serde_json::json!(persona);
+            if record["installed"].is_object() && record["persona"] != identity {
+                crate::briefing_delivery::next_generation(&mut record);
+            }
+            record["persona"] = identity;
+            let plan = crate::briefing_delivery::plan(&record);
+            let (context, config, wake_key, token, reason, prebuilt) = (
+                self.context.clone(), cfg.clone(), key.to_owned(), self.turn_token.clone(),
+                self.current_reason.clone(), prompt.to_owned(),
+            );
+            let turn = recorder.id.clone();
+            let (wake, plan) = tokio::task::spawn_blocking(move || {
+                let wake = crate::prompt::render_wake(&context, &config, &wake_key, &token, &reason, &prebuilt, &plan, false, &turn)?;
+                if crate::persona::briefing_identity(&context, &wake_key) != persona {
+                    return Err(crate::prompt::WAKE_BRIEFING_CHANGED.to_owned());
+                }
+                Ok::<_, String>((wake, plan))
+            }).await.map_err(|_| "wake briefing worker stopped".to_owned())??;
+            if !wake.hold(&mut record, &plan, &recorder.id) {
+                return Err(crate::prompt::WAKE_BRIEFING_CHANGED.to_owned());
+            }
+            self.carried_messages.clear();
+            crate::model_failure::merge_refs(&mut self.carried_messages,
+                crate::model_failure::snapshot_refs(&wake.text).unwrap_or_default());
+            let layers = serde_json::json!({"injected": wake.layers.to_json(), "cut": wake.cut.to_json()});
+            // Harness history is keyed by the authority epoch, which also identifies its session.
+            let authority_epoch = self.turn_epoch.as_str();
+            let session_id = authority_epoch;
+            crate::briefing::alert_empty(&self.context, cfg, key, session_id, authority_epoch, plan.generation, &wake.layers);
+            delivery.briefing = Some(record);
+            delivery.full_prompt = wake.full_text;
+            delivery.recalled = wake.recalled;
+            (wake.text, Some(layers))
+        } else if mode == "reserved2" {
+            (prompt.lines().filter(|line| !line.starts_with("【会话令牌】")).collect::<Vec<_>>().join("\n"), None)
+        } else {
+            (prompt.to_owned(), None)
+        };
+        let prompt = if mode == "reserved2" {
+            crate::activity::mask_session_tokens(&prompt, std::slice::from_ref(&self.turn_token))
+        } else { prompt };
+        if let Some(full) = &mut delivery.full_prompt {
+            *full = crate::activity::mask_session_tokens(full, std::slice::from_ref(&self.turn_token));
+        }
+        let deadline = if let Some(budget) = self.reserved2_budget {
+            if self.check_harness_turn(key)? { return Err(self.expire_unadmitted_harness(key)); }
+            std::time::Duration::from_millis(budget.ceiling.saturating_sub(crate::turn_ledger::now_ms()).max(0) as u64)
+        } else { timeout };
+        let tools = crate::harness::Tools::capture(&self.context, cfg, mode, key, &self.turn_epoch)?
+            .with_interactions(self.owner_interactions.clone());
+        let prompt_chars = prompt.chars().count();
+        recorder.attempt_with_layers(&attempt, "", layers.as_ref())?;
+        let mut turn = harness.admit_with_delivery(TurnRequest {
             id: recorder.id.clone(), conversation: key.to_string(), generation: self.turn_epoch.clone(),
-            prompt: prompt.to_string(),
-            // The media parts `run_chat_turn` acquired for this turn: the ones DSH would get.
+            prompt,
             media: self.chat.as_ref().map(|c| c.media_parts.clone()).unwrap_or_default(),
-            profile: if self.chat.as_ref().is_some_and(|c| c.mode == "closed-agent") { "closed-agent".into() } else { self.preset_chat.clone() }, route,
+            profile: if matches!(mode, "closed-agent" | "reserved2") { mode.into() } else { self.preset_chat.clone() },
+            route,
             limits: crate::harness::Limits::from_config(cfg),
-            tools: crate::harness::Tools::capture(&self.context, cfg, self.chat.as_ref().map_or("", |c| c.mode.as_str()), key, &self.turn_epoch)?
-                .with_interactions(self.owner_interactions.clone()),
-            deadline: timeout,
-        })?;
+            tools,
+            deadline,
+        }, delivery)?;
         self.dispatch_unsubmitted = false;
-        recorder.accepted(&attempt)?;
-        // The model starts on admission: this is the thinking start reserved2 typing delays read.
-        let _ = recorder.started();
+        let accepted = recorder.accepted(&attempt);
+        if let Err(error) = accepted {
+            turn.cancel();
+            let _ = turn.wait().await;
+            self.turn_final = matches!(turn.status(), crate::harness::Status::Paused { .. });
+            return Err(error);
+        }
         let started = std::time::Instant::now();
         if let Some(ack) = self.chat.as_mut().and_then(|c| c.ack.take()) {
             self.send_chat_text(key, "", "ack", &ack);
         }
         let mut invalidated = false;
+        let mut capped = false;
         let result = loop {
-            tokio::select! {
+            tokio::select! { biased;
                 result = turn.wait() => break result,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    if self.chat_guard(key, "").is_err() {
-                        invalidated = true;
-                        turn.cancel();
-                        break turn.wait().await;
+                    #[cfg(test)]
+                    if let Some(hook) = self.harness_cap_poll_hook.take() {
+                        let (release, wait) = tokio::sync::oneshot::channel();
+                        let _ = hook.send(release);
+                        let _ = wait.await;
                     }
+                    match self.check_harness_turn(key) {
+                        Ok(false) => continue,
+                        Ok(true) => {
+                            if crate::console::observation_wait_turn(&self.context, key)
+                                .ok().flatten().as_deref() == Some(recorder.id.as_str())
+                            {
+                                // Publish the sleep before revocation can release the handler.
+                                turn.mark_observation_sleep();
+                            }
+                            self.revoke_harness_cap(key);
+                            capped = true;
+                        }
+                        Err(_) => invalidated = true,
+                    }
+                    turn.cancel();
+                    break turn.wait().await;
                 }
             }
         };
+        use crate::harness::Status;
+        let mut status = turn.status();
+        if !capped && self.reserved2_budget.is_some()
+            && (matches!(status, Status::ObservationSleep)
+                || result.as_ref().is_err_and(|error| error == crate::harness::DEADLINE_EXCEEDED))
+        {
+            // The runner can observe the cap while a response or tool dispatch beats our poll.
+            self.revoke_harness_cap(key);
+            capped = true;
+        }
         let turn_ms = started.elapsed().as_millis() as i64;
         for reference in turn.message_refs() {
             if !self.carried_messages.contains(&reference) {
                 self.carried_messages.push(reference);
             }
         }
-        let status = turn.status();
+        // The runner may have committed completion while the cap poll was checking authority.
+        let settled_cap = match &status {
+            Status::ObservationSleep => Some("observationSleep"),
+            Status::Failed(_) | Status::Cancelled if capped => {
+                status = Status::Failed(crate::harness::DEADLINE_EXCEEDED.into());
+                Some("turnTimeout")
+            }
+            _ => None,
+        };
         // The route the turn's last request went to, after any failover.
         let model = turn.model();
         self.report_facts(key, &crate::turn_engine::Facts::of_harness(
@@ -1532,10 +1852,21 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             invalidated,
             attempt,
             format!("openai/{model}"),
-            prompt.chars().count(),
+            prompt_chars,
             turn_ms,
             begun.elapsed().as_millis() as i64,
         ));
+        let result = if let Some(reason) = settled_cap {
+            self.turn_final = true;
+            let observation = reason == "observationSleep";
+            let outcome = if observation { "completed" } else { "cancelled" };
+            let _ = recorder.verified("cancel-requested", reason);
+            if recorder.end_cancellation(outcome, reason).is_err() {
+                eprintln!("[turn] simulation cap terminal write failed; recovery required");
+            }
+            if observation { return Ok(String::new()); }
+            Err(crate::harness::DEADLINE_EXCEEDED.to_owned())
+        } else { result };
         match status {
             crate::harness::Status::Paused { .. } => self.turn_final = true,
             crate::harness::Status::Cancelled => self.finish_turn("cancelled", "harness turn cancelled"),
@@ -1570,7 +1901,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
                 return Err(error);
             }
         };
-        self.chat_guard(key, "")?;
+        // A completed reserved2 turn can reach here after its cap poll revoked its token.
+        // Reserved2 only logs the final text, and the hub checks epoch ownership before settling coverage.
+        if !capped {
+            self.check_harness_authority(key)?;
+        }
         self.last_report = Some(TurnReport { end_kind: "completed".into(), send_tool_ok: turn.sent_tool_reply(), ..Default::default() });
         Ok(text)
     }
@@ -1733,13 +2068,16 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     /// 模型自己调工具发了一条之后，那段"最终回答"（常常是"群里已经回了一句"
     /// 这类内心独白）就被桥接当成话发出去 —— 实测 2026-10-23 11:23:45/48
     /// 那对重复消息就是这么产生的（日志「已回复 9 字」正好对上群里那句）。
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
         &mut self,
         target: &Target,
         dsh_prompt: &str,
         cli_prompt: &str,
         cfg: &serde_json::Value,
+        cli_cfg: &serde_json::Value,
         adapter: crate::turn_engine::Adapter,
+        refs: WakePromptRefs,
     ) -> Result<usize, String> {
         let key = target.key();
         let key: &str = &key;
@@ -1752,14 +2090,19 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         // 为什么不能让它自己调工具：opencode v2 的 MCP 工具藏在 `execute` 代码沙箱里，
         // flash 档模型想不明白，实测会转去 `shell`/`grep`/`glob` 翻仓库，
         // 15 步烧 95 秒还一条消息没读到。改成纯文本后它没有别的路可走。
-        if let Some(id) = pinned_cli_backend(cfg, key) {
+        if let Some(id) = pinned_cli_backend(cli_cfg, key).filter(|_| adapter.uses_dsh()) {
+            let inbound_refs = refs.cli.map(|cli| std::mem::replace(&mut self.carried_messages, cli));
             let (context, backend_cfg, backend_id, backend_key) =
-                (self.context.clone(), cfg.clone(), id.to_owned(), key.to_owned());
-            if let Some(sent) = self.run_cli_turn(target, cli_prompt, cfg, id, move |prompt| {
+                (self.context.clone(), cli_cfg.clone(), id.to_owned(), key.to_owned());
+            if let Some(sent) = self.run_cli_turn(target, cli_prompt, cli_cfg, id, move |prompt| {
                 crate::backend::cli_fallback_by_id_with_runtime(
                     &context, &backend_cfg, &backend_id, &backend_key, prompt, 30,
                 )
             }).await? { return Ok(sent); }
+            if let Some(inbound_refs) = inbound_refs { self.carried_messages = inbound_refs; }
+        }
+        if adapter.uses_dsh() {
+            if let Some(dsh) = refs.dsh { self.carried_messages = dsh; }
         }
 
         // ── 2) The turn engine: full prompt, the model sends through its own tools ──
@@ -1788,7 +2131,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             cfg,
             crate::parity_clock::now_ms(),
         );
-        let reply = self.run_admitted_turn(&adapter, key, &delivered, reserved2_turn_timeout(cfg), cfg).await?;
+        let timeout = if matches!(&adapter, crate::turn_engine::Adapter::Harness) {
+            // The adapter reads the absolute dispatch budget itself.
+            std::time::Duration::ZERO
+        } else {
+            reserved2_turn_timeout(cfg)
+        };
+        let reply = self.run_admitted_turn(&adapter, key, &delivered, timeout, cfg).await?;
         let after = Self::last_ai_reply_at(&self.context, &key);
         let trimmed = reply.trim();
         let n = trimmed.chars().count();
@@ -1798,7 +2147,8 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             self.log_internal_output(key, trimmed);
         }
         println!(
-            "[pipeline] {key}：DSH 回合结束（输出 {n} 字，{}）｜{preview}",
+            "[pipeline] {key}：{} 回合结束（输出 {n} 字，{}）｜{preview}",
+            if adapter.uses_dsh() { "DSH" } else { adapter.id() },
             if after > before {
                 "模型自己发过"
             } else {

@@ -239,6 +239,30 @@ impl Limits {
     }
 }
 
+/// Reserved2 keeps the current wake's full form available if replay loses its base briefing.
+#[derive(Default)]
+pub(crate) struct TurnDelivery {
+    pub recorder: Option<crate::turn_ledger::Recorder>,
+    pub briefing: Option<Value>,
+    pub full_prompt: Option<String>,
+    pub recalled: Vec<i64>,
+    pub reserved2_budget: Option<crate::pipeline::Reserved2Budget>,
+}
+
+impl TurnDelivery {
+    fn check_deadline(
+        budget: Option<crate::pipeline::Reserved2Budget>, context: &RuntimeContext, key: &str,
+    ) -> Result<(), String> {
+        if let Some(budget) = budget {
+            let state = context.read_social_state()?;
+            if budget.expired(&state["conversations"][key]) {
+                return Err(DEADLINE_EXCEEDED.into());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct TurnRequest {
     pub id: String,
     pub conversation: String,
@@ -300,6 +324,7 @@ pub(crate) fn user_message(prompt: &str, media: &[Value]) -> ChatMessage {
 pub enum Status {
     Running,
     Completed(String),
+    ObservationSleep,
     Failed(String),
     Cancelled,
     Paused { reason: String, detail: String },
@@ -400,6 +425,7 @@ pub struct Turn {
     progress: Arc<std::sync::Mutex<Progress>>,
     status: watch::Receiver<Status>,
     cancel: watch::Sender<bool>,
+    observation_sleep: Arc<AtomicBool>,
     events: broadcast::Sender<Event>,
 }
 
@@ -436,11 +462,16 @@ impl Turn {
         let _ = self.cancel.send(true);
     }
 
+    pub(crate) fn mark_observation_sleep(&self) {
+        self.observation_sleep.store(true, Ordering::SeqCst);
+    }
+
     pub async fn wait(&mut self) -> Result<String, String> {
         loop {
             match self.status() {
                 Status::Running => {}
                 Status::Completed(text) => return Ok(text),
+                Status::ObservationSleep => return Ok(String::new()),
                 Status::Failed(reason) => return Err(reason),
                 Status::Cancelled => return Err("回合已取消（harness）".into()),
                 Status::Paused { reason, detail } => {
@@ -484,7 +515,16 @@ impl Harness {
         self.store.status(turn)
     }
 
-    pub fn admit(&self, mut request: TurnRequest) -> Result<Turn, String> {
+    #[cfg(test)]
+    pub fn admit(&self, request: TurnRequest) -> Result<Turn, String> {
+        self.admit_with_delivery(request, TurnDelivery::default())
+    }
+
+    pub(crate) fn wake_briefing(&self, conversation: &str, generation: &str) -> Result<Value, String> {
+        self.store.wake_briefing(conversation, generation)
+    }
+
+    pub(crate) fn admit_with_delivery(&self, mut request: TurnRequest, mut delivery: TurnDelivery) -> Result<Turn, String> {
         if request.id.is_empty() || request.conversation.is_empty() || request.generation.is_empty()
         {
             return Err("harness admission requires turn, conversation and generation".into());
@@ -501,6 +541,9 @@ impl Harness {
         request.tools.check().map_err(String::from)?;
         request.prompt = request.route.redact(&request.prompt);
         request.profile = request.route.redact(&request.profile);
+        if let Some(full) = &mut delivery.full_prompt {
+            *full = request.route.redact(full);
+        }
         // Media labels are text too; image data stays the bytes the pipeline normalized.
         for part in request.media.iter_mut() {
             let redacted = part["text"]
@@ -521,7 +564,7 @@ impl Harness {
             memory.start(&chain, len, std::time::Instant::now())
         });
         // The history after the session's newest checkpoint; the turn's task completes it (`handover::prepare`).
-        let history = self.store.admit(&request)?;
+        let history = self.store.admit_with_briefing(&request, delivery.briefing.take())?;
         let instruction = request.tools.instruction();
         let store = self.store.clone();
         let (status_tx, status) = watch::channel(Status::Running);
@@ -540,6 +583,8 @@ impl Harness {
         }));
         let progress_for_task = progress.clone();
         let task_cancel = cancel.clone();
+        let observation_sleep = Arc::new(AtomicBool::new(false));
+        let task_observation = observation_sleep.clone();
         tokio::spawn(async move {
             // Keep ownership through result persistence and uncertainty publication.
             let _owner = owner;
@@ -547,12 +592,14 @@ impl Harness {
             let cancellation = cancelled.clone();
             let deadline = tokio::time::Instant::now() + request.deadline;
             let deadline_generation = std::sync::OnceLock::new();
+            let mut recalled = delivery.recalled.as_slice();
             let execution = tool_loop(
                 &context,
                 &client,
                 &store,
                 &request,
                 history,
+                &delivery,
                 instruction,
                 &notifications,
                 &sent_flag,
@@ -561,9 +608,15 @@ impl Harness {
                 deadline,
                 &deadline_generation,
                 cancellation,
+                &mut recalled,
             );
             let (outcome, interrupted) = settle_turn(
-                execution, deadline, &task_cancel, cancelled, &request.tools, &deadline_generation,
+                execution,
+                delivery.reserved2_budget.is_none().then_some(deadline),
+                &task_cancel,
+                cancelled,
+                &request.tools,
+                &deadline_generation,
             ).await;
             let mut result = match outcome {
                 Err(Failure::Uncertain(detail)) => Status::Paused {
@@ -578,16 +631,28 @@ impl Harness {
                 Err(Failure::Failed(reason)) => interrupted.unwrap_or(Status::Failed(reason)),
                 Ok(event) => match interrupted {
                     Some(status) => status,
-                    None => {
-                        let Event::Assistant { text, .. } = &event else {
-                            unreachable!()
-                        };
-                        let status = Status::Completed(text.clone());
-                        assistant = Some(event);
-                        status
+                    None => match TurnDelivery::check_deadline(delivery.reserved2_budget, &context, &request.conversation) {
+                        Err(reason) => Status::Failed(reason),
+                        Ok(()) => {
+                            let Event::Assistant { text, .. } = &event else {
+                                unreachable!()
+                            };
+                            let status = Status::Completed(text.clone());
+                            assistant = Some(event);
+                            status
+                        }
                     }
                 },
             };
+            let witnessed_cap = matches!(&result, Status::Failed(reason) if reason == DEADLINE_EXCEEDED)
+                && delivery.reserved2_budget.is_some()
+                && crate::console::observation_wait_turn(&context, &request.conversation)
+                    .ok().flatten().as_deref() == Some(request.id.as_str());
+            if (task_observation.load(Ordering::SeqCst) || witnessed_cap)
+                && matches!(result, Status::Failed(_) | Status::Cancelled)
+            {
+                result = Status::ObservationSleep;
+            }
             if let Err(reason) = store.finish(&request.id, &result, assistant.as_ref()) {
                 result = Status::Paused {
                     reason: "send-unresolved".into(),
@@ -599,6 +664,8 @@ impl Harness {
                 let _ = request.tools.pause(&request.id, reason, detail);
             }
             if let Some(event) = assistant {
+                // Final text counts only after the runner accepts and persists completion.
+                crate::prompt::record_recall_hits(&context, recalled);
                 let _ = notifications.send(event);
             }
             let _ = notifications.send(Event::Ended(result.clone()));
@@ -610,6 +677,7 @@ impl Harness {
             progress,
             status,
             cancel,
+            observation_sleep,
             events,
         })
     }
@@ -617,7 +685,7 @@ impl Harness {
 
 async fn settle_turn<T>(
     execution: impl std::future::Future<Output = Result<T, Failure>>,
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     cancel: &watch::Sender<bool>,
     mut cancelled: watch::Receiver<bool>,
     tools: &Tools,
@@ -626,7 +694,12 @@ async fn settle_turn<T>(
     tokio::pin!(execution);
     let interrupted = tokio::select! { biased;
         _ = cancelled.changed() => Status::Cancelled,
-        _ = tokio::time::sleep_until(deadline) => Status::Failed(DEADLINE_EXCEEDED.into()),
+        _ = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        } => Status::Failed(DEADLINE_EXCEEDED.into()),
         result = &mut execution => return (result, None),
     };
 
@@ -691,6 +764,7 @@ async fn tool_loop(
     store: &store::Store,
     request: &TurnRequest,
     history: store::History,
+    delivery: &TurnDelivery,
     instruction: String,
     events: &broadcast::Sender<Event>,
     sent: &AtomicBool,
@@ -699,10 +773,11 @@ async fn tool_loop(
     deadline: tokio::time::Instant,
     deadline_generation: &std::sync::OnceLock<String>,
     mut cancelled: watch::Receiver<bool>,
+    recalled: &mut &[i64],
 ) -> Result<Event, Failure> {
     let session = history.session.clone();
     // #6: the session's idle rotation and budget checkpoint, before the turn's first request.
-    let (mut messages, rounds) =
+    let (mut messages, rounds, checkpoint_clipped) =
         handover::prepare(context, store, request, history, instruction, &mut cancelled, deadline).await?;
     let mut chain = ChainState::new(context, request, usage::next_number());
     let mut spent = 0u32;
@@ -723,13 +798,27 @@ async fn tool_loop(
         // #175: an oversized tool result reaches the model as a preview; #160: a replayed call to a
         // tool this request does not offer reaches it as text (`budget::fit`).
         let limit = budget::limit(&context.load_config()?, &route.spec.id);
-        let (kept, delivered) = budget::fit(
-            filter_model_messages(context, messages.clone())?,
-            &rounds,
-            &offered,
-            request.limits,
-            limit,
-        );
+        let fit = |messages| -> Result<_, String> {
+            Ok(budget::fit(
+                filter_model_messages(context, messages)?,
+                &rounds,
+                &offered,
+                request.limits,
+                limit,
+            ))
+        };
+        let (mut kept, mut delivered) = fit(messages.clone())?;
+        if let Some(full) = delivery.full_prompt.as_ref().filter(|_| {
+            checkpoint_clipped || kept.len() != messages.len()
+        }) {
+            let current = rounds.last().map_or_else(
+                || usize::from(messages.first().is_some_and(|message| message.role == ChatRole::System)),
+                |last| last.end,
+            );
+            let mut with_full = messages.clone();
+            with_full[current] = user_message(full, &request.media);
+            (kept, delivered) = fit(with_full)?;
+        }
         // Capture only structured references from the request being issued. Later read results
         // and recalled tool facts may add sources absent from the inbound wake. They are read from
         // the whole filtered copy of the rounds kept, so they still cover every ID a preview shows.
@@ -752,6 +841,13 @@ async fn tool_loop(
         });
         // A request that misses is recorded with its size (`ChainState::missed`).
         let request_bytes = serde_json::to_vec(&delivered).map_or(0, |bytes| bytes.len());
+        check_bound(request, &cancelled, deadline)?;
+        TurnDelivery::check_deadline(delivery.reserved2_budget, context, &request.conversation)?;
+        if step == 0 {
+            if let Some(recorder) = &delivery.recorder {
+                recorder.started()?;
+            }
+        }
         let model = model_step(
             client,
             route,
@@ -852,7 +948,9 @@ async fn tool_loop(
             // Revocation may precede the pipeline's cancellation notification. It ends
             // the turn, rather than becoming a refusal with a new durable tool intent.
             check_bound(request, &cancelled, deadline)?;
+            TurnDelivery::check_deadline(delivery.reserved2_budget, context, &request.conversation)?;
             let run = store.tool_start(&request.id, &attempt, &call)?;
+            crate::prompt::record_recall_hits(context, std::mem::take(recalled));
             // Once a validated handler is scheduled, its effects may escape even if
             // it reports an error. Never retry a later model stream in this turn.
             chain.dispatched |= prepared.is_ok();
@@ -888,19 +986,24 @@ async fn tool_loop(
                     let tools = request.tools.clone();
                     let invocation = call.clone();
                     let cancel = cancelled.clone();
-                    let outcome = tokio::task::spawn_blocking(move || {
+                    let budget = delivery.reserved2_budget;
+                    let context = context.clone();
+                    let key = request.conversation.clone();
+                    tokio::task::spawn_blocking(move || {
                         if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
-                            return tools::error("tool dispatch cancelled or expired");
+                            return (tools::error("tool dispatch cancelled or expired"), None);
                         }
-                        tools.dispatch(&invocation, &args)
+                        if let Err(reason) = TurnDelivery::check_deadline(budget, &context, &key) {
+                            return (tools::error("tool dispatch cancelled or expired"), Some(reason.into()));
+                        }
+                        (tools.dispatch(&invocation, &args), None)
                     })
                     .await
                     .map_err(|_| {
                         Failure::Uncertain(
                             "harness tool worker failed before its effect could be settled".into(),
                         )
-                    })?;
-                    (outcome, None)
+                    })?
                 }
             };
             redact(&mut outcome, &request.route.credentials);

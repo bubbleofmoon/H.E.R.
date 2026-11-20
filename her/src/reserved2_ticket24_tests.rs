@@ -125,7 +125,8 @@ async fn a_whole_reset_keeps_a_running_turn_attached_until_it_ends() {
     hub.active.insert(key.into(), Active {
         task: tokio::spawn(async move { let _ = wait.await; (Ok(0), false) }),
         inbound: event.clone(), reason: "operatorMarker".into(), previous: state["conversations"][key].clone(),
-        at: crate::now_ms() as i64, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(), session: Default::default(), minted: Default::default(), cap_abort_at: None, text_only: false,
+        at: crate::now_ms() as i64, token: "test-token".into(), mode_stamp: hub.mode_stamp.clone(), session: Default::default(), minted: Default::default(), cap_abort_at: None,
+        route: Default::default(), admitted: Default::default(),
     });
     let (status, reply) = crate::console::admin_request(&hub.context, "POST", "/api/socialV2/reset", Some(&json!({})));
     assert_eq!(status, 200, "{reply}");

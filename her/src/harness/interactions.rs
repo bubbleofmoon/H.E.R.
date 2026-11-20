@@ -601,7 +601,7 @@ mod tests {
         ).unwrap();
         let turn = super::super::settle_turn(
             wait_for_reply(&lease, reply, None, &mut interaction_cancelled),
-            deadline, &cancel, cancelled, &tools, &generation,
+            Some(deadline), &cancel, cancelled, &tools, &generation,
         );
         tokio::pin!(turn);
         assert!(futures_util::poll!(&mut turn).is_pending());

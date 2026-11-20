@@ -75,9 +75,10 @@ pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<Option<V
 
 /// The scoped choice and global default from one settings snapshot. The caller supplies
 /// the loader's document for the registry's ordinary config and default fallback.
-pub(crate) fn engine_choice(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<Value, String> {
+pub(crate) fn engine_choice(context: &RuntimeContext, cfg: &Value, key: &str, inherit_default: bool) -> Result<Value, String> {
     use crate::settings::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
-    let Inspection::Ready(conn) = inspect(context)? else { return Ok(ENGINE_DEFAULT.read(cfg)) };
+    let fallback = || if inherit_default { ENGINE_DEFAULT.read(cfg) } else { Value::String("dsh".into()) };
+    let Inspection::Ready(conn) = inspect(context)? else { return Ok(fallback()) };
     let scoped = if schema_version(&conn)? >= 2 {
         stored_row(&conn, key, CONVERSATION_ENGINE.key).map_err(|(_, error)| error)?
     } else {
@@ -87,8 +88,9 @@ pub(crate) fn engine_choice(context: &RuntimeContext, cfg: &Value, key: &str) ->
         return serde_json::from_str::<Value>(&text).ok().and_then(|value| CONVERSATION_ENGINE.normalize(&value))
             .ok_or_else(|| "stored conversation engine is invalid".into());
     }
+    if !inherit_default { return Ok(fallback()); }
     Ok(read_stored_values(&conn)?.into_iter().find(|(setting, _)| setting.key == ENGINE_DEFAULT.key)
-        .map_or_else(|| ENGINE_DEFAULT.read(cfg), |(_, value)| value))
+        .map_or_else(fallback, |(_, value)| value))
 }
 
 /// The refusal of a conversation that is not `group:<id>` or `private:<id>`.

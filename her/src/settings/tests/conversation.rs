@@ -24,7 +24,7 @@ fn reset_engine(context: &RuntimeContext, conversation: &str) -> (u16, Value) {
 
 /// The engine the next turn of `conversation` runs on today: the turn engine's reader on the loaded configuration.
 fn next_turn_engine(context: &RuntimeContext, conversation: &str) -> Result<&'static str, String> {
-    crate::turn_engine::Engine::selected(context, &context.load_config().unwrap(), conversation).map(crate::turn_engine::Engine::id)
+    crate::turn_engine::Engine::selected(context, &context.load_config().unwrap(), conversation, "chat").map(crate::turn_engine::Engine::id)
 }
 
 /// `GET /api/settings/conversations`.
@@ -708,8 +708,8 @@ fn legacy_engine_choices_import_once_before_routing() {
     let old = json!({KEPT_GROUP: "harness", LOST_GROUP: "harness", "group:91": "harness"});
     write_config(&root, |config| config["conversationEngines"] = old.clone());
     crate::console::import_engine_choices(&context).unwrap();
-    assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), LOST_GROUP).unwrap(), "harness", "legacy choice must be imported");
-    assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), KEPT_GROUP).unwrap(), "dsh", "the administrator's stored choice wins");
+    assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), LOST_GROUP, true).unwrap(), "harness", "legacy choice must be imported");
+    assert_eq!(crate::settings::engine_choice(&context, &context.load_config().unwrap(), KEPT_GROUP, true).unwrap(), "dsh", "the administrator's stored choice wins");
     assert_eq!(stored_conversations(&root), [KEPT_GROUP, LOST_GROUP]);
     assert!(stored_config(&root).get("conversationEngines").is_none());
 
@@ -728,8 +728,8 @@ fn legacy_engine_import_skips_and_audits_one_invalid_choice() {
     write_config(&root, |config| config["conversationEngines"] = old.clone());
     assert!(crate::console::import_engine_choices(&context).is_ok(), "one invalid choice must not abort the import");
     let cfg = context.load_config().unwrap();
-    assert_eq!(crate::settings::engine_choice(&context, &cfg, KEPT_GROUP).unwrap(), "dsh");
-    assert_eq!(crate::settings::engine_choice(&context, &cfg, LOST_GROUP).unwrap(), "harness");
+    assert_eq!(crate::settings::engine_choice(&context, &cfg, KEPT_GROUP, true).unwrap(), "dsh");
+    assert_eq!(crate::settings::engine_choice(&context, &cfg, LOST_GROUP, true).unwrap(), "harness");
     assert_eq!(stored_conversations(&root), [LOST_GROUP]);
     assert!(stored_config(&root).get("conversationEngines").is_none());
     let (before, _) = history_page(&context, &format!("?conversation={KEPT_GROUP}"));

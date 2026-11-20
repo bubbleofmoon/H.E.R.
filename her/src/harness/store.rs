@@ -151,14 +151,24 @@ impl Store {
 
     pub fn status(&self, turn: &str) -> Result<Option<Status>, String> {
         let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
-        let row: Option<(String, String)> = conn
-            .query_row("SELECT state,result FROM turns WHERE id=?1", [turn], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+        // Restore can reconcile a completed turn whose final text was absent from the snapshot.
+        let row: Option<(String, String, bool)> = conn
+            .query_row(
+                "SELECT t.state,t.result,
+                    CASE WHEN t.state='completed' AND t.result='' THEN EXISTS(
+                        SELECT 1 FROM events e WHERE e.session_id=t.session_id
+                        AND e.turn_id=t.id AND e.kind='turn_ended'
+                        AND json_extract(e.payload,'$.reason')='observationSleep'
+                    ) ELSE 0 END
+                 FROM turns t WHERE t.id=?1",
+                [turn],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .optional()
             .map_err(|_| STORAGE_ERROR)?;
-        row.map(|(state, result)| match state.as_str() {
+        row.map(|(state, result, observation_sleep)| match state.as_str() {
             "running" => Ok(Status::Running),
+            "completed" if observation_sleep => Ok(Status::ObservationSleep),
             "completed" => Ok(Status::Completed(result)),
             "failed" => Ok(Status::Failed(result)),
             "cancelled" => Ok(Status::Cancelled),
@@ -174,9 +184,36 @@ impl Store {
         .transpose()
     }
 
+    /// The latest completed canonical wake, including observation sleep, is eligible for replay.
+    /// If a checkpoint covers its full briefing, the next wake supplies a fresh base.
+    pub(super) fn wake_briefing(&self, conversation: &str, generation: &str) -> Result<Value, String> {
+        let conn = self.conn.lock().map_err(|_| STORAGE_ERROR)?;
+        let current: Option<(String, String)> = conn.query_row(
+            "SELECT e.session_id,e.payload FROM events e JOIN turns t ON e.turn_id=t.id
+             JOIN sessions s ON s.id=e.session_id
+             WHERE s.conversation=?1 AND s.generation=?2 AND e.kind='wake_briefing'
+               AND t.state='completed' ORDER BY e.seq DESC LIMIT 1",
+            params![conversation, generation], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(|_| STORAGE_ERROR)?;
+        let Some((session, payload)) = current else {
+            return Ok(crate::briefing_delivery::fresh(conversation, generation));
+        };
+        let mut record: Value = serde_json::from_str(&payload).map_err(|_| STORAGE_ERROR)?;
+        let through = latest_checkpoint(&conn, &session)?.0;
+        if through >= record["fullSeq"].as_i64().ok_or(STORAGE_ERROR)? {
+            crate::briefing_delivery::history_gap(&mut record, through);
+        }
+        Ok(record)
+    }
+
+    #[cfg(test)]
+    pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
+        self.admit_with_briefing(request, None)
+    }
+
     /// Atomic admission and attempt intent, before the model request is allowed to start. Returns what the turn
     /// replays: the session's newest checkpoint summary, the completed turns after it and its idle start.
-    pub fn admit(&self, request: &TurnRequest) -> Result<History, String> {
+    pub(super) fn admit_with_briefing(&self, request: &TurnRequest, briefing: Option<Value>) -> Result<History, String> {
         let known = record_credentials(&self.context)?;
         let initial = crate::engine_switch::summary(
             &self.context,
@@ -288,6 +325,17 @@ impl Store {
             "user",
             json!({"text":request.prompt,"message":request.user_message()}),
         )?;
+        if let Some(mut record) = briefing {
+            // The preceding insert is the canonical user fact. The receipt and fact commit together.
+            let seq = tx.last_insert_rowid();
+            if record["pending"]["full"] == true {
+                record["fullSeq"] = json!(seq);
+            }
+            if !crate::briefing_delivery::delivered(&mut record, &request.id, seq) {
+                return Err(STORAGE_ERROR.into());
+            }
+            append(&known, &tx, &session, &request.id, None, "wake_briefing", record)?;
+        }
         append(
             &known,
             &tx,
@@ -454,10 +502,22 @@ impl Store {
         status: &Status,
         assistant: Option<&Event>,
     ) -> Result<(), String> {
+        let reason = matches!(status, Status::ObservationSleep).then_some("observationSleep");
+        self.finish_with_reason(turn, status, assistant, reason)
+    }
+
+    pub(crate) fn finish_with_reason(
+        &self,
+        turn: &str,
+        status: &Status,
+        assistant: Option<&Event>,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
         let pause;
         let (state, result) = match status {
             Status::Running => return Err("cannot finish a running harness turn".into()),
             Status::Completed(text) => ("completed", text.as_str()),
+            Status::ObservationSleep => ("completed", ""),
             Status::Failed(reason) => ("failed", reason.as_str()),
             Status::Cancelled => ("cancelled", "cancelled"),
             Status::Paused { reason, detail } => {
@@ -485,6 +545,10 @@ impl Store {
             params![turn, state, now, &result],
         )
         .map_err(|_| STORAGE_ERROR)?;
+        let mut terminal = json!({"state":state,"result":result});
+        if let Some(reason) = reason {
+            terminal["reason"] = json!(reason);
+        }
         append(
             &known,
             &tx,
@@ -496,7 +560,7 @@ impl Store {
             } else {
                 "turn_ended"
             },
-            json!({"state":state,"result":result}),
+            terminal,
         )?;
         tx.commit().map_err(|_| STORAGE_ERROR)?;
         Ok(())
@@ -505,7 +569,7 @@ impl Store {
 
 /// The newest checkpoint of `session` (`Store::checkpoint`): the sequence of the last fact it covers and the summary it
 /// carries; `(0, None)` without one.
-fn latest_checkpoint(tx: &Transaction<'_>, session: &str) -> Result<(i64, Option<String>), String> {
+fn latest_checkpoint(tx: &Connection, session: &str) -> Result<(i64, Option<String>), String> {
     let payload: Option<String> = tx
         .query_row(
             "SELECT payload FROM events WHERE session_id=?1 AND kind='checkpoint' ORDER BY seq DESC LIMIT 1",

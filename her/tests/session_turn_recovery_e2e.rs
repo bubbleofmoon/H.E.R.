@@ -952,11 +952,11 @@ struct Opts {
 
 impl Rig {
     fn new(name: &str, opts: Opts) -> Self {
-        Self::new_with_console_hook(name, opts, |_| {})
+        Self::new_with_console_hook(name, opts, None, |_| {})
     }
 
     // The hook runs in the reservation-to-child-bind interval, only in this fixture.
-    fn new_with_console_hook(name: &str, opts: Opts, mut after_release: impl FnMut(u16)) -> Self {
+    fn new_with_console_hook(name: &str, opts: Opts, epoch: Option<i64>, mut after_release: impl FnMut(u16)) -> Self {
         let root = crate::install_root::development_root(std::env::temp_dir().join(format!("her-ticket10-{name}-{}-{}", std::process::id(), now_ms())));
         for dir in ["config", "data/logs", "resources", "user/dsh", "ambient"] {
             fs::create_dir_all(root.join(dir)).expect("create runtime dir");
@@ -1039,8 +1039,8 @@ impl Rig {
         }
         drop(console_reservation);
         after_release(console_port);
-        let console = spawn_console(&root, console_port);
-        let mut rig = Self { root, console_port, dsh, gateway, console, candidate: None, epoch:None, clock_advance_file:None };
+        let console = spawn_console_at_epoch(&root, console_port, epoch, None);
+        let mut rig = Self { root, console_port, dsh, gateway, console, candidate: None, epoch, clock_advance_file:None };
         rig.wait_for_console_with_hook(Duration::from_secs(20), &mut after_release);
         rig
     }
@@ -1144,10 +1144,6 @@ impl Rig {
     }
 }
 
-fn spawn_console(root: &Path, port: u16) -> Child {
-    spawn_console_at_epoch(root,port,None,None)
-}
-
 fn spawn_console_at_epoch(root: &Path, port: u16, epoch: Option<i64>, advance_file: Option<&Path>) -> Child {
     let ambient = root.join("ambient");
     let mut command = Command::new(env!("CARGO_BIN_EXE_her"));
@@ -1176,7 +1172,7 @@ const LONG: Duration = Duration::from_secs(45);
 fn fixture_console_retries_port_taken_after_reservation_release() {
     let mut collision = None;
     let mut attempts = Vec::new();
-    let mut rig = Rig::new_with_console_hook("console-bind-collision", Opts { seed_session: Some("js-origin-session") }, |port| {
+    let mut rig = Rig::new_with_console_hook("console-bind-collision", Opts { seed_session: Some("js-origin-session") }, None, |port| {
         attempts.push(port);
         if collision.is_none() {
             // Synchronously take the released reservation before Command::spawn can bind.
@@ -1561,8 +1557,11 @@ fn scheduling_busy_reply_check_is_suppressed_after_turn_answers_and_marks_read()
 
 #[test]
 fn scheduling_persisted_conversation_gets_proactive_opportunity_without_ingress() {
-    let mut rig = Rig::new("proactive", Opts { seed_session: Some("js-origin-session") });
-    rig.epoch = Some(1793001600000); // 2026-10-26 08:00 UTC, daytime in the bridge's supported zone.
+    // The console checks the bridge's absolute snapshot deadline. Both need the same daytime clock.
+    let daytime_epoch = 1_793_001_600_000; // 2026-10-26 08:00 UTC
+    let mut rig = Rig::new_with_console_hook(
+        "proactive", Opts { seed_session: Some("js-origin-session") }, Some(daytime_epoch), |_| {},
+    );
     rig.patch_config(|c| c["socialV2"]["proactive"] = json!({"enabled":true,"checkIntervalMinMs":60000,"checkIntervalMaxMs":60000,"idleThresholdMs":1,"probability":1}));
     rig.dsh.set_plan(Plan { send:None, hold:false });
     rig.start_candidate(vec![]);

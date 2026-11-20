@@ -40,12 +40,42 @@ fn epoch_of(conv: &Value) -> String {
 /// deliberately not stored in `social-v2.json`: after a restart the model must fetch unread messages
 /// again (bridge.js `readThroughSeqV2` comment), so a persisted receipt could authorise skipping unseen
 /// messages. A token rotation (cancelled, replaced or reset turn) voids them as well.
-pub(super) fn receipts_of(context: &RuntimeContext, key: &str, epoch: &str) -> Vec<i64> {
+fn tool_receipts(context: &RuntimeContext, key: &str, epoch: &str) -> Vec<i64> {
     let store = receipt_store().lock().unwrap_or_else(|p| p.into_inner());
     match store.get(&(receipt_scope(context), key.to_string())) {
         Some((stored_epoch, set)) if stored_epoch == epoch => set.iter().copied().collect(),
         _ => Vec::new(),
     }
+}
+
+struct SnapshotGrant {
+    epoch: String,
+    budget: crate::pipeline::Reserved2Budget,
+    seqs: BTreeSet<i64>,
+}
+
+type SnapshotGrants = StdHashMap<(String, String), SnapshotGrant>;
+
+// The social-state gate orders snapshot replacement with acknowledgement. Take this mutex
+// last and release it before consulting any other store or acquiring the tool receipt mutex.
+fn snapshot_grants() -> &'static Mutex<SnapshotGrants> {
+    static GRANTS: std::sync::OnceLock<Mutex<SnapshotGrants>> = std::sync::OnceLock::new();
+    GRANTS.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+fn receipts_of(context: &RuntimeContext, key: &str, conv: &Value) -> Vec<i64> {
+    let epoch = epoch_of(conv);
+    let mut seen: BTreeSet<_> = tool_receipts(context, key, &epoch).into_iter().collect();
+    let mut grants = snapshot_grants().lock().unwrap_or_else(|p| p.into_inner());
+    let slot = (receipt_scope(context), key.to_owned());
+    if let Some(grant) = grants.get(&slot) {
+        if grant.epoch == epoch && !grant.budget.expired(conv) {
+            seen.extend(&grant.seqs);
+        } else if grant.epoch == epoch {
+            grants.remove(&slot);
+        }
+    }
+    seen.into_iter().collect()
 }
 
 fn set_receipts(context: &RuntimeContext, key: &str, epoch: &str, seqs: Vec<i64>) {
@@ -90,14 +120,16 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
     let input = parse_object_body(body)?;
     let key = body_text(&input, "key");
     let token = body_text(&input, "token");
+    let evidence_only = input.get("readOnly") == Some(&json!(true));
+    let _gate = (context.is_isolated() && !evidence_only).then(|| acquire_social_state_gate(context)).transpose()?;
     let state = load_social_state_for(context)?;
     if current_mode_for(context)? != "reserved2" || state["paused"] == true
         || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(cfg, &key)
-        || token.is_empty() || !agent_token_ok_for(context, &key, &token)? {
+        || !agent_token_matches_state(&state, &key, &token) {
         return Err((403, "wake snapshot invalidated".into()));
     }
     let conv = &state["conversations"][&key];
-    if input.get("readOnly") == Some(&json!(true)) {
+    if evidence_only {
         let turn = body_text(&input, "turnId");
         let store = urgent_delivery_store().lock().unwrap_or_else(|p|p.into_inner());
         let delivered: Vec<_> = store.get(&(receipt_scope(context), key.clone()))
@@ -105,11 +137,23 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
             .map(|(_, seqs)| seqs.iter().copied().collect()).unwrap_or_default();
         return Ok(json!({"urgentDeliveredSeqs":delivered}));
     }
+    let epoch = epoch_of(conv);
+    let turn = body_text(&input, "turnId");
+    let (_, mut budget) = captured_turn_budget(context, cfg, &key, &epoch, conv, false)?
+        .filter(|(id, _)| !turn.is_empty() && id == &turn)
+        .ok_or_else(|| (409, "wake snapshot turn changed".to_owned()))?;
+    let slot = (receipt_scope(context), key.clone());
+    snapshot_grants().lock().unwrap_or_else(|p| p.into_inner()).remove(&slot);
     let Some(mut packet) = build_wake_snapshot(context, cfg, &key, conv) else {
         return Ok(Value::Null);
     };
-    let unread = conv["unread"].as_array().cloned().unwrap_or_default();
-    note_offered_receipts(context, &key, conv, &unread, packet["messages"].as_array().unwrap());
+    // A later engagement cannot extend authority beyond the deadline of this offer.
+    budget.ceiling = budget.deadline_for(conv);
+    if budget.expired(conv) { return Err((409, "wake snapshot expired".into())); }
+    let seqs = packet["messages"].as_array().unwrap().iter()
+        .filter_map(|message| js_safe_integer(&message["seq"]).filter(|seq| *seq > 0)).collect();
+    let grant = SnapshotGrant { epoch, budget, seqs };
+    snapshot_grants().lock().unwrap_or_else(|p| p.into_inner()).insert(slot, grant);
     packet["readThroughSeq"] = json!(through_of(context, &key, conv));
     Ok(packet)
 }
@@ -131,9 +175,10 @@ pub(crate) fn build_wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &s
     let max_unread = bounded("wakeMessageLimit", 12.0, 1.0, 100.0);
     let max_recent = bounded("wakeRecentLimit", 4.0, 0.0, 20.0);
     let mut packet = json!({"messages":[],"recent":[],"unreadCount":unread.len(),"includedUnreadCount":0,"readThroughSeq":through_of(context,&key,conv),"partial":!unread.is_empty()});
+    let seen_before = receipts_of(context, key, conv);
     let candidate_through = |packet: &Value| {
         let mut offered = conv.clone();
-        let mut seen = receipts_of(context, &key, &epoch_of(conv));
+        let mut seen = seen_before.clone();
         for field in ["messages", "recent"] {
             seen.extend(packet[field].as_array().unwrap().iter().filter_map(|m| js_safe_integer(&m["seq"])));
         }
@@ -168,9 +213,9 @@ pub(crate) fn build_wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &s
 
 /// Put this process's receipts into a conversation value (replacing anything the file carried).
 pub(super) fn attach_receipts(context: &RuntimeContext, key: &str, conv: &mut Value) {
-    let epoch = epoch_of(conv);
+    let seen = receipts_of(context, key, conv);
     if let Some(obj) = conv.as_object_mut() {
-        obj.insert("modelSeenSeqs".to_string(), json!(receipts_of(context, key, &epoch)));
+        obj.insert("modelSeenSeqs".to_string(), json!(seen));
     }
 }
 
@@ -207,7 +252,7 @@ fn note_offered_receipts(context: &RuntimeContext, key: &str, conv: &Value, unre
     let unread_seqs: BTreeSet<i64> = unread.iter().filter_map(|m| {
         m.get("seq").and_then(|seq| seq.as_i64().or_else(|| js_safe_integer(seq)))
     }).collect();
-    let mut seen: BTreeSet<i64> = receipts_of(context, key, &epoch).into_iter().filter(|s| unread_seqs.contains(s)).collect();
+    let mut seen: BTreeSet<i64> = tool_receipts(context, key, &epoch).into_iter().filter(|s| unread_seqs.contains(s)).collect();
     for message in offered {
         if let Some(seq) = message.get("seq").and_then(js_safe_integer) {
             if seq > 0 && unread_seqs.contains(&seq) {
@@ -1262,8 +1307,8 @@ fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Valu
 }
 
 /// JS `requestedReadThroughSeqV2`: Ok(None) when the request has no `throughSeq` member at all.
-fn requested_through(body: &Value, conv: &Value, through_now: i64, is_agent: bool) -> Result<Option<i64>, (u16, String)> {
-    let Some(raw) = body.get("throughSeq") else { return Ok(None) };
+fn requested_through(raw: Option<&Value>, conv: &Value, through_now: i64, is_agent: bool) -> Result<Option<i64>, (u16, String)> {
+    let Some(raw) = raw else { return Ok(None) };
     let last_unread = conv.get("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0);
     let max = if is_agent { through_now } else { last_unread };
     match js_safe_integer(raw) {
@@ -1351,14 +1396,10 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
         ensure_conversation(context, state, &storage_key);
         let conv = &mut state["conversations"][&storage_key];
         let now = now_ms();
-        let through_now = through_of(context, &storage_key, conv);
         let (_, wait_used) = wait_usage(context, &storage_key, conv)?;
         let wait_max = wait_policy(cfg).max_per_turn;
         let exhausted = wait_used >= wait_max;
         let short_rewake = exhausted && crate::wake::pre_sleep_remaining(conv, cfg, now).is_some();
-        let through = requested_through(&b, conv, through_now, is_agent).map_err(|(status, error)| {
-            (status, if exhausted { format!("{error} {END_TURN}") } else { error })
-        })?;
         // Back to diving right after talking is refused until the pre-sleep observation was done
         // (private chats are exempt, as in JS).
         let wake = conv.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
@@ -1367,6 +1408,11 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
                 return Err(error);
             }
         }
+        // An agent omitting the cursor requests the whole unread prefix. Check its grant too.
+        let last_unread = json!(conv.get("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0));
+        let requested = b.get("throughSeq").or(is_agent.then_some(&last_unread));
+        let through = requested_through(requested, conv, through_of(context, &storage_key, conv), is_agent)
+            .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;
         let marked = acknowledge(context, &storage_key, conv, through);
         conv["lastActionAt"] = json!(now);
         let mut wc = conv.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
@@ -1422,16 +1468,11 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
         ensure_conversation(context, state, &storage_key);
         let conv = &mut state["conversations"][&storage_key];
         let now = now_ms();
-        let through_now = through_of(context, &storage_key, conv);
         let (_, wait_used) = wait_usage(context, &storage_key, conv)?;
         let wait_max = wait_policy(cfg).max_per_turn;
         let exhausted = wait_used >= wait_max;
         let short_rewake = exhausted && crate::wake::pre_sleep_remaining(conv, cfg, now).is_some();
-        let through = requested_through(&b, conv, through_now, is_agent).map_err(|(status, error)| {
-            (status, if exhausted { format!("{error} {END_TURN}") } else { error })
-        })?;
-        // With the markRead tool switched off the mark is ignored and only the configuration is set.
-        let acknowledge_on_close = through.is_some() && tool_enabled(cfg, "markRead");
+
         let current = conv.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
         let input = b.get("config").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
         let next = crate::wake::normalize_wake_config(&current, &input, cfg, &storage_key, now, rand01())?;
@@ -1440,6 +1481,10 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
                 return Err(error);
             }
         }
+        let through = requested_through(b.get("throughSeq"), conv, through_of(context, &storage_key, conv), is_agent)
+            .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;
+        // With the markRead tool switched off the mark is ignored and only the configuration is set.
+        let acknowledge_on_close = through.is_some() && tool_enabled(cfg, "markRead");
         let marked = if acknowledge_on_close { acknowledge(context, &storage_key, conv, through) } else { 0 };
         let mut wc = next.clone();
         if let Some(obj) = wc.as_object_mut() {
@@ -1848,5 +1893,5 @@ mod tests {
 /// Receipts this process holds for a conversation record (token epoch taken from the record itself).
 #[cfg(test)]
 pub(super) fn receipts_for(context: &RuntimeContext, key: &str, conv: &Value) -> Vec<i64> {
-    receipts_of(context, key, &epoch_of(conv))
+    receipts_of(context, key, conv)
 }

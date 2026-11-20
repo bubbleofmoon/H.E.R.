@@ -2173,7 +2173,7 @@ fn note_model_seen_with_auth(
     seen_msgs: &[Value],
     auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<(), (u16, String)> {
-    // The receipt is process memory (see `agent::receipts_of`) and is never written to the state file. In a
+    // The receipt is process memory (see `agent::attach_receipts`) and is never written to the state file. In a
     // selected runtime it is still recorded under the shared state gate against the committed state, so a
     // session that was revoked, replaced or paused while the request waited records nothing.
     if context.is_isolated() {
@@ -4787,6 +4787,18 @@ fn social_v2_projection_session_allowed(cfg: &Value, key: &str) -> bool {
     }
 }
 
+/// Additional menu gates imposed by the reserved2 console routes.
+pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
+    match name {
+        "qq_send_private_message" => key.starts_with("private:"),
+        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => key.starts_with("group:"),
+        "qq_send_voice" | "qq_list_voices" =>
+            voice_http::voice_cfg(cfg).enabled && voice_http::send_voice_tool_enabled(cfg),
+        "qq_set_sticker_remark" => tool_enabled(cfg, "setStickerRemark"),
+        _ => true,
+    }
+}
+
 /// 校验会话令牌（读 state 里的 agentToken）。
 fn agent_token_ok(key: &str, token: &str) -> bool {
     if token.is_empty() {
@@ -5563,11 +5575,19 @@ pub(crate) fn turn_send_cap(cfg: &Value) -> u64 {
 pub(crate) const END_TURN: &str = "end this turn now: produce your final answer and make no further tool calls";
 const TURN_CLOSE_MARGIN_MS: i64 = 20_000;
 
-/// Wait-only deadline; captured budgets survive companion restarts.
-fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value) -> Result<Option<(String, i64)>, (u16, String)> {
+/// Effective deadline shared by live simulation and the console's durable wait budget.
+pub(crate) fn reserved2_deadline(deadline: i64, cap: i64, ceiling: i64, start: i64, conv: &Value) -> i64 {
+    conv["engagedAt"].as_i64().filter(|at| *at > 0 && *at >= start)
+        .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
+}
+
+/// Captured simulation budget shared by observation waits and snapshot read grants.
+fn captured_turn_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value, infer_legacy_wait: bool)
+    -> Result<Option<(String, crate::pipeline::Reserved2Budget)>, (u16, String)> {
+    use crate::pipeline::Reserved2Budget;
     if !context.is_isolated() {
         return Ok(conv["waitTurnDeadlineAt"].as_i64().filter(|at| *at > 0)
-            .map(|at| (conv["waitTurnId"].as_str().unwrap_or("").to_string(), at)));
+            .map(|at| (conv["waitTurnId"].as_str().unwrap_or("").to_string(), Reserved2Budget { deadline: at, ceiling: at, cap_ms: 0, began: 0 })));
     }
     let records = crate::turn_ledger::read_records(context).map_err(|_| (503,"wait turn ledger is unavailable".to_string()))?;
     let turns = crate::turn_ledger::fold(&records).0;
@@ -5575,6 +5595,7 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
     let record = records.iter().rev().find(|r|r["turn"]==turn.id && r["k"]=="budget");
     let deadline = match record.and_then(|r|r["deadline"].as_i64()).filter(|at| *at > 0) {
         Some(deadline) => deadline,
+        None if !infer_legacy_wait => return Ok(None),
         None => {
             // Older binaries did not capture a budget. Infer only within a current
             // start's cap interval; unknown or stale evidence cannot prove exhaustion.
@@ -5588,15 +5609,19 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
     };
     // While she is engaged the captured cap runs from her last send in this turn, never past
     // the captured ceiling. Records without capMs/ceiling keep their dispatch deadline.
-    let deadline = match record.and_then(|r| Some((r["capMs"].as_i64()?, r["ceiling"].as_i64()?, r))) {
-        Some((cap, ceiling, r)) => {
-            let start = r["t"].as_i64().unwrap_or(turn.begun_at);
-            conv["engagedAt"].as_i64().filter(|at| *at > 0 && *at >= start)
-                .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
-        }
-        None => deadline,
+    let (cap_ms, ceiling) = record.and_then(|r| Some((r["capMs"].as_i64()?, r["ceiling"].as_i64()?)))
+        .unwrap_or((0, deadline));
+    let budget = Reserved2Budget {
+        deadline,
+        cap_ms,
+        ceiling,
+        began: record.and_then(|r| r["t"].as_i64()).unwrap_or(turn.begun_at),
     };
-    Ok(Some((turn.id.clone(), deadline)))
+    Ok(Some((turn.id.clone(), budget)))
+}
+
+fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value) -> Result<Option<(String, i64)>, (u16, String)> {
+    Ok(captured_turn_budget(context, cfg, key, epoch, conv, true)?.map(|(turn, budget)| (turn, budget.deadline_for(conv))))
 }
 
 fn mark_turn_budget_ended(context: &RuntimeContext, key: &str, token: &str, turn: &str) -> Result<(), (u16, String)> {
@@ -5652,6 +5677,24 @@ fn wait_live_path(console: &str, request: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("{console}:{request}").as_bytes());
     format!("locks/observation-wait-{digest:x}.lock")
+}
+
+#[cfg(test)]
+pub(crate) fn hold_test_observation_wait(
+    context: &RuntimeContext, key: &str, token: &str, turn: &str,
+) -> std::fs::File {
+    // Hold the same request witness as the console without taking the process-wide wait lease.
+    let console = wait_console_generation();
+    let request = crate::turn_ledger::mint_id("wait-");
+    let lock = context.open_locked_file(RuntimeArea::Data, &wait_live_path(console, &request)).unwrap();
+    mutate_social_state_for(context, |state| {
+        state["conversations"][key]["activeWait"] = json!({
+            "id":request,"console":console,"turn":turn,"purpose":"messages",
+            "epoch":crate::send_outbox::token_epoch(token)
+        });
+        Ok(())
+    }).unwrap();
+    lock
 }
 
 pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
@@ -8040,7 +8083,8 @@ fn handle_session_reset_isolated(
     };
     let cfg = context.load_config().map_err(|_| (503, "runtime configuration is unavailable".to_string()))?;
     // A conversation whose turn engine needs no DSH resets without a DSH session mapping.
-    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key)
+    let mode = runtime_mode(context);
+    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key, &mode)
         .map_err(|error| (503, error))?
         .uses_dsh();
     let mapped = match store.get("sessions") {

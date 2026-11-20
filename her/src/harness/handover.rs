@@ -75,7 +75,8 @@ pub(super) async fn prepare(
     instruction: String,
     cancelled: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
-) -> Result<(Vec<ChatMessage>, Vec<Range<usize>>), Failure> {
+) -> Result<(Vec<ChatMessage>, Vec<Range<usize>>, bool), Failure> {
+    let first_round = history.rounds.first().map(|round| round.through);
     let cfg = context.load_config()?;
     let route = request.route.routes[request.route.start].spec.id.clone();
     let summaries = cfg
@@ -119,7 +120,9 @@ pub(super) async fn prepare(
         )
         .await?;
     }
-    Ok(assemble(history, current))
+    let clipped = first_round != history.rounds.first().map(|round| round.through);
+    let (messages, rounds) = assemble(history, current);
+    Ok((messages, rounds, clipped))
 }
 
 /// What the turn's first request holds besides its history: the system instruction (when the turn has one), then the

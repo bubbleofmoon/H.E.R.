@@ -16,6 +16,8 @@ pub(crate) const STICKER_SOFTEN_KEY: &str = "prompt.stickerSoften";
 /// Mode prompts: the start of a harness turn's system message, one per mode profile (`harness::profile::Profile::prompt_key`).
 pub(crate) const MODE_CHAT_KEY: &str = "prompt.mode.chat";
 pub(crate) const MODE_OWNER_PRIVATE_KEY: &str = "prompt.mode.ownerPrivate";
+pub(crate) const MODE_RESERVED2_KEY: &str = "prompt.mode.reserved2";
+pub(crate) const MODE_RESERVED2_OWNER_KEY: &str = "prompt.mode.reserved2Owner";
 pub(crate) const MODE_CLOSED_AGENT_KEY: &str = "prompt.mode.closedAgent";
 
 /// The longest briefing rule or sticker text, in Unicode scalar values. Rule sections are never cut or counted by the

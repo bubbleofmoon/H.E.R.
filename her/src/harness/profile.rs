@@ -217,15 +217,15 @@ impl Profile {
         }
     }
 
-    /// The text setting (`prompt_text`) holding this profile's mode prompt. `None` for the profiles
-    /// no harness turn admits yet (`turn_engine::Adapter::supports`): the reserved2 rows and the
-    /// jobs. The change that admits one of them adds its key here.
+    /// The text setting holding this profile's mode prompt, if it has one.
     pub(crate) fn prompt_key(self) -> Option<&'static str> {
         match self {
             Self::Chat => Some(crate::prompt_text::MODE_CHAT_KEY),
             Self::OwnerPrivate => Some(crate::prompt_text::MODE_OWNER_PRIVATE_KEY),
             Self::ClosedAgent => Some(crate::prompt_text::MODE_CLOSED_AGENT_KEY),
-            Self::Reserved2 | Self::Reserved2Owner | Self::Digest | Self::SlangLearner => None,
+            Self::Reserved2 => Some(crate::prompt_text::MODE_RESERVED2_KEY),
+            Self::Reserved2Owner => Some(crate::prompt_text::MODE_RESERVED2_OWNER_KEY),
+            Self::Digest | Self::SlangLearner => None,
         }
     }
 }

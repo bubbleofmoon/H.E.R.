@@ -16,7 +16,7 @@ use crate::runtime::RuntimeContext;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The turn engine selected by the scoped setting and its global default.
+/// The turn engine selected by the scoped setting, reserved2 CLI pin and global default.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
@@ -25,18 +25,19 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub fn selected(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Result<Self, String> {
+    pub fn selected(context: &RuntimeContext, cfg: &Value, conversation: &str, mode: &str) -> Result<Self, String> {
         if !context.is_isolated() {
             return Ok(Self::Dsh);
         }
         if cfg.get("conversationEngines").is_some() {
             crate::console::import_engine_choices_outside_request(context).map_err(|(_, error)| error)?;
         }
-        Self::read_choice(context, cfg, conversation)
+        Self::read_choice(context, cfg, conversation, mode)
     }
 
-    pub(crate) fn read_choice(context: &RuntimeContext, cfg: &Value, conversation: &str) -> Result<Self, String> {
-        Self::parse(&crate::settings::engine_choice(context, cfg, conversation)?)
+    pub(crate) fn read_choice(context: &RuntimeContext, cfg: &Value, conversation: &str, mode: &str) -> Result<Self, String> {
+        let inherit_default = mode != "reserved2" || crate::pipeline::pinned_cli_backend(cfg, conversation).is_none();
+        Self::parse(&crate::settings::engine_choice(context, cfg, conversation, inherit_default)?)
     }
 
     pub(crate) fn parse(value: &Value) -> Result<Self, String> {
@@ -48,7 +49,7 @@ impl Engine {
     }
 
     pub(crate) fn supports(self, mode: &str) -> bool {
-        self == Self::Dsh || matches!(mode, "chat" | "closed-agent")
+        self == Self::Dsh || matches!(mode, "chat" | "closed-agent" | "reserved2")
     }
 
     pub fn id(self) -> &'static str {
@@ -66,7 +67,7 @@ impl Engine {
 
 /// Refusal of a participation mode the harness does not run yet.
 pub(crate) const UNSUPPORTED_MODE: &str =
-    "harness supports chat and owner-private closed-agent modes only";
+    "harness supports chat, owner-private closed-agent and reserved2 modes only";
 
 pub(crate) const ADMISSION_CHANGED: &str = "turn engine changed before admission";
 
@@ -153,7 +154,7 @@ impl Facts {
     ) -> Self {
         use crate::harness::Status;
         let (end_kind, cancel_reason) = match status {
-            Status::Completed(_) => (Some("completed"), None),
+            Status::Completed(_) | Status::ObservationSleep => (Some("completed"), None),
             Status::Cancelled if invalidated => (Some("cancelled"), Some("turnInvalidated")),
             Status::Cancelled => (Some("cancelled"), Some("harnessCancelled")),
             Status::Failed(reason) if reason == crate::harness::DEADLINE_EXCEEDED => {
@@ -163,7 +164,7 @@ impl Facts {
             Status::Running | Status::Paused { .. } => (None, None),
         };
         Self {
-            ok: matches!(status, Status::Completed(_)),
+            ok: matches!(status, Status::Completed(_) | Status::ObservationSleep),
             end_kind: end_kind.map(str::to_string),
             cancel_reason,
             attempt,
@@ -244,8 +245,8 @@ mod tests {
         }
         assert!(harness.supports("chat") && harness.supports("closed-agent"));
         assert!(
-            !harness.supports("reserved") && !harness.supports("reserved2"),
-            "the harness refuses the reserved modes"
+            !harness.supports("reserved") && harness.supports("reserved2"),
+            "the harness runs second-generation simulation and refuses first-generation reserved"
         );
         assert!(dsh.uses_dsh() && !harness.uses_dsh(), "only the DSH adapter needs DSH");
         let scripted = Adapter::Scripted(Script::answering("ok"));

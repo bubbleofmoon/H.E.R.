@@ -26,8 +26,7 @@ impl Pipeline {
             &format!("{}\n{summary}", crate::harness::handover::SUMMARY_LABEL), 2_100))
     }
 
-    /// The DSH adapter's admitted turn (`turn_engine::Adapter::Dsh`): refused locally without a DSH
-    /// login, else the DSH candidate chain with its failover.
+    /// The DSH adapter's admitted turn. Reserved2 acquires its login here, after any pinned CLI.
     pub(super) async fn run_dsh_turn(
         &mut self,
         key: &str,
@@ -36,7 +35,13 @@ impl Pipeline {
         cfg: &serde_json::Value,
     ) -> Result<String, String> {
         if !self.has_dsh() {
-            return Err(crate::dsh_credential::UNBOUND.to_string());
+            if self.reserved2_budget.is_none() {
+                return Err(crate::dsh_credential::UNBOUND.to_string());
+            }
+            if crate::dsh_health::is_down(&self.context) {
+                return Err("DSH is unavailable for the wake".into());
+            }
+            self.rpc = crate::console::dsh_rpc_for(&self.context, cfg)?;
         }
         // A pinned CLI backend was the caller's to run: the DSH adapter's configuration
         // copy drops `backends.sessions`, so its failover never runs that CLI again.
@@ -344,14 +349,41 @@ impl Pipeline {
     /// buffered work without adopting a later reset or revocation's token. A failed DSH stop is
     /// reported beside the minted epoch, never instead of it.
     pub fn cancel_with_reason(&mut self, key: &str, reason: &str) -> Result<Cancelled, String> {
+        self.cancel_with_dispatch(key, reason, None)
+    }
+
+    pub(crate) fn cancel_reserved2_cap(
+        context: &RuntimeContext, cfg: &serde_json::Value, key: &str, dispatch: Option<(&str, &MintedEpoch)>,
+    ) -> Result<Cancelled, String> {
+        let mut control = Self::new_without_dsh(context, cfg, true)?;
+        control.cancel_with_dispatch(key, "turnTimeout", dispatch)
+    }
+
+    fn cancel_with_dispatch(
+        &mut self, key: &str, reason: &str, dispatch: Option<(&str, &MintedEpoch)>,
+    ) -> Result<Cancelled, String> {
         let sid = if self.context.is_isolated() {
             crate::session_map::lookup(&self.context, key)?
         } else {
             self.store.sessions.get(key).map(|r| r.session_id.clone())
         };
         let Some(sid) = sid else {
-            return Ok(Cancelled::default()); // 还没建会话，没什么可取消的
+            if let Some((expected, publication)) = dispatch {
+                // An unmapped first wake can still be waiting for the turn gate.
+                let mut minted = publication.lock().unwrap_or_else(|p| p.into_inner());
+                let current = minted.as_deref().unwrap_or(expected);
+                let token = crate::conversation_authority::revoke_if_current(&self.context, key, current)?;
+                if let Some(replacement) = &token {
+                    *minted = Some(replacement.clone());
+                }
+                return Ok(Cancelled { token, stop_error: None });
+            }
+            return Ok(Cancelled::default());
         };
+        if reason == "turnTimeout" && self.context.is_isolated() && !self.has_dsh() {
+            let cfg = self.context.load_config().map_err(str::to_string)?;
+            self.rpc = crate::console::dsh_rpc_for(&self.context, &cfg)?;
+        }
         if self.context.is_isolated() {
             // 被取消/被替代的回合不能再有迟到的结果：先清 inbox（DSH 的 cancel 保留队列）并取消，
             // 再换令牌，之后它的工具调用与发送都因令牌不符被拒；账本里把它记为已取消。
@@ -910,13 +942,13 @@ impl Pipeline {
             let rpc_id = crate::dsh::mint_request_id();
             self.turn_validity(key, &sid)?;
             let mut layers: Option<serde_json::Value> = None;
-            if self.context.is_isolated() && self.cur_turn.is_some() && self.chat.is_none() {
+            if let Some(turn) = self.cur_turn.as_ref().filter(|_| self.context.is_isolated() && self.chat.is_none()) {
                 follow.track_briefing(&self.context, key, &sid, &self.turn_token)?;
                 if self.current_reason != "wakeReminder" {
                     // A persona switch or compaction can start a new briefing generation while this
                     // wake is prepared; nothing was submitted, so prepare once more.
-                    let wake = match crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt) {
-                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt),
+                    let wake = match crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt, &turn.id) {
+                        Err(error) if error == crate::prompt::WAKE_BRIEFING_CHANGED => crate::prompt::prepare_dsh_wake_layered(&self.context, cfg, key, &sid, &self.turn_token, &self.current_reason, &rpc_id, prompt, &turn.id),
                         other => other,
                     }?;
                     layers = Some(serde_json::json!({"injected": wake.layers.to_json(), "cut": wake.cut.to_json()}));

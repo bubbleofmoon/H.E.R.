@@ -750,12 +750,14 @@ impl Pass<'_> {
                     pause("send-unresolved", detail.clone(), true),
                 _ => {
                     let tools = crate::harness::store::Store::open(self.context).and_then(|store| {
-                        store.status(&turn.id)?.ok_or("harness interrupted turn is missing from conversation storage")?;
-                        store.has_unsettled_tools(&turn.id)
+                        store.status(&turn.id)?.map(|_| store.has_unsettled_tools(&turn.id)).transpose()
                     });
                     match tools {
-                        Ok(false) => pause("harness-interrupted", "Harness turn interrupted; administrator resolution required", true),
-                        Ok(true) => pause("send-unresolved", "Harness tool effect could not be confirmed; administrator confirmation required before retry", true),
+                        Ok(None) if (turn.reserved2 || turn.wake_claim.is_some()) && turn.attempts.is_empty() && matches!(&sends, SendState::None) =>
+                            decide(turn, None, &sends, validity(self.context, self.cfg, turn)),
+                        Ok(None) => pause("send-unresolved", "harness interrupted turn is missing from conversation storage", true),
+                        Ok(Some(false)) => pause("harness-interrupted", "Harness turn interrupted; administrator resolution required", true),
+                        Ok(Some(true)) => pause("send-unresolved", "Harness tool effect could not be confirmed; administrator confirmation required before retry", true),
                         Err(detail) => pause("send-unresolved", detail, true),
                     }
                 }
@@ -887,11 +889,15 @@ impl Pass<'_> {
             }
             // The main loop marks a refused wake's events handled one iteration later; wait for it.
             let settled = held.iter().all(|k| {
-                !matches!(journal.stage_of(k).ok().flatten().as_deref(), Some("received" | "processing"))
+                journal.stage_of(k).is_ok_and(|stage| !matches!(stage.as_deref(), Some("received" | "processing")))
             });
             if !settled {
                 continue;
             }
+            // The worker persists a held wake's expiry before the hub settles its journal entry.
+            // Our pass may have read the hold before that end. Recheck it after observing settlement.
+            let Ok(fresh) = turn_ledger::read_records(self.context) else { continue };
+            if turn_ledger::held_events(&fresh, &key) != held { continue; }
             if let Err(error) = turn_ledger::append_record(
                 self.context,
                 &serde_json::json!({"k": "requeued", "t": now(), "key": key, "inbound": held}),
@@ -910,6 +916,12 @@ impl Pass<'_> {
     fn orphans(&self, journal: &Journal, turns: &[Turn], records: &[Value]) {
         let Ok(interrupted) = journal.interrupted_events() else { return };
         for event in interrupted {
+            if records.iter().any(|r| turn_ledger::ended_hold(r) && r["key"] == event.conversation
+                && r["inbound"].as_array().is_some_and(|keys| keys.iter().any(|k| k.as_str() == Some(event.event_key.as_str())))) {
+                // A crash can interrupt the journal mark after the durable expiry of a held wake.
+                settle(journal, std::slice::from_ref(&event.event_key), "handled");
+                continue;
+            }
             if turns.iter().any(|t| t.inbound.contains(&event.event_key)) {
                 // Handled by the owning turn's verdict (finished turns settle in `finished`).
                 continue;
@@ -1241,6 +1253,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ticket159_expired_held_inbound_stays_handled_after_resolution() {
+        let key = "group:42";
+        let cfg = json!({"consoleToken":"synthetic-held-cap","engineDefault":"harness","allow":{"groups":[42]}});
+        let root = crate::runtime::tests::runtime_fixture(std::env::temp_dir().join(turn_ledger::mint_id("her-held-cap-")),
+            &cfg, &json!({"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}));
+        std::fs::write(root.0.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.0.join("data/social-v2.json"), json!({"conversations":{key:{"agentToken":"held-cap-token"}}}).to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root.0).unwrap();
+        let journal = Journal::open(&context).unwrap();
+        let input = "group:42|message:159".to_owned();
+        journal.record_received(&input, key, "{}", 1).unwrap();
+        journal.mark_processing(std::slice::from_ref(&input), 2).unwrap();
+        let paused = Recorder::begin(&context, key, "dsh", "atMention", "earlier", &[], None).unwrap();
+        paused.unknown("send-unresolved", "fixture").unwrap();
+        let mut pipe = crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true).unwrap();
+        pipe.note_turn("atMention", std::slice::from_ref(&input));
+        pipe.expect_dispatch_deadline(10);
+        let clock_context = context.clone();
+        pipe.admission_clock = Some(Box::new(move || {
+            if turn_ledger::read_records(&clock_context).unwrap().iter().any(|r| r["k"] == "held") { 10 } else { 9 }
+        }));
+        let err = pipe.run_turn(&crate::onebot::Target::Group(42), "", "", &cfg).await.unwrap_err();
+        assert!(err.contains("turnTimeout"), "{err}");
+        // Lose the process after the durable expiry and before the hub marks the input handled.
+        assert_eq!(journal.recover_interrupted(now()).unwrap(), vec![input.clone()]);
+        paused.resolved("abandon").unwrap();
+        let pass = Pass { context: &context, cfg: &cfg };
+        let records = turn_ledger::read_records(&context).unwrap();
+        pass.resolutions(&journal, &fold(&records).0, &records);
+        let records = turn_ledger::read_records(&context).unwrap();
+        assert!(fold(&records).0.iter().any(|t| t.id == paused.id && t.resolution_applied));
+        pass.orphans(&journal, &fold(&records).0, &records);
+        assert_eq!(journal.stage_of(&input).unwrap().as_deref(), Some("handled"));
+        // A pass that observed resolution and the hold before its terminal write must also refuse replay.
+        let stale: Vec<_> = records.iter().filter(|r| !turn_ledger::ended_hold(r)).cloned().collect();
+        pass.release_held(&journal, &fold(&stale).0, &stale);
+        pass.release_held(&journal, &fold(&records).0, &records);
+        assert_eq!(journal.stage_of(&input).unwrap().as_deref(), Some("handled"), "an expired held wake must never replay");
+        let records = turn_ledger::read_records(&context).unwrap();
+        assert!(records.iter().any(|r| r["k"] == "ended" && r["reason"] == "turnTimeout" && r["outcome"] == "cancelled"
+            && r["inbound"] == json!([input])));
+    }
+
     #[test]
     fn hf84_failed_notification_sync_prevents_delivery() {
         use std::io::{BufRead, Read, Write};
@@ -1328,6 +1384,71 @@ mod tests {
         assert_eq!(fold(&crate::turn_ledger::read_records(&context).unwrap()).0[0].state, State::Resumed);
         drop(journal);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    async fn recover_reserved2_before_admission(claimed: bool, with_budget: bool) -> (Turn, Value) {
+        let root = crate::install_root::development_root(std::env::temp_dir().join(crate::turn_ledger::mint_id("her-harness-wake-recovery-")));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _root = Cleanup(root.clone());
+        for dir in ["config", "data", "resources", "user/dsh"] { std::fs::create_dir_all(root.join(dir)).unwrap(); }
+        std::fs::write(root.join("config/config.json"), r#"{"consoleToken":"synthetic-review-token","allow":{"groups":[1]}}"#).unwrap();
+        std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
+        std::fs::write(root.join("dependencies.json"), r#"{"dsh":"http://127.0.0.1:1","model":"http://127.0.0.1:1","onebot":"http://127.0.0.1:1"}"#).unwrap();
+        let token = "fixture-token";
+        let deadline = "2000-01-01T00:00:00.000Z";
+        let previous = json!({"wakeConfig":{"confirmedAt":1,"sleepUntil":deadline,"lastWakeAt":0,"wakeCount":0},"lastWakeReason":""});
+        let mut wake = previous["wakeConfig"].clone();
+        // Dispatch records bookkeeping before begun. Only a durable claim consumes sleepUntil.
+        wake["lastWakeAt"] = json!(10);
+        wake["wakeCount"] = json!(1);
+        if claimed { wake["sleepUntil"] = Value::Null; }
+        std::fs::write(root.join("data/social-v2.json"), json!({"conversations":{"group:1":{"agentToken":token,"wakeTimes":[10],"wakeConfig":wake}}}).to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap();
+        let cfg = context.load_config().unwrap();
+        let journal = Journal::open(&context).unwrap();
+        let epoch = crate::send_outbox::token_epoch(token);
+        let recorder = if claimed {
+            // Keep coverage for older claimed wakes whose begun record has no mode.
+            Recorder::begin(&context, "group:1", "harness", "timeout", &epoch, &[], None)
+        } else {
+            Recorder::begin_reserved2(&context, "group:1", "harness", "timeout", &epoch, &[])
+        }.unwrap();
+        if with_budget {
+            turn_ledger::append_record(&context, &json!({"k":"budget","turn":recorder.id,"t":10,"deadline":20,"capMs":10,"ceiling":30})).unwrap();
+        }
+        if claimed { recorder.wake_claim(&json!({"at":10,"previous":previous})).unwrap(); }
+        let turns = fold(&turn_ledger::read_records(&context).unwrap()).0;
+        let outbox = crate::send_outbox::read_records(&context);
+        Pass { context: &context, cfg: &cfg }.reconcile(&journal, &turns[0], &turns, &outbox).await;
+        let recovered = fold(&turn_ledger::read_records(&context).unwrap()).0.remove(0);
+        let restored = context.read_social_state().unwrap()["conversations"]["group:1"]["wakeConfig"]["sleepUntil"].clone();
+        (recovered, restored)
+    }
+
+    #[tokio::test]
+    async fn ticket159_reserved2_recovery_resumes_a_harness_wake_before_admission() {
+        let (recovered, restored) = recover_reserved2_before_admission(true, true).await;
+        assert_eq!(recovered.state, State::Resumed,
+            "a harness wake with no attempt or store row must resume, got pause reason {:?}", recovered.pause_reason);
+        assert_eq!(restored, "2000-01-01T00:00:00.000Z", "the resumed timer's wake claim must be rolled back");
+    }
+
+    #[tokio::test]
+    async fn ticket159_reserved2_recovery_resumes_before_the_wake_claim() {
+        let begun = recover_reserved2_before_admission(false, false).await;
+        let budget = recover_reserved2_before_admission(false, true).await;
+        assert_eq!([begun.0.state, budget.0.state], [State::Resumed; 2],
+            "both pre-claim crash boundaries must resume the reserved2 wake, got {:?} and {:?}",
+            begun.0.pause_reason, budget.0.pause_reason);
+        for (turn, sleep_until) in [begun, budget] {
+            assert!(turn.wake_claim.is_none());
+            assert_eq!(sleep_until, "2000-01-01T00:00:00.000Z", "the unconsumed timer deadline remains due");
+        }
     }
 
     /// Ticket 24 second fix round (Codex 7): a revocation (or reset) voids work of the old epoch

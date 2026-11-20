@@ -14,7 +14,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Rule: not a clerk",
         hint: "First rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::PROACTIVE_KEY,
@@ -25,7 +25,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Rule: initiative",
         hint: "Second rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::GROUP_CONDUCT_KEY,
@@ -36,7 +36,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Rule: group conduct",
         hint: "Third rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::REPEAT_KEY,
@@ -47,7 +47,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Rule: no repeated bits",
         hint: "Last rule of the briefing's behaviour section. Saved text is checked for denied names; empty sends nothing.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::STICKER_STRATEGY_KEY,
@@ -58,7 +58,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Sticker strategy",
         hint: "Opens the briefing's sticker section while stickers are on. Saved text is checked for denied names.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::STICKER_SOFTEN_KEY,
@@ -69,7 +69,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Softening a reply with a sticker",
         hint: "Follows the sticker strategy when a sticker list is shown. Saved text is checked for denied names.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::MODE_CHAT_KEY,
@@ -80,7 +80,29 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Mode prompt: chat",
         hint: "Opens the system message of each chat-mode turn on HER's own engine, in groups and other people's private chats. Checked for denied names; empty sends none.",
         chat: false,
-    secret: false,
+        secret: false,
+    },
+    Setting {
+        key: crate::prompt_text::MODE_RESERVED2_KEY,
+        pointer: "/prompts/mode/reserved2",
+        kind: &Text { max_chars: crate::prompt_text::MODE_MAX_CHARS, default: crate::prompt_text::NO_MODE_PROMPT },
+        applies: "live",
+        group: "prompt text",
+        label: "Mode prompt: simulation",
+        hint: "Opens the system message of each simulation turn on HER's own engine, in groups and other people's private chats. Checked for denied names; empty sends none.",
+        chat: false,
+        secret: false,
+    },
+    Setting {
+        key: crate::prompt_text::MODE_RESERVED2_OWNER_KEY,
+        pointer: "/prompts/mode/reserved2Owner",
+        kind: &Text { max_chars: crate::prompt_text::MODE_MAX_CHARS, default: crate::prompt_text::NO_MODE_PROMPT },
+        applies: "live",
+        group: "prompt text",
+        label: "Mode prompt: owner's private simulation",
+        hint: "Opens the system message of each simulation turn on HER's own engine, in the owner's private chat. Checked for denied names; empty sends none.",
+        chat: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::MODE_OWNER_PRIVATE_KEY,
@@ -91,7 +113,7 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Mode prompt: owner's private chat",
         hint: "Opens the system message of each chat-mode turn on HER's own engine in the owner's private chat. Checked for denied names; empty sends none.",
         chat: false,
-    secret: false,
+        secret: false,
     },
     Setting {
         key: crate::prompt_text::MODE_CLOSED_AGENT_KEY,
@@ -102,6 +124,6 @@ pub(super) const SETTINGS: &[Setting] = &[
         label: "Mode prompt: admin agent",
         hint: "Opens the system message of each admin-agent turn on HER's own engine. Checked for denied names; empty sends none.",
         chat: false,
-    secret: false,
+        secret: false,
     },
 ];

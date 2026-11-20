@@ -1993,7 +1993,22 @@ pub(crate) fn prepare_dsh_wake(
     context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
     reason: &str, rpc_id: &str, prebuilt: &str,
 ) -> Result<(String, Vec<i64>), String> {
-    prepare_dsh_wake_layered(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt).map(|w| (w.text, w.recalled))
+    prepare_test_dsh_wake(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt).map(|w| (w.text, w.recalled))
+}
+
+/// Direct renderer fixtures enter the same turn-scoped snapshot route as the live pipeline.
+#[cfg(test)]
+pub(crate) fn prepare_test_dsh_wake(
+    context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
+    reason: &str, rpc_id: &str, prebuilt: &str,
+) -> Result<DshWake, String> {
+    let turn = crate::turn_ledger::Recorder::begin_reserved2(context, key, "dsh", reason,
+        &crate::send_outbox::token_epoch(epoch), &[])?;
+    let deadline = crate::turn_ledger::now_ms() + crate::wake::turn_budget(cfg).hard_cap_ms;
+    crate::turn_ledger::append_record(context, &serde_json::json!({"k":"budget","turn":turn.id,"deadline":deadline}))?;
+    let wake = prepare_dsh_wake_layered(context, cfg, key, sid, epoch, reason, rpc_id, prebuilt, &turn.id);
+    turn.end(if wake.is_ok() { "completed" } else { "failed" }, "fixture render")?;
+    wake
 }
 
 /// Render at the DSH submission boundary, after resolving the actual session and epoch.
@@ -2002,8 +2017,43 @@ pub(crate) fn prepare_dsh_wake(
 /// (`record_recall_hits`) only after DSH accepts the submission.
 pub(crate) fn prepare_dsh_wake_layered(
     context: &RuntimeContext, cfg: &Value, key: &str, sid: &str, epoch: &str,
-    reason: &str, rpc_id: &str, prebuilt: &str,
+    reason: &str, rpc_id: &str, prebuilt: &str, turn: &str,
 ) -> Result<DshWake, String> {
+    let record = crate::session_map::context_record(context, key, sid, epoch)?;
+    let delivery = crate::briefing_delivery::plan(&record);
+    let wake = render_wake(context, cfg, key, epoch, reason, prebuilt, &delivery, true, turn)?;
+    if !crate::session_map::update_context(context, key, sid, epoch, |record| {
+        wake.hold(record, &delivery, rpc_id);
+    })? {
+        return Err(WAKE_BRIEFING_CHANGED.into());
+    }
+    let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, delivery.generation, &wake.layers);
+    Ok(DshWake { text: wake.text, recalled: wake.recalled, layers: wake.layers, cut: wake.cut, alerted })
+}
+
+/// The shared section render and its proposed delivery receipt. Each adapter commits the receipt in its own store.
+pub(crate) struct RenderedWake {
+    pub text: String,
+    pub full_text: Option<String>,
+    pub recalled: Vec<i64>,
+    pub layers: crate::briefing::Counts,
+    pub cut: crate::briefing::Counts,
+    revision: String,
+    hashes: std::collections::BTreeMap<&'static str, String>,
+    carried: Vec<i64>,
+}
+
+impl RenderedWake {
+    pub(crate) fn hold(&self, record: &mut Value, delivery: &crate::briefing_delivery::WakePlan, receipt: &str) -> bool {
+        crate::briefing_delivery::hold(record, delivery, receipt, &self.revision, &self.hashes, &self.carried)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_wake(
+    context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
+    reason: &str, prebuilt: &str, delivery: &crate::briefing_delivery::WakePlan, include_token: bool, turn: &str,
+) -> Result<RenderedWake, String> {
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -2016,9 +2066,6 @@ pub(crate) fn prepare_dsh_wake_layered(
     // Capture the briefing generation before any section is rendered. A persona switch saves the
     // library before it bumps the generation, so sections rendered after this capture are at least
     // as new as it; a bump after it fails the pending guard below and the caller prepares again.
-    let record = crate::session_map::context_record(context,key,sid,epoch)?;
-    // Full or delta, the changed sections and the held recall are `briefing_delivery`'s rules.
-    let delivery = crate::briefing_delivery::plan(&record);
     let (generation, full) = (delivery.generation, delivery.full);
     let identity = read_data_json(context, "identity.json").unwrap_or(json!({}));
     let saved_identity = identity_line(identity["nickname"].as_str().unwrap_or(""), identity["userId"].as_str().unwrap_or(""));
@@ -2063,21 +2110,29 @@ pub(crate) fn prepare_dsh_wake_layered(
     let hashes: BTreeMap<&str,String> = sections.iter().filter(|(_,v)| !v.is_empty())
         .map(|(k,v)| (*k, format!("{:x}",Sha256::digest(v.as_bytes())))).collect();
     let revision = format!("{:x}",Sha256::digest(serde_json::to_vec(&hashes).map_err(|e|e.to_string())?));
-    let mut body = if full { format!("【简报 revision={revision} generation={generation}】\n以下各节是本代会话的当前完整简报。\n\n") }
-        else { format!("【唤醒增量】沿用简报；当前 revision={revision} generation={generation}。仅下列替换/删除改变旧简报。\n\n") };
-    for (name,text) in &sections {
-        if full {
-            if !text.is_empty() { body.push_str(&format!("【简报节 {name}】\n{text}\n\n")); }
-        } else if delivery.changed(name, hashes.get(name).map(String::as_str)) {
-            if text.is_empty() { body.push_str(&format!("【删除简报节 {name}】旧内容已失效。\n\n")); }
-            else { body.push_str(&format!("【替换简报节 {name}】完整替换旧节：\n{text}\n\n")); }
+    let header = |full| {
+        let mut body = if full {
+            format!("【简报 revision={revision} generation={generation}】\n以下各节是本代会话的当前完整简报。\n\n")
+        } else {
+            format!("【唤醒增量】沿用简报；当前 revision={revision} generation={generation}。仅下列替换/删除改变旧简报。\n\n")
+        };
+        for (name, text) in &sections {
+            if full {
+                if !text.is_empty() { body.push_str(&format!("【简报节 {name}】\n{text}\n\n")); }
+            } else if delivery.changed(name, hashes.get(name).map(String::as_str)) {
+                if text.is_empty() { body.push_str(&format!("【删除简报节 {name}】旧内容已失效。\n\n")); }
+                else { body.push_str(&format!("【替换简报节 {name}】完整替换旧节：\n{text}\n\n")); }
+            }
         }
-    }
-    if !full {
-        body.push_str("【本轮发送】文本输出不会发送到 QQ；本轮要发言请调用发送工具。\n\n");
-    }
+        if !full {
+            body.push_str("【本轮发送】文本输出不会发送到 QQ；本轮要发言请调用发送工具。\n\n");
+        }
+        body
+    };
     let mut delta = String::new();
-    delta.push_str(&token_line(epoch));
+    if include_token {
+        delta.push_str(&token_line(epoch));
+    }
     delta.push_str(&format!("【此刻状态】未读 {} 条；lastReplyAt={}\n\n", st["unread"].as_array().map_or(0,Vec::len), st["lastAiReplyAt"]));
     delta.push_str(&wake_line(st));
     let wake_config = crate::wake::without_wake_bookkeeping(st["wakeConfig"].clone());
@@ -2086,8 +2141,8 @@ pub(crate) fn prepare_dsh_wake_layered(
     delta.push_str(&format!("【观察状态】preSleepWaitRemainingMs={}\n\n",
         crate::wake::pre_sleep_remaining(st,cfg,now_ms()).unwrap_or(0)));
     if !full { delta.push_str(&wait_limit_line(cfg)); }
-    // Automatic recall for the message being answered, the same block the console preview shows; the
-    // briefing's retrieval section remains the on-demand route (`memory_search`).
+    // Automatic recall for the message being answered. The briefing's retrieval section remains
+    // the on-demand route (`memory_search`).
     // Neither a delta nor a same-generation full refresh repeats a memory the installed briefing's
     // wakes already carried; a new generation, session or epoch starts afresh.
     let held = delivery.held.clone();
@@ -2119,14 +2174,11 @@ pub(crate) fn prepare_dsh_wake_layered(
     delta.push_str(&recall);
     delta.push_str(&crate::schedule::reminder_line(context, reason));
     delta.push_str(&tail(reason,key,pre_sleep_ms(cfg)));
-    body.push_str(&crate::model_view::strip_from_model_text(&delta, cfg));
-    body.push_str(&crate::qq_tools::wake_snapshot(context,cfg,key,epoch)?);
-    let carried: Vec<i64> = held.iter().chain(&recalled).copied().collect();
-    // Held as pending only while the generation and refresh state read above still hold; DSH reports the
-    // delivery (`session_context::observe`), which installs it.
-    if !crate::session_map::update_context(context,key,sid,epoch,|r| { crate::briefing_delivery::hold(r,&delivery,rpc_id,&revision,&hashes,&carried); })? {
-        return Err(WAKE_BRIEFING_CHANGED.into());
-    }
-    let alerted = crate::briefing::alert_empty(context, cfg, key, sid, epoch, generation, &layers);
-    Ok(DshWake { text: format!("{}\n\n{body}", clock_line(cfg, now_ms())), recalled, layers, cut, alerted })
+    let delta = crate::model_view::strip_from_model_text(&delta, cfg);
+    let snapshot = crate::qq_tools::wake_snapshot(context, cfg, key, epoch, turn)?;
+    let carried = held.iter().chain(&recalled).copied().collect();
+    let clock = format!("{}\n\n", clock_line(cfg, now_ms()));
+    let text = format!("{clock}{}{delta}{snapshot}", header(full));
+    let full_text = (!include_token && !full).then(|| format!("{clock}{}{delta}{snapshot}", header(true)));
+    Ok(RenderedWake { text, full_text, recalled, layers, cut, revision, hashes, carried })
 }
