@@ -8534,7 +8534,7 @@ fn handle_console_token_post(
     }
     if context.is_isolated() {
         let _credential = crate::console_auth::credential_mutation_gate(context).map_err(|e| (503, e))?;
-        let _gate = acquire_social_state_gate(context)?; if !matches!(context.console_authority, Some(crate::console_auth::ConsoleAuthority::Machine { .. })) { return Err((401, "machine proof required".into())); } // RED-R3-E2
+        let _gate = acquire_social_state_gate(context)?;
         crate::console_auth::rotate_console_token(context, &new_token, !generated)?;
     } else {
         let mut cfg = read_json_for(context, CONFIG_PATH)
