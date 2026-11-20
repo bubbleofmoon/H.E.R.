@@ -420,7 +420,7 @@ def run_relay(args, key, connect):
                     fd = syscall_filter.fileno()
                     status = run_worker(worker_command(args, relay_path, fd), fd, args.timeout,
                                         args.capture_result)
-                    if args.capture_result and not relay.inference_succeeded:
+                    if args.capture_result and not relay.inference_succeeded and status != 0:
                         if relay.inference_status == 429:
                             return 75
                         if status == 0:
