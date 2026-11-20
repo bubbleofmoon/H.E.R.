@@ -375,7 +375,7 @@ fn hit_from_row(row: Row, score: f64) -> Hit {
         owner_type,
         archived,
         expires_at,
-        provenance: Provenance::Fact, // RED-inference
+        provenance: Provenance::Inference,
         message_id: None,
         attributed_to: None,
     }
