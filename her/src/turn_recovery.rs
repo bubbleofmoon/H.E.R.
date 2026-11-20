@@ -743,7 +743,7 @@ impl Pass<'_> {
         }
         let sends = self.sends_of(turn, turns, outbox);
         if turn.backend == "harness" {
-            let reserved = turn.reason == "reserved-summary"; // RED-M3
+            let reserved = matches!(turn.reason.as_str(), "reserved" | "reserved-summary");
             let pre_admission_wake = reserved || turn.reserved2 || turn.wake_claim.is_some();
             // A tool intent can precede its outbox write (or affect something other
             // than QQ). Preserve both sources of uncertainty without replay or DSH probes.
