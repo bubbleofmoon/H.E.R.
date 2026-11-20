@@ -11,7 +11,10 @@ use rusqlite::{params, Connection, OpenFlags, ToSql};
 use std::path::PathBuf;
 
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
+mod dense;
 mod store;
+#[cfg(test)]
+pub(crate) use dense::fixture::install as install_fixture_embeddings;
 pub use store::{DigestCursor, ForgetError, MemoryStore, NewMemory, Reader};
 
 pub const DB_PATH: &str = crate::legacy_path!("data/memory.db");
@@ -610,7 +613,8 @@ fn recall_term(raw: &str) -> Option<String> {
         })
         .collect();
     let cleaned = cleaned.trim_matches('.');
-    cleaned.chars().any(char::is_alphanumeric).then(|| cleaned.to_string())
+    let stopword = matches!(cleaned, "你好" | "谢谢" | "请问" | "那个" | "这个" | "什么" | "一下");
+    (!stopword && cleaned.chars().any(char::is_alphanumeric)).then(|| cleaned.to_string())
 }
 
 /// The distinct terms of a message in message order, each with the indexes of the message
@@ -645,36 +649,73 @@ fn recall_match_expression(terms: &[String]) -> String {
         .join(" OR ")
 }
 
-/// Automatic recall for `text` (the message being answered): at most `limit` memories, capped at
-/// five, that the reader may see and that share enough words with it, best first. The ids in
-/// `exclude` are already held by the session generation. Recall returns only relevant matches.
-/// Relevance (bm25 and shared terms) leads the score; pin, importance, recency
-/// and past use only add small boosts. Hits are not counted here: the caller counts the items
-/// it actually delivered with `record_hits`.
+/// Automatic recall fuses applicable local semantic and sparse ranks. Both channels
+/// filter by reader scope and the ids already held by this session generation.
 pub fn recall(
     reader: &Reader<'_>,
     text: &str,
+    semantic: Option<(&RuntimeContext, &str)>,
     limit: usize,
     exclude: &[i64],
 ) -> rusqlite::Result<Vec<Hit>> {
     let limit = limit.min(RECALL_MAX_ITEMS);
-    let (conn, reader_key, is_owner) = (reader.conn, reader.key.as_str(), reader.is_owner);
-    // A message under four letters, digits or Han characters is too short to say what it is about.
-    if text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
+    if limit == 0 || text.chars().filter(|c| recall_counts(*c)).count() < RECALL_MIN_SHARED_CHARS {
         return Ok(Vec::new());
     }
-    let spans = recall_term_spans(text);
-    let terms: Vec<String> = spans.iter().map(|(term, _)| term.clone()).collect();
-    if terms.is_empty() || limit == 0 {
-        return Ok(Vec::new());
-    }
-    let (where_sql, args) = visibility_filter(conn, reader_key, is_owner, &[])?;
     let excluded = if exclude.is_empty() {
         String::new()
     } else {
         let ids: Vec<String> = exclude.iter().map(i64::to_string).collect();
         format!(" AND m.id NOT IN ({})", ids.join(","))
     };
+
+    const FUSION_DEPTH: usize = 20;
+    let dense = semantic
+        .and_then(|(context, query)| dense::rank(context, reader, query, &excluded, FUSION_DEPTH))
+        .unwrap_or_default();
+    let sparse_depth = if dense.is_empty() { limit } else { FUSION_DEPTH };
+    let sparse = match sparse_recall(reader, text, &excluded, sparse_depth) {
+        Ok(hits) => hits,
+        Err(error) if dense.is_empty() => return Err(error),
+        Err(error) => {
+            eprintln!("memory recall sparse search failed: {}", search_error_message(&error));
+            Vec::new()
+        }
+    };
+    if dense.is_empty() {
+        return Ok(sparse);
+    }
+    Ok(fuse_recall(sparse, dense, limit))
+}
+
+fn fuse_recall(sparse: Vec<Hit>, dense: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    const RANK_OFFSET: f64 = 60.0;
+    let mut fused = std::collections::HashMap::<i64, Hit>::new();
+    for ranking in [sparse, dense] {
+        for (position, mut hit) in ranking.into_iter().enumerate() {
+            hit.score = 1.0 / (RANK_OFFSET + 1.0 + position as f64);
+            fused.entry(hit.id).and_modify(|existing| existing.score += hit.score).or_insert(hit);
+        }
+    }
+    let mut hits: Vec<_> = fused.into_values().collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    hits.truncate(limit);
+    hits
+}
+
+fn sparse_recall(
+    reader: &Reader<'_>,
+    text: &str,
+    excluded: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<Hit>> {
+    let spans = recall_term_spans(text);
+    let terms: Vec<String> = spans.iter().map(|(term, _)| term.clone()).collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = reader.conn;
+    let (where_sql, args) = visibility_filter(conn, &reader.key, reader.is_owner, &[])?;
     let sql = format!(
         "SELECT m.id, m.owner_id, m.scope, m.kind, m.subject, m.content,
                 bm25(memory_fts) AS rank, m.pinned, m.importance, m.hits, m.created_at,
@@ -1184,6 +1225,10 @@ mod tests {
 
     fn reader_for<'a>(conn: &'a Connection, key: &str, is_owner: bool) -> Reader<'a> {
         Reader { conn, key: key.to_string(), is_owner }
+    }
+
+    fn recall(reader: &Reader<'_>, text: &str, limit: usize, exclude: &[i64]) -> rusqlite::Result<Vec<Hit>> {
+        super::recall(reader, text, None, limit, exclude)
     }
 
     fn recall_fixture() -> Connection {

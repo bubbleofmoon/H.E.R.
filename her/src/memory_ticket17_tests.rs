@@ -799,3 +799,147 @@ fn conversation_authority_owner_config_is_store_owner() {
     assert!(!store.for_reader("private:1").is_owner(), "ownerQQ 2 must not make private:1 the owner");
     assert!(store.for_reader("private:2").is_owner(), "the configured integer owner is the owner");
 }
+
+const HYBRID_CONSOLE: &str = "hybrid-fixture-console";
+const HYBRID_AGENT: &str = "hybrid-fixture-agent";
+const HYBRID_QUESTION: &str = "小孩害怕打雷该如何安抚";
+const HYBRID_MATCH: &str = "幼童遇到风暴时需要拥抱";
+const HYBRID_OTHER_GROUP: &str = "幼童遇到风暴时听白噪声";
+const HYBRID_PRIVATE: &str = "幼童遇到风暴时握着毛毯";
+const HYBRID_ARCHIVED: &str = "幼童遇到风暴时需要陪伴";
+
+fn hybrid_fixture(
+    label: &str,
+    question: &str,
+    memories: &[(&str, &str, &str)],
+) -> (FixtureRoot, RuntimeContext) {
+    let (root, context) = fixture_runtime(label, HYBRID_CONSOLE);
+    let state = json!({"conversations":{"group:101":{
+        "agentToken":HYBRID_AGENT,
+        "unread":[{"sender":"青竹","text":question}],
+        "activeTopics":[{"text":"天气","lastMentionAt":2},{"text":"阅读","lastMentionAt":1}]
+    }}});
+    context
+        .write_atomic(RuntimeArea::Data, "social-v2.json", &serde_json::to_vec(&state).unwrap())
+        .unwrap();
+    let conn = initialize_fixture_memory_database(&context);
+    for (owner_id, scope, content) in memories {
+        let id = crate::memory::write_memory(&conn, &crate::memory::MemoryInput {
+            owner_type: "session",
+            owner_id,
+            scope,
+            kind: "fact",
+            subject: None,
+            content,
+            tags: None,
+            source: "fixture",
+            importance: 0.5,
+        }).unwrap();
+        if *content == HYBRID_ARCHIVED {
+            conn.execute("UPDATE memory SET archived = 1 WHERE id = ?1", [id]).unwrap();
+        }
+    }
+    (root, context)
+}
+
+fn hybrid_preview(context: RuntimeContext) -> String {
+    let (port, server) = start_http_fixture(context, 1);
+    let (status, body) = http_json_with_agent(
+        port, "POST", "/api/memory/preview", HYBRID_CONSOLE, Some(HYBRID_AGENT),
+        Some(&json!({"key":"group:101"}).to_string()),
+    );
+    server.join().unwrap();
+    assert_eq!(status, 200, "{body}");
+    body["block"].as_str().unwrap().to_string()
+}
+
+fn hybrid_fixture_embeddings(texts: &[String]) -> Option<Vec<Vec<f32>>> {
+    Some(texts.iter().map(|text| {
+        let semantic_match = if text.contains(HYBRID_QUESTION) {
+            text.contains("青竹") && text.contains("天气") && !text.contains("阅读")
+        } else {
+            text.contains("幼童遇到风暴")
+        };
+        let mut vector = vec![0.0; 512];
+        vector[if semantic_match { 0 } else { 1 }] = 1.0;
+        vector
+    }).collect())
+}
+
+#[test]
+fn hybrid_preview_recalls_a_chinese_paraphrase() {
+    let (_root, context) = hybrid_fixture("hybrid paraphrase", HYBRID_QUESTION, &[
+        ("group:101", "group", HYBRID_MATCH),
+        ("group:101", "group", "样本周末整理书柜"),
+    ]);
+    assert!(!hybrid_preview(context.clone()).contains(HYBRID_MATCH), "the sparse channel must miss the paraphrase");
+    let _embedding = crate::memory::install_fixture_embeddings(&context, hybrid_fixture_embeddings);
+    let block = hybrid_preview(context);
+    assert!(block.contains(HYBRID_MATCH), "a Chinese paraphrase must reach the console preview");
+    assert!(!block.contains("样本周末整理书柜"), "an unrelated vector must stay below the relevance bar");
+}
+
+#[test]
+fn hybrid_preview_limits_dense_recall_to_reader_scope() {
+    let (_root, context) = hybrid_fixture("hybrid scope", HYBRID_QUESTION, &[
+        ("group:101", "group", HYBRID_MATCH),
+        ("group:303", "group", HYBRID_OTHER_GROUP),
+        ("private:202", "private", HYBRID_PRIVATE),
+        ("group:101", "group", HYBRID_ARCHIVED),
+    ]);
+    let _embedding = crate::memory::install_fixture_embeddings(&context, hybrid_fixture_embeddings);
+    let block = hybrid_preview(context.clone());
+    assert!(block.contains(HYBRID_MATCH), "the reader's own paraphrase must be recalled");
+    assert!(
+        [HYBRID_OTHER_GROUP, HYBRID_PRIVATE, HYBRID_ARCHIVED].iter().all(|content| !block.contains(*content)),
+        "dense recall must obey reader scope and exclude private and archived rows"
+    );
+
+    let set_wildcard = |action| {
+        let (port, server) = start_http_fixture(context.clone(), 1);
+        let (status, body) = http_json(
+            port, "POST", "/api/memory/acl", HYBRID_CONSOLE,
+            Some(&json!({
+                "action": action, "readerType": "session", "readerId": "group:101",
+                "readType": "*", "readId": "*"
+            }).to_string()),
+        );
+        server.join().unwrap();
+        assert_eq!(status, 200, "{body}");
+    };
+    set_wildcard("grant");
+    let granted = hybrid_preview(context.clone());
+    assert!(granted.contains(HYBRID_OTHER_GROUP), "a grant must make the matching group row eligible");
+    assert!(!granted.contains(HYBRID_PRIVATE), "a wildcard grant must still exclude another conversation's private row");
+    assert!(!granted.contains(HYBRID_ARCHIVED), "a wildcard grant must still exclude archived rows");
+    set_wildcard("revoke");
+    assert!(!hybrid_preview(context).contains(HYBRID_OTHER_GROUP), "a cached vector must obey grant revocation");
+}
+
+#[test]
+fn hybrid_preview_falls_back_to_sparse_when_embedding_fails() {
+    let (_root, context) = hybrid_fixture("hybrid fallback", "周末登山看日出", &[
+        ("group:101", "group", "周末登山看日出"),
+    ]);
+    let _embedding = crate::memory::install_fixture_embeddings(&context, |_| None);
+    let block = hybrid_preview(context);
+    assert!(block.contains("周末登山看日出"), "unavailable embeddings must preserve lexical recall");
+}
+
+#[test]
+fn hybrid_preview_prefers_a_match_ranked_by_both_channels() {
+    let overlap = "小孩害怕时，幼童遇到风暴需要拥抱";
+    let (_root, context) = hybrid_fixture("hybrid fusion", HYBRID_QUESTION, &[
+        ("group:101", "group", HYBRID_MATCH),
+        ("group:101", "group", HYBRID_QUESTION),
+        ("group:101", "group", overlap),
+    ]);
+    let _embedding = crate::memory::install_fixture_embeddings(&context, hybrid_fixture_embeddings);
+    let block = hybrid_preview(context);
+    let matches: Vec<_> = block.lines().filter(|line| line.starts_with("- [")).collect();
+    assert!(
+        matches.first().is_some_and(|line| line.contains(overlap)),
+        "a match supported by both channels must rank ahead of either single-channel match"
+    );
+    assert_eq!(matches.len(), 3, "fusion must carry each qualifying memory once");
+}

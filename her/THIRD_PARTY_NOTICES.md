@@ -1,5 +1,16 @@
 # Third-party dependency notices
 
+## Local recall dependencies
+
+HER uses fastembed 7.7.1 (Apache-2.0) and its ONNX Runtime binding ort (MIT or Apache-2.0) for CPU inference, and sqlite-vec 0.1.9 (MIT or Apache-2.0) for cosine distance in bundled SQLite. The separately provisioned model is Xenova's ONNX conversion of BAAI bge-small-zh-v1.5, which BAAI licenses under MIT.
+
+- [fastembed license](https://docs.rs/crate/fastembed/7.7.1/source/LICENSE)
+- [ort source and licenses](https://github.com/pykeio/ort)
+- [ONNX Runtime license](https://github.com/microsoft/onnxruntime/blob/main/LICENSE)
+- [sqlite-vec source and licenses](https://github.com/asg017/sqlite-vec)
+- [BAAI model card](https://huggingface.co/BAAI/bge-small-zh-v1.5)
+- [Xenova ONNX model card](https://huggingface.co/Xenova/bge-small-zh-v1.5)
+
 ## Jiff 0.2.39
 
 HER uses Jiff for IANA time zone lookup, civil scheduling and calendar conversion under the Unlicense option of its Unlicense OR MIT dual license. The bundled IANA time-zone database is distributed with Jiff's tzdb packages. The upstream license texts accompany the redistributable source.
