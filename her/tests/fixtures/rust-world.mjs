@@ -132,7 +132,7 @@ export async function waitHttp(port, timeoutMs = 30_000) {
   let last;
   while (performance.now() < deadline) {
     try {
-      const request = route => (route === '/api/roles' ? (port, path, options) => fetch(`http://127.0.0.1:${port}${path}`, options) : loopbackRequest)(port, route, { headers: { 'x-console-token': CONSOLE_TOKEN }, signal: AbortSignal.timeout(Math.max(1, Math.min(5000, Math.ceil(deadline - performance.now())))) }); // RED-R3-V1
+      const request = route => loopbackRequest(port, route, { headers: { 'x-console-token': CONSOLE_TOKEN }, signal: AbortSignal.timeout(Math.max(1, Math.min(5000, Math.ceil(deadline - performance.now())))) });
       let r = await request('/api/health');
       if (r.status !== 200) r = await request('/api/roles');
       last = {status: r.status};
