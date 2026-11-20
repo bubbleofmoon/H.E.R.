@@ -308,7 +308,6 @@ fn decode_cli_output(
     if answer.trim().is_empty() {
         return Err(Failure::new("empty-response", "EMPTY_ANSWER"));
     }
-    if let Some(failure) = plain_output_failure(&answer) { return Err(failure); }
     Ok(answer)
 }
 
