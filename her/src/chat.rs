@@ -1234,7 +1234,7 @@ async fn worker(
             continue;
         }
         if pipeline.is_none() {
-            match crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true) {
+            match crate::pipeline::Pipeline::new_without_dsh(&context, &cfg) {
                 Ok(mut p) => {
                     p.owner_interactions = mailbox.clone();
                     pipeline = Some(p);

@@ -14,7 +14,7 @@ use crate::failover;
 use crate::recovery_log;
 use crate::run_record::{Component, Outcome, Trigger};
 use std::sync::{Arc, Mutex, OnceLock};
-use crate::onebot::{OneBot, RateLimiter, SendTuning, Target};
+use crate::onebot::{OneBot, Target};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 
 // The DSH turn adapter (`turn_engine::Adapter::Dsh`): its sessions, model failover, prompt
@@ -451,10 +451,7 @@ pub struct Pipeline {
     failover: Arc<Mutex<FailoverState>>,
     pub rpc: Rpc,
     pub ob: OneBot,
-    pub tune: SendTuning,
-    pub limiter: RateLimiter,
     pub store: SessionStore,
-    pub live: bool,
     pub preset_group: String,
     pub preset_owner: String,
     pub owner_qq: String,
@@ -618,16 +615,8 @@ pub fn patch_token_line(prompt: &str, token: &str) -> String {
 }
 
 impl Pipeline {
-    pub fn new(cfg: &serde_json::Value, live: bool) -> Result<Self, String> {
-        Self::new_with_runtime(&RuntimeContext::legacy(), cfg, live)
-    }
-
-    pub fn new_with_runtime(
-        context: &RuntimeContext,
-        cfg: &serde_json::Value,
-        live: bool,
-    ) -> Result<Self, String> {
-        Self::build(context, cfg, live, true)
+    pub fn new_with_runtime(context: &RuntimeContext, cfg: &serde_json::Value) -> Result<Self, String> {
+        Self::build(context, cfg, true)
     }
 
     /// A pipeline for turns whose engine needs no DSH (`turn_engine::Engine::uses_dsh` is false;
@@ -636,15 +625,13 @@ impl Pipeline {
     pub fn new_without_dsh(
         context: &RuntimeContext,
         cfg: &serde_json::Value,
-        live: bool,
     ) -> Result<Self, String> {
-        Self::build(context, cfg, live, false)
+        Self::build(context, cfg, false)
     }
 
     fn build(
         context: &RuntimeContext,
         cfg: &serde_json::Value,
-        live: bool,
         dsh: bool,
     ) -> Result<Self, String> {
         // Validate selected-root session state before constructing any live dependencies or
@@ -734,13 +721,7 @@ impl Pipeline {
             failover: failover_state_for(context),
             rpc,
             ob,
-            tune: SendTuning::from_config(cfg),
-            limiter: RateLimiter::new(
-                SendTuning::max_per_minute(cfg),
-                SendTuning::max_per_hour(cfg),
-            ),
             store,
-            live,
             preset_group,
             preset_owner,
             owner_qq,
@@ -2064,10 +2045,7 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     /// 这是 JS 的模式，也是更自然的那个：桥接只负责"叫醒 + 给上下文"，
     /// 说什么、什么时候说、发几条，全由模型决定。
     ///
-    /// 为什么不能用 `handle_with_failover`：它会**把模型的输出文本再发一遍**。
-    /// 模型自己调工具发了一条之后，那段"最终回答"（常常是"群里已经回了一句"
-    /// 这类内心独白）就被桥接当成话发出去 —— 实测 2026-10-23 11:23:45/48
-    /// 那对重复消息就是这么产生的（日志「已回复 9 字」正好对上群里那句）。
+    /// DSH 和 harness 唤醒回合的最终文本留在回合内，对话消息由模型的发送工具投递。
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
         &mut self,
@@ -2551,7 +2529,7 @@ mod tests {
         )
         .unwrap();
         let context = RuntimeContext::from_root(root).unwrap();
-        let pipeline = Pipeline::new_with_runtime(&context, &serde_json::json!({}), true).unwrap();
+        let pipeline = Pipeline::new_with_runtime(&context, &serde_json::json!({})).unwrap();
         (context, pipeline)
     }
 
@@ -2608,7 +2586,7 @@ mod tests {
     #[test]
     fn shadow_key_is_refused_by_live_session_entry() {
         let (_root, context, cfg) = shadow_refusal_fixture();
-        let mut pipeline = Pipeline::new_without_dsh(&context, &cfg, false).unwrap();
+        let mut pipeline = Pipeline::new_without_dsh(&context, &cfg).unwrap();
 
         assert_eq!(
             pipeline.ensure_session("ab:group:42"),
@@ -2623,7 +2601,7 @@ mod tests {
         write_selected_secret(&root.0, [0x37; 32]);
         // A nonexistent backend makes reaching the CLI route observable without launching a process.
         cfg["backends"] = json!({"sessions": {"ab:group:42": "missing-fixture-backend"}});
-        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, false).unwrap();
+        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg).unwrap();
 
         assert_eq!(
             pipeline
@@ -2742,7 +2720,7 @@ mod tests {
         let original = b"{this is deliberately invalid";
         std::fs::write(&session_file, original).unwrap();
 
-        let error = match Pipeline::new_with_runtime(&context, &serde_json::json!({}), true) {
+        let error = match Pipeline::new_with_runtime(&context, &serde_json::json!({})) {
             Ok(_) => panic!("corrupt selected session data must not initialize a live pipeline"),
             Err(error) => error,
         };

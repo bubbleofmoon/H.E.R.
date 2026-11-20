@@ -3,8 +3,7 @@
 //! usage ledger rows and the CLI fallback after an exhausted DSH chain. `pipeline.rs` keeps the
 //! code every engine shares and reaches this module only through its registration points: the
 //! `Adapter::Dsh` arm of `run_admitted_turn`, the DSH chat availability and login checks, and the
-//! public DSH entry points other modules call (`ensure_session`, `cancel*`, `has_dsh`,
-//! `ask_with_failover`, `handle_with_failover`).
+//! public DSH entry points other modules call, including session preparation and cancellation.
 
 use super::*;
 use crate::dependency::{Clock, Idempotency, RetryDecision, RetryPolicy, SystemClock};
@@ -676,6 +675,7 @@ impl Pipeline {
     ///
     /// **只在还没发出任何字节时重投**：这里发送发生在回合成功之后，
     /// 所以重投不会重复发言；一旦将来改成流式边说边发，这个前提就得重新审。
+    #[cfg(test)]
     pub async fn ask_with_failover(
         &mut self,
         key: &str,
@@ -1419,36 +1419,6 @@ impl Pipeline {
             Err(note) => Err(format!("{why_full}；CLI 后端也没成：{note}")),
         }
     }
-    /// 投一句 prompt 并等到这一轮结束，返回回复正文。
-    ///
-    /// **先订阅再投递**：反过来的话回合可能在订阅建立前就结束，实时流不重放。
-    pub async fn ask(&mut self, key: &str, prompt: &str, timeout_secs: u64) -> Result<String, String> {
-        if !self.has_dsh() {
-            return Err(crate::dsh_credential::UNBOUND.to_string());
-        }
-        let sid = self.ensure_session(key)?;
-        self.prepare_title();
-        let mut follow = FollowStream::open(&self.rpc.base, &self.rpc.cookie(), &sid).await?;
-        let accepted = self.rpc.call(
-            "session/prompt",
-            serde_json::json!({
-                "sessionId": sid,
-                "mode": "queue",
-                "content": [{ "type": "text", "text": prompt }]
-            }),
-        )?;
-        if accepted.get("accepted").and_then(|a| a.as_bool()) != Some(true) {
-            return Err(format!("prompt 未被接受：{accepted}"));
-        }
-        self.flush_title();
-        let reply = follow
-            .next_turn(std::time::Duration::from_secs(timeout_secs))
-            .await;
-        // turn/end 之后 usage 已收集完：先落账，再关流。
-        self.record_turn_usage(&key, &sid, &follow, None, None);
-        follow.close().await;
-        reply
-    }
 
     /// 回合结束后把 usage 落账（Rust 接管写账本的唯一入口）。
     ///
@@ -1488,88 +1458,6 @@ impl Pipeline {
         if let Err(e) = crate::ledger::append_planned(&self.context, &rows) {
             eprintln!("[ledger] 写账本失败：{e}");
         }
-    }
-
-    /// 把回复发回 QQ（先看静默标记，再过哨兵）。
-    ///
-    /// `[SILENT]` 是模型"我选择不说"的合法出口（JS `isSilentMarker`）。
-    /// 没有这一步的话，整段 `[SILENT]` 会被原样发到群里 —— 那是最尴尬的一种 bug：
-    /// 它只会出现在"AI 决定闭嘴"的时刻，平时测不到。
-    pub fn reply(&mut self, target: &Target, text: &str) -> Result<Vec<serde_json::Value>, String> {
-        if is_silent_marker(text) {
-            println!("[pipeline] {} 选择静默（[SILENT]），不发送", target.key());
-            return Ok(Vec::new());
-        }
-        let cfg = self.context.load_config().map_err(str::to_string)?;
-        if let Some(mute) = crate::group_mute::active(&self.context, &target.key()) {
-            return Err(mute.refusal_text(crate::parity_clock::now_ms(), &cfg));
-        }
-        if let Some(why) = configured_outbound_violation(&cfg, text, &self.secrets) {
-            return Err(format!("被出站哨兵拦下：{why}"));
-        }
-        self.tune = SendTuning::from_config(&cfg);
-        self.limiter.max_per_minute = SendTuning::max_per_minute(&cfg);
-        self.limiter.max_per_hour = SendTuning::max_per_hour(&cfg);
-        let sent = self.ob.send_text(target, text, &self.tune, &mut self.limiter);
-        if let Err(error) = &sent {
-            if crate::onebot::is_mute_refusal(error) {
-                // #46: QQ refused with result=120; later sends and wakes for this group stay local.
-                crate::group_mute::learn_from_refusal(&self.context, &target.key());
-            }
-        }
-        sent
-    }
-
-    /// 完整一轮：投 prompt → 等回复 → 发回 QQ。
-    ///
-    /// `live=false` 时只走前半段并打印，不发送（影子模式）。
-    // 保留「不带 failover 的简单路径」：排障时能一眼看到单候选下的行为，
-    // 也方便以后写"只想跑一个候选"的测试。主流程一律走 handle_with_failover。
-    #[allow(dead_code)]
-    pub async fn handle(&mut self, target: &Target, prompt: &str) -> Result<Option<String>, String> {
-        let key = target.key();
-        let key: &str = &key;
-        let reply = self.ask(&key, prompt, 180).await?;
-        let trimmed = reply.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("agent 返回了空回复".to_string());
-        }
-        if !self.live {
-            println!("[pipeline] dry-run {key}：回复 {} 字，未发送", trimmed.chars().count());
-            return Ok(Some(trimmed));
-        }
-        let sent = self.reply(target, &trimmed)?;
-        println!("[pipeline] {key}：已发送 {} 条", sent.len());
-        Ok(Some(trimmed))
-    }
-
-    /// 与 `handle` 相同，但走带 failover 的 ask（主路径用这个）。
-    ///
-    /// 单独开一个方法而不是改 `handle`：`handle` 是「单候选」的最简路径，
-    /// 诊断/探针还会用到；主路径要的是候选链 + 失败重投。
-    pub async fn handle_with_failover(
-        &mut self,
-        target: &Target,
-        prompt: &str,
-        cfg: &serde_json::Value,
-    ) -> Result<Option<String>, String> {
-        let key = target.key();
-        let key: &str = &key;
-        let reply = self.ask_with_failover(&key, prompt, 180, cfg).await?;
-        let trimmed = reply.trim().to_string();
-        if trimmed.is_empty() {
-            return Err("agent 返回了空回复".to_string());
-        }
-        if !self.live {
-            println!(
-                "[pipeline] dry-run {key}：回复 {} 字，未发送",
-                trimmed.chars().count()
-            );
-            return Ok(Some(trimmed));
-        }
-        let sent = self.reply(target, &trimmed)?;
-        println!("[pipeline] {key}：已发送 {} 条", sent.len());
-        Ok(Some(trimmed))
     }
 }
 

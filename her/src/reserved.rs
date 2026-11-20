@@ -1013,7 +1013,7 @@ impl Hub {
             for (key, active) in std::mem::take(&mut self.active) {
                 let context = self.context.clone();
                 let cfg = context.load_config().map_err(|e| e.to_string())?;
-                if let Ok(p) = Pipeline::new_with_runtime(&context, &cfg, true) {
+                if let Ok(p) = Pipeline::new_with_runtime(&context, &cfg) {
                     let _ = p.cancel_reserved_epoch(&key, &active.job.authority.token);
                 }
                 active.task.abort();
@@ -1308,7 +1308,7 @@ impl Hub {
             let cfg = cfg.clone();
             let work = job.clone();
             let task = tokio::spawn(async move {
-                let mut pipe = match Pipeline::new_with_runtime(&ctx, &cfg, true) {
+                let mut pipe = match Pipeline::new_with_runtime(&ctx, &cfg) {
                     Ok(p) => p,
                     Err(e) => return (Err(e), true),
                 };

@@ -1268,7 +1268,7 @@ mod tests {
         journal.mark_processing(std::slice::from_ref(&input), 2).unwrap();
         let paused = Recorder::begin(&context, key, "dsh", "atMention", "earlier", &[], None).unwrap();
         paused.unknown("send-unresolved", "fixture").unwrap();
-        let mut pipe = crate::pipeline::Pipeline::new_without_dsh(&context, &cfg, true).unwrap();
+        let mut pipe = crate::pipeline::Pipeline::new_without_dsh(&context, &cfg).unwrap();
         pipe.note_turn("atMention", std::slice::from_ref(&input));
         pipe.expect_dispatch_deadline(10);
         let clock_context = context.clone();

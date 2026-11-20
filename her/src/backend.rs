@@ -1810,7 +1810,7 @@ impl Backend for DshBackend {
     }
     fn ask(&self, _req: &BackendRequest) -> Result<BackendReply, BackendError> {
         // 需要在 async 运行时里跑 RPC；trait 保持同步签名，所以这里明确拒绝，
-        // 由调用方（pipeline::ask_with_failover）直接走 DSH 原生通道。
+        // 由 pipeline 的 DSH 适配器直接走原生通道。
         Err(BackendError::Config(
             "DSH 后端请在 pipeline 里直连，不要经由同步 trait".into(),
         ))

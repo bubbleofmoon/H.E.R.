@@ -66,7 +66,7 @@ async fn hf123_fix2_cli_unavailable_console_fails_closed_within_bound() {
             .unwrap()
             .with_console_port(address.port());
         let cfg = context.load_config().unwrap();
-        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, true).unwrap();
+        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg).unwrap();
         pipeline.begin_ledger_turn("group:42").unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -157,7 +157,7 @@ async fn hf123_fix1_cli_sentinel_checks_canonical_paths_and_known_secrets() {
         .unwrap()
         .with_console_port(port);
     let cfg = context.load_config().unwrap();
-    let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, true).unwrap();
+    let mut pipeline = Pipeline::new_with_runtime(&context, &cfg).unwrap();
     pipeline.secrets = vec!["opaque-fixture-value-Q7N4".into()];
     pipeline.begin_ledger_turn("group:42").unwrap();
     let stop = Arc::new(AtomicBool::new(false));
@@ -216,7 +216,7 @@ async fn hf123_cli_protocol_empty_initial_draft_keeps_fallback_but_silent_ends()
         write_selected_secret(&root, [0x44; 32]);
         std::fs::write(root.join("data/mode.json"), r#"{"mode":"reserved2"}"#).unwrap();
         let cfg = context.load_config().unwrap();
-        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, true).unwrap();
+        let mut pipeline = Pipeline::new_with_runtime(&context, &cfg).unwrap();
         pipeline.begin_ledger_turn("group:42").unwrap();
         let mut calls = 0;
         let result = pipeline
@@ -299,7 +299,7 @@ async fn hf123_cli_protocol_with_mute(
     let context = RuntimeContext::from_root(&root)
         .unwrap()
         .with_console_port(port);
-    let mut pipeline = Pipeline::new_with_runtime(&context, &cfg, true).unwrap();
+    let mut pipeline = Pipeline::new_with_runtime(&context, &cfg).unwrap();
     pipeline.begin_ledger_turn("group:42").unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let seen = Arc::new(Mutex::new(Vec::new()));

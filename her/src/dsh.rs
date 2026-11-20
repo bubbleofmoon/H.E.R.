@@ -633,77 +633,6 @@ impl Rpc {
     }
 }
 
-// ── 演示：建会话 + 投 prompt（A2 验收）────────────────────────────────────────
-
-/// 用 Rust 建一个会话并投一句 prompt，打印每步结果。
-pub async fn demo_create_and_prompt(base: &str, preset: &str) -> Result<(), String> {
-    let rpc = Rpc::connect(base)?;
-    println!("[dsh] 1/5 Cookie 铸造成功");
-
-    let list = rpc.call("session/list", serde_json::json!({}))?;
-    let n = list.get("items").and_then(|i| i.as_array()).map(|a| a.len()).unwrap_or(0);
-    println!("[dsh] 2/5 session/list ok：{n} 个会话");
-
-    let presets = rpc.call("agentPresets/list", serde_json::Value::Null)?;
-    let names: Vec<String> = presets
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    println!("[dsh] 3/5 可用预设：{}", names.join(", "));
-
-    let ws_dir = crate::legacy_path!("state/rust-demo");
-    let _ = std::fs::create_dir_all(ws_dir);
-    let ws = rpc.call("workspace/create", serde_json::json!({ "path": ws_dir }))?;
-    let ws_id = ws
-        .get("workspace")
-        .and_then(|w| w.get("workspaceId"))
-        .and_then(|i| i.as_str())
-        .ok_or_else(|| format!("workspace/create 没返回 workspaceId：{ws}"))?
-        .to_string();
-    println!("[dsh] 4/5 workspace/create ok：{ws_id}");
-    let _ = rpc.call(
-        "workspace/rename",
-        serde_json::json!({ "workspaceId": ws_id, "title": "Rust 移植验证" }),
-    );
-
-    let sess = rpc.call(
-        "session/create",
-        serde_json::json!({ "workspaceId": ws_id, "agentPreset": preset }),
-    )?;
-    let sid = sess
-        .get("sessionId")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| format!("session/create 没返回 sessionId：{sess}"))?
-        .to_string();
-    println!("[dsh] 5/5 session/create ok：{sid}（预设 {preset}）");
-
-    // A3：**先订阅再投 prompt**。反过来的话回合可能在订阅建立前就结束，
-    // 实时流不会重放，只能读快照，那样分不清是这轮还是上一轮的回复。
-    let mut follow = FollowStream::open(base, &rpc.cookie(), &sid).await?;
-    println!("[dsh] 已订阅事件流（baseline seq={}）", follow.baseline_seq());
-
-    let accepted = rpc.call(
-        "session/prompt",
-        serde_json::json!({
-            "sessionId": sid,
-            "mode": "queue",
-            "content": [{ "type": "text", "text": "只回复两个字：收到" }]
-        }),
-    )?;
-    println!("[dsh] prompt 已投递：{}", accepted);
-
-    println!("[dsh] 等回复（实时事件流）…");
-    let reply = follow.next_turn(std::time::Duration::from_secs(120)).await?;
-    follow.close().await;
-    println!("[dsh] ✅ 拿到回复：{reply}");
-    println!("[dsh] ✅ A2+A3 通过（会话 {sid}）");
-    Ok(())
-}
-
 // ── A3：session/follow 事件流 ────────────────────────────────────────────────
 
 use futures_util::{SinkExt, StreamExt};
@@ -1232,10 +1161,6 @@ impl FollowStream {
         Ok(())
     }
 
-    pub fn baseline_seq(&self) -> i64 {
-        self.baseline_seq
-    }
-
     /// 本轮 turn 编号（`turn/end` 时用于 `b:null` 记录）。
     pub fn turn_id(&self) -> Option<i64> {
         self.current_turn
@@ -1249,14 +1174,7 @@ impl FollowStream {
     ///   assistant/message -> 累加 text 块
     ///   turn/end          -> 返回
     /// 只接受 seq > baseline 的事件，避免把快照里的历史回合当成新回复。
-    pub async fn next_turn(&mut self, timeout: std::time::Duration) -> Result<String, String> {
-        self.next_turn_with_start(timeout, || Ok(())).await
-    }
-
-    pub async fn next_turn_with_start(&mut self, timeout: std::time::Duration, on_start: impl FnMut() -> Result<(), String> + Send) -> Result<String,String> {
-        self.next_turn_with_lifecycle(timeout, on_start, |_| Ok(())).await
-    }
-
+    ///
     /// Observe the matching end before usage/tool bookkeeping or returning to the caller.
     pub async fn next_turn_with_lifecycle(
         &mut self,
@@ -1835,53 +1753,8 @@ pub(crate) fn switch_history(rpc: &Rpc, sid: &str, limit: usize) -> Result<Vec<S
     })
 }
 
-pub async fn watch_raw(base: &str, cookie: &str, session_id: &str, secs: u64) -> Result<(), String> {
-    let ws_url = format!("{}/api/remote.mux", base.replacen("http://", "ws://", 1));
-    let mut request = ws_url
-        .as_str()
-        .into_client_request()
-        .map_err(|e| format!("构造 WS 请求失败：{e}"))?;
-    request
-        .headers_mut()
-        .insert("Cookie", cookie.parse().map_err(|_| "Cookie 头非法".to_string())?);
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| format!("连 mux 失败：{e}"))?;
-    println!("[watch] WS 已连上");
-
-    let stream_id = mint_request_id();
-    let open = serde_json::json!({
-        "type": "open",
-        "streamId": stream_id,
-        "endpoint": "session/follow",
-        "payload": { "args": { "request": {
-            "address": { "kind": "session", "sessionId": session_id },
-            "maxMessages": 10
-        } } }
-    });
-    ws.send(Message::Text(open.to_string())).await.map_err(|e| e.to_string())?;
-    println!("[watch] 已发送 open（stream {stream_id}）");
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
-    while !deadline.saturating_duration_since(tokio::time::Instant::now()).is_zero() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => {
-                let head: String = crate::activity::preview_chars(&t, 400);
-                println!("[watch] 帧：{head}");
-            }
-            Ok(Some(Ok(_))) => println!("[watch] 非文本帧"),
-            Ok(Some(Err(e))) => { println!("[watch] 错误：{e}"); break }
-            Ok(None) => { println!("[watch] 流结束"); break }
-            Err(_) => break,
-        }
-    }
-    let _ = ws.close(None).await;
-    Ok(())
-}
-
-
-/// 诊断用：拉一次 snapshot，列出事件类型与该会话里所有 assistant 文本。
+/// Snapshot rendering for the diagnostic redaction test.
+#[cfg(test)]
 pub async fn dump_snapshot(base: &str, cookie: &str, session_id: &str) -> Result<(), String> {
     let ws_url = format!("{}/api/remote.mux", base.replacen("http://", "ws://", 1));
     let mut request = ws_url.as_str().into_client_request().map_err(|e| e.to_string())?;

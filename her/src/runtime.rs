@@ -2980,7 +2980,7 @@ pub(crate) mod tests {
         mcp_live_groups.extend(["--live-groups".to_string(), "group:123".to_string()]);
         assert!(RuntimeContext::from_process_args_with_environment(&mcp_live_groups, None).is_err());
 
-        // These flags dispatch through legacy probes before the live service loop in main.rs.
+        // Legacy and retired flags cannot select an isolated live service.
         for early_probe in [
             "--send-probe", "--ask", "--memory-probe", "--memory-write-probe",
             "--hot-render", "--index-hint", "--price-probe", "--role-probe",

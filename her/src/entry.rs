@@ -988,7 +988,7 @@ fn prepare_live_pipeline(
     if !live_mode || (live_groups.is_empty() && !live_all) {
         return Ok(None);
     }
-    match pipeline::Pipeline::new_with_runtime(context, cfg, true) {
+    match pipeline::Pipeline::new_with_runtime(context, cfg) {
         Ok(pipeline) => {
             println!("[her] LIVE 模式：会真的建会话并发送 QQ 消息");
             Ok(Some(pipeline))
@@ -1072,18 +1072,6 @@ fn fetch_group_card(host: &str, port: u16, token: &str, gid: i64, self_id: i64) 
         .filter(|c| !c.is_empty())
         .map(|c| c.to_string())
 }
-
-
-/// DSH 基址：优先环境变量，其次 bridge 的 config.json。
-fn dsh_probe_base() -> String {
-    if let Ok(v) = std::env::var("DSH_BASE_URL") {
-        return v;
-    }
-    read_json(crate::legacy_path!("qq-bridge/config.json"))
-        .and_then(|v| v.get("dsh").and_then(|d| d.get("baseUrl")).and_then(|b| b.as_str()).map(|s| s.to_string()))
-        .unwrap_or_else(|| "http://127.0.0.1:3080".to_string())
-}
-
 
 
 /// 解析 `private:123` / `group:456` 形式的发送目标。
@@ -1204,6 +1192,8 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.iter().skip(1).any(|arg| matches!(arg.as_str(),
         "--ab-full" | "--ab-probe" | "--shadow-turn" | "--shadow-state-root"
         | "--replay" | "--wake-replay" | "--replay-jsonl" | "--replay-triggers"
+        | "--ask" | "--rpc-probe" | "--selftest-401" | "--failover-probe"
+        | "--dsh-dump" | "--dsh-watch" | "--dsh-probe" | "--dsh-demo"
     )) {
         eprintln!("[her] unknown option");
         std::process::exit(2);
@@ -1211,11 +1201,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // These diagnostic/maintenance modes use legacy paths rather than a selected runtime.
     // They remain development-only even when launched through an installed image.
     let development_mode = args.iter().skip(1).any(|arg| matches!(arg.as_str(),
-        "--send-probe" | "--ask" | "--memory-probe" | "--memory-write-probe"
+        "--send-probe" | "--memory-probe" | "--memory-write-probe"
         | "--hot-render" | "--index-hint" | "--price-probe" | "--role-probe"
-        | "--prompt-wrapped" | "--rpc-probe" | "--slang-parse-test" | "--selftest-401"
-        | "--failover-probe" | "--sticker-sync" | "--build-prompt" | "--dsh-dump"
-        | "--dsh-watch" | "--dsh-probe" | "--dsh-demo" | "--question-probe"
+        | "--prompt-wrapped" | "--slang-parse-test" | "--sticker-sync"
+        | "--build-prompt" | "--question-probe"
         | "--split-probe" | "--sensitive-probe" | "--backend-ask" | "--backends"
     ));
     if development_mode {
@@ -1236,7 +1225,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
     activity::set_log_context(&runtime_context);
-    // P2-A 探针：--dsh-probe 只验鉴权；--dsh-demo 建会话并投 prompt
     // P2-B 探针：发一条私聊测试消息，验证 OneBot 发送链路
     if std::env::args().any(|a| a == "--send-probe") {
         let cfgv = read_json(crate::legacy_path!("qq-bridge/config.json")).unwrap_or_default();
@@ -1272,32 +1260,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         match ob.send_text(&target, &text, &tune, &mut limiter) {
             Ok(list) => println!("[send] ✅ 发送成功 {} 条：{list:?}", list.len()),
             Err(e) => println!("[send] ❌ {e}"),
-        }
-        return Ok(());
-    }
-
-    // P2-C 探针：完整一轮（投 prompt -> 等回复 -> 可选发送）
-    //   --ask private:7001 "你好"            默认 dry-run，只打印回复
-    //   --ask private:7001 "你好" --live     真的发出去
-    if let Some(pos) = std::env::args().position(|a| a == "--ask") {
-        let target_arg = std::env::args().nth(pos + 1).ok_or("--ask needs target")?;
-        let text = std::env::args().nth(pos + 2).ok_or("--ask needs text")?;
-        let live = std::env::args().any(|a| a == "--live");
-        let cfgv = read_json(crate::legacy_path!("qq-bridge/config.json")).unwrap_or_default();
-        let target = parse_target(&target_arg, &cfgv)?;
-        match pipeline::Pipeline::new(&cfgv, live) {
-            Ok(mut p) => {
-                println!("[ask] target={} live={}", target.key(), live);
-                // 走**带 failover** 的那条：诊断/探针也应该是生产路径，
-                // 否则"探针能通"不代表"主路径能通"（候选链、失败分类、重投都没被走到）。
-                let result = p.handle_with_failover(&target, &text, &cfgv).await;
-                match result {
-                    Ok(Some(reply)) => println!("[ask] 回复：{reply}"),
-                    Ok(None) => println!("[ask] 无回复"),
-                    Err(e) => println!("[ask] ❌ {e}"),
-                }
-            }
-            Err(e) => println!("[ask] ❌ 初始化失败：{e}"),
         }
         return Ok(());
     }
@@ -1513,21 +1475,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    // 排障：直接打一个 DSH RPC 方法，看是 cookie 问题还是端点问题
-    if let Some(pos) = std::env::args().position(|a| a == "--rpc-probe") {
-        let method = std::env::args().nth(pos + 1).unwrap_or_else(|| "session/list".to_string());
-        let cfg = read_json(CONFIG_PATH).unwrap_or_default();
-        let base = cfg.get("dsh").and_then(|d| d.get("baseUrl")).and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080");
-        println!("[rpc-probe] base={base} method={method}");
-        let rpc = dsh::Rpc::connect(base)?;
-        match rpc.call(&method, json!({})) {
-            Ok(v) => println!("[rpc-probe] ok: {}", activity::preview_chars(&v.to_string(), 300)),
-            Err(e) => println!("[rpc-probe] err: {e}"),
-        }
-        return Ok(());
-    }
-
     // 回归/排障：只跑一遍抽取解析器，证明「模型输出不是 JSON」时不会崩。
     // 从 stdin 读原文（正文里可能有换行/引号，放命令行参数会被 shell 转义弄坏）。
     if std::env::args().any(|a| a == "--slang-parse-test") {
@@ -1592,73 +1539,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         return Ok(());
     }
 
-    // 401 自愈演练：故意把 cookie 弄坏 → 确认 harness 能重铸并成功。
-    //
-    // 为什么单独做：真实 401 只有"DSH 重启换密钥"才会出现，那是线上操作。
-    // 但**弄坏自己手里的 cookie** 等价于同一个状态（服务端认不出这张票），
-    // 所以可以在不影响 DSH 的前提下把这条路走一遍。
-    if std::env::args().any(|a| a == "--selftest-401") {
-        let cfg_raw = read_json(CONFIG_PATH).ok_or("no config.json")?;
-        let base = cfg_raw
-            .get("dsh")
-            .and_then(|d| d.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080")
-            .to_string();
-        let mut rpc = dsh::Rpc::connect(&base)?;
-        // 伪造成"服务端换了密钥"的效果：票本身格式合法但签名对不上。
-        // 直接在末尾加一个字符，破坏签名。
-        rpc.credential().disable_refresh();
-        rpc.credential().set_cookie(format!("{}x", rpc.cookie()));
-
-        let args = json!({ "workspaceId": "probe", "agentPreset": "default" });
-        let first = rpc.call("session/create", args.clone());
-        println!("[selftest-401] 坏票调用结果：{}", match &first {
-            Ok(_) => "成功（说明 DSH 没校验？）".to_string(),
-            Err(e) => format!("失败（预期）：{}", activity::preview_chars(&e, 80)),
-        });
-        let hit_401 = matches!(&first, Err(e) if e.contains("401"));
-        if !hit_401 {
-            println!("[selftest-401] ❌ 没拿到 401，这条演练不成立（可能 DSH 未运行）");
-            std::process::exit(1);
-        }
-        rpc.relogin()?;
-        // 重铸后用一个**无副作用**的鉴权调用证明票好了。
-        // 不用 session/create 收尾：它会真的建会话，而这里只想验"票能用"。
-        match rpc.call("agentPresets/list", json!({})) {
-            Ok(_) => {
-                println!("[selftest-401] ✅ 重铸票后鉴权调用成功（agentPresets/list）");
-                std::process::exit(0);
-            }
-            Err(e) => {
-                println!("[selftest-401] ❌ 重铸后仍失败：{e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // P8 验收：故意把主 provider 写坏，看是否能自动切到 fallback 并拿到回复
-    if std::env::args().any(|a| a == "--failover-probe") {
-        let mut cfg_raw = read_json(CONFIG_PATH).ok_or("no config.json")?;
-        // 只改主 provider；fallbacks 保持配置原样
-        if let Some(dsh) = cfg_raw.get_mut("dsh") {
-            dsh["provider"] = serde_json::json!("definitely-not-a-provider");
-            dsh["model"] = serde_json::json!("no-such-model");
-        }
-        let mut pipe = pipeline::Pipeline::new(&cfg_raw, false)?;
-        let chain = failover::model_chain(&cfg_raw);
-        println!("[failover-probe] 候选链 {} 个：{:?}", chain.len(), chain.iter().map(|c| c.label()).collect::<Vec<_>>());
-        let key = "private:7001";
-        match pipe
-            .ask_with_failover(key, "只回复两个字：收到", 180, &cfg_raw)
-            .await
-        {
-            Ok(text) => println!("[failover-probe] ✅ 拿到回复（{} 字）：{}", text.chars().count(), activity::preview_chars(&text, 40)),
-            Err(e) => println!("[failover-probe] ❌ 失败：{e}"),
-        }
-        return Ok(());
-    }
-
     // P7：同步 QQ 收藏表情（拉取 → 合并 → 落盘）
     if std::env::args().any(|a| a == "--sticker-sync") {
         let cfg_raw = read_json(CONFIG_PATH).ok_or("no config.json")?;
@@ -1687,59 +1567,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         let name = std::env::var("HER_SELF_NICK").unwrap_or_else(|_| "Fixture Bot".to_string());
         let qq = std::env::var("HER_SELF_QQ").unwrap_or_else(|_| "7004".to_string());
         print!("{}", prompt::build(&key, &reason, &name, &qq));
-        return Ok(());
-    }
-
-    // 诊断：拉 snapshot 并列出事件
-    if let Some(pos) = std::env::args().position(|a| a == "--dsh-dump") {
-        let sid = std::env::args().nth(pos + 1).ok_or("--dsh-dump needs a sessionId")?;
-        let base = dsh_probe_base();
-        match dsh::Rpc::connect(&base) {
-            Ok(rpc) => {
-                if let Err(e) = dsh::dump_snapshot(&base, &rpc.cookie(), &sid).await {
-                    println!("[dump] ❌ {e}");
-                }
-            }
-            Err(e) => println!("[dump] ❌ {e}"),
-        }
-        return Ok(());
-    }
-
-    // 诊断：订阅并打印原始帧
-    if let Some(pos) = std::env::args().position(|a| a == "--dsh-watch") {
-        let sid = std::env::args().nth(pos + 1).ok_or("--dsh-watch needs a sessionId")?;
-        let base = dsh_probe_base();
-        match dsh::Rpc::connect(&base) {
-            Ok(rpc) => {
-                if let Err(e) = dsh::watch_raw(&base, &rpc.cookie(), &sid, 30).await {
-                    println!("[watch] ❌ {e}");
-                }
-            }
-            Err(e) => println!("[watch] ❌ {e}"),
-        }
-        return Ok(());
-    }
-
-    if std::env::args().any(|a| a == "--dsh-probe" || a == "--dsh-demo") {
-        let base = dsh_probe_base();
-        if std::env::args().any(|a| a == "--dsh-demo") {
-            let preset = std::env::var("DSH_DEMO_PRESET").unwrap_or_else(|_| "qq-chat-v2".to_string());
-            match dsh::demo_create_and_prompt(&base, &preset).await {
-                Ok(()) => {}
-                Err(e) => println!("[dsh] ❌ {e}"),
-            }
-        } else {
-            match dsh::Rpc::connect(&base) {
-                Ok(rpc) => match rpc.call("session/list", serde_json::json!({})) {
-                    Ok(v) => {
-                        let n = v.get("items").and_then(|i| i.as_array()).map(|a| a.len()).unwrap_or(0);
-                        println!("[dsh] 鉴权探针：✅ 通过（看到 {n} 个会话）");
-                    }
-                    Err(e) => println!("[dsh] 鉴权探针：❌ {e}"),
-                },
-                Err(e) => println!("[dsh] ❌ {e}"),
-            }
-        }
         return Ok(());
     }
 
@@ -3364,8 +3191,7 @@ mod tests {
                 ]}});
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(frame.to_string())).unwrap();
             });
-            // Exercise the real diagnostic function in a fresh process with an explicit context;
-            // the legacy --dsh-dump CLI intentionally refuses selected-runtime arguments.
+            // Exercise snapshot rendering in a fresh process with an explicit context.
             let output = crate::subprocess::command_without_console(std::env::current_exe().unwrap())
                 .args(["--exact", std::thread::current().name().unwrap(), "--nocapture"])
                 .env(CHILD_ROOT, root).output().unwrap();

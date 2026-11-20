@@ -147,7 +147,7 @@ fn rejected_completion_cap_case(failover: bool, sleep: bool) {
     });
     pipe.begin_ledger_turn(key).unwrap();
     let id = pipe.cur_turn.as_ref().unwrap().id.clone();
-    let mut control = Pipeline::new_with_runtime(&context, &json!({}), true).unwrap();
+    let mut control = Pipeline::new_with_runtime(&context, &json!({})).unwrap();
     let cap_context = context.clone();
     let cap_id = id.clone();
     let mut attempts = 0;

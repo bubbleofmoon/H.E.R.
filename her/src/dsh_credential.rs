@@ -158,8 +158,7 @@ pub struct Credential {
     base: String,
     context: RuntimeContext,
     cookie: Mutex<String>,
-    /// One refresh after a rejection (the frozen JS `_doFetchWithAuth`). The 401 drill (`--selftest-401`) turns it
-    /// off to observe the raw refusal.
+    /// One refresh after a rejection (disabled for unbound credentials and fixed test cookies).
     refresh: AtomicBool,
     /// False for a pipeline whose turns run without DSH: no secret was read and no cookie minted.
     bound: bool,
@@ -242,12 +241,12 @@ impl Credential {
             .clone()
     }
 
-    pub fn set_cookie(&self, cookie: String) {
+    fn set_cookie(&self, cookie: String) {
         *self.cookie.lock().unwrap_or_else(|p| p.into_inner()) = cookie;
     }
 
-    /// Turn the refresh after a rejection off (only the `--selftest-401` drill does).
-    pub fn disable_refresh(&self) {
+    #[cfg(test)]
+    fn disable_refresh(&self) {
         self.refresh.store(false, Ordering::SeqCst);
     }
 

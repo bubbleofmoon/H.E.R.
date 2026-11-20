@@ -36,7 +36,7 @@ impl SeamRuntime {
 
     /// A DSH pipeline whose next admitted turn runs on `script`.
     fn scripted(&self, script: &crate::turn_engine::Script) -> Pipeline {
-        let mut pipe = Pipeline::new_with_runtime(&self.context, &self.cfg(), true).unwrap();
+        let mut pipe = Pipeline::new_with_runtime(&self.context, &self.cfg()).unwrap();
         pipe.scripted = Some(script.clone());
         pipe
     }
@@ -165,7 +165,7 @@ async fn cli_pin_added_at_admission(expire: bool) {
     let key = "group:42";
     let token = crate::console::ensure_or_rotate_agent_token(&runtime.context, key, false).unwrap();
     let gate = crate::engine_switch::turn_gate(&runtime.context, key).await.unwrap();
-    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &queued, true).unwrap();
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &queued).unwrap();
     pipe.expect_dispatch_token(token);
     let route = SharedReserved2Route::default();
     *route.lock().unwrap() = Reserved2Route::PendingHarness;
@@ -235,7 +235,7 @@ async fn seam_harness_turn_builds_and_runs_without_a_dsh_credential() {
     .unwrap();
     runtime.reload();
     let cfg = runtime.cfg();
-    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg, true)
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg)
         .unwrap_or_else(|error| panic!("a pipeline without DSH must build without a DSH credential: {error}"));
     assert!(!pipe.has_dsh(), "the pipeline holds no DSH login");
     let server = std::thread::spawn(move || {
@@ -379,7 +379,7 @@ async fn ticket164_harness_chat_turn_sends_the_acquired_image_with_the_voice_lab
         .unwrap();
         serde_json::from_str::<Value>(&request.body).unwrap()
     });
-    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg, true).unwrap();
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg).unwrap();
     let media = [json!({"kind":"image","file":"fixture-164.png"})];
     let result = pipe
         .run_chat_turn("private:8808", "hello harness media [语音]", None, &cfg, &[], &media, "closed-agent", true)
@@ -426,7 +426,7 @@ async fn seam_unbound_pipeline_asks_never_open_a_dsh_stream() {
     runtime.reload();
     crate::session_map::bind(&runtime.context, "private:8808", "seam-session-62", None).unwrap();
     let cfg = runtime.cfg();
-    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg, true).unwrap();
+    let mut pipe = Pipeline::new_without_dsh(&runtime.context, &cfg).unwrap();
     let reply = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         pipe.ask("private:8808", "hello seam unbound", 5),

@@ -971,7 +971,7 @@ mod tests {
         let route = pipeline::SharedReserved2Route::default();
         *route.lock().unwrap() = pipeline::Reserved2Route::PendingHarness;
         let (minted, admitted) = (pipeline::MintedEpoch::default(), pipeline::MintedEpoch::default());
-        let mut pipe = pipeline::Pipeline::new_without_dsh(&hub.context, &cfg, true).unwrap();
+        let mut pipe = pipeline::Pipeline::new_without_dsh(&hub.context, &cfg).unwrap();
         pipe.share_reserved2_route(route.clone(), admitted.clone());
         pipe.share_minted_epoch(minted.clone());
         pipe.expect_dispatch_token(token.clone());
@@ -1418,7 +1418,7 @@ mod tests {
         let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
         assert!(crate::session_map::lookup(&hub.context, key).unwrap().is_none());
         let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
-        let mut pipe = pipeline::Pipeline::new_without_dsh(&hub.context, &cfg, true).unwrap();
+        let mut pipe = pipeline::Pipeline::new_without_dsh(&hub.context, &cfg).unwrap();
         let route = pipeline::SharedReserved2Route::default();
         let minted = pipeline::MintedEpoch::default();
         let admitted = pipeline::MintedEpoch::default();
@@ -1831,7 +1831,7 @@ mod tests {
         driver.sched.turn_started_at = Some(now);
         driver.sched.prompt_running = true;
         driver.apply(session::Input::Message { reason: "atMention".into(), seq: 2, at_ms: now });
-        let mut pipe = pipeline::Pipeline::new_with_runtime(&hub.context, &hub.context.load_config().unwrap(), true).unwrap();
+        let mut pipe = pipeline::Pipeline::new_with_runtime(&hub.context, &hub.context.load_config().unwrap()).unwrap();
         pipe.share_minted_epoch(minted.clone());
         let (persisted, persisted_rx) = std::sync::mpsc::channel();
         let (publish, publish_rx) = std::sync::mpsc::channel();
@@ -1979,7 +1979,7 @@ mod tests {
         let (contended, contention) = std::sync::mpsc::channel();
         if capped { hub.epoch_contended_hook = Some(contended); }
         std::fs::write(root.join("user/dsh/.credentials.yaml"), "secret: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n").unwrap();
-        let mut pipe = pipeline::Pipeline::new_with_runtime(&hub.context,&cfg,true).unwrap();
+        let mut pipe = pipeline::Pipeline::new_with_runtime(&hub.context,&cfg).unwrap();
         pipe.share_minted_epoch(minted.clone());
         let context = hub.context.clone();
         let task = tokio::spawn(async move {
@@ -2031,7 +2031,7 @@ mod tests {
         if twice {
             // A failed abandonment still persists/publishes T1. Tick must snapshot it
             // while the base queue still belongs to T0; pause_unknown then publishes T2.
-            let mut abandon = pipeline::Pipeline::new_with_runtime(&hub.context,&cfg,true).unwrap();
+            let mut abandon = pipeline::Pipeline::new_with_runtime(&hub.context,&cfg).unwrap();
             abandon.share_minted_epoch(minted.clone());
             assert!(abandon.abandon_attempt_for_test(key,"missing-session",|| {}).is_err());
             assert_ne!(console::conversation_token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
@@ -3280,7 +3280,7 @@ impl Hub {
     fn cancel_running(&self, cfg: &Value, when: &str) {
         for (key, active) in &self.active {
             let Some(session) = active.session() else { continue };
-            if let Err(error) = pipeline::Pipeline::new_with_runtime(&self.context, cfg, true).and_then(|mut p| p.cancel_session(key, &session)) {
+            if let Err(error) = pipeline::Pipeline::new_with_runtime(&self.context, cfg).and_then(|mut p| p.cancel_session(key, &session)) {
                 println!("[reserved2] {key} {when}取消在途回合失败：{error}");
             }
         }
@@ -3572,7 +3572,7 @@ impl Hub {
                 println!("[reserved2] {key} preemption revocation failed: {error}");
             }
         } else if preempted {
-            let cancelled = pipeline::Pipeline::new_with_runtime(&self.context, &cfg, true)
+            let cancelled = pipeline::Pipeline::new_with_runtime(&self.context, &cfg)
                 .and_then(|mut control| control.cancel_with_reason(&key, "superseded"));
             match cancelled {
                 Ok(cancelled) => {
@@ -4257,7 +4257,7 @@ impl Hub {
             let admitted = pipeline::MintedEpoch::default();
             let admitted_shared = admitted.clone();
             let task = tokio::spawn(async move {
-                match pipeline::Pipeline::new_without_dsh(&context, &cfg2, true) {
+                match pipeline::Pipeline::new_without_dsh(&context, &cfg2) {
                     Err(error) => (Err(error), true),
                     Ok(mut pipe) => {
                         pipe.share_session(shared);
