@@ -131,7 +131,7 @@ impl Reader<'_> {
             {
                 hit.message_id = message_id;
                 hit.attributed_to = attributed_to;
-                if hit.message_id.is_none() && hit.attributed_to.is_none() { // RED-fact
+                if hit.message_id.is_some() && hit.attributed_to.is_none() {
                     hit.provenance = Provenance::Fact;
                 }
             }
