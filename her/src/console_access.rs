@@ -342,15 +342,11 @@ pub(super) static SCOPE_AFTER_READ: std::sync::Mutex<Option<std::sync::Arc<dyn F
 
 /// #186: admit (`"action":"admit"`) or remove (`"action":"remove"`) one conversation (`"conversation"`: `group:<id>`
 /// or `private:<id>`) in both keys that decide whether it is answered: its allow list (`allow.groups` or
-/// `allow.private`) and `rollout.rustGroups`. One read-modify-write of `config.json` under the gates of
-/// `POST /api/whitelist`, then the same immediate revocation. The running live process keeps the `--live-groups`
-/// list it was started with; `liveRestart` says whether it must restart. The body never names `key`: the console's
-/// key preflight would refuse a conversation that is not admitted yet.
-/// #154: the allow lists are security settings: a change of one needs `"confirm": true` (409 otherwise, nothing
-/// written; `her-cli conversation` confirms with its `--confirm`) and is stored through the settings store after the
-/// revocation is recorded; `rollout.rustGroups` and the alias removal are written to the file, which keeps its registry
-/// members as the store wrote them back. The allow list is the ids the setting reads: an item of a hand-edited list that
-/// is no usable id is dropped by the change, never a reason to refuse it.
+/// `allow.private`) and `rollout.rustGroups`. Under the gates of `POST /api/whitelist`, the confirmed changes
+/// commit in one settings transaction with their audit rows. Write-back mirrors the committed values, and the file
+/// write folds the changed allow list's alias into its canonical member. Revocation finishes before the reply.
+/// The running live process keeps the `--live-groups` list it started with; `liveRestart` reports any required restart.
+/// The body never names `key`: the console's key preflight would refuse a conversation before admission.
 pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     let confirm = crate::settings::confirm_field(&body)?;
@@ -372,7 +368,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
     let served_same = |value: &Value| value.as_str().and_then(canonical_v2_key).is_some_and(|served| served == key);
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
     finish_pending_before_change(context, &interaction)?;
-    let (before, after, changed, pending) = {
+    let (before, after, changed, pending, mirror_error) = {
         let _gate = acquire_social_state_gate(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         // #192: the file as read, to tell a write that failed before publication from one that published.
@@ -425,7 +421,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
             changed.push("rollout.rustGroups".to_string());
         }
         if changed.is_empty() {
-            (effective_before.clone(), effective_before, changed, None)
+            (effective_before.clone(), effective_before, changed, None, None)
         } else {
             let changes = crate::settings::console_changes(context, &unchanged, &file)?;
             let settings: Vec<&crate::settings::Setting> = changes.iter().map(|(setting, _)| *setting).collect();
@@ -440,11 +436,14 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
                 note_config_before_request(context);
             }
             let pending = begin_access_change(context, &effective_before, &effective_after, "access-revoked")?;
-            store_access_changes(context, changes, &previewed, &pending, "console")?;
-            keep_stored_members(context, &mut file)?;
-            // Once the store holds the change, a failed file write keeps the pending revocation (`Null`: always kept).
-            write_config_or_forget(context, &file, if stored { &Value::Null } else { &unchanged }, &pending)?;
-            (effective_before, effective_after, changed, pending)
+            let mirror_error = store_access_changes(context, changes, &previewed, &pending, "console")?;
+            if mirror_error.is_none() {
+                keep_stored_members(context, &mut file)?;
+                // A failed file write after the commit keeps the recorded revocation.
+                write_config_or_forget(context, &file, if stored { &Value::Null } else { &unchanged }, &pending)?;
+            }
+            let effective_after = context.load_config().unwrap_or(effective_after);
+            (effective_before, effective_after, changed, pending, mirror_error)
         }
     };
     let (retired, failures) = if changed.is_empty() {
@@ -463,7 +462,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         .unwrap_or_default();
     let restart = live_restart(context, &target);
     let gaps = crate::watchdog::rollout_scope_gaps(&after);
-    Ok(json!({
+    let mut reply = json!({
         "ok": true,
         "conversation": key,
         "action": if admit { "admit" } else { "remove" },
@@ -471,7 +470,11 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
         "revoked": retired,
         "liveRestart": restart,
         "scope": {"notAllowed": gaps.not_allowed, "notServed": gaps.not_served},
-    }))
+    });
+    if let Some(error) = mirror_error {
+        reply["mirrorError"] = json!(error);
+    }
+    Ok(reply)
 }
 
 /// #186: whether the running live owner must restart to serve `target` (`rollout.rustGroups`). It serves the
@@ -1007,17 +1010,16 @@ fn write_config_or_forget(
 }
 
 /// #154: stores an access change's registry settings (`settings::apply_changes`, actor `administrator`, `source`) after
-/// its revocation was recorded. A failed store write is settled by `settle_failed_store_write`, whose note the error
-/// carries.
+/// its revocation was recorded. Returns any mirror failure after the commit. A failed store write is settled by
+/// `settle_failed_store_write`, whose note the error carries.
 pub(super) fn store_access_changes(
     context: &RuntimeContext,
     changes: Vec<(&'static crate::settings::Setting, Value)>,
     previewed: &[(&'static crate::settings::Setting, Option<Value>)],
     pending: &Option<String>,
     source: &str,
-) -> Result<(), (u16, String)> {
+) -> Result<Option<String>, (u16, String)> {
     crate::settings::apply_changes(context, changes, "administrator", source)
-        .map(|_| ())
         .map_err(|(status, error)| (status, format!("{error}{}", settle_failed_store_write(context, previewed, pending))))
 }
 
