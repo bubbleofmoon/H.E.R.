@@ -206,6 +206,38 @@ jobs:
           name: ci-evidence-ubuntu-24.04-${{ matrix.shard }}
           path: ${{ env.CI_EVIDENCE }}
           retention-days: 7
+  dsh-contract:
+    name: DSH credential contract (ubuntu-22.04)
+    # This fixture needs unprivileged user and network namespaces.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      PUBLIC_TREE: /tmp/her
+      CARGO_TARGET_DIR: /tmp/her-target
+    steps:
+      - name: Fetch source
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+      - name: Toolchains
+        run: |
+          python "$PUBLIC_TREE/scripts/ci/install-node.py" "$RUNNER_TEMP/her-node"
+          echo "$RUNNER_TEMP/her-node/bin" >> "$GITHUB_PATH"
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.PUBLIC_TREE }}/her -> ../../her-target
+          key: dsh-contract-ubuntu-22.04
+          cache-on-failure: true
+      - name: Run the DSH credential contract against baseline and candidate
+        run: python -I "$PUBLIC_TREE/scripts/ci/dsh-contract.py"
   # Windows test shards run on every push to main only; a pull request runs scans on Windows and the Linux shards.
   tests-windows:
     name: tests (windows-2022, shard ${{ matrix.shard }}/5)

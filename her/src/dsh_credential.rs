@@ -455,6 +455,10 @@ impl LoginWatch {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "dsh_credential/contract.rs"]
+mod contract;
+
 #[cfg(test)]
 mod tests {
     use super::*;
