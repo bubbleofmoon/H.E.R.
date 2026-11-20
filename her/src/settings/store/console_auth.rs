@@ -289,7 +289,7 @@ fn observe_browser_clock(conn: &Connection, now: i64) -> Result<Option<(Generati
 }
 
 fn session_timestamps_valid(created: i64, last: i64, expires: i64, now: i64) -> bool {
-    0 <= created && created <= last && last <= now && last.checked_add(BROWSER_IDLE_MS) == Some(expires)
+    0 <= created && created <= last && last <= now.saturating_add(BROWSER_IDLE_MS) && last.checked_add(BROWSER_IDLE_MS) == Some(expires) // RED-R3-P
 }
 
 struct SessionRow {
