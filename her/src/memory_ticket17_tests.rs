@@ -13,7 +13,7 @@ fn fts_dot_http_and_mcp_search_surface_safe_errors_and_preserve_valid_results() 
     }).unwrap();
     let args = json!({"key":"group:101","token":"group-token","query":"deepseek-v4.1-flash"});
     let valid = crate::mcp::call_tool_with_context("memory_search", &args, &context).unwrap();
-    assert_eq!(valid, "1. [#1 fact] deepseek-v4.1-flash v0.2.1");
+    assert_eq!(valid, "1. [#1 fact·推断] deepseek-v4.1-flash v0.2.1");
     let block = crate::prompt::recall_block_with_runtime(&context, &context.load_config().unwrap(),
         &json!({"unread":[{"text":"deepseek-v4.1-flash v0.2.1"}]}), "group:101");
     assert!(block.contains("deepseek-v4.1-flash v0.2.1"), "dotted recall must inject: {block}");

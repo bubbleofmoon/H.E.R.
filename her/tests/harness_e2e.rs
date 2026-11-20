@@ -3397,7 +3397,7 @@ fn tool_preview_oversized_memory_search_reaches_the_model_as_a_preview_and_stays
         let wire = tool_preview_wire(&requests[1], "preview-search");
         let outcome: Value = serde_json::from_str(&wire).unwrap();
         let shown = outcome["content"][0]["text"].as_str().unwrap();
-        assert!(shown.starts_with("1. [#1 fact] HEAD175 filler"), "{shown}");
+        assert!(shown.starts_with("1. [#1 fact·推断] HEAD175 filler"), "{shown}");
         assert!(!wire.contains("TAIL175"), "omitted text reached the model");
         let written = tool_wire_result(&requests[1], "preview-write");
         assert_eq!(
