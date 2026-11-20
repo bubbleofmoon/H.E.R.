@@ -19,7 +19,6 @@ SCRIPTS = Path(__file__).resolve().parent
 CHECKOUT = SCRIPTS.parent
 MAX_LOG = 1024 * 1024
 BRIEF = "brief.md"
-LAST_PRIMARY_QUOTA = "last-primary-quota"
 
 
 def required_env(name):
@@ -216,8 +215,6 @@ def run(args, out, ticket):
             print("readonly-task: worker log exceeded the capture limit", file=sys.stderr)
         report = "" if overflow else read_report(args.provider, out("out.log"))
         api_error = has_api_error(out("err.log"))
-        if code == 0 and (not report or api_error) and (stage / LAST_PRIMARY_QUOTA).is_file():
-            code = 75
         code = exit_receipt(out, code, report, api_error)
         if code or not ticket:
             return code

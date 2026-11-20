@@ -25,10 +25,10 @@ import time
 PYTHON = "/usr/bin/python3"
 GIT = "/usr/bin/git"
 BWRAP = "/usr/bin/bwrap"
+CA_BUNDLE = Path("/etc/ssl/certs/ca-certificates.crt")
 MODEL_SOCKET = "/model.sock"
 CODEX_REPORT = "/tmp/her-report.md"
 MAX_REPORT = 1024 * 1024
-LAST_PRIMARY_QUOTA = "last-primary-quota"
 TMPFS_SIZE = str(64 * 1024 * 1024)
 WORKER_ENV = {
     "HOME": "/home/agent", "PATH": "/usr/bin:/bin", "TMPDIR": "/tmp",
@@ -319,8 +319,7 @@ def worker_command(args, relay_path, filter_fd):
         "--ro-bind", str(args.stage / "passwd"), "/etc/passwd",
         "--ro-bind", str(args.stage / "group"), "/etc/group",
         "--ro-bind", str(args.stage / "hosts"), "/etc/hosts",
-        "--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs",
-        "--ro-bind-try", "/usr/share/ca-certificates", "/usr/share/ca-certificates",
+        "--ro-bind-try", str(CA_BUNDLE), "/etc/ssl/certs/ca-certificates.crt",
         "--size", TMPFS_SIZE, "--tmpfs", "/home/agent",
         "--size", TMPFS_SIZE, "--tmpfs", "/tmp",
         "--ro-bind", str(args.stage / "repo"), "/repo",
@@ -466,12 +465,15 @@ def run_relay(args, key, connect):
                     returncode = run_worker(worker_command(args, relay_path, fd), fd, args.timeout,
                                             args.capture_result)
                     status = returncode if returncode >= 0 else 128 - returncode
-                    if args.capture_result and status not in (124, 137):
-                        if relay.inference_status == 429:
-                            if status or not relay.inference_succeeded:
+                    if args.capture_result:
+                        primary_status = relay.inference_status
+                        if primary_status is not None and not 200 <= primary_status < 300:
+                            if primary_status == 429:
                                 return 75
-                            # The task still has to validate a zero-exit client's report.
-                            (args.stage / LAST_PRIMARY_QUOTA).touch()
+                            if status == 0:
+                                print(f"readonly-agent: final model inference returned HTTP {primary_status}",
+                                      file=sys.stderr)
+                                return 69
                         if status == 0 and not relay.inference_succeeded:
                             print("readonly-agent: no successful model inference", file=sys.stderr)
                             return 69

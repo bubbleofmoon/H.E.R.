@@ -14,7 +14,9 @@ if [ "${RUNNER_OS:-}" = Linux ]; then
   if [ -n "$filter" ]; then
     case "$filter" in
       IsolationTests.test_worker_cannot_read_host_credentials|IsolationTests.test_worker_cannot_push_to_host_git_endpoint|\
+      IsolationTests.test_worker_cannot_read_pem_beside_ca_bundle|\
       RoutingTests.test_codex_review_and_investigation_use_read_only_export|\
+      RoutingTests.test_final_primary_failure_rejects_partial_report|\
       RoutingTests.test_model_failure_cannot_publish_success_shaped_report|\
       RoutingTests.test_invalid_plan_keeps_previous_scratch_and_sha) ;;
       *) echo "unknown repository-check filter" >&2; exit 2 ;;

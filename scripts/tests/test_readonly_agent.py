@@ -45,6 +45,16 @@ if case == "credentials":
     assert "HER_OPENAI_API_KEY" not in os.environ, "provider credential environment is visible"
     assert "GIT_CONFIG_COUNT" not in os.environ, "host Git configuration is visible"
     assert not Path.home().joinpath(".gitconfig").exists(), "host Git config file is visible"
+elif case == "tls":
+    certs = Path("/etc/ssl/certs")
+    bundle = certs / "ca-certificates.crt"
+    assert b"-----BEGIN CERTIFICATE-----" in bundle.read_bytes(), "worker cannot read the CA bundle"
+    assert not os.access(bundle, os.W_OK), "worker can write the CA bundle"
+    try:
+        with (certs / argument).open("rb"):
+            raise AssertionError("worker read the PEM beside the CA bundle")
+    except (FileNotFoundError, PermissionError):
+        pass
 elif case == "push":
     result = subprocess.run(["git", "push", argument, "HEAD:refs/heads/worker"],
                             capture_output=True, text=True, timeout=5)
@@ -209,19 +219,23 @@ class WorkerFixture(unittest.TestCase):
         return subprocess.check_output(["git", *args], cwd=cwd, text=True,
                                        stderr=subprocess.PIPE).strip()
 
-    def launch(self, case, *, argument=None, port=1, provider="codex", mode="review", env=None):
+    def launch(self, case, *, argument=None, port=1, provider="codex", mode="review", env=None, ca_bundle=None):
         # Inject the upstream in trusted test code, never through the launcher CLI or environment.
         harness = """
 import http.client
+from pathlib import Path
 import runpy
 import sys
-launcher, port = sys.argv[1:3]
-sys.argv = [launcher, *sys.argv[3:]]
+launcher, port, ca_bundle = sys.argv[1:4]
+sys.argv = [launcher, *sys.argv[4:]]
 module = runpy.run_path(launcher)
+if ca_bundle:
+    module["worker_command"].__globals__["CA_BUNDLE"] = Path(ca_bundle)
 raise SystemExit(module["main"](lambda _host: http.client.HTTPConnection(
     "127.0.0.1", int(port), timeout=3)))
 """
         return subprocess.run([sys.executable, "-I", "-c", harness, str(LAUNCHER), str(port),
+                               str(ca_bundle) if ca_bundle else "",
                                "--repo", str(self.repo), "--head", self.head, "--base", self.base,
                                "--inputs", str(self.inputs), "--stage", str(self.stage),
                                "--provider", provider, "--mode", mode, "--exec", str(PYTHON),
@@ -238,6 +252,16 @@ raise SystemExit(module["main"](lambda _host: http.client.HTTPConnection(
 class IsolationTests(WorkerFixture):
     def test_worker_cannot_read_host_credentials(self):
         self.completed(self.launch("credentials", argument=str(self.home)), "credentials")
+
+    def test_worker_cannot_read_pem_beside_ca_bundle(self):
+        certs = self.root / "certs"
+        certs.mkdir()
+        bundle = certs / "ca-certificates.crt"
+        shutil.copyfile("/etc/ssl/certs/ca-certificates.crt", bundle)
+        pem = certs / "fixture-key.pem"
+        subprocess.run(["/usr/bin/openssl", "genpkey", "-algorithm", "ED25519", "-out", str(pem)],
+                       check=True, timeout=5)
+        self.completed(self.launch("tls", argument=pem.name, ca_bundle=bundle), "tls")
 
     def test_worker_cannot_push_to_host_git_endpoint(self):
         remote = self.root / "receiver.git"
@@ -573,10 +597,21 @@ class RoutingTests(WorkerFixture):
         result = self.run_route("codex", "review", action="nonzero", status=(429, 200))
         self.assertEqual(result.returncode, 3)
         self.assertEqual(self.receipt("exit.txt"), "3")
-        result = self.run_route("codex", "review", status=(200, 429))
+        result = self.run_route("codex", "review", status=(429, 200))
         self.assertEqual(result.returncode, 0)
         self.assertEqual(self.receipt("exit.txt"), "0")
+        self.assertEqual(self.receipt("report.md"), "fixture report")
         self.assertEqual(len(self.requests), 2)
+
+    def test_final_primary_failure_rejects_partial_report(self):
+        for provider in ("codex", "claude"):
+            for status, code, receipt in ((429, 75, "quota"), (503, 69, "no-report")):
+                with self.subTest(provider=provider, status=status):
+                    result = self.run_route(provider, "review", status=(200, status))
+                    self.assertEqual(len(self.requests), 2)
+                    self.assertEqual(result.returncode, code, "final model failure was reported as success")
+                    self.assertEqual(self.receipt("exit.txt"), receipt)
+                    self.assertFalse((self.out / "fixture.report.md").exists())
 
     def test_missing_prerequisites_refuse_to_start_the_client(self):
         for key in ("HER_OPENAI_API_KEY", "HER_READONLY_INPUTS", "HER_READONLY_BASE"):
