@@ -615,7 +615,7 @@ impl Hub {
         };
         // A partial or uncertain delivery may still give the owner a question to answer.
         if report.confirmed == 0 && !report.unknown && p.valid(&self.context) {
-            // Leave the undelivered request in the snapshot. RED-M1
+            state.entries.remove(&p.key);
             if let Err(error) = self.save(&state) {
                 eprintln!("[closed-agent] pending state write failed: {error}");
             }
