@@ -394,7 +394,7 @@ impl StoreRef {
         let mut order: Vec<String> = Vec::new();
         let mut runs: HashMap<String, RunView> = HashMap::new();
         for event in events {
-            if event.state == RunState::Queued {
+            if event.n.is_some() {
                 let (Some(task_id), Some(source), Some(n)) = (&event.task_id, event.source, event.n) else { continue };
                 if runs.contains_key(&event.run_id) {
                     continue;
@@ -407,12 +407,12 @@ impl StoreRef {
                         n,
                         task_id: task_id.clone(),
                         source,
-                        state: RunState::Queued,
+                        state: event.state,
                         queued_at: event.at,
                         started_at: None,
-                        ended_at: None,
-                        exit_code: None,
-                        reason: None,
+                        ended_at: event.state.is_terminal().then_some(event.at),
+                        exit_code: event.exit_code,
+                        reason: event.reason.clone(),
                         pid: None,
                         request_id: event.request_id.clone(),
                         by: event.by.clone(),
@@ -513,6 +513,39 @@ impl TaskStore {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Record an elapsed slot without starting a task. Share the scheduler's key and
+    /// history gate so a slot already claimed for execution cannot be marked missed.
+    pub(crate) fn record_missed(&self, due: crate::tasks::Due) -> Result<bool, String> {
+        const MISSED_BY: &str = "schedule-monitor";
+        let store = self.store_ref();
+        let _gate = store.gate()?;
+        let events = store
+            .load_events()
+            .map_err(|e| format!("task history is unreadable: {}", e.kind()))?;
+        let runs = store.fold(&events);
+        let key = due.dedup_key();
+        if let Some(run) = runs.iter().find(|r| r.dedup_key.as_deref() == Some(key.as_str())) {
+            // A previous attempt may have written history before saving its notice claim.
+            return Ok(run.by.as_deref() == Some(MISSED_BY));
+        }
+        let task = due.task.as_str();
+        let slot = due.slot;
+        let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!("{task}-{slot}-{}-{seq}", std::process::id());
+        let finish = Finish::Cancelled { reason: "scheduled slot missed".into() };
+        let mut event = store.terminal_event(&run_id, &finish, slot);
+        event.n = Some(runs.iter().map(|r| r.n).max().unwrap_or(0) + 1);
+        event.task_id = Some(task.into());
+        event.source = Some(RunSource::Scheduled);
+        event.dedup_key = Some(key);
+        event.by = Some(MISSED_BY.into());
+        store
+            .append(&event)
+            .map_err(|e| format!("task history cannot be written: {}", e.kind()))?;
+        let _ = store.compact_locked();
+        Ok(true)
     }
 
     /// Settle one trigger. `request_id` (manual) and `dedup_key` (a schedule slot) make repeated triggers return the

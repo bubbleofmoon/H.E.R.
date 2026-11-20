@@ -135,6 +135,7 @@ fn claim_notice(
 /// Claims are synced before sending; unknown send outcomes are never retried.
 fn update_notices(
     context: &RuntimeContext,
+    state_file: &str,
     update: impl FnOnce(&mut NoticeState) -> Result<Vec<(String, String)>, String>,
 ) -> Result<Vec<(String, String)>, String> {
     let started = Instant::now();
@@ -151,7 +152,7 @@ fn update_notices(
         }
     };
     let mut state: NoticeState = match context
-        .read_optional_text(RuntimeArea::Data, NOTICE_STATE)
+        .read_optional_text(RuntimeArea::Data, state_file)
         .map_err(str::to_owned)?
     {
         None => NoticeState::default(),
@@ -165,7 +166,7 @@ fn update_notices(
     let notices = update(&mut state)?;
     context.write_atomic(
         RuntimeArea::Data,
-        NOTICE_STATE,
+        state_file,
         &serde_json::to_vec(&state).map_err(|e| e.to_string())?,
     )?;
     Ok(notices)
@@ -193,7 +194,7 @@ pub fn notify_failure(
     reason: &str,
 ) {
     let now = crate::parity_clock::now_ms();
-    let notices = update_notices(context, |state| {
+    let notices = update_notices(context, NOTICE_STATE, |state| {
         let mut notices = Vec::new();
         claim_notice(
             state,
@@ -207,7 +208,7 @@ pub fn notify_failure(
     send_notices(context, config, notices);
 }
 
-/// Observe retained failed runs and elapsed daily slots without catch-up execution.
+/// Observe retained full backup failures and elapsed backup slots without catch-up execution.
 /// A minute's grace allows the scheduler to claim a due slot before it is called missed.
 pub fn monitor_notices(
     context: &RuntimeContext,
@@ -215,16 +216,37 @@ pub fn monitor_notices(
     store: &crate::task_runs::TaskStore,
     now: i64,
 ) -> Result<(), String> {
+    let mut result = Ok(());
+    for task in [TaskId::Backup, TaskId::MemoryBackup, TaskId::MemoryRestoreTest] {
+        result = monitor_task_notices(context, config, store, now, task).and(result);
+    }
+    result
+}
+
+fn monitor_task_notices(
+    context: &RuntimeContext,
+    config: &serde_json::Value,
+    store: &crate::task_runs::TaskStore,
+    now: i64,
+    task: TaskId,
+) -> Result<(), String> {
     use crate::task_runs::{RunQuery, RunSource, RunState};
-    use crate::tasks::{self, TaskId};
-    let schedule = tasks::configured_schedule(tasks::task_def(TaskId::Backup), config);
-    let on = crate::supervisor::enabled_in(context, config, tasks::task_def(TaskId::Backup));
-    let time = crate::settings::BACKUP_TIME.read(config);
-    let time = time.as_str().expect("resolved backup time");
+    use crate::tasks::{self, Due, Schedule};
+
+    let name = task.as_str();
+    let def = tasks::task_def(task);
+    let full = task == TaskId::Backup;
+    let schedule = tasks::configured_schedule(def, config);
+    let on = crate::supervisor::enabled_in(context, config, def);
+    let (time, cadence) = match schedule {
+        Schedule::Daily { hour, minute } => (format!("{hour:02}:{minute:02}"), "daily"),
+        Schedule::Monthly { hour, minute } => (format!("{hour:02}:{minute:02}"), "monthly"),
+        _ => return Err(format!("unexpected backup schedule for {name}")),
+    };
     let zone = crate::local_time::configured_zone(config);
-    let zone_identity = format!("{zone:?}");
-    let signature = format!("\"{time}\":{on}:{zone_identity}");
-    let notices = update_notices(context, |state| {
+    let signature = format!("\"{time}\":{on}:{zone:?}");
+    let state_file = format!("{name}-notices.json");
+    let notices = update_notices(context, &state_file, |state| {
         // The first observation and every time/enabled change start now: neither older
         // history nor slots before this moment (e.g. a time already past) are alerted.
         if state.schedule.as_deref() != Some(signature.as_str()) {
@@ -232,51 +254,59 @@ pub fn monitor_notices(
             state.active_since = now;
             state.checked_through = Some(now);
         }
-        // Read history inside the notice gate: pruning a stale snapshot must
-        // never erase a failure claim concurrently saved by another process.
-        let mut runs = Vec::new();
-        let mut before = None;
-        loop {
-            let page = store.list(&RunQuery {
-                task: Some("backup".into()),
-                before,
-                limit: Some(200),
-            })?;
-            before = page.next_before;
-            runs.extend(page.runs);
-            if before.is_none() {
-                break;
-            }
-        }
-        let retained: BTreeSet<_> = runs
-            .iter()
-            .map(|run| format!("backup-failed-{}", run.run_id))
-            .collect();
-        // Failed-run keys need live only as long as their retained task history.
-        state
-            .seen
-            .retain(|key, _| !key.starts_with("backup-failed-") || retained.contains(key));
         let mut notices = Vec::new();
-        for run in &runs {
-            if run.ended_at.unwrap_or(run.queued_at) < state.active_since {
-                continue;
+        let mut runs = Vec::new();
+        // The other jobs report ordinary execution failures through the task executor.
+        if full {
+            // Read history inside the notice gate: pruning a stale snapshot must
+            // never erase a failure claim concurrently saved by another process.
+            let mut before = None;
+            loop {
+                let page = store.list(&RunQuery {
+                    task: Some("backup".into()),
+                    before,
+                    limit: Some(200),
+                })?;
+                before = page.next_before;
+                runs.extend(page.runs);
+                if before.is_none() {
+                    break;
+                }
             }
-            if matches!(run.state, RunState::Failed | RunState::Unknown)
-                || (run.source == RunSource::Scheduled && run.state == RunState::Cancelled)
-            {
-                claim_notice(
-                    state,
-                    now,
-                    format!("backup-failed-{}", run.run_id),
-                    format!(
-                        "Backup failed ({}): {}",
-                        run.run_id,
-                        run.reason.as_deref().unwrap_or("result unknown")
-                    ),
-                    &mut notices,
-                );
+            let retained: BTreeSet<_> = runs
+                .iter()
+                .map(|run| format!("backup-failed-{}", run.run_id))
+                .collect();
+            // Failed-run keys need live only as long as their retained task history.
+            state
+                .seen
+                .retain(|key, _| !key.starts_with("backup-failed-") || retained.contains(key));
+            for run in &runs {
+                if run.ended_at.unwrap_or(run.queued_at) < state.active_since {
+                    continue;
+                }
+                if matches!(run.state, RunState::Failed | RunState::Unknown)
+                    || (run.source == RunSource::Scheduled && run.state == RunState::Cancelled)
+                {
+                    claim_notice(
+                        state,
+                        now,
+                        format!("backup-failed-{}", run.run_id),
+                        format!(
+                            "Backup failed ({}): {}",
+                            run.run_id,
+                            run.reason.as_deref().unwrap_or("result unknown")
+                        ),
+                        &mut notices,
+                    );
+                }
             }
         }
+        let title = match task {
+            TaskId::MemoryBackup => "Memory backup",
+            TaskId::MemoryRestoreTest => "Memory restore test",
+            _ => "Backup",
+        };
         if on {
             let mut after = state
                 .checked_through
@@ -284,19 +314,23 @@ pub fn monitor_notices(
             while let Some(slot) = tasks::next_due(schedule, after, &zone)
                 .filter(|slot| *slot <= now.saturating_sub(60_000))
             {
-                let next_slot = tasks::next_due(schedule, slot, &zone);
-                let attempted = runs.iter().any(|run| {
-                    run.source == RunSource::Scheduled
-                        && run.queued_at >= slot
-                        && next_slot.is_none_or(|next| run.queued_at < next)
-                });
-                if !attempted {
+                let missed = if full {
+                    let next_slot = tasks::next_due(schedule, slot, &zone);
+                    !runs.iter().any(|run| {
+                        run.source == RunSource::Scheduled
+                            && run.queued_at >= slot
+                            && next_slot.is_none_or(|next| run.queued_at < next)
+                    })
+                } else {
+                    store.record_missed(Due { task, slot })?
+                };
+                if missed {
                     claim_notice(
                         state,
                         now,
-                        format!("backup-missed-{slot}"),
+                        format!("{name}-missed-{slot}"),
                         format!(
-                            "Backup missed its daily slot at {} UTC (local {} {}).",
+                            "{title} missed its {cadence} slot at {} UTC (local {} {}).",
                             archive_stem(slot).trim_start_matches("qqbot-"),
                             time,
                             crate::local_time::label(&crate::local_time::at(slot, &zone)),
@@ -310,7 +344,7 @@ pub fn monitor_notices(
         }
         Ok(notices)
     });
-    send_notices(context, config, notices);
+    send_notices(context, config, Ok(notices?));
     Ok(())
 }
 
@@ -2293,6 +2327,63 @@ mod tests {
         let id = run.run_id().to_owned();
         run.finish(finish, at + 1).unwrap();
         id
+    }
+
+    #[test]
+    fn missed_memory_slots_are_recorded_and_alerted_once_after_restart() {
+        use crate::task_runs::{RunQuery, RunSource};
+        use crate::tasks::Clock;
+
+        let fixture = Fixture::new("missed-memory-slots");
+        let context = fixture.context();
+        let mut config = context.load_config().unwrap();
+        config["time"] = json!({"zone":"UTC"});
+        let start = timestamp("2026-02-01T03:59:00Z");
+        let clock = std::sync::Arc::new(crate::dependency::ManualClock::new(start));
+        let task_api = || crate::supervisor::task_api_with_clock(&context, &config, clock.clone()).unwrap();
+        let observe = |api: &crate::console_tasks::TasksApi| {
+            super::monitor_notices(&context, &config, api.dispatcher.store(), clock.now_ms())
+                .unwrap();
+        };
+        observe(&task_api());
+        // No scheduler ran while either calendar slot elapsed.
+        clock.set(timestamp("2026-02-01T05:30:59Z"));
+        let api = task_api();
+        observe(&api);
+        assert!(api.dispatcher.store().list(&RunQuery {
+            task: Some(TaskId::MemoryRestoreTest.as_str().into()),
+            before: None,
+            limit: None,
+        }).unwrap().runs.is_empty(), "the drill still has its minute of grace");
+        drop(api);
+
+        clock.set(timestamp("2026-02-01T05:31:00Z"));
+        let api = task_api();
+        observe(&api);
+        observe(&api);
+        for (task, slot) in [
+            (TaskId::MemoryBackup, timestamp("2026-02-01T04:00:00Z")),
+            (TaskId::MemoryRestoreTest, timestamp("2026-02-01T05:30:00Z")),
+        ] {
+            let name = task.as_str();
+            let runs = api.dispatcher.store().list(&RunQuery {
+                task: Some(name.into()),
+                before: None,
+                limit: None,
+            }).unwrap().runs;
+            assert_eq!(runs.len(), 1, "one history entry for each missed memory slot: {name}");
+            let run = &runs[0];
+            assert_eq!((run.source, run.state, run.queued_at), (RunSource::Scheduled, RunState::Cancelled, slot));
+            assert!(run.started_at.is_none());
+            assert!(run.reason.as_deref().unwrap().contains("missed"));
+            let notices = context.read_optional_text(
+                crate::runtime::RuntimeArea::Data,
+                &format!("{name}-notices.json"),
+            ).unwrap().unwrap();
+            let notices: serde_json::Value = serde_json::from_str(&notices).unwrap();
+            assert_eq!(notices["seen"].as_object().unwrap().keys().collect::<Vec<_>>(),
+                [&format!("{name}-missed-{slot}")]);
+        }
     }
 
     #[test]
