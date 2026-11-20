@@ -1253,7 +1253,7 @@ fn unallowed_rollout_key<'a>(keys: &'a [String], kind: &str, allowed: &HashSet<u
 fn rollout_can_seed(conn: &Connection, document: &Value, found: &Value) -> Result<bool, (u16, String)> {
     let Ok(keys) = crate::watchdog::rollout_groups(found) else { return Ok(false) };
     let effective = scope_document(conn, document)?;
-    Ok(ROLLOUT_ALLOW_LISTS.iter().any(|(kind, setting)| { // RED-2
+    Ok(ROLLOUT_ALLOW_LISTS.iter().all(|(kind, setting)| {
         unallowed_rollout_key(&keys, kind, &allow_ids(setting, &effective)).is_none()
     }))
 }
