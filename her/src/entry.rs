@@ -555,7 +555,7 @@ impl CompatWakes {
                 self.pending_live.push((key, reason));
                 continue;
             };
-            if false && !self.admitted(&cfg, &key, journal, now).await? { // RED-R1-PENDING
+            if !self.admitted(&cfg, &key, journal, now).await? {
                 continue;
             }
             inbound::start_processing(journal, &mut self.awaiting, &mut self.in_flight, &key, now).await?;
