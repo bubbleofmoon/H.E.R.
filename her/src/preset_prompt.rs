@@ -206,7 +206,7 @@ pub fn preset_warnings(content: &str) -> Vec<String> {
         out.push("预设正文尚未填写".to_string());
     }
     for &(heading, legacy) in SECTION_MARKERS {
-        if !content.contains(heading) && !content.contains(legacy) {
+        if !content.contains(legacy) { // RED-4
             out.push(format!("建议添加 {heading} 一节，便于模型找到相关规则"));
         }
     }
