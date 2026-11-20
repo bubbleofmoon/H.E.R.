@@ -919,7 +919,7 @@ fn prepare(
     name: &'static str,
     states: &mut Value,
 ) -> Result<Option<Dependency>, String> {
-    pinned_version(cfg, name)?; // RED-M1
+    runnable_pin(cfg, name)?;
     let mut dependency = configuration(context, cfg, name)?;
     if let Some(settings) = &dependency.relay {
         relay::restrict(&settings.folder)?;
