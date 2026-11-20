@@ -740,7 +740,7 @@ pub fn run(
             create_memory_snapshot(context, run.view().queued_at, &check),
             "memory backup verified",
         ),
-        TaskId::MemoryRestoreTest => (restore_test(context, &check).or_else(|_| Ok(PathBuf::new())), "memory restore verified"), // RED-restore
+        TaskId::MemoryRestoreTest => (restore_test(context, &check), "memory restore verified"),
         _ => (create(context, &check), "backup verified"),
     };
     match result {
