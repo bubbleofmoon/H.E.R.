@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useConsole } from '../stores/consoleStore';
+import { AuditInspector } from './AuditInspector';
 import { Badge, Button, SettingField } from './Primitives';
 
 export const InspectorDrawer: React.FC = () => {
@@ -121,6 +122,10 @@ export const InspectorDrawer: React.FC = () => {
                 {inspector.id}
               </div>
             </>
+          ) : inspector.kind === 'audit' ? (
+            <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
+              审计详情 ({inspector.id})
+            </h3>
           ) : (
             <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
               详情检视 ({inspector.kind === 'setting' ? inspector.key : inspector.id})
@@ -163,6 +168,8 @@ export const InspectorDrawer: React.FC = () => {
               完整单会话控制台（互动与状态、恢复与队列、单会话设置）将在 #356 会话工作台切片中接入。
             </p>
           </div>
+        ) : inspector.kind === 'audit' ? (
+          <AuditInspector key={inspector.id} auditId={inspector.id} />
         ) : (
           <p className="text-[var(--text-muted)]">详情视图将在对应功能切片中接入。</p>
         )}
