@@ -275,6 +275,19 @@ export const SettingField: React.FC<{
           }}
           className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
         />
+      ) : kind.type === 'choice' && Array.isArray(kind.options) ? (
+        <select
+          value={typeof effective === 'string' ? effective : ''}
+          onChange={(e) => onDraftChange?.(e.target.value)}
+          className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
+        >
+          {typeof effective !== 'string' && <option value="">（请选择）</option>}
+          {kind.options.map((opt) => (
+            <option key={opt} value={opt}>
+              {opt}
+            </option>
+          ))}
+        </select>
       ) : kind.type === 'daily time' ? (
         <input
           type="time"

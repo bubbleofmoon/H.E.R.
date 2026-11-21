@@ -9,6 +9,7 @@ import {
   fetchConversationStates,
   fetchPendingItems,
   fetchQqLoginState,
+  fetchReleaseStatus,
   fetchSettingsList,
   isDesktopOrigin,
   resetSettingValue,
@@ -230,30 +231,40 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   }, []);
 
   const refreshLiveData = useCallback(async () => {
-    const [statusRes, pendingRes, settingsRes, statesRes, qqRes] = await Promise.allSettled([
-      fetchConsoleStatus(),
-      fetchPendingItems(),
-      fetchSettingsList(),
-      fetchConversationStates(),
-      fetchQqLoginState(),
-    ]);
+    const [statusRes, pendingRes, settingsRes, statesRes, qqRes, releasesRes] =
+      await Promise.allSettled([
+        fetchConsoleStatus(),
+        fetchPendingItems(),
+        fetchSettingsList(),
+        fetchConversationStates(),
+        fetchQqLoginState(),
+        fetchReleaseStatus(),
+      ]);
 
+    let fallbackUpdate: string | null = null;
     if (statusRes.status === 'fulfilled') {
       const s = statusRes.value;
-      const stopped = s.stopped === true || s.paused === true;
+      const stopped = s.socialV2Paused === true || s.stopped === true || s.paused === true;
       setRunState(stopped ? '已暂停' : '运行中');
       if (typeof s.mode === 'string' && s.mode) {
         setGlobalMode(s.mode);
       }
       if (typeof s.updateAvailable === 'string' && s.updateAvailable) {
-        setUpdateAvailable(s.updateAvailable);
-      } else {
-        setUpdateAvailable(null);
+        fallbackUpdate = s.updateAvailable;
       }
     }
 
+    if (releasesRes.status === 'fulfilled') {
+      const tag = releasesRes.value.available?.tag;
+      setUpdateAvailable(typeof tag === 'string' && tag ? tag : fallbackUpdate);
+    } else if (statusRes.status === 'fulfilled') {
+      setUpdateAvailable(fallbackUpdate);
+    }
+
     if (pendingRes.status === 'fulfilled') {
-      const items = pendingRes.value.items;
+      const items = Array.isArray(pendingRes.value.pending)
+        ? pendingRes.value.pending
+        : pendingRes.value.items;
       setPendingCount(Array.isArray(items) ? items.length : 0);
     }
 
@@ -274,7 +285,12 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
           key: String(item.key ?? item.conversation ?? ''),
           name: typeof item.name === 'string' ? item.name : undefined,
           phase: typeof item.phase === 'string' ? item.phase : undefined,
-          unread: typeof item.unread === 'number' ? item.unread : undefined,
+          unread:
+            typeof item.unreadCount === 'number'
+              ? item.unreadCount
+              : typeof item.unread === 'number'
+                ? item.unread
+                : undefined,
           nextWakeAt: typeof item.nextWakeAt === 'number' ? item.nextWakeAt : undefined,
         }))
         .filter((item) => item.key.length > 0);

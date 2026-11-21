@@ -244,6 +244,12 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("needs: changes", windows)
         self.assertIn("if: github.event_name == 'push' && needs.changes.outputs.code == 'true'", windows)
 
+        for job in ("lint", "tests", "tests-windows"):
+            block = self.job_block(text, job)
+            self.assertIn("her-ui", block, job)
+            self.assertIn("npm run build", block, job)
+            self.assertIn("HER_REQUIRE_UI_DIST=1", block, job)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -203,8 +203,12 @@ export async function fetchConsoleStatus(): Promise<Record<string, unknown>> {
   return apiRequest<Record<string, unknown>>('/api/status', { method: 'GET' });
 }
 
-export async function fetchPendingItems(): Promise<{ items?: unknown[] }> {
-  return apiRequest<{ items?: unknown[] }>('/api/pending', { method: 'GET' });
+export async function fetchPendingItems(): Promise<{ pending?: unknown[]; items?: unknown[] }> {
+  return apiRequest<{ pending?: unknown[]; items?: unknown[] }>('/api/pending', { method: 'GET' });
+}
+
+export async function fetchReleaseStatus(): Promise<{ available?: { tag?: string } | null }> {
+  return apiRequest<{ available?: { tag?: string } | null }>('/api/releases', { method: 'GET' });
 }
 
 export async function fetchSettingsList(): Promise<SettingsResponse> {

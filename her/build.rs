@@ -22,7 +22,9 @@ fn collect_dist_files(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>)
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|entry| entry.path())).collect();
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|entry| entry.path()))
+        .collect();
     paths.sort();
     for path in paths {
         if path.is_dir() {
@@ -37,7 +39,9 @@ fn collect_dist_files(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>)
                         .collect::<Vec<_>>()
                         .join("/")
                 );
-                let abs = fs::canonicalize(&path).unwrap_or(path);
+                let abs = env::current_dir()
+                    .map(|cwd| cwd.join(&path))
+                    .unwrap_or(path);
                 out.push((url_path, abs));
             }
         }
@@ -66,7 +70,7 @@ fn write_ui_assets(require_dist: bool) {
         collect_dist_files(dist_root, dist_root, &mut files);
         files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        source.push_str("pub(crate) const UI_IS_STUB: bool = false;\n");
+        source.push_str("#[cfg_attr(not(test), allow(dead_code))]\npub(crate) const UI_IS_STUB: bool = false;\n");
         source.push_str("pub(crate) const UI_ASSETS: &[EmbeddedAsset] = &[\n");
         for (url_path, abs_path) in files {
             let ctype = content_type_for(&abs_path);
@@ -83,7 +87,9 @@ fn write_ui_assets(require_dist: bool) {
             "HER_REQUIRE_UI_DIST is set, but ../her-ui/dist/index.html is missing or empty; run `npm ci && npm run build` in her-ui first"
         );
     } else {
-        source.push_str("pub(crate) const UI_IS_STUB: bool = true;\n");
+        source.push_str(
+            "#[cfg_attr(not(test), allow(dead_code))]\npub(crate) const UI_IS_STUB: bool = true;\n",
+        );
         source.push_str(
             "pub(crate) const UI_ASSETS: &[EmbeddedAsset] = &[\n    EmbeddedAsset {\n        path: \"/index.html\",\n        content_type: \"text/html; charset=utf-8\",\n        bytes: b\"<!doctype html><html lang=\\\"zh-CN\\\"><head><meta charset=\\\"utf-8\\\"><title>HER Console</title></head><body>HER Console UI placeholder</body></html>\",\n    },\n];\n",
         );
@@ -109,6 +115,7 @@ fn main() {
     }
     let require_dist = env::var("HER_REQUIRE_UI_DIST")
         .map(|val| !val.is_empty() && val != "0")
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || env::var("PROFILE").as_deref() == Ok("release");
     write_ui_assets(require_dist);
 }

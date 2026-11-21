@@ -19,8 +19,9 @@ pub(crate) fn legacy_redirect(path: &str) -> Option<&'static str> {
 
 /// Resolves an embedded asset by exact path or SPA navigation fallback.
 ///
-/// Returns `None` for `/api` routes, `/assets/*` misses, and missing file-extension paths so API
-/// routers and 404 handlers keep their own contracts.
+/// Returns `None` for `/api` routes, `/assets/*` misses, trailing-slash paths (other than `/`),
+/// and paths containing dotted segments (such as `/favicon.ico/`) so API routers and 404 handlers
+/// keep their own contracts.
 pub(crate) fn resolve_asset(path: &str) -> Option<&'static EmbeddedAsset> {
     if path == "/api" || path.starts_with("/api/") {
         return None;
@@ -31,11 +32,24 @@ pub(crate) fn resolve_asset(path: &str) -> Option<&'static EmbeddedAsset> {
     if path.starts_with("/assets/") {
         return None;
     }
-    let last_segment = path.rsplit('/').next().unwrap_or("");
-    if last_segment.contains('.') {
+    if path != "/" && path.ends_with('/') {
+        return None;
+    }
+    if path.split('/').any(|seg| seg.contains('.')) {
         return None;
     }
     UI_ASSETS.iter().find(|asset| asset.path == "/index.html")
+}
+
+/// Returns true for non-legacy HTML navigation paths that serve the embedded SPA `index.html`.
+pub(crate) fn is_spa_page_path(path: &str) -> bool {
+    legacy_redirect(path).is_none()
+        && resolve_asset(path).is_some_and(|asset| asset.path == "/index.html")
+}
+
+/// Returns true for `GET` requests targeting either a canonical SPA route or a legacy page redirect.
+pub(crate) fn is_ui_page_request(method: &str, path: &str) -> bool {
+    method == "GET" && (legacy_redirect(path).is_some() || is_spa_page_path(path))
 }
 
 #[cfg(test)]
@@ -85,6 +99,38 @@ mod tests {
         assert!(resolve_asset("/assets/does-not-exist.js").is_none());
         assert!(resolve_asset("/missing-file.txt").is_none());
         let _ = is_stub();
+    }
+
+    #[test]
+    fn resolve_asset_rejects_trailing_slash_and_dotted_segments() {
+        assert!(resolve_asset("/favicon.ico/").is_none());
+        assert!(resolve_asset("/settings/").is_none());
+        assert!(resolve_asset("/v1.0/settings").is_none());
+        assert!(is_ui_page_request("GET", "/"));
+        assert!(is_ui_page_request("GET", "/personas"));
+        assert!(is_ui_page_request("GET", "/settings"));
+        assert!(!is_ui_page_request("POST", "/"));
+        assert!(!is_ui_page_request("GET", "/favicon.ico/"));
+        assert!(!is_ui_page_request("GET", "/api/settings"));
+    }
+
+    #[test]
+    fn ci_and_required_builds_embed_real_ui_bundle() {
+        let required = option_env!("HER_REQUIRE_UI_DIST")
+            .is_some_and(|val| !val.is_empty() && val != "0")
+            || std::env::var("HER_REQUIRE_UI_DIST").is_ok_and(|val| !val.is_empty() && val != "0");
+        if required {
+            assert!(
+                !is_stub(),
+                "HER_REQUIRE_UI_DIST build must embed her-ui/dist"
+            );
+            assert!(UI_ASSETS
+                .iter()
+                .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".js")));
+            assert!(UI_ASSETS
+                .iter()
+                .any(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(".css")));
+        }
     }
 
     #[test]
