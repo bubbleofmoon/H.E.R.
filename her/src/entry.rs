@@ -45,6 +45,7 @@ mod sticker;
 mod failover;
 mod console;
 mod console_auth;
+mod console_ui;
 mod desktop;
 mod qq_login;
 mod pricing;

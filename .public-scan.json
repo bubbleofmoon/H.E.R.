@@ -5921,6 +5921,24 @@
       "value": "0-0-1-0-0-0-0-0",
       "line_sha256": "7e4e-69db-4311-1098-2d06-cf68-afda-61b0-af8b-5d44-9fa0-8334-55f9-59d3-b67e-9c79",
       "reason": "Windows API hexadecimal flags"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "5e2a-34ac-b084-da09-601c-5bc5-2d19-9025-f76e-a003-182d-9d73-15b5-7ef9-b36a-fbe8",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "191e-176f-a4bf-529e-6857-61f8-898e-4453-277d-2cf7-b9a9-7977-0e81-2bee-e728-3c85",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
+    },
+    {
+      "path": "her-ui/package-lock.json",
+      "value": "3-0-0-0-1-8-2-6",
+      "line_sha256": "e590-dcac-6177-0c91-5de4-029a-5af3-30e6-98d6-c1d0-36da-5749-f07a-e820-7488-58b3",
+      "reason": "caniuse-lite semver patch number in npm lockfile"
     }
   ],
   "path_exceptions": [

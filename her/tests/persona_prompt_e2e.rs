@@ -1050,14 +1050,22 @@ fn persona_library_crud_versions_and_approval_over_console_http() {
     let (_, listed) = rig.console("GET", "/api/personas", None);
     assert_eq!(listed["personas"].as_array().map(Vec::len), Some(1));
     let canonical_host = format!("her.localhost:{}", rig.console_port);
-    let page = http_json_call(
+    let legacy_page = http_json_call(
         rig.console_port,
         "GET",
         "/personas",
         &[("Host", canonical_host.as_str()), ("x-console-token", CONSOLE_TOKEN)],
         None,
     );
-    assert_eq!(page.map(|(status, _)| status), Some(200));
+    assert_eq!(legacy_page.map(|(status, _)| status), Some(302));
+    let spa_page = http_json_call(
+        rig.console_port,
+        "GET",
+        "/persona",
+        &[("Host", canonical_host.as_str()), ("x-console-token", CONSOLE_TOKEN)],
+        None,
+    );
+    assert_eq!(spa_page.map(|(status, _)| status), Some(200));
     assert_eq!(rig.data_json("personas.json")["format"], json!(1));
 }
 

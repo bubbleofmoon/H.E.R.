@@ -159,6 +159,13 @@ jobs:
           echo "$RUNNER_TEMP/her-node" >> "$GITHUB_PATH"
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
+      - name: Build console UI (her-ui)
+        run: |
+          cd "$PUBLIC_TREE/her-ui"
+          npm ci
+          npm run typecheck
+          npm run build
+          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -226,6 +233,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           python --version
+      - name: Build console UI (her-ui)
+        run: |
+          cd "$PUBLIC_TREE/her-ui"
+          npm ci
+          npm run build
+          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -290,6 +303,12 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           python --version
+      - name: Build console UI (her-ui)
+        run: |
+          cd "$PUBLIC_TREE/her-ui"
+          npm ci
+          npm run build
+          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:

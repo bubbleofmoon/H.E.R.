@@ -1061,16 +1061,13 @@ fn console_policy_defaults_to_notify_and_only_administrators_can_save_it() {
             before
         );
     }
-    assert!(http(port, "GET", "/tasks", "", true, false)
-        .1
-        .contains("id=\"update-settings\""));
-    assert!(http(port, "GET", "/", "", true, false)
-        .1
-        .contains("her-update-banner"));
-    let tasks = http(port,"GET","/tasks","",true,false).1;
-    assert!(tasks.contains("id=\"approve-update\""),"tasks page needs an approval button");
-    assert!(tasks.contains("/api/releases/approve"));
-    assert!(http(port,"GET","/","",true,false).1.contains("/api/releases/approve"),"the app banner must approve too");
+    assert_eq!(http(port, "GET", "/tasks", "", true, false).0, 302);
+    let root_page = http(port, "GET", "/", "", true, false);
+    assert_eq!(root_page.0, 200);
+    assert!(root_page.1.to_ascii_lowercase().contains("<!doctype html>"));
+    let schedule_page = http(port, "GET", "/schedule", "", true, false);
+    assert_eq!(schedule_page.0, 200);
+    assert!(schedule_page.1.to_ascii_lowercase().contains("<!doctype html>"));
 }
 #[cfg(feature = "parity-clock")]
 #[test]

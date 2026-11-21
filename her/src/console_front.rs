@@ -256,7 +256,7 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
 
         (
             "GET",
-            "/" | "/api/status" | "/api/pending" | "/api/whitelist" | "/api/security"
+            "/api/status" | "/api/pending" | "/api/whitelist" | "/api/security"
             | "/api/audit/recent",
         )
         | ("POST", "/api/whitelist" | "/api/security" | "/api/console/token" | "/api/audit/undo")
@@ -297,6 +297,16 @@ pub(crate) fn route_policy(method: &str, path: &str) -> Option<RoutePolicy> {
             | "/api/slang/batch-reject"
             | "/api/slang/research",
         ) => Some(RoutePolicy::console_or_agent(KeyPreflight::None)),
+        _ if method == "GET"
+            && !path.starts_with("/api/")
+            && path != "/api"
+            && (crate::console_ui::legacy_redirect(path).is_some()
+                || crate::console_ui::resolve_asset(path).is_some()) =>
+        {
+            Some(RoutePolicy::admin(
+                "console UI routes are restricted to administrators",
+            ))
+        }
         _ => None,
     }
 }
@@ -634,6 +644,37 @@ pub(crate) fn enforce_agent_denials(
     None
 }
 
+fn ui_asset_response(asset: &'static crate::console_ui::EmbeddedAsset) -> ConsoleResponse {
+    let mut response = ConsoleResponse::from((
+        200,
+        asset.content_type.to_string(),
+        String::from_utf8(asset.bytes.to_vec()).unwrap_or_default(),
+    ));
+    response.raw_body = Some(asset.bytes);
+    response.csp = Some(crate::console_ui::STRICT_CSP);
+    response
+}
+
+fn ui_page_response(req: &Request, renewal: Option<BrowserCookie>) -> Option<ConsoleResponse> {
+    if req.method != "GET" {
+        return None;
+    }
+    if let Some(target) = crate::console_ui::legacy_redirect(&req.path) {
+        let mut response = ConsoleResponse::from((302, String::new(), String::new()));
+        response.redirect = Some(ConsoleRedirect::Path(target));
+        response.cookies = renewal.into_iter().collect();
+        return Some(response);
+    }
+    if crate::console_ui::is_spa_page_path(&req.path) {
+        if let Some(asset) = crate::console_ui::resolve_asset("/index.html") {
+            let mut response = ui_asset_response(asset);
+            response.cookies = renewal.into_iter().collect();
+            return Some(response);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_PEER_SAME_USER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
@@ -648,7 +689,9 @@ fn peer_is_installing_user(stream: Option<&TcpStream>) -> bool {
 }
 
 fn eligible_for_local_auto_sign_in(req: &Request, port: u16, admission: &FrontAdmission) -> bool {
-    if req.method != "GET" || !PAGE_MOUNTS.contains(&req.path.as_str()) {
+    if !crate::console_ui::is_ui_page_request(&req.method, &req.path)
+        || matches!(req.path.as_str(), "/login" | "/setup")
+    {
         return false;
     }
     if !canonical_request(req, port) || admission.proof.is_some() {
@@ -703,6 +746,18 @@ pub(crate) fn handle_http_request(
         if let Some((status, value)) = host_denial(req, port) {
             return json_reply(status, value);
         }
+        if req.method == "GET" && req.path.starts_with("/assets/") {
+            if has_agent_marker(req) {
+                return json_reply(
+                    403,
+                    json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                );
+            }
+            return match crate::console_ui::resolve_asset(&req.path) {
+                Some(asset) => ui_asset_response(asset),
+                None => json_reply(404, json!({"ok": false, "error": "not found"})),
+            };
+        }
         let mut admission = match admit_selected_request(req, context, port) {
             Ok(admission) => admission,
             Err((status, error)) => return json_reply(status, json!({"ok":false,"error":error})),
@@ -711,10 +766,19 @@ pub(crate) fn handle_http_request(
             admission.proof,
             Some(crate::console_auth::ConsoleAuthority::Desktop { .. })
         );
-        if req.method == "GET" && !canonical_request(req, port) && !desktop {
-            if let Some(mount) = PAGE_MOUNTS.iter().copied().find(|mount| *mount == req.path) {
+        if req.method == "GET" && crate::console_ui::is_ui_page_request(&req.method, &req.path) {
+            if has_agent_marker(req) {
+                return json_reply(
+                    403,
+                    json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                );
+            }
+            if !canonical_request(req, port) && !desktop {
+                let target = crate::console_ui::legacy_redirect(&req.path)
+                    .unwrap_or(&req.path)
+                    .to_string();
                 let mut response = ConsoleResponse::from((302, String::new(), String::new()));
-                response.redirect = Some((port, mount));
+                response.redirect = Some(ConsoleRedirect::CanonicalOrigin(port, target));
                 return response;
             }
         }
@@ -745,6 +809,27 @@ pub(crate) fn handle_http_request(
         hook();
     }
     let agent_marker = has_agent_marker(req);
+    if let Some(admission_state) = admission.as_mut() {
+        if crate::console_ui::is_ui_page_request(&req.method, &req.path) {
+            if agent_marker {
+                return json_reply(
+                    403,
+                    json!({"ok": false, "error": "console UI routes are restricted to administrators"}),
+                );
+            }
+            if presented_console_token(req).is_some()
+                && admitted_context.console_authority.is_none()
+            {
+                return json_reply(
+                    401,
+                    json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}),
+                );
+            }
+            if let Some(response) = ui_page_response(req, admission_state.renewal.take()) {
+                return response;
+            }
+        }
+    }
     let kind = if admission.is_some() {
         if agent_marker {
             CallerKind::Agent {
@@ -1446,6 +1531,121 @@ mod tests {
     }
 
     #[test]
+    fn isolated_spa_assets_csp_and_legacy_redirects_enforce_front_contract() {
+        let (_root, context) = super::super::tests::fixture_runtime(
+            "front spa csp and redirects",
+            "fixture-front-token",
+        );
+        let cfg = context.load_config().unwrap();
+        let make_get = |host: &str, path: &str, token: Option<&str>, agent: Option<&str>| {
+            let mut headers = HashMap::from([("host".to_string(), host.to_string())]);
+            if let Some(tok) = token {
+                headers.insert("x-console-token".to_string(), tok.to_string());
+            }
+            if let Some(ag) = agent {
+                headers.insert("x-agent-token".to_string(), ag.to_string());
+            }
+            handle_http_request(
+                None,
+                &Request {
+                    method: "GET".to_string(),
+                    path: path.to_string(),
+                    query: HashMap::new(),
+                    headers,
+                    body: String::new(),
+                    body_too_large: false,
+                },
+                &cfg,
+                &context,
+                3999,
+            )
+        };
+        let canonical = crate::console_auth::canonical_host(3999);
+        let desktop = "127.0.0.1:3999";
+
+        for path in [
+            "/",
+            "/conversations",
+            "/persona",
+            "/settings",
+            "/login",
+            "/setup",
+        ] {
+            let resp = make_get(&canonical, path, None, None);
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
+            assert_eq!(resp.csp, Some(crate::console_ui::STRICT_CSP));
+            assert!(resp.content_type.starts_with("text/html"));
+            assert!(!resp.body.is_empty());
+
+            let denied_agent = make_get(&canonical, path, None, Some("agent-tok"));
+            assert_eq!(denied_agent.status, 403, "{path} agent must be refused");
+
+            let denied_alias_agent = make_get(desktop, path, None, Some("agent-tok"));
+            assert_eq!(
+                denied_alias_agent.status, 403,
+                "{path} alias-host agent must be refused before redirect"
+            );
+        }
+
+        for (legacy, target) in [
+            ("/personas", "/persona"),
+            ("/tasks", "/schedule"),
+            ("/settings/conversations", "/conversations"),
+            ("/settings/models", "/models"),
+        ] {
+            let resp = make_get(&canonical, legacy, None, None);
+            assert_eq!(resp.status, 302, "{legacy}");
+            assert!(matches!(resp.redirect, Some(ConsoleRedirect::Path(p)) if p == target));
+
+            let denied_alias_agent = make_get(desktop, legacy, None, Some("agent-tok"));
+            assert_eq!(
+                denied_alias_agent.status, 403,
+                "{legacy} alias-host agent must be refused before redirect"
+            );
+
+            let alias = make_get(desktop, legacy, None, None);
+            assert_eq!(alias.status, 302, "{legacy} alias redirect");
+            assert!(matches!(
+                alias.redirect,
+                Some(ConsoleRedirect::CanonicalOrigin(3999, ref p)) if p == target
+            ));
+        }
+
+        let unknown_api = make_get(
+            &canonical,
+            "/api/does-not-exist",
+            Some(&context.effective_console_token(&cfg)),
+            None,
+        );
+        assert_ne!(
+            unknown_api.status, 200,
+            "unknown /api route must never fall back to SPA"
+        );
+        assert!(unknown_api.content_type.starts_with("application/json"));
+
+        let missing_asset = make_get(&canonical, "/assets/missing.js", None, None);
+        assert_eq!(missing_asset.status, 404);
+        assert!(missing_asset.content_type.starts_with("application/json"));
+
+        let missing_file = make_get(
+            &canonical,
+            "/missing.txt",
+            Some(&context.effective_console_token(&cfg)),
+            None,
+        );
+        assert_ne!(
+            missing_file.status, 200,
+            "missing static extension path must never fall back to SPA"
+        );
+
+        let bad_host_asset = make_get("evil.example:3999", "/assets/missing.js", None, None);
+        assert_eq!(bad_host_asset.status, 403);
+
+        let agent_asset = make_get(&canonical, "/assets/missing.js", None, Some("agent-tok"));
+        assert_eq!(agent_asset.status, 403);
+    }
+
+    #[test]
     fn local_browser_auto_sign_in_issues_session_only_for_same_user_non_cross_site_when_enabled() {
         struct PeerGuard;
         impl Drop for PeerGuard {
@@ -1475,7 +1675,7 @@ mod tests {
             }
         };
 
-        // Unavailable peer (`stream = None`, no test override) -> refused, no cookie.
+        // Unavailable peer (`stream = None`, no test override) -> serves public SPA shell, issues no cookie.
         TEST_PEER_SAME_USER.with(|cell| cell.set(None));
         let unavailable = handle_http_request(
             None,
@@ -1484,10 +1684,10 @@ mod tests {
             &context,
             port,
         );
-        assert_eq!(unavailable.status, 401);
+        assert_eq!(unavailable.status, 200);
         assert!(unavailable.cookies.is_empty());
 
-        // Different user (`Some(false)`) -> refused, no cookie.
+        // Different user (`Some(false)`) -> serves public SPA shell, issues no cookie.
         TEST_PEER_SAME_USER.with(|cell| cell.set(Some(false)));
         let other_user = handle_http_request(
             None,
@@ -1496,19 +1696,19 @@ mod tests {
             &context,
             port,
         );
-        assert_eq!(other_user.status, 401);
+        assert_eq!(other_user.status, 200);
         assert!(other_user.cookies.is_empty());
 
-        // Same user (`Some(true)`), cross-site / bad Host / agent / explicit token / API path -> refused, no cookie.
+        // Same user (`Some(true)`), cross-site / bad Host / agent / explicit token / /login / /setup / API path -> no cookie issued.
         TEST_PEER_SAME_USER.with(|cell| cell.set(Some(true)));
         for (req, expected_status) in [
             (
                 make_page_req(&canonical, "/settings", &[("sec-fetch-site", "cross-site")]),
-                401,
+                200,
             ),
             (
                 make_page_req(&canonical, "/settings", &[("sec-fetch-site", "same-site")]),
-                401,
+                200,
             ),
             (
                 make_page_req(
@@ -1516,12 +1716,20 @@ mod tests {
                     "/settings",
                     &[("origin", "http://evil.example")],
                 ),
-                401,
+                200,
+            ),
+            (
+                make_page_req(&canonical, "/login", &[("sec-fetch-site", "none")]),
+                200,
+            ),
+            (
+                make_page_req(&canonical, "/setup", &[("sec-fetch-site", "none")]),
+                200,
             ),
             (make_page_req("evil.example:3999", "/settings", &[]), 403),
             (
                 make_page_req(&canonical, "/settings", &[("x-agent-token", "agent-123")]),
-                401,
+                403,
             ),
             (
                 make_page_req(
@@ -1566,7 +1774,7 @@ mod tests {
             .0
             .to_string();
 
-        // Issued cookie authenticates /api/auth/status as a browser session.
+        // Issued cookie authenticates /api/auth/status and /api/settings as a browser session.
         let status_res = handle_http_request(
             None,
             &make_page_req(
@@ -1583,6 +1791,19 @@ mod tests {
         assert_eq!(status_json["authenticated"], json!(true));
         assert_eq!(status_json["authKind"], json!("browser"));
         assert_eq!(status_json["requirePasswordLocally"], json!(false));
+
+        let api_settings = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/settings",
+                &[("cookie", &cookie_pair), ("sec-fetch-site", "same-origin")],
+            ),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(api_settings.status, 200, "{}", api_settings.body);
 
         // Enabling `security.requirePasswordLocally` turns off auto sign-in even for same user.
         crate::settings::apply(
@@ -1601,7 +1822,19 @@ mod tests {
             &context,
             port,
         );
-        assert_eq!(disabled.status, 401);
+        assert_eq!(disabled.status, 200);
         assert!(disabled.cookies.is_empty());
+        let unauth_api = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/settings",
+                &[("sec-fetch-site", "same-origin")],
+            ),
+            &reloaded,
+            &context,
+            port,
+        );
+        assert_eq!(unauth_api.status, 401);
     }
 }

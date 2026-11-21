@@ -671,7 +671,9 @@ fn conversation_settings_page_lists_and_sets_through_the_routes() {
     );
     assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
     let (status, _) = admin_request(&context, "GET", "/settings/conversations", None);
-    assert_eq!(status, 200, "the page is served behind the console front");
+    assert_eq!(status, 302, "legacy path redirects behind the console front");
+    let (status, _) = admin_request(&context, "GET", "/conversations", None);
+    assert_eq!(status, 200, "canonical SPA route is served behind the console front");
     let (status, body) = agent_request(&context, "GET", "/settings/conversations", None, "fixture-agent-token");
     assert_eq!(status, 403, "{body}");
     let body = conversations_view(&context);
@@ -877,7 +879,9 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     );
     assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
     let (status, _) = admin_request(&context, "GET", "/settings/models", None);
-    assert_eq!(status, 200, "the page is served behind the console front");
+    assert_eq!(status, 302, "legacy path redirects behind the console front");
+    let (status, _) = admin_request(&context, "GET", "/models", None);
+    assert_eq!(status, 200, "canonical SPA route is served behind the console front");
     for path in ["/settings/models", "/api/settings/models"] {
         let (status, reply) = agent_request(&context, "GET", path, None, "fixture-agent-token");
         assert_eq!(status, 403, "{path}: {reply}");

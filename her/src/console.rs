@@ -986,7 +986,15 @@ fn read_chunked_request_body(
 }
 
 fn respond(stream: &mut TcpStream, response: ConsoleResponse) {
-    let ConsoleResponse { status, content_type, body, redirect, cookies } = response;
+    let ConsoleResponse {
+        status,
+        content_type,
+        body,
+        redirect,
+        cookies,
+        raw_body,
+        csp,
+    } = response;
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
@@ -1004,19 +1012,32 @@ fn respond(stream: &mut TcpStream, response: ConsoleResponse) {
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
+    let nosniff = crate::console_ui::NOSNIFF;
+    let content_len = raw_body.map_or(body.len(), <[u8]>::len);
     let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
-        body.len()
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {content_len}\r\nCache-Control: no-store\r\nX-Content-Type-Options: {nosniff}\r\nConnection: close\r\n",
     );
-    if let Some((port, mount)) = redirect {
-        head.push_str(&format!("Location: {}{mount}\r\n", crate::console_auth::canonical_origin(port)));
+    if let Some(csp) = csp {
+        head.push_str(&format!("Content-Security-Policy: {csp}\r\n"));
+    }
+    match redirect {
+        Some(ConsoleRedirect::CanonicalOrigin(port, mount)) => {
+            head.push_str(&format!(
+                "Location: {}{mount}\r\n",
+                crate::console_auth::canonical_origin(port)
+            ));
+        }
+        Some(ConsoleRedirect::Path(mount)) => {
+            head.push_str(&format!("Location: {mount}\r\n"));
+        }
+        None => {}
     }
     for cookie in cookies {
         head.push_str(&format!("Set-Cookie: {}\r\n", cookie.header()));
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.write_all(raw_body.unwrap_or(body.as_bytes()));
     let _ = stream.flush();
 }
 
@@ -13854,8 +13875,6 @@ const ROOT_BROWSER_TRANSPORT: &str = r#"<script>
 })();
 </script>"#;
 
-const PAGE_MOUNTS: &[&str] = &["/", "/settings", "/settings/conversations", "/settings/models", "/personas", "/tasks", "/schedule"];
-
 fn has_fetch_metadata(req: &Request) -> bool {
     req.headers.keys().any(|name| name.starts_with("sec-fetch-"))
 }
@@ -13884,17 +13903,32 @@ impl BrowserCookie {
     }
 }
 
+enum ConsoleRedirect {
+    CanonicalOrigin(u16, String),
+    Path(&'static str),
+}
+
 struct ConsoleResponse {
     status: u16,
     content_type: String,
     body: String,
-    redirect: Option<(u16, &'static str)>,
+    redirect: Option<ConsoleRedirect>,
     cookies: Vec<BrowserCookie>,
+    raw_body: Option<&'static [u8]>,
+    csp: Option<&'static str>,
 }
 
 impl From<(u16, String, String)> for ConsoleResponse {
     fn from((status, content_type, body): (u16, String, String)) -> Self {
-        Self { status, content_type, body, redirect: None, cookies: Vec::new() }
+        Self {
+            status,
+            content_type,
+            body,
+            redirect: None,
+            cookies: Vec::new(),
+            raw_body: None,
+            csp: None,
+        }
     }
 }
 
@@ -14053,7 +14087,8 @@ fn admit_selected_request(
     let browser_auth = explicit.is_none()
         && !agent_call
         && !candidates.is_empty()
-        && (canonical_request(req, port) || !PAGE_MOUNTS.contains(&req.path.as_str()));
+        && (canonical_request(req, port)
+            || !crate::console_ui::is_ui_page_request(&req.method, &req.path));
     let _gate = if browser_auth {
         Some(acquire_social_state_gate(context)?)
     } else {
@@ -24220,9 +24255,17 @@ pub(super) mod tests {
         let (page_b_status, page_b) = http_json_with_host(port_b, &host_b, "GET", "/", token_b, None, None);
         assert_eq!(page_a_status, 200, "selected A page should be served: {page_a}");
         assert_eq!(page_b_status, 200, "selected B page should be served: {page_b}");
-        assert!(page_a["raw"].as_str().unwrap().contains("selected-a"));
+        assert!(page_a["raw"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("<!doctype html>"));
         assert!(!page_a["raw"].as_str().unwrap().contains("selected-b"));
-        assert!(page_b["raw"].as_str().unwrap().contains("selected-b"));
+        assert!(page_b["raw"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("<!doctype html>"));
         assert!(!page_b["raw"].as_str().unwrap().contains("selected-a"));
 
         assert_eq!(http_status_without_token(port_a, "/favicon.ico"), 204);
