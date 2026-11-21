@@ -14192,6 +14192,8 @@ fn auth_status_route(
             "consecutiveFailures": snapshot.consecutive_failures,
             "retryAfterMs": snapshot.retry_after_ms,
             "retryAfterSeconds": auth_retry_seconds(snapshot.retry_after_ms),
+            "requirePasswordLocally": crate::console_auth::require_password_locally(&admission.config),
+            "localAutoSignInAvailable": cfg!(windows),
         }),
     )
 }
@@ -14603,6 +14605,32 @@ fn handle_conn(
 }
 
 #[cfg(windows)]
+pub(super) fn same_installing_user(stream: &TcpStream) -> bool {
+    crate::process_identity::tcp_peer_user(stream)
+        .and_then(|peer| {
+            crate::process_identity::current_user().map(|own| {
+                #[cfg(debug_assertions)]
+                let fixture_matches = std::env::var("HER_TEST_DESKTOP_PEER_SID_HEX")
+                    .map(|sid| {
+                        sid.eq_ignore_ascii_case(
+                            &peer.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                        )
+                    })
+                    .unwrap_or(true);
+                #[cfg(not(debug_assertions))]
+                let fixture_matches = true;
+                peer == own && fixture_matches
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+pub(super) fn same_installing_user(_stream: &TcpStream) -> bool {
+    false
+}
+
+#[cfg(windows)]
 pub(super) fn desktop_sign_in_selected(
     stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16,
 ) -> Result<String, (u16, String)> {
@@ -14634,18 +14662,9 @@ pub(super) fn desktop_sign_in_selected(
         };
         (credential_digest(&expected), desktop_grants::current_issuer(context)?.generation, proof)
     };
-    let same_user = crate::process_identity::tcp_peer_user(stream)
-        .and_then(|peer| crate::process_identity::current_user().map(|own| {
-            #[cfg(debug_assertions)]
-            let fixture_matches = std::env::var("HER_TEST_DESKTOP_PEER_SID_HEX")
-                .map(|sid| sid.eq_ignore_ascii_case(&peer.iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
-                .unwrap_or(true);
-            #[cfg(not(debug_assertions))]
-            let fixture_matches = true;
-            peer == own && fixture_matches
-        }))
-        .unwrap_or(false);
-    if !same_user { return Err((403, "desktop sign-in requires the installing user".into())); }
+    if !same_installing_user(stream) {
+        return Err((403, "desktop sign-in requires the installing user".into()));
+    }
     let _gate = acquire_social_state_gate(context)?;
     let cfg = selected_config_for_handler(context)?;
     let effective = checked_console_token(context, &cfg)?;

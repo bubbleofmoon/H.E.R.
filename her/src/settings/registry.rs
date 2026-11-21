@@ -28,7 +28,7 @@ pub(crate) use tools::{tool_enabled, tool_switches};
 pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOICE_MAX_HOUR, VOICE_MAX_MINUTE, VOICE_MAX_SECONDS};
 
 pub(crate) use alerts::{ALERT_HOURLY_CAP, ALERT_KEY_WINDOW, GATEWAY_SILENCE_WARN};
-pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
+pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, REQUIRE_PASSWORD_LOCALLY, SECURITY_GROUP};
 pub(super) use access::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use memory::{material_item_limit,

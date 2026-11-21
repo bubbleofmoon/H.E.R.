@@ -694,6 +694,48 @@ pub(crate) fn auth_login(
     }
 }
 
+pub(crate) fn require_password_locally(cfg: &serde_json::Value) -> bool {
+    crate::settings::REQUIRE_PASSWORD_LOCALLY.switch(cfg)
+}
+
+pub(crate) fn auth_local_browser_auto_sign_in(
+    context: &RuntimeContext,
+    port: u16,
+) -> Result<Option<(crate::settings::IssuedSession, ConsoleAuthority)>, (u16, String)> {
+    if !context.is_isolated() {
+        return Ok(None);
+    }
+    let _credential = credential_mutation_gate(context)
+        .map_err(|error| (503, error))?;
+    let unauth = unauthenticated_context(context);
+    let _config = crate::console::config_gate(&unauth)?;
+    let cfg = unauth
+        .load_config()
+        .map_err(|error| (503, error.to_string()))?;
+    if require_password_locally(&cfg) {
+        return Ok(None);
+    }
+    let expected = checked_console_token(&unauth, &cfg)?;
+    if expected.is_empty() {
+        return Ok(None);
+    }
+    let digest = credential_digest(&expected);
+    let origin = canonical_origin(port);
+    let issued = crate::settings::issue_browser_session(&unauth, &origin, digest)?;
+    let Some(admitted) =
+        crate::settings::admit_browser(&unauth, &origin, Some(digest), &[issued.id_digest], false)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        issued,
+        ConsoleAuthority::Browser {
+            token_digest: digest,
+            grant: admitted.proof,
+        },
+    )))
+}
+
 pub(crate) fn auth_change_password(
     context: &RuntimeContext,
     port: u16,
