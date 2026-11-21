@@ -1004,15 +1004,29 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
     fn report_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, code: &str, message: &str) {
         let failure = crate::model_failure::Failure::classify(code, message);
         note_model_error(&self.context, key, &failure.summary());
-        self.alert_backend_failure(cfg, key, backend, provider, model, &failure);
+        self.alert_backend_failure(cfg, key, backend, provider, model, &failure, &[], None);
     }
 
     /// The owner's alert and refusal record of one failed backend request, without a model error note: a request that
     /// only failed over is no turn failure (`report_backend_failure` adds the note for the failure that ended the turn).
-    fn alert_backend_failure(&mut self, cfg: &serde_json::Value, key: &str, backend: &str, provider: &str, model: &str, failure: &crate::model_failure::Failure) {
+    #[allow(clippy::too_many_arguments)]
+    fn alert_backend_failure(
+        &mut self,
+        cfg: &serde_json::Value,
+        key: &str,
+        backend: &str,
+        provider: &str,
+        model: &str,
+        failure: &crate::model_failure::Failure,
+        tool_refs: &[serde_json::Value],
+        call: Option<crate::model_failure::RefusalCall<'_>>,
+    ) {
         self.failure_reported = true;
         if failure.class == "refusal" && self.refusals_recorded.insert((backend.into(), provider.into(), model.into())) {
-            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, &self.carried_messages);
+            let mut messages = self.carried_messages.clone();
+            crate::model_failure::merge_refs(&mut messages, tool_refs.to_vec());
+            let input = crate::model_failure::RefusalInput { messages: &messages, call };
+            crate::model_failure::record_refusal(&self.context, key, backend, provider, model, failure, input);
         }
         crate::model_failure::notify(&self.context, cfg, key, backend, provider, model, failure);
     }
@@ -1831,11 +1845,6 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             capped = true;
         }
         let turn_ms = started.elapsed().as_millis() as i64;
-        for reference in turn.message_refs() {
-            if !self.carried_messages.contains(&reference) {
-                self.carried_messages.push(reference);
-            }
-        }
         // The runner may have committed completion while the cap poll was checking authority.
         let settled_cap = match &status {
             Status::ObservationSleep => Some("observationSleep"),
@@ -1879,12 +1888,17 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
         let count = failures.len();
         for (index, failure) in failures.iter().enumerate() {
             println!("[failover] {key} harness route {} failed ({})", failure.route, failure.summary);
+            let classified = crate::model_failure::Failure::classify("", &failure.summary);
             if model_end && index + 1 == count {
-                self.report_backend_failure(cfg, key, "harness", "openai", &failure.model, "", &failure.summary);
-            } else {
-                let classified = crate::model_failure::Failure::classify("", &failure.summary);
-                self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified);
+                note_model_error(&self.context, key, &classified.summary());
             }
+            let call = crate::model_failure::RefusalCall {
+                turn_id: &recorder.id,
+                index: Some(failure.model_call),
+                rpc_id: None,
+            };
+            self.alert_backend_failure(cfg, key, "harness", "openai", &failure.model, &classified,
+                &failure.message_refs, Some(call));
         }
         // When every route of the chain has failed, the owner is told once per outage, after the route reports above
         // (`harness::route_health`).

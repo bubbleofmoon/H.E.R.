@@ -1030,6 +1030,8 @@ impl Pipeline {
             let mut had_send = false;
             // An attempt that ended in `turn/end` error: (code, detail, the model's message).
             let mut model_failure: Option<(String, String, String)> = None;
+            let mut refusal_sources = crate::dsh::RefusalSources::default();
+            let mut replayable = false;
             let failed: Result<(), String> = match submitted {
                 Err(Submit::Unverified(why)) => {
                     follow.close().await;
@@ -1152,10 +1154,11 @@ impl Pipeline {
                     let send_tool_ok = follow.tools.iter().any(|t| is_send_tool(&t.name) && t.done && t.ok);
                     if let Some(turn) = &self.cur_turn {
                         if let Some(dsh_turn) = follow.turn_id() {
-                            let _ = turn.dsh_turn(&rpc_id, dsh_turn);
+                            replayable = turn.dsh_turn(&rpc_id, dsh_turn).is_ok();
                         }
                         let _ = turn.tools(follow.tools.iter().map(|t| t.to_json()).collect());
                     }
+                    refusal_sources = std::mem::take(&mut follow.refusal);
                     follow.close().await;
                     let end_kind = ended.pointer("/reason/kind").and_then(|k| k.as_str());
                     let classified_failure = reply.as_ref().ok().and_then(|text| {
@@ -1273,7 +1276,16 @@ impl Pipeline {
             };
             let (failure_code, failure_detail) = model_failure.as_ref()
                 .map(|(code, detail, _)| (code.as_str(), detail.as_str())).unwrap_or(("", why.as_str()));
-            self.report_backend_failure(cfg, key, "dsh", &chain[idx].provider, &chain[idx].model, failure_code, failure_detail);
+            let failure = crate::model_failure::Failure::classify(failure_code, failure_detail);
+            note_model_error(&self.context, key, &failure.summary());
+            let turn_id = self.cur_turn.as_ref().filter(|_| replayable).map(|turn| turn.id.clone());
+            let call = turn_id.as_deref().map(|turn_id| crate::model_failure::RefusalCall {
+                turn_id,
+                index: refusal_sources.model_call(),
+                rpc_id: Some(&rpc_id),
+            });
+            self.alert_backend_failure(cfg, key, "dsh", &chain[idx].provider, &chain[idx].model, &failure,
+                &refusal_sources.messages, call);
             // 等回复超时 / 流断开：DSH 里这一轮可能还在跑，结果未知。绝不把整条 prompt 交给下一个候选再投一遍
             // （ticket 25 决定 Q3，ticket 10 的未知结果合同）：先清队列并取消 DSH 里的回合、再换令牌，让它之后迟到的
             // 工具调用和发送全部因令牌不符被拒；取消核实不了就暂停交管理员，否则按失败收尾。只有明确的
