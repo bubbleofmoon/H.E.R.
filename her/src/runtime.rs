@@ -1257,7 +1257,7 @@ impl RuntimeContext {
             || (method == "POST" && path == "/api/schedule")
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/schedule/"))
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
-            || (method == "POST" && path == "/api/memory/archive")
+            || (method == "POST" && matches!(path, "/api/memory/archive" | "/api/memory/history"))
             || (method == "GET" && path == "/personas")
             || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
             || (matches!(method, "GET" | "POST") && crate::console_settings::is_route(path))
@@ -2982,8 +2982,7 @@ pub(crate) mod tests {
 
         // These flags dispatch through legacy probes before the live service loop in main.rs.
         for early_probe in [
-            "--send-probe", "--ask", "--memory-probe", "--memory-write-probe",
-            "--hot-render", "--index-hint", "--price-probe", "--role-probe",
+            "--send-probe", "--ask", "--price-probe", "--role-probe",
             "--prompt-wrapped", "--rpc-probe", "--slang-parse-test", "--selftest-401",
             "--ab-probe", "--failover-probe", "--sticker-sync", "--wake-replay",
             "--build-prompt", "--dsh-dump", "--dsh-watch", "--dsh-probe", "--dsh-demo",

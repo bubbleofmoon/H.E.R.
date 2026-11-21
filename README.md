@@ -82,7 +82,7 @@ Human reply timing enforced in code (held sends and a typing indicator), a guard
 | Path | What it is |
 | --- | --- |
 | `her/` | The Rust bridge, supervisor and desktop app: `her` (GUI), `her-cli` (console twin) and `herupdate` (update helper) |
-| `her-memory/` | Memory tooling |
+| `her-memory/` | Memory store, Recall, and benchmark runner |
 | `scripts/` | Build-slot, validation and fixture helpers |
 | `docs/` | Agent-facing contracts (`docs/agents/`), decisions (`docs/adr/`) and release checks |
 | `GLOSSARY.md` | The project's vocabulary |

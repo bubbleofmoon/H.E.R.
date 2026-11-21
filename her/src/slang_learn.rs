@@ -1283,7 +1283,7 @@ fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str,
     let route = crate::harness::routes::chain(cfg).ok().and_then(|chain| chain.into_iter().next());
     let model_name = route.as_ref().map_or("unspecified", |route| route.model.as_str());
     let fail = |failure: Failure| {
-        crate::model_failure::record_refusal(context, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure, &[]);
+        crate::model_failure::record_refusal(context, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure, Default::default());
         crate::model_failure::notify(context, cfg, key, ROUTE_BACKEND, ROUTE_PROVIDER, model_name, &failure);
         failure.summary()
     };
@@ -1346,7 +1346,7 @@ fn ask_model(
             Err(e) => {
                 let failure = crate::model_failure::Failure::classify("", &e);
                 let (provider, model) = crate::model_failure::cli_identity(cfg, backend_id);
-                crate::model_failure::record_refusal(context, key, backend_id, &provider, &model, &failure, &[]);
+                crate::model_failure::record_refusal(context, key, backend_id, &provider, &model, &failure, Default::default());
                 crate::model_failure::notify(context, cfg, key, backend_id, &provider, &model, &failure);
                 errors.push(format!("{backend_id}: {e}"));
             }

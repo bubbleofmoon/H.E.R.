@@ -1,14 +1,14 @@
 //! Reader-bound access to the memory database. ACL scope, the private rule and owner authority are
 //! applied here; callers name a conversation, never an `is_owner` flag.
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
-use super::{Hit, MemoryInput, ReaderScope, UpsertOutcome};
-use crate::runtime::RuntimeContext;
+use super::{Hit, MemoryInput, Provenance, UpsertOutcome};
 
 pub struct MemoryStore {
     conn: Connection,
     owner: Option<String>,
+    has_provenance: bool,
 }
 
 /// One conversation's view: search, write, forget and index see only what it may read.
@@ -16,11 +16,13 @@ pub struct Reader<'a> {
     pub(super) conn: &'a Connection,
     pub(super) key: String,
     pub(super) is_owner: bool,
+    pub(super) has_provenance: bool,
 }
 
 /// ACL and archive administration, for callers that authorized first.
 pub struct Admin<'a> {
     conn: &'a Connection,
+    has_provenance: bool,
 }
 
 /// A memory a conversation writes; its owner is always the reader's conversation.
@@ -34,6 +36,14 @@ pub struct NewMemory<'a> {
     pub tags: Option<&'a str>,
     pub source: &'a str,
     pub importance: f64,
+}
+
+/// A verbatim incoming message resolved by the bridge in the reader's own conversation.
+pub struct VerifiedMessage<'a> {
+    pub id: &'a str,
+    pub text: &'a str,
+    pub author_id: &'a str,
+    pub position: (i64, i64),
 }
 
 /// Digest progress of one conversation in one sequence space.
@@ -61,17 +71,18 @@ pub enum ForgetError {
 }
 
 impl MemoryStore {
-    /// The selected runtime's database at the current schema version; the owner is `cfg.ownerQQ`.
-    pub fn open(context: &RuntimeContext, cfg: &Value) -> Result<Self, String> {
+    /// Prepare an open connection to the current memory schema version and enable provenance queries.
+    pub fn open_prepared(conn: Connection, owner: Option<String>) -> Result<Self, String> {
         Ok(Self {
-            conn: super::open_ready_for_runtime(context)?,
-            owner: crate::conversation_authority::owner_conversation(cfg),
+            conn: super::prepare_connection(conn)?,
+            owner,
+            has_provenance: true,
         })
     }
 
-    /// An already-open connection (probes and tests); no migration runs.
+    /// Bind an initialized connection and the optional owner conversation (probes and tests; no migration runs).
     pub fn from_connection(conn: Connection, owner: Option<String>) -> Self {
-        Self { conn, owner }
+        Self { conn, owner, has_provenance: false }
     }
 
     pub fn for_reader(&self, conversation: &str) -> Reader<'_> {
@@ -79,11 +90,15 @@ impl MemoryStore {
             conn: &self.conn,
             key: conversation.to_string(),
             is_owner: self.owner.as_deref() == Some(conversation),
+            has_provenance: self.has_provenance,
         }
     }
 
     pub fn admin(&self) -> Admin<'_> {
-        Admin { conn: &self.conn }
+        Admin {
+            conn: &self.conn,
+            has_provenance: self.has_provenance,
+        }
     }
 }
 
@@ -92,14 +107,123 @@ impl Reader<'_> {
         self.is_owner
     }
 
-    /// The owner ids this conversation may read (diagnostic probes).
-    pub fn scope(&self) -> rusqlite::Result<ReaderScope> {
-        super::resolve_reader_scope(self.conn, &self.key, self.is_owner)
-    }
-
     /// Explicit search; counts a hit on every returned memory.
     pub fn search(&self, query: &str, kinds: &[String], limit: usize) -> rusqlite::Result<Vec<Hit>> {
-        super::search(self.conn, &self.key, self.is_owner, query, kinds, limit)
+        let mut hits = super::search(self.conn, &self.key, self.is_owner, query, kinds, limit)?;
+        self.attach_provenance(&mut hits)?;
+        Ok(hits)
+    }
+
+    pub(super) fn attach_provenance(&self, hits: &mut [Hit]) -> rusqlite::Result<()> {
+        if !self.has_provenance || hits.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT message_id, attributed_to FROM memory_provenance WHERE memory_id=?1",
+        )?;
+        for hit in hits {
+            if let Some((message_id, attributed_to)) = stmt
+                .query_row([hit.id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+            {
+                hit.message_id = message_id;
+                hit.attributed_to = attributed_to;
+                if hit.message_id.is_some() && hit.attributed_to.is_none() {
+                    hit.provenance = Provenance::Fact;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A correction and its predecessor update commit together. Only the original speaker
+    /// can correct a linked message. The owner can also correct an unlinked private note.
+    pub fn write_message(
+        &self, message: VerifiedMessage<'_>, supersedes: Option<i64>,
+    ) -> rusqlite::Result<Option<UpsertOutcome>> {
+        let attribution = (!self.is_owner).then_some(message.author_id);
+        let content = match attribution {
+            Some(speaker) => format!("{speaker}说：{}", message.text),
+            None => message.text.to_string(),
+        };
+        let scope = if self.key.starts_with("private:") { "private" } else { "group" };
+        super::atomic(self.conn, |conn| {
+            let existing = conn.query_row(
+                "SELECT m.id, m.archived FROM memory m JOIN memory_provenance p ON p.memory_id=m.id
+                 WHERE m.owner_id=?1 AND p.message_id=?2",
+                params![self.key, message.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, bool>(1)?)),
+            ).optional()?;
+            let existing_id = existing.map(|(id, _)| id);
+            if let Some(previous) = supersedes {
+                let predecessor = conn.query_row(
+                    "SELECT m.archived, p.author_id, p.message_at, p.message_seq, p.superseded_by
+                     FROM memory m LEFT JOIN memory_provenance p ON p.memory_id=m.id
+                     WHERE m.id=?1 AND m.owner_id=?2 AND m.owner_type='session' AND m.scope=?3",
+                    params![previous, self.key, scope],
+                    |r| Ok((r.get::<_, bool>(0)?, r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?.zip(r.get::<_, Option<i64>>(3)?),
+                        r.get::<_, Option<i64>>(4)?)),
+                ).optional()?;
+                let Some((archived, author, at, replacement)) = predecessor else {
+                    return Ok(None);
+                };
+                if replacement.is_some() && replacement == existing_id {
+                    return Ok(existing_id.map(|id| UpsertOutcome { id, deduped: true }));
+                }
+                let same_author = author.as_deref() == Some(message.author_id)
+                    || (author.is_none() && self.is_owner);
+                if archived || replacement.is_some() || !same_author || existing_id == Some(previous)
+                    || existing.is_some_and(|(_, archived)| archived)
+                    || at.is_some_and(|old| message.position <= old)
+                {
+                    return Ok(None);
+                }
+            }
+
+            let written = if let Some(id) = existing_id {
+                UpsertOutcome { id, deduped: true }
+            } else {
+                let id = super::write_memory(conn, &MemoryInput {
+                    owner_type: "session", owner_id: &self.key, scope,
+                    kind: if attribution.is_some() { "inference" } else { "fact" },
+                    subject: None, content: &content, tags: None, source: "verified-message",
+                    importance: 0.5,
+                })?;
+                conn.execute(
+                    "INSERT INTO memory_provenance(memory_id,message_id,attributed_to,author_id,message_at,message_seq)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![id, message.id, attribution, message.author_id,
+                        message.position.0, message.position.1],
+                )?;
+                super::audit(conn, &self.key, "write-message", Some(id), None)?;
+                UpsertOutcome { id, deduped: false }
+            };
+            if let Some(previous) = supersedes {
+                conn.execute(
+                    "INSERT INTO memory_provenance(memory_id,superseded_by) VALUES(?1,?2)
+                     ON CONFLICT(memory_id) DO UPDATE SET superseded_by=excluded.superseded_by",
+                    params![previous, written.id],
+                )?;
+                conn.execute("UPDATE memory SET archived=1 WHERE id=?1", [previous])?;
+                super::audit(conn, &self.key, "supersede", Some(previous), None)?;
+            }
+            Ok(Some(written))
+        })
+    }
+
+    pub fn correction_history(&self, id: i64) -> rusqlite::Result<Option<Value>> {
+        if !self.has_provenance {
+            return Ok(None);
+        }
+        self.conn.query_row(
+            "SELECT m.content, p.superseded_by FROM memory m
+             JOIN memory_provenance p ON p.memory_id=m.id
+             WHERE m.id=?1 AND m.owner_id=?2 AND p.superseded_by IS NOT NULL",
+            params![id, self.key],
+            |r| Ok(serde_json::json!({
+                "id": id, "content": r.get::<_, String>(0)?, "superseded_by": r.get::<_, i64>(1)?
+            })),
+        ).optional()
     }
 
     pub fn index(&self, max_terms: usize) -> rusqlite::Result<(i64, Vec<String>)> {
@@ -116,7 +240,7 @@ impl Reader<'_> {
             subject: m.subject,
             content: m.content,
             tags: m.tags,
-            source: m.source,
+            source: if m.source == "verified-message" { "agent" } else { m.source },
             importance: m.importance,
         })
     }
@@ -169,7 +293,11 @@ impl Reader<'_> {
                 return Ok(None);
             }
             deleting = true;
-            super::forget_memory(conn, id, &self.key).map(Some)
+            let deleted = super::forget_memory(conn, id, &self.key)?;
+            if deleted && self.has_provenance {
+                conn.execute("UPDATE memory_provenance SET superseded_by=NULL WHERE superseded_by=?1", [id])?;
+            }
+            Ok(Some(deleted))
         })
         .map_err(|error| if deleting { ForgetError::Delete(error) } else { ForgetError::Check(error) })
     }
@@ -189,7 +317,16 @@ impl Admin<'_> {
     }
 
     pub fn archive(&self, id: i64, archived: bool, actor: &str) -> rusqlite::Result<bool> {
-        super::archive_memory(self.conn, id, archived, actor)
+        let has_provenance = self.has_provenance;
+        super::atomic(self.conn, |conn| {
+            if !archived && has_provenance && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_provenance WHERE memory_id=?1 AND superseded_by IS NOT NULL)",
+                [id], |r| r.get::<_, bool>(0),
+            )? {
+                return Ok(false);
+            }
+            super::archive_memory(conn, id, archived, actor)
+        })
     }
 }
 
@@ -203,9 +340,9 @@ mod tests {
     /// ACL: group:1 reads group:3; group:7 holds a wildcard grant.
     fn store(owner: Option<&str>) -> MemoryStore {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../spec/memory-schema.sql")).unwrap();
+        conn.execute_batch(include_str!("../spec/memory-schema.sql")).unwrap();
         for (owner_id, scope) in [("group:1", "group"), ("private:2", "private"), ("group:3", "group"), (OWNER, "private")] {
-            crate::memory::write_memory(&conn, &MemoryInput {
+            crate::write_memory(&conn, &MemoryInput {
                 owner_type: "session", owner_id, scope, kind: "fact", subject: None,
                 content: &format!("needle {owner_id}"), tags: None, source: "fixture", importance: 0.5,
             }).unwrap();
@@ -282,7 +419,7 @@ mod tests {
     #[test]
     fn digest_write_commits_memories_with_its_cursor_and_refuses_a_moved_cursor() {
         let store = store(Some(OWNER));
-        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
@@ -305,7 +442,7 @@ mod tests {
     #[test]
     fn a_fault_after_the_memory_insert_rolls_back_the_memories_and_the_cursor() {
         let store = store(Some(OWNER));
-        store.conn.execute_batch(crate::memory::DIGEST_CURSOR_V2).unwrap();
+        store.conn.execute_batch(crate::DIGEST_CURSOR_V2).unwrap();
         let new = |content: &'static str| NewMemory { owner_type: "session", scope: None, kind: "inference",
             subject: Some("s"), content, tags: None, source: "digest:group:3:msg:1-4", importance: 0.5 };
         let reader = store.for_reader("group:3");
@@ -321,5 +458,13 @@ mod tests {
         assert!(reader.write_digest("msg", 4, 9, (0, 0), &[new("lost one"), new("lost two")]).is_err());
         assert_eq!(counts(), before, "a failed cursor commit kept memory rows");
         assert_eq!(reader.digest_cursor("msg").unwrap().map(|c| c.through), Some(4), "a failed commit moved the cursor");
+    }
+
+    #[test]
+    fn pre_v3_from_connection_guards_correction_history_and_archive() {
+        let store = store(Some(OWNER));
+        assert_eq!(store.for_reader(OWNER).correction_history(1).unwrap(), None);
+        assert!(store.admin().archive(1, true, "fixture").unwrap());
+        assert!(store.admin().archive(1, false, "fixture").unwrap());
     }
 }
