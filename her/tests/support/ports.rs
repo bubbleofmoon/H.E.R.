@@ -181,3 +181,41 @@ pub fn hold(reservation: Reserved) {
 pub fn release_held() {
     HELD.with(|held| held.borrow_mut().clear());
 }
+
+/// Explicit per-fixture custody for reserved loopback ports.
+/// Unlike thread-local `hold`/`release_held`, helper child spawns never disturb these reservations;
+/// the owning fixture releases individual ports or all ports right before the target process binds.
+#[derive(Default)]
+pub struct PortCustody {
+    held: Vec<Reserved>,
+}
+
+impl PortCustody {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reserve(&mut self) -> u16 {
+        let reservation = reserve();
+        let port = reservation.port();
+        self.held.push(reservation);
+        port
+    }
+
+    pub fn reserve_many<const N: usize>(&mut self) -> [u16; N] {
+        std::array::from_fn(|_| self.reserve())
+    }
+
+    pub fn take(&mut self, port: u16) -> Option<Reserved> {
+        let index = self.held.iter().position(|r| r.port() == port)?;
+        Some(self.held.swap_remove(index))
+    }
+
+    pub fn release(&mut self, port: u16) -> bool {
+        self.take(port).is_some()
+    }
+
+    pub fn release_all(&mut self) {
+        self.held.clear();
+    }
+}

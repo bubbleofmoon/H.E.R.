@@ -15,13 +15,8 @@ const DSH_VERSION: &str = "0.2.1-rc.2";
 const DSH_PACKAGE: &str = "@deepseek-ai/dsh";
 
 fn hidden(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    crate::support::ports::release_held(); // every child starts here: free the fixture's held ports first
     let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    crate::support::hide_window(&mut command);
     command.env_remove("HER_RUNTIME_ROOT");
     command
 }
@@ -161,6 +156,7 @@ struct Fixture {
     root: PathBuf,
     node: PathBuf,
     ports: [u16; 3],
+    custody: crate::support::ports::PortCustody,
     config: Value,
     registry: Option<(Owned, String)>,
     supervisor: Option<Owned>,
@@ -190,8 +186,9 @@ impl Fixture {
         ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
-        let reservations: Vec<_> = (0..3).map(|_| crate::support::ports::reserve()).collect();
-        let ports = std::array::from_fn(|i| reservations[i].port());
+        let mut custody = crate::support::ports::PortCustody::new();
+        let [snow_port, dsh_port] = custody.reserve_many();
+        let ports = [snow_port, dsh_port, 0];
         let system_node = which("node");
         let npm = npm_cli(&system_node);
         let exe = if cfg!(windows) { "node.exe" } else { "node" };
@@ -236,6 +233,7 @@ impl Fixture {
             root,
             node: system_node,
             ports,
+            custody,
             config,
             registry: None,
             supervisor: None,
@@ -244,7 +242,6 @@ impl Fixture {
             env: Vec::new(),
         };
         fixture.save();
-        reservations.into_iter().for_each(crate::support::ports::hold); // freed by the first hidden() spawn
         fixture
     }
 
@@ -327,12 +324,34 @@ impl Fixture {
 
     fn start(&mut self) {
         if self.console.is_none() {
-            self.console = Some(self.spawn_her(&[
-                "--console-serve",
-                "--console-port",
-                &self.ports[2].to_string(),
-            ]));
+            let root = self.root.clone();
+            let env = self.env.clone();
+            let mut config = self.config.clone();
+            let (child, port) =
+                crate::support::ports::start_console(Duration::from_secs(20), |port| {
+                    config["consolePort"] = json!(port);
+                    std::fs::write(root.join("config/config.json"), config.to_string()).unwrap();
+                    hidden(env!("CARGO_BIN_EXE_her"))
+                        .args(["--console-serve", "--console-port", &port.to_string()])
+                        .arg("--runtime-root")
+                        .arg(&root)
+                        .env("npm_config_userconfig", root.join("npmrc"))
+                        .env("npm_config_update_notifier", "false")
+                        .envs(env.iter().cloned())
+                        .stdout(Stdio::from(
+                            std::fs::File::create(root.join("--console-serve.out")).unwrap(),
+                        ))
+                        .stderr(Stdio::from(
+                            std::fs::File::create(root.join("--console-serve.err")).unwrap(),
+                        ))
+                        .spawn()
+                        .unwrap()
+                });
+            self.config["consolePort"] = json!(port);
+            self.console = Some(Owned::new(child));
         }
+        // Release SnowLuma and DSH held ports right before `supervise` spawns them.
+        self.custody.release_all();
         self.supervisor = Some(self.spawn_her(&["supervise"]));
     }
 
@@ -395,16 +414,18 @@ impl Fixture {
     }
 
     fn wait_for(&self, timeout: Duration, predicate: impl Fn() -> bool) {
-        let deadline = Instant::now() + timeout;
-        while !predicate() {
-            assert!(
-                Instant::now() < deadline,
-                "fixture wait expired; states={} supervisor={}",
-                self.states(),
-                self.supervisor_err()
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        crate::support::wait::assert_eventually(
+            timeout,
+            Duration::from_millis(25),
+            predicate,
+            || {
+                format!(
+                    "fixture wait expired; states={} supervisor={}",
+                    self.states(),
+                    self.supervisor_err()
+                )
+            },
+        );
     }
 
     /// A prebuilt fake package laid out as npm installs it.
@@ -686,7 +707,10 @@ fn dsh_installs_at_another_version_or_in_an_npx_cache_are_refused_without_starti
         fixture.start_registry();
         fixture.start();
         fixture.wait(|| fixture.supervisor_err().contains(reason));
-        std::thread::sleep(Duration::from_secs(2));
+        fixture.wait(|| {
+            fixture.states()["snowluma"]["state"] == "started"
+                && fixture.states()["dsh"]["state"] == "refused"
+        });
         assert_eq!(
             fixture.states()["snowluma"]["state"],
             "started",
@@ -1124,7 +1148,11 @@ fn an_unpinned_legacy_npx_install_still_runs_with_one_warning() {
     fixture.healthy();
     assert_eq!(fixture.supervisor_err().matches("unpinned DSH").count(), 1);
     set_desired(&fixture, "maintenance");
-    std::thread::sleep(Duration::from_secs(2));
+    fixture.wait(|| {
+        std::fs::read_to_string(fixture.root.join("data/tasks/runs.jsonl"))
+            .unwrap_or_default()
+            .contains("desired-state")
+    });
     set_desired(&fixture, "running");
     fixture.wait(|| fixture.states()["dsh"]["state"] == "adopted");
     assert_eq!(fixture.supervisor_err().matches("unpinned DSH").count(), 1);
@@ -1199,7 +1227,44 @@ fn failed_installs_back_off_across_passes_and_restarts_without_holding_the_launc
         );
         assert_eq!(unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_UN) }, 0);
     }
-    std::thread::sleep(Duration::from_secs(2));
+    #[cfg(windows)]
+    {
+        use sha2::{Digest, Sha256};
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{
+            CreateMutexW, ReleaseMutex, WaitForSingleObject,
+        };
+        let canonical = std::fs::canonicalize(&fixture.root).unwrap();
+        let raw = canonical.to_string_lossy();
+        let normalized = raw
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&raw)
+            .replace('/', "\\")
+            .to_lowercase();
+        let hash = format!("{:x}", Sha256::digest(normalized.as_bytes())).to_uppercase();
+        let name: Vec<u16> = format!("Global\\QQBot-StartAll-{hash}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        fixture.wait_for(Duration::from_secs(5), || unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle.is_null() {
+                return false;
+            }
+            let wait = WaitForSingleObject(handle, 0);
+            let acquired = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+            if acquired {
+                let _ = ReleaseMutex(handle);
+            }
+            CloseHandle(handle);
+            acquired
+        });
+    }
+    assert_eq!(
+        fixture.health("0").1["parts"]["snowluma"]["verdict"],
+        "pass",
+        "restarted supervisor must keep snowluma healthy"
+    );
     assert_eq!(
         fixture.registry_requests().len(),
         requests,
@@ -1310,7 +1375,7 @@ fn another_runtime_sweep_preserves_staging_after_npm_exit_until_publication() {
 
     let mut fixture = Fixture::new();
     // The trial's reservations are taken while the first fixture's ports are still held, so the two
-    // fixtures get distinct ports. The first hidden() call frees both sets.
+    // fixtures get distinct ports. Each fixture releases its own PortCustody in start().
     let mut trial = Fixture::new();
     let ready = fixture.root.join("npm-ready.json");
     let release = fixture.root.join("npm-exit");
