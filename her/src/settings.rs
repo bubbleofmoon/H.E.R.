@@ -21,9 +21,11 @@
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
 //!
-//! Secret settings (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
+//! Endpoint credentials (`registry/secrets.rs`) keep a key for one endpoint. They are administrator-only and read through
 //! `secret_value`. Ordinary overlays, seeding and mirroring exclude them. History holds a fixed marker on both sides
 //! of every change and refuses undo. Reset clears the stored credential and lets an explicit compatibility source apply.
+//! The administrator password keeps a PHC string and uses its own transaction for first-run and reset. Settings exposes
+//! only its presence, and the configuration loader has no password value to apply.
 //!
 //! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
 //! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
@@ -55,7 +57,7 @@ pub(crate) use kinds::ID_LIST_MAX;
 #[cfg(test)]
 pub(crate) use probe::{AuditRow, StoreProbe};
 pub(crate) use registry::{reply, send, wake as wake_timing, CONVERSATION_ENGINE, ENGINE_DEFAULT};
-pub(crate) use registry::{CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
+pub(crate) use registry::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 pub(crate) use registry::{REMINDER_CONVERSATION_CAP, REMINDER_HORIZON, REMINDER_REPEAT_FLOOR, REMINDER_TOTAL_CAP};
 pub(crate) use registry::{
     daily, material_item_limit, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE,
@@ -78,6 +80,8 @@ pub(crate) use registry::{
     GATEWAY_SILENCE_WARN,
 };
 #[cfg(test)]
+pub(crate) use store::seed_browser_session;
+#[cfg(test)]
 pub(crate) use store::{
     create_store, FAIL_AFTER_CLEAR, FAIL_BEFORE_AUDIT, FAIL_MIGRATION, FAIL_UNDO_LOOK, FAIL_WRITE_BACK,
     NEWER_SCHEMA_ERROR, PANIC_BEFORE_COMMIT, WAL_SWITCH_BUSY,
@@ -87,9 +91,17 @@ pub(crate) use store::{
     complete_timing, console_changes, conversation_admitted, conversation_value, conversation_view, direct_change_error, engine_choice,
     has_legacy_engine_choices, has_stored_values, history, import_engine_choices,
     holds_any, keep_file_members, keep_registry_values, last_good_text, mirror_into, overlay, overlay_checked, place_changes, preview,
-    archive_has_endpoint_credentials, harness_credential, registry_free, reset, reset_conversation, resolve_config,
+    admit_browser, archive_credentials, auth_status, change_administrator_password,
+    clamp_throttle_deadline, complete_login, harness_credential, issue_browser_session,
+    list_browser_sessions, load_login_challenge, recheck_browser, record_login_failure,
+    revoke_browser_session_by_digest, revoke_browser_sessions, revoke_other_browser_sessions,
+    scrub_auth_snapshot, set_initial_administrator_password_with_session, start_browser_clock,
+    throttle_delay_ms, ArchivedCredentials, AuthStatusSnapshot, BrowserSessionView, IssuedSession,
+    LoginChallenge, LoginFailureState, LoginOutcome, THROTTLE_MAX_MS, registry_free, reset,
+    reset_conversation, resolve_config,
     resolve_live_batch, restore_gate, restore_switch_choice, secret_revision, secret_value, security_restore,
-    store_mark, store_path, stored_secrets, undo, view, write_back, Applied, Change, CONVERSATION_ERROR,
+    reset_administrator_password, set_initial_administrator_password, store_mark, store_path, stored_secrets, undo,
+    view, write_back, Applied, Change, CONVERSATION_ERROR,
 };
 
 /// #154: a request's `confirm` member: missing is false, a boolean is itself, anything else is 400.

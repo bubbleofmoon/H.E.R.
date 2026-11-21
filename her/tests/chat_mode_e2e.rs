@@ -2847,6 +2847,7 @@ impl DependencyMetadata16 {
         let stop=Arc::new(std::sync::atomic::AtomicBool::new(false));let done=stop.clone();
         let worker=thread::spawn(move||while !done.load(std::sync::atomic::Ordering::SeqCst) {
             if let Ok((mut stream,_))=listener.accept() {
+                let _=stream.set_nonblocking(false);
                 let _=read_request(&mut stream);
                 respond(&mut stream,200,&json!({"dist-tags":{"latest":"0.3.0"},"versions":{"0.3.0":{}}}));
             } else {thread::sleep(Duration::from_millis(10));}

@@ -41,9 +41,10 @@ fn prompt_text_edit_is_live_on_the_next_wake_as_a_section_replacement() {
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..2 {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     let (briefing, _) = crate::prompt::prepare_dsh_wake(&context, &context.load_config().unwrap(), key, "sid-140", "epoch-140",

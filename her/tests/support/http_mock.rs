@@ -142,8 +142,14 @@ pub fn http_json_call(
         .set_read_timeout(Some(Duration::from_secs(20)))
         .ok()?;
     let payload = body.map(Value::to_string).unwrap_or_default();
-    let mut head =
-        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    let has_host = headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("host"));
+    let mut head = if has_host {
+        format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n")
+    } else {
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n")
+    };
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }

@@ -896,7 +896,10 @@ fn create_snapshot(
     if let Some(db) =
         crate::settings::backup_source(context).map_err(|error| format!("settings backup: {error}"))?
     {
-        online_snapshot(db, &scratch.0.join("settings.db"), "settings", check)?;
+        let snapshot = scratch.0.join("settings.db");
+        online_snapshot(db, &snapshot, "settings", check)?;
+        crate::settings::scrub_auth_snapshot(&snapshot, check)
+            .map_err(|error| format!("settings backup: {error}"))?;
         databases.push("settings.db");
     }
     let candidate = scratch.0.join("archive.zip");
@@ -1079,7 +1082,10 @@ pub fn verify_archive(path: &Path, check: Check<'_>) -> Result<Manifest, String>
     verify_file(File::open(path).map_err(|e| e.to_string())?, check)
 }
 
-pub(crate) fn verify_archive_for_restore(path: &Path, inspect_settings: bool) -> Result<(Manifest, bool), String> {
+pub(crate) fn verify_archive_for_restore(
+    path: &Path,
+    inspect_settings: bool,
+) -> Result<(Manifest, crate::settings::ArchivedCredentials), String> {
     verify_file_inner(File::open(path).map_err(|e| e.to_string())?, &|| Ok(()), inspect_settings)
 }
 
@@ -1087,7 +1093,11 @@ fn verify_file(file: File, check: Check<'_>) -> Result<Manifest, String> {
     verify_file_inner(file, check, false).map(|(manifest, _)| manifest)
 }
 
-fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Result<(Manifest, bool), String> {
+fn verify_file_inner(
+    file: File,
+    check: Check<'_>,
+    inspect_settings: bool,
+) -> Result<(Manifest, crate::settings::ArchivedCredentials), String> {
     let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
     let manifest: Manifest = {
         let file = archive
@@ -1109,6 +1119,14 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
         let name = file.name().to_string();
         if !safe_name(&name) || !seen.insert(name.clone()) {
             return Err("backup contains unsafe or duplicate paths".into());
+        }
+        let auth_path = name.to_ascii_lowercase();
+        let auth_path = auth_path.strip_prefix("state/").or_else(|| auth_path.strip_prefix("data/")).unwrap_or(&auth_path);
+        if matches!(auth_path, crate::console_auth::RESTORE_GENERATION_FILE | crate::console_auth::TOKEN_FILE
+            | crate::console_auth::ROTATION_FILE | crate::console::DESKTOP_GRANTS_FILE | crate::restore::RECOVERY_DIR)
+            || auth_path.starts_with("console-restore-recovery/")
+        {
+            return Err("backup contains destination console authentication state".into());
         }
         if name == "manifest.json" {
             continue;
@@ -1149,7 +1167,7 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
     if seen.len() != manifest.files.len() + 1 {
         return Err("backup files missing from ZIP".into());
     }
-    let mut has_endpoint_credentials = false;
+    let mut credentials = crate::settings::ArchivedCredentials::default();
     for name in ["memory.db", "conversations.db", "settings.db"] {
         if !manifest.files.contains_key(name) {
             continue;
@@ -1177,12 +1195,12 @@ fn verify_file_inner(file: File, check: Check<'_>, inspect_settings: bool) -> Re
             return Err("backup database integrity check returned no result".into());
         }
         if inspect_settings && name == "settings.db" {
-            // A future settings schema can still be restored when its credential presence is unknown.
-            has_endpoint_credentials = crate::settings::archive_has_endpoint_credentials(&db).unwrap_or(true);
+            credentials = crate::settings::archive_credentials(&db)
+                .map_err(|error| format!("backup settings verification: {error}"))?;
         }
     }
     check()?;
-    Ok((manifest, has_endpoint_credentials))
+    Ok((manifest, credentials))
 }
 
 fn safe_name(name: &str) -> bool {

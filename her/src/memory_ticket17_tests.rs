@@ -576,8 +576,9 @@ fn the_dsh_wake_delivers_the_recall_the_preview_shows_and_counts_a_hit_only_when
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         let (stream, _) = listener.accept().unwrap();
-        handle_conn(stream, served_cfg, served);
+        handle_conn(stream, served_cfg, served, startup);
     });
     let (delivered, recalled) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-148", "").unwrap();
     server.join().unwrap();
@@ -597,9 +598,10 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     // One message packet is fetched per wake.
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..4 {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     // DSH accepting a wake installs its briefing record (what `session_context::observe` does).
@@ -636,8 +638,9 @@ fn a_session_generation_never_receives_the_same_recalled_memory_twice() {
     let context = context.with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         let (stream, _) = listener.accept().unwrap();
-        handle_conn(stream, served_cfg, served);
+        handle_conn(stream, served_cfg, served, startup);
     });
     let (_, fresh) = crate::prompt::prepare_dsh_wake(&context, &cfg, key, "sid-148", "epoch-148", "atMention", "rpc-5", "").unwrap();
     server.join().unwrap();
@@ -650,9 +653,10 @@ fn serve_wake_packets(context: &RuntimeContext, n: usize) -> (RuntimeContext, st
     let context = context.clone().with_console_port(listener.local_addr().unwrap().port());
     let (served, served_cfg) = (context.clone(), context.load_config().unwrap());
     let server = std::thread::spawn(move || {
+        let startup = std::sync::Arc::new(std::sync::Mutex::new(true));
         for _ in 0..n {
             let (stream, _) = listener.accept().unwrap();
-            handle_conn(stream, served_cfg.clone(), served.clone());
+            handle_conn(stream, served_cfg.clone(), served.clone(), startup.clone());
         }
     });
     (context, server)

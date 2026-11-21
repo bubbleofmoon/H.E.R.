@@ -29,7 +29,7 @@ pub(crate) use rollout_list::RolloutList;
 pub(crate) use probability::Probability;
 pub(crate) use route_id::RouteId;
 pub(crate) use route_list::RouteList;
-pub(crate) use secret::ApiKey;
+pub(crate) use secret::{AdministratorPasswordPhc, ApiKey};
 pub(crate) use switch::Switch;
 pub(crate) use text::Text;
 pub(crate) use time_zone::TimeZoneName;
