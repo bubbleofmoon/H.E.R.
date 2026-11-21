@@ -4315,6 +4315,64 @@ fn reserved2_current_prompt(request: &Value) -> &str {
 }
 
 #[test]
+fn her_reminders_use_the_schedule_and_live_settings() {
+    let at = now_ms() + 3_600_000;
+    let model = FakeModel::script(vec![
+        ModelReply::ToolCalls(vec![
+            reserved2_call("create", "reminder_create", json!({"text":"喝水","at":at})),
+            reserved2_call(
+                "over-cap",
+                "reminder_create",
+                json!({"text":"喝茶","at":at}),
+            ),
+        ]),
+        ModelReply::Text("internal fixture completion".into()),
+    ]);
+    let mut rig = reserved2_fixture_with_config(
+        "reminder-tools",
+        &model,
+        json!({
+            "conversationEngines":{OWNER_KEY:"harness"}
+        }),
+    );
+    let settings = json!({"setting":"reminders.maxPerConversation","value":1});
+    assert_eq!(
+        rig.console("POST", "/api/settings/set", Some(&settings)).0,
+        200
+    );
+    rig.start();
+    says(&rig, OWNER_KEY, OWNER, "owner", "Set a personal reminder");
+    assert!(
+        wait_for(LONG, || lock(&model.requests).len() >= 2),
+        "the model must receive the two tool outcomes"
+    );
+    {
+        let requests = lock(&model.requests);
+        let outcome = tool_wire_result(&requests[1], "over-cap");
+        assert_eq!(outcome["isError"], true);
+        assert_eq!(
+            outcome["content"][0]["text"],
+            "本会话的提醒已达上限（1 条）"
+        );
+    }
+    let (status, page) = rig.console("GET", "/api/schedule", None);
+    assert_eq!(status, 200);
+    let reminders: Vec<_> = page["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["kind"] == "reminder")
+        .collect();
+    assert_eq!(reminders.len(), 1);
+    assert_eq!(
+        reminders[0]["creator"], "her",
+        "a reminder created by the tool is credited to HER"
+    );
+    assert_eq!(reminders[0]["conversation"], OWNER_KEY);
+    assert_eq!(reminders[0]["nextRunAt"], at);
+}
+
+#[test]
 fn refusal_replays_two_waits_and_unread_at_the_failed_model_call() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
