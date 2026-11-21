@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::conversation_authority as authority;
-use crate::memory::{ForgetError, MemoryStore, NewMemory};
+use crate::memory::{ForgetError, MemoryStore, NewMemory, VerifiedMessage};
 use crate::runtime::RuntimeContext;
 
 /// The MCP memory tools use the same authorization and mutations as the HTTP surface.
@@ -18,6 +18,10 @@ pub(crate) fn tool_action(context: &RuntimeContext, action: &str, args: &Value) 
         // Keep old Rust callers usable while exposing the frozen JS parameter names.
         for (old, new) in [("setting", "settingKey"), ("read_type", "readType"), ("read_id", "readId")] {
             if !obj.contains_key(new) { if let Some(v) = obj.get(old).cloned() { obj.insert(new.to_string(), v); } }
+        }
+        if action == "write" {
+            obj.remove("messageId");
+            obj.remove("supersedes");
         }
     }
     let headers = HashMap::from([("x-agent-token".to_string(), args["token"].as_str().unwrap_or("").to_string())]);
@@ -152,19 +156,44 @@ pub(crate) fn handle(
             let tags = b.get("tags").and_then(|v| v.as_str()).map(|s| s.to_string());
             let source = b.get("source").and_then(|v| v.as_str()).unwrap_or("agent").to_string();
             let importance = b.get("importance").and_then(|v| v.as_f64()).unwrap_or(0.5);
-            let out = reader.write(&NewMemory {
-                owner_type: b.get("ownerType").and_then(|v| v.as_str()).unwrap_or("session"),
-                scope: b.get("scope").and_then(|v| v.as_str()),
-                kind: &kind,
-                subject: subject.as_deref(),
-                content: &content,
-                tags: tags.as_deref(),
-                source: &source,
-                importance,
-            }).map_err(|e| (500, format!("写入记忆失败：{e}")))?;
+            let supersedes = b.get("supersedes").map(|value| {
+                value.as_i64().filter(|id| *id > 0).ok_or((400, "supersedes 无效".to_string()))
+            }).transpose()?;
+            let write_failed = |error| (500, format!("写入记忆失败：{}", crate::memory::search_error_message(&error)));
+            let out = if let Some(message_id) = b.get("messageId") {
+                let message_id = message_id.as_str().filter(|id| !id.is_empty())
+                    .ok_or((400, "messageId 无效".to_string()))?;
+                let conversation = authority::conversation(context, &key).map_err(unavailable)?
+                    .unwrap_or_default();
+                let message = verified_message(&conversation, &key, message_id, &content)
+                    .ok_or((400, "内容必须与本会话的原消息一致".to_string()))?;
+                reader.write_message(message, supersedes).map_err(write_failed)?
+                    .ok_or((409, "该记忆无法由此消息更正".to_string()))?
+            } else {
+                if supersedes.is_some() {
+                    return Err((400, "更正需要原消息".to_string()));
+                }
+                reader.write(&NewMemory {
+                    owner_type: b.get("ownerType").and_then(|v| v.as_str()).unwrap_or("session"),
+                    scope: b.get("scope").and_then(|v| v.as_str()),
+                    kind: &kind,
+                    subject: subject.as_deref(),
+                    content: &content,
+                    tags: tags.as_deref(),
+                    source: &source,
+                    importance,
+                }).map_err(write_failed)?
+            };
             use sha1::{Digest, Sha1};
             let hash = format!("{:x}", Sha1::digest(content.as_bytes()));
             Ok(json!({ "ok": true, "id": out.id, "deduped": out.deduped, "hash": hash }))
+        }
+        "history" => {
+            let id = b.get("id").and_then(Value::as_i64).filter(|id| *id > 0)
+                .ok_or((400, "id 无效".to_string()))?;
+            reader.correction_history(id)
+                .map_err(|e| (500, crate::memory::search_error_message(&e)))?
+                .ok_or((404, "没有找到已更正的记忆".to_string()))
         }
         "search" => {
             let query = b.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -221,4 +250,22 @@ pub(crate) fn handle(
 
 fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, (u16, String)> {
     crate::memory::open_store(context, cfg).map_err(|e| (500, format!("打开记忆库失败：{e}")))
+}
+
+/// Use plain incoming text so a quoted reply cannot acquire the quoting sender's authority.
+fn verified_message<'a>(
+    conversation: &'a Value, key: &str, id: &'a str, content: &str,
+) -> Option<VerifiedMessage<'a>> {
+    let message = conversation.get("recentMessages")?.as_array()?.iter().find(|message| {
+        message["messageId"].as_str() == Some(id)
+            && message["isSelf"] == false
+            && message["textTruncated"] != true
+    })?;
+    let text = message["plain"].as_str()?.trim();
+    let user = message["userId"].as_str().filter(|user| !user.is_empty())?;
+    if text != content || key.strip_prefix("private:").is_some_and(|peer| peer != user) {
+        return None;
+    }
+    let position = (message["time"].as_i64()?, message["seq"].as_i64().unwrap_or_default());
+    Some(VerifiedMessage { id, text, author_id: user, position })
 }

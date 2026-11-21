@@ -27039,6 +27039,7 @@ mod tests {
     }
 
     mod memory_ticket17_tests { include!("memory_ticket17_tests.rs"); }
+    mod memory_ticket24_tests { include!("memory_ticket24_tests.rs"); }
     mod briefing_tests { include!("briefing_tests.rs"); }
     mod access_ticket24_base_tests { include!("access_ticket24_base_tests.rs"); }
     mod access_ticket24_tests { include!("access_ticket24_tests.rs"); }

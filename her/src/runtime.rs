@@ -1257,7 +1257,7 @@ impl RuntimeContext {
             || (method == "POST" && path == "/api/schedule")
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/schedule/"))
             || (matches!(method, "GET" | "POST") && path.starts_with("/api/tasks/"))
-            || (method == "POST" && path == "/api/memory/archive")
+            || (method == "POST" && matches!(path, "/api/memory/archive" | "/api/memory/history"))
             || (method == "GET" && path == "/personas")
             || (matches!(method, "GET" | "POST") && (path == "/api/personas" || path.starts_with("/api/personas/")))
             || (matches!(method, "GET" | "POST") && crate::console_settings::is_route(path))

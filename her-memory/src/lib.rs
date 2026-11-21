@@ -13,11 +13,17 @@ pub mod parity_clock;
 mod store;
 
 use parity_clock::now_ms;
-pub use store::{Admin, DigestCursor, ForgetError, MemoryStore, NewMemory, Reader};
+pub use store::{Admin, DigestCursor, ForgetError, MemoryStore, NewMemory, Reader, VerifiedMessage};
 
-/// Memory schema version (`PRAGMA user_version`). Version 1 is the frozen
-/// `spec/memory-schema.sql` with its FTS index and the default owner grant; version 2 adds `digest_cursor`.
-const SCHEMA_VERSION: i64 = 2;
+/// Current memory schema version (`PRAGMA user_version`). Version 1 is the frozen
+/// `spec/memory-schema.sql`, version 2 adds `digest_cursor`, and version 3 adds `memory_provenance`.
+const SCHEMA_VERSION: i64 = 3;
+const PROVENANCE_V3: &str = "CREATE TABLE IF NOT EXISTS memory_provenance (
+  memory_id INTEGER PRIMARY KEY, message_id TEXT, attributed_to TEXT, author_id TEXT, message_at INTEGER, message_seq INTEGER, superseded_by INTEGER
+);
+CREATE INDEX IF NOT EXISTS memory_provenance_message ON memory_provenance(message_id);
+CREATE TRIGGER IF NOT EXISTS remove_memory_provenance AFTER DELETE ON memory
+BEGIN DELETE FROM memory_provenance WHERE memory_id=OLD.id; END;";
 /// Version 2: the Digest's progress per conversation and sequence space, written with its memories.
 const DIGEST_CURSOR_V2: &str = "CREATE TABLE IF NOT EXISTS digest_cursor (
   conversation TEXT NOT NULL, space TEXT NOT NULL, through_seq INTEGER NOT NULL, updated_at INTEGER NOT NULL,
@@ -59,6 +65,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<i64> {
     if version == 1 {
         conn.execute_batch(DIGEST_CURSOR_V2)?;
         version = 2;
+        conn.pragma_update(None, "user_version", version)?;
+    }
+    if version == 2 {
+        conn.execute_batch(PROVENANCE_V3)?;
+        version = 3;
         conn.pragma_update(None, "user_version", version)?;
     }
     Ok(version)
@@ -292,7 +303,18 @@ fn hit_from_row(row: Row, score: f64) -> Hit {
         owner_type,
         archived,
         expires_at,
+        provenance: Provenance::Inference,
+        message_id: None,
+        attributed_to: None,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provenance {
+    Fact,
+    #[default]
+    Inference,
 }
 
 /// 一条检索结果。
@@ -317,6 +339,21 @@ pub struct Hit {
     pub owner_type: String,
     pub archived: i64,
     pub expires_at: Option<i64>,
+    #[serde(default)]
+    pub provenance: Provenance,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    #[serde(default)]
+    pub attributed_to: Option<String>,
+}
+
+impl Hit {
+    pub fn provenance_label(&self) -> &'static str {
+        match self.provenance {
+            Provenance::Fact => "事实",
+            Provenance::Inference => "推断",
+        }
+    }
 }
 
 /// SQLite messages may contain query text, stored values, trigger messages or paths.
@@ -662,6 +699,7 @@ pub fn recall(
             .then(a.id.cmp(&b.id))
     });
     scored.truncate(limit);
+    reader.attach_provenance(&mut scored)?;
     Ok(scored)
 }
 
@@ -996,7 +1034,7 @@ mod tests {
     // ── Recall (automatic recall) ───────────────────────────────────────────────
 
     fn reader_for<'a>(conn: &'a Connection, key: &str, is_owner: bool) -> Reader<'a> {
-        Reader { conn, key: key.to_string(), is_owner }
+        Reader { conn, key: key.to_string(), is_owner, has_provenance: false }
     }
 
     fn recall_fixture() -> Connection {
