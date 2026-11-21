@@ -12,6 +12,39 @@ concurrency:
   group: checks-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: /tmp
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      PUBLIC_TREE: /tmp/her
+      BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - name: Fetch source and base
+        run: |
+          git init "$PUBLIC_TREE"
+          git -C "$PUBLIC_TREE" remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git -C "$PUBLIC_TREE" fetch --depth=1 origin "$GITHUB_SHA"
+          git -C "$PUBLIC_TREE" checkout --detach FETCH_HEAD
+          if [ -n "$BASE_SHA" ] && [ -n "${BASE_SHA//0/}" ]; then
+            git -C "$PUBLIC_TREE" fetch --depth=1 origin "$BASE_SHA" || true
+          fi
+      - name: Classify changed paths
+        id: classify
+        run: |
+          python -I "$PUBLIC_TREE/scripts/ci/classify-changes.py" \
+            --repo "$PUBLIC_TREE" \
+            --base "$BASE_SHA" \
+            --head "$GITHUB_SHA" \
+            --github-output "$GITHUB_OUTPUT"
   scans:
     name: scans (${{ matrix.os }})
     strategy:
@@ -71,6 +104,7 @@ jobs:
           python -I scripts/tests/test_snowluma_export.py
           python -I scripts/tests/test_codex_task.py
           python -I scripts/tests/test_quick_workflow.py
+          python -I scripts/tests/test_checks_workflow.py
           python -I scripts/tests/test_merge_check.py
           python -I scripts/tests/test_plan_export.py
           python -I scripts/scan-public.py
@@ -78,6 +112,8 @@ jobs:
   # Formatting and clippy on both OSes; report-only for now (the job stays green, the output is in the log).
   lint:
     name: lint (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -155,6 +191,8 @@ jobs:
   # Linux test shards run on every pull request and every push to main.
   tests:
     name: tests (ubuntu-24.04, shard ${{ matrix.shard }}/5)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -210,7 +248,8 @@ jobs:
   # Windows test shards run on every push to main only; a pull request runs scans on Windows and the Linux shards.
   tests-windows:
     name: tests (windows-2022, shard ${{ matrix.shard }}/5)
-    if: github.event_name == 'push'
+    needs: changes
+    if: github.event_name == 'push' && needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
