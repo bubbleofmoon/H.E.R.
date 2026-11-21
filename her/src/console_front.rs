@@ -1217,7 +1217,8 @@ mod tests {
         );
         assert_eq!(synthetic.status, 403);
 
-        std::fs::write(root.0.join("data/restore.pending"), "{}").unwrap();
+        let rotation_marker = root.0.join("data").join(crate::console_auth::ROTATION_FILE);
+        std::fs::write(&rotation_marker, "{}").unwrap();
         let pending = handle_http_request(
             None,
             &make_req("POST", "127.0.0.1:3999", None),
@@ -1225,7 +1226,7 @@ mod tests {
             &context,
             3999,
         );
-        let _ = std::fs::remove_file(root.0.join("data/restore.pending"));
+        let _ = std::fs::remove_file(&rotation_marker);
         assert_eq!(pending.status, 503);
     }
 
