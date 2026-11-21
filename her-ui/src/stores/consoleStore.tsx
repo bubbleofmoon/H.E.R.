@@ -160,6 +160,8 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [dirtyEntry, setDirtyEntry] = useState<DirtyEntry | null>(null);
   const pageRef = useRef<PageId>(initialPage);
+  const liveSeqRef = useRef(0);
+  const qqEventSeqRef = useRef(0);
 
   useEffect(() => {
     pageRef.current = page;
@@ -231,6 +233,8 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   }, []);
 
   const refreshLiveData = useCallback(async () => {
+    const seq = ++liveSeqRef.current;
+    const qqEpoch = qqEventSeqRef.current;
     const [statusRes, pendingRes, settingsRes, statesRes, qqRes, releasesRes] =
       await Promise.allSettled([
         fetchConsoleStatus(),
@@ -240,6 +244,8 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
         fetchQqLoginState(),
         fetchReleaseStatus(),
       ]);
+
+    if (seq !== liveSeqRef.current) return;
 
     let fallbackUpdate: string | null = null;
     if (statusRes.status === 'fulfilled') {
@@ -297,7 +303,11 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       setConversations(mapped);
     }
 
-    if (qqRes.status === 'fulfilled' && typeof qqRes.value.state === 'string') {
+    if (
+      qqEpoch === qqEventSeqRef.current &&
+      qqRes.status === 'fulfilled' &&
+      typeof qqRes.value.state === 'string'
+    ) {
       setQqLoginState(qqRes.value.state);
     }
   }, []);
@@ -372,6 +382,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       if (preHydration) {
         preHydration.remove();
       }
+      qqEventSeqRef.current += 1;
       setQqLoginState(state || 'unknown');
     };
   }, []);

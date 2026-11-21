@@ -3,7 +3,9 @@ import { CommandPalette } from './components/CommandPalette';
 import { ConfirmModal, StickySaveBar, ToastHost } from './components/Primitives';
 import { WorkbenchLayout } from './layouts/WorkbenchLayout';
 import { LoginPage } from './pages/LoginPage';
+import { SchedulePage } from './pages/SchedulePage';
 import { SetupPage } from './pages/SetupPage';
+import { SystemPage } from './pages/SystemPage';
 import { WorkspacePlaceholderPage } from './pages/WorkspacePlaceholderPage';
 import { ConsoleProvider, useConsole } from './stores/consoleStore';
 
@@ -31,7 +33,13 @@ const ConsoleRouter: React.FC = () => {
   return (
     <>
       <WorkbenchLayout>
-        <WorkspacePlaceholderPage />
+        {page === 'schedule' ? (
+          <SchedulePage />
+        ) : page === 'system' ? (
+          <SystemPage />
+        ) : (
+          <WorkspacePlaceholderPage />
+        )}
       </WorkbenchLayout>
       <StickySaveBar />
       <CommandPalette />
