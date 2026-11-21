@@ -1,6 +1,6 @@
 //! Ticket 24 (US-40, US-41, US-42): access, security and console-token administration, the
-//! second-generation whole reset and manual wake, the console's host and cross-site checks, and
-//! the immediate invalidation that follows an access change.
+//! second-generation whole reset and manual wake, and the immediate invalidation that follows an
+//! access change.
 //!
 //! Invalidation rule: an administrator change that removes a conversation's authority (allow/deny
 //! lists, closed-agent owner, `POST /api/socialV2/reset`, an audit undo that restores a narrower
@@ -10,69 +10,6 @@
 //! undo) creates a new epoch; nothing queued under the old one runs again.
 
 use super::*;
-
-// ── host and cross-site checks (frozen JS console front) ─────────────────────────────────────────
-
-fn allowed_hosts(port: u16) -> [String; 4] {
-    let with_port = |host: &str| if port == 80 { host.to_owned() } else { format!("{host}:{port}") };
-    [with_port("127.0.0.1"), with_port("localhost"), with_port("[::1]"), crate::console_auth::canonical_host(port)]
-}
-
-/// JS: the Host header must name the loopback console with its bound port (DNS rebinding).
-/// Checked before credentials; the icon no-ops and the Rust-only health probe precede it.
-pub(super) fn host_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
-    if req.method == "GET" && matches!(req.path.as_str(), "/favicon.ico" | "/apple-touch-icon.png" | "/api/health") {
-        return None;
-    }
-    let host = req.headers.get("host").map(String::as_str).unwrap_or("");
-    if allowed_hosts(port).iter().any(|allowed| allowed == &host.to_ascii_lowercase())
-        || (port == 80 && matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1:80" | "localhost:80" | "[::1]:80" | "her.localhost:80")) {
-        return None;
-    }
-    let shown = if host.is_empty() { "缺失" } else { host };
-    Some((403, json!({"ok": false, "error": format!("Host 头不被允许（{shown}）：控制台只接受本机回环访问")})))
-}
-
-/// `new URL(origin).host` for the cases a browser sends: scheme://authority, lowercased, with the
-/// scheme's default port dropped. Anything else (for example the opaque origin `null`) is empty.
-fn origin_host(origin: &str) -> String {
-    let Some((scheme, rest)) = origin.split_once("://") else { return String::new() };
-    let scheme = scheme.to_ascii_lowercase();
-    if scheme.is_empty() || !scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) {
-        return String::new();
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let authority = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority).to_lowercase();
-    let default_port = match scheme.as_str() {
-        "http" | "ws" => Some("80"),
-        "https" | "wss" => Some("443"),
-        _ => None,
-    };
-    match (authority.rsplit_once(':'), default_port) {
-        (Some((host, port)), Some(default)) if port == default && !host.is_empty() => host.to_string(),
-        _ => authority,
-    }
-}
-
-/// JS CSRF guard for every non-GET request that passed the console credential check: the body
-/// must be declared `application/json` (415) and an Origin, when present, must be the loopback
-/// console page (403).
-pub(super) fn cross_site_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
-    if req.method == "GET" {
-        return None;
-    }
-    let content_type = req.headers.get("content-type").map(|v| v.to_lowercase()).unwrap_or_default();
-    if !content_type.contains("application/json") {
-        return Some((415, json!({"ok": false, "error": "请求必须是 application/json"})));
-    }
-    if let Some(origin) = req.headers.get("origin").filter(|o| !o.is_empty()) {
-        let host = origin_host(origin);
-        if !allowed_hosts(port).contains(&host) {
-            return Some((403, json!({"ok": false, "error": "跨站请求被拒绝"})));
-        }
-    }
-    None
-}
 
 // ── JS value helpers ─────────────────────────────────────────────────────────────────────────────
 
@@ -350,7 +287,6 @@ pub(super) static SCOPE_AFTER_READ: std::sync::Mutex<Option<std::sync::Arc<dyn F
 /// commit in one settings transaction with their audit rows. Write-back mirrors the committed values, and the file
 /// write folds the changed allow list's alias into its canonical member. Revocation finishes before the reply.
 /// The running live process keeps the `--live-groups` list it started with; `liveRestart` reports any required restart.
-/// The body never names `key`: the console's key preflight would refuse a conversation before admission.
 pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     let confirm = crate::settings::confirm_field(&body)?;

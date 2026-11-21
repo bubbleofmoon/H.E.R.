@@ -387,8 +387,13 @@ fn prompt_text_works_on_a_store_written_before_it() {
 #[test]
 fn prompt_text_settings_page_edits_text_in_a_text_area() {
     let (root, context) = settings_fixture("prompt text page");
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, _, page) = crate::console_settings::route(&context, "GET", "/settings", &HashMap::new(), "", false, &granted);
+    let (status, _, page) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&context),
+        "GET",
+        "/settings",
+        &HashMap::new(),
+        "",
+    );
     assert_eq!(status, 200, "{page}");
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
     assert_eq!(status, 200, "{body}");

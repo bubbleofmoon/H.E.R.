@@ -288,8 +288,6 @@ fn conversation_settings_skip_rows_with_a_non_canonical_conversation() {
 
 #[test]
 fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
     let legacy = RuntimeContext::legacy();
     let owner_set = r#"{"conversation":"private:7001","setting":"conversation.engine","value":"harness"}"#;
     let owner_reset = r#"{"conversation":"private:7001","setting":"conversation.engine"}"#;
@@ -298,14 +296,27 @@ fn conversation_settings_refuse_malformed_unknown_and_unadmitted_requests() {
         ("POST", "/api/settings/conversation/set", owner_set),
         ("POST", "/api/settings/conversation/reset", owner_reset),
     ] {
-        let (status, _, reply) = crate::console_settings::route(&legacy, method, path, &HashMap::new(), body, false, &granted);
+        let (status, _, reply) = crate::console_settings::route(
+            crate::console_front::AdminCaller::new(&legacy),
+            method,
+            path,
+            &HashMap::new(),
+            body,
+        );
         let reply: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!((status, reply["error"].clone()), (503, json!("settings require a selected runtime")), "{path}");
     }
     let (root, context) = settings_fixture("conversation settings refusals");
     admit_groups(&root, json!([101]));
+    let revoked = crate::console_front::revoked_admin_context(&context);
     for (path, body) in [("/api/settings/conversation/set", owner_set), ("/api/settings/conversation/reset", owner_reset)] {
-        let (status, _, reply) = crate::console_settings::route(&context, "POST", path, &HashMap::new(), body, false, &revoked);
+        let (status, _, reply) = crate::console_settings::route(
+            crate::console_front::AdminCaller::new(&revoked),
+            "POST",
+            path,
+            &HashMap::new(),
+            body,
+        );
         assert_eq!(status, 401, "{path}: the authority re-checks the credential before anything is written: {reply}");
     }
     let mut requests = Vec::new();
@@ -651,9 +662,13 @@ fn conversation_settings_registry_agrees_with_the_engine_reader() {
 #[test]
 fn conversation_settings_page_lists_and_sets_through_the_routes() {
     let (root, context) = settings_fixture("conversation settings page");
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, content_type, page) =
-        crate::console_settings::route(&context, "GET", "/settings/conversations", &HashMap::new(), "", false, &granted);
+    let (status, content_type, page) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&context),
+        "GET",
+        "/settings/conversations",
+        &HashMap::new(),
+        "",
+    );
     assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
     let (status, _) = admin_request(&context, "GET", "/settings/conversations", None);
     assert_eq!(status, 200, "the page is served behind the console front");
@@ -853,9 +868,13 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     let row = model_row(&body, "group:101");
     assert_eq!((row["route"].clone(), row["inChain"].clone(), row["order"].clone()), (json!("b"), json!(false), json!(["a", "b2"])));
     // The page and the list are administrator-only and need a selected runtime.
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let (status, content_type, page) =
-        crate::console_settings::route(&context, "GET", "/settings/models", &HashMap::new(), "", false, &granted);
+    let (status, content_type, page) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&context),
+        "GET",
+        "/settings/models",
+        &HashMap::new(),
+        "",
+    );
     assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
     let (status, _) = admin_request(&context, "GET", "/settings/models", None);
     assert_eq!(status, 200, "the page is served behind the console front");
@@ -863,8 +882,14 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
         let (status, reply) = agent_request(&context, "GET", path, None, "fixture-agent-token");
         assert_eq!(status, 403, "{path}: {reply}");
     }
-    let (status, _, reply) =
-        crate::console_settings::route(&RuntimeContext::legacy(), "GET", "/api/settings/models", &HashMap::new(), "", false, &granted);
+    let legacy_ctx = RuntimeContext::legacy();
+    let (status, _, reply) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&legacy_ctx),
+        "GET",
+        "/api/settings/models",
+        &HashMap::new(),
+        "",
+    );
     assert_eq!(status, 503, "{reply}");
     for needle in [
         "api('/api/settings/models')",
@@ -882,8 +907,13 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     write_config(&legacy_root, |config| config["conversationEngines"] = json!({OWNER_CHAT: "harness"}));
     let config_path = legacy_root.0.join("config/config.json");
     let before = std::fs::read(&config_path).unwrap();
-    let (status, _, _) =
-        crate::console_settings::route(&legacy, "GET", "/settings/models", &HashMap::new(), "", false, &granted);
+    let (status, _, _) = crate::console_settings::route(
+        crate::console_front::AdminCaller::new(&legacy),
+        "GET",
+        "/settings/models",
+        &HashMap::new(),
+        "",
+    );
     assert_eq!(status, 200);
     let (status, _) = admin_request(&legacy, "GET", "/api/settings/models", None);
     assert_eq!(status, 200);

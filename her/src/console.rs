@@ -46,6 +46,8 @@ pub(crate) use access::take_admin_wake;
 pub(crate) use access::access_setting_change;
 #[path = "console_schedule.rs"]
 mod schedule_routes;
+#[path = "console_front.rs"]
+pub(crate) mod front;
 pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
     revoke as revoke_agent_token, token as conversation_token,
@@ -12037,7 +12039,9 @@ fn key_in_allowlist(cfg: &Value, key: &str) -> bool {
 
 #[cfg(test)]
 fn route(req: &Request, cfg: &Value) -> (u16, String, String) {
-    route_with_context(req, cfg, &RuntimeContext::legacy(), crate::memory_actions::ConsoleCapability::Conversation, None)
+    let context = RuntimeContext::legacy();
+    let response = front::handle_http_request(None, req, cfg, &context, DEFAULT_PORT);
+    (response.status, response.content_type, response.body)
 }
 
 #[cfg(test)]
@@ -12051,7 +12055,7 @@ fn route_test(req: &Request, cfg: &Value, context: &RuntimeContext) -> (u16, Str
     if req.method != "GET" {
         req.headers.entry("content-type".to_string()).or_insert_with(|| "application/json".to_string());
     }
-    let response = serve_request(&req, cfg, context, port);
+    let response = front::handle_http_request(None, &req, cfg, context, port);
     (response.status, response.content_type, response.body)
 }
 
@@ -12366,14 +12370,10 @@ fn json_result(result: Result<Value, (u16, String)>) -> (u16, String, String) {
     }
 }
 
-fn route_with_context(
-    req: &Request,
-    cfg: &Value,
-    context: &RuntimeContext,
-    memory: crate::memory_actions::ConsoleCapability,
-    browser_acl: Option<crate::memory_actions::BrowserAcl>,
-) -> (u16, String, String) {
-    if !context.supports_console_request(&req.method, &req.path) {
+fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16, String, String) {
+    let context = &caller.context;
+    let cfg = &caller.config;
+    if !front::supports_request(context, &req.method, &req.path) {
         return (
             503,
             "application/json; charset=utf-8".to_string(),
@@ -12384,10 +12384,6 @@ fn route_with_context(
             .to_string(),
         );
     }
-    // `/api/health` 是唯一免鉴权的 API 探针：它是自重启时"新进程起来了吗"的探针。
-    // 探针手里没有令牌（也不该为了探活去读令牌），所以这里放行；
-    // 只回 pid/端口；隔离模式附加路径选择状态和依赖名称，不附路径或 URL。
-    // 图标是独立的静态 no-op 例外，稍后在配置加载与鉴权前直接返回 204。
     if req.path == "/api/health" && req.method == "GET" {
         let mut payload = json!({
             "ok": true,
@@ -12409,83 +12405,31 @@ fn route_with_context(
             payload.to_string(),
         );
     }
-    // Browsers fetch these two icons without a console token. The legacy endpoint is a no-op
-    // (204); keep that behavior before configuration loading and authorization in both modes.
     if req.method == "GET" && matches!(req.path.as_str(), "/favicon.ico" | "/apple-touch-icon.png") {
         return (204, String::new(), String::new());
     }
-    let admitted = if context.is_isolated() { context.console_authority.is_some() } else { authorized(req, cfg) };
     if context.is_isolated() {
         if let Err(error) = crate::reserved::refresh_console_config(context, cfg) {
             return (503, "application/json; charset=utf-8".to_string(),
                 json!({"ok":false,"error":error}).to_string());
         }
     }
-    // Frozen JS checks console auth before dispatching memory routes. Nonempty agent
-    // credentials remain the memory-route exception and are checked by the handler's ACL.
     let memory_route = req.path.starts_with("/api/memory/");
-    let memory_agent_call = memory_route
-        && req
-            .headers
-            .get("x-agent-token")
-            .map(|token| !token.is_empty())
-            .unwrap_or(false);
-    if memory_route && !admitted && !memory_agent_call {
+    let memory_agent_call = front::memory_agent_call(req);
+    if memory_route && !caller.is_admitted() && !memory_agent_call {
         return (
             401,
             "application/json; charset=utf-8".to_string(),
             json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}).to_string(),
         );
     }
-    // TD-2：会话级端点（memory-* / mark-read / wake-config / initial-prompt /
-    // session-reset / wait，以及其余带 key 的端点）统一前置检查 ——
-    // 只认 console token 不看目标会话，等于「拿到控制台令牌就能操作任意会话」。
-    // 一处拦掉：带 key 且 key 不在 allow.groups / allow.private → 403；
-    // 不带 key 的请求原样放行（key 是可选的那些端点行为不变）。
-    //
-    // 放在 `/api/memory/*` 分发**之前**：那条路有自己的一套鉴权（按会话的 agent token），
-    // 不经过下面的 authorized()，所以检查必须比它更早。
-    // 但先看「请求手里有没有凭据」再判 403：否则匿名调用者能用 401/403 的差别
-    // 探测某个群号在不在白名单里。没凭据的请求继续走原来的鉴权分支。
-    let has_credential = admitted
-        || req
-            .headers
-            .get("x-agent-token")
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false);
-    // Inline social-v2 agent requests apply their JS-compatible session check
-    // after ordinary console authentication; the generic preflight has a
-    // different message and would otherwise shadow that route contract.
-    // These agent-owned views apply their own JS-compatible policy after console auth.
-    let has_agent_header = req.headers.contains_key("x-agent-token");
-    let defer_agent_allowlist = memory_agent_call
-        || (has_agent_header
-            && (social_agent_policy_route(req) || pending_admin_agent_gate_route(req)));
-    let defer_send_message_agent_allowlist = (req.method == "POST"
-        && req.path == "/api/socialV2/send-message"
-        && has_agent_header)
-        || agent::is_send_route(req)
-        // Selected manual wake and read authorization answer with the JS key/mode texts.
-        || (context.is_isolated()
-            && req.method == "POST"
-            && matches!(req.path.as_str(), "/api/socialV2/wake" | "/api/authorize/read"));
-    if has_credential && !defer_agent_allowlist && !defer_send_message_agent_allowlist {
-        if let Some(key) = request_session_key(req) {
-            let closed_owner_reset = context.is_isolated()
-                && req.method == "POST" && req.path == "/api/session/reset"
-                && runtime_mode(context) == "closed-agent" && crate::chat::is_owner_key(cfg, &key);
-            if !key_in_allowlist(cfg, &key) && !closed_owner_reset {
-                return (
-                    403,
-                    "application/json; charset=utf-8".to_string(),
-                    json!({"ok": false, "error": format!("会话不在允许范围内：{key}")}).to_string(),
-                );
-            }
-        }
+    if let Some(reply) = front::enforce_key_preflight(req, cfg, context, caller) {
+        return reply;
     }
-    // `/api/memory/*` 是前缀分发（10 个动作），必须在精确匹配之前处理
-    if req.path.starts_with("/api/memory/") {
+    if memory_route {
         let action = req.path.trim_start_matches("/api/memory/").to_string();
+        let memory = std::mem::take(&mut caller.memory);
+        let browser_acl = caller.browser_acl.take();
         return match crate::memory_actions::handle_http(&action, req, cfg, context, memory, browser_acl) {
             Ok(v) => (200, "application/json; charset=utf-8".to_string(), v.to_string()),
             Err((code, msg)) => (
@@ -12494,57 +12438,16 @@ fn route_with_context(
                 json!({ "ok": false, "error": msg }).to_string(),
             ),
         };
-    }    // `/` 也要求令牌：管理台页面里带着会话，裸访问给 401 是 JS 的既有行为。
-    if !admitted {
+    }
+    if !caller.is_admitted() {
         return (
             401,
             "application/json; charset=utf-8".to_string(),
             json!({"ok": false, "error": "未授权：请提供控制台访问令牌"}).to_string(),
         );
     }
-    if req.method == "GET" && req.path == "/api/qq/login" {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"QQ login state is restricted to administrators"}).to_string());
-        }
-        if !context.is_isolated() {
-            return (503, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"QQ login state requires a selected runtime"}).to_string());
-        }
-        return (200, "application/json; charset=utf-8".into(), crate::qq_login::probe(context, cfg).to_string());
-    }
-    if let Some((status, message)) = agent::agent_global_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = tool_log_agent_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = pending_agent_denial(req) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = send_message_global_agent_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
-    }
-    if let Some((status, message)) = social_agent_policy_denial(req, cfg, context) {
-        return (
-            status,
-            "application/json; charset=utf-8".to_string(),
-            json!({ "ok": false, "error": message }).to_string(),
-        );
+    if let Some(reply) = front::enforce_agent_denials(req, cfg, context, caller) {
+        return reply;
     }
     if let Err((status, message)) = isolated_request_preflight(req, context) {
         return (
@@ -12560,10 +12463,13 @@ fn route_with_context(
             json!({ "ok": false, "error": BODY_TOO_LARGE_ERROR }).to_string(),
         );
     }
-    if context.is_isolated() && req.method == "POST" && req.path == "/api/restart" {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"restart is restricted to administrators"}).to_string());
+    if req.method == "GET" && req.path == "/api/qq/login" {
+        if !context.is_isolated() {
+            return (503, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"QQ login state requires a selected runtime"}).to_string());
         }
+        return (200, "application/json; charset=utf-8".into(), crate::qq_login::probe(context, cfg).to_string());
+    }
+    if context.is_isolated() && req.method == "POST" && req.path == "/api/restart" {
         let _gate = match acquire_social_state_gate(context) {
             Ok(gate) => gate,
             Err((status, message)) => return (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
@@ -12575,9 +12481,6 @@ fn route_with_context(
     }
 
     if context.is_isolated() && matches!(req.path.as_str(), "/api/dependencies" | "/api/dependencies/check" | "/api/dependencies/approve") {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".into(), json!({"ok":false,"error":"dependency upgrades are restricted to administrators"}).to_string());
-        }
         let result = (|| -> Result<Value,(u16,String)> {
             let cfg = selected_config_for_handler(context)?;
             match (req.method.as_str(),req.path.as_str()) {
@@ -12602,9 +12505,6 @@ fn route_with_context(
     }
 
     if context.is_isolated() && matches!(req.path.as_str(),"/api/releases"|"/api/releases/settings"|"/api/releases/approve") {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403,"application/json; charset=utf-8".into(),json!({"ok":false,"error":"release settings are restricted to administrators"}).to_string());
-        }
         let result=match(req.method.as_str(),req.path.as_str()) {
             ("GET","/api/releases")=>selected_config_for_handler(context).and_then(|cfg|crate::release::status(context,&cfg).map_err(|error|(503,error))),
             ("GET","/api/releases/settings")=>selected_config_for_handler(context).and_then(|cfg|crate::release::settings(&cfg).map(|settings|json!({"ok":true,"settings":settings})).map_err(|error|(400,error))),
@@ -12618,9 +12518,6 @@ fn route_with_context(
         };
     }
     if context.is_isolated() && matches!(req.path.as_str(), "/api/backups/settings" | "/api/backups" | "/api/backups/restore/preview" | "/api/backups/restore") {
-        if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-            return (403, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"backup settings are restricted to administrators"}).to_string());
-        }
         let result = match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/api/backups") => handle_backup_list(context),
             ("GET", "/api/backups/settings") => handle_backup_settings_get(context),
@@ -12633,58 +12530,40 @@ fn route_with_context(
             Err((status, message)) => (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
         };
     }
+    let admin_required = || {
+        (
+            403,
+            "application/json; charset=utf-8".to_string(),
+            json!({"ok": false, "error": "this route is restricted to administrators"}).to_string(),
+        )
+    };
     if crate::console_settings::is_route(&req.path) {
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
         if !context.is_isolated() {
             return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":"settings require a selected runtime"}).to_string());
         }
-        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
-        // A set commits under the configuration gate after a fresh credential check, like persona writes.
-        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
-            let gate = config_gate(context)?;
-            Ok(gate)
-        };
-        let (status, content_type, body) = crate::console_settings::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
+        let (status, content_type, body) = crate::console_settings::route(admin_caller, &req.method, &req.path, &req.query, &req.body);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && crate::console_persona::is_route(&req.path) {
-        let agent_call = req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call");
-        // Writes commit under the configuration gate after a fresh credential check, like release
-        // approval: a credential revoked while this request waited never writes.
-        let authority = || -> Result<Option<std::fs::File>, (u16, String)> {
-            let gate = config_gate(context)?;
-            Ok(gate)
-        };
-        let (status, content_type, body) = crate::console_persona::route(context, &req.method, &req.path, &req.query, &req.body, agent_call, &authority);
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
+        let (status, content_type, body) = crate::console_persona::route(admin_caller, &req.method, &req.path, &req.query, &req.body);
         return (status, content_type.to_string(), body);
     }
     if context.is_isolated() && schedule_routes::is_schedule_path(&req.path) {
-        return schedule_routes::route(context, cfg, req);
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
+        return schedule_routes::route(admin_caller, cfg, req);
     }
     if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
-        // Hold the configuration gate until the lifecycle mutation commits. A credential
-        // accepted at the front may have been revoked while another writer held this gate.
-        let _lifecycle_authority = if req.method == "POST" && req.path == "/api/tasks/lifecycle"
-            && !req.headers.contains_key("x-agent-token") && !req.headers.contains_key("x-agent-call") {
-            let gate = match acquire_social_state_gate(context) {
-                Ok(gate) => gate,
-                Err((status, message)) => return (status, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":message}).to_string()),
-            };
-            Some(gate)
-        } else { None };
-        if req.method == "POST" && req.path.ends_with("/run") && !has_agent_marker(req) {
-            if let Err((status, error)) = config_gate(context) {
-                return (status, "application/json; charset=utf-8".into(), json!({"ok":false,"error":error}).to_string());
-            }
-        }
+        let Some(admin_caller) = caller.admin() else { return admin_required(); };
         let api = match crate::supervisor::task_api(context, cfg) {
             Ok(api) => api,
             Err(error) => return (503, "application/json; charset=utf-8".to_string(), json!({"ok":false,"error":error}).to_string()),
         };
         let request = crate::console_tasks::TaskRequest {
             method: &req.method, path: &req.path, query: &req.query, body: &req.body,
-            agent_call: req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call"),
         };
-        if let Some(response) = crate::console_tasks::route(&api, &request) {
+        if let Some(response) = crate::console_tasks::route(admin_caller, &api, &request) {
             return (response.status, response.content_type.to_string(), response.body);
         }
     }
@@ -12699,7 +12578,7 @@ fn route_with_context(
         }
     };
     let role_management_body = role_management_body.as_deref().unwrap_or(&req.body);
-    if let Some((status, value)) = agent::route(req, cfg, context) {
+    if let Some((status, value)) = agent::route(caller, req) {
         return (status, "application/json; charset=utf-8".to_string(), value.to_string());
     }
 
@@ -12837,7 +12716,7 @@ fn route_with_context(
             } else {
                 handle_status(cfg)
             };
-            (200, "application/json; charset=utf-8".to_string(), agent::finish_status(req, context, cfg, payload).to_string())
+            (200, "application/json; charset=utf-8".to_string(), agent::finish_status(caller, payload).to_string())
         }
         ("GET", "/api/socialV2/state") => {
             let key = req
@@ -14215,7 +14094,7 @@ fn admit_selected_request(
     if (proof.is_some() || (memory_route && req.headers.get("x-agent-token").is_some_and(|t| !t.is_empty())))
         && !matches!(proof, Some(crate::console_auth::ConsoleAuthority::Browser { .. }))
     {
-        if let Some((status, value)) = access::cross_site_denial(req, port) {
+        if let Some((status, value)) = front::cross_site_denial(req, port) {
             return Err((status, value["error"].as_str().unwrap_or("request refused").to_string()));
         }
     }
@@ -14719,42 +14598,12 @@ fn handle_conn(
             }
         }
     }
-    let response = if req.path == "/api/desktop/sign-in" {
-        desktop_sign_in(&stream, &req, &context, port).into()
-    } else {
-        serve_request(&req, &cfg, &context, port)
-    };
+    let response = front::handle_http_request(Some(&stream), &req, &cfg, &context, port);
     respond(&mut stream, response);
 }
 
-/// This route requires transport identity as well as the protected credential.
-/// It is deliberately outside the string-only router: no synthetic Request can
-/// supply a PID or claim a TCP peer. Session secrets never enter the audit trail.
-fn desktop_sign_in(stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16) -> (u16, String, String) {
-    let reply = |status, value: Value| (status, "application/json; charset=utf-8".to_string(), value.to_string());
-    if let Some((status, value)) = access::host_denial(req, port) { return reply(status, value); }
-    if req.method != "POST" { return reply(405, json!({"ok":false,"error":"method not allowed"})); }
-    if !context.is_isolated() { return reply(403, json!({"ok":false,"error":"desktop sign-in requires a selected runtime"})); }
-    if let Err((status, error)) = crate::console_auth::ensure_credentials_ready(context) {
-        return reply(status, json!({"ok":false,"error":error}));
-    }
-    if has_agent_marker(req) {
-        return reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"}));
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = stream;
-        reply(403, json!({"ok":false,"error":"desktop sign-in requires the installing user"}))
-    }
-    #[cfg(windows)]
-    match desktop_sign_in_selected(stream, req, context, port) {
-        Ok(session) => reply(200, json!({"ok":true,"session":session})),
-        Err((status, error)) => reply(status, json!({"ok":false,"error":error})),
-    }
-}
-
 #[cfg(windows)]
-fn desktop_sign_in_selected(
+pub(super) fn desktop_sign_in_selected(
     stream: &TcpStream, req: &Request, context: &RuntimeContext, port: u16,
 ) -> Result<String, (u16, String)> {
     use crate::console_auth::{checked_console_token, ConsoleAuthority};
@@ -14810,114 +14659,9 @@ fn desktop_sign_in_selected(
     desktop_grants::issue(context, registry, token_digest)
 }
 
-/// One request through the console front, the router and the audit trail.
+#[cfg(test)]
 fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16) -> ConsoleResponse {
-    let json_reply = |status: u16, value: Value| ConsoleResponse::from((status, "application/json; charset=utf-8".to_string(), value.to_string()));
-    let mut admitted_context = context.clone().with_console_port(port);
-    let public = req.method == "GET" && matches!(req.path.as_str(), "/api/health" | "/favicon.ico" | "/apple-touch-icon.png");
-    let admission = if context.is_isolated() && !public {
-        if let Some((status, value)) = access::host_denial(req, port) {
-            return json_reply(status, value);
-        }
-        let admission = match admit_selected_request(req, context, port) {
-            Ok(admission) => admission,
-            Err((status, error)) => return json_reply(status, json!({"ok":false,"error":error})),
-        };
-        let desktop = matches!(admission.proof, Some(crate::console_auth::ConsoleAuthority::Desktop { .. }));
-        if req.method == "GET" && !canonical_request(req, port) && !desktop {
-            if let Some(mount) = PAGE_MOUNTS.iter().copied().find(|mount| *mount == req.path) {
-                let mut response = ConsoleResponse::from((302, String::new(), String::new()));
-                response.redirect = Some((port, mount));
-                return response;
-            }
-        }
-        admitted_context.console_authority = admission.proof.clone();
-        Some(admission)
-    } else {
-        None
-    };
-    #[cfg(test)]
-    if let Some(hook) = AFTER_ADMISSION.with(|hook| hook.borrow_mut().take()) { hook(); }
-    let administrator = admitted_context.console_authority.is_some()
-        && !has_agent_marker(req)
-        && !matches!(req.path.as_str(), "/api/authorize/read" | "/api/socialV2/wake-snapshot");
-    let context = &admitted_context;
-    // 写操作审计（PLAN-V3 P0）。
-    //
-    // 对应 Cordis 的「时间可组合性」：组件改动过的共享状态，必须能完整撤回。
-    // 我们的做法是**请求前后对配置文件做快照对比**，不碰 58 个 handler ——
-    // 改动量小、覆盖面全，新增端点自动被审计。
-    //
-    // 只审计人改的配置文件。`social-v2.json` 这类运行时状态每条消息都在变，
-    // 审计它会刷爆日志，而且"撤销一条群消息"不是有意义的操作。
-    let task_log_read = req.method == "GET" && req.path.starts_with("/api/tasks/runs/") && req.path.ends_with("/log");
-    let audit = (req.method != "GET" && req.path.starts_with("/api/")) || (context.is_isolated() && task_log_read);
-    let before = if audit && !task_log_read {
-        match audit_snapshot(context) {
-            Ok(snapshot) => snapshot,
-            Err(message) => return json_reply(503, json!({ "ok": false, "error": message })),
-        }
-    } else {
-        Vec::new()
-    };
-    take_config_writes();
-    let (status, ctype, mut body, auth_cookies, renewal) = if let Some(admission) = admission {
-        if let Some(auth_response) = handle_auth_route(req, context, port, &admission) {
-            (
-                auth_response.status,
-                auth_response.content_type,
-                auth_response.body,
-                auth_response.cookies,
-                admission.renewal,
-            )
-        } else {
-            let (status, ctype, body) = route_with_context(
-                req,
-                &admission.config,
-                context,
-                admission.memory,
-                admission.browser_acl,
-            );
-            (status, ctype, body, Vec::new(), admission.renewal)
-        }
-    } else {
-        let (status, ctype, body) = route_with_context(
-            req,
-            cfg,
-            context,
-            crate::memory_actions::ConsoleCapability::Conversation,
-            None,
-        );
-        (status, ctype, body, Vec::new(), None)
-    };
-    let config_writes = take_config_writes();
-    // Selected runtime: every administrator write is recorded with its actual result, including
-    // refusals and their reason, so the console history shows what happened and why.
-    let record_admin = audit && administrator;
-    if audit && ((200..300).contains(&status) || record_admin) {
-        if let Err(error) = audit_write(context, req, status, &body, record_admin, &before, config_writes) {
-            crate::safe_println!("[console] ⚠️ 审计记录写入失败（{} {}，状态 {status}）：{error}", req.method, req.path);
-            // The change keeps its result; the response says that it has no audit record (and
-            // so no undo).
-            if context.is_isolated() {
-                if let Ok(Value::Object(mut reply)) = serde_json::from_str::<Value>(&body) {
-                    reply.insert("audit".into(), json!({"ok": false, "error": format!("审计记录写入失败，此变更无法撤销：{error}")}));
-                    body = Value::Object(reply).to_string();
-                }
-            }
-        }
-    }
-    let mut response = ConsoleResponse::from((status, ctype, body));
-    if !auth_cookies.is_empty() {
-        response.cookies = auth_cookies;
-    } else if (200..300).contains(&status) && req.method == "POST" && req.path == "/api/console/token" {
-        if let Some(crate::console_auth::ConsoleAuthority::Browser { grant, .. }) = &context.console_authority {
-            response.cookies.push(BrowserCookie::Delete { port, digest: grant.id_digest });
-        }
-    } else if let Some(renewal) = renewal {
-        response.cookies.push(renewal);
-    }
-    response
+    front::handle_http_request(None, req, cfg, context, port)
 }
 
 /// Test seam: one administrator request (console token, JSON body, loopback Host) through
@@ -15876,7 +15620,7 @@ pub fn load_config() -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -15926,7 +15670,7 @@ mod tests {
         assert!(v["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
     }
 
-    fn req(method: &str, path: &str, token: Option<&str>) -> Request {
+    pub(super) fn req(method: &str, path: &str, token: Option<&str>) -> Request {
         let mut headers = HashMap::new();
         if let Some(t) = token {
             headers.insert("x-console-token".to_string(), t.to_string());
@@ -16609,7 +16353,7 @@ mod tests {
 
     use crate::runtime::tests::{runtime_fixture, FixtureRoot};
 
-    fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
+    pub(super) fn fixture_runtime(label: &str, token: &str) -> (FixtureRoot, RuntimeContext) {
         fixture_runtime_with_dsh(label, token, "http://127.0.0.1:49101")
     }
 
@@ -26339,7 +26083,7 @@ mod tests {
             request.body = body.to_string();
             let mut admitted = context.clone();
             admitted.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: credential_digest(OLD) });
-            let (status, _, response) = schedule_routes::route(&admitted, &front, &request);
+            let (status, _, response) = schedule_routes::route(front::AdminCaller::new(&admitted), &front, &request);
             assert_eq!(status, 401, "{path}: {response}");
         }
         assert!(!root.0.join("data/schedule.json").exists(), "nothing was written with the revoked credential");
@@ -26349,7 +26093,7 @@ mod tests {
         request.body = json!({"confirm": true}).to_string();
         let mut admitted = context.clone();
         admitted.console_authority = Some(crate::console_auth::ConsoleAuthority::Machine { token_digest: credential_digest(NEW) });
-        let (status, _, response) = schedule_routes::route(&admitted, &context.load_config().unwrap(), &request);
+        let (status, _, response) = schedule_routes::route(front::AdminCaller::new(&admitted), &context.load_config().unwrap(), &request);
         assert_eq!(status, 200, "{response}");
         assert!(crate::schedule::ScheduleStore::new(&context).system_paused("backup"));
     }
