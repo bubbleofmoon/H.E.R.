@@ -72,6 +72,46 @@ fn parse_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, Stri
     }
 }
 
+fn list(context: &RuntimeContext, cfg: &Value) -> Reply {
+    let api = crate::supervisor::task_api(context, cfg).map_err(|error| (503, error))?;
+    let latest = api.dispatcher.store().latest_by_task().map_err(|error| (503, error))?;
+    let jobs: Vec<SystemJob> = {
+        let scheduler = api.scheduler.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        REGISTRY
+            .iter()
+            .map(|def| {
+                let last = latest.get(def.id.as_str());
+                SystemJob {
+                    id: def.id.as_str(),
+                    effect: def.effect,
+                    repeat: scheduler.schedule(def.id).unwrap_or(def.schedule).describe(),
+                    next_at: scheduler.next_run(def.id),
+                    enabled_by_config: crate::supervisor::enabled(cfg, def),
+                    running: last.is_some_and(|run| !run.state.is_terminal()),
+                    last_result: last.map(|run| {
+                        let state = serde_json::to_value(run.state).ok().and_then(|v| v.as_str().map(str::to_string));
+                        let summary = match (state, &run.reason) {
+                            (Some(state), Some(reason)) => format!("{state} {reason}"),
+                            (Some(state), None) => state,
+                            (None, _) => String::new(),
+                        };
+                        RunResult { at: run.ended_at.or(run.started_at).unwrap_or(run.queued_at), summary, late: false }
+                    }),
+                }
+            })
+            .collect()
+    };
+    let now = crate::parity_clock::now_ms();
+    let entries = ScheduleStore::new(context).entries(&jobs, now).map_err(store_error)?;
+    let zone = crate::local_time::configured_zone(cfg);
+    let current = crate::local_time::at(now, &zone);
+    Ok((200, json!({
+        "ok": true, "now": now, "entries": entries,
+        "timeZone": {"name": zone.iana_name(), "offsetSeconds": current.offset().seconds(),
+                     "label": crate::local_time::label(&current)}
+    })))
+}
+
 fn create(caller: front::AdminCaller<'_>, req: &Request) -> Reply {
     let context = caller.context();
     let fields = parse_object(&req.body)?;
