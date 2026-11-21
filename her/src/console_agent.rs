@@ -1644,7 +1644,9 @@ pub(super) fn js_number_or(value: Option<&Value>, fallback: f64) -> f64 {
 }
 
 /// The agent routes of this module; `None` for every other request.
-pub(super) fn route(req: &Request, cfg: &Value, context: &RuntimeContext) -> Option<(u16, Value)> {
+pub(super) fn route(caller: &front::VerifiedCaller, req: &Request) -> Option<(u16, Value)> {
+    let context = &caller.context;
+    let cfg = &caller.config;
     match (req.method.as_str(), req.path.as_str()) {
         ("POST", "/api/socialV2/mark-read") => Some(mark_read(context, cfg, &req.headers, &req.body)),
         ("POST", "/api/socialV2/wake-config") => Some(wake_config(context, cfg, &req.headers, &req.body)),
@@ -1662,12 +1664,14 @@ pub(super) fn route(req: &Request, cfg: &Value, context: &RuntimeContext) -> Opt
 
 /// `GET /api/status`: the real mode (JS `currentMode`); an agent call only gets the minimal object, never the
 /// administrator fields (owner, allow-lists, activity).
-pub(super) fn finish_status(req: &Request, context: &RuntimeContext, cfg: &Value, mut payload: Value) -> Value {
+pub(super) fn finish_status(caller: &front::VerifiedCaller, mut payload: Value) -> Value {
+    let context = &caller.context;
+    let cfg = &caller.config;
     let mode = current_mode_for(context).unwrap_or_else(|_| "reserved2".to_string());
     let role = read_role_state(context).unwrap_or_else(|_| json!({}));
     let role_name = role.get("role").cloned().unwrap_or(Value::Null);
     let role_mode = role.get("mode").cloned().unwrap_or_else(|| json!("active"));
-    if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
+    if caller.is_agent() {
         // JS checkDsh uses settings.describe success, not socket reachability or credentials alone.
         let dsh_ready = dsh_rpc_for(context, cfg)
             .and_then(|rpc| rpc.call("settings/describe", json!({})))

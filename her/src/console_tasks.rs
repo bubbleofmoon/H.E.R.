@@ -1,8 +1,8 @@
 //! Ticket 27 (renamed by ticket 33): the Schedule page's task routes (`/api/tasks/*`) and the page markup.
 //!
-//! Mounted behind the console front (ticket 24): Host check, console credential, `application/json` and Origin checks
-//! on POST, and the audit record of every administrator write happen before [`route`] is called (phase B wiring). This
-//! module adds what is specific to tasks: agent credentials are refused on every task route; only registered task ids
+//! Mounted behind the console front (`console_front`): Host check, console credential, agent refusal, `application/json` and Origin checks
+//! on POST, and the audit record of every administrator write happen before [`route`] is called. This
+//! module adds what is specific to tasks: [`route`] rechecks `AdminCaller::gate` before starting or changing task lifecycle; only registered task ids
 //! can be triggered; a manual trigger needs a client request id (repeating it returns the first run, a running task
 //! answers 409); a trigger answers `202 queued` and the page follows the run until its real result. Logs are served
 //! redacted (store redaction plus long digit runs masked); chat-bearing tasks show only metadata.
@@ -20,8 +20,6 @@ pub struct TaskRequest<'a> {
     pub path: &'a str,
     pub query: &'a HashMap<String, String>,
     pub body: &'a str,
-    /// The request carried agent credentials (`x-agent-call` / `x-agent-token`).
-    pub agent_call: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,14 +47,11 @@ fn error(status: u16, message: &str) -> Option<TaskResponse> {
 }
 
 /// `None`: not a task route (the console continues with its own table).
-pub fn route(api: &TasksApi, req: &TaskRequest) -> Option<TaskResponse> {
+pub fn route(caller: crate::console_front::AdminCaller<'_>, api: &TasksApi, req: &TaskRequest) -> Option<TaskResponse> {
     let path = req.path;
     let is_task_route = path == "/tasks" || path == "/api/tasks" || path.starts_with("/api/tasks/");
     if !is_task_route {
         return None;
-    }
-    if req.agent_call {
-        return error(403, "任务接口仅限管理员控制台，不接受 agent 凭据");
     }
     if path == "/tasks" {
         return match req.method {
@@ -73,7 +68,13 @@ pub fn route(api: &TasksApi, req: &TaskRequest) -> Option<TaskResponse> {
     let rest = &path["/api/tasks/".len()..];
     if rest == "lifecycle" {
         return match req.method {
-            "POST" => set_lifecycle(api, req.body),
+            "POST" => {
+                let _authority = match caller.gate() {
+                    Ok(gate) => gate,
+                    Err((status, message)) => return error(status, &message),
+                };
+                set_lifecycle(api, req.body)
+            }
             _ => error(405, "method not allowed"),
         };
     }
@@ -96,6 +97,9 @@ pub fn route(api: &TasksApi, req: &TaskRequest) -> Option<TaskResponse> {
     if let Some(task) = rest.strip_suffix("/run") {
         if req.method != "POST" {
             return error(405, "method not allowed");
+        }
+        if let Err((status, message)) = caller.gate() {
+            return error(status, &message);
         }
         return trigger(api, task, req.body);
     }
@@ -525,7 +529,8 @@ mod tests {
 
         fn call(&self, method: &str, path: &str, query: &[(&str, &str)], body: &str) -> (u16, Value) {
             let query: HashMap<String, String> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-            let response = route(&self.api, &TaskRequest { method, path, query: &query, body, agent_call: false }).expect("a task route");
+            let context = crate::runtime::RuntimeContext::legacy();
+            let response = route(crate::console_front::AdminCaller::new(&context), &self.api, &TaskRequest { method, path, query: &query, body }).expect("a task route");
             assert_eq!(response.content_type, JSON_TYPE);
             (response.status, serde_json::from_str(&response.body).unwrap())
         }
@@ -558,23 +563,20 @@ mod tests {
     fn non_task_paths_are_left_to_the_console() {
         let f = Fixture::new("passthrough");
         let query = HashMap::new();
+        let context = crate::runtime::RuntimeContext::legacy();
         for path in ["/api/status", "/api/tasksx", "/task", "/"] {
-            assert!(route(&f.api, &TaskRequest { method: "GET", path, query: &query, body: "", agent_call: false }).is_none(), "{path}");
+            assert!(route(crate::console_front::AdminCaller::new(&context), &f.api, &TaskRequest { method: "GET", path, query: &query, body: "" }).is_none(), "{path}");
         }
     }
 
     #[test]
-    fn the_page_is_served_and_agents_are_refused_everywhere() {
+    fn the_page_is_served() {
         let f = Fixture::new("page");
         let query = HashMap::new();
-        let page = route(&f.api, &TaskRequest { method: "GET", path: "/tasks", query: &query, body: "", agent_call: false }).unwrap();
+        let context = crate::runtime::RuntimeContext::legacy();
+        let page = route(crate::console_front::AdminCaller::new(&context), &f.api, &TaskRequest { method: "GET", path: "/tasks", query: &query, body: "" }).unwrap();
         assert_eq!((page.status, page.content_type), (200, HTML_TYPE));
         assert!(page.body.contains("/api/tasks") && page.body.contains("x-console-token") && page.body.contains("requestId"));
-        for (method, path) in [("GET", "/tasks"), ("GET", "/api/tasks"), ("GET", "/api/tasks/runs"), ("POST", "/api/tasks/backup/run")] {
-            let r = route(&f.api, &TaskRequest { method, path, query: &query, body: r#"{"requestId":"req-agent-01"}"#, agent_call: true }).unwrap();
-            assert_eq!(r.status, 403, "{method} {path}");
-        }
-        assert!(f.api.dispatcher.store().list(&RunQuery::default()).unwrap().runs.is_empty(), "an agent starts nothing");
     }
 
     #[test]

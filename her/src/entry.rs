@@ -101,6 +101,7 @@ mod restore;
 mod console_tasks;
 mod console_persona;
 mod console_settings;
+pub(crate) use console::front as console_front;
 mod settings;
 mod supervisor;
 mod supervisor_dependencies;

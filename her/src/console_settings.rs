@@ -1,14 +1,14 @@
 //! Settings console page and routes (`GET /settings`, `GET /api/settings`, `GET /api/settings/history`,
 //! `POST /api/settings/set`, `POST /api/settings/reset`, `POST /api/settings/undo`). Mounted behind the console front
 //! (Host, credential, JSON and Origin checks, request audit); the registry, validation, the store and its history live
-//! in `settings.rs` and `settings/`. Bodies and queries name the setting as `setting`, never `key`, which the console's
-//! conversation-key preflight would refuse. The conversation scope's page and routes (#218) are in
+//! in `settings.rs` and `settings/`. The conversation scope's page and routes (#218) are in
 //! `console_settings/conversation.rs`; the model route page and list (#162, `GET /settings/models`,
 //! `GET /api/settings/models`) in `console_settings/models.rs`.
 
 mod conversation;
 mod models;
 
+use crate::console_front::AdminCaller;
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -24,16 +24,13 @@ pub fn is_route(path: &str) -> bool {
         || path.starts_with("/api/settings/")
 }
 
-/// `authority` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
+/// `caller` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
 /// it commits and its write-back into `config.json` is done (the store gate is taken inside it,
 /// `settings::store::write_store`).
 pub fn route(
-    context: &RuntimeContext, method: &str, path: &str, query: &HashMap<String, String>, body: &str, agent_call: bool,
-    authority: crate::persona::Authority<'_>,
+    caller: AdminCaller<'_>, method: &str, path: &str, query: &HashMap<String, String>, body: &str,
 ) -> (u16, &'static str, String) {
-    if agent_call {
-        return failure(403, "settings routes are restricted to administrators");
-    }
+    let context = caller.context();
     // The model page and list only read state, even if startup left a legacy engine map.
     if !matches!((method, path), ("GET", "/settings/models" | "/api/settings/models")) {
         if let Err((status, error)) = crate::console::import_engine_choices(context) {
@@ -48,12 +45,12 @@ pub fn route(
         ("GET", "/api/settings/conversations") => conversation::list(context),
         ("GET", "/api/settings/models") => models::list(context),
         ("GET", "/api/settings/history") => history(context, query),
-        ("POST", "/api/settings/set") => set(context, body, authority),
-        ("POST", "/api/settings/reset") => reset(context, body, authority),
-        ("POST", "/api/settings/undo") => undo(context, body, authority),
-        ("POST", "/api/settings/conversation/set") => conversation::set(context, body, authority),
-        ("POST", "/api/settings/conversation/reset") => conversation::reset(context, body, authority),
-        ("POST", "/api/settings/conversation/switch") => conversation::switch(context, body, authority),
+        ("POST", "/api/settings/set") => set(caller, body),
+        ("POST", "/api/settings/reset") => reset(caller, body),
+        ("POST", "/api/settings/undo") => undo(caller, body),
+        ("POST", "/api/settings/conversation/set") => conversation::set(caller, body),
+        ("POST", "/api/settings/conversation/reset") => conversation::reset(caller, body),
+        ("POST", "/api/settings/conversation/switch") => conversation::switch(caller, body),
         _ => Err((404, "unknown settings route".to_string())),
     };
     match result {
@@ -140,7 +137,8 @@ thread_local! {
 
 /// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting. A change of an
 /// access setting revokes like a whitelist write (`console::access_setting_change`).
-fn set(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
+    let context = caller.context();
     let fields = body_fields(body, &["setting", "value", "confirm"])?;
     let setting = setting_field(&fields)?;
     let value = fields.get("value").ok_or((400, "value is required".to_string()))?;
@@ -152,14 +150,15 @@ fn set(context: &RuntimeContext, body: &str, authority: crate::persona::Authorit
     };
     if found.is_some_and(|found| found.access()) {
         let change = crate::settings::Change::Set { key: setting, value };
-        return crate::console::access_setting_change(context, authority, &change, commit);
+        return caller.with_authority(|authority| crate::console::access_setting_change(context, authority, &change, commit));
     }
-    let _gate = authority()?;
+    let _gate = caller.gate()?;
     commit()
 }
 
 /// `{"setting": <registry key>}`, plus `"confirm": true` for a security setting: stores the setting's default.
-fn reset(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+fn reset(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
+    let context = caller.context();
     let fields = body_fields(body, &["setting", "confirm"])?;
     let setting = setting_field(&fields)?;
     let found = crate::settings::find(setting);
@@ -170,16 +169,17 @@ fn reset(context: &RuntimeContext, body: &str, authority: crate::persona::Author
     };
     if found.is_some_and(|found| found.access()) {
         let change = crate::settings::Change::Reset { key: setting };
-        return crate::console::access_setting_change(context, authority, &change, commit);
+        return caller.with_authority(|authority| crate::console::access_setting_change(context, authority, &change, commit));
     }
-    let _gate = authority()?;
+    let _gate = caller.gate()?;
     commit()
 }
 
 /// `{"entry": <history entry id>}`, plus `"confirm": true` when the entry's setting is a security setting; the reply
 /// names the entry, the setting and its stored value now (`null`: none), plus `mirrorError` when `config.json` could not
 /// be updated (the undo stands). An undo of an access setting revokes like a whitelist write.
-fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+fn undo(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
+    let context = caller.context();
     let fields = body_fields(body, &["entry", "confirm"])?;
     let entry = fields
         .get("entry")
@@ -224,9 +224,11 @@ fn undo(context: &RuntimeContext, body: &str, authority: crate::persona::Authori
         Ok(reply)
     };
     if access {
-        return crate::console::access_setting_change(context, authority, &crate::settings::Change::Undo { entry }, commit);
+        return caller.with_authority(|authority| {
+            crate::console::access_setting_change(context, authority, &crate::settings::Change::Undo { entry }, commit)
+        });
     }
-    let _gate = authority()?;
+    let _gate = caller.gate()?;
     commit()
 }
 
