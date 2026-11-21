@@ -1,4 +1,4 @@
-//! Settings for the daily system jobs and the half-hourly digest check.
+//! System job timing, the runtime time zone and HER's reminder limits.
 
 use crate::settings::kinds::{daily_parts, DailyTime, FileRule, Integer, TimeZoneName};
 use crate::settings::Setting;
@@ -56,7 +56,84 @@ pub(crate) const TIME_ZONE: Setting = Setting {
     secret: false,
 };
 
-pub(super) const SETTINGS: &[Setting] = &[DIGEST_TIME, DIGEST_CHECK_MINUTE, BACKUP_TIME, TIME_ZONE];
+pub(crate) const REMINDER_CONVERSATION_CAP: Setting = Setting {
+    key: "reminders.maxPerConversation",
+    pointer: "/reminders/maxPerConversation",
+    kind: &Integer {
+        min: 0,
+        max: 10_000,
+        default: Some(20),
+        file: FileRule::Default,
+    },
+    applies: "live",
+    group: "schedule",
+    label: "HER reminders per conversation",
+    hint: "Counts active and paused HER reminders. Zero blocks new HER reminders.",
+    chat: false,
+    secret: false,
+};
+
+pub(crate) const REMINDER_TOTAL_CAP: Setting = Setting {
+    key: "reminders.maxTotal",
+    pointer: "/reminders/maxTotal",
+    kind: &Integer {
+        min: 0,
+        max: 10_000,
+        default: Some(200),
+        file: FileRule::Default,
+    },
+    applies: "live",
+    group: "schedule",
+    label: "HER reminders across conversations",
+    hint: "Counts active and paused HER reminders. Zero blocks new HER reminders.",
+    chat: false,
+    secret: false,
+};
+
+pub(crate) const REMINDER_REPEAT_FLOOR: Setting = Setting {
+    key: "reminders.minRepeatMinutes",
+    pointer: "/reminders/minRepeatMinutes",
+    kind: &Integer {
+        min: crate::schedule::MIN_REPEAT_MINUTES as i64,
+        max: 1440,
+        default: Some(60),
+        file: FileRule::Default,
+    },
+    applies: "live",
+    group: "schedule",
+    label: "Minimum repeat interval for HER reminders",
+    hint: "Minutes between interval repeats. Daily reminders follow the local calendar.",
+    chat: false,
+    secret: false,
+};
+
+pub(crate) const REMINDER_HORIZON: Setting = Setting {
+    key: "reminders.maxAheadDays",
+    pointer: "/reminders/maxAheadDays",
+    kind: &Integer {
+        min: 1,
+        max: crate::schedule::MAX_AHEAD_DAYS,
+        default: Some(365),
+        file: FileRule::Default,
+    },
+    applies: "live",
+    group: "schedule",
+    label: "Maximum days ahead for HER reminders",
+    hint: "Applies to the first run of a new reminder and to rescheduling an existing reminder.",
+    chat: false,
+    secret: false,
+};
+
+pub(super) const SETTINGS: &[Setting] = &[
+    DIGEST_TIME,
+    DIGEST_CHECK_MINUTE,
+    BACKUP_TIME,
+    TIME_ZONE,
+    REMINDER_CONVERSATION_CAP,
+    REMINDER_TOTAL_CAP,
+    REMINDER_REPEAT_FLOOR,
+    REMINDER_HORIZON,
+];
 const HEAVY_JOB_GAP_MINUTES: u32 = 30;
 
 pub(crate) fn daily(setting: &Setting, document: &Value) -> (u32, u32) {
