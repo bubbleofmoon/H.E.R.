@@ -988,7 +988,7 @@ mod windows {
                 if raw == "about:blank" { return true; }
                 let Some(token) = nav_session.lock().ok().and_then(|token| token.clone()) else { return false; };
                 let Some(url) = session_url(&nav_context, &raw, &token) else { return false; };
-                if url::Url::parse(&raw).ok().is_some_and(|url| url.query_pairs().find(|(key, _)| key == "token").is_some_and(|(_, value)| value == token)) { return true; }
+                if url::Url::parse(&raw).ok().is_some_and(|url| url.query_pairs().find(|(key, _)| key == "token").is_some_and(|(_, value)| crate::console_auth::credential_eq(&token, value.as_ref()))) { return true; }
                 let _ = proxy.send_event(Ui::Navigate(url));
                 false
             })

@@ -402,7 +402,7 @@ fn live_wake_save_with_unreadable_store_writes_nothing() {
     assert_eq!(status, 200, "{reply}");
     store_group_plan(&context, crate::wake::default_wake_config(&context.load_config().unwrap(), now_ms(), 0.5));
     write_config(&root, |cfg| cfg["socialV2"]["wake"]["batchWindowMs"] = json!(8000));
-    StoreProbe::at(&root.0).edit("PRAGMA user_version=3;");
+    StoreProbe::at(&root.0).edit("PRAGMA user_version=4;");
     let path = root.0.join("data/social-v2.json");
     let before = std::fs::read(&path).unwrap();
     let config_path = root.0.join("config/config.json");

@@ -102,7 +102,8 @@ fn http_call(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
     let payload = body.map(Value::to_string).unwrap_or_default();
-    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
+    let host = if method == "GET" && path == "/personas" { "her.localhost" } else { "127.0.0.1" };
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n");
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }

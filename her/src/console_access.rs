@@ -13,8 +13,9 @@ use super::*;
 
 // ── host and cross-site checks (frozen JS console front) ─────────────────────────────────────────
 
-fn allowed_hosts(port: u16) -> [String; 3] {
-    [format!("127.0.0.1:{port}"), format!("localhost:{port}"), format!("[::1]:{port}")]
+fn allowed_hosts(port: u16) -> [String; 4] {
+    let with_port = |host: &str| if port == 80 { host.to_owned() } else { format!("{host}:{port}") };
+    [with_port("127.0.0.1"), with_port("localhost"), with_port("[::1]"), crate::console_auth::canonical_host(port)]
 }
 
 /// JS: the Host header must name the loopback console with its bound port (DNS rebinding).
@@ -24,7 +25,8 @@ pub(super) fn host_denial(req: &Request, port: u16) -> Option<(u16, Value)> {
         return None;
     }
     let host = req.headers.get("host").map(String::as_str).unwrap_or("");
-    if allowed_hosts(port).iter().any(|allowed| allowed == &host.to_lowercase()) {
+    if allowed_hosts(port).iter().any(|allowed| allowed == &host.to_ascii_lowercase())
+        || (port == 80 && matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1:80" | "localhost:80" | "[::1]:80" | "her.localhost:80")) {
         return None;
     }
     let shown = if host.is_empty() { "缺失" } else { host };
@@ -242,7 +244,9 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
     // Access changes are serialized with closed-agent receipts, mode changes and resets: the gate
     // is taken before anything is written, so its failure leaves the configuration unchanged.
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-    finish_pending_before_change(context, &interaction)?;
+    let mut repair = context.clone();
+    repair.console_authority = None;
+    finish_pending_before_change(&repair, &interaction)?;
     // The revocation compares the policy the runtime authorizes with (canonical lists and the
     // closed-agent owner overlay), read under the same gate as the write.
     let (before, after, file, pending) = {
@@ -1314,6 +1318,7 @@ fn js_truthy(value: &Value) -> bool {
 pub(super) fn security_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     if body.get("rehardenStateDir") == Some(&json!(true)) {
+        let _gate = acquire_social_state_gate(context)?;
         let dir = state_dir(context).map_err(|error| (503, error))?;
         let (ok, detail) = harden_state_dir(&dir);
         if !ok {

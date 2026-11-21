@@ -370,7 +370,7 @@ let scheduleZone={name:'UTC',offsetSeconds:0};
 const t=ms=>{if(!ms)return '';if(scheduleZone.name){try{return new Date(ms).toLocaleString('zh-CN',{timeZone:scheduleZone.name,hour12:false})}catch{}}
  return new Date(ms+scheduleZone.offsetSeconds*1000).toLocaleString('zh-CN',{timeZone:'UTC',hour12:false})};
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{'x-console-token':token(),'content-type':'application/json'}});
+async function api(path,opt={}){const bearer=location.hostname==='her.localhost'?'':token();const r=await fetch(path,{...opt,credentials:'same-origin',headers:{...(bearer?{'x-console-token':bearer}:{}),'content-type':'application/json'}});
  const j=await r.json().catch(()=>({ok:false,error:'HTTP '+r.status}));j.status=r.status;return j}
 
 let displayedRelease=null;

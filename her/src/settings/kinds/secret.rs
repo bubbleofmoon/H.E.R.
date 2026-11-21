@@ -1,4 +1,5 @@
 use super::SettingKind;
+use crate::console_auth::AdministratorPasswordHash;
 use serde_json::{json, Value};
 
 pub(crate) struct ApiKey;
@@ -38,5 +39,43 @@ impl SettingKind for ApiKey {
         for invalid in [json!(42), json!("prefix\r\nheader"), json!("has space"), json!("fixture中文")] {
             assert!(setting.normalize(&invalid).is_none());
         }
+    }
+}
+
+pub(crate) struct AdministratorPasswordPhc;
+
+impl SettingKind for AdministratorPasswordPhc {
+    fn normalize(&self, value: &Value) -> Option<Value> {
+        AdministratorPasswordHash::parse(value.as_str()?)?;
+        Some(value.clone())
+    }
+
+    fn default_value(&self) -> Value {
+        Value::Null
+    }
+
+    fn read(&self, _: &Value) -> Option<Value> {
+        None
+    }
+
+    fn refusal(&self, _: &str, _: &Value) -> String {
+        "unsupported administrator password hash".to_string()
+    }
+
+    fn view(&self) -> Value {
+        json!({"type": "password"})
+    }
+
+    fn chat_requirement(&self, _: &str) -> String {
+        "此项只可在本地设置".to_string()
+    }
+
+    #[cfg(test)]
+    fn check_entry(&self, setting: &crate::settings::Setting) {
+        let supported = json!(crate::console_auth::tests::supported_phc());
+        assert!(setting.normalize(&supported).is_some());
+        assert!(setting.normalize(&Value::Null).is_none());
+        assert!(self.read(&supported).is_none());
+        assert_eq!(setting.default_value(), Value::Null);
     }
 }

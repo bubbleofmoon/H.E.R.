@@ -28,6 +28,7 @@ const QUIET_KEY: &str = "reply.wakeQuietMs";
 const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings.rs", include_str!("../../settings.rs")),
     ("settings/store.rs", include_str!("../store.rs")),
+    ("settings/store/console_auth.rs", include_str!("../store/console_auth.rs")),
     ("settings/store/conversation.rs", include_str!("../store/conversation.rs")),
     ("settings/kinds.rs", include_str!("../kinds.rs")),
     ("settings/kinds/choice.rs", include_str!("../kinds/choice.rs")),

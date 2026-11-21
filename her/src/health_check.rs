@@ -77,8 +77,12 @@ fn owner(data: &Path, role: &str, lock: &str) -> Part {
 
 /// One snapshot: the named parts of the health verdict (`dsh` and `dshLogin` come from one DSH probe).
 pub fn check(root: &Path, deadline: Instant) -> Verdict {
+    check_restore_candidate(root, deadline, None)
+}
+
+pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Option<[u8; 32]>) -> Verdict {
     let mut parts = BTreeMap::new();
-    let context = match RuntimeContext::from_root(root) {
+    let context = match RuntimeContext::for_console_recovery(root) {
         Ok(context) => context,
         Err(reason) => {
             for name in [
@@ -123,10 +127,14 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
         "supervisor",
         owner(context.data_dir(), "supervisor", SUPERVISOR_LOCK),
     );
+    let recovery = crate::restore::recovery_pending(&context);
+    let verifying = permit.is_some_and(|expected| crate::restore::verifying_recovery(&context)
+        .is_some_and(|actual| crate::console_auth::digests_equal(&expected, &actual)));
     let cfg = match context.load_config() {
         Ok(cfg) => cfg,
         Err(reason) => {
             for name in ["console", "snowluma", "dsh", "dshLogin", "relay"] {
+                let reason = if recovery && name == "console" { crate::restore::RECOVERY_REASON } else { reason };
                 parts.insert(name, Part::new(false, reason));
             }
             return Verdict {
@@ -188,6 +196,11 @@ pub fn check(root: &Path, deadline: Instant) -> Verdict {
     if let Some(relay) = relay {
         parts.insert("relay", relay);
     }
+    let permit_still_valid = verifying && permit.is_some_and(|expected| crate::restore::verifying_recovery(&context)
+        .is_some_and(|actual| crate::console_auth::digests_equal(&expected, &actual)));
+    let console = if (recovery || crate::restore::recovery_pending(&context)) && !permit_still_valid {
+        Part::new(false, crate::restore::RECOVERY_REASON)
+    } else { console };
     parts.insert("console", console);
     parts.insert("snowluma", snowluma);
     parts.insert("dsh", dsh);

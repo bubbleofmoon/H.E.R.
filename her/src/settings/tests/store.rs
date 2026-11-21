@@ -151,7 +151,7 @@ fn settings_source_list_names_every_product_file() {
 fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
     // A newer release's WAL store, closed cleanly: everything is in the file and no sidecar is left.
     let (root, context) = settings_fixture("settings newer schema");
-    StoreProbe::at(&root.0).build_wal("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;", false);
+    StoreProbe::at(&root.0).build_wal("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;", false);
     for suffix in ["-wal", "-shm", "-journal"] {
         assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "the fixture left settings.db{suffix}");
     }
@@ -171,7 +171,7 @@ fn settings_store_refuses_a_newer_schema_and_reads_the_file() {
         assert!(!root.0.join(format!("data/settings.db{suffix}")).exists(), "the refusal created settings.db{suffix}");
     }
     let store = StoreProbe::at(&root.0);
-    assert_eq!(store.user_version(), 3, "a newer store is never migrated down");
+    assert_eq!(store.user_version(), 4, "a newer store is never migrated down");
     assert_eq!(store.objects_named("settings"), 0, "a newer store is never written");
 }
 
@@ -479,7 +479,7 @@ fn settings_store_refusal_leaves_uncheckpointed_frames_alone() {
     let wal = root.0.join("data/settings.db-wal");
     let shm = root.0.join("data/settings.db-shm");
     StoreProbe::at(&root.0)
-        .build_wal("CREATE TABLE later (x INTEGER); INSERT INTO later VALUES (1); PRAGMA user_version=3;", true);
+        .build_wal("CREATE TABLE later (x INTEGER); INSERT INTO later VALUES (1); PRAGMA user_version=4;", true);
     let db_before = std::fs::read(settings_db(&root)).unwrap();
     let wal_before = std::fs::read(&wal).unwrap();
     assert!(!wal_before.is_empty() && shm.is_file(), "the fixture leaves frames in the WAL");
@@ -500,7 +500,7 @@ fn settings_store_refusal_leaves_uncheckpointed_frames_alone() {
 fn settings_store_refuses_a_newer_store_with_a_journal_and_leaves_both() {
     let (root, context) = settings_fixture("settings newer journal");
     let journal = root.0.join("data/settings.db-journal");
-    StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;");
+    StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;");
     std::fs::write(&journal, vec![0xff_u8; 512]).unwrap();
     let db_before = std::fs::read(settings_db(&root)).unwrap();
     let (status, body) = set_quiet(&context, json!(4500));
