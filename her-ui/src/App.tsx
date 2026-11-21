@@ -3,6 +3,7 @@ import { CommandPalette } from './components/CommandPalette';
 import { ConfirmModal, StickySaveBar, ToastHost } from './components/Primitives';
 import { WorkbenchLayout } from './layouts/WorkbenchLayout';
 import { AuditPage } from './pages/AuditPage';
+import { LegacyPage } from './pages/LegacyPage';
 import { LoginPage } from './pages/LoginPage';
 import { SecurityPage } from './pages/SecurityPage';
 import { SetupPage } from './pages/SetupPage';
@@ -37,6 +38,8 @@ const ConsoleRouter: React.FC = () => {
           <SecurityPage />
         ) : page === 'audit' ? (
           <AuditPage />
+        ) : page === 'legacy' ? (
+          <LegacyPage />
         ) : (
           <WorkspacePlaceholderPage />
         )}
