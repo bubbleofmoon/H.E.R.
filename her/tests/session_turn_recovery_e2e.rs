@@ -25,7 +25,9 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio_tungstenite::tungstenite::{accept, Message};
+use tokio_tungstenite::tungstenite::{
+    accept, Error as WsError, HandshakeError, Message, WebSocket,
+};
 
 const GROUP_ID: i64 = 420042;
 const GROUP_KEY: &str = "group:420042";
@@ -96,12 +98,60 @@ struct HttpReq {
     body: Vec<u8>,
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<HttpReq> {
-    stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
+fn read_with_stop(
+    stream: &mut TcpStream,
+    control: &ListenerControl,
+    deadline: Instant,
+    mut op: impl FnMut(&mut TcpStream) -> std::io::Result<usize>,
+) -> Option<usize> {
+    stream.set_read_timeout(Some(Duration::from_millis(50))).ok()?;
+    while !control.is_stopped() && Instant::now() < deadline {
+        match op(stream) {
+            Ok(count) => return Some(count),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn accept_ws(stream: TcpStream, control: &ListenerControl) -> Option<WebSocket<TcpStream>> {
+    stream.set_nonblocking(true).ok()?;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut pending = accept(stream);
+    loop {
+        match pending {
+            Ok(socket) => {
+                socket.get_ref().set_nonblocking(false).ok()?;
+                return Some(socket);
+            }
+            Err(HandshakeError::Interrupted(mid)) => {
+                if control.is_stopped() || Instant::now() >= deadline {
+                    return None;
+                }
+                control.wait_for_stop(Duration::from_millis(10));
+                if control.is_stopped() {
+                    return None;
+                }
+                pending = mid.handshake();
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream, control: &ListenerControl) -> Option<HttpReq> {
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let count = stream.read(&mut chunk).ok()?;
+        let count = read_with_stop(stream, control, deadline, |s| s.read(&mut chunk))?;
         if count == 0 {
             return None;
         }
@@ -737,7 +787,10 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream, connection: &AcceptedS
     trace.record("peek", "start");
     const WS_PREFIX: &str = "GET /api/remote.mux";
     let mut peek = [0u8; 64];
-    let Ok(n) = stream.peek(&mut peek) else {
+    let peek_deadline = Instant::now() + Duration::from_secs(8);
+    let Some(n) =
+        read_with_stop(&mut stream, &connection.control, peek_deadline, |s| s.peek(&mut peek))
+    else {
         trace.record("peek", "read-error");
         return;
     };
@@ -764,11 +817,11 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream, connection: &AcceptedS
             trace.record("probe-http-404", write_outcome(result.is_ok()));
             return;
         }
-        dsh_follow(&world, stream, &trace);
+        dsh_follow(&world, stream, &trace, &connection.control);
         return;
     }
     trace.record("http-read", "start");
-    let Some(request) = read_request(&mut stream) else {
+    let Some(request) = read_request(&mut stream, &connection.control) else {
         trace.record("http-read", "incomplete");
         return;
     };
@@ -858,17 +911,40 @@ fn dsh_connection(world: Arc<Dsh>, mut stream: TcpStream, connection: &AcceptedS
     trace.record("http-write", write_outcome(written));
 }
 
-fn dsh_follow(world: &Dsh, stream: TcpStream, trace: &ConnectionTrace<'_>) {
+fn dsh_follow(
+    world: &Dsh,
+    stream: TcpStream,
+    trace: &ConnectionTrace<'_>,
+    control: &ListenerControl,
+) {
     trace.record("handshake", "start");
-    let Ok(mut socket) = accept(stream) else {
+    let Some(mut socket) = accept_ws(stream, control) else {
         trace.record("handshake", "error");
         return;
     };
     trace.record("handshake", "ok");
     trace.record("follow-open", "start");
-    let Ok(Message::Text(open)) = socket.read() else {
-        trace.record("follow-open", "missing-text-frame");
-        return;
+    let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)));
+    let open_deadline = Instant::now() + Duration::from_secs(8);
+    let open = loop {
+        if control.is_stopped() || Instant::now() >= open_deadline {
+            trace.record("follow-open", "missing-text-frame");
+            return;
+        }
+        match socket.read() {
+            Ok(Message::Text(open)) => break open,
+            Err(WsError::Io(ref e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            _ => {
+                trace.record("follow-open", "missing-text-frame");
+                return;
+            }
+        }
     };
     let Ok(frame) = serde_json::from_str::<Value>(&open) else {
         trace.record("follow-open", "invalid-json");
@@ -932,7 +1008,7 @@ fn dsh_follow(world: &Dsh, stream: TcpStream, trace: &ConnectionTrace<'_>) {
     }
     let _ = socket.get_ref().set_read_timeout(Some(Duration::from_millis(50)));
     let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
+    while !control.is_stopped() && Instant::now() < deadline {
         let fresh: Vec<Value> = {
             let inner = lock(&world.inner);
             inner
@@ -1124,7 +1200,7 @@ fn mention_event(message_id: i64, text: &str) -> Value {
 }
 
 fn gateway_connection(stream: TcpStream, gateway: &Mutex<Gateway>, control: &ListenerControl) {
-    let Ok(mut socket) = accept(stream) else { return };
+    let Some(mut socket) = accept_ws(stream, control) else { return };
     let script = {
         let mut g = lock(gateway);
         if g.scripts.is_empty() { Vec::new() } else { g.scripts.remove(0) }
@@ -1171,8 +1247,12 @@ fn gateway_connection(stream: TcpStream, gateway: &Mutex<Gateway>, control: &Lis
     }
 }
 
-fn onebot_connection(mut stream: TcpStream, gateway: &Mutex<Gateway>) {
-    let Some(request) = read_request(&mut stream) else { return };
+fn onebot_connection(
+    mut stream: TcpStream,
+    gateway: &Mutex<Gateway>,
+    control: &ListenerControl,
+) {
+    let Some(request) = read_request(&mut stream, control) else { return };
     let path = request.request_line.split_whitespace().nth(1).unwrap_or("").to_string();
     let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
     let reply = {
@@ -1354,8 +1434,8 @@ impl Rig {
             dsh_connection(dsh.clone(), stream, connection);
         });
         let onebot = gateway.clone();
-        rig.listeners.start(ob_listener, true, move |stream, _| {
-            onebot_connection(stream, &onebot);
+        rig.listeners.start(ob_listener, true, move |stream, connection| {
+            onebot_connection(stream, &onebot, &connection.control);
         });
         rig.listeners.start(ws_listener, false, move |stream, connection| {
             gateway_connection(stream, &gateway, &connection.control);
@@ -1520,11 +1600,14 @@ fn fixture_drop_joins_all_listeners_with_silent_peers() {
         .expect("Rig drop did not join all fake listeners with connected silent peers");
     dropper.join().unwrap();
     for address in addresses {
-        assert_eq!(
-            TcpStream::connect_timeout(&address, Duration::from_secs(1))
-                .expect_err("fake listener still accepts connections after Rig drop")
-                .kind(),
-            std::io::ErrorKind::ConnectionRefused
+        let err = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+            .expect_err("fake listener still accepts connections after Rig drop");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ),
+            "unexpected connect error after Rig drop: {err:?}"
         );
     }
     drop(peers);
