@@ -1,8 +1,8 @@
 //! Ticket 33: the Schedule page (`/schedule`, alias `/tasks`) and its JSON routes over `schedule.rs`.
 //!
-//! Mounted behind the console front: Host, credential and Origin checks and the audit record of every
-//! administrator write happen before [`route`] is called. Agent credentials are refused here. Every write
-//! rechecks the console credential under the configuration gate ([`authority`]). System jobs take
+//! Mounted behind `console_front`: Host, credential, agent-refusal and Origin checks and the audit record of every
+//! administrator write happen before [`route`] is called. Every write rechecks the console credential under
+//! the configuration gate (`AdminCaller::gate`). System jobs take
 //! `confirm: true` for every action they offer; HER's timers offer cancel and run now only (no pause).
 
 use super::*;
@@ -22,11 +22,8 @@ pub(super) fn is_schedule_path(p: &str) -> bool {
     p == "/schedule" || p == "/api/schedule" || p.starts_with("/api/schedule/")
 }
 
-pub(super) fn route(context: &RuntimeContext, cfg: &Value, req: &Request) -> (u16, String, String) {
-    if req.headers.contains_key("x-agent-token") || req.headers.contains_key("x-agent-call") {
-        let body = json!({"ok": false, "error": "日程接口仅限管理员控制台，不接受 agent 凭据"}).to_string();
-        return (403, JSON_TYPE.to_string(), body);
-    }
+pub(super) fn route(caller: front::AdminCaller<'_>, cfg: &Value, req: &Request) -> (u16, String, String) {
+    let context = caller.context();
     let method = req.method.as_str();
     let path = req.path.as_str();
     if path == "/schedule" {
@@ -38,7 +35,7 @@ pub(super) fn route(context: &RuntimeContext, cfg: &Value, req: &Request) -> (u1
     let outcome: Reply = if path == "/api/schedule" {
         match method {
             "GET" => list(context, cfg),
-            "POST" => create(context, req),
+            "POST" => create(caller, req),
             _ => Err((405, "method not allowed".to_string())),
         }
     } else if path == "/api/schedule/history" {
@@ -48,7 +45,7 @@ pub(super) fn route(context: &RuntimeContext, cfg: &Value, req: &Request) -> (u1
         }
     } else if let Some((target, action)) = path.strip_prefix("/api/schedule/").and_then(|rest| rest.rsplit_once('/')) {
         match method {
-            "POST" => act(context, cfg, req, target, action),
+            "POST" => act(caller, cfg, req, target, action),
             _ => Err((405, "method not allowed".to_string())),
         }
     } else {
@@ -73,14 +70,6 @@ fn parse_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, Stri
         Ok(Value::Object(fields)) => Ok(fields),
         _ => Err((400, "请求体必须是 JSON 对象".to_string())),
     }
-}
-
-/// Every schedule write holds the configuration gate (the social-state gate that credential rotation and the other
-/// console writers hold) and rechecks the credential against the current configuration, as the backup and release
-/// settings writers do. A write that waited behind a rotation answers 401 and changes nothing. Writes into the social
-/// state take that same gate again inside their own update, so they release this one first and recheck there.
-fn authority(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
-    config_gate(context)
 }
 
 fn list(context: &RuntimeContext, cfg: &Value) -> Reply {
@@ -123,7 +112,8 @@ fn list(context: &RuntimeContext, cfg: &Value) -> Reply {
     })))
 }
 
-fn create(context: &RuntimeContext, req: &Request) -> Reply {
+fn create(caller: front::AdminCaller<'_>, req: &Request) -> Reply {
+    let context = caller.context();
     let fields = parse_object(&req.body)?;
     let conversation = fields
         .get("conversation")
@@ -131,7 +121,7 @@ fn create(context: &RuntimeContext, req: &Request) -> Reply {
         .and_then(canonical_v2_key)
         .ok_or((400, "会话标识无效".to_string()))?;
     let text = fields.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
-    let _authority = authority(context)?;
+    let _authority = caller.gate()?;
     let cfg = selected_config_for_handler(context)?;
     let at = optional_time(&fields, &cfg)
         .map_err(store_error)?
@@ -151,28 +141,29 @@ fn history(context: &RuntimeContext, query: &HashMap<String, String>) -> Reply {
     Ok((200, json!({"ok": true, "history": records})))
 }
 
-fn act(context: &RuntimeContext, cfg: &Value, req: &Request, target: &str, action: &str) -> Reply {
+fn act(caller: front::AdminCaller<'_>, cfg: &Value, req: &Request, target: &str, action: &str) -> Reply {
     let well_formed = !target.is_empty() && target.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'));
     let Some((kind, rest)) = target.split_once(':').filter(|_| well_formed) else {
         return Err((404, NOT_FOUND.to_string()));
     };
     let fields = if req.body.trim().is_empty() { serde_json::Map::new() } else { parse_object(&req.body)? };
     match kind {
-        "system" => system_action(context, cfg, req, rest, action, &fields),
-        "item" => item_action(context, rest, action, &fields),
-        "replyCheck" | "reachOut" | "sleep" => timer_action(context, cfg, kind, rest, action, &fields),
+        "system" => system_action(caller, cfg, req, rest, action, &fields),
+        "item" => item_action(caller, rest, action, &fields),
+        "replyCheck" | "reachOut" | "sleep" => timer_action(caller, cfg, kind, rest, action, &fields),
         _ => Err((404, NOT_FOUND.to_string())),
     }
 }
 
 fn system_action(
-    context: &RuntimeContext,
+    caller: front::AdminCaller<'_>,
     cfg: &Value,
     req: &Request,
     job: &str,
     action: &str,
     fields: &serde_json::Map<String, Value>,
 ) -> Reply {
+    let context = caller.context();
     let id = TaskId::parse(job).ok_or((404, NOT_FOUND.to_string()))?;
     // What the job offers is checked before confirmation: an action it never offers answers 409, confirmed or not.
     match action {
@@ -188,13 +179,13 @@ fn system_action(
     }
     if action == "run" {
         // The task trigger's admission rechecks the credential under the same gate, so this one is released first.
-        drop(authority(context)?);
+        drop(caller.gate()?);
         let api = crate::supervisor::task_api(context, cfg).map_err(|error| (503, error))?;
         let response = crate::console_tasks::trigger(&api, id.as_str(), &req.body).ok_or((404, NOT_FOUND.to_string()))?;
         let value = serde_json::from_str::<Value>(&response.body).unwrap_or_else(|_| json!({"ok": false}));
         return Ok((response.status, value));
     }
-    let _authority = authority(context)?;
+    let _authority = caller.gate()?;
     ScheduleStore::new(context).set_system_paused(id.as_str(), action == "pause").map_err(store_error)?;
     Ok((200, json!({"ok": true, "id": format!("system:{}", id.as_str())})))
 }
@@ -206,11 +197,12 @@ fn optional<T>(fields: &serde_json::Map<String, Value>, key: &str, parse: impl F
     }
 }
 
-fn item_action(context: &RuntimeContext, id: &str, action: &str, fields: &serde_json::Map<String, Value>) -> Reply {
+fn item_action(caller: front::AdminCaller<'_>, id: &str, action: &str, fields: &serde_json::Map<String, Value>) -> Reply {
+    let context = caller.context();
     if !matches!(action, "pause" | "resume" | "cancel" | "run" | "edit") {
         return Err((409, UNSUPPORTED.to_string()));
     }
-    let _authority = authority(context)?;
+    let _authority = caller.gate()?;
     let change = if action == "edit" {
         let cfg = selected_config_for_handler(context)?;
         ItemChange {
@@ -235,29 +227,30 @@ fn item_action(context: &RuntimeContext, id: &str, action: &str, fields: &serde_
 }
 
 fn timer_action(
-    context: &RuntimeContext,
+    caller: front::AdminCaller<'_>,
     cfg: &Value,
     kind: &str,
     key: &str,
     action: &str,
     fields: &serde_json::Map<String, Value>,
 ) -> Reply {
+    let context = caller.context();
     let now = crate::parity_clock::now_ms();
     let id = format!("{kind}:{key}");
     match (kind, action) {
-        ("replyCheck", "run") => wake(context, cfg, key, "replyCheck"),
-        ("reachOut", "run") => wake(context, cfg, key, "proactiveCheck"),
-        ("sleep", "run") => wake(context, cfg, key, "timeout"),
+        ("replyCheck", "run") => wake(caller, cfg, key, "replyCheck"),
+        ("reachOut", "run") => wake(caller, cfg, key, "proactiveCheck"),
+        ("sleep", "run") => wake(caller, cfg, key, "timeout"),
         ("replyCheck", "cancel") | ("reachOut", "cancel") => {
             let timer = if kind == "replyCheck" { TimerKind::ReplyCheck } else { TimerKind::ReachOut };
             // The timer's time as the page showed it: only that timer is cancelled, never one armed since.
             let at = fields.get("at").and_then(Value::as_i64).ok_or((400, "取消需要页面上显示的计时器时间 at".to_string()))?;
-            let _authority = authority(context)?;
+            let _authority = caller.gate()?;
             ScheduleStore::new(context).request_timer_cancel(key, timer, at, now).map_err(store_error)?;
             Ok((200, json!({"ok": true, "id": id, "status": "cancelRequested"})))
         }
-        ("sleep", "cancel") => set_sleep(context, key, None),
-        ("sleep", "edit") => set_sleep(context, key, Some(fields)),
+        ("sleep", "cancel") => set_sleep(caller, key, None),
+        ("sleep", "edit") => set_sleep(caller, key, Some(fields)),
         ("sleep", "pause") | ("sleep", "resume") | ("replyCheck", "pause") | ("replyCheck", "resume") | ("reachOut", "pause") | ("reachOut", "resume") => {
             Err((409, "HER 的内部计时器不能暂停；可以取消或立即运行".to_string()))
         }
@@ -265,14 +258,15 @@ fn timer_action(
     }
 }
 
-fn wake(context: &RuntimeContext, cfg: &Value, key: &str, reason: &str) -> Reply {
-    drop(authority(context)?);
+fn wake(caller: front::AdminCaller<'_>, cfg: &Value, key: &str, reason: &str) -> Reply {
+    drop(caller.gate()?);
     let body = json!({"key": key, "reason": reason}).to_string();
-    access::social_v2_wake(context, cfg, &body).map(|value| (200, value))
+    access::social_v2_wake(caller.context(), cfg, &body).map(|value| (200, value))
 }
 
-fn set_sleep(context: &RuntimeContext, key: &str, fields: Option<&serde_json::Map<String, Value>>) -> Reply {
-    drop(authority(context)?);
+fn set_sleep(caller: front::AdminCaller<'_>, key: &str, fields: Option<&serde_json::Map<String, Value>>) -> Reply {
+    let context = caller.context();
+    drop(caller.gate()?);
     mutate_social_state_for(context, |state| {
         // Rechecked under the social-state gate: a rotation may have completed since the check above.
         let current = selected_config_for_handler(context)?;

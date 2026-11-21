@@ -454,6 +454,7 @@ fn settings_no_console_writer_changes_an_ordinary_registry_setting_in_config_jso
         ("console_access.rs", include_str!("../../console_access.rs")),
         ("console_agent.rs", include_str!("../../console_agent.rs")),
         ("console_feedback.rs", include_str!("../../console_feedback.rs")),
+        ("console_front.rs", include_str!("../../console_front.rs")),
         ("console_persona.rs", include_str!("../../console_persona.rs")),
         ("console_reply.rs", include_str!("../../console_reply.rs")),
         ("console_schedule.rs", include_str!("../../console_schedule.rs")),

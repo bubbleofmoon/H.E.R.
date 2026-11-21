@@ -670,8 +670,14 @@ mod tests {
         let (root, context) = fixture("authority");
         let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
         assert_eq!(super::create(&context, &json!({"name": "甲", "core": "核心。"}), &revoked).unwrap_err().0, 401);
-        let (status, _, body) = crate::console_persona::route(&context, "POST", "/api/personas/create",
-            &std::collections::HashMap::new(), r#"{"name":"甲","core":"核心。"}"#, false, &revoked);
+        let revoked_context = crate::console_front::revoked_admin_context(&context);
+        let (status, _, body) = crate::console_persona::route(
+            crate::console_front::AdminCaller::new(&revoked_context),
+            "POST",
+            "/api/personas/create",
+            &std::collections::HashMap::new(),
+            r#"{"name":"甲","core":"核心。"}"#,
+        );
         assert_eq!(status, 401, "{body}");
         assert!(!root.join("data/personas.json").exists(), "nothing was written");
         let _ = new_id(super::create(&context, &json!({"name": "甲", "core": "核心。"}), open()).unwrap());

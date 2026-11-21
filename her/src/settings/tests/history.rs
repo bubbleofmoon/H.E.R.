@@ -2,10 +2,9 @@
 use super::*;
 
 /// One request straight to `console_settings::route`, past the console front.
-fn direct_route(
-    context: &RuntimeContext, method: &str, path: &str, body: &str, authority: crate::persona::Authority<'_>,
-) -> (u16, Value) {
-    let (status, _, reply) = crate::console_settings::route(context, method, path, &HashMap::new(), body, false, authority);
+fn direct_route(context: &RuntimeContext, method: &str, path: &str, body: &str) -> (u16, Value) {
+    let (status, _, reply) =
+        crate::console_settings::route(crate::console_front::AdminCaller::new(context), method, path, &HashMap::new(), body);
     (status, serde_json::from_str(&reply).unwrap_or(Value::Null))
 }
 
@@ -316,15 +315,13 @@ fn settings_undo_cut_off_before_its_audit_row_changes_nothing() {
 
 #[test]
 fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input() {
-    let granted = || -> Result<Option<std::fs::File>, (u16, String)> { Ok(None) };
-    let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
     let legacy = RuntimeContext::legacy();
     for (method, path, body) in [
         ("GET", "/api/settings/history", ""),
         ("POST", "/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#),
         ("POST", "/api/settings/undo", r#"{"entry":1}"#),
     ] {
-        let (status, reply) = direct_route(&legacy, method, path, body, &granted);
+        let (status, reply) = direct_route(&legacy, method, path, body);
         assert_eq!((status, reply["error"].clone()), (503, json!("settings require a selected runtime")), "{path}");
     }
 
@@ -336,8 +333,9 @@ fn settings_history_undo_and_reset_refuse_agents_legacy_contexts_and_bad_input()
     let (status, body) = set_quiet(&context, json!(4500));
     assert_eq!(status, 200, "{body}");
     // The authority re-checks the console credential under the configuration gate before anything is written.
+    let revoked = crate::console_front::revoked_admin_context(&context);
     for (path, body) in [("/api/settings/reset", r#"{"setting":"reply.wakeQuietMs"}"#), ("/api/settings/undo", r#"{"entry":1}"#)] {
-        let (status, reply) = direct_route(&context, "POST", path, body, &revoked);
+        let (status, reply) = direct_route(&revoked, "POST", path, body);
         assert_eq!(status, 401, "{path}: {reply}");
     }
     for (request, status, error) in [

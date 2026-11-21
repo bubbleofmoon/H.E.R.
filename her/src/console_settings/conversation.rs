@@ -1,10 +1,11 @@
 //! #218: the conversation scope of the settings page (`GET /settings/conversations`, `GET /api/settings/conversations`,
 //! `POST /api/settings/conversation/set`, `POST /api/settings/conversation/reset`). Undo and history are the settings
 //! routes' own (`POST /api/settings/undo`, `GET /api/settings/history?conversation=`). Bodies name the conversation as
-//! `conversation` and the setting as `setting`, never `key`, which the console's conversation-key preflight would
-//! refuse. The settings store keeps the desired engine; the switch also drains and moves the active generation.
+//! `conversation` and the setting as `setting`. The settings store keeps the desired engine; the switch also drains
+//! and moves the active generation.
 
 use super::{applied_reply, body_fields, setting_field};
+use crate::console_front::AdminCaller;
 use crate::runtime::RuntimeContext;
 use serde_json::{json, Map, Value};
 
@@ -78,9 +79,8 @@ pub(super) fn list(context: &RuntimeContext) -> Result<Value, (u16, String)> {
 /// `{"conversation": <key>, "setting": <conversation setting key>, "value": <value>}`, and
 /// `{"conversation", "setting"}` for a reset. Order of refusals: the body, the conversation key and an unknown setting
 /// (400); then, under the configuration gate, a conversation that is not admitted (409) and a refused value (400).
-fn write(
-    context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>, reset: bool,
-) -> Result<Value, (u16, String)> {
+fn write(caller: AdminCaller<'_>, body: &str, reset: bool) -> Result<Value, (u16, String)> {
+    let context = caller.context();
     legacy_refused(context)?;
     let allowed: &[&str] = if reset { &["conversation", "setting"] } else { &["conversation", "setting", "value"] };
     let fields = body_fields(body, allowed)?;
@@ -88,7 +88,7 @@ fn write(
     let setting = setting_field(&fields)?;
     crate::settings::find_conversation(setting).ok_or((400, "unknown setting".to_string()))?;
     let value = if reset { None } else { Some(fields.get("value").ok_or((400, "value is required".to_string()))?) };
-    let _gate = authority()?;
+    let _gate = caller.gate()?;
     if !crate::settings::conversation_admitted(&loaded_config(context)?, &conversation) {
         return Err((409, NOT_ADMITTED_ERROR.to_string()));
     }
@@ -100,18 +100,19 @@ fn write(
 }
 
 /// `POST /api/settings/conversation/set`.
-pub(super) fn set(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    write(context, body, authority, false)
+pub(super) fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
+    write(caller, body, false)
 }
 
 /// `POST /api/settings/conversation/reset`: stores the global setting's default for that conversation.
-pub(super) fn reset(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    write(context, body, authority, true)
+pub(super) fn reset(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
+    write(caller, body, true)
 }
 
 /// Wait outside the configuration gate so the admitted turn can finish its sends.
-pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
+pub(super) fn switch(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     use crate::turn_engine::Engine;
+    let context = caller.context();
     legacy_refused(context)?;
     let fields = body_fields(body, &["conversation", "engine"])?;
     let key = conversation_field(&fields)?;
@@ -120,7 +121,7 @@ pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::per
     let _gates = crate::engine_switch::drain(context, &key)?;
     let setting = &crate::settings::CONVERSATION_ENGINE;
     let (mode, applied, rollback) = {
-        let _config = authority()?;
+        let _config = caller.gate()?;
         let cfg = loaded_config(context)?;
         let mode = crate::console::runtime_mode(context);
         if !crate::settings::conversation_admitted(&cfg, &key) || !crate::console::access_allowed(&cfg, &mode, &key) {
@@ -138,7 +139,7 @@ pub(super) fn switch(context: &RuntimeContext, body: &str, authority: crate::per
     let result = crate::engine_switch::prepare(context, &key, &mode, requested);
     if result.is_err() {
         if let Some(rollback) = rollback {
-            let _config = crate::console::config_gate(context)?;
+            let _config = caller.gate()?;
             crate::settings::restore_switch_choice(context, &key, rollback)?;
         }
     }

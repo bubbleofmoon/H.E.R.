@@ -1,7 +1,7 @@
 //! Persona library and persona wake-word console routes (`/personas`, `/api/personas*`). Mounted behind the console
 //! front (Host, credential, JSON and Origin checks, audit); storage and validation live in `persona.rs`.
 
-use crate::runtime::RuntimeContext;
+use crate::console_front::AdminCaller;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -13,12 +13,9 @@ pub fn is_route(path: &str) -> bool {
 }
 
 pub fn route(
-    context: &RuntimeContext, method: &str, path: &str, query: &HashMap<String, String>, body: &str, agent_call: bool,
-    authority: crate::persona::Authority<'_>,
+    caller: AdminCaller<'_>, method: &str, path: &str, query: &HashMap<String, String>, body: &str,
 ) -> (u16, &'static str, String) {
-    if agent_call {
-        return failure(403, "persona routes are restricted to administrators");
-    }
+    let context = caller.context();
     let object = || -> Result<Value, (u16, String)> {
         match serde_json::from_str::<Value>(body) {
             Ok(value) if value.is_object() => Ok(value),
@@ -29,15 +26,15 @@ pub fn route(
         ("GET", "/personas") => return (200, HTML_TYPE, PAGE.to_string()),
         ("GET", "/api/personas") => crate::persona::list(context),
         ("GET", "/api/personas/item") => crate::persona::item(context, query.get("id").map(String::as_str).unwrap_or("")),
-        ("POST", "/api/personas/create") => object().and_then(|b| crate::persona::create(context, &b, authority)),
-        ("POST", "/api/personas/update") => object().and_then(|b| crate::persona::update(context, &b, authority)),
-        ("POST", "/api/personas/duplicate") => object().and_then(|b| crate::persona::duplicate(context, &b, authority)),
-        ("POST", "/api/personas/delete") => object().and_then(|b| crate::persona::delete(context, &b, authority)),
-        ("POST", "/api/personas/approve") => object().and_then(|b| crate::persona::approve(context, &b, authority)),
-        ("POST", "/api/personas/assign") => object().and_then(|b| crate::persona::assign(context, &b, authority)),
-        ("POST", "/api/personas/import-roles") => crate::persona::import_roles(context, authority),
+        ("POST", "/api/personas/create") => object().and_then(|b| caller.with_authority(|a| crate::persona::create(context, &b, a))),
+        ("POST", "/api/personas/update") => object().and_then(|b| caller.with_authority(|a| crate::persona::update(context, &b, a))),
+        ("POST", "/api/personas/duplicate") => object().and_then(|b| caller.with_authority(|a| crate::persona::duplicate(context, &b, a))),
+        ("POST", "/api/personas/delete") => object().and_then(|b| caller.with_authority(|a| crate::persona::delete(context, &b, a))),
+        ("POST", "/api/personas/approve") => object().and_then(|b| caller.with_authority(|a| crate::persona::approve(context, &b, a))),
+        ("POST", "/api/personas/assign") => object().and_then(|b| caller.with_authority(|a| crate::persona::assign(context, &b, a))),
+        ("POST", "/api/personas/import-roles") => caller.with_authority(|a| crate::persona::import_roles(context, a)),
         ("GET", "/api/personas/wake-words") => crate::wake_words::view(context, query.get("conversation").map(String::as_str).unwrap_or("")),
-        ("POST", "/api/personas/wake-words/undo") => object().and_then(|b| crate::console::undo_wake_words(context, &b, authority)),
+        ("POST", "/api/personas/wake-words/undo") => object().and_then(|b| caller.with_authority(|a| crate::console::undo_wake_words(context, &b, a))),
         _ => Err((404, "unknown persona route".to_string())),
     };
     match result {
