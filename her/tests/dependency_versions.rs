@@ -94,8 +94,6 @@ import path from 'node:path';
 const cfg=JSON.parse(fs.readFileSync(new URL('./fixture.json',import.meta.url)));
 if(cfg.dsh && path.resolve(process.env.DSH_HOME||'')!==path.resolve(cfg.home)) throw Error('wrong DSH_HOME');
 if(!cfg.dsh && process.env.SNOWLUMA_HOOK_AUTOLOAD!=='1') throw Error('missing SnowLuma hook');
-fs.mkdirSync(cfg.record,{recursive:true});
-fs.writeFileSync(path.join(cfg.record,process.pid+'.json'),JSON.stringify({pid:process.pid,cwd:process.cwd(),script:process.argv[1],args:process.argv.slice(2),home:process.env.DSH_HOME||null}));
 const server=http.createServer((req,res)=>{
  let request='';req.on('data',chunk=>request+=chunk);
  req.on('end',()=>{
@@ -103,7 +101,10 @@ const server=http.createServer((req,res)=>{
   res.writeHead(200,{'Content-Length':Buffer.byteLength(body),'Connection':'close'});res.end(body);
  });
 });
-server.listen(cfg.port,'127.0.0.1');
+server.listen(cfg.port,'127.0.0.1',()=>{
+ fs.mkdirSync(cfg.record,{recursive:true});
+ fs.writeFileSync(path.join(cfg.record,process.pid+'.json'),JSON.stringify({pid:process.pid,cwd:process.cwd(),script:process.argv[1],args:process.argv.slice(2),home:process.env.DSH_HOME||null}));
+});
 setTimeout(()=>server.close(()=>process.exit(0)),300000).unref();
 "#;
 
@@ -641,6 +642,7 @@ fn a_configured_dsh_install_at_the_pinned_version_is_adopted_in_place() {
     let script = fixture.prebuilt(&fixture.root.join("existing"), DSH_VERSION);
     fixture.config["dependencies"]["dsh"]["script"] = json!(script);
     fixture.save();
+    fixture.custody.release(fixture.ports[1]);
     let running = Owned::new(
         hidden(fixture.root.join("node").join(fixture.exe()))
             .arg(&script)
