@@ -675,6 +675,53 @@ fn ui_page_response(req: &Request, renewal: Option<BrowserCookie>) -> Option<Con
     None
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PEER_SAME_USER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn peer_is_installing_user(stream: Option<&TcpStream>) -> bool {
+    #[cfg(test)]
+    if let Some(override_same) = TEST_PEER_SAME_USER.with(|cell| cell.get()) {
+        return override_same;
+    }
+    stream.is_some_and(super::same_installing_user)
+}
+
+fn eligible_for_local_auto_sign_in(req: &Request, port: u16, admission: &FrontAdmission) -> bool {
+    if !crate::console_ui::is_ui_page_request(&req.method, &req.path)
+        || matches!(req.path.as_str(), "/login" | "/setup")
+    {
+        return false;
+    }
+    if !canonical_request(req, port) || admission.proof.is_some() {
+        return false;
+    }
+    if has_agent_marker(req)
+        || req.headers.contains_key("x-console-token")
+        || req.query.contains_key("token")
+    {
+        return false;
+    }
+    if req
+        .headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| !matches!(site.as_str(), "same-origin" | "none"))
+    {
+        return false;
+    }
+    let expected_origin = crate::console_auth::canonical_origin(port);
+    if req
+        .headers
+        .get("origin")
+        .filter(|origin| !origin.is_empty())
+        .is_some_and(|origin| origin != &expected_origin)
+    {
+        return false;
+    }
+    !crate::console_auth::require_password_locally(&admission.config)
+}
+
 /// One HTTP request through host/origin guards, credential admission, audit wrapper and routing.
 pub(crate) fn handle_http_request(
     stream: Option<&TcpStream>,
@@ -711,7 +758,7 @@ pub(crate) fn handle_http_request(
                 None => json_reply(404, json!({"ok": false, "error": "not found"})),
             };
         }
-        let admission = match admit_selected_request(req, context, port) {
+        let mut admission = match admit_selected_request(req, context, port) {
             Ok(admission) => admission,
             Err((status, error)) => return json_reply(status, json!({"ok":false,"error":error})),
         };
@@ -733,6 +780,23 @@ pub(crate) fn handle_http_request(
                 let mut response = ConsoleResponse::from((302, String::new(), String::new()));
                 response.redirect = Some(ConsoleRedirect::CanonicalOrigin(port, target));
                 return response;
+            }
+        }
+        if eligible_for_local_auto_sign_in(req, port, &admission) && peer_is_installing_user(stream)
+        {
+            match crate::console_auth::auth_local_browser_auto_sign_in(context, port) {
+                Ok(Some((issued, authority))) => {
+                    admission.proof = Some(authority);
+                    admission.renewal = Some(BrowserCookie::Renew {
+                        port,
+                        digest: issued.id_digest,
+                        id: issued.id,
+                    });
+                }
+                Ok(None) => {}
+                Err((status, error)) => {
+                    return json_reply(status, json!({"ok":false,"error":error}))
+                }
             }
         }
         admitted_context.console_authority = admission.proof.clone();
@@ -1579,5 +1643,198 @@ mod tests {
 
         let agent_asset = make_get(&canonical, "/assets/missing.js", None, Some("agent-tok"));
         assert_eq!(agent_asset.status, 403);
+    }
+
+    #[test]
+    fn local_browser_auto_sign_in_issues_session_only_for_same_user_non_cross_site_when_enabled() {
+        struct PeerGuard;
+        impl Drop for PeerGuard {
+            fn drop(&mut self) {
+                TEST_PEER_SAME_USER.with(|cell| cell.set(None));
+            }
+        }
+        let _guard = PeerGuard;
+        let (_root, context) =
+            super::super::tests::fixture_runtime("front local auto sign-in", "fixture-front-token");
+        let port = 3999;
+        let canonical = crate::console_auth::canonical_host(port);
+        let cfg = context.load_config().unwrap();
+
+        let make_page_req = |host: &str, path: &str, extra: &[(&str, &str)]| {
+            let mut headers = HashMap::from([("host".to_string(), host.to_string())]);
+            for (k, v) in extra {
+                headers.insert((*k).to_string(), (*v).to_string());
+            }
+            Request {
+                method: "GET".to_string(),
+                path: path.to_string(),
+                query: HashMap::new(),
+                headers,
+                body: String::new(),
+                body_too_large: false,
+            }
+        };
+
+        // Unavailable peer (`stream = None`, no test override) -> serves public SPA shell, issues no cookie.
+        TEST_PEER_SAME_USER.with(|cell| cell.set(None));
+        let unavailable = handle_http_request(
+            None,
+            &make_page_req(&canonical, "/settings", &[("sec-fetch-site", "none")]),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(unavailable.status, 200);
+        assert!(unavailable.cookies.is_empty());
+
+        // Different user (`Some(false)`) -> serves public SPA shell, issues no cookie.
+        TEST_PEER_SAME_USER.with(|cell| cell.set(Some(false)));
+        let other_user = handle_http_request(
+            None,
+            &make_page_req(&canonical, "/settings", &[("sec-fetch-site", "none")]),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(other_user.status, 200);
+        assert!(other_user.cookies.is_empty());
+
+        // Same user (`Some(true)`), cross-site / bad Host / agent / explicit token / /login / /setup / API path -> no cookie issued.
+        TEST_PEER_SAME_USER.with(|cell| cell.set(Some(true)));
+        for (req, expected_status) in [
+            (
+                make_page_req(&canonical, "/settings", &[("sec-fetch-site", "cross-site")]),
+                200,
+            ),
+            (
+                make_page_req(&canonical, "/settings", &[("sec-fetch-site", "same-site")]),
+                200,
+            ),
+            (
+                make_page_req(
+                    &canonical,
+                    "/settings",
+                    &[("origin", "http://evil.example")],
+                ),
+                200,
+            ),
+            (
+                make_page_req(&canonical, "/login", &[("sec-fetch-site", "none")]),
+                200,
+            ),
+            (
+                make_page_req(&canonical, "/setup", &[("sec-fetch-site", "none")]),
+                200,
+            ),
+            (make_page_req("evil.example:3999", "/settings", &[]), 403),
+            (
+                make_page_req(&canonical, "/settings", &[("x-agent-token", "agent-123")]),
+                403,
+            ),
+            (
+                make_page_req(
+                    &canonical,
+                    "/settings",
+                    &[("x-console-token", "wrong-token")],
+                ),
+                401,
+            ),
+            (
+                make_page_req(&canonical, "/api/status", &[("sec-fetch-site", "none")]),
+                401,
+            ),
+        ] {
+            let denied = handle_http_request(None, &req, &cfg, &context, port);
+            assert_eq!(
+                denied.status, expected_status,
+                "{} {}",
+                req.path, denied.body
+            );
+            assert!(
+                denied.cookies.is_empty(),
+                "{} must not issue a cookie",
+                req.path
+            );
+        }
+
+        // Same-user canonical page GET -> issues browser cookie & serves page (200).
+        let signed_in = handle_http_request(
+            None,
+            &make_page_req(&canonical, "/settings", &[("sec-fetch-site", "none")]),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(signed_in.status, 200, "{}", signed_in.body);
+        assert_eq!(signed_in.cookies.len(), 1);
+        let cookie_pair = signed_in.cookies[0]
+            .header()
+            .split_once(';')
+            .unwrap()
+            .0
+            .to_string();
+
+        // Issued cookie authenticates /api/auth/status and /api/settings as a browser session.
+        let status_res = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/auth/status",
+                &[("cookie", &cookie_pair), ("sec-fetch-site", "same-origin")],
+            ),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(status_res.status, 200, "{}", status_res.body);
+        let status_json: Value = serde_json::from_str(&status_res.body).unwrap();
+        assert_eq!(status_json["authenticated"], json!(true));
+        assert_eq!(status_json["authKind"], json!("browser"));
+        assert_eq!(status_json["requirePasswordLocally"], json!(false));
+
+        let api_settings = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/settings",
+                &[("cookie", &cookie_pair), ("sec-fetch-site", "same-origin")],
+            ),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(api_settings.status, 200, "{}", api_settings.body);
+
+        // Enabling `security.requirePasswordLocally` turns off auto sign-in even for same user.
+        crate::settings::apply(
+            &context,
+            "security.requirePasswordLocally",
+            &json!(true),
+            "administrator",
+            "console",
+        )
+        .unwrap();
+        let reloaded = context.load_config().unwrap();
+        let disabled = handle_http_request(
+            None,
+            &make_page_req(&canonical, "/settings", &[("sec-fetch-site", "none")]),
+            &reloaded,
+            &context,
+            port,
+        );
+        assert_eq!(disabled.status, 200);
+        assert!(disabled.cookies.is_empty());
+        let unauth_api = handle_http_request(
+            None,
+            &make_page_req(
+                &canonical,
+                "/api/settings",
+                &[("sec-fetch-site", "same-origin")],
+            ),
+            &reloaded,
+            &context,
+            port,
+        );
+        assert_eq!(unauth_api.status, 401);
     }
 }

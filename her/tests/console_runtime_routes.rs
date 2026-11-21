@@ -5169,3 +5169,194 @@ fn backup_restore_preview_requires_admin_and_confirmation_without_stopping_the_c
     assert!(page.body.to_ascii_lowercase().contains("<!doctype html>"));
     drop(console);
 }
+
+#[test]
+fn local_browser_auto_sign_in_over_loopback_tcp() {
+    let fixture = BrowserFixture::new("local-auto-sign-in");
+    let canonical = format!("her.localhost:{}", fixture.port);
+
+    #[cfg(windows)]
+    {
+        let console = fixture.start();
+        let (cross_site, cross_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "cross-site")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(cross_site.status, 200);
+        assert!(!cross_headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+
+        let (page, page_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(page.status, 200, "{}", page.body);
+        let set_cookie = page_headers
+            .lines()
+            .find_map(|line| line.strip_prefix("Set-Cookie: "))
+            .expect("auto sign-in issues browser session cookie");
+        let cookie_pair = set_cookie.split(';').next().unwrap().trim().to_string();
+        assert!(cookie_pair.starts_with(&format!("her_browser_{}_", fixture.port)));
+
+        let (status_res, _) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/api/auth/status",
+            &canonical,
+            &[("Cookie", &cookie_pair), ("Sec-Fetch-Site", "same-origin")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(status_res.status, 200, "{}", status_res.body);
+        let parsed: Value = serde_json::from_str(&status_res.body).unwrap();
+        assert_eq!(parsed["authenticated"], json!(true));
+        assert_eq!(parsed["authKind"], json!("browser"));
+        assert_eq!(parsed["requirePasswordLocally"], json!(false));
+        assert_eq!(parsed["localAutoSignInAvailable"], json!(true));
+
+        let (toggle, _) = fixture.request(
+            "POST",
+            "/api/settings/set",
+            &cookie_pair,
+            Some(json!({"setting": "security.requirePasswordLocally", "value": true, "confirm": true})),
+        );
+        assert_eq!(toggle.status, 200, "{}", toggle.body);
+
+        let (after_toggle, after_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(after_toggle.status, 200);
+        assert!(!after_headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+        drop(console);
+
+        let mismatch = ConsoleProcess::start_with_peer_sid(
+            &fixture.root,
+            fixture.port,
+            &fixture.home,
+            Some("00"),
+        );
+        let reset_cfg = http_request(
+            fixture.port,
+            "POST",
+            "/api/settings/set",
+            Some(BROWSER_MACHINE),
+            None,
+            Some(&json!({"setting": "security.requirePasswordLocally", "value": false, "confirm": true})),
+        )
+        .unwrap();
+        assert_eq!(reset_cfg.status, 200, "{}", reset_cfg.body);
+        let (other_user, other_headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(other_user.status, 200);
+        assert!(!other_headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+        drop(mismatch);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let console = fixture.start();
+        let (page, headers) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/settings",
+            &canonical,
+            &[("Sec-Fetch-Site", "none")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(page.status, 200);
+        assert!(!headers.contains("Set-Cookie:"));
+        assert_eq!(
+            raw_browser_http(
+                fixture.port,
+                "GET",
+                "/api/settings",
+                &canonical,
+                &[("Sec-Fetch-Site", "same-origin")],
+                "",
+            )
+            .unwrap()
+            .0
+            .status,
+            401
+        );
+        let (status_res, _) = raw_browser_http(
+            fixture.port,
+            "GET",
+            "/api/auth/status",
+            &canonical,
+            &[("Sec-Fetch-Site", "same-origin")],
+            "",
+        )
+        .unwrap();
+        assert_eq!(status_res.status, 200, "{}", status_res.body);
+        let parsed: Value = serde_json::from_str(&status_res.body).unwrap();
+        assert_eq!(parsed["authenticated"], json!(false));
+        assert_eq!(parsed["localAutoSignInAvailable"], json!(false));
+        drop(console);
+    }
+}
