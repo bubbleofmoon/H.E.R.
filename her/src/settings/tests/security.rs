@@ -3,7 +3,7 @@
 // routes through the store, the admin agent mode's owner, the seed and the registry.
 use super::*;
 
-const SECURITY_KEYS: [&str; 8] = [
+const SECURITY_KEYS: [&str; 9] = [
     "allow.private",
     "allow.groups",
     "deny.private",
@@ -11,6 +11,7 @@ const SECURITY_KEYS: [&str; 8] = [
     "ownerQQ",
     "security.interceptNotify",
     "security.outboundGuard",
+    "security.requirePasswordLocally",
     "rollout.rustGroups",
 ];
 const KEPT: &str = "group:7001";
