@@ -571,6 +571,7 @@ fn is_bounded_json_post(method: &str, path: &str) -> bool {
         || (matches!(method, "GET" | "POST") && path == "/api/memory/acl")
         || (method == "POST" && path == "/api/restart")
         || (method == "POST" && path.starts_with("/api/settings/"))
+        || (method == "POST" && path.starts_with("/api/auth/"))
 }
 
 fn bounded_post_body_too_large(req: &Request) -> bool {
@@ -997,6 +998,7 @@ fn respond(stream: &mut TcpStream, response: ConsoleResponse) {
         409 => "Conflict",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        429 => "Too Many Requests",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
@@ -14163,21 +14165,40 @@ fn admit_selected_request(
     req: &Request, context: &RuntimeContext, port: u16,
 ) -> Result<FrontAdmission, (u16, String)> {
     use crate::memory_actions::ConsoleCapability;
-    let _gate = acquire_social_state_gate(context)?;
+    let agent_call = has_agent_marker(req);
+    let explicit = presented_console_token(req);
+    let candidates = browser_candidates(req, port)?;
+    let browser_auth = explicit.is_none()
+        && !agent_call
+        && !candidates.is_empty()
+        && (canonical_request(req, port) || !PAGE_MOUNTS.contains(&req.path.as_str()));
+    let _gate = if browser_auth {
+        Some(acquire_social_state_gate(context)?)
+    } else {
+        None
+    };
+    let config = load_front_config(context)
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
     crate::console_auth::ensure_credentials_ready(context)?;
-    let config = load_front_config(context).map_err(|error| (503, error.to_string()))?;
     let expected = context.effective_console_token(&config);
     let memory_route = req.path.starts_with("/api/memory/");
-    let agent_call = has_agent_marker(req);
-    let (proof, renewal, browser_acl) = if let Some(presented) = presented_console_token(req) {
+    let (proof, renewal, browser_acl) = if let Some(presented) = explicit {
         (select_explicit_authority(context, presented, &expected, !has_fetch_metadata(req))?, None, None)
-    } else if !agent_call && !browser_candidates(req, port)?.is_empty()
-        && (canonical_request(req, port) || !PAGE_MOUNTS.contains(&req.path.as_str()))
-    {
+    } else if browser_auth {
         browser_denial(req, port)?;
         if bounded_post_body_too_large(req) { return Err((413, BODY_TOO_LARGE_ERROR.into())); }
         let acl = validate_browser_acl(req)?;
-        let renew = !(req.method == "POST" && req.path == "/api/console/token");
+        let renew = !(req.method == "POST"
+            && matches!(
+                req.path.as_str(),
+                "/api/console/token"
+                    | "/api/auth/first-run"
+                    | "/api/auth/login"
+                    | "/api/auth/logout"
+                    | "/api/auth/change-password"
+                    | "/api/auth/sessions/revoke"
+            ))
+            && !(req.method == "GET" && req.path == "/api/auth/status");
         let (proof, renewal) = select_browser(req, context, port, &expected, renew)?;
         let acl = proof.as_ref().and(acl);
         (proof, renewal, acl)
@@ -14195,6 +14216,482 @@ fn admit_selected_request(
         selected_memory_capability(req, context, &config, &expected)?
     } else { ConsoleCapability::Conversation };
     Ok(FrontAdmission { config, proof, renewal, memory, browser_acl })
+}
+
+fn parse_auth_json_object(body: &str) -> Result<serde_json::Map<String, Value>, (u16, String)> {
+    let Value::Object(map) = serde_json::from_str::<Value>(body)
+        .map_err(|_| (400, "请求体必须是合法 JSON 对象".to_string()))?
+    else {
+        return Err((400, "请求体必须是 JSON 对象".to_string()));
+    };
+    Ok(map)
+}
+
+fn parse_auth_digest(raw: &str) -> Option<[u8; 32]> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    if raw.len() != 43 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(raw).ok()?;
+    let digest: [u8; 32] = bytes.try_into().ok()?;
+    if URL_SAFE_NO_PAD.encode(digest) != raw {
+        return None;
+    }
+    Some(digest)
+}
+
+fn auth_retry_seconds(retry_after_ms: i64) -> i64 {
+    if retry_after_ms <= 0 {
+        0
+    } else {
+        retry_after_ms.saturating_add(999) / 1000
+    }
+}
+
+fn issue_session_cookie_response(
+    port: u16,
+    issued: crate::settings::IssuedSession,
+) -> ConsoleResponse {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    let mut response = ConsoleResponse::from((
+        200,
+        "application/json; charset=utf-8".to_string(),
+        json!({
+            "ok": true,
+            "authenticated": true,
+            "sessionId": URL_SAFE_NO_PAD.encode(issued.id_digest),
+        })
+        .to_string(),
+    ));
+    response.cookies.push(BrowserCookie::Renew {
+        port,
+        digest: issued.id_digest,
+        id: issued.id,
+    });
+    response
+}
+
+fn auth_status_route(
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::ConsoleAuthority;
+    let json_reply = |status: u16, value: Value| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            value.to_string(),
+        ))
+    };
+    let snapshot = match crate::settings::auth_status(context) {
+        Ok(snapshot) => snapshot,
+        Err((code, msg)) => return json_reply(code, json!({ "ok": false, "error": msg })),
+    };
+    let auth_kind = match &admission.proof {
+        Some(ConsoleAuthority::Browser { .. }) => json!("browser"),
+        Some(ConsoleAuthority::Desktop { .. }) => json!("desktop"),
+        Some(ConsoleAuthority::Machine { .. }) => json!("machine"),
+        None => Value::Null,
+    };
+    json_reply(
+        200,
+        json!({
+            "ok": true,
+            "passwordSet": snapshot.password_set,
+            "authenticated": admission.proof.is_some(),
+            "authKind": auth_kind,
+            "canonicalOrigin": crate::console_auth::canonical_origin(port),
+            "tokenFile": "data/console-token",
+            "consecutiveFailures": snapshot.consecutive_failures,
+            "retryAfterMs": snapshot.retry_after_ms,
+            "retryAfterSeconds": auth_retry_seconds(snapshot.retry_after_ms),
+        }),
+    )
+}
+
+fn auth_first_run_route(req: &Request, context: &RuntimeContext, port: u16) -> ConsoleResponse {
+    use crate::console_auth::PasswordError;
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    if let Err((code, msg)) = browser_denial(req, port) {
+        return err(code, &msg);
+    }
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let Some(token) = fields
+        .get("consoleToken")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return err(400, "缺少 consoleToken");
+    };
+    let Some(password) = fields.get("password").and_then(Value::as_str) else {
+        return err(400, "缺少 password");
+    };
+    match crate::console_auth::auth_first_run_browser(context, port, token, password) {
+        Ok(issued) => issue_session_cookie_response(port, issued),
+        Err(PasswordError::Input) => err(400, "管理员密码至少需要 8 个字符，且不能超过 1024 个字符"),
+        Err(PasswordError::Proof) => err(401, "控制台令牌校验失败"),
+        Err(PasswordError::AlreadySet) => err(409, "管理员密码已设置"),
+        Err(PasswordError::Busy | PasswordError::Unavailable) => {
+            err(503, "administrator password storage is unavailable")
+        }
+    }
+}
+
+fn auth_login_route(req: &Request, context: &RuntimeContext, port: u16) -> ConsoleResponse {
+    use crate::console_auth::LoginError;
+    let err = |status: u16, value: Value| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            value.to_string(),
+        ))
+    };
+    if let Err((code, msg)) = browser_denial(req, port) {
+        return err(code, json!({ "ok": false, "error": msg }));
+    }
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, json!({ "ok": false, "error": msg })),
+    };
+    let Some(password) = fields.get("password").and_then(Value::as_str) else {
+        return err(400, json!({ "ok": false, "error": "缺少 password" }));
+    };
+    match crate::console_auth::auth_login(context, port, password) {
+        Ok(issued) => issue_session_cookie_response(port, issued),
+        Err(LoginError::Input) => err(400, json!({ "ok": false, "error": "密码长度超出限制" })),
+        Err(LoginError::NotSet) => err(
+            409,
+            json!({ "ok": false, "passwordSet": false, "error": "尚未设置管理员密码" }),
+        ),
+        Err(LoginError::WrongPassword { retry_after_ms, consecutive_failures }) => err(
+            401,
+            json!({
+                "ok": false,
+                "error": "管理员密码错误",
+                "consecutiveFailures": consecutive_failures,
+                "retryAfterMs": retry_after_ms,
+                "retryAfterSeconds": auth_retry_seconds(retry_after_ms),
+            }),
+        ),
+        Err(LoginError::Throttled { retry_after_ms, consecutive_failures }) => err(
+            429,
+            json!({
+                "ok": false,
+                "error": "尝试次数过多，请稍后再试",
+                "consecutiveFailures": consecutive_failures,
+                "retryAfterMs": retry_after_ms,
+                "retryAfterSeconds": auth_retry_seconds(retry_after_ms),
+            }),
+        ),
+        Err(LoginError::Busy | LoginError::Unavailable) => {
+            err(503, json!({ "ok": false, "error": "administrator authentication is unavailable" }))
+        }
+    }
+}
+
+fn auth_logout_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::ConsoleAuthority;
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    if let Err((code, msg)) = browser_denial(req, port) {
+        return err(code, &msg);
+    }
+    let _gate = match acquire_social_state_gate(context) {
+        Ok(gate) => gate,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let mut digests = Vec::new();
+    if let Some(ConsoleAuthority::Browser { grant, .. }) = &admission.proof {
+        if let Err((code, msg)) = crate::settings::revoke_browser_session_by_digest(context, grant.id_digest) {
+            return err(code, &msg);
+        }
+        digests.push(grant.id_digest);
+    }
+    if let Ok(candidates) = browser_candidates(req, port) {
+        for (digest, _) in candidates {
+            if !digests.iter().any(|existing| crate::console_auth::digests_equal(existing, &digest)) {
+                digests.push(digest);
+            }
+        }
+    }
+    let mut response = ConsoleResponse::from((
+        200,
+        "application/json; charset=utf-8".to_string(),
+        json!({ "ok": true }).to_string(),
+    ));
+    for digest in digests {
+        response.cookies.push(BrowserCookie::Delete { port, digest });
+    }
+    response
+}
+
+fn auth_change_password_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::{ChangePasswordError, ConsoleAuthority};
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    let Some(authority) = &admission.proof else {
+        return err(401, "console credential is required");
+    };
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let Some(current_password) = fields.get("currentPassword").and_then(Value::as_str) else {
+        return err(400, "缺少 currentPassword");
+    };
+    let Some(new_password) = fields.get("newPassword").and_then(Value::as_str) else {
+        return err(400, "缺少 newPassword");
+    };
+    match crate::console_auth::auth_change_password(
+        context,
+        port,
+        authority,
+        current_password,
+        new_password,
+    ) {
+        Ok(rotated) => {
+            let mut response = ConsoleResponse::from((
+                200,
+                "application/json; charset=utf-8".to_string(),
+                json!({ "ok": true, "sessionRotated": rotated.is_some() }).to_string(),
+            ));
+            if let (ConsoleAuthority::Browser { grant, .. }, Some(issued)) = (authority, rotated) {
+                response.cookies.push(BrowserCookie::Delete {
+                    port,
+                    digest: grant.id_digest,
+                });
+                response.cookies.push(BrowserCookie::Renew {
+                    port,
+                    digest: issued.id_digest,
+                    id: issued.id,
+                });
+            }
+            response
+        }
+        Err(ChangePasswordError::Input) => err(400, "管理员密码至少需要 8 个字符，且不能超过 1024 个字符"),
+        Err(ChangePasswordError::WrongCurrent) => err(401, "当前密码错误"),
+        Err(ChangePasswordError::Revoked) => err(401, "console credential was revoked"),
+        Err(ChangePasswordError::NotSet) => err(409, "尚未设置管理员密码"),
+        Err(ChangePasswordError::Busy | ChangePasswordError::Unavailable) => {
+            err(503, "administrator password storage is unavailable")
+        }
+    }
+}
+
+fn auth_sessions_list_route(
+    context: &RuntimeContext,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::ConsoleAuthority;
+    let json_reply = |status: u16, value: Value| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            value.to_string(),
+        ))
+    };
+    let Some(authority) = &admission.proof else {
+        return json_reply(401, json!({ "ok": false, "error": "console credential is required" }));
+    };
+    let (token_digest, current_id) = match authority {
+        ConsoleAuthority::Browser { token_digest, grant } => (*token_digest, Some(grant.id_digest)),
+        ConsoleAuthority::Machine { token_digest } | ConsoleAuthority::Desktop { token_digest, .. } => {
+            (*token_digest, None)
+        }
+    };
+    match crate::settings::list_browser_sessions(context, token_digest, current_id) {
+        Ok(sessions) => json_reply(200, json!({ "ok": true, "sessions": sessions })),
+        Err((code, msg)) => json_reply(code, json!({ "ok": false, "error": msg })),
+    }
+}
+
+fn auth_sessions_revoke_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> ConsoleResponse {
+    use crate::console_auth::ConsoleAuthority;
+    enum RevokeTarget {
+        One([u8; 32]),
+        Others([u8; 32]),
+        All,
+    }
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    let Some(authority) = &admission.proof else {
+        return err(401, "console credential is required");
+    };
+    let fields = match parse_auth_json_object(&req.body) {
+        Ok(fields) => fields,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let id_field = fields.get("id").filter(|v| !v.is_null());
+    let others_field = match fields.get("others") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return err(400, "others 必须是布尔值"),
+    };
+    let all_field = match fields.get("all") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return err(400, "all 必须是布尔值"),
+    };
+    let target = match (id_field, others_field, all_field) {
+        (Some(Value::String(raw)), false, false) => {
+            let Some(digest) = parse_auth_digest(raw) else {
+                return err(400, "无效的会话 id");
+            };
+            RevokeTarget::One(digest)
+        }
+        (None, true, false) => {
+            let ConsoleAuthority::Browser { grant, .. } = authority else {
+                return err(400, "仅当前浏览器会话支持撤销其他会话，撤销全部请传 all: true");
+            };
+            RevokeTarget::Others(grant.id_digest)
+        }
+        (None, false, true) => RevokeTarget::All,
+        _ => return err(400, "请明确指定 id、others: true 或 all: true"),
+    };
+
+    let _gate = match acquire_social_state_gate(context) {
+        Ok(gate) => gate,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    let cfg = match selected_config_for_handler(context) {
+        Ok(cfg) => cfg,
+        Err((code, msg)) => return err(code, &msg),
+    };
+    if let Err((code, msg)) = authority.recheck(context, &cfg) {
+        return err(code, &msg);
+    }
+    let (revoked_count, delete_own) = match target {
+        RevokeTarget::One(digest) => {
+            match crate::settings::revoke_browser_session_by_digest(context, digest) {
+                Ok(removed) => {
+                    let own = matches!(
+                        authority,
+                        ConsoleAuthority::Browser { grant, .. }
+                            if crate::console_auth::digests_equal(&grant.id_digest, &digest)
+                    )
+                    .then_some(digest);
+                    (usize::from(removed), own)
+                }
+                Err((code, msg)) => return err(code, &msg),
+            }
+        }
+        RevokeTarget::Others(keep) => {
+            match crate::settings::revoke_other_browser_sessions(context, Some(keep)) {
+                Ok(count) => (count, None),
+                Err((code, msg)) => return err(code, &msg),
+            }
+        }
+        RevokeTarget::All => {
+            match crate::settings::revoke_other_browser_sessions(context, None) {
+                Ok(count) => {
+                    let own = match authority {
+                        ConsoleAuthority::Browser { grant, .. } => Some(grant.id_digest),
+                        _ => None,
+                    };
+                    (count, own)
+                }
+                Err((code, msg)) => return err(code, &msg),
+            }
+        }
+    };
+    let mut response = ConsoleResponse::from((
+        200,
+        "application/json; charset=utf-8".to_string(),
+        json!({ "ok": true, "revoked": revoked_count }).to_string(),
+    ));
+    if let Some(digest) = delete_own {
+        response.cookies.push(BrowserCookie::Delete { port, digest });
+    }
+    response
+}
+
+fn handle_auth_route(
+    req: &Request,
+    context: &RuntimeContext,
+    port: u16,
+    admission: &FrontAdmission,
+) -> Option<ConsoleResponse> {
+    if !context.is_isolated() || !req.path.starts_with("/api/auth/") {
+        return None;
+    }
+    let err = |status: u16, message: &str| {
+        ConsoleResponse::from((
+            status,
+            "application/json; charset=utf-8".to_string(),
+            json!({ "ok": false, "error": message }).to_string(),
+        ))
+    };
+    if has_agent_marker(req) {
+        return Some(err(403, "agent credential cannot access console authentication"));
+    }
+    if bounded_post_body_too_large(req) {
+        return Some(err(413, BODY_TOO_LARGE_ERROR));
+    }
+    let response = match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/auth/status") => auth_status_route(context, port, admission),
+        ("POST", "/api/auth/first-run") => auth_first_run_route(req, context, port),
+        ("POST", "/api/auth/login") => auth_login_route(req, context, port),
+        ("POST", "/api/auth/logout") => auth_logout_route(req, context, port, admission),
+        ("POST", "/api/auth/change-password") => {
+            auth_change_password_route(req, context, port, admission)
+        }
+        ("GET", "/api/auth/sessions") => auth_sessions_list_route(context, admission),
+        ("POST", "/api/auth/sessions/revoke") => {
+            auth_sessions_revoke_route(req, context, port, admission)
+        }
+        (
+            _,
+            "/api/auth/status"
+            | "/api/auth/first-run"
+            | "/api/auth/login"
+            | "/api/auth/logout"
+            | "/api/auth/change-password"
+            | "/api/auth/sessions"
+            | "/api/auth/sessions/revoke",
+        ) => err(405, "method not allowed"),
+        _ => err(404, "not found"),
+    };
+    Some(response)
 }
 
 fn handle_conn(
@@ -14357,12 +14854,34 @@ fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16
         Vec::new()
     };
     take_config_writes();
-    let (status, ctype, mut body, renewal) = if let Some(admission) = admission {
-        let (status, ctype, body) = route_with_context(req, &admission.config, context, admission.memory, admission.browser_acl);
-        (status, ctype, body, admission.renewal)
+    let (status, ctype, mut body, auth_cookies, renewal) = if let Some(admission) = admission {
+        if let Some(auth_response) = handle_auth_route(req, context, port, &admission) {
+            (
+                auth_response.status,
+                auth_response.content_type,
+                auth_response.body,
+                auth_response.cookies,
+                admission.renewal,
+            )
+        } else {
+            let (status, ctype, body) = route_with_context(
+                req,
+                &admission.config,
+                context,
+                admission.memory,
+                admission.browser_acl,
+            );
+            (status, ctype, body, Vec::new(), admission.renewal)
+        }
     } else {
-        let (status, ctype, body) = route_with_context(req, cfg, context, crate::memory_actions::ConsoleCapability::Conversation, None);
-        (status, ctype, body, None)
+        let (status, ctype, body) = route_with_context(
+            req,
+            cfg,
+            context,
+            crate::memory_actions::ConsoleCapability::Conversation,
+            None,
+        );
+        (status, ctype, body, Vec::new(), None)
     };
     let config_writes = take_config_writes();
     // Selected runtime: every administrator write is recorded with its actual result, including
@@ -14382,7 +14901,9 @@ fn serve_request(req: &Request, cfg: &Value, context: &RuntimeContext, port: u16
         }
     }
     let mut response = ConsoleResponse::from((status, ctype, body));
-    if (200..300).contains(&status) && req.method == "POST" && req.path == "/api/console/token" {
+    if !auth_cookies.is_empty() {
+        response.cookies = auth_cookies;
+    } else if (200..300).contains(&status) && req.method == "POST" && req.path == "/api/console/token" {
         if let Some(crate::console_auth::ConsoleAuthority::Browser { grant, .. }) = &context.console_authority {
             response.cookies.push(BrowserCookie::Delete { port, digest: grant.id_digest });
         }
@@ -15600,6 +16121,414 @@ mod tests {
             assert!(completed["run"]["startedAt"].is_null());
             assert!(!root.0.join("data/backups").exists());
         }
+    }
+
+    fn cookie_pair(response: &ConsoleResponse) -> String {
+        response
+            .cookies
+            .iter()
+            .filter_map(|cookie| match cookie {
+                BrowserCookie::Renew { .. } => {
+                    let header = cookie.header();
+                    assert!(header.contains("HttpOnly"));
+                    assert!(header.contains("SameSite=Strict"));
+                    assert!(header.contains("Path=/"));
+                    assert!(header.contains("Max-Age=604800"));
+                    header.split(';').next().map(str::to_string)
+                }
+                BrowserCookie::Delete { .. } => None,
+            })
+            .next()
+            .expect("expected a Renew browser cookie")
+    }
+
+    fn post_browser_auth(path: &str, cookie: Option<&str>, body: Value) -> Request {
+        browser_request("POST", path, cookie.unwrap_or(""), Some(body))
+    }
+
+    #[test]
+    fn auth_first_run_sets_password_issues_cookie_and_rejects_second_attempt() {
+        let (root, context) = fixture_runtime("auth first-run route", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let config_before = std::fs::read(root.0.join("config/config.json")).unwrap();
+
+        let status_before = browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None));
+        assert_eq!(status_before.status, 200);
+        let status_json: Value = serde_json::from_str(&status_before.body).unwrap();
+        assert_eq!(status_json["passwordSet"], false);
+        assert_eq!(status_json["authenticated"], false);
+
+        let bad_token = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": "wrong-token", "password": "初始管理员密码1"}),
+            ),
+        );
+        assert_eq!(bad_token.status, 401);
+
+        let short_pw = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": BROWSER_FIXTURE_TOKEN, "password": "shortpw"}),
+            ),
+        );
+        assert_eq!(short_pw.status, 400);
+
+        let secret_pw = "初始管理员密码-first-run";
+        let ok = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": BROWSER_FIXTURE_TOKEN, "password": secret_pw}),
+            ),
+        );
+        assert_eq!(ok.status, 200, "{}", ok.body);
+        let cookie = cookie_pair(&ok);
+
+        assert_eq!(
+            browser_reply(&context, &browser_request("GET", "/api/status", &cookie, None)).status,
+            200
+        );
+        let status_after: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", &cookie, None)).body,
+        )
+        .unwrap();
+        assert_eq!(status_after["passwordSet"], true);
+        assert_eq!(status_after["authenticated"], true);
+        assert_eq!(status_after["authKind"], "browser");
+
+        let second = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/first-run",
+                None,
+                json!({"consoleToken": BROWSER_FIXTURE_TOKEN, "password": "另一个密码1234"}),
+            ),
+        );
+        assert_eq!(second.status, 409);
+
+        assert_eq!(std::fs::read(root.0.join("config/config.json")).unwrap(), config_before);
+        let history = probe.audit_rows();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["old"], "\"(hidden)\"");
+        assert_eq!(history[0]["new"], "\"(hidden)\"");
+        assert!(!history[0].to_string().contains(secret_pw));
+    }
+
+    #[test]
+    fn auth_login_logout_and_agent_isolation() {
+        let (root, context) = fixture_runtime("auth login logout", BROWSER_FIXTURE_TOKEN);
+        let pw = "测试登录密码-99";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+        std::fs::write(
+            root.0.join("data/social-v2.json"),
+            serde_json::to_vec(&json!({"conversations":{"private:7001":{"agentToken":"agent-tok-1"}}})).unwrap(),
+        )
+        .unwrap();
+
+        let mut cross = post_browser_auth("/api/auth/login", None, json!({"password": pw}));
+        cross.headers.insert("origin".into(), "http://localhost:3999".into());
+        assert_eq!(browser_reply(&context, &cross).status, 403);
+
+        let login1 = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(login1.status, 200, "{}", login1.body);
+        let cookie1 = cookie_pair(&login1);
+
+        let login2 = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(login2.status, 200, "{}", login2.body);
+        let cookie2 = cookie_pair(&login2);
+
+        for (method, path) in [
+            ("GET", "/api/auth/status"),
+            ("POST", "/api/auth/login"),
+            ("POST", "/api/auth/first-run"),
+            ("POST", "/api/auth/logout"),
+            ("POST", "/api/auth/change-password"),
+            ("GET", "/api/auth/sessions"),
+            ("POST", "/api/auth/sessions/revoke"),
+        ] {
+            let mut agent_req = browser_request(method, path, &cookie1, Some(json!({})));
+            agent_req.headers.insert("x-agent-token".into(), "agent-tok-1".into());
+            assert_eq!(browser_reply(&context, &agent_req).status, 403, "agent denied on {method} {path}");
+        }
+
+        let logout = browser_reply(&context, &post_browser_auth("/api/auth/logout", Some(&cookie1), json!({})));
+        assert_eq!(logout.status, 200);
+        assert!(logout.cookies.iter().any(|c| matches!(c, BrowserCookie::Delete { .. })));
+
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 200);
+    }
+
+    #[test]
+    fn auth_login_throttle_backs_off_after_five_failures_and_clears_on_success_or_reset() {
+        let (root, context) = fixture_runtime("auth throttle backoff", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let pw = "正确登录密码-42";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+
+        assert_eq!(crate::settings::throttle_delay_ms(4), 0);
+        assert_eq!(crate::settings::throttle_delay_ms(5), 60_000);
+        assert_eq!(crate::settings::throttle_delay_ms(6), 120_000);
+        assert_eq!(crate::settings::throttle_delay_ms(7), 240_000);
+        assert_eq!(crate::settings::throttle_delay_ms(8), 480_000);
+        assert_eq!(crate::settings::throttle_delay_ms(9), crate::settings::THROTTLE_MAX_MS);
+        assert_eq!(crate::settings::throttle_delay_ms(12), crate::settings::THROTTLE_MAX_MS);
+
+        for attempt in 1..=4 {
+            let resp = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
+            assert_eq!(resp.status, 401);
+            let body: Value = serde_json::from_str(&resp.body).unwrap();
+            assert_eq!(body["consecutiveFailures"], attempt);
+            assert_eq!(body["retryAfterMs"], 0);
+        }
+
+        let fifth = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
+        assert_eq!(fifth.status, 401);
+        let fifth_json: Value = serde_json::from_str(&fifth.body).unwrap();
+        assert_eq!(fifth_json["consecutiveFailures"], 5);
+        assert_eq!(fifth_json["retryAfterMs"], 60_000);
+        assert_eq!(fifth_json["retryAfterSeconds"], 60);
+
+        let throttled = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(throttled.status, 429, "valid password during throttle must still wait: {}", throttled.body);
+        let throttled_json: Value = serde_json::from_str(&throttled.body).unwrap();
+        assert_eq!(throttled_json["consecutiveFailures"], 5);
+        assert!(throttled_json["retryAfterMs"].as_i64().unwrap() > 0);
+
+        let far_future = crate::parity_clock::now_ms() + 3_600_000;
+        probe.edit(&format!("UPDATE console_auth_state SET deadline_ms={far_future} WHERE id=1;"));
+        let status_clamped: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
+        )
+        .unwrap();
+        assert!(status_clamped["retryAfterMs"].as_i64().unwrap() <= crate::settings::THROTTLE_MAX_MS);
+
+        probe.edit("UPDATE console_auth_state SET deadline_ms=1 WHERE id=1;");
+        let sixth = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": "wrong-password"})));
+        assert_eq!(sixth.status, 401);
+        let sixth_json: Value = serde_json::from_str(&sixth.body).unwrap();
+        assert_eq!(sixth_json["consecutiveFailures"], 6);
+        assert_eq!(sixth_json["retryAfterMs"], 120_000);
+
+        probe.edit("UPDATE console_auth_state SET deadline_ms=1 WHERE id=1;");
+        let success = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(success.status, 200, "{}", success.body);
+        let after_ok: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
+        )
+        .unwrap();
+        assert_eq!(after_ok["consecutiveFailures"], 0);
+        assert_eq!(after_ok["retryAfterMs"], 0);
+
+        let cookie = cookie_pair(&success);
+        let far_future_reset = crate::parity_clock::now_ms() + 3_600_000;
+        probe.edit(&format!("UPDATE console_auth_state SET consecutive_failures=5, deadline_ms={far_future_reset} WHERE id=1;"));
+        {
+            let _gate = config_gate(&context).unwrap();
+            crate::settings::reset_administrator_password(&context).unwrap();
+        }
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie, None)).status, 401);
+        let after_reset: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/status", "", None)).body,
+        )
+        .unwrap();
+        assert_eq!(after_reset["passwordSet"], false);
+        assert_eq!(after_reset["consecutiveFailures"], 0);
+        assert_eq!(after_reset["retryAfterMs"], 0);
+    }
+
+    #[test]
+    fn auth_login_clamps_clock_rollback_throttle_in_store_and_ignores_stale_cookie() {
+        let (root, context) = fixture_runtime("auth rollback clamp and stale cookie", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let pw = "回拨夹紧密码-88";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+
+        let initial_login = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(initial_login.status, 200);
+        let stale_cookie = cookie_pair(&initial_login);
+        {
+            let _gate = config_gate(&context).unwrap();
+            crate::settings::revoke_browser_sessions(&context).unwrap();
+        }
+        let relogin = browser_reply(
+            &context,
+            &post_browser_auth("/api/auth/login", Some(&stale_cookie), json!({"password": pw})),
+        );
+        assert_eq!(relogin.status, 200, "revoked prior cookie must not block valid password login: {}", relogin.body);
+        let fresh_cookie = cookie_pair(&relogin);
+        assert_ne!(fresh_cookie, stale_cookie);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &fresh_cookie, None)).status, 200);
+
+        let rollback_deadline = crate::parity_clock::now_ms() + 2 * 60 * 60 * 1000;
+        probe.edit(&format!("UPDATE console_auth_state SET consecutive_failures=5, deadline_ms={rollback_deadline} WHERE id=1;"));
+
+        let throttled = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(throttled.status, 429, "{}", throttled.body);
+        let throttled_json: Value = serde_json::from_str(&throttled.body).unwrap();
+        assert!(throttled_json["retryAfterMs"].as_i64().unwrap() <= crate::settings::THROTTLE_MAX_MS);
+
+        let clamped_deadline: i64 = probe
+            .open()
+            .query_row("SELECT deadline_ms FROM console_auth_state WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            clamped_deadline <= crate::parity_clock::now_ms() + crate::settings::THROTTLE_MAX_MS,
+            "stored rollback deadline {clamped_deadline} must be clamped within 15 minutes"
+        );
+
+        let past_fifteen_min = clamped_deadline - crate::settings::THROTTLE_MAX_MS - 1;
+        probe.edit(&format!("UPDATE console_auth_state SET deadline_ms={past_fifteen_min} WHERE id=1;"));
+        let recovered = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(recovered.status, 200, "login must succeed once 15-minute clamped window elapses: {}", recovered.body);
+        let _ = cookie_pair(&recovered);
+    }
+
+    #[test]
+    fn auth_change_password_returns_401_when_session_revoked_under_gate() {
+        let (_root, context) = fixture_runtime("auth change password revoked", BROWSER_FIXTURE_TOKEN);
+        let old_pw = "改密撤销测试-1";
+        let new_pw = "改密撤销测试-2";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, old_pw, "administrator").unwrap();
+        let cookie = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))));
+
+        let context_for_cut = context.clone();
+        AFTER_ADMISSION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _gate = config_gate(&context_for_cut).unwrap();
+                crate::settings::revoke_browser_sessions(&context_for_cut).unwrap();
+            }));
+        });
+        let revoked = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/change-password",
+                Some(&cookie),
+                json!({"currentPassword": old_pw, "newPassword": new_pw}),
+            ),
+        );
+        assert_eq!(revoked.status, 401, "revoked proof at writer gate must return 401: {}", revoked.body);
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))).status, 200);
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": new_pw}))).status, 401);
+    }
+
+    #[test]
+    fn auth_change_password_rotates_current_session_and_ends_others() {
+        let (root, context) = fixture_runtime("auth change password", BROWSER_FIXTURE_TOKEN);
+        let probe = crate::settings::StoreProbe::at(&root.0);
+        let old_pw = "原始密码-alpha";
+        let new_pw = "更新密码-omega";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, old_pw, "administrator").unwrap();
+
+        let cookie1 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))));
+        let cookie2 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))));
+
+        let wrong = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/change-password",
+                Some(&cookie1),
+                json!({"currentPassword": "wrong-current-password", "newPassword": new_pw}),
+            ),
+        );
+        assert_eq!(wrong.status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 200);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 200);
+
+        let changed = browser_reply(
+            &context,
+            &post_browser_auth(
+                "/api/auth/change-password",
+                Some(&cookie1),
+                json!({"currentPassword": old_pw, "newPassword": new_pw}),
+            ),
+        );
+        assert_eq!(changed.status, 200, "{}", changed.body);
+        assert!(changed.cookies.iter().any(|c| matches!(c, BrowserCookie::Delete { .. })));
+        let rotated_cookie = cookie_pair(&changed);
+        assert_ne!(rotated_cookie, cookie1);
+
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &rotated_cookie, None)).status, 200);
+
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": old_pw}))).status, 401);
+        assert_eq!(browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": new_pw}))).status, 200);
+
+        let rows = probe.audit_rows();
+        let last = rows.last().unwrap();
+        assert_eq!(last["source"], "change-password");
+        assert_eq!(last["old"], "\"(hidden)\"");
+        assert_eq!(last["new"], "\"(hidden)\"");
+        assert!(!last.to_string().contains(old_pw) && !last.to_string().contains(new_pw));
+    }
+
+    #[test]
+    fn auth_sessions_list_and_revoke_single_or_others() {
+        let (_root, context) = fixture_runtime("auth sessions manage", BROWSER_FIXTURE_TOKEN);
+        let pw = "会话管理密码-77";
+        crate::console_auth::first_run(&context, BROWSER_FIXTURE_TOKEN, pw, "administrator").unwrap();
+
+        let cookie1 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw}))));
+        let cookie2 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw}))));
+        let cookie3 = cookie_pair(&browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw}))));
+
+        let listed = browser_reply(&context, &browser_request("GET", "/api/auth/sessions", &cookie1, None));
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        let sessions: Value = serde_json::from_str(&listed.body).unwrap();
+        let items = sessions["sessions"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items.iter().filter(|item| item["current"] == true).count(), 1);
+        let other_id = items
+            .iter()
+            .find(|item| item["current"] == false)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let revoke_one = browser_reply(
+            &context,
+            &post_browser_auth("/api/auth/sessions/revoke", Some(&cookie1), json!({"id": other_id})),
+        );
+        assert_eq!(revoke_one.status, 200);
+        assert_eq!(serde_json::from_str::<Value>(&revoke_one.body).unwrap()["revoked"], 1);
+
+        let revoke_others = browser_reply(
+            &context,
+            &post_browser_auth("/api/auth/sessions/revoke", Some(&cookie1), json!({"others": true})),
+        );
+        assert_eq!(revoke_others.status, 200);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 200);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie2, None)).status, 401);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie3, None)).status, 401);
+
+        {
+            let _gate = config_gate(&context).unwrap();
+            let origin = crate::console_auth::canonical_origin(BROWSER_FIXTURE_PORT);
+            let digest = crate::console_auth::credential_digest(BROWSER_FIXTURE_TOKEN);
+            for _ in 0..crate::console_auth::MAX_BROWSER_SESSIONS {
+                crate::settings::issue_browser_session(&context, &origin, digest).unwrap();
+            }
+        }
+        let newest = browser_reply(&context, &post_browser_auth("/api/auth/login", None, json!({"password": pw})));
+        assert_eq!(newest.status, 200);
+        let newest_cookie = cookie_pair(&newest);
+        assert_eq!(browser_reply(&context, &browser_request("GET", "/api/status", &cookie1, None)).status, 401);
+        let capped: Value = serde_json::from_str(
+            &browser_reply(&context, &browser_request("GET", "/api/auth/sessions", &newest_cookie, None)).body,
+        )
+        .unwrap();
+        assert_eq!(
+            capped["sessions"].as_array().unwrap().len(),
+            crate::console_auth::MAX_BROWSER_SESSIONS
+        );
     }
 
     fn cfg() -> Value {
@@ -18236,6 +19165,19 @@ mod tests {
         agent_token: Option<&str>,
         body: Option<&str>,
     ) -> (u16, Value) {
+        let host = format!("127.0.0.1:{port}");
+        http_json_with_host(port, &host, method, path, token, agent_token, body)
+    }
+
+    fn http_json_with_host(
+        port: u16,
+        host: &str,
+        method: &str,
+        path: &str,
+        token: &str,
+        agent_token: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, Value) {
         let body = body.unwrap_or("");
         let agent_header = agent_token
             .map(|value| format!("x-agent-token: {value}\r\n"))
@@ -18245,7 +19187,7 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-console-token: {token}\r\n{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nx-console-token: {token}\r\n{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.as_bytes().len()
         );
         stream.write_all(request.as_bytes()).unwrap();
@@ -23502,8 +24444,10 @@ mod tests {
         let (port_a, server_a) = start_http_fixture(context_a, 10);
         let (port_b, server_b) = start_http_fixture(context_b, 9);
 
-        let (page_a_status, page_a) = http_json(port_a, "GET", "/", token_a, None);
-        let (page_b_status, page_b) = http_json(port_b, "GET", "/", token_b, None);
+        let host_a = crate::console_auth::canonical_host(port_a);
+        let host_b = crate::console_auth::canonical_host(port_b);
+        let (page_a_status, page_a) = http_json_with_host(port_a, &host_a, "GET", "/", token_a, None, None);
+        let (page_b_status, page_b) = http_json_with_host(port_b, &host_b, "GET", "/", token_b, None, None);
         assert_eq!(page_a_status, 200, "selected A page should be served: {page_a}");
         assert_eq!(page_b_status, 200, "selected B page should be served: {page_b}");
         assert!(page_a["raw"].as_str().unwrap().contains("selected-a"));

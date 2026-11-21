@@ -8,9 +8,14 @@ mod console_auth;
 mod conversation;
 
 pub(crate) use console_auth::{
-    admit_browser, archive_credentials, recheck_browser, reset_administrator_password,
-    revoke_browser_sessions, scrub_auth_snapshot, start_browser_clock,
-    set_initial_administrator_password, ArchivedCredentials,
+    admit_browser, archive_credentials, auth_status, change_administrator_password,
+    clamp_throttle_deadline, complete_login, issue_browser_session, list_browser_sessions,
+    load_login_challenge, recheck_browser, record_login_failure, reset_administrator_password,
+    revoke_browser_session_by_digest, revoke_browser_sessions, revoke_other_browser_sessions,
+    scrub_auth_snapshot, set_initial_administrator_password,
+    set_initial_administrator_password_with_session, start_browser_clock, throttle_delay_ms,
+    ArchivedCredentials, AuthStatusSnapshot, BrowserSessionView, IssuedSession, LoginChallenge,
+    LoginFailureState, LoginOutcome, THROTTLE_MAX_MS,
 };
 
 #[cfg(test)]

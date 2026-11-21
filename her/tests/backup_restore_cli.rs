@@ -49,6 +49,7 @@ impl Fixture {
         for (name, source) in [
             ("memory.db", "data/memory.db"),
             ("conversations.db", "data/conversations.db"),
+            ("state/social-v2.json", "data/social-v2.json"),
             ("config.json", "config/config.json"),
         ]
         .into_iter()

@@ -57,10 +57,17 @@ pub(crate) fn new_generation() -> Result<Generation, PasswordError> {
     Ok(generation)
 }
 
+/// Lock order: credential_mutation_gate -> config_gate -> browser_anchors -> store_gate (Argon2id never runs inside any gate).
 pub(crate) fn credential_mutation_gate(context: &RuntimeContext) -> Result<fs::File, String> {
     context
         .open_locked_file(RuntimeArea::Data, "locks/console-credential.lock")
         .map_err(|_| "console credential mutation is busy or unavailable".to_string())
+}
+
+fn unauthenticated_context(context: &RuntimeContext) -> RuntimeContext {
+    let mut unauth = context.clone();
+    unauth.console_authority = None;
+    unauth
 }
 
 pub(crate) fn open_protected_auth_file(path: &Path) -> Result<Option<fs::File>, String> {
@@ -168,6 +175,7 @@ pub(crate) struct BrowserProof {
     pub(crate) restore_generation: Generation,
 }
 
+/// Lock order: credential_mutation_gate -> config_gate -> browser_anchors -> store_gate (Argon2id never runs inside any gate).
 #[derive(Debug, Default)]
 pub(crate) struct BrowserAnchors(
     pub(crate) std::sync::Mutex<std::collections::HashMap<[u8; 32], (i64, std::time::Instant)>>,
@@ -454,8 +462,6 @@ impl AdministratorPasswordHash {
         Ok(Self(hash.to_string()))
     }
 
-    // Used by browser login and current-password verification.
-    #[allow(dead_code)]
     pub(crate) fn verify(&self, password: &str) -> Result<bool, PasswordError> {
         validate_password_maximum(password)?;
         let hash = Self::parse_phc(self.as_str()).ok_or(PasswordError::Unavailable)?;
@@ -523,9 +529,10 @@ fn first_run_with_password_work(
     check_first_run_proof(context, proof)?;
     let hash = derive(password)?;
     let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
-    let _config = crate::console::config_gate(context).map_err(|_| PasswordError::Unavailable)?;
-    check_first_run_proof(context, proof)?;
-    crate::settings::set_initial_administrator_password(context, &hash, actor).map_err(
+    let unauth = unauthenticated_context(context);
+    let _config = crate::console::config_gate(&unauth).map_err(|_| PasswordError::Unavailable)?;
+    check_first_run_proof(&unauth, proof)?;
+    crate::settings::set_initial_administrator_password(&unauth, &hash, actor).map_err(
         |(code, _)| {
             if code == 409 {
                 PasswordError::AlreadySet
@@ -534,6 +541,217 @@ fn first_run_with_password_work(
             }
         },
     )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LoginError {
+    Input,
+    NotSet,
+    WrongPassword { retry_after_ms: i64, consecutive_failures: i64 },
+    Throttled { retry_after_ms: i64, consecutive_failures: i64 },
+    Busy,
+    Unavailable,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ChangePasswordError {
+    Input,
+    NotSet,
+    WrongCurrent,
+    Revoked,
+    Busy,
+    Unavailable,
+}
+
+fn current_token_digest(context: &RuntimeContext) -> Result<Generation, ()> {
+    let cfg = context.load_config().map_err(|_| ())?;
+    let expected = checked_console_token(context, &cfg).map_err(|_| ())?;
+    if expected.is_empty() {
+        return Err(());
+    }
+    Ok(credential_digest(&expected))
+}
+
+pub(crate) fn auth_first_run_browser(
+    context: &RuntimeContext,
+    port: u16,
+    proof: &str,
+    password: &str,
+) -> Result<crate::settings::IssuedSession, PasswordError> {
+    if !context.is_isolated() {
+        return Err(PasswordError::Unavailable);
+    }
+    validate_new_password(password)?;
+    check_first_run_proof(context, proof)?;
+    let hash = AdministratorPasswordHash::derive(password)?;
+    let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
+    let unauth = unauthenticated_context(context);
+    let _config = crate::console::config_gate(&unauth).map_err(|_| PasswordError::Unavailable)?;
+    check_first_run_proof(&unauth, proof)?;
+    let digest = current_token_digest(&unauth).map_err(|_| PasswordError::Unavailable)?;
+    crate::settings::set_initial_administrator_password_with_session(
+        &unauth,
+        &hash,
+        "administrator",
+        &canonical_origin(port),
+        digest,
+    )
+    .map_err(|(code, _)| {
+        if code == 409 {
+            PasswordError::AlreadySet
+        } else {
+            PasswordError::Unavailable
+        }
+    })
+}
+
+pub(crate) fn auth_login(
+    context: &RuntimeContext,
+    port: u16,
+    password: &str,
+) -> Result<crate::settings::IssuedSession, LoginError> {
+    use crate::settings::{LoginChallenge, LoginOutcome};
+
+    if !context.is_isolated() {
+        return Err(LoginError::Unavailable);
+    }
+    validate_password_maximum(password).map_err(|_| LoginError::Input)?;
+    let mut attempted_clamp = false;
+    let hash = loop {
+        match crate::settings::load_login_challenge(context, true).map_err(|_| LoginError::Unavailable)? {
+            LoginChallenge::NotSet => return Err(LoginError::NotSet),
+            LoginChallenge::Throttled {
+                retry_after_ms,
+                consecutive_failures,
+                needs_clamp,
+            } => {
+                if !needs_clamp || attempted_clamp {
+                    return Err(LoginError::Throttled {
+                        retry_after_ms,
+                        consecutive_failures,
+                    });
+                }
+                attempted_clamp = true;
+                let _credential = credential_mutation_gate(context).map_err(|_| LoginError::Busy)?;
+                let unauth = unauthenticated_context(context);
+                let _config =
+                    crate::console::config_gate(&unauth).map_err(|_| LoginError::Unavailable)?;
+                let (failures, wait_ms) = crate::settings::clamp_throttle_deadline(&unauth)
+                    .map_err(|(code, _)| {
+                        if code == 409 {
+                            LoginError::NotSet
+                        } else {
+                            LoginError::Unavailable
+                        }
+                    })?;
+                if wait_ms > 0 {
+                    return Err(LoginError::Throttled {
+                        retry_after_ms: wait_ms,
+                        consecutive_failures: failures,
+                    });
+                }
+            }
+            LoginChallenge::Ready { hash } => break hash,
+        }
+    };
+    let matched = hash
+        .verify(password)
+        .map_err(|err| if err == PasswordError::Input { LoginError::Input } else { LoginError::Unavailable })?;
+
+    let _credential = credential_mutation_gate(context).map_err(|_| LoginError::Busy)?;
+    let unauth = unauthenticated_context(context);
+    let _config = crate::console::config_gate(&unauth).map_err(|_| LoginError::Unavailable)?;
+    let digest = current_token_digest(&unauth).map_err(|_| LoginError::Unavailable)?;
+
+    if !matched {
+        let failure = crate::settings::record_login_failure(&unauth).map_err(|(code, _)| {
+            if code == 409 { LoginError::NotSet } else { LoginError::Unavailable }
+        })?;
+        return Err(if failure.throttled_before {
+            LoginError::Throttled {
+                retry_after_ms: failure.retry_after_ms,
+                consecutive_failures: failure.consecutive_failures,
+            }
+        } else {
+            LoginError::WrongPassword {
+                retry_after_ms: failure.retry_after_ms,
+                consecutive_failures: failure.consecutive_failures,
+            }
+        });
+    }
+
+    match crate::settings::complete_login(&unauth, hash.as_str(), &canonical_origin(port), digest) {
+        Ok(LoginOutcome::Issued(issued)) => Ok(issued),
+        Ok(LoginOutcome::NotSet) => Err(LoginError::NotSet),
+        Ok(LoginOutcome::PasswordChanged) => Err(LoginError::WrongPassword {
+            retry_after_ms: 0,
+            consecutive_failures: 0,
+        }),
+        Ok(LoginOutcome::Throttled { retry_after_ms, consecutive_failures }) => {
+            Err(LoginError::Throttled { retry_after_ms, consecutive_failures })
+        }
+        Err(_) => Err(LoginError::Unavailable),
+    }
+}
+
+pub(crate) fn auth_change_password(
+    context: &RuntimeContext,
+    port: u16,
+    authority: &ConsoleAuthority,
+    current_password: &str,
+    new_password: &str,
+) -> Result<Option<crate::settings::IssuedSession>, ChangePasswordError> {
+    if !context.is_isolated() {
+        return Err(ChangePasswordError::Unavailable);
+    }
+    validate_password_maximum(current_password).map_err(|_| ChangePasswordError::Input)?;
+    validate_new_password(new_password).map_err(|_| ChangePasswordError::Input)?;
+    let crate::settings::LoginChallenge::Ready { hash } =
+        crate::settings::load_login_challenge(context, false)
+            .map_err(|_| ChangePasswordError::Unavailable)?
+    else {
+        return Err(ChangePasswordError::NotSet);
+    };
+    if !hash
+        .verify(current_password)
+        .map_err(|_| ChangePasswordError::Unavailable)?
+    {
+        return Err(ChangePasswordError::WrongCurrent);
+    }
+    let new_hash =
+        AdministratorPasswordHash::derive(new_password).map_err(|_| ChangePasswordError::Unavailable)?;
+
+    let _credential = credential_mutation_gate(context).map_err(|_| ChangePasswordError::Busy)?;
+    let _config = crate::console::config_gate(context).map_err(|(code, _)| {
+        if code == 401 {
+            ChangePasswordError::Revoked
+        } else {
+            ChangePasswordError::Unavailable
+        }
+    })?;
+    let cfg = context.load_config().map_err(|_| ChangePasswordError::Unavailable)?;
+    authority.recheck(context, &cfg).map_err(|(code, _)| {
+        if code == 401 { ChangePasswordError::Revoked } else { ChangePasswordError::Unavailable }
+    })?;
+    let origin = canonical_origin(port);
+    let rotate = if matches!(authority, ConsoleAuthority::Browser { .. }) {
+        let digest = current_token_digest(context).map_err(|_| ChangePasswordError::Unavailable)?;
+        Some((origin.as_str(), digest))
+    } else {
+        None
+    };
+    crate::settings::change_administrator_password(
+        context,
+        hash.as_str(),
+        &new_hash,
+        "administrator",
+        rotate,
+    )
+    .map_err(|(code, _)| match code {
+        409 => ChangePasswordError::NotSet,
+        401 => ChangePasswordError::WrongCurrent,
+        _ => ChangePasswordError::Unavailable,
+    })
 }
 
 fn read_input(
