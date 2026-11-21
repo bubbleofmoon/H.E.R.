@@ -60,6 +60,7 @@ struct HttpReq {
 }
 
 fn read_request(stream: &mut TcpStream) -> Option<HttpReq> {
+    stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(8))).ok()?;
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -1013,9 +1014,22 @@ impl Rig {
     }
 
     fn data_lines(&self, name: &str) -> Vec<Value> {
-        fs::read_to_string(self.root.join("data").join(name))
-            .unwrap_or_default()
-            .lines()
+        let path = self.root.join("data").join(name);
+        let mut text = String::new();
+        for attempt in 0..20 {
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    text = content;
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(err) if cfg!(windows) && err.raw_os_error() == Some(33) && attempt < 19 => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("read {}: {err}", path.display()),
+            }
+        }
+        text.lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     }
