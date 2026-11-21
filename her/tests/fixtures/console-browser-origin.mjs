@@ -23,24 +23,31 @@ assert.ok(chrome, 'Chromium is required for the console origin fixture');
 const options = [
   '--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
   '--disable-background-networking', '--disable-component-update', '--disable-extensions',
+  '--disable-gpu', '--disable-dev-shm-usage',
   '--no-default-browser-check', '--no-first-run', '--no-proxy-server', 'about:blank',
 ];
-if (process.getuid?.() === 0) options.unshift('--no-sandbox');
-const browser = spawn(chrome, options, { windowsHide: true, stdio: 'ignore' });
+if (process.getuid?.() === 0 || (process.platform === 'linux' && process.env.CI)) options.unshift('--no-sandbox');
+const browser = spawn(chrome, options, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+let browserStderr = '';
+browser.stderr?.on('data', chunk => {
+  if (browserStderr.length < 4096) browserStderr += chunk.toString('utf8').slice(0, 4096 - browserStderr.length);
+});
 const closed = once(browser, 'close').catch(() => {});
 let socket;
 let next = 0;
 const pending = new Map();
 
 async function until(probe, description) {
-  const deadline = performance.now() + 10_000;
+  const deadline = performance.now() + 30_000;
   while (performance.now() < deadline) {
-    if (browser.exitCode !== null) throw new Error('Chromium exited before the origin fixture completed');
+    if (browser.exitCode !== null) {
+      throw new Error(`Chromium exited before the origin fixture completed${browserStderr ? `: ${browserStderr}` : ''}`);
+    }
     const result = await probe();
     if (result) return result;
     await delay(30);
   }
-  throw new Error(description);
+  throw new Error(`${description}${browserStderr ? `: ${browserStderr}` : ''}`);
 }
 
 function send(method, params = {}) {
@@ -80,7 +87,8 @@ try {
   await once(browser, 'spawn');
   const devtools = await until(async () => {
     try {
-      const [debugPort] = fs.readFileSync(path.join(profile, 'DevToolsActivePort'), 'utf8').split('\n');
+      const debugPort = fs.readFileSync(path.join(profile, 'DevToolsActivePort'), 'utf8').split(/\r?\n/)[0]?.trim();
+      if (!debugPort) return undefined;
       const response = await fetch(`http://127.0.0.1:${debugPort}/json/list`, { signal: AbortSignal.timeout(500) });
       return (await response.json()).find(tab => tab.type === 'page')?.webSocketDebuggerUrl;
     } catch {

@@ -14165,6 +14165,9 @@ fn admit_selected_request(
     req: &Request, context: &RuntimeContext, port: u16,
 ) -> Result<FrontAdmission, (u16, String)> {
     use crate::memory_actions::ConsoleCapability;
+    let config = load_front_config(context)
+        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+    crate::console_auth::ensure_credentials_ready(context)?;
     let agent_call = has_agent_marker(req);
     let explicit = presented_console_token(req);
     let candidates = browser_candidates(req, port)?;
@@ -14177,9 +14180,13 @@ fn admit_selected_request(
     } else {
         None
     };
-    let config = load_front_config(context)
-        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    crate::console_auth::ensure_credentials_ready(context)?;
+    let config = if browser_auth {
+        crate::console_auth::ensure_credentials_ready(context)?;
+        load_front_config(context)
+            .map_err(|_| (503, "runtime config is unavailable".to_string()))?
+    } else {
+        config
+    };
     let expected = context.effective_console_token(&config);
     let memory_route = req.path.starts_with("/api/memory/");
     let (proof, renewal, browser_acl) = if let Some(presented) = explicit {
