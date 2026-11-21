@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   Archive,
   ArrowUpCircle,
   Bell,
+  ChevronDown,
+  ChevronRight,
   LogOut,
   Menu,
   Moon,
@@ -37,6 +39,11 @@ export const WorkbenchLayout: React.FC<{ children: React.ReactNode }> = ({ child
   } = useConsole();
 
   const [showLegacy, setShowLegacy] = useState(page === 'legacy');
+  useEffect(() => {
+    if (page === 'legacy') {
+      setShowLegacy(true);
+    }
+  }, [page]);
   const firstConversationId = conversations[0]?.key ?? 'private:owner';
 
   const sidebarContent = (
@@ -89,19 +96,40 @@ export const WorkbenchLayout: React.FC<{ children: React.ReactNode }> = ({ child
       <div className="border-t border-[var(--border-hairline)] p-2">
         <button
           type="button"
-          onClick={() => {
-            setShowLegacy((v) => !v);
-            if (!showLegacy || page !== 'legacy') navigate('legacy');
-          }}
-          className={`flex w-full items-center gap-2 rounded px-2 py-1 text-[11.5px] ${
+          aria-expanded={showLegacy}
+          onClick={() => setShowLegacy((v) => !v)}
+          className={`flex w-full items-center justify-between rounded px-2 py-1 text-[11.5px] ${
             page === 'legacy'
-              ? 'bg-[var(--accent-soft)] font-semibold text-[var(--accent)]'
+              ? 'font-semibold text-[var(--accent)]'
               : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
           }`}
         >
-          <Archive className="h-3.5 w-3.5 shrink-0" />
-          <span>旧版</span>
+          <span className="flex items-center gap-2">
+            <Archive className="h-3.5 w-3.5 shrink-0" />
+            <span>旧版</span>
+          </span>
+          {showLegacy ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+          )}
         </button>
+        {showLegacy && (
+          <div className="mt-1 pl-2">
+            <button
+              type="button"
+              onClick={() => navigate('legacy')}
+              className={`flex w-full items-center justify-between rounded px-2 py-1.5 text-[11.5px] transition-colors ${
+                page === 'legacy'
+                  ? 'bg-[var(--accent-soft)] font-semibold text-[var(--accent)]'
+                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+              }`}
+            >
+              <span className="truncate">旧版工具隔离区</span>
+              <span className="text-[10px] text-[var(--warn)]">#78</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
