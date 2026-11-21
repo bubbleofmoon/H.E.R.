@@ -214,8 +214,8 @@ fn request_with_token(context: &RuntimeContext, token: &str, method: &str, path:
         body_too_large: false,
     };
     let cfg = context.load_config().unwrap_or_else(|_| json!({}));
-    let (status, _, text) = serve_request(&req, &cfg, context, port);
-    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    let response = serve_request(&req, &cfg, context, port);
+    (response.status, serde_json::from_str(&response.body).unwrap_or(Value::Null))
 }
 
 /// S1: the generated console token is the hex of 24 bytes from the entropy source, nothing else.
@@ -381,8 +381,7 @@ fn ticket24_token_change_is_not_half_written_when_the_token_file_fails() {
         assert_eq!(context.load_config().unwrap()["consoleToken"], old);
     }
     std::fs::remove_dir_all(root.0.join("data/console-token")).unwrap();
-    // Post-write failure: the token file is written, then config.json cannot be replaced (its
-    // directory is immutable). The token file must be rolled back so the old token still works.
+    // A configuration directory that cannot stage the new document refuses before either publication.
     #[cfg(target_os = "linux")]
     {
         let previous = "previous-file-console-token-abcdefghij";
@@ -681,17 +680,20 @@ fn ticket24_fix2_every_config_writer_waits_for_the_gate_and_rereads_inside_it() 
 #[test]
 fn ticket24_fix2_an_audit_record_holds_only_its_own_change() {
     let (root, context) = seeded("票据24 fix2 attribution", "fixture-ticket24-fix2-attr-token-abcdefghij");
-    let held = acquire_social_state_gate(&context).unwrap();
-    let worker_context = context.clone();
-    let worker = std::thread::spawn(move || admin_request(&worker_context, "POST", "/api/security", Some(&json!({"interceptNotify": false, "confirm": true}))));
-    std::thread::sleep(std::time::Duration::from_millis(400));
-    // Another administrator replaces the console token meanwhile (as the token handler writes it).
     let rotated = "fixture-ticket24-fix2-attr-rotated-abcdefghij";
-    let mut cfg = raw_config(&root);
-    cfg["consoleToken"] = json!(rotated);
-    write_raw_config(&root, &cfg);
-    drop(held);
-    let (status, reply) = worker.join().unwrap();
+    let worker_context = context.clone();
+    AFTER_ADMISSION.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+        let _config = acquire_social_state_gate(&worker_context).unwrap();
+        let mut cfg = raw_config_object(&worker_context).unwrap();
+        cfg["consoleToken"] = json!(rotated);
+        worker_context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
+    })));
+    let edit = json!({"interceptNotify": false, "confirm": true});
+    let (status, reply) = admin_request(&context, "POST", "/api/security", Some(&edit));
+    assert_eq!(status, 401, "{reply}");
+    let refused = audit_entries(&context).into_iter().next().unwrap();
+    assert_eq!(refused["files"], json!([]), "revocation refuses the write and records no mutation");
+    let (status, reply) = admin_request(&context, "POST", "/api/security", Some(&edit));
     assert_eq!(status, 200, "{reply}");
     let entry = audit_entries(&context).into_iter().find(|e| e["path"] == "/api/security").unwrap();
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": entry["id"], "confirm": true})));

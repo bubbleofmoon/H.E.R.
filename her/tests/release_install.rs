@@ -992,7 +992,8 @@ fn http(
         ""
     };
     let agent = if agent { "x-agent-call: true\r\n" } else { "" };
-    write!(socket,"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n{token}{agent}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+    let host = if method == "GET" && matches!(path, "/" | "/tasks" | "/schedule") { "her.localhost" } else { "127.0.0.1" };
+    write!(socket,"{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: http://127.0.0.1:{port}\r\n{token}{agent}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
     let mut bytes = Vec::new();
     socket.read_to_end(&mut bytes).unwrap();
     let response = String::from_utf8(bytes).unwrap();

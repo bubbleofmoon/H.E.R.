@@ -44,6 +44,7 @@ mod reserved;
 mod sticker;
 mod failover;
 mod console;
+mod console_auth;
 mod desktop;
 mod qq_login;
 mod pricing;
@@ -1180,6 +1181,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.get(1).map(String::as_str) == Some("backup") {
         std::process::exit(restore::run_cli(&args[2..]));
     }
+    if args.get(1).map(String::as_str) == Some("console") {
+        std::process::exit(console_auth::run_cli(&args[2..]));
+    }
     if args.get(1).map(String::as_str) == Some("lifecycle") {
         std::process::exit(lifecycle_cli::run_lifecycle(&args[2..]));
     }
@@ -1468,11 +1472,15 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 .unwrap_or(3101)
         };
         if runtime_context.is_isolated() {
-            let cfg = match runtime_context.load_config() {
-                Ok(config) => config,
-                Err(message) => {
-                    eprintln!("[her] {message}");
-                    std::process::exit(2);
+            let cfg = {
+                let _config = console::config_gate(&runtime_context).map_err(|(_, e)| e)?;
+                if restore::recovery_pending(&runtime_context) {
+                    json!({})
+                } else {
+                    if console_auth::reconcile_token_rotation(&runtime_context).is_err() {
+                        crate::safe_eprintln!("[console] console credentials require recovery");
+                    }
+                    runtime_context.load_config().map_err(str::to_owned)?
                 }
             };
             console::serve_with_context(&cfg, port, runtime_context)?;

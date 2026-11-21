@@ -163,7 +163,7 @@ fn chat_settings_answer_store_trouble_without_its_details() {
         let (root, context) = chat_fixture(&format!("chat settings trouble {trouble}"));
         match trouble {
             "garbage" => std::fs::write(settings_db(&root), vec![b'x'; 4096]).unwrap(),
-            "newer" => StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=3;"),
+            "newer" => StoreProbe::at(&root.0).build("CREATE TABLE later (x INTEGER); PRAGMA user_version=4;"),
             _ => {
                 StoreProbe::at(&root.0).build("CREATE TABLE scratch (x INTEGER); DROP TABLE scratch;");
                 std::fs::write(root.0.join("data/settings.db-journal"), vec![0xff_u8; 512]).unwrap();

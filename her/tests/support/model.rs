@@ -64,6 +64,7 @@ impl FakeModel {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                let _ = socket.set_nonblocking(false);
                 let Some(req) = read_model_request(&mut socket) else {
                     continue;
                 };

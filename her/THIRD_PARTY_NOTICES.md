@@ -19,6 +19,17 @@ HER uses Jiff for IANA time zone lookup, civil scheduling and calendar conversio
 - [Jiff license and source](https://docs.rs/crate/jiff/0.2.39/source/COPYING)
 - [Jiff time-zone database package](https://docs.rs/crate/jiff-tzdb/0.1.9/source/LICENSE)
 
+## Console password and credential comparison dependencies
+
+HER uses RustCrypto Argon2 0.5.3 under MIT. Its new transitive dependencies Blake2 0.10.6, Password Hash 0.5.0 and Base64ct 1.8.3 also use the MIT option of their dual license. Hidden terminal prompts use rpassword 7.5.4 under Apache-2.0. Fixed-size credential comparisons use subtle 2.6.1 under BSD-3-Clause.
+
+- [Argon2 MIT license](https://docs.rs/crate/argon2/0.5.3/source/LICENSE-MIT)
+- [Blake2 MIT license](https://docs.rs/crate/blake2/0.10.6/source/LICENSE-MIT)
+- [Password Hash MIT license](https://docs.rs/crate/password-hash/0.5.0/source/LICENSE-MIT)
+- [Base64ct MIT license](https://docs.rs/crate/base64ct/1.8.3/source/LICENSE-MIT)
+- [rpassword Apache-2.0 license](https://docs.rs/crate/rpassword/7.5.4/source/LICENSE-APACHE)
+- [subtle BSD-3-Clause license](https://docs.rs/crate/subtle/2.6.1/source/LICENSE)
+
 ## Signed release verification dependencies
 
 `minisign-verify` 0.3.0 is the maintained upstream Minisign/Ed25519 verifier used by all three HER images. Its crates.io metadata declares MIT and it has no dependencies. `minisign` 0.10.0 is a dev dependency used only to sign synthetic test releases. Its metadata also declares MIT. Both packages retain notices for crypto derived from rust-crypto. These permissive notices fit the source-available distribution in ADR 0002; no cargo-deny/licence allowlist is present. This file retains the upstream notices and must accompany redistribution of these components.
