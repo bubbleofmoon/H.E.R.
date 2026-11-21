@@ -37,6 +37,7 @@ const SETTINGS_SOURCES: &[(&str, &str)] = &[
     ("settings/kinds/integer.rs", include_str!("../kinds/integer.rs")),
     ("settings/kinds/model_id.rs", include_str!("../kinds/model_id.rs")),
     ("settings/kinds/owner_id.rs", include_str!("../kinds/owner_id.rs")),
+    ("settings/kinds/rollout_list.rs", include_str!("../kinds/rollout_list.rs")),
     ("settings/kinds/probability.rs", include_str!("../kinds/probability.rs")),
     ("settings/kinds/route_id.rs", include_str!("../kinds/route_id.rs")),
     ("settings/kinds/route_list.rs", include_str!("../kinds/route_list.rs")),

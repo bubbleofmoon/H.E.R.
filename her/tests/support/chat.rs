@@ -450,6 +450,24 @@ impl Dsh {
         if prompt.contains("#RATE81#") {
             return finish(json!({"kind":"error","error":{"code":"QUOTA_EXCEEDED","message":"HTTP 429 quota exceeded CHAT_SECRET_81"}}));
         }
+        if prompt.contains("#REFUSE47#") {
+            let mut inner = lock(&self.inner);
+            let session = inner.sessions.get_mut(sid).unwrap();
+            for (step, name, field, id, seq) in [
+                (0, "qq_wait_for_messages", "newMessages", "wait-fixture-one", 71),
+                (1, "qq_wait_for_messages", "newMessages", "wait-fixture-two", 72),
+                (1, "qq_get_unread_messages", "messages", "unread-fixture", 73),
+            ] {
+                let call = format!("fixture-read-{seq}");
+                event(session, "tool/call", json!({"turn":turn,"step":step,"callId":call,"name":format!("mcp__snowluma__{name}")}));
+                let packet = json!({(field):[{"messageId":id,"seq":seq,"text":"CHAT_SECRET_47"}]});
+                event(session, "tool/result", json!({"turn":turn,"message":{
+                    "source":{"callId":call},"content":[{"type":"text","text":packet.to_string()}]}}));
+            }
+            event(session, "llm/retry-started", json!({"turn":turn,"step":2,"retry":1}));
+            drop(inner);
+            return finish(json!({"kind":"error","failure":{"code":"EMPTY_RESPONSE","message":"model returned a completed response with no content"}}));
+        }
         if prompt.contains("#REFUSE83#") {
             return finish(json!({"kind":"error","failure":{"code":"EMPTY_RESPONSE","message":"model returned a completed response with no content CHAT_SECRET_83"}}));
         }

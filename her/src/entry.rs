@@ -73,7 +73,7 @@ mod release;
 mod release_signature;
 mod release_store;
 mod update;
-mod parity_clock;
+use her_memory::parity_clock;
 mod config;
 mod inbound;
 mod send_outbox;
@@ -1208,6 +1208,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     if args.iter().skip(1).any(|arg| matches!(arg.as_str(),
         "--ab-full" | "--ab-probe" | "--shadow-turn" | "--shadow-state-root"
         | "--replay" | "--wake-replay" | "--replay-jsonl" | "--replay-triggers"
+        | "--memory-probe" | "--memory-write-probe" | "--hot-render" | "--index-hint"
     )) {
         eprintln!("[her] unknown option");
         std::process::exit(2);
@@ -1215,8 +1216,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // These diagnostic/maintenance modes use legacy paths rather than a selected runtime.
     // They remain development-only even when launched through an installed image.
     let development_mode = args.iter().skip(1).any(|arg| matches!(arg.as_str(),
-        "--send-probe" | "--ask" | "--memory-probe" | "--memory-write-probe"
-        | "--hot-render" | "--index-hint" | "--price-probe" | "--role-probe"
+        "--send-probe" | "--ask" | "--price-probe" | "--role-probe"
         | "--prompt-wrapped" | "--rpc-probe" | "--slang-parse-test" | "--selftest-401"
         | "--failover-probe" | "--sticker-sync" | "--build-prompt" | "--dsh-dump"
         | "--dsh-watch" | "--dsh-probe" | "--dsh-demo" | "--question-probe"
@@ -1302,115 +1302,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
             Err(e) => println!("[ask] ❌ 初始化失败：{e}"),
-        }
-        return Ok(());
-    }
-
-    // P3 探针：直接在 Rust 里查记忆库，结果与 JS 对拍
-    if std::env::args().any(|a| a == "--memory-probe") {
-        let reader = std::env::args()
-            .position(|a| a == "--memory-probe")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .unwrap_or_else(|| "private:7001".to_string());
-        let query = std::env::args()
-            .position(|a| a == "--query")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .unwrap_or_else(|| "管理员偏好".to_string());
-        let json_mode = std::env::args().any(|a| a == "--json");
-        let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
-        let conn = rusqlite::Connection::open(&db_path)?;
-        let total: i64 = conn.query_row("SELECT COUNT(*) FROM memory", [], |r| r.get(0))?;
-        // The parity fixture's owner is private:7001.
-        let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
-        let memory_reader = store.for_reader(&reader);
-        let is_owner = memory_reader.is_owner();
-        if !json_mode {
-            println!("[memory] 库 {} 条，reader={reader} isOwner={is_owner}", total);
-        }
-        let scope = memory_reader.scope()?;
-        if !json_mode {
-            println!("[memory] 可见范围 allowAll={} ids={:?}", scope.allow_all, scope.ids);
-        }
-        let hits = memory_reader.search(&query, &[], 5)?;
-        if std::env::args().any(|a| a == "--json") {
-            // 给对拍脚本用：只输出纯 JSON，不要别的行
-            let ids: Vec<i64> = hits.iter().map(|h| h.id).collect();
-            let payload = json!({
-                "reader": reader,
-                "isOwner": is_owner,
-                "query": query,
-                "total": total,
-                "allowAll": scope.allow_all,
-                "ids": ids,
-                "hits": hits,
-            });
-            println!("{}", serde_json::to_string(&payload)?);
-            return Ok(());
-        }
-        println!("[memory] 查询 {query:?} 命中 {} 条", hits.len());
-        for h in &hits {
-            println!("  #{} [{}·{}] {:.3} {}", h.id, h.scope, h.kind, h.score, activity::preview_chars(&h.content, 40));
-        }
-        return Ok(());
-    }
-
-    // P3 写路径验证：upsert 去重 + 检索命中（默认用临时副本，不动真库）
-    if std::env::args().any(|a| a == "--memory-write-probe") {
-        let content = std::env::args()
-            .position(|a| a == "--content")
-            .and_then(|i| std::env::args().nth(i + 1))
-            .unwrap_or_else(|| "Rust 写入验证：这条由 her 写入".to_string());
-        let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
-        let conn = rusqlite::Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
-
-        let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
-        let probe = store.for_reader("private:7001");
-        let mk = |imp: f64| memory::NewMemory {
-            owner_type: "session",
-            scope: Some("private"),
-            kind: "fact",
-            subject: Some("rust-write-probe"),
-            content: &content,
-            tags: None,
-            source: "rust-probe",
-            importance: imp,
-        };
-        let first = probe.write(&mk(0.6))?;
-        let second = probe.write(&mk(0.7))?;
-        let hits = probe.search(&content, &[], 5)?;
-        println!("{}", serde_json::to_string(&json!({
-            "db": db_path,
-            "first": { "id": first.id, "deduped": first.deduped },
-            "second": { "id": second.id, "deduped": second.deduped },
-            "hitIds": hits.iter().map(|h| h.id).collect::<Vec<_>>(),
-        }))?);
-        return Ok(());
-    }
-
-    // P3 热缓存/索引提示探针：--hot-render 输出渲染结果，--index-hint 输出词表
-    if std::env::args().any(|a| a == "--hot-render" || a == "--index-hint") {
-        let db_path = std::env::var("HER_MEMORY_DB").unwrap_or_else(|_| memory::DB_PATH.to_string());
-        let conn = rusqlite::Connection::open(&db_path)?;
-        if std::env::args().any(|a| a == "--hot-render") {
-            let items = memory::pick_hot(&conn, 40)?;
-            let (text, count, chars) = memory::render_hot(&items);
-            println!("{}", serde_json::to_string(&json!({
-                "candidates": items.len(),
-                "count": count,
-                "chars": chars,
-                "text": text,
-            }))?);
-        } else {
-            let reader = std::env::args()
-                .position(|a| a == "--index-hint")
-                .and_then(|i| std::env::args().nth(i + 1))
-                .unwrap_or_else(|| "private:7001".to_string());
-            let store = memory::MemoryStore::from_connection(conn, Some("private:7001".to_string()));
-            let (total, terms) = store.for_reader(&reader).index(12)?;
-            println!("{}", serde_json::to_string(&json!({
-                "reader": reader, "total": total, "terms": terms,
-            }))?);
         }
         return Ok(());
     }

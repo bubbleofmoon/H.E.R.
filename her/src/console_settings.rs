@@ -301,6 +301,7 @@ async function list(){
     const type=s.kind.type;
     const text=type==='text';
     const routeList=type==='route list';
+    const conversationList=type==='conversation list';
     const input=document.createElement(text||routeList?'textarea':'input');
     if(type==='password'){
       input.type='password';
@@ -317,10 +318,10 @@ async function list(){
     }else if(type==='switch'){
       input.type='checkbox';
       input.checked=s.value===true;
-    }else if(type==='id list'){
+    }else if(type==='id list'||conversationList){
       input.type='text';
       input.size=40;
-      input.value=(s.value||[]).join(', ');
+      input.value=Array.isArray(s.value)?s.value.join(', '):'';
     }else if(text||routeList){
       input.rows=8;
       input.cols=60;
@@ -338,7 +339,9 @@ async function list(){
     const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok){if(type==='password')input.value='';refresh()}};
     const save=()=>{
       let value;
-      if(routeList){
+      if(conversationList){
+        value=input.value.trim()?input.value.split(',').map(key=>key.trim()):[];
+      }else if(routeList){
         try{
           value=JSON.parse(input.value);
         }catch{
@@ -354,6 +357,7 @@ async function list(){
     if(s.overriddenBy)current=shown(s.value)+' (in effect: '+shown(s.overriddenBy.value)+' from the '+s.overriddenBy.source+')';
     if(type==='password')current=s.isSet?'Set':'Unset';
     if(routeList)current=s.value==null?'(none)':JSON.stringify(s.value,null,2);
+    if(conversationList)current=shown(s.value);
     const field=document.createElement('td');
     field.append(input);
     tr.append(cell(s.label+' ('+s.key+')'+(s.confirm?' [needs confirmation]':'')),cell(s.hint),cell(current),

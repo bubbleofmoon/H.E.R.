@@ -1995,17 +1995,54 @@ mod tests {
         id
     }
 
-    #[test]
-    fn backup_notice_first_observation_starts_now_and_later_occurrences_alert_once() {
-        use crate::task_runs::{Finish, RunSource};
-        let fixture = Fixture::new("first-observation");
+    struct NoticeFixture {
+        fixture: Fixture,
+        config_path: PathBuf,
+        context: RuntimeContext,
+        config: serde_json::Value,
+        schedule: crate::tasks::Schedule,
+        zone: jiff::tz::TimeZone,
+    }
+
+    fn notice_fixture(name: &str) -> NoticeFixture {
+        let fixture = Fixture::new(name);
         let config_path = fixture.0.join("config/config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
         config["backup"] = json!({"time":"04:00"});
         config["tasks"]["backup"] = json!({"enabled":true});
         fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
-        let now = crate::parity_clock::now_ms();
+        let context = fixture.context();
+        let config = context.load_config().unwrap();
+        let zone = crate::local_time::configured_zone(&config);
+        let schedule =
+            crate::tasks::configured_schedule(crate::tasks::task_def(TaskId::Backup), &config);
+        NoticeFixture {
+            fixture,
+            config_path,
+            context,
+            config,
+            schedule,
+            zone,
+        }
+    }
+
+    #[test]
+    fn backup_notice_first_observation_starts_now_and_later_occurrences_alert_once() {
+        use crate::task_runs::{Finish, RunSource};
+        let NoticeFixture {
+            fixture,
+            config_path,
+            context,
+            config,
+            schedule,
+            zone,
+        } = notice_fixture("first-observation");
+        let first_slot =
+            crate::tasks::next_due(schedule, crate::parity_clock::now_ms(), &zone).unwrap();
+        // Anchor 10 minutes past a scheduled slot so `now..=now + 180_000` always has
+        // >22 hours of headroom before the next daily slot across timezones and DST.
+        let now = first_slot + 600_000;
         let days = |n: u64| Duration::from_secs(n * 86_400);
         let wall = std::time::UNIX_EPOCH + Duration::from_millis(now as u64);
         fs::File::options()
@@ -2014,8 +2051,6 @@ mod tests {
             .unwrap()
             .set_modified(wall - days(9))
             .unwrap();
-        let context = fixture.context();
-        let config = context.load_config().unwrap();
         let api = crate::supervisor::task_api(&context, &config).unwrap();
         let store = api.dispatcher.store();
         let failed = |reason: &str| Finish::Failed {
@@ -2046,14 +2081,44 @@ mod tests {
         super::monitor_notices(&context, &config, store, now + 180_000).unwrap();
         assert_eq!(claimed_notices(&fixture), expected, "and only once");
 
-        let schedule = crate::tasks::configured_schedule(crate::tasks::task_def(TaskId::Backup), &config);
-        let slot = crate::tasks::next_due(schedule, now + 180_000, &crate::local_time::configured_zone(&config))
-            .unwrap();
+        let slot = crate::tasks::next_due(schedule, now + 180_000, &zone).unwrap();
         super::monitor_notices(&context, &config, store, slot + 61_000).unwrap();
         let mut expected = expected;
         expected.insert(format!("backup-missed-{slot}"));
         assert_eq!(claimed_notices(&fixture), expected, "a later missed slot alerts once");
         super::monitor_notices(&context, &config, store, slot + 3_600_000).unwrap();
+        assert_eq!(claimed_notices(&fixture), expected, "and only once");
+    }
+
+    #[test]
+    fn backup_notice_first_observation_near_slot_boundary_alerts_once_when_slot_passes() {
+        let NoticeFixture {
+            fixture,
+            context,
+            config,
+            schedule,
+            zone,
+            ..
+        } = notice_fixture("near-slot-boundary");
+        let first_slot =
+            crate::tasks::next_due(schedule, crate::parity_clock::now_ms(), &zone).unwrap();
+        let now = first_slot - 60_000;
+        let api = crate::supervisor::task_api(&context, &config).unwrap();
+        let store = api.dispatcher.store();
+
+        super::monitor_notices(&context, &config, store, now).unwrap();
+        assert!(claimed_notices(&fixture).is_empty());
+
+        super::monitor_notices(&context, &config, store, first_slot + 61_000).unwrap();
+        let expected: std::collections::BTreeSet<_> =
+            [format!("backup-missed-{first_slot}")].into();
+        assert_eq!(
+            claimed_notices(&fixture),
+            expected,
+            "missed slot alerts once when crossed"
+        );
+
+        super::monitor_notices(&context, &config, store, first_slot + 180_000).unwrap();
         assert_eq!(claimed_notices(&fixture), expected, "and only once");
     }
 

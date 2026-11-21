@@ -26,13 +26,14 @@ required-features = ["release-test-keys"]
 [features]
 default = []
 # Synthetic Rust fixtures: advancing epoch via HER_PARITY_EPOCH_MS; off by default.
-parity-clock = []
+parity-clock = ["her-memory/parity-clock"]
 # Private controlled-poll seam for the ticket 13 regression only.
 deadlock-regression = []
 # Synthetic signing pins for fake-feed executables only; rejected in release-profile builds.
 release-test-keys = []
 
 [dependencies]
+her-memory = { path = "../her-memory" }
 genai = "=0.7.3"
 jiff = { version = "=0.2.39", features = ["tzdb-bundle-always"] }
 tokio = { version = "1", features = ["full"] }

@@ -3,6 +3,20 @@
 use super::*;
 use std::io::{Read, Write};
 
+pub(super) enum ProbeError {
+    Connect(std::io::ErrorKind),
+    Request(String),
+}
+
+impl ProbeError {
+    pub(super) fn reason(self) -> String {
+        match self {
+            Self::Connect(_) => "relay health connection failed".into(),
+            Self::Request(reason) => reason,
+        }
+    }
+}
+
 pub(super) struct Settings {
     pub arguments: Vec<String>,
     pub folder: PathBuf,
@@ -152,7 +166,23 @@ impl Settings {
         Ok(())
     }
 
-    pub(super) fn probe(&self, endpoint: SocketAddr, deadline: Instant) -> Result<(), String> {
+    pub(super) fn probe(&self, endpoint: SocketAddr, deadline: Instant) -> Result<(), ProbeError> {
+        let connect_timeout = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(ProbeError::Connect(std::io::ErrorKind::TimedOut))?;
+        let stream = std::net::TcpStream::connect_timeout(&endpoint, connect_timeout)
+            .map_err(|err| ProbeError::Connect(err.kind()))?;
+        self.probe_connected(stream, endpoint, deadline)
+            .map_err(ProbeError::Request)
+    }
+
+    fn probe_connected(
+        &self,
+        mut stream: std::net::TcpStream,
+        endpoint: SocketAddr,
+        deadline: Instant,
+    ) -> Result<(), String> {
         let key = self.key()?;
         let remaining = || {
             deadline
@@ -160,40 +190,108 @@ impl Settings {
                 .filter(|d| !d.is_zero())
                 .ok_or("relay health request timed out")
         };
-        let mut stream = std::net::TcpStream::connect_timeout(&endpoint, remaining()?)
-            .map_err(|_| "relay health connection failed")?;
-        stream
-            .set_write_timeout(Some(remaining()?))
-            .map_err(|_| "relay health timeout is unavailable")?;
-        write!(stream, "GET /v1/models HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n")
-            .map_err(|_| "relay health request failed")?;
-        // Only status is needed. Never retain a response body (including credential echoes),
-        // follow redirects, or let a peer extend the absolute deadline by dribbling bytes.
-        let mut line = Vec::new();
-        for _ in 0..512 {
+        let request = format!("GET /v1/models HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {key}\r\nConnection: close\r\n\r\n");
+        let mut pending = request.as_bytes();
+        while !pending.is_empty() {
+            stream
+                .set_write_timeout(Some(remaining()?))
+                .map_err(|_| "relay health timeout is unavailable")?;
+            match stream.write(pending) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) | Ok(0) => return Err("relay health request failed".into()),
+                Ok(count) => pending = &pending[count..],
+            }
+        }
+        read_probe_status(|buffer| loop {
             stream
                 .set_read_timeout(Some(remaining()?))
                 .map_err(|_| "relay health timeout is unavailable")?;
-            let mut byte = [0];
-            stream
-                .read_exact(&mut byte)
-                .map_err(|_| "relay health response failed or timed out")?;
-            line.push(byte[0]);
-            if byte[0] == b'\n' {
-                let status = std::str::from_utf8(&line).ok().and_then(|line| {
+            match stream.read(buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err("relay health response failed or timed out"),
+                Ok(count) => {
+                    remaining()?;
+                    return Ok(count);
+                }
+            }
+        })
+        .map_err(str::to_string)
+    }
+}
+
+/// Only inspect the bounded status line, even when a read includes headers or body bytes.
+fn read_probe_status(
+    mut read_chunk: impl FnMut(&mut [u8]) -> Result<usize, &'static str>,
+) -> Result<(), &'static str> {
+    let mut line = [0; 512];
+    let mut used = 0;
+    while used < line.len() {
+        let count = read_chunk(&mut line[used..])?;
+        if count == 0 {
+            return Err("relay health response failed or timed out");
+        }
+        let end = used + count;
+        if let Some(newline) = line[used..end].iter().position(|&byte| byte == b'\n') {
+            let status = std::str::from_utf8(&line[..used + newline + 1])
+                .ok()
+                .and_then(|line| {
                     let mut fields = line.split_whitespace();
                     matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1"))
                         .then(|| fields.next())
                         .flatten()
                 });
-                return if status == Some("200") {
-                    Ok(())
-                } else {
-                    Err("relay models health request was refused".into())
-                };
-            }
+            return if status == Some("200") {
+                Ok(())
+            } else {
+                Err("relay models health request was refused")
+            };
         }
-        Err("relay health response is invalid".into())
+        used = end;
+    }
+    Err("relay health response is invalid")
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn relay_reads_a_buffered_status_line_at_the_byte_limit() {
+        let mut status = String::from("HTTP/1.1 200 ");
+        status.extend(std::iter::repeat_n('x', 511 - status.len()));
+        status.push('\n');
+        let mut response = std::io::Cursor::new(status.as_bytes());
+        let mut reads = 0;
+        assert_eq!(
+            read_probe_status(|buffer| {
+                reads += 1;
+                Ok(response.read(buffer).unwrap())
+            }),
+            Ok(())
+        );
+        assert_eq!(reads, 1, "read a complete status line in one chunk");
+
+        status.insert(511, 'x');
+        let mut response = std::io::Cursor::new(status.as_bytes());
+        assert_eq!(
+            read_probe_status(|buffer| Ok(response.read(buffer).unwrap())),
+            Err("relay health response is invalid")
+        );
+    }
+
+    #[test]
+    fn relay_assembles_split_status_and_ignores_bytes_after_the_line() {
+        let mut chunks = [&b"HTTP/1.1 2"[..], &b"00 OK\r\n\xff"[..]].into_iter();
+        assert_eq!(
+            read_probe_status(|buffer| {
+                let chunk = chunks
+                    .next()
+                    .expect("status line should already be complete");
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                Ok(chunk.len())
+            }),
+            Ok(())
+        );
     }
 }
 

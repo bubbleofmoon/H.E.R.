@@ -1390,6 +1390,7 @@ dependencies = [
  "futures-util",
  "genai",
  "getrandom 0.2.17",
+ "her-memory",
  "hmac",
  "image",
  "indexmap 2.14.2",
@@ -1415,6 +1416,15 @@ dependencies = [
  "windows-sys 0.61.2",
  "wry",
  "zip",
+]
+
+[[package]]
+name = "her-memory"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

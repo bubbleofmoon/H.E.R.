@@ -361,22 +361,43 @@ pub fn take_prompt_refs(
     (hash == prompt_hash(prompt)).then_some(refs)
 }
 
-pub fn record_refusal(
+pub(crate) struct RefusalCall<'a> {
+    pub turn_id: &'a str,
+    pub index: Option<usize>,
+    pub rpc_id: Option<&'a str>,
+}
+
+#[derive(Default)]
+pub(crate) struct RefusalInput<'a> {
+    pub messages: &'a [Value],
+    pub call: Option<RefusalCall<'a>>,
+}
+
+pub(crate) fn record_refusal(
     context: &RuntimeContext,
     key: &str,
     backend: &str,
     provider: &str,
     model: &str,
     failure: &Failure,
-    messages: &[Value],
+    input: RefusalInput<'_>,
 ) {
     if failure.class != "refusal" || !context.is_isolated() {
         return;
     }
-    let messages = message_refs(&Value::Array(messages.to_vec()));
-    let record = serde_json::json!({"time":crate::parity_clock::now_ms(), "key":key,
+    let messages = message_refs(&Value::Array(input.messages.to_vec()));
+    let mut record = serde_json::json!({"time":crate::parity_clock::now_ms(), "key":key,
         "backend":backend, "provider":provider, "model":model, "errorClass":failure.class,
         "errorCode":failure.code, "messages":messages});
+    if let Some(call) = input.call {
+        record["turnId"] = Value::from(call.turn_id);
+        if let Some(index) = call.index {
+            record["modelCall"] = Value::from(index);
+        }
+        if let Some(rpc_id) = call.rpc_id {
+            record["rpcId"] = Value::from(rpc_id);
+        }
+    }
     let mut line = crate::activity::mask_json_session_tokens(&record, &crate::activity::known_session_tokens(context)).to_string();
     line.push('\n');
     if context
@@ -405,13 +426,16 @@ mod tests {
         std::fs::write(root.join("data/social-v2.json"), r#"{"conversations":{"group:42":{"agentToken":"K128sessionVALUExyz"}}}"#).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         let shape = "0123456789abcdef0123456789abcdef0123456789abcdef";
-        record_refusal(&context, "group:42", "harness", "openai", "K128session\nVALUExyz", &Failure::new("refusal", shape), &[json!({"messageId":"K128sessionVALUExyz","seq":42})]);
+        record_refusal(&context, "group:42", "harness", "openai", "K128session\nVALUExyz", &Failure::new("refusal", shape), RefusalInput {
+            messages: &[json!({"messageId":"K128sessionVALUExyz","seq":42,"text":"CHAT_SECRET_47"})],
+            call: None,
+        });
         let text = std::fs::read_to_string(root.join("data/logs/model-refusals.jsonl")).unwrap();
         std::fs::remove_dir_all(root).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["model"], "***");
         assert_eq!(value["errorCode"], "***");
-        assert_eq!(value["messages"], json!([{"messageId":"***","seq":42}]));
+        assert_eq!(value["messages"], json!([{"messageId":"***","seq":42}]), "refusal record contains message text or extra message fields");
         assert_eq!(value["backend"], "harness");
     }
 

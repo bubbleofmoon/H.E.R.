@@ -6,7 +6,10 @@
 //! `confirm: true` for every action they offer; HER's timers offer cancel and run now only (no pause).
 
 use super::*;
-use crate::schedule::{Creator, ItemChange, NewItem, Repeat, RunResult, ScheduleStore, StoreError, SystemJob, TimerKind, PAUSABLE_JOBS};
+use crate::schedule::{
+    optional_time, Creator, ItemChange, NewItem, Repeat, RunResult, ScheduleStore, StoreError,
+    SystemJob, TimerKind, PAUSABLE_JOBS,
+};
 use crate::tasks::{TaskId, REGISTRY};
 
 type Reply = Result<(u16, Value), (u16, String)>;
@@ -130,7 +133,9 @@ fn create(context: &RuntimeContext, req: &Request) -> Reply {
     let text = fields.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
     let _authority = authority(context)?;
     let cfg = selected_config_for_handler(context)?;
-    let at = optional_time(&fields, &cfg)?.ok_or((400, "提醒时间无效".to_string()))?;
+    let at = optional_time(&fields, &cfg)
+        .map_err(store_error)?
+        .ok_or((400, "提醒时间无效".to_string()))?;
     let repeat = match fields.get("repeat") {
         None | Some(Value::Null) => Repeat::Once,
         Some(value) => serde_json::from_value::<Repeat>(value.clone()).map_err(|error| (400, format!("重复设置无效：{error}")))?,
@@ -201,18 +206,6 @@ fn optional<T>(fields: &serde_json::Map<String, Value>, key: &str, parse: impl F
     }
 }
 
-fn optional_time(fields: &serde_json::Map<String, Value>, cfg: &Value) -> Result<Option<i64>, (u16, String)> {
-    let invalid = || (400, "提醒时间无效".to_string());
-    match (fields.get("at"), fields.get("localAt")) {
-        (None, None) => Ok(None),
-        (Some(at), None) => at.as_i64().map(Some).ok_or_else(invalid),
-        (None, Some(local)) => local.as_str()
-            .and_then(|text| crate::local_time::parse_wall_minute(text, &crate::local_time::configured_zone(cfg)))
-            .map(Some).ok_or_else(invalid),
-        (Some(_), Some(_)) => Err(invalid()),
-    }
-}
-
 fn item_action(context: &RuntimeContext, id: &str, action: &str, fields: &serde_json::Map<String, Value>) -> Reply {
     if !matches!(action, "pause" | "resume" | "cancel" | "run" | "edit") {
         return Err((409, UNSUPPORTED.to_string()));
@@ -222,7 +215,7 @@ fn item_action(context: &RuntimeContext, id: &str, action: &str, fields: &serde_
         let cfg = selected_config_for_handler(context)?;
         ItemChange {
             text: optional(fields, "text", |v| v.as_str().map(str::to_string), "提醒内容必须是文字")?,
-            at: optional_time(fields, &cfg)?,
+            at: optional_time(fields, &cfg).map_err(store_error)?,
             repeat: optional(fields, "repeat", |v| serde_json::from_value::<Repeat>(v.clone()).ok(), "重复设置无效")?,
         }
     } else {
@@ -284,7 +277,7 @@ fn set_sleep(context: &RuntimeContext, key: &str, fields: Option<&serde_json::Ma
         // Rechecked under the social-state gate: a rotation may have completed since the check above.
         let current = selected_config_for_handler(context)?;
         let until = fields.map(|fields| {
-            let at = optional_time(fields, &current)?.ok_or((400, "提醒时间无效".to_string()))?;
+            let at = optional_time(fields, &current).map_err(store_error)?.ok_or((400, "提醒时间无效".to_string()))?;
             if at <= crate::parity_clock::now_ms() {
                 return Err((400, "睡眠结束时间必须在现在之后".to_string()));
             }

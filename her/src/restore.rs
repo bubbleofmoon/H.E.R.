@@ -1177,7 +1177,18 @@ fn execute_with(
             Ok(())
         })();
         match attempt {
-            Ok(()) => Ok(json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)})),
+            Ok(()) => {
+                let mut reply = json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous)});
+                if !memory_only {
+                    if let Ok(effective) = context.load_config() {
+                        let notices = crate::watchdog::rollout_scope_gaps(&effective).lines();
+                        if !notices.is_empty() {
+                            reply["scopeNotices"] = json!(notices);
+                        }
+                    }
+                }
+                Ok(reply)
+            }
             Err(Step::Refused(reason)) => {
                 // Quiescence completed before the refusal. Resume the owners without replacing anything.
                 let started = resume(context, by).and_then(|()| control.restart(context));
@@ -1703,6 +1714,7 @@ mod tests {
         fail_rollback_stop: bool,
         leave_conversation_sidecars: bool,
         leave_settings_sidecars: bool,
+        settings_sidecars_after_replace: Option<[bool; 3]>,
         fail_relative: Option<&'static str>,
         replaced: Vec<String>,
         probe_settings_write: bool,
@@ -1784,6 +1796,13 @@ mod tests {
             Ok(())
         }
         fn store_replaced(&mut self, context: &RuntimeContext) {
+            if self.leave_settings_sidecars {
+                let root = context.runtime_root().unwrap();
+                self.settings_sidecars_after_replace = Some(
+                    ["-wal", "-shm", "-journal"]
+                        .map(|suffix| root.join(format!("data/settings.db{suffix}")).exists()),
+                );
+            }
             if self.probe_store_replaced {
                 self.settings_after_replace = Some(
                     crate::settings::apply(context, "reply.wakeQuietMs", &json!(4321), "probe", "console")

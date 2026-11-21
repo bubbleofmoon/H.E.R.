@@ -13,7 +13,7 @@ fn fts_dot_http_and_mcp_search_surface_safe_errors_and_preserve_valid_results() 
     }).unwrap();
     let args = json!({"key":"group:101","token":"group-token","query":"deepseek-v4.1-flash"});
     let valid = crate::mcp::call_tool_with_context("memory_search", &args, &context).unwrap();
-    assert_eq!(valid, "1. [#1 fact] deepseek-v4.1-flash v0.2.1");
+    assert_eq!(valid, "1. [#1 fact·推断] deepseek-v4.1-flash v0.2.1");
     let block = crate::prompt::recall_block_with_runtime(&context, &context.load_config().unwrap(),
         &json!({"unread":[{"text":"deepseek-v4.1-flash v0.2.1"}]}), "group:101");
     assert!(block.contains("deepseek-v4.1-flash v0.2.1"), "dotted recall must inject: {block}");
@@ -799,7 +799,7 @@ fn ticket55_forget_visibility_check_failure_answers_search_failed() {
 fn conversation_authority_owner_config_is_store_owner() {
     let (_root, context) = fixture_runtime("ticket55 owner config", "fixture-console-token-17");
     let cfg = json!({"ownerQQ": 2});
-    let store = crate::memory::MemoryStore::open(&context, &cfg).unwrap();
+    let store = crate::memory::open_store(&context, &cfg).unwrap();
     assert!(!store.for_reader("private:1").is_owner(), "ownerQQ 2 must not make private:1 the owner");
     assert!(store.for_reader("private:2").is_owner(), "the configured integer owner is the owner");
 }

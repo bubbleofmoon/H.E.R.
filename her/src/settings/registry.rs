@@ -18,6 +18,7 @@ mod tools;
 mod voice;
 
 pub(crate) use schedule::{check_schedule, checks_schedule, daily, BACKUP_CLOCK, BACKUP_TIME, DIGEST_CHECK_MINUTE, DIGEST_CHECK_PHASE, DIGEST_CLOCK, DIGEST_TIME, TIME_ZONE};
+pub(crate) use schedule::{REMINDER_CONVERSATION_CAP, REMINDER_HORIZON, REMINDER_REPEAT_FLOOR, REMINDER_TOTAL_CAP};
 pub(crate) use secrets::{ADMINISTRATOR_PASSWORD, CLI_MODEL_API_KEY, WEB_SEARCH_API_KEY};
 
 pub(crate) use media::{MEDIA_BYTES, MEDIA_COUNT, MEDIA_PIXELS};
@@ -28,6 +29,7 @@ pub(crate) use voice::{VOICE_AUTO_READBACK, VOICE_ENABLED, VOICE_MAX_BYTES, VOIC
 
 pub(crate) use alerts::{ALERT_HOURLY_CAP, ALERT_KEY_WINDOW, GATEWAY_SILENCE_WARN};
 pub(crate) use access::{INTERCEPT_NOTIFY, OUTBOUND_GUARD, OWNER, SECURITY_GROUP};
+pub(super) use access::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 pub(crate) use engine::{CONVERSATION_ENGINE, ENGINE_DEFAULT};
 pub(crate) use memory::{material_item_limit,
     RELATED_TOP_K,

@@ -4,6 +4,7 @@ pub(crate) mod handover;
 pub(crate) mod interactions;
 pub(crate) mod one_shot;
 pub(crate) mod profile;
+mod reminders;
 pub(crate) mod rotation;
 pub(crate) mod route_health;
 pub(crate) mod routes;
@@ -386,6 +387,8 @@ pub struct RouteFailure {
     pub model: String,
     /// The content-free failure summary (`model_failure::Failure::summary`).
     pub summary: String,
+    pub model_call: usize,
+    pub message_refs: Vec<Value>,
 }
 
 /// The routes a turn has used so far.
@@ -421,7 +424,6 @@ pub enum Event {
 
 pub struct Turn {
     sent: Arc<AtomicBool>,
-    request_refs: Arc<std::sync::Mutex<Vec<Value>>>,
     progress: Arc<std::sync::Mutex<Progress>>,
     status: watch::Receiver<Status>,
     cancel: watch::Sender<bool>,
@@ -430,10 +432,6 @@ pub struct Turn {
 }
 
 impl Turn {
-    pub fn message_refs(&self) -> Vec<Value> {
-        self.request_refs.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
     /// The model of the route the turn's last request went to (its start route before any request).
     pub fn model(&self) -> String {
         self.progress.lock().unwrap_or_else(|p| p.into_inner()).model.clone()
@@ -575,8 +573,6 @@ impl Harness {
         let context = self.context.clone();
         let sent = Arc::new(AtomicBool::new(false));
         let sent_flag = sent.clone();
-        let request_refs = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let refs_for_task = request_refs.clone();
         let progress = Arc::new(std::sync::Mutex::new(Progress {
             model: request.route.routes[request.route.start].model.clone(),
             ..Progress::default()
@@ -603,7 +599,6 @@ impl Harness {
                 instruction,
                 &notifications,
                 &sent_flag,
-                &refs_for_task,
                 &progress_for_task,
                 deadline,
                 &deadline_generation,
@@ -673,7 +668,6 @@ impl Harness {
         });
         Ok(Turn {
             sent,
-            request_refs,
             progress,
             status,
             cancel,
@@ -768,7 +762,6 @@ async fn tool_loop(
     instruction: String,
     events: &broadcast::Sender<Event>,
     sent: &AtomicBool,
-    request_refs: &std::sync::Mutex<Vec<Value>>,
     progress: &std::sync::Mutex<Progress>,
     deadline: tokio::time::Instant,
     deadline_generation: &std::sync::OnceLock<String>,
@@ -819,10 +812,6 @@ async fn tool_loop(
             with_full[current] = user_message(full, &request.media);
             (kept, delivered) = fit(with_full)?;
         }
-        // Capture only structured references from the request being issued. Later read results
-        // and recalled tool facts may add sources absent from the inbound wake. They are read from
-        // the whole filtered copy of the rounds kept, so they still cover every ID a preview shows.
-        *request_refs.lock().unwrap_or_else(|p| p.into_inner()) = model_request_refs(&kept);
         // Each request caps its output at the remaining token budget, up to its route's cap.
         let max_tokens = request
             .limits
@@ -862,6 +851,7 @@ async fn tool_loop(
         };
         let at = MissAt {
             step,
+            kept: &kept,
             spent,
             request_bytes,
             deadline,
@@ -1034,8 +1024,10 @@ async fn tool_loop(
 
 /// Where a request that missed stood in its turn.
 #[derive(Clone, Copy)]
-struct MissAt {
+struct MissAt<'a> {
     step: usize,
+    /// Whole filtered messages for structured refs, before tool previews are clipped.
+    kept: &'a [ChatMessage],
     /// Tokens the turn has spent, the missed answer's included.
     spent: u32,
     /// The size of the request's delivered messages, serialized.
@@ -1117,7 +1109,7 @@ impl ChainState {
         request: &TurnRequest,
         progress: &std::sync::Mutex<Progress>,
         sent: &AtomicBool,
-        at: MissAt,
+        at: MissAt<'_>,
         failure: ModelFailure,
         cancelled: &mut watch::Receiver<bool>,
     ) -> Result<(), Failure> {
@@ -1147,13 +1139,16 @@ impl ChainState {
             crate::recovery_log::record(context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
         };
         let keep = || {
+            let class = crate::model_failure::Failure::classify("", &summary).class;
+            let message_refs = if class == "refusal" { model_request_refs(at.kept) } else { Vec::new() };
             progress.lock().unwrap_or_else(|p| p.into_inner()).failures.push(RouteFailure {
                 route: route.id.clone(),
                 model: route.model.clone(),
                 summary: summary.clone(),
+                model_call: at.step + 1,
+                message_refs,
             });
             // A route failure is the route's health too (`route_health`); a retry on the same route is not.
-            let class = crate::model_failure::Failure::classify("", &summary).class;
             request.route.observe(context, self.route, route_health::Seen::Failed { class });
         };
         match next {
@@ -2006,7 +2001,7 @@ mod tests {
         .to_string();
         let filtered = filter_tool_text(&original, &json!({}), Some("memory_search")).unwrap();
         let (shown, _, data) = tool_preview_parts(&preview_tool_text(&filtered, 1_000), 1_000);
-        assert!(shown.starts_with("1. [#7 fact] HEAD175 filler"), "{shown}");
+        assert!(shown.starts_with("1. [#7 fact·推断] HEAD175 filler"), "{shown}");
         assert!(!shown.contains("TAIL175"), "{shown}");
         assert!(
             data.get("_meta").is_none(),
