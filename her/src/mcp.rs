@@ -230,10 +230,11 @@ pub(crate) fn format_tool_result(name: &str, args: &Value, result: &Value) -> Re
                     .enumerate()
                     .map(|(i, m)| {
                         format!(
-                            "{}. [#{} {}{}] {}",
+                            "{}. [#{} {}·{}{}] {}",
                             i + 1,
                             m.id,
                             m.kind,
+                            m.provenance_label(),
                             m.subject
                                 .as_ref()
                                 .filter(|s| !s.is_empty())
