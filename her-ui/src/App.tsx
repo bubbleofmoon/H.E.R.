@@ -7,8 +7,10 @@ import { ConversationsPage } from './pages/ConversationsPage';
 import { LegacyPage } from './pages/LegacyPage';
 import { LoginPage } from './pages/LoginPage';
 import { OverviewPage } from './pages/OverviewPage';
+import { SchedulePage } from './pages/SchedulePage';
 import { SecurityPage } from './pages/SecurityPage';
 import { SetupPage } from './pages/SetupPage';
+import { SystemPage } from './pages/SystemPage';
 import { WorkspacePlaceholderPage } from './pages/WorkspacePlaceholderPage';
 import { ConsoleProvider, useConsole } from './stores/consoleStore';
 
@@ -40,6 +42,10 @@ const ConsoleRouter: React.FC = () => {
           <OverviewPage />
         ) : page === 'conversations' ? (
           <ConversationsPage />
+        ) : page === 'schedule' ? (
+          <SchedulePage />
+        ) : page === 'system' ? (
+          <SystemPage />
         ) : page === 'security' ? (
           <SecurityPage />
         ) : page === 'audit' ? (
