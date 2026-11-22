@@ -226,25 +226,57 @@ export async function fetchSettingsList(): Promise<SettingsResponse> {
   return apiRequest<SettingsResponse>('/api/settings', { method: 'GET' });
 }
 
+const settingWriteChains = new Map<string, Promise<unknown>>();
+const activeSettingWrites = new Map<string, number>();
+
+export function isSettingWriteLocked(key: string): boolean {
+  return (activeSettingWrites.get(key) ?? 0) > 0;
+}
+
+async function runWithSettingWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  activeSettingWrites.set(key, (activeSettingWrites.get(key) ?? 0) + 1);
+  const prev = settingWriteChains.get(key) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  const tracked = next.catch(() => undefined);
+  settingWriteChains.set(key, tracked);
+  try {
+    return await next;
+  } finally {
+    const remaining = (activeSettingWrites.get(key) ?? 1) - 1;
+    if (remaining <= 0) {
+      activeSettingWrites.delete(key);
+    } else {
+      activeSettingWrites.set(key, remaining);
+    }
+    if (settingWriteChains.get(key) === tracked) {
+      settingWriteChains.delete(key);
+    }
+  }
+}
+
 export async function saveSettingValue(
   setting: string,
   value: unknown,
   confirm = false,
 ): Promise<Record<string, unknown>> {
-  return apiRequest('/api/settings/set', {
-    method: 'POST',
-    body: confirm ? { setting, value, confirm: true } : { setting, value },
-  });
+  return runWithSettingWriteLock(setting, () =>
+    apiRequest('/api/settings/set', {
+      method: 'POST',
+      body: confirm ? { setting, value, confirm: true } : { setting, value },
+    }),
+  );
 }
 
 export async function resetSettingValue(
   setting: string,
   confirm = false,
 ): Promise<Record<string, unknown>> {
-  return apiRequest('/api/settings/reset', {
-    method: 'POST',
-    body: confirm ? { setting, confirm: true } : { setting },
-  });
+  return runWithSettingWriteLock(setting, () =>
+    apiRequest('/api/settings/reset', {
+      method: 'POST',
+      body: confirm ? { setting, confirm: true } : { setting },
+    }),
+  );
 }
 
 export async function fetchConversationStates(): Promise<Record<string, unknown>> {

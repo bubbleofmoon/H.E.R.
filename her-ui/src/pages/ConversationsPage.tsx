@@ -66,10 +66,14 @@ export const ConversationsPage: React.FC = () => {
 
   useEffect(() => {
     mountedRef.current = true;
+    const keyParam = new URLSearchParams(window.location.search).get('key');
+    if (keyParam && keyParam.trim()) {
+      setInspector({ kind: 'conversation', id: keyParam.trim() });
+    }
     return () => {
       mountedRef.current = false;
     };
-  }, []);
+  }, [setInspector]);
 
   const [restartState, setRestartState] = useState<PersistedLiveRestart | null>(() =>
     readPersistedLiveRestart(),

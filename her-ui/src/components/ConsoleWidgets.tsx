@@ -50,10 +50,12 @@ export function SegmentedControl<T extends string>({
   value,
   onChange,
   options,
+  disabled = false,
 }: {
   value: T;
   onChange: (next: T) => void;
   options: { value: T; label: string }[];
+  disabled?: boolean;
 }): React.ReactElement {
   return (
     <div className="inline-flex rounded-md border border-[var(--border-strong)] bg-[var(--bg-subtle)] p-0.5 text-xs">
@@ -63,8 +65,9 @@ export function SegmentedControl<T extends string>({
           <button
             key={opt.value}
             type="button"
+            disabled={disabled}
             onClick={() => onChange(opt.value)}
-            className={`rounded px-2.5 py-1 font-medium transition-colors ${
+            className={`rounded px-2.5 py-1 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
               active
                 ? 'bg-[var(--bg-surface)] text-[var(--text-primary)] shadow-xs'
                 : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
