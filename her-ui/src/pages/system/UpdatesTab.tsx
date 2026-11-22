@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { ArrowUpCircle, PackageCheck } from 'lucide-react';
 import { ApiRequestError } from '../../api/client';
 import {
@@ -86,6 +86,8 @@ export const UpdatesTab: React.FC<UpdatesTabProps> = ({
   onRefreshAll,
 }) => {
   const { openConfirm, pushToast, refreshLiveData } = useConsole();
+  const releasesStaleRef = useRef(releasesStale);
+  releasesStaleRef.current = releasesStale;
 
   const releasesReady = releases !== null && !releasesStale && !releasesLoading;
   const effectivePolicy =
@@ -171,8 +173,10 @@ export const UpdatesTab: React.FC<UpdatesTabProps> = ({
       pushToast(formatErrorMessage(err, '保存更新策略失败'), 'danger');
       const isDefinitiveClientReject =
         err instanceof ApiRequestError && err.status >= 400 && err.status < 500;
-      if (!isDefinitiveClientReject && mountedRef.current) {
-        setReleasesStale(true);
+      if ((!isDefinitiveClientReject || releasesStaleRef.current) && mountedRef.current) {
+        if (!isDefinitiveClientReject) {
+          setReleasesStale(true);
+        }
         await onRefreshAll();
       }
     } finally {

@@ -1,15 +1,10 @@
 //! P10：控制台 HTTP 服务（Rust 版）。
 //!
-//! 目标是把 JS 桥接那 99 个 `/api/*` 端点搬过来，前端 `public/console.html` 原样 serve，
-//! 不重写页面 —— 页面只是一堆 `fetch('/api/...')`，跟后端语言无关。
-//!
-//! 这一版只做骨架 + 两个最好对拍的读类端点（status / whitelist）：
-//! 先把「路由 + 令牌 + JSON 契约」这套地基验住，再往里加端点。
+//! API endpoints (`/api/*`) paired with the embedded V3 SPA served from `console_ui` (`her-ui/dist/`).
 //!
 //! 设计约束（都是踩过的坑）：
 //!   · 令牌校验用定长比较，且**所有**路由都要过，包括 `/`
 //!   · 响应必须带 `no-store`，否则管理台改完配置刷新看不到新值
-//!   · 端口默认 3101：3100 被 JS 桥接占着，两个进程要能同时跑才能对拍
 
 use crate::console_auth::{credential_digest, credential_eq, digests_equal};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
@@ -23,7 +18,6 @@ const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 /// 写类端点改的那份文件（与 CONFIG_PATH 同一个，单独命名是为了让读/写意图在代码里可辨）
 const CFG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 const SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
-const CONSOLE_HTML: &str = crate::legacy_path!("qq-bridge/public/console.html");
 /// DSH Web 总账文件名：events 里的 day/model/cost/tokens 是**所有入口**（含 Web GUI / CLI）的用量。
 /// No-root callers find it under the explicit DSH home; isolated callers use `user/dsh`.
 const DSH_USAGE_FILE_NAME: &str = ".dshw-usage.json";
@@ -12575,7 +12569,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
         let Some(admin_caller) = caller.admin() else { return admin_required(); };
         return schedule_routes::route(admin_caller, cfg, req);
     }
-    if context.is_isolated() && (req.path == "/tasks" || req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
+    if context.is_isolated() && (req.path == "/api/tasks" || req.path.starts_with("/api/tasks/")) {
         let Some(admin_caller) = caller.admin() else { return admin_required(); };
         let api = match crate::supervisor::task_api(context, cfg) {
             Ok(api) => api,
@@ -12613,23 +12607,6 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
     }
 
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => match read_text_for(context, CONSOLE_HTML) {
-            Ok(mut html) => {
-                if context.is_isolated() {
-                    if context.console_port().is_some_and(|port| canonical_request(req, port)) {
-                        let offset = html.to_ascii_lowercase().find("<script").unwrap_or(html.len());
-                        html.insert_str(offset, ROOT_BROWSER_TRANSPORT);
-                    }
-                    html.push_str(crate::release::BANNER);
-                }
-                (200, "text/html; charset=utf-8".to_string(), html)
-            },
-            Err(_) => (
-                500,
-                "text/plain; charset=utf-8".to_string(),
-                "控制台页面缺失：qq-bridge/public/console.html".to_string(),
-            ),
-        },
         // 审计：看最近改了什么、怎么撤回。
         ("GET", "/api/audit/recent") => {
             let limit = req
@@ -13860,21 +13837,6 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
     }
 }
 
-// The installed bridge page still includes its original fetch helpers.
-const ROOT_BROWSER_TRANSPORT: &str = r#"<script>
-(() => {
-    if (location.hostname !== 'her.localhost') return;
-    const fetch = window.fetch.bind(window);
-    window.fetch = (input, init) => {
-        const url = new URL(input instanceof Request ? input.url : input, location.href);
-        if (url.origin !== location.origin || !url.pathname.startsWith('/api/')) return fetch(input, init);
-        const request = new Request(input, init);
-        request.headers.delete('x-console-token');
-        return fetch(request);
-    };
-})();
-</script>"#;
-
 fn has_fetch_metadata(req: &Request) -> bool {
     req.headers.keys().any(|name| name.starts_with("sec-fetch-"))
 }
@@ -13890,22 +13852,38 @@ fn canonical_request(req: &Request, port: u16) -> bool {
 enum BrowserCookie {
     Renew { port: u16, digest: [u8; 32], id: [u8; 32] },
     Delete { port: u16, digest: [u8; 32] },
+    LegacyPage { port: u16, mac: [u8; 32] },
+    LegacyPageDelete { port: u16 },
 }
 
 impl BrowserCookie {
     fn header(&self) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-        let (port, digest, value, age) = match self {
-            Self::Renew { port, digest, id } => (*port, digest, URL_SAFE_NO_PAD.encode(id), 7 * 24 * 60 * 60),
-            Self::Delete { port, digest } => (*port, digest, String::new(), 0),
-        };
-        format!("her_browser_{port}_{}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}", URL_SAFE_NO_PAD.encode(digest))
+        match self {
+            Self::Renew { port, digest, id } => format!(
+                "her_browser_{port}_{}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                URL_SAFE_NO_PAD.encode(digest),
+                URL_SAFE_NO_PAD.encode(id),
+                7 * 24 * 60 * 60
+            ),
+            Self::Delete { port, digest } => format!(
+                "her_browser_{port}_{}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+                URL_SAFE_NO_PAD.encode(digest)
+            ),
+            Self::LegacyPage { port, mac } => format!(
+                "her_legacy_{port}={}; HttpOnly; SameSite=Strict; Path=/",
+                URL_SAFE_NO_PAD.encode(mac)
+            ),
+            Self::LegacyPageDelete { port } => format!(
+                "her_legacy_{port}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            ),
+        }
     }
 }
 
 enum ConsoleRedirect {
     CanonicalOrigin(u16, String),
-    Path(&'static str),
+    Path(String),
 }
 
 struct ConsoleResponse {
@@ -15941,7 +15919,9 @@ pub(super) mod tests {
                     assert!(header.contains("Max-Age=604800"));
                     header.split(';').next().map(str::to_string)
                 }
-                BrowserCookie::Delete { .. } => None,
+                BrowserCookie::Delete { .. }
+                | BrowserCookie::LegacyPage { .. }
+                | BrowserCookie::LegacyPageDelete { .. } => None,
             })
             .next()
             .expect("expected a Renew browser cookie")
@@ -24195,13 +24175,7 @@ pub(super) mod tests {
         let (root_b, _context_b) = fixture_runtime("票据 03 静态资源 B", token_b);
 
         for (root, marker, agent) in [(&root_a, "selected-a", agent_a), (&root_b, "selected-b", agent_b)] {
-            std::fs::create_dir_all(root.0.join("resources/public")).unwrap();
             std::fs::create_dir_all(root.0.join("resources/audio/nested")).unwrap();
-            std::fs::write(
-                root.0.join("resources/public/console.html"),
-                format!("<!doctype html><title>{marker}</title>"),
-            )
-            .unwrap();
             std::fs::write(
                 root.0.join(format!("resources/audio/{marker}.mp3")),
                 b"mp3",

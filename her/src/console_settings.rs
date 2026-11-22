@@ -1,9 +1,9 @@
-//! Settings console page and routes (`GET /settings`, `GET /api/settings`, `GET /api/settings/history`,
+//! Settings console JSON routes (`GET /api/settings`, `GET /api/settings/history`,
 //! `POST /api/settings/set`, `POST /api/settings/reset`, `POST /api/settings/undo`). Mounted behind the console front
 //! (Host, credential, JSON and Origin checks, request audit); the registry, validation, the store and its history live
-//! in `settings.rs` and `settings/`. The conversation scope's page and routes (#218) are in
-//! `console_settings/conversation.rs`; the model route page and list (#162, `GET /settings/models`,
-//! `GET /api/settings/models`) in `console_settings/models.rs`.
+//! in `settings.rs` and `settings/`. The conversation scope's JSON routes (#218) are in
+//! `console_settings/conversation.rs`; the model route list (#162, `GET /api/settings/models`) in
+//! `console_settings/models.rs`. The V3 SPA renders these views at `/settings`, `/conversations`, and `/models`.
 
 mod conversation;
 mod models;
@@ -14,14 +14,9 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 
 const JSON_TYPE: &str = "application/json; charset=utf-8";
-const HTML_TYPE: &str = "text/html; charset=utf-8";
 
 pub fn is_route(path: &str) -> bool {
-    path == "/settings"
-        || path == "/settings/conversations"
-        || path == "/settings/models"
-        || path == "/api/settings"
-        || path.starts_with("/api/settings/")
+    path == "/api/settings" || path.starts_with("/api/settings/")
 }
 
 /// `caller` takes the configuration gate and re-checks the console credential; a set, reset or undo holds it until
@@ -31,16 +26,13 @@ pub fn route(
     caller: AdminCaller<'_>, method: &str, path: &str, query: &HashMap<String, String>, body: &str,
 ) -> (u16, &'static str, String) {
     let context = caller.context();
-    // The model page and list only read state, even if startup left a legacy engine map.
-    if !matches!((method, path), ("GET", "/settings/models" | "/api/settings/models")) {
+    // The model route list only reads state, even if startup left a legacy engine map.
+    if (method, path) != ("GET", "/api/settings/models") {
         if let Err((status, error)) = crate::console::import_engine_choices(context) {
             return failure(status, &error);
         }
     }
     let result = match (method, path) {
-        ("GET", "/settings") => return (200, HTML_TYPE, PAGE.to_string()),
-        ("GET", "/settings/conversations") => return (200, HTML_TYPE, conversation::PAGE.to_string()),
-        ("GET", "/settings/models") => return (200, HTML_TYPE, models::PAGE.to_string()),
         ("GET", "/api/settings") => crate::settings::view(context),
         ("GET", "/api/settings/conversations") => conversation::list(context),
         ("GET", "/api/settings/models") => models::list(context),
@@ -251,127 +243,3 @@ fn history(context: &RuntimeContext, query: &HashMap<String, String>) -> Result<
 fn failure(status: u16, message: &str) -> (u16, &'static str, String) {
     (status, JSON_TYPE, json!({"ok": false, "error": message}).to_string())
 }
-
-/// Lists every setting from `GET /api/settings` with set (`POST /api/settings/set`) and reset
-/// (`POST /api/settings/reset`) buttons. Integers and numbers use numeric inputs, daily times use time inputs,
-/// and switches use checkboxes. Text and route lists use text areas, with route lists parsed as JSON. Id lists
-/// accept comma- or space-separated ids. Model ids, route ids, owner ids, choices and time zones use text inputs.
-/// The page also shows the history from
-/// `GET /api/settings/history`, newest first, with an undo button per entry (`POST /api/settings/undo`) and an
-/// older-entries button. A set, reset or undo of a security
-/// setting (`confirm` in the list) first asks with `window.confirm` and then sends `"confirm": true`; the owner's
-/// `overriddenBy` is shown beside its value. The message line shows a change's `mirrorError` when present.
-/// Text is shown with `textContent` only.
-const PAGE: &str = r##"<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Settings</title>
-<style>body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:40em}</style></head><body>
-<h1>Settings</h1>
-<p>Console token <input id="token" type="password" size="32"> <button id="use">Use</button> <span id="msg" role="status"></span></p>
-<table id="list"><thead><tr><th>Setting</th><th>Hint</th><th>Current</th><th>Default</th><th>Applies</th><th>New value</th><th></th><th></th></tr></thead><tbody></tbody></table>
-<h2>History</h2>
-<table id="history"><thead><tr><th>When</th><th>Setting</th><th>Old</th><th>New</th><th>Source</th><th>By</th><th></th></tr></thead><tbody></tbody></table>
-<p><button id="older" hidden>Older</button></p>
-<script>
-const $=s=>document.querySelector(s);
-const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
-$('#token').value=token();
-const pageBearer=()=>location.hostname==='her.localhost'?'':token();
-const api=async(path,body)=>{const r=await fetch(path,{method:body?'POST':'GET',headers:{...(pageBearer()?{'x-console-token':pageBearer()}:{}),...(body?{'content-type':'application/json'}:{})},credentials:'same-origin',body:body?JSON.stringify(body):undefined});const j=await r.json();if(body||!j.ok)$('#msg').textContent=j.ok?(j.mirrorError||j.wakeRefreshError||(j.changed===false?'Unchanged':'Saved')):(j.error||r.status);return j};
-const cell=t=>{const td=document.createElement('td');td.textContent=t==null?'':String(t);return td};
-const action=(text,run)=>{const b=document.createElement('button');b.textContent=text;b.onclick=run;const td=document.createElement('td');td.append(b);return td};
-const shown=v=>v==null?'(none)':JSON.stringify(v);
-let next=null;
-let security=new Set();
-let credentials=new Set();
-const ask=key=>confirm('Change the security setting '+key+'? A change of an allow or deny list or the owner revokes every conversation that loses access at once.');
-async function list(){
-  const j=await api('/api/settings');
-  if(!j.ok)return;
-  if(j.storeError)$('#msg').textContent='Stored settings are not applied: '+j.storeError;
-  security=new Set(j.settings.filter(s=>s.confirm).map(s=>s.key));
-  credentials=new Set(j.settings.filter(s=>s.kind.type==="password").map(s=>s.key));
-  const tb=$('#list tbody');
-  tb.replaceChildren();
-  for(const s of j.settings){
-    const tr=document.createElement('tr');
-    if(s.managedBy==='consoleAuth'){
-      tr.append(cell(s.label+' ('+s.key+')'),cell(s.hint),cell(s.isSet?'Set':'Unset'),
-        cell(''),cell(s.applies),cell(''),cell(''),cell(''));
-      tb.append(tr);
-      continue;
-    }
-    const type=s.kind.type;
-    const text=type==='text';
-    const routeList=type==='route list';
-    const conversationList=type==='conversation list';
-    const input=document.createElement(text||routeList?'textarea':'input');
-    if(type==='password'){
-      input.type='password';
-      input.autocomplete='new-password';
-    }else if(type==='integer'||type==='number'||type==='probability'){
-      input.type='number';
-      input.min=s.kind.min;
-      input.max=s.kind.max;
-      if(type==='number'||type==='probability')input.step='any';
-      input.value=s.value==null?'':s.value;
-    }else if(type==='daily time'){
-      input.type='time';
-      input.value=s.value;
-    }else if(type==='switch'){
-      input.type='checkbox';
-      input.checked=s.value===true;
-    }else if(type==='id list'||conversationList){
-      input.type='text';
-      input.size=40;
-      input.value=Array.isArray(s.value)?s.value.join(', '):'';
-    }else if(text||routeList){
-      input.rows=8;
-      input.cols=60;
-      if(routeList){
-        input.setAttribute('aria-label',s.label);
-        input.value=s.redacted||s.value==null?'':JSON.stringify(s.value,null,2);
-        input.placeholder=s.redacted?'Enter a full replacement list':'[{"id":"first","model":"model-id"}]';
-      }else{
-        input.value=s.value==null?'':s.value;
-      }
-    }else{
-      input.type='text';
-      input.value=s.value==null?'':s.value;
-    }
-    const send=async(path,body)=>{if(s.confirm){if(!ask(s.key))return;body.confirm=true}const r=await api(path,body);if(r.ok){if(type==='password')input.value='';refresh()}};
-    const save=()=>{
-      let value;
-      if(conversationList){
-        value=input.value.trim()?input.value.split(',').map(key=>key.trim()):[];
-      }else if(routeList){
-        try{
-          value=JSON.parse(input.value);
-        }catch{
-          $('#msg').textContent='Enter a JSON array of model routes.';
-          return;
-        }
-      }else{
-        value=(type==='integer'||type==='number'||type==='probability')?Number(input.value):type==='switch'?input.checked:type==='id list'?input.value.split(/[\s,]+/).filter(Boolean):type==='owner id'?input.value.trim():input.value;
-      }
-      return send('/api/settings/set',{setting:s.key,value});
-    };
-    let current=s.value;
-    if(s.overriddenBy)current=shown(s.value)+' (in effect: '+shown(s.overriddenBy.value)+' from the '+s.overriddenBy.source+')';
-    if(type==='password')current=s.isSet?'Set':'Unset';
-    if(routeList)current=s.value==null?'(none)':JSON.stringify(s.value,null,2);
-    if(conversationList)current=shown(s.value);
-    const field=document.createElement('td');
-    field.append(input);
-    tr.append(cell(s.label+' ('+s.key+')'+(s.confirm?' [needs confirmation]':'')),cell(s.hint),cell(current),
-      cell(routeList?shown(s.default):s.default),cell(s.applies),field,action('Set',save),
-      action('Reset',()=>send('/api/settings/reset',{setting:s.key})));
-    tb.append(tr);
-  }
-}
-async function history(more){const j=await api('/api/settings/history'+(more&&next!=null?'?before='+next:''));if(!j.ok)return;const tb=$('#history tbody');if(!more)tb.replaceChildren();for(const e of j.entries){const tr=document.createElement('tr');tr.append(cell(new Date(e.atMs).toLocaleString()),cell(e.setting),cell(shown(e.old)),cell(shown(e.new)),cell(e.source),cell(e.actor),credentials.has(e.setting)?cell(''):action('Undo',async()=>{const body={entry:e.entry};if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}const r=await api('/api/settings/undo',body);if(r.ok)refresh()}));tb.append(tr)}next=j.next;$('#older').hidden=next==null}
-async function refresh(){await list();await history(false)}
-$('#use').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);refresh()};
-$('#older').onclick=()=>history(true);
-refresh();
-</script></body></html>
-"##;

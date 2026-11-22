@@ -883,12 +883,6 @@ impl Fixture {
         fs::write(path, config.to_string()).unwrap();
     }
     fn console(&self) -> (Child, u16) {
-        fs::create_dir_all(self.root.join("runtime/resources/public")).unwrap();
-        fs::write(
-            self.root.join("runtime/resources/public/console.html"),
-            "<!doctype html><body>fixture console</body>",
-        )
-        .unwrap();
         let (child, port) = crate::support::ports::start_console(Duration::from_secs(15), |port| {
             self.command(&[
                 "--console-serve",

@@ -109,6 +109,11 @@ jobs:
             echo '::error::console_ui runs its entire matrix and takes no filter'
             exit 1
           fi
+          cd "$PUBLIC_TREE/her-ui"
+          npm ci
+          npm run build
+          export HER_REQUIRE_UI_DIST=1
+          echo "HER_REQUIRE_UI_DIST=1" >> "$GITHUB_ENV"
           cd "$PUBLIC_TREE/her"
           echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           if [ "$RUNNER_OS" = Windows ]; then
@@ -116,15 +121,13 @@ jobs:
           else
             cargo build --locked --features release-test-keys --bin her-cli
           fi
-      - name: Install Playwright and browsers
+      - name: Install Playwright and Chromium (Linux)
         if: inputs.target == 'console_ui'
         run: |
           cd "$PUBLIC_TREE/her/tests/ui"
           npm ci --ignore-scripts --no-audit --no-fund
-          if [ "$RUNNER_OS" = Windows ]; then
-            npx --no-install playwright install msedge
-          else
-            npx --no-install playwright install --with-deps chromium firefox webkit
+          if [ "$RUNNER_OS" != Windows ]; then
+            npx --no-install playwright install --with-deps chromium
           fi
       - name: Capture the console and walk its controls
         if: inputs.target == 'console_ui'

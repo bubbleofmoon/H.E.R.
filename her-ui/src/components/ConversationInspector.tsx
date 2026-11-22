@@ -563,6 +563,34 @@ export const ConversationInspector: React.FC<{ conversationKey: string }> = ({
     });
   };
 
+  const handleClearCategoryMemory = () => {
+    const label =
+      memCategory === 'activeTopic'
+        ? '活跃话题'
+        : memCategory === 'pendingThought'
+          ? '待表达想法'
+          : '成员印象';
+    openConfirm({
+      title: `清空 ${conversationKey} 的「${label}」？`,
+      description: `将仅清空该会话的「${label}」类别记录，其他类别保留且不可撤销。`,
+      confirmLabel: '确认清空该类',
+      danger: true,
+      onConfirm: async () => {
+        setBusy(true);
+        try {
+          await clearLightMemory(conversationKey, memCategory);
+          pushToast(`已清空${label}`, 'success');
+          const mRes = await fetchLightMemory(conversationKey);
+          if (mountedRef.current) setLightMemory(mRes);
+        } catch (err) {
+          pushToast(err instanceof Error ? err.message : '清空该类轻记忆失败', 'danger');
+        } finally {
+          if (mountedRef.current) setBusy(false);
+        }
+      },
+    });
+  };
+
   const handleClearMemory = () => {
     openConfirm({
       title: `清空 ${conversationKey} 的全部轻记忆？`,
@@ -875,14 +903,19 @@ export const ConversationInspector: React.FC<{ conversationKey: string }> = ({
             </div>
 
             <Card className="p-3 space-y-2.5">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="font-semibold text-[var(--text-primary)]">
                   轻记忆（话题 / 想法 / 成员印象）
                 </span>
-                <Button size="sm" variant="ghost" disabled={busy} onClick={handleClearMemory}>
-                  <Trash2 className="h-3.5 w-3.5" />
-                  清空
-                </Button>
+                <div className="flex items-center gap-1">
+                  <Button size="sm" variant="ghost" disabled={busy} onClick={handleClearCategoryMemory}>
+                    清空当前类
+                  </Button>
+                  <Button size="sm" variant="ghost" disabled={busy} onClick={handleClearMemory}>
+                    <Trash2 className="h-3.5 w-3.5" />
+                    清空
+                  </Button>
+                </div>
               </div>
               <div className="space-y-1.5">
                 <div className="flex gap-1.5">

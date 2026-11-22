@@ -552,7 +552,9 @@ export async function refreshSharedScheduleSettings(): Promise<SettingItemView[]
   try {
     const res = await fetchSettingsList();
     const list = Array.isArray(res.settings) ? res.settings : [];
-    commitSharedSettingsRead(list, readStartGen);
+    if (!commitSharedSettingsRead(list, readStartGen)) {
+      return null;
+    }
     return list;
   } catch {
     markSharedSettingsReadFailed(readStartGen);
@@ -571,6 +573,7 @@ let nextSystemMountSeq = 1;
 let backupDirVersion = 0;
 let activeBackupSaves = 0;
 let activeBackupDirSaves = 0;
+let activeExternalBackupTimeSaves = 0;
 let backupSaveVersion = 0;
 let activeReleaseSaves = 0;
 let releaseSaveVersion = 0;
@@ -601,7 +604,7 @@ export function getReleaseSaveVersion(): number {
 }
 
 export function hasActiveBackupSaves(): boolean {
-  return activeBackupSaves > 0;
+  return activeBackupSaves > 0 || activeExternalBackupTimeSaves > 0;
 }
 
 export function hasPendingBackupDirSaves(): boolean {
@@ -610,6 +613,22 @@ export function hasPendingBackupDirSaves(): boolean {
 
 export function hasActiveReleaseSaves(): boolean {
   return activeReleaseSaves > 0;
+}
+
+export function beginExternalBackupTimeSave(): void {
+  activeExternalBackupTimeSaves += 1;
+  systemSyncListeners.forEach((h) => {
+    h.onActiveSavesChanged();
+  });
+}
+
+export function finishExternalBackupTimeSave(): void {
+  activeExternalBackupTimeSaves = Math.max(0, activeExternalBackupTimeSaves - 1);
+  backupSaveVersion += 1;
+  systemSyncListeners.forEach((h) => {
+    h.onActiveSavesChanged();
+    h.onBackupSaveSettled();
+  });
 }
 
 export function beginBackupSave(hasDirChange: boolean): void {

@@ -1,4 +1,4 @@
-//! Ticket 27 (renamed by ticket 33): the Schedule page's task routes (`/api/tasks/*`) and the page markup.
+//! Ticket 27 (renamed by ticket 33): the Schedule JSON task routes (`/api/tasks/*`; the SPA is served at `/schedule` via `console_ui`).
 //!
 //! Mounted behind the console front (`console_front`): Host check, console credential, agent refusal, `application/json` and Origin checks
 //! on POST, and the audit record of every administrator write happen before [`route`] is called. This
@@ -30,7 +30,6 @@ pub struct TaskResponse {
 }
 
 const JSON_TYPE: &str = "application/json; charset=utf-8";
-const HTML_TYPE: &str = "text/html; charset=utf-8";
 
 pub struct TasksApi {
     pub dispatcher: Arc<Dispatcher>,
@@ -49,15 +48,9 @@ fn error(status: u16, message: &str) -> Option<TaskResponse> {
 /// `None`: not a task route (the console continues with its own table).
 pub fn route(caller: crate::console_front::AdminCaller<'_>, api: &TasksApi, req: &TaskRequest) -> Option<TaskResponse> {
     let path = req.path;
-    let is_task_route = path == "/tasks" || path == "/api/tasks" || path.starts_with("/api/tasks/");
+    let is_task_route = path == "/api/tasks" || path.starts_with("/api/tasks/");
     if !is_task_route {
         return None;
-    }
-    if path == "/tasks" {
-        return match req.method {
-            "GET" => Some(TaskResponse { status: 200, content_type: HTML_TYPE, body: PAGE.to_string() }),
-            _ => error(405, "method not allowed"),
-        };
     }
     if path == "/api/tasks" {
         return match req.method {
@@ -326,147 +319,6 @@ pub(crate) fn trigger(api: &TasksApi, task: &str, body: &str) -> Option<TaskResp
     }
 }
 
-pub(crate) const PAGE: &str = r##"<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><title>日程</title>
-<style>
-body{font:14px system-ui,sans-serif;margin:16px;color:#222}table{border-collapse:collapse;margin:8px 0}
-td,th{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}th{background:#f4f4f4}
-.state-failed,.state-unknown{color:#b00}.state-succeeded{color:#070}.state-running,.state-queued{color:#a60}
-pre{background:#f8f8f8;border:1px solid #ddd;padding:8px;max-height:360px;overflow:auto;white-space:pre-wrap}
-</style></head><body>
-<h1>日程</h1>
-<p>控制台令牌 <input id="token" type="password" size="32"> <button id="save">使用</button> <span id="desired"></span></p>
-<p>运行状态： <button data-state="running">运行</button> <button data-state="maintenance">维护（暂停 live 和任务）</button> <button data-state="stopped">停止</button></p>
-<h2 id="updates">HER 更新</h2>
-<p id="release-available" role="status" hidden></p>
-<button id="approve-update" type="button" hidden>批准更新</button>
-<form id="update-settings"><label>更新策略 <select id="update-policy"><option value="off">关闭</option><option value="notify">通知（默认）</option><option value="auto">自动</option></select></label>
-<button type="submit">保存</button> <span id="update-message" role="status"></span></form>
-<h2 id="dependencies">依赖更新</h2>
-<p>依赖升级始终需要管理员批准，包括自动策略。<button id="check-dependencies" type="button">检查依赖版本</button></p>
-<div id="dependency-list"></div><p id="dependency-message" role="status"></p>
-<h2 id="backups">备份设置</h2>
-<form id="backup-settings">
-<p><label>备份位置 <input id="backup-dir" size="54" placeholder="留空使用默认位置" spellcheck="false"></label></p>
-<p>实际位置：<code id="backup-resolved" style="overflow-wrap:anywhere"></code></p>
-<p><label>保留天数 <input id="backup-days" type="number" min="1" step="1" required></label> <label>每日时间（本地） <input id="backup-time" type="time" required></label> <label><input id="backup-state" type="checkbox"> 包含状态</label></p>
-<p><button id="backup-save" type="submit">保存设置</button> <button type="button" data-run="backup" data-effect="创建并验证一次备份">立即备份</button> <span id="backup-message" role="status"></span></p>
-<p>支持本地文件夹和 SMB 路径。SMB 凭据请在 Windows 凭据管理器中设置；保存后下次备份生效。</p>
-</form>
-<h3>备份记录 <button id="backup-refresh" type="button">刷新</button></h3>
-<p><label>恢复范围 <select id="restore-scope"><option value="everything">全部（记忆、状态、角色和配置）</option><option value="memory">仅记忆</option></select></label></p>
-<p id="backup-list-message" role="status"></p>
-<table id="backup-list"><thead><tr><th>时间</th><th>文件 / 运行</th><th>大小</th><th>结果</th><th>恢复</th></tr></thead><tbody></tbody></table>
-<h2 id="schedule">日程</h2><p><button id="tab-upcoming" type="button">即将运行</button> <button id="tab-history" type="button">历史</button> <span id="schedule-zone"></span> <span id="schedule-message" role="status"></span></p>
-<section id="upcoming"><table id="schedule-upcoming"><thead><tr><th>类型</th><th>创建者</th><th>会话</th><th>下次运行</th><th>重复</th><th>动作</th><th>状态</th><th>创建时间</th><th>上次结果</th><th></th></tr></thead><tbody></tbody></table>
-<form id="schedule-create"><label>会话 <input id="create-conversation" placeholder="group:123 / private:123" required></label> <label>时间 <input id="create-at" type="datetime-local" required></label> <label>重复 <select id="create-repeat"><option value="once">一次</option><option value="hourly">每小时</option><option value="daily">每天</option></select></label> <label>内容 <input id="create-text" size="40" maxlength="500" required></label> <button type="submit">新建提醒</button></form></section>
-<section id="history" hidden><h3>提醒记录</h3><table id="schedule-history"><thead><tr><th>时间</th><th>项目</th><th>会话</th><th>结果</th></tr></thead><tbody></tbody></table>
-<h2>运行历史</h2><p>筛选 <select id="filter"><option value="">全部</option></select> <button id="more">更早</button></p>
-<table id="runs"><thead><tr><th>运行 ID</th><th>任务</th><th>来源</th><th>状态</th><th>退出码</th><th>原因</th><th>排队</th><th>开始</th><th>结束</th></tr></thead><tbody></tbody></table>
-</section>
-<h2>日志 <span id="logrun"></span></h2><pre id="log">选择一次运行查看日志</pre>
-<h2>旧计划任务处置</h2><table id="legacy"><thead><tr><th>Windows 任务</th><th>处置</th><th>替代</th><th>说明</th></tr></thead><tbody></tbody></table>
-<script>
-const $=s=>document.querySelector(s);let before=null;
-const token=()=>sessionStorage.getItem('consoleToken')||new URLSearchParams(location.search).get('token')||'';
-$('#token').value=token();$('#save').onclick=()=>{sessionStorage.setItem('consoleToken',$('#token').value);load();loadBackupSettings();loadUpdates()};
-let scheduleZone={name:'UTC',offsetSeconds:0};
-const t=ms=>{if(!ms)return '';if(scheduleZone.name){try{return new Date(ms).toLocaleString('zh-CN',{timeZone:scheduleZone.name,hour12:false})}catch{}}
- return new Date(ms+scheduleZone.offsetSeconds*1000).toLocaleString('zh-CN',{timeZone:'UTC',hour12:false})};
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function api(path,opt={}){const bearer=location.hostname==='her.localhost'?'':token();const r=await fetch(path,{...opt,credentials:'same-origin',headers:{...(bearer?{'x-console-token':bearer}:{}),'content-type':'application/json'}});
- const j=await r.json().catch(()=>({ok:false,error:'HTTP '+r.status}));j.status=r.status;return j}
-
-let displayedRelease=null;
-async function loadUpdates(){try{const j=await api('/api/releases');if(!j.ok)throw Error(j.error);displayedRelease=j;$('#update-policy').value=j.settings.policy;const b=$('#release-available');b.hidden=!j.available;b.textContent=j.available?'HER 更新可用：'+(j.current||'未知版本')+' → '+j.available.tag:'';$('#approve-update').hidden=!j.available;$('#approve-update').disabled=!!j.approval;if(j.updateError)$('#update-message').textContent=j.updateError}catch(e){displayedRelease=null;$('#approve-update').hidden=true;$('#update-message').textContent=e.message}}
-$('#approve-update').onclick=async()=>{const j=displayedRelease;if(!j?.available||!confirm('批准更新 HER：'+(j.current||'未知版本')+' → '+j.available.tag+'？'))return;$('#approve-update').disabled=true;try{const r=await api('/api/releases/approve',{method:'POST',body:JSON.stringify({confirm:true,tag:j.available.tag})});if(!r.ok)throw Error(r.error);$('#update-message').textContent='已批准，正在更新…'}catch(e){$('#update-message').textContent=e.message;$('#approve-update').disabled=false}};
-$('#update-settings').onsubmit=async e=>{e.preventDefault();try{const j=await api('/api/releases/settings',{method:'POST',body:JSON.stringify({policy:$('#update-policy').value})});if(!j.ok)throw Error(j.error);$('#update-message').textContent='已保存';await loadUpdates()}catch(error){$('#update-message').textContent=error.message}};
-loadUpdates();setInterval(loadUpdates,30000);
-async function loadDependencies(){try{const j=await api('/api/dependencies');if(!j.ok)throw Error(j.error);const list=$('#dependency-list');list.replaceChildren();for(const [name,d] of Object.entries(j.dependencies)){const row=document.createElement('p');row.textContent=name+': '+(d.current||'未配置')+(d.available?' → '+d.available:(d.latest?'；最新版本：'+d.latest:''))+' '+(d.sourceUnavailable||d.error||'');if(d.available){const button=document.createElement('button');button.textContent='批准升级';button.disabled=!!j.approval||j.result?.status==='running';button.onclick=async()=>{if(!confirm('批准升级 '+name+'：'+d.current+' → '+d.available+'？'))return;button.disabled=true;try{const r=await api('/api/dependencies/approve',{method:'POST',body:JSON.stringify({confirm:true,name,version:d.available})});if(!r.ok)throw Error(r.error);await loadDependencies();$('#dependency-message').textContent='已批准，等待现有会话完成后升级…'}catch(e){$('#dependency-message').textContent=e.message;button.disabled=false}};row.append(button)}list.append(row)}$('#dependency-message').textContent=j.updateError||(j.result?.status?j.result.name+': '+j.result.status:'')}catch(e){$('#dependency-message').textContent=e.message}}
-$('#check-dependencies').onclick=async()=>{const b=$('#check-dependencies');b.disabled=true;try{const j=await api('/api/dependencies/check',{method:'POST',body:'{}'});if(!j.ok)throw Error(j.error);await loadDependencies()}catch(e){$('#dependency-message').textContent=e.message}finally{b.disabled=false}};
-loadDependencies();setInterval(loadDependencies,30000);
-
-function fillBackupSettings(s){$('#backup-dir').value=s.dir??'';$('#backup-days').value=s.keepDays;$('#backup-time').value=s.time;$('#backup-state').checked=s.includeState;$('#backup-resolved').textContent=s.resolvedDir}
-async function loadBackupSettings(){try{const j=await api('/api/backups/settings');if(!j.ok)throw Error(j.error);fillBackupSettings(j.settings);$('#backup-message').textContent=''}catch(e){$('#backup-message').textContent=e.message}}
-$('#backup-settings').onsubmit=async e=>{e.preventDefault();const b=$('#backup-save'),message=$('#backup-message');b.disabled=true;try{
- const j=await api('/api/backups/settings',{method:'POST',body:JSON.stringify({dir:$('#backup-dir').value||null,keepDays:Number($('#backup-days').value),time:$('#backup-time').value,includeState:$('#backup-state').checked})});
- if(!j.ok){message.textContent=j.error;return}fillBackupSettings(j.settings);message.textContent='已保存；下次备份生效';await load()
-}catch(error){message.textContent=error.message}finally{b.disabled=false}};
-async function loadBackupList(){try{const j=await api('/api/backups');if(!j.ok)throw Error(j.error);
- const labels={verified:'已验证',unverified:'未验证',pending:'尚未验证',failed:'失败',unknown:'结果未知',cancelled:'已取消'};
- const rows=[...j.backups,...j.failedAttempts.map(r=>({time:r.endedAt||r.startedAt||r.queuedAt,name:r.runId,size:null,result:r.state}))].sort((a,b)=>b.time-a.time);
- $('#backup-list tbody').innerHTML=rows.map(r=>`<tr><td>${t(r.time)}</td><td>${esc(r.name)}</td><td>${r.size==null?'':esc(r.size)+' B'}</td><td>${esc(labels[r.result]||r.result)}</td><td>${r.result==='verified'?`<button type="button" data-restore="${esc(r.name)}">恢复…</button>`:''}</td></tr>`).join('');
- $('#backup-list-message').textContent=rows.length?'':'暂无备份'
-}catch(e){$('#backup-list-message').textContent=e.message}}
-$('#backup-refresh').onclick=loadBackupList;
-$('#backup-list tbody').onclick=async e=>{
- const b=e.target.closest('[data-restore]');if(!b)return;b.disabled=true;
- const message=$('#backup-list-message'),selection={archive:b.dataset.restore,memoryOnly:$('#restore-scope').value==='memory'};
- try{
-  const j=await api('/api/backups/restore/preview',{method:'POST',body:JSON.stringify(selection)});if(!j.ok)throw Error(j.error);
-  const p=j.preview;
-  const question='恢复备份：'+selection.archive+'\n目标：'+p.runtimeRoot+'\n时间：'+t(p.time)+'\n范围：'+(selection.memoryOnly?'仅记忆':'全部')+'\n内容：\n'+p.contents.join('\n')+'\n将替换：\n'+p.replaces.join('\n')+'\n将删除：\n'+(p.removes||[]).join('\n')+'\n恢复前会备份当前状态；健康检查失败会自动撤回。确认恢复？';
-  const warnings=(p.warnings||[]).join('\n');
-  if(!confirm(warnings?question+'\n\n'+warnings:question))return;
-  const result=await api('/api/backups/restore',{method:'POST',body:JSON.stringify({...selection,confirmation:p.confirmation})});if(!result.ok)throw Error(result.error);
-  message.textContent='恢复已开始；控制台会重新启动，请稍后刷新。结果请查看审计日志。'
- }catch(error){message.textContent=error.message}finally{b.disabled=false}
-};
-
-function runRow(r){return `<tr><td><a href="#" data-log="${esc(r.runId)}">${esc(r.runId)}</a></td><td>${esc(r.taskId)}</td><td>${esc(r.source)}</td>
- <td class="state-${esc(r.state)}">${esc(r.state)}</td><td>${esc(r.exitCode)}</td><td>${esc(r.reason)}</td><td>${t(r.queuedAt)}</td><td>${t(r.startedAt)}</td><td>${t(r.endedAt)}</td></tr>`}
-async function load(){const j=await api('/api/tasks');if(!j.ok){$('#desired').textContent=j.error;return}
- $('#desired').textContent='期望状态：'+j.desired.state;
-  $('#legacy tbody').innerHTML=j.legacy.map(x=>`<tr><td>${esc(x.name)}</td><td>${x.disposition==='retired'?'退役':'迁移'}</td><td>${esc(x.replacement)}</td><td>${esc(x.note)}</td></tr>`).join('');
- if($('#filter').options.length===1)for(const x of j.tasks){const o=document.createElement('option');o.value=x.id;o.textContent=x.title;$('#filter').append(o)}
- before=null;$('#runs tbody').innerHTML='';await loadSchedule();await runs();await loadBackupList()}
-async function runs(){const q=new URLSearchParams({limit:'50'});if($('#filter').value)q.set('task',$('#filter').value);if(before)q.set('before',before);
- const j=await api('/api/tasks/runs?'+q);if(!j.ok)return;$('#runs tbody').insertAdjacentHTML('beforeend',j.runs.map(runRow).join(''));before=j.nextBefore;$('#more').disabled=!before}
-async function showLog(id){$('#logrun').textContent=id;let after=null,text='';
- for(;;){const q=new URLSearchParams();if(after)q.set('after',after);const j=await api(`/api/tasks/runs/${encodeURIComponent(id)}/log?`+q);
-  if(!j.ok){text+=j.error;break}text+=j.lines.map(l=>`[${l.stream}] ${l.text}`).join('\n')+(j.lines.length?'\n':'');
-  if(j.stdoutHidden&&after===null)text='（此任务的输出可能含聊天内容，仅显示元数据）\n'+text;after=j.nextAfter;if(!after)break}
- $('#log').textContent=text||'（无日志）'}
-async function follow(id){for(;;){const j=await api('/api/tasks/runs/'+encodeURIComponent(id));if(!j.ok||!['queued','running'].includes(j.run.state)){await load();return showLog(id)}
- await new Promise(r=>setTimeout(r,1500))}}
-document.addEventListener('click',async e=>{const control=e.target.closest('[data-state]');if(control){const state=control.dataset.state;
- if(!confirm('切换运行状态到 '+state+'？这会影响后台进程与任务。'))return;
- const j=await api('/api/tasks/lifecycle',{method:'POST',body:JSON.stringify({state,confirm:true})});if(!j.ok)alert(j.error);else await load();return}
- const b=e.target.closest('[data-run]');if(b){if(!confirm('运行「'+b.dataset.run+'」？\n'+b.dataset.effect))return;
-  const requestId=(crypto.randomUUID?crypto.randomUUID():String(Date.now())+Math.random().toString(16).slice(2)).replace(/[^A-Za-z0-9_-]/g,'');
-  if(b.dataset.run==='console-restart'){b.disabled=true;const j=await api('/api/restart',{method:'POST',body:JSON.stringify({requestId,confirm:true})});
-   if(!j.ok){alert(j.error);b.disabled=false;return}alert('已排队，完成后可在运行历史查看结果');setTimeout(()=>load().catch(()=>{}),4000);return}
-  b.disabled=true;const j=await api(`/api/tasks/${encodeURIComponent(b.dataset.run)}/run`,{method:'POST',body:JSON.stringify({requestId})});
-  if(!j.ok){alert(j.error);if(j.runId)follow(j.runId);else load();return}follow(j.runId);return}
- const l=e.target.closest('[data-log]');if(l){e.preventDefault();showLog(l.dataset.log)}});
-const schedKinds={job:'任务',reminder:'提醒',sleep:'潜水结束',replyCheck:'回复检查',reachOut:'主动冒泡'};
-const schedCreators={system:'系统',owner:'管理员',her:'HER'};
-const schedStatus={active:'待运行',paused:'已暂停',overdue:'已逾期',running:'运行中',disabled:'未启用',stale:'已过时（HER 未在运行）'};
-const schedLabels={pause:'暂停',resume:'恢复',edit:'编辑',cancel:'取消',run:'立即运行'};
-function schedRow(x){const buttons=x.actions.map(a=>x.kind==='job'&&a==='run'?`<button data-run="${esc(x.id.slice(7))}" data-effect="${esc(x.action)}" ${x.status==='running'?'disabled':''}>${schedLabels.run}</button>`:`<button type="button" data-sched="${esc(x.id)}" data-act="${a}" data-text="${esc(x.action)}" data-at="${esc(x.nextRunAt??'')}">${schedLabels[a]}</button>`).join(' ');
- return `<tr><td>${esc(schedKinds[x.kind]||x.kind)}</td><td>${esc(schedCreators[x.creator]||x.creator)}</td><td>${esc(x.conversation??'')}</td><td>${x.nextRunAt==null?'':t(x.nextRunAt)}</td><td>${esc(x.repeat)}</td><td>${esc(x.action)}</td><td>${esc(schedStatus[x.status]||x.status)}</td><td>${t(x.createdAt)}</td><td>${x.lastResult?esc(x.lastResult.summary)+' '+t(x.lastResult.at):''}</td><td>${buttons}</td></tr>`}
-async function loadSchedule(){try{const j=await api('/api/schedule');if(!j.ok)throw Error(j.error);scheduleZone=j.timeZone;$('#schedule-zone').textContent=scheduleZone.label;$('#schedule-upcoming tbody').innerHTML=j.entries.map(schedRow).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
-async function loadScheduleHistory(){try{const j=await api('/api/schedule/history?limit=100');if(!j.ok)throw Error(j.error);$('#schedule-history tbody').innerHTML=j.history.map(r=>`<tr><td>${t(r.at)}</td><td>${esc(r.id)}</td><td>${esc(r.conversation)}</td><td>${esc(r.summary)}${r.late?'（迟到）':''}</td></tr>`).join('');$('#schedule-message').textContent=''}catch(e){$('#schedule-message').textContent=e.message}}
-$('#tab-upcoming').onclick=()=>{$('#upcoming').hidden=false;$('#history').hidden=true};
-$('#tab-history').onclick=()=>{$('#upcoming').hidden=true;$('#history').hidden=false;loadScheduleHistory()};
-document.addEventListener('click',async e=>{const b=e.target.closest('[data-sched]');if(!b)return;
- const id=b.dataset.sched,act=b.dataset.act,message=$('#schedule-message'),body={};
- if(id.startsWith('system:')){if(!confirm((act==='pause'?'暂停':'恢复')+'系统任务「'+id.slice(7)+'」？'))return;body.confirm=true}
- if(act==='cancel'&&!confirm(id.startsWith('reachOut:')?'跳过这次主动冒泡机会？下一次机会会在它之后重新安排。':'取消这条日程？'))return;if(act==='cancel'&&(id.startsWith('replyCheck:')||id.startsWith('reachOut:')))body.at=Number(b.dataset.at);
- if(act==='edit'){const at=prompt('新的时间（本地，例如 2026-11-14 09:00）','');if(!at)return;body.localAt=at.trim().replace(' ','T');
-  if(id.startsWith('item:')){const text=prompt('提醒内容',b.dataset.text||'');if(text===null)return;body.text=text}}
- b.disabled=true;
- try{const j=await api('/api/schedule/'+id+'/'+act,{method:'POST',body:JSON.stringify(body)});if(!j.ok){message.textContent=j.error||'操作失败';return}message.textContent='已完成';await loadSchedule()}
- catch(error){message.textContent=error.message}finally{b.disabled=false}});
-$('#schedule-create').onsubmit=async e=>{e.preventDefault();const message=$('#schedule-message');const localAt=$('#create-at').value;const [,hour,minute]=localAt.match(/T(\d{2}):(\d{2})$/)||[];
- const kind=$('#create-repeat').value;
- const repeat=kind==='hourly'?{kind:'every',minutes:60}:kind==='daily'?{kind:'daily',hour:Number(hour),minute:Number(minute)}:{kind:'once'};
- const j=await api('/api/schedule',{method:'POST',body:JSON.stringify({conversation:$('#create-conversation').value,text:$('#create-text').value,localAt,repeat})});
- if(!j.ok){message.textContent=j.error;return}message.textContent='已新建';e.target.reset();await loadSchedule()};
-$('#filter').onchange=()=>{before=null;$('#runs tbody').innerHTML='';runs()};$('#more').onclick=runs;load();loadBackupSettings();
-</script></body></html>
-"##;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,16 +419,6 @@ mod tests {
         for path in ["/api/status", "/api/tasksx", "/task", "/"] {
             assert!(route(crate::console_front::AdminCaller::new(&context), &f.api, &TaskRequest { method: "GET", path, query: &query, body: "" }).is_none(), "{path}");
         }
-    }
-
-    #[test]
-    fn the_page_is_served() {
-        let f = Fixture::new("page");
-        let query = HashMap::new();
-        let context = crate::runtime::RuntimeContext::legacy();
-        let page = route(crate::console_front::AdminCaller::new(&context), &f.api, &TaskRequest { method: "GET", path: "/tasks", query: &query, body: "" }).unwrap();
-        assert_eq!((page.status, page.content_type), (200, HTML_TYPE));
-        assert!(page.body.contains("/api/tasks") && page.body.contains("x-console-token") && page.body.contains("requestId"));
     }
 
     #[test]

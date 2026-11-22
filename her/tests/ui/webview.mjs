@@ -56,10 +56,59 @@ export async function withWebView(cli, fixture, run) {
     const [context] = browser.contexts();
     assert(context, 'CDP did not expose the desktop WebView2 context');
     const page = context.pages()[0] ?? await context.waitForEvent('page', { timeout: 8000 });
-    await page.waitForURL(url => url.origin === origin && url.searchParams.has('token'),
-      { timeout: 30_000, waitUntil: 'domcontentloaded' })
-      .catch(() => { throw Error('HER desktop did not sign in and navigate its WebView2 to the fixture console'); });
-    const session = new URL(page.url()).searchParams.get('token');
+    const startupIssues = [];
+    const onStartupPageError = err => startupIssues.push(`pageerror: ${err instanceof Error ? err.message : String(err)}`);
+    const onStartupConsole = msg => {
+      if (msg.type() === 'error') startupIssues.push(`console.error: ${msg.text()}`);
+    };
+    const onStartupResponse = res => {
+      if (res.status() >= 400) {
+        try {
+          startupIssues.push(`http ${res.status()}: ${res.request().method()} ${new URL(res.url()).pathname}`);
+        } catch {
+          startupIssues.push(`http ${res.status()}: ${res.request().method()}`);
+        }
+      }
+    };
+    page.on('pageerror', onStartupPageError);
+    page.on('console', onStartupConsole);
+    page.on('response', onStartupResponse);
+    await page.evaluate(() => {
+      if (!window.__herCspHooked) {
+        window.__herCspHooked = true;
+        window.__herCspViolations = [];
+        document.addEventListener('securitypolicyviolation', ev => {
+          window.__herCspViolations.push(`${ev.violatedDirective}:${ev.blockedURI}`);
+        });
+      }
+    }).catch(() => {});
+    await page.addInitScript(() => {
+      if (!window.__herCspHooked) {
+        window.__herCspHooked = true;
+        window.__herCspViolations = [];
+        document.addEventListener('securitypolicyviolation', ev => {
+          window.__herCspViolations.push(`${ev.violatedDirective}:${ev.blockedURI}`);
+        });
+      }
+    });
+    await page.waitForFunction(
+      expectedOrigin => window.location.origin === expectedOrigin
+        && !new URLSearchParams(window.location.search).has('token')
+        && Boolean(window.sessionStorage.getItem('consoleToken') || window.localStorage.getItem('consoleToken'))
+        && typeof window.herQqLogin === 'function'
+        && Boolean(document.querySelector('h1')),
+      origin,
+      { timeout: 30_000 },
+    ).catch(err => {
+      const detail = startupIssues.length ? ` (${startupIssues.join('; ')})` : '';
+      throw Error(`HER desktop did not sign in, strip URL token, and mount the fixture console${detail}: ${err instanceof Error ? err.message : err}`);
+    });
+    page.off('pageerror', onStartupPageError);
+    page.off('console', onStartupConsole);
+    page.off('response', onStartupResponse);
+    page.__herStartupIssues = startupIssues;
+    const session = await page.evaluate(() => window.sessionStorage.getItem('consoleToken')
+      || window.localStorage.getItem('consoleToken'));
     assert(session && session !== CONSOLE_TOKEN, 'HER desktop did not issue its own console session');
     await run(page, session, browser.version());
   } finally {

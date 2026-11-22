@@ -16,7 +16,6 @@ import { SecurityPage } from './pages/SecurityPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { SetupPage } from './pages/SetupPage';
 import { SystemPage } from './pages/SystemPage';
-import { WorkspacePlaceholderPage } from './pages/WorkspacePlaceholderPage';
 import { ConsoleProvider, useConsole } from './stores/consoleStore';
 
 const ConsoleRouter: React.FC = () => {
@@ -68,7 +67,7 @@ const ConsoleRouter: React.FC = () => {
         ) : page === 'legacy' ? (
           <LegacyPage />
         ) : (
-          <WorkspacePlaceholderPage />
+          <OverviewPage />
         )}
       </WorkbenchLayout>
       <StickySaveBar />

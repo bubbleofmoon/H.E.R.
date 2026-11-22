@@ -1,4 +1,4 @@
-//! Ticket 33: the Schedule page (`/schedule`, alias `/tasks`) and its JSON routes over `schedule.rs`.
+//! Ticket 33: the Schedule JSON routes over `schedule.rs` (the SPA page is served at `/schedule` via `console_ui`).
 //!
 //! Mounted behind `console_front`: Host, credential, agent-refusal and Origin checks and the audit record of every
 //! administrator write happen before [`route`] is called. Every write rechecks the console credential under
@@ -19,19 +19,13 @@ const NOT_FOUND: &str = "未找到该日程项";
 const UNSUPPORTED: &str = "该项目不支持此操作";
 
 pub(super) fn is_schedule_path(p: &str) -> bool {
-    p == "/schedule" || p == "/api/schedule" || p.starts_with("/api/schedule/")
+    p == "/api/schedule" || p.starts_with("/api/schedule/")
 }
 
 pub(super) fn route(caller: front::AdminCaller<'_>, cfg: &Value, req: &Request) -> (u16, String, String) {
     let context = caller.context();
     let method = req.method.as_str();
     let path = req.path.as_str();
-    if path == "/schedule" {
-        return match method {
-            "GET" => (200, "text/html; charset=utf-8".to_string(), crate::console_tasks::PAGE.to_string()),
-            _ => refusal(405, "method not allowed"),
-        };
-    }
     let outcome: Reply = if path == "/api/schedule" {
         match method {
             "GET" => list(context, cfg),

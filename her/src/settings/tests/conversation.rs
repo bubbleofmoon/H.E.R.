@@ -662,14 +662,6 @@ fn conversation_settings_registry_agrees_with_the_engine_reader() {
 #[test]
 fn conversation_settings_page_lists_and_sets_through_the_routes() {
     let (root, context) = settings_fixture("conversation settings page");
-    let (status, content_type, page) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&context),
-        "GET",
-        "/settings/conversations",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
     let (status, _) = admin_request(&context, "GET", "/settings/conversations", None);
     assert_eq!(status, 302, "legacy path redirects behind the console front");
     let (status, _) = admin_request(&context, "GET", "/conversations", None);
@@ -698,24 +690,7 @@ fn conversation_settings_page_lists_and_sets_through_the_routes() {
         }}])
     );
     assert!(body["note"].as_str().unwrap().starts_with("Switch waits"), "the page explains the drain: {body}");
-    for needle in [
-        "api('/api/settings/conversations')",
-        "$('#note').textContent=j.note",
-        "s.key==='conversation.engine'?action('Switch'",
-        "api('/api/settings/conversation/switch',{conversation:c.conversation,engine:select.value})",
-        "document.createElement(s.kind.options?'select':'input')",
-        "api('/api/settings/conversation/set',{conversation:c.conversation,setting:s.key,value:select.value})",
-        "api('/api/settings/conversation/reset',{conversation:c.conversation,setting:s.key})",
-        "'/api/settings/history?conversation='+encodeURIComponent(shownConversation)",
-        "api('/api/settings/undo',{entry:e.entry})",
-        "cell(c.engineToday)",
-        "s.kind.options",
-        "'x-console-token'",
-    ] {
-        assert!(page.contains(needle), "the page uses {needle}");
-    }
-    assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
-    assert!(!settings_db(&root).exists(), "showing the page and the list creates no store");
+    assert!(!settings_db(&root).exists(), "listing conversation settings creates no store");
     let (status, body) = set_engine(&context, OWNER_CHAT, json!("harness"));
     assert_eq!(status, 200, "{body}");
     let entry = conversation_entry(&context, OWNER_CHAT).unwrap();
@@ -869,15 +844,7 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     let (_, body) = admin_request(&context, "GET", "/api/settings/models", None);
     let row = model_row(&body, "group:101");
     assert_eq!((row["route"].clone(), row["inChain"].clone(), row["order"].clone()), (json!("b"), json!(false), json!(["a", "b2"])));
-    // The page and the list are administrator-only and need a selected runtime.
-    let (status, content_type, page) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&context),
-        "GET",
-        "/settings/models",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!((status, content_type), (200, "text/html; charset=utf-8"), "{page}");
+    // The legacy path redirects, canonical SPA route is served, and the list requires admin + selected runtime.
     let (status, _) = admin_request(&context, "GET", "/settings/models", None);
     assert_eq!(status, 302, "legacy path redirects behind the console front");
     let (status, _) = admin_request(&context, "GET", "/models", None);
@@ -895,15 +862,6 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
         "",
     );
     assert_eq!(status, 503, "{reply}");
-    for needle in [
-        "api('/api/settings/models')",
-        "api('/api/settings/conversation/set',{conversation:c.conversation,setting:j.setting,value:select.value})",
-        "api('/api/settings/conversation/reset',{conversation:c.conversation,setting:j.setting})",
-        "'x-console-token'",
-    ] {
-        assert!(page.contains(needle), "the page uses {needle}");
-    }
-    assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
     let source = include_str!("../../console_settings/models.rs");
     assert!(!source.contains("write_atomic(RuntimeArea::Config") && !source.contains("dsh"), "the list writes nothing and asks no DSH");
 
@@ -911,14 +869,6 @@ fn model_route_list_shows_the_chain_health_prices_and_each_conversations_order_w
     write_config(&legacy_root, |config| config["conversationEngines"] = json!({OWNER_CHAT: "harness"}));
     let config_path = legacy_root.0.join("config/config.json");
     let before = std::fs::read(&config_path).unwrap();
-    let (status, _, _) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&legacy),
-        "GET",
-        "/settings/models",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!(status, 200);
     let (status, _) = admin_request(&legacy, "GET", "/api/settings/models", None);
     assert_eq!(status, 200);
     assert_eq!(std::fs::read(config_path).unwrap(), before, "model route reads must leave the legacy map alone");
