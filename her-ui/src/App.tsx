@@ -2,8 +2,10 @@ import React from 'react';
 import { CommandPalette } from './components/CommandPalette';
 import { ConfirmModal, StickySaveBar, ToastHost } from './components/Primitives';
 import { WorkbenchLayout } from './layouts/WorkbenchLayout';
+import { ConversationsPage } from './pages/ConversationsPage';
 import { LegacyPage } from './pages/LegacyPage';
 import { LoginPage } from './pages/LoginPage';
+import { OverviewPage } from './pages/OverviewPage';
 import { SetupPage } from './pages/SetupPage';
 import { WorkspacePlaceholderPage } from './pages/WorkspacePlaceholderPage';
 import { ConsoleProvider, useConsole } from './stores/consoleStore';
@@ -32,7 +34,15 @@ const ConsoleRouter: React.FC = () => {
   return (
     <>
       <WorkbenchLayout>
-        {page === 'legacy' ? <LegacyPage /> : <WorkspacePlaceholderPage />}
+        {page === 'overview' ? (
+          <OverviewPage />
+        ) : page === 'conversations' ? (
+          <ConversationsPage />
+        ) : page === 'legacy' ? (
+          <LegacyPage />
+        ) : (
+          <WorkspacePlaceholderPage />
+        )}
       </WorkbenchLayout>
       <StickySaveBar />
       <CommandPalette />
