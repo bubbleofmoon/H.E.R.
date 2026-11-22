@@ -216,6 +216,11 @@ export const walks = {
       const drawer = inspectorDrawer(page);
       const input = drawer.getByPlaceholder('为该会话下一次新建立时注入一次性引导说明…');
       await usable(input);
+      await page.waitForFunction(
+        el => el.value === 'Seeded fixture prompt',
+        await input.elementHandle(),
+        { timeout: 8000 },
+      );
       assert.equal(await input.inputValue(), 'Seeded fixture prompt');
     },
     'initial-save': async ({ page }) => {
@@ -294,6 +299,12 @@ export const walks = {
       const engineSelect = drawer.locator('label', { hasText: '单会话回合引擎' }).locator('select');
       await usable(routeSelect);
       await usable(engineSelect);
+      await routeSelect.locator('option[value="second"]').waitFor({ state: 'attached', timeout: 8000 });
+      await page.waitForFunction(
+        el => el.value === 'dsh',
+        await engineSelect.elementHandle(),
+        { timeout: 8000 },
+      );
       assert.equal(await routeSelect.locator('option[value="second"]').count(), 1);
       assert.equal(await routeSelect.inputValue(), '');
       assert.equal(await engineSelect.inputValue(), 'dsh');
@@ -641,10 +652,13 @@ export const walks = {
     'v2-config': async ({ page }) => {
       const card = settingCard(page, 'reply.wakeQuietMs');
       const input = card.locator('input[type="number"]').first();
+      const saveBtn = page.getByRole('button', { name: '保存', exact: true });
       await input.fill('3001');
-      await click(page, page.getByRole('button', { name: '保存', exact: true }), 'POST', '/api/settings/set');
+      await click(page, saveBtn, 'POST', '/api/settings/set');
+      await saveBtn.waitFor({ state: 'hidden', timeout: 8000 });
       await input.fill('3000');
-      await click(page, page.getByRole('button', { name: '保存', exact: true }), 'POST', '/api/settings/set');
+      await click(page, saveBtn, 'POST', '/api/settings/set');
+      await saveBtn.waitFor({ state: 'hidden', timeout: 8000 });
     },
     feedback: async ({ page }) => {
       await switchTab(page, '诊断日志');

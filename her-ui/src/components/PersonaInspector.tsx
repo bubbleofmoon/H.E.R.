@@ -105,6 +105,7 @@ export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId })
   const loadGenRef = useRef(0);
   const draftGenRef = useRef(0);
   const dirtyRef = useRef(false);
+  const deletedRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -151,11 +152,13 @@ export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId })
   );
 
   useEffect(() => {
+    deletedRef.current = false;
     void loadPersona(false);
   }, [loadPersona]);
 
   useEffect(() => {
     const onUpdated = () => {
+      if (deletedRef.current) return;
       void loadPersona(true);
     };
     window.addEventListener(PERSONA_UPDATED_EVENT, onUpdated);
@@ -386,12 +389,13 @@ export const PersonaInspector: React.FC<{ personaId: string }> = ({ personaId })
         setBusy(true);
         try {
           await deletePersona(personaId);
+          deletedRef.current = true;
           if (!mountedRef.current) return;
           pushToast('已删除人设', 'success');
           dirtyRef.current = false;
           setInspectorDirty(false);
-          emitPersonaUpdated();
           setInspector(null);
+          emitPersonaUpdated();
         } catch (err) {
           pushToast(formatErrorMessage(err, '删除人设失败'), 'danger');
         } finally {
