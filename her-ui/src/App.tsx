@@ -6,7 +6,9 @@ import { AuditPage } from './pages/AuditPage';
 import { ConversationsPage } from './pages/ConversationsPage';
 import { LegacyPage } from './pages/LegacyPage';
 import { LoginPage } from './pages/LoginPage';
+import { MemoryPage } from './pages/MemoryPage';
 import { OverviewPage } from './pages/OverviewPage';
+import { PersonaPage } from './pages/PersonaPage';
 import { SchedulePage } from './pages/SchedulePage';
 import { SecurityPage } from './pages/SecurityPage';
 import { SetupPage } from './pages/SetupPage';
@@ -42,6 +44,10 @@ const ConsoleRouter: React.FC = () => {
           <OverviewPage />
         ) : page === 'conversations' ? (
           <ConversationsPage />
+        ) : page === 'persona' ? (
+          <PersonaPage />
+        ) : page === 'memory' ? (
+          <MemoryPage />
         ) : page === 'schedule' ? (
           <SchedulePage />
         ) : page === 'system' ? (
