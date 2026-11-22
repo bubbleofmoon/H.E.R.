@@ -230,26 +230,27 @@ export const SettingField: React.FC<{
           rows={5}
           value={
             kind.type === 'route list'
-              ? effective
-                ? JSON.stringify(effective, null, 2)
-                : ''
+              ? draftValue === undefined && setting.redacted
+                ? ''
+                : typeof effective === 'string'
+                  ? effective
+                  : effective
+                    ? JSON.stringify(effective, null, 2)
+                    : ''
               : typeof effective === 'string'
                 ? effective
                 : ''
           }
           onChange={(e) => {
-            if (!onDraftChange) return;
-            if (kind.type === 'route list') {
-              try {
-                onDraftChange(JSON.parse(e.target.value));
-              } catch {
-                onDraftChange(e.target.value);
-              }
-            } else {
-              onDraftChange(e.target.value);
-            }
+            onDraftChange?.(e.target.value);
           }}
-          placeholder={setting.redacted ? '输入完整 JSON 数组替换原路由列表' : ''}
+          placeholder={
+            setting.redacted
+              ? '当前值已脱敏，输入完整 JSON 数组以整体替换（不可包含 [REDACTED]）'
+              : kind.type === 'route list'
+                ? '[{"id": "primary", "model": "..."}]'
+                : ''
+          }
           className="w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-2 font-mono text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
         />
       ) : kind.type === 'password' ? (
@@ -299,23 +300,17 @@ export const SettingField: React.FC<{
         <input
           type="text"
           value={
-            Array.isArray(effective)
-              ? effective.join(', ')
-              : effective === null || effective === undefined
-                ? ''
-                : String(effective)
+            (kind.type === 'id list' || kind.type === 'conversation list') &&
+            typeof draftValue === 'string'
+              ? draftValue
+              : Array.isArray(effective)
+                ? effective.join(', ')
+                : effective === null || effective === undefined
+                  ? ''
+                  : String(effective)
           }
           onChange={(e) => {
-            if (!onDraftChange) return;
-            if (kind.type === 'id list' || kind.type === 'conversation list') {
-              const items = e.target.value
-                .split(/[\s,]+/)
-                .map((s) => s.trim())
-                .filter(Boolean);
-              onDraftChange(items);
-            } else {
-              onDraftChange(e.target.value);
-            }
+            onDraftChange?.(e.target.value);
           }}
           placeholder={formatSettingDisplay(setting)}
           className="h-8 w-full rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"

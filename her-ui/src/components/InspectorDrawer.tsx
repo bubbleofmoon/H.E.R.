@@ -1,6 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { X } from 'lucide-react';
 import { useConsole } from '../stores/consoleStore';
+import { formatAppliesLabel } from '../utils/format';
+import {
+  localizeSettingItem,
+  parseSettingDraftForSave,
+  settingValuesEqual,
+} from '../utils/herHelpers';
 import { AuditInspector } from './AuditInspector';
 import { Badge, Button, SettingField } from './Primitives';
 import { ConversationInspector } from './ConversationInspector';
@@ -21,24 +27,49 @@ export const InspectorDrawer: React.FC = () => {
 
   const [draftValue, setDraftValue] = useState<unknown>(undefined);
   const [busy, setBusy] = useState(false);
+  const prevSettingKeyRef = useRef<string | null>(null);
+  const draftRevRef = useRef(0);
 
-  const settingItem =
+  const rawSettingItem =
     inspector?.kind === 'setting'
       ? settings.find((item) => item.key === inspector.key) ?? null
       : null;
-
-  useEffect(() => {
-    if (settingItem) {
-      setDraftValue(settingItem.value);
-    } else {
-      setDraftValue(undefined);
-    }
-  }, [inspector, settingItem]);
+  const settingItem = rawSettingItem ? localizeSettingItem(rawSettingItem) : null;
 
   const isSettingDirty =
     settingItem !== null &&
     draftValue !== undefined &&
-    JSON.stringify(draftValue) !== JSON.stringify(settingItem.value);
+    (settingItem.redacted && settingItem.kind.type === 'route list'
+      ? typeof draftValue === 'string'
+        ? draftValue.trim().length > 0
+        : true
+      : !settingValuesEqual(
+          settingItem.kind.type === 'id list' || settingItem.kind.type === 'conversation list'
+            ? parseSettingDraftForSave(settingItem, draftValue)
+            : draftValue,
+          settingItem.value,
+        ));
+
+  useEffect(() => {
+    if (inspector?.kind !== 'setting') {
+      if (prevSettingKeyRef.current !== null) {
+        prevSettingKeyRef.current = null;
+        draftRevRef.current += 1;
+        setDraftValue(undefined);
+      }
+      return;
+    }
+    if (prevSettingKeyRef.current !== inspector.key) {
+      prevSettingKeyRef.current = inspector.key;
+      draftRevRef.current += 1;
+      setDraftValue(undefined);
+    }
+  }, [inspector]);
+
+  const handleDraftChange = (next: unknown) => {
+    draftRevRef.current += 1;
+    setDraftValue(next);
+  };
 
   useEffect(() => {
     if (inspector?.kind === 'setting') {
@@ -55,10 +86,21 @@ export const InspectorDrawer: React.FC = () => {
 
   const handleSaveSetting = async () => {
     if (!settingItem) return;
+    let parsedValue: unknown;
+    try {
+      parsedValue = parseSettingDraftForSave(settingItem, draftValue);
+    } catch (err) {
+      pushToast(err instanceof Error ? err.message : '设置格式无效', 'danger');
+      return;
+    }
+    const saveRev = draftRevRef.current;
     const executeSave = async (confirm: boolean) => {
       setBusy(true);
       try {
-        await saveSetting(settingItem.key, draftValue, confirm);
+        await saveSetting(settingItem.key, parsedValue, confirm);
+        if (draftRevRef.current === saveRev) {
+          setDraftValue(undefined);
+        }
       } catch (err) {
         pushToast(err instanceof Error ? err.message : '保存设置失败', 'danger');
       } finally {
@@ -82,10 +124,14 @@ export const InspectorDrawer: React.FC = () => {
 
   const handleResetSetting = async () => {
     if (!settingItem) return;
+    const resetRev = draftRevRef.current;
     const executeReset = async (confirm: boolean) => {
       setBusy(true);
       try {
         await resetSetting(settingItem.key, confirm);
+        if (draftRevRef.current === resetRev) {
+          setDraftValue(undefined);
+        }
       } catch (err) {
         pushToast(err instanceof Error ? err.message : '恢复默认值失败', 'danger');
       } finally {
@@ -120,7 +166,7 @@ export const InspectorDrawer: React.FC = () => {
                   {settingItem.label}
                 </h3>
                 <Badge tone={settingItem.confirm ? 'warn' : 'accent'}>
-                  {settingItem.applies}
+                  {formatAppliesLabel(settingItem.applies)}
                 </Badge>
               </div>
               <div className="mt-0.5 font-mono text-[11px] text-[var(--text-muted)]">
@@ -176,7 +222,7 @@ export const InspectorDrawer: React.FC = () => {
               <SettingField
                 setting={settingItem}
                 draftValue={draftValue}
-                onDraftChange={setDraftValue}
+                onDraftChange={handleDraftChange}
                 onReset={() => void handleResetSetting()}
               />
             ) : inspector.kind === 'audit' ? (
@@ -199,7 +245,10 @@ export const InspectorDrawer: React.FC = () => {
                     size="sm"
                     variant="ghost"
                     disabled={!isSettingDirty || busy}
-                    onClick={() => setDraftValue(settingItem.value)}
+                    onClick={() => {
+                      draftRevRef.current += 1;
+                      setDraftValue(undefined);
+                    }}
                   >
                     放弃
                   </Button>

@@ -168,12 +168,27 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [dirtyEntry, setDirtyEntry] = useState<DirtyEntry | null>(null);
   const dirtyEntryRef = useRef<DirtyEntry | null>(null);
   const pageRef = useRef<PageId>(initialPage);
+  const activeTabsRef = useRef<Record<string, string>>({});
+  const lastPathRef = useRef<string>(
+    typeof window !== 'undefined' ? `${window.location.pathname}${window.location.search}` : '/',
+  );
+  const histIdxRef = useRef<number>(
+    typeof window !== 'undefined' && typeof window.history.state?.herHistIdx === 'number'
+      ? window.history.state.herHistIdx
+      : 0,
+  );
+  const suppressPopRef = useRef(0);
+  const bypassGuardOnceRef = useRef(false);
   const liveSeqRef = useRef(0);
   const qqEventSeqRef = useRef(0);
 
   useEffect(() => {
     pageRef.current = page;
   }, [page]);
+
+  useEffect(() => {
+    activeTabsRef.current = activeTabs;
+  }, [activeTabs]);
 
   useEffect(() => {
     dirtyEntryRef.current = dirtyEntry;
@@ -211,17 +226,28 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     [],
   );
 
-  const applyNavigation = useCallback((fullPath: string, tabId?: string) => {
+  const applyNavigation = useCallback((fullPath: string, tabId?: string, replace = false) => {
     const url = new URL(fullPath, window.location.origin);
     const redirected = LEGACY_REDIRECTS[url.pathname];
     const targetPathname = redirected ?? url.pathname;
     const nextUrl = `${targetPathname}${url.search}`;
     if (`${window.location.pathname}${window.location.search}` !== nextUrl) {
-      window.history.pushState(null, '', nextUrl);
+      if (replace) {
+        window.history.replaceState(
+          { ...(window.history.state ?? {}), herHistIdx: histIdxRef.current },
+          '',
+          nextUrl,
+        );
+      } else {
+        histIdxRef.current += 1;
+        window.history.pushState({ herHistIdx: histIdxRef.current }, '', nextUrl);
+      }
     }
+    lastPathRef.current = nextUrl;
     const targetPage = pageForPath(targetPathname);
     setPage(targetPage);
     if (tabId) {
+      activeTabsRef.current = { ...activeTabsRef.current, [targetPage]: tabId };
       setActiveTabs((prev) => ({ ...prev, [targetPage]: tabId }));
     }
     if (targetPage === 'login') {
@@ -237,8 +263,12 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       const targetPathname = LEGACY_REDIRECTS[url.pathname] ?? url.pathname;
       const targetPage = pageForPath(targetPathname);
       const curDirty = dirtyEntryRef.current;
+      const switchingTabWithDirty =
+        targetPage === pageRef.current &&
+        tabId !== undefined &&
+        tabId !== activeTabsRef.current[targetPage];
       if (
-        targetPage !== pageRef.current &&
+        (targetPage !== pageRef.current || switchingTabWithDirty) &&
         targetPage !== 'login' &&
         targetPage !== 'setup' &&
         curDirty &&
@@ -246,7 +276,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       ) {
         setConfirmRequest({
           title: '丢弃未保存的更改？',
-          description: `${curDirty.label || '当前页面存在未保存更改'}，离开当前页面将会丢失这些修改。`,
+          description: `${curDirty.label || '当前页面存在未保存更改'}，离开或切换标签页将会丢失这些修改。`,
           confirmLabel: '放弃并离开',
           danger: true,
           onConfirm: () => {
@@ -280,6 +310,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   );
 
   const setActiveTab = useCallback((pageId: string, tabId: string) => {
+    activeTabsRef.current = { ...activeTabsRef.current, [pageId]: tabId };
     setActiveTabs((prev) => ({ ...prev, [pageId]: tabId }));
   }, []);
 
@@ -411,13 +442,100 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   }, [refreshAuthAndShell]);
 
   useEffect(() => {
+    if (typeof window !== 'undefined' && typeof window.history.state?.herHistIdx !== 'number') {
+      window.history.replaceState(
+        { ...(window.history.state ?? {}), herHistIdx: histIdxRef.current },
+        '',
+        `${window.location.pathname}${window.location.search}`,
+      );
+    }
+
     const onPopState = () => {
+      if (suppressPopRef.current > 0) {
+        suppressPopRef.current -= 1;
+        return;
+      }
+
+      setConfirmRequest(null);
+
       const raw = window.location.pathname || '/';
       const redirected = LEGACY_REDIRECTS[raw];
-      if (redirected) {
-        window.history.replaceState(null, '', `${redirected}${window.location.search}`);
+      const resolvedPath = `${redirected ?? raw}${window.location.search}`;
+      const targetPage = pageForPath(redirected ?? raw);
+      const targetIdx =
+        typeof window.history.state?.herHistIdx === 'number'
+          ? window.history.state.herHistIdx
+          : null;
+
+      if (bypassGuardOnceRef.current) {
+        bypassGuardOnceRef.current = false;
+        if (targetIdx !== null) {
+          histIdxRef.current = targetIdx;
+        }
+        if (redirected) {
+          window.history.replaceState(
+            { ...(window.history.state ?? {}), herHistIdx: histIdxRef.current },
+            '',
+            resolvedPath,
+          );
+        }
+        lastPathRef.current = resolvedPath;
+        setPage(targetPage);
+        return;
       }
-      setPage(pageForPath(redirected ?? raw));
+
+      const curDirty = dirtyEntryRef.current;
+      const hasPageDirty = Boolean(curDirty && curDirty.count > 0);
+      const hasDrawerDirty =
+        (targetPage === 'login' || targetPage === 'setup') && inspectorDirtyRef.current;
+
+      if (targetPage !== pageRef.current && (hasPageDirty || hasDrawerDirty)) {
+        const currentIdx = histIdxRef.current;
+        const deltaToCurrent =
+          targetIdx !== null && targetIdx !== currentIdx ? currentIdx - targetIdx : 1;
+
+        suppressPopRef.current += 1;
+        window.history.go(deltaToCurrent);
+
+        const label = hasPageDirty
+          ? curDirty?.label || '当前页面存在未保存更改'
+          : '右侧抽屉中有未保存的设置修改';
+
+        setConfirmRequest({
+          title: '丢弃未保存的更改？',
+          description: `${label}，浏览器后退/前进将会丢失这些修改。`,
+          confirmLabel: '放弃并离开',
+          danger: true,
+          onConfirm: () => {
+            if (histIdxRef.current !== currentIdx) return;
+            if (hasPageDirty && curDirty) {
+              curDirty.onDiscard();
+              dirtyEntryRef.current = null;
+              setDirtyEntry(null);
+            }
+            if (hasDrawerDirty) {
+              inspectorDirtyRef.current = false;
+              setInspectorState(null);
+            }
+            bypassGuardOnceRef.current = true;
+            window.history.go(-deltaToCurrent);
+          },
+        });
+        return;
+      }
+
+      if (targetIdx !== null) {
+        histIdxRef.current = targetIdx;
+      }
+      if (redirected) {
+        window.history.replaceState(
+          { ...(window.history.state ?? {}), herHistIdx: histIdxRef.current },
+          '',
+          resolvedPath,
+        );
+      }
+      lastPathRef.current = resolvedPath;
+      setPage(targetPage);
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
@@ -551,18 +669,38 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
 
   const saveSetting = useCallback(
     async (setting: string, value: unknown, confirm = false) => {
-      await saveSettingValue(setting, value, confirm);
+      const res = await saveSettingValue(setting, value, confirm);
       await refreshLiveData();
-      pushToast(`已保存设置 ${setting}`, 'success');
+      const mirrorErr = typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
+      const wakeErr =
+        typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
+          ? res.wakeRefreshError
+          : null;
+      const warn = [mirrorErr, wakeErr].filter(Boolean).join('；');
+      if (warn) {
+        pushToast(`已保存设置 ${setting}（写回警告：${warn}）`, 'warn');
+      } else {
+        pushToast(`已保存设置 ${setting}`, 'success');
+      }
     },
     [pushToast, refreshLiveData],
   );
 
   const resetSetting = useCallback(
     async (setting: string, confirm = false) => {
-      await resetSettingValue(setting, confirm);
+      const res = await resetSettingValue(setting, confirm);
       await refreshLiveData();
-      pushToast(`已恢复默认设置 ${setting}`, 'success');
+      const mirrorErr = typeof res.mirrorError === 'string' && res.mirrorError ? res.mirrorError : null;
+      const wakeErr =
+        typeof res.wakeRefreshError === 'string' && res.wakeRefreshError
+          ? res.wakeRefreshError
+          : null;
+      const warn = [mirrorErr, wakeErr].filter(Boolean).join('；');
+      if (warn) {
+        pushToast(`已恢复默认设置 ${setting}（写回警告：${warn}）`, 'warn');
+      } else {
+        pushToast(`已恢复默认设置 ${setting}`, 'success');
+      }
     },
     [pushToast, refreshLiveData],
   );
