@@ -298,6 +298,8 @@ export interface PersonaListResponse {
   ok: boolean;
   default: string | null;
   overrides: Record<string, string>;
+  importedRolesAt?: number | null;
+  rebriefDue?: string[];
   personas: {
     id: string;
     name: string;

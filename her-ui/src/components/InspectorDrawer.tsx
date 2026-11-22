@@ -4,6 +4,7 @@ import { useConsole } from '../stores/consoleStore';
 import { AuditInspector } from './AuditInspector';
 import { Badge, Button, SettingField } from './Primitives';
 import { ConversationInspector } from './ConversationInspector';
+import { PersonaInspector } from './PersonaInspector';
 
 export const InspectorDrawer: React.FC = () => {
   const {
@@ -135,13 +136,22 @@ export const InspectorDrawer: React.FC = () => {
                 {inspector.id}
               </div>
             </>
+          ) : inspector.kind === 'persona' ? (
+            <>
+              <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
+                人设详情
+              </h3>
+              <div className="mt-0.5 font-mono text-[11px] text-[var(--text-muted)]">
+                {inspector.id}
+              </div>
+            </>
           ) : inspector.kind === 'audit' ? (
             <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
               审计详情 ({inspector.id})
             </h3>
           ) : (
             <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
-              详情检视 ({inspector.kind === 'setting' ? inspector.key : inspector.id})
+              详情检视 ({inspector.key})
             </h3>
           )}
         </div>
@@ -157,6 +167,8 @@ export const InspectorDrawer: React.FC = () => {
 
       {inspector.kind === 'conversation' ? (
         <ConversationInspector key={inspector.id} conversationKey={inspector.id} />
+      ) : inspector.kind === 'persona' ? (
+        <PersonaInspector key={inspector.id} personaId={inspector.id} />
       ) : (
         <>
           <div className="flex-1 space-y-4 overflow-y-auto p-4 text-xs">

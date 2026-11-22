@@ -329,7 +329,18 @@ export const SettingField: React.FC<{
 
 export const StickySaveBar: React.FC = () => {
   const { dirtyEntry } = useConsole();
+  const [busy, setBusy] = useState(false);
   if (!dirtyEntry || dirtyEntry.count <= 0) return null;
+
+  const handleSave = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await dirtyEntry.onSave();
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="fixed inset-x-0 bottom-0 z-30 border-t border-[var(--border-strong)] bg-[var(--bg-surface)]/95 px-4 py-2.5 shadow-lg backdrop-blur">
@@ -338,11 +349,11 @@ export const StickySaveBar: React.FC = () => {
           {dirtyEntry.label || `有 ${dirtyEntry.count} 项未保存更改`}
         </div>
         <div className="flex items-center gap-2">
-          <Button size="sm" variant="ghost" onClick={dirtyEntry.onDiscard}>
+          <Button size="sm" variant="ghost" disabled={busy} onClick={dirtyEntry.onDiscard}>
             放弃
           </Button>
-          <Button size="sm" variant="primary" onClick={() => void dirtyEntry.onSave()}>
-            保存
+          <Button size="sm" variant="primary" disabled={busy} onClick={() => void handleSave()}>
+            {busy ? '保存中…' : '保存'}
           </Button>
         </div>
       </div>

@@ -166,6 +166,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const [dirtyEntry, setDirtyEntry] = useState<DirtyEntry | null>(null);
+  const dirtyEntryRef = useRef<DirtyEntry | null>(null);
   const pageRef = useRef<PageId>(initialPage);
   const liveSeqRef = useRef(0);
   const qqEventSeqRef = useRef(0);
@@ -173,6 +174,10 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   useEffect(() => {
     pageRef.current = page;
   }, [page]);
+
+  useEffect(() => {
+    dirtyEntryRef.current = dirtyEntry;
+  }, [dirtyEntry]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -206,7 +211,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     [],
   );
 
-  const navigatePath = useCallback((fullPath: string) => {
+  const applyNavigation = useCallback((fullPath: string, tabId?: string) => {
     const url = new URL(fullPath, window.location.origin);
     const redirected = LEGACY_REDIRECTS[url.pathname];
     const targetPathname = redirected ?? url.pathname;
@@ -216,6 +221,9 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     }
     const targetPage = pageForPath(targetPathname);
     setPage(targetPage);
+    if (tabId) {
+      setActiveTabs((prev) => ({ ...prev, [targetPage]: tabId }));
+    }
     if (targetPage === 'login') {
       const nextParam = sanitizeNextPath(url.searchParams.get('next'));
       if (nextParam) setNextPathAfterAuth(nextParam);
@@ -223,16 +231,52 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     setNavDrawerOpen(false);
   }, []);
 
+  const navigateWithGuard = useCallback(
+    (fullPath: string, tabId?: string) => {
+      const url = new URL(fullPath, window.location.origin);
+      const targetPathname = LEGACY_REDIRECTS[url.pathname] ?? url.pathname;
+      const targetPage = pageForPath(targetPathname);
+      const curDirty = dirtyEntryRef.current;
+      if (
+        targetPage !== pageRef.current &&
+        targetPage !== 'login' &&
+        targetPage !== 'setup' &&
+        curDirty &&
+        curDirty.count > 0
+      ) {
+        setConfirmRequest({
+          title: '丢弃未保存的更改？',
+          description: `${curDirty.label || '当前页面存在未保存更改'}，离开当前页面将会丢失这些修改。`,
+          confirmLabel: '放弃并离开',
+          danger: true,
+          onConfirm: () => {
+            curDirty.onDiscard();
+            dirtyEntryRef.current = null;
+            setDirtyEntry(null);
+            applyNavigation(fullPath, tabId);
+          },
+        });
+        return;
+      }
+      applyNavigation(fullPath, tabId);
+    },
+    [applyNavigation],
+  );
+
+  const navigatePath = useCallback(
+    (fullPath: string) => {
+      navigateWithGuard(fullPath);
+    },
+    [navigateWithGuard],
+  );
+
   const navigate = useCallback(
     (targetPage: PageId, tabId?: string, query?: string) => {
       const basePath = pathForPage(targetPage);
       const nextUrl = query ? `${basePath}?${query}` : basePath;
-      navigatePath(nextUrl);
-      if (tabId) {
-        setActiveTabs((prev) => ({ ...prev, [targetPage]: tabId }));
-      }
+      navigateWithGuard(nextUrl, tabId);
     },
-    [navigatePath],
+    [navigateWithGuard],
   );
 
   const setActiveTab = useCallback((pageId: string, tabId: string) => {

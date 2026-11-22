@@ -42,6 +42,7 @@ export interface SettingItemView {
   managedBy?: string;
   isSet?: boolean;
   redacted?: boolean;
+  overriddenBy?: { source?: string; value?: unknown };
   value?: unknown;
   default?: unknown;
   stored?: unknown;
@@ -117,7 +118,7 @@ function readDesktopBearer(): string {
 export async function apiRequest<T = Record<string, unknown>>(
   path: string,
   options: {
-    method?: 'GET' | 'POST';
+    method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
     body?: unknown;
     skipUnauthorizedRedirect?: boolean;
     quoteNonIntegerNumbers?: boolean;
@@ -130,9 +131,11 @@ export async function apiRequest<T = Record<string, unknown>>(
     headers['x-console-token'] = desktopBearer;
   }
   let serialized: string | undefined;
-  if (options.body !== undefined) {
+  if (method !== 'GET') {
     headers['content-type'] = 'application/json';
-    serialized = JSON.stringify(options.body);
+    if (options.body !== undefined) {
+      serialized = JSON.stringify(options.body);
+    }
   }
 
   const response = await fetch(path, {
