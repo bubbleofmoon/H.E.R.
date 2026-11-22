@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useConsole } from '../stores/consoleStore';
+import { AuditInspector } from './AuditInspector';
 import { Badge, Button, SettingField } from './Primitives';
+import { ConversationInspector } from './ConversationInspector';
 
 export const InspectorDrawer: React.FC = () => {
   const {
@@ -13,6 +15,7 @@ export const InspectorDrawer: React.FC = () => {
     resetSetting,
     openConfirm,
     pushToast,
+    setInspectorDirty,
   } = useConsole();
 
   const [draftValue, setDraftValue] = useState<unknown>(undefined);
@@ -31,12 +34,23 @@ export const InspectorDrawer: React.FC = () => {
     }
   }, [inspector, settingItem]);
 
-  if (!inspector) return null;
-
   const isSettingDirty =
     settingItem !== null &&
     draftValue !== undefined &&
     JSON.stringify(draftValue) !== JSON.stringify(settingItem.value);
+
+  useEffect(() => {
+    if (inspector?.kind === 'setting') {
+      setInspectorDirty(isSettingDirty);
+      return () => setInspectorDirty(false);
+    }
+    if (!inspector) {
+      setInspectorDirty(false);
+    }
+    return undefined;
+  }, [inspector, isSettingDirty, setInspectorDirty]);
+
+  if (!inspector) return null;
 
   const handleSaveSetting = async () => {
     if (!settingItem) return;
@@ -121,6 +135,10 @@ export const InspectorDrawer: React.FC = () => {
                 {inspector.id}
               </div>
             </>
+          ) : inspector.kind === 'audit' ? (
+            <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
+              审计详情 ({inspector.id})
+            </h3>
           ) : (
             <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
               详情检视 ({inspector.kind === 'setting' ? inspector.key : inspector.id})
@@ -137,70 +155,62 @@ export const InspectorDrawer: React.FC = () => {
         </button>
       </div>
 
-      <div className="flex-1 space-y-4 overflow-y-auto p-4 text-xs">
-        {inspector.kind === 'setting' && settingItem ? (
-          <SettingField
-            setting={settingItem}
-            draftValue={draftValue}
-            onDraftChange={setDraftValue}
-            onReset={() => void handleResetSetting()}
-          />
-        ) : inspector.kind === 'conversation' ? (
-          <div className="space-y-3">
-            <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--bg-subtle)]/50 p-3 space-y-2">
-              <div className="flex justify-between">
-                <span className="text-[var(--text-muted)]">会话标识</span>
-                <code className="font-mono">{inspector.id}</code>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-[var(--text-muted)]">当前阶段</span>
-                <span>
-                  {conversations.find((c) => c.key === inspector.id)?.phase || '等待加载 (#356)'}
-                </span>
-              </div>
-            </div>
-            <p className="text-[var(--text-muted)]">
-              完整单会话控制台（互动与状态、恢复与队列、单会话设置）将在 #356 会话工作台切片中接入。
-            </p>
+      {inspector.kind === 'conversation' ? (
+        <ConversationInspector key={inspector.id} conversationKey={inspector.id} />
+      ) : (
+        <>
+          <div className="flex-1 space-y-4 overflow-y-auto p-4 text-xs">
+            {inspector.kind === 'setting' && settingItem ? (
+              <SettingField
+                setting={settingItem}
+                draftValue={draftValue}
+                onDraftChange={setDraftValue}
+                onReset={() => void handleResetSetting()}
+              />
+            ) : inspector.kind === 'audit' ? (
+              <AuditInspector key={inspector.id} auditId={inspector.id} />
+            ) : (
+              <p className="text-[var(--text-muted)]">详情视图将在对应功能切片中接入。</p>
+            )}
           </div>
-        ) : (
-          <p className="text-[var(--text-muted)]">详情视图将在对应功能切片中接入。</p>
-        )}
-      </div>
 
-      <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-[var(--border-hairline)] bg-[var(--bg-subtle)]/60 px-4 py-2.5">
-        {inspector.kind === 'setting' && settingItem && settingItem.managedBy !== 'consoleAuth' ? (
-          <>
-            <span className="text-[11px] text-[var(--text-muted)]">
-              {isSettingDirty ? '有未保存的更改' : '与服务端同步'}
-            </span>
-            <div className="flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="ghost"
-                disabled={!isSettingDirty || busy}
-                onClick={() => setDraftValue(settingItem.value)}
-              >
-                放弃
-              </Button>
-              <Button
-                size="sm"
-                variant="primary"
-                disabled={!isSettingDirty || busy}
-                onClick={() => void handleSaveSetting()}
-              >
-                保存
-              </Button>
-            </div>
-          </>
-        ) : (
-          <div className="ml-auto">
-            <Button size="sm" variant="secondary" onClick={() => setInspector(null)}>
-              关闭
-            </Button>
-          </div>
-        )}
-      </footer>
+          <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-[var(--border-hairline)] bg-[var(--bg-subtle)]/60 px-4 py-2.5">
+            {inspector.kind === 'setting' &&
+            settingItem &&
+            settingItem.managedBy !== 'consoleAuth' ? (
+              <>
+                <span className="text-[11px] text-[var(--text-muted)]">
+                  {isSettingDirty ? '有未保存的更改' : '与服务端同步'}
+                </span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={!isSettingDirty || busy}
+                    onClick={() => setDraftValue(settingItem.value)}
+                  >
+                    放弃
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    disabled={!isSettingDirty || busy}
+                    onClick={() => void handleSaveSetting()}
+                  >
+                    保存
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <div className="ml-auto">
+                <Button size="sm" variant="secondary" onClick={() => setInspector(null)}>
+                  关闭
+                </Button>
+              </div>
+            )}
+          </footer>
+        </>
+      )}
     </aside>
   );
 };

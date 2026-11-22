@@ -250,6 +250,28 @@ class WorkflowContract(unittest.TestCase):
             self.assertIn("npm run build", block, job)
             self.assertIn("HER_REQUIRE_UI_DIST=1", block, job)
 
+    def test_checks_workflow_defines_always_run_checks_gate(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        gate = self.job_block(text, "gate")
+
+        self.assertIn("name: checks-gate", gate)
+        self.assertIn("needs: [changes, scans, lint, tests]", gate)
+        self.assertIn("if: always()", gate)
+        for expr in (
+            "needs.changes.result",
+            "needs.changes.outputs.code",
+            "needs.scans.result",
+            "needs.lint.result",
+            "needs.tests.result",
+        ):
+            self.assertIn(expr, gate)
+
+        self.assertIn('if [ "$CODE_CHANGED" = "false" ]; then', gate)
+        self.assertIn('"$LINT_RESULT" != "skipped"', gate)
+        self.assertIn('"$TESTS_RESULT" != "skipped"', gate)
+        self.assertIn('if [ "$LINT_RESULT" != "success" ]; then', gate)
+        self.assertIn('if [ "$TESTS_RESULT" != "success" ]; then', gate)
+
 
 if __name__ == "__main__":
     unittest.main()

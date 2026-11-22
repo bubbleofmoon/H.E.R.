@@ -5,6 +5,7 @@ export interface AuthStatusResponse {
   authKind: 'browser' | 'desktop' | 'machine' | null;
   canonicalOrigin?: string;
   tokenFile?: string;
+  requirePasswordLocally?: boolean;
   consecutiveFailures?: number;
   retryAfterMs?: number;
   retryAfterSeconds?: number;
@@ -119,6 +120,7 @@ export async function apiRequest<T = Record<string, unknown>>(
     method?: 'GET' | 'POST';
     body?: unknown;
     skipUnauthorizedRedirect?: boolean;
+    quoteNonIntegerNumbers?: boolean;
   } = {},
 ): Promise<T> {
   const method = options.method ?? (options.body !== undefined ? 'POST' : 'GET');
@@ -143,8 +145,14 @@ export async function apiRequest<T = Record<string, unknown>>(
   const text = await response.text();
   let parsed: Record<string, unknown> = {};
   if (text) {
+    const jsonSource = options.quoteNonIntegerNumbers
+      ? text.replace(
+          /"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+(?:[eE][+-]?\d+)?|[eE][+-]?\d+)/g,
+          (match) => (match.startsWith('"') ? match : JSON.stringify(match)),
+        )
+      : text;
     try {
-      parsed = JSON.parse(text) as Record<string, unknown>;
+      parsed = JSON.parse(jsonSource) as Record<string, unknown>;
     } catch {
       parsed = { ok: false, error: text };
     }

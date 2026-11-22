@@ -75,6 +75,7 @@ interface ConsoleContextValue {
   setPaletteOpen: (open: boolean) => void;
   inspector: InspectorTarget;
   setInspector: (target: InspectorTarget) => void;
+  setInspectorDirty: (dirty: boolean) => void;
   highlightedKey: string | null;
   jumpToSetting: (key: string, openDrawer?: boolean) => void;
   runState: string;
@@ -144,8 +145,14 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const [theme, setTheme] = useState<ThemeMode>(readInitialTheme);
   const [navDrawerOpen, setNavDrawerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
-  const [inspector, setInspector] = useState<InspectorTarget>(null);
+  const [inspector, setInspectorState] = useState<InspectorTarget>(null);
+  const inspectorRef = useRef<InspectorTarget>(null);
+  const inspectorDirtyRef = useRef(false);
   const [highlightedKey, setHighlightedKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    inspectorRef.current = inspector;
+  }, [inspector]);
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [expiredNotice, setExpiredNotice] = useState<string | null>(null);
@@ -387,6 +394,48 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
   }, []);
 
+  const openConfirm = useCallback((req: ConfirmRequest) => {
+    setConfirmRequest(req);
+  }, []);
+
+  const closeConfirm = useCallback(() => {
+    setConfirmRequest(null);
+  }, []);
+
+  const setInspectorDirty = useCallback((dirty: boolean) => {
+    inspectorDirtyRef.current = dirty;
+  }, []);
+
+  const setInspector = useCallback((target: InspectorTarget) => {
+    const cur = inspectorRef.current;
+    const sameTarget =
+      cur === target ||
+      (cur !== null &&
+        target !== null &&
+        cur.kind === target.kind &&
+        (cur.kind === 'setting'
+          ? cur.key === (target as { kind: 'setting'; key: string }).key
+          : cur.id === (target as { id: string }).id));
+    if (sameTarget) {
+      return;
+    }
+    if (cur !== null && inspectorDirtyRef.current) {
+      openConfirm({
+        title: '丢弃未保存的检视修改？',
+        description: '当前右侧抽屉中存在尚未保存的修改，切换或关闭将会丢失这些修改。',
+        confirmLabel: '丢弃并继续',
+        danger: true,
+        onConfirm: () => {
+          inspectorDirtyRef.current = false;
+          setInspectorState(target);
+        },
+      });
+      return;
+    }
+    inspectorDirtyRef.current = false;
+    setInspectorState(target);
+  }, [openConfirm]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
@@ -409,7 +458,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [confirmRequest, inspector, navDrawerOpen, paletteOpen]);
+  }, [confirmRequest, inspector, navDrawerOpen, paletteOpen, setInspector]);
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
@@ -426,7 +475,8 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       // Still transition to /login so local view drops session state.
     }
     setAuthStatus((prev) => (prev ? { ...prev, authenticated: false, authKind: null } : prev));
-    setInspector(null);
+    inspectorDirtyRef.current = false;
+    setInspectorState(null);
     pushToast('已退出控制台会话', 'info');
     navigate('login');
   }, [navigate, pushToast]);
@@ -452,7 +502,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
         setHighlightedKey((curr) => (curr === key ? null : curr));
       }, 2400);
     },
-    [navigate],
+    [navigate, setInspector],
   );
 
   const saveSetting = useCallback(
@@ -472,14 +522,6 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
     },
     [pushToast, refreshLiveData],
   );
-
-  const openConfirm = useCallback((req: ConfirmRequest) => {
-    setConfirmRequest(req);
-  }, []);
-
-  const closeConfirm = useCallback(() => {
-    setConfirmRequest(null);
-  }, []);
 
   return (
     <ConsoleContext.Provider
@@ -505,6 +547,7 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
         setPaletteOpen,
         inspector,
         setInspector,
+        setInspectorDirty,
         highlightedKey,
         jumpToSetting,
         runState,

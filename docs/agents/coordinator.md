@@ -6,14 +6,16 @@ Binding for the single Windows Antigravity coordinator (`C:/her`, 32 GB, 4 cores
 
 1. Pick ready open issues (`docs/agents/issue-tracker.md`) whose blockers are closed, claim with `in-progress`, and cut `her/<n>-<slug>` from `origin/main` in `C:/her-wt/<n>`.
 2. Implement directly or through Antigravity subagents (`docs/agents/implementer-protocol.md`), driving tests first (`tdd` / `diagnosing-bugs`).
-3. Review every ticket diff with two-axis `code-review` (Standards against `CODING_STANDARDS.md` + Spec against the issue and vault spec in parallel subagents).
-4. Integrate current `origin/main` (run `python -I scripts/merge-check.py` before committing the merge), push with `HER_GITLEAKS=C:/her-orch/tools/gitleaks-8.30.0/gitleaks.exe`, open the PR via `scripts/gh-public.ps1`, wait for hosted checks with `scripts/ci-wait.py`, run required Windows native/elevated checks via `scripts/cargo-slot.ps1`, merge, clean up the worktree and close the issue.
+3. Review every ticket diff with dual-axis `code-review` (Standards against `CODING_STANDARDS.md` via `research` subagent + Spec/Rust-contract review via `scripts/codex-task.ps1 -Sandbox read-only` or parallel Spec subagent).
+4. For `her-ui/` changes, run local UI checks (`npm --prefix her-ui run typecheck`, `npm --prefix her-ui run build`, inline-style `git grep`) alongside `python scripts/check-repo.py` and `python scripts/scan-public.py --root .`.
+5. Integrate current `origin/main` (run `python -I scripts/merge-check.py` before committing the merge), push with `HER_GITLEAKS=C:/her-orch/tools/gitleaks-8.30.0/gitleaks.exe`, open the PR via `scripts/gh-public.ps1`, wait for hosted checks with `scripts/ci-wait.py`, run required Windows native/elevated checks via `scripts/cargo-slot.ps1`, merge, clean up the worktree and close the issue.
 
 ## Model and review routing
 
 - **Default coordinator:** `Orchestrator (Neon)` (plans on Gemini 4 Neon, fast execution).
+- **Spec/contract second opinion:** `scripts/codex-task.ps1 -Model gpt-6.2-astra -Effort high -Sandbox read-only` for cross-file state/backend contract audits alongside Antigravity Standards review.
 - **Deep single-model work:** use `Gemini 4 Neon (High/XHigh)` for deep backend bug audits, UI/navigation architecture, or subtle Rust concurrency/lifecycle fixes.
-- **Review cap:** verify each finding in code before requiring fixes, stop after two review rounds, and file medium/low non-blocking polish as follow-up issues.
+- **Review cap:** verify each finding in code before requiring fixes, and file non-blocking medium/low polish as follow-up issues (`#362` or dedicated follow-up tickets).
 
 ## Native checks
 

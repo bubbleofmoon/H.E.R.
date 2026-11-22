@@ -2,9 +2,13 @@ import React from 'react';
 import { CommandPalette } from './components/CommandPalette';
 import { ConfirmModal, StickySaveBar, ToastHost } from './components/Primitives';
 import { WorkbenchLayout } from './layouts/WorkbenchLayout';
+import { AuditPage } from './pages/AuditPage';
+import { ConversationsPage } from './pages/ConversationsPage';
 import { LegacyPage } from './pages/LegacyPage';
 import { LoginPage } from './pages/LoginPage';
+import { OverviewPage } from './pages/OverviewPage';
 import { SchedulePage } from './pages/SchedulePage';
+import { SecurityPage } from './pages/SecurityPage';
 import { SetupPage } from './pages/SetupPage';
 import { SystemPage } from './pages/SystemPage';
 import { WorkspacePlaceholderPage } from './pages/WorkspacePlaceholderPage';
@@ -34,10 +38,18 @@ const ConsoleRouter: React.FC = () => {
   return (
     <>
       <WorkbenchLayout>
-        {page === 'schedule' ? (
+        {page === 'overview' ? (
+          <OverviewPage />
+        ) : page === 'conversations' ? (
+          <ConversationsPage />
+        ) : page === 'schedule' ? (
           <SchedulePage />
         ) : page === 'system' ? (
           <SystemPage />
+        ) : page === 'security' ? (
+          <SecurityPage />
+        ) : page === 'audit' ? (
+          <AuditPage />
         ) : page === 'legacy' ? (
           <LegacyPage />
         ) : (
