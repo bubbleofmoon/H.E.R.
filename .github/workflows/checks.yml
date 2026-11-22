@@ -336,3 +336,50 @@ jobs:
           name: ci-evidence-windows-2022-${{ matrix.shard }}
           path: ${{ env.CI_EVIDENCE }}
           retention-days: 7
+  # Always-run merge-gate aggregator so branch rulesets can require one stable check across code and docs-only PRs.
+  gate:
+    name: checks-gate
+    needs: [changes, scans, lint, tests]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      CHANGES_RESULT: ${{ needs.changes.result }}
+      CODE_CHANGED: ${{ needs.changes.outputs.code }}
+      SCANS_RESULT: ${{ needs.scans.result }}
+      LINT_RESULT: ${{ needs.lint.result }}
+      TESTS_RESULT: ${{ needs.tests.result }}
+    steps:
+      - name: Verify required checks
+        shell: bash
+        run: |
+          echo "changes=$CHANGES_RESULT code=$CODE_CHANGED scans=$SCANS_RESULT lint=$LINT_RESULT tests=$TESTS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "FAIL: changes job did not succeed ($CHANGES_RESULT)" >&2
+            exit 1
+          fi
+          if [ "$SCANS_RESULT" != "success" ]; then
+            echo "FAIL: scans job did not succeed ($SCANS_RESULT)" >&2
+            exit 1
+          fi
+          if [ "$CODE_CHANGED" = "false" ]; then
+            if [ "$LINT_RESULT" != "skipped" ] && [ "$LINT_RESULT" != "success" ]; then
+              echo "FAIL: lint job unexpected result on docs-only change ($LINT_RESULT)" >&2
+              exit 1
+            fi
+            if [ "$TESTS_RESULT" != "skipped" ] && [ "$TESTS_RESULT" != "success" ]; then
+              echo "FAIL: tests job unexpected result on docs-only change ($TESTS_RESULT)" >&2
+              exit 1
+            fi
+            echo "PASS: docs-only checks green"
+            exit 0
+          fi
+          if [ "$LINT_RESULT" != "success" ]; then
+            echo "FAIL: lint job did not succeed ($LINT_RESULT)" >&2
+            exit 1
+          fi
+          if [ "$TESTS_RESULT" != "success" ]; then
+            echo "FAIL: tests job did not succeed ($TESTS_RESULT)" >&2
+            exit 1
+          fi
+          echo "PASS: code checks green"
