@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { useConsole } from '../stores/consoleStore';
+import { AuditInspector } from './AuditInspector';
 import { Badge, Button, SettingField } from './Primitives';
 import { ConversationInspector } from './ConversationInspector';
 
@@ -134,6 +135,10 @@ export const InspectorDrawer: React.FC = () => {
                 {inspector.id}
               </div>
             </>
+          ) : inspector.kind === 'audit' ? (
+            <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
+              审计详情 ({inspector.id})
+            </h3>
           ) : (
             <h3 className="truncate text-[15px] font-semibold text-[var(--text-primary)]">
               详情检视 ({inspector.kind === 'setting' ? inspector.key : inspector.id})
@@ -162,6 +167,8 @@ export const InspectorDrawer: React.FC = () => {
                 onDraftChange={setDraftValue}
                 onReset={() => void handleResetSetting()}
               />
+            ) : inspector.kind === 'audit' ? (
+              <AuditInspector key={inspector.id} auditId={inspector.id} />
             ) : (
               <p className="text-[var(--text-muted)]">详情视图将在对应功能切片中接入。</p>
             )}
