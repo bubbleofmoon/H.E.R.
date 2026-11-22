@@ -1,11 +1,18 @@
 {
   "inventory": {
-    "root": 87,
-    "personas": 13,
-    "schedule": 22,
-    "registry": 7,
-    "conversations": 6,
-    "models": 3
+    "overview": 4,
+    "conversations": 18,
+    "persona": 21,
+    "memory": 28,
+    "behavior": 11,
+    "models": 11,
+    "settings": 4,
+    "schedule": 10,
+    "system": 16,
+    "security": 11,
+    "audit": 8,
+    "legacy": 9,
+    "auth": 2
   },
   "functions": {
     "refresh-status": {
@@ -13,7 +20,7 @@
       "area": "overview",
       "section": "runtime",
       "sources": [
-        "root.refresh"
+        "overview.refresh"
       ]
     },
     "activity-log": {
@@ -21,7 +28,10 @@
       "area": "overview",
       "section": "recent-activity",
       "sources": [
-        "root.activity"
+        "overview.activity"
+      ],
+      "readOnlySources": [
+        "overview.activity"
       ]
     },
     "dark-mode": {
@@ -29,610 +39,633 @@
       "area": "overview",
       "section": "appearance",
       "sources": [
-        "root.dark"
+        "overview.dark"
       ]
     },
     "pending-items": {
       "label": "待审批请求与提问",
-      "area": "sessions",
+      "area": "overview",
       "section": "pending",
       "sources": [
-        "root.pending"
+        "overview.pending"
+      ],
+      "readOnlySources": [
+        "overview.pending"
       ]
     },
     "sessions-view": {
       "label": "会话列表与快捷选择",
-      "area": "sessions",
+      "area": "conversations",
       "section": "mapping",
       "sources": [
-        "root.sessions",
-        "root.v2-pick"
+        "conversations.list"
+      ],
+      "readOnlySources": [
+        "conversations.list"
       ]
     },
     "session-reset": {
       "label": "重置会话映射",
-      "area": "sessions",
+      "area": "conversations",
       "section": "mapping",
       "sources": [
-        "root.session-reset"
+        "conversations.session-reset"
       ]
     },
     "session-scope": {
       "label": "会话授权范围",
-      "area": "sessions",
+      "area": "conversations",
       "section": "mapping",
-      "sources": [],
-      "detail": "The Sessions and Approvals page will expose conversation authorization scope."
+      "sources": [
+        "conversations.scope"
+      ]
     },
     "persona-list": {
       "label": "人格列表",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.roles",
-        "personas.list"
+        "persona.list"
       ],
       "readOnlySources": [
-        "personas.list"
+        "persona.list"
       ]
     },
     "persona-content": {
       "label": "读取人格内容",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-content",
-        "personas.edit-load"
+        "persona.edit-load"
       ]
     },
     "persona-create": {
       "label": "新建人格",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-create",
-        "personas.create"
+        "persona.create"
       ]
     },
     "persona-save": {
       "label": "保存人格为新版本",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-update",
-        "personas.save-version"
+        "persona.save-version"
       ]
     },
     "persona-rename": {
       "label": "重命名人格",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-rename"
+        "persona.rename"
       ]
     },
     "persona-copy": {
       "label": "复制人格",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-duplicate",
-        "personas.duplicate"
+        "persona.duplicate"
       ]
     },
     "persona-delete": {
       "label": "删除人格",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-delete",
-        "personas.delete"
+        "persona.delete"
       ]
     },
     "persona-inject": {
       "label": "人格注入上限",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-limit"
+        "persona.inject-limit"
       ]
     },
     "persona-default": {
       "label": "设置默认人格",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-set",
-        "personas.assign-default"
+        "persona.assign-default"
       ]
     },
     "persona-clear": {
       "label": "清除默认人格",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "root.role-clear"
+        "persona.assign-clear"
       ]
     },
     "persona-override": {
       "label": "会话人格覆盖",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "personas.assign-override"
+        "persona.assign-override"
       ]
     },
     "persona-import": {
       "label": "导入旧角色卡",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "personas.import"
+        "persona.import"
       ]
     },
     "persona-versions": {
       "label": "人格版本记录",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "personas.versions"
+        "persona.versions"
       ]
     },
     "persona-approve": {
       "label": "批准待审人格版本",
-      "area": "her",
+      "area": "persona",
       "section": "personas",
       "sources": [
-        "personas.approve"
+        "persona.approve"
       ]
     },
     "sim-prompt-view": {
       "label": "查看预设仿真提示词",
-      "area": "her",
+      "area": "persona",
       "section": "prompts",
       "sources": [
-        "root.sim-prompt-show"
+        "persona.sim-prompt-show"
       ]
     },
     "sim-prompt-save": {
       "label": "保存并同步仿真提示词",
-      "area": "her",
+      "area": "persona",
       "section": "prompts",
       "sources": [
-        "root.sim-prompt-save"
+        "persona.sim-prompt-save"
       ]
     },
     "sim-prompt-backups": {
       "label": "仿真提示词备份列表",
-      "area": "her",
+      "area": "persona",
       "section": "prompts",
-      "sources": [],
-      "detail": "The HER page will list simulation prompt backups in Prompts."
+      "sources": [
+        "persona.sim-prompt-backups"
+      ]
     },
     "sim-prompt-restore": {
       "label": "还原仿真提示词备份",
-      "area": "her",
+      "area": "persona",
       "section": "prompts",
       "sources": [
-        "root.sim-prompt-restore"
+        "persona.sim-prompt-restore"
       ]
     },
     "initial-prompt-load": {
       "label": "载入会话初始提示词",
-      "area": "her",
+      "area": "conversations",
       "section": "prompts",
       "sources": [
-        "root.v2-initial-load"
+        "conversations.initial-load"
       ]
     },
     "initial-prompt-save": {
       "label": "保存会话初始提示词",
-      "area": "her",
+      "area": "conversations",
       "section": "prompts",
       "sources": [
-        "root.v2-initial-save"
+        "conversations.initial-save"
       ]
     },
     "initial-prompt-delete": {
       "label": "删除会话初始提示词",
-      "area": "her",
+      "area": "conversations",
       "section": "prompts",
       "sources": [
-        "root.v2-initial-delete"
+        "conversations.initial-delete"
       ]
     },
     "effective-prompt": {
       "label": "查看二代生效提示词",
-      "area": "her",
+      "area": "persona",
       "section": "prompts",
-      "sources": [],
-      "detail": "The HER page will show the effective prompt in Prompts."
+      "sources": [
+        "persona.effective-prompt"
+      ],
+      "readOnlySources": [
+        "persona.effective-prompt"
+      ]
     },
     "light-memory": {
       "label": "读取轻量记忆",
-      "area": "her",
+      "area": "conversations",
       "section": "memory",
       "sources": [
-        "root.v2-memory-load"
+        "conversations.memory-load"
       ]
     },
     "light-memory-edit": {
       "label": "编辑轻量记忆",
-      "area": "her",
+      "area": "conversations",
       "section": "memory",
       "sources": [
-        "root.v2-memory-edit"
+        "conversations.memory-add-edit"
       ]
     },
     "memory-forget": {
       "label": "忘记记忆条目",
-      "area": "her",
+      "area": "conversations",
       "section": "memory",
       "sources": [
-        "root.v2-memory-remove"
+        "conversations.memory-remove"
       ]
     },
     "light-memory-clear-category": {
       "label": "清空指定类别的记忆",
-      "area": "her",
+      "area": "conversations",
       "section": "memory",
       "sources": [
-        "root.v2-memory-clear-category"
+        "conversations.memory-clear-category"
       ]
     },
     "light-memory-clear": {
       "label": "清空会话轻量记忆",
-      "area": "her",
+      "area": "conversations",
       "section": "memory",
       "sources": [
-        "root.v2-memory-clear-all"
+        "conversations.memory-clear-all"
       ]
     },
     "memory-search": {
       "label": "搜索记忆",
-      "area": "her",
+      "area": "memory",
       "section": "memory",
-      "sources": [],
-      "detail": "The HER page will offer memory search in Memory."
+      "sources": [
+        "memory.search"
+      ]
     },
     "memory-preview": {
       "label": "预览记忆条目",
-      "area": "her",
+      "area": "memory",
       "section": "memory",
-      "sources": [],
-      "detail": "The HER page will preview memory entries in Memory."
+      "sources": [
+        "memory.preview"
+      ]
     },
     "memory-write": {
       "label": "写入记忆",
-      "area": "her",
+      "area": "memory",
       "section": "memory",
-      "sources": [],
-      "detail": "The HER page will offer memory entry creation in Memory."
+      "sources": [
+        "memory.write"
+      ]
     },
     "memory-index": {
       "label": "查看记忆索引",
-      "area": "her",
+      "area": "memory",
       "section": "memory",
-      "sources": [],
-      "detail": "The HER page will show the memory index in Memory."
+      "sources": [
+        "memory.index"
+      ]
     },
     "memory-archive": {
       "label": "归档或取消归档记忆",
-      "area": "her",
+      "area": "memory",
       "section": "memory",
-      "sources": [],
-      "detail": "The HER page will offer archive and unarchive actions in Memory."
+      "sources": [
+        "memory.archive"
+      ]
     },
     "slang-tabs": {
       "label": "筛选词条状态",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-tabs"
+        "memory.slang-tabs"
       ]
     },
     "slang-list": {
       "label": "黑话词库列表",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-list"
+        "memory.slang-list"
       ]
     },
     "slang-confirm": {
       "label": "确认词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-confirm"
+        "memory.slang-confirm"
       ]
     },
     "slang-edit": {
       "label": "编辑词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-edit"
+        "memory.slang-edit"
       ]
     },
     "slang-reject": {
       "label": "拒绝词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-reject"
+        "memory.slang-reject"
       ]
     },
     "slang-delete": {
       "label": "删除词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-delete"
+        "memory.slang-delete"
       ]
     },
     "slang-restore": {
       "label": "恢复为候选",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-restore"
+        "memory.slang-restore"
       ]
     },
     "slang-batch-research": {
       "label": "批量研究黑话",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-batch-research"
+        "memory.slang-batch-research"
       ]
     },
     "slang-batch-confirm": {
       "label": "批量确认词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-batch-confirm"
+        "memory.slang-batch-confirm"
       ]
     },
     "slang-batch-reject": {
       "label": "批量拒绝词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-batch-reject"
+        "memory.slang-batch-reject"
       ]
     },
     "slang-batch-delete": {
       "label": "批量删除词条",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-batch-delete"
+        "memory.slang-batch-delete"
       ]
     },
     "slang-extract": {
       "label": "立即提取黑话",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-extract"
+        "memory.slang-extract"
       ]
     },
     "slang-add": {
       "label": "手动添加黑话",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-add"
+        "memory.slang-add"
       ]
     },
     "slang-settings": {
       "label": "黑话学习参数",
-      "area": "her",
+      "area": "memory",
       "section": "slang",
       "sources": [
-        "root.slang-config"
+        "memory.slang-config"
       ]
     },
     "stickers-list": {
       "label": "表情包收藏列表",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will list saved stickers in Stickers."
+      "sources": [
+        "memory.stickers-list"
+      ]
     },
     "stickers-sync": {
       "label": "同步表情包",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will offer sticker synchronization in Stickers."
+      "sources": [
+        "memory.stickers-sync"
+      ]
     },
     "stickers-note": {
       "label": "编辑表情包本地笔记",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will offer local sticker notes in Stickers."
+      "sources": [
+        "memory.stickers-note"
+      ]
     },
     "stickers-remark": {
       "label": "修改 QQ 表情备注",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will offer QQ sticker remark editing in Stickers."
+      "sources": [
+        "memory.stickers-remark"
+      ]
     },
     "stickers-preview": {
       "label": "预览表情图片",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will offer image previews in Stickers."
+      "sources": [
+        "memory.stickers-preview"
+      ]
     },
     "stickers-send": {
       "label": "试发表情",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will offer a test send in Stickers."
+      "sources": [
+        "memory.stickers-send-policy"
+      ],
+      "readOnlySources": [
+        "memory.stickers-send-policy"
+      ]
     },
     "stickers-collect": {
       "label": "收藏聊天表情",
-      "area": "her",
+      "area": "memory",
       "section": "stickers",
-      "sources": [],
-      "detail": "The HER page will offer a save action for chat stickers in Stickers."
+      "sources": [
+        "memory.stickers-collect"
+      ]
     },
     "voice-refresh": {
       "label": "刷新语音库",
-      "area": "her",
+      "area": "memory",
       "section": "voice",
       "sources": [
-        "root.v2-voice-list"
+        "memory.voice-list"
       ]
     },
     "voice-send": {
       "label": "试发语音",
-      "area": "her",
+      "area": "memory",
       "section": "voice",
       "sources": [
-        "root.v2-voice-send"
+        "memory.voice-send"
       ]
     },
     "run-mode": {
       "label": "运行模式",
-      "area": "engagement",
+      "area": "behavior",
       "section": "mode",
       "sources": [
-        "root.mode"
+        "behavior.mode"
       ]
     },
     "silent": {
       "label": "静默开关",
-      "area": "engagement",
+      "area": "behavior",
       "section": "mode",
       "sources": [
-        "root.silent"
+        "behavior.silent"
       ]
     },
     "v2-pause": {
       "label": "暂停二代仿真",
-      "area": "engagement",
+      "area": "behavior",
       "section": "mode",
       "sources": [
-        "root.v2-pause"
+        "behavior.v2-pause"
       ]
     },
     "v2-resume": {
       "label": "恢复二代仿真",
-      "area": "engagement",
+      "area": "behavior",
       "section": "mode",
       "sources": [
-        "root.v2-resume"
+        "behavior.v2-resume"
       ]
     },
     "v2-reset": {
       "label": "重置二代仿真状态",
-      "area": "engagement",
+      "area": "behavior",
       "section": "mode",
       "sources": [
-        "root.v2-reset"
+        "behavior.v2-reset"
       ]
     },
     "wake-words": {
       "label": "查看人格唤醒词",
-      "area": "engagement",
+      "area": "persona",
       "section": "wake",
       "sources": [
-        "personas.wake-load"
+        "persona.wake-load"
       ]
     },
     "wake-words-undo": {
       "label": "撤销唤醒词变更",
-      "area": "engagement",
+      "area": "persona",
       "section": "wake",
       "sources": [
-        "personas.wake-undo"
+        "persona.wake-undo"
       ]
     },
     "wake-state": {
       "label": "查看会话唤醒状态",
-      "area": "engagement",
+      "area": "conversations",
       "section": "wake",
       "sources": [
-        "root.v2-state"
+        "conversations.wake-state"
       ]
     },
     "wake-now": {
       "label": "立即唤醒会话",
-      "area": "engagement",
+      "area": "conversations",
       "section": "wake",
       "sources": [
-        "root.v2-wake"
+        "conversations.wake-now"
       ]
     },
     "wake-state-all": {
       "label": "列出全部会话状态",
-      "area": "engagement",
+      "area": "conversations",
       "section": "wake",
       "sources": [
-        "root.v2-states"
+        "conversations.wake-states-all"
+      ],
+      "readOnlySources": [
+        "conversations.wake-states-all"
       ]
     },
     "v2-config": {
       "label": "二代仿真参数与注册表设置",
-      "area": "engagement",
+      "area": "behavior",
       "section": "engagement-settings",
       "sources": [
-        "root.v2-config"
+        "behavior.v2-config"
       ]
     },
     "feedback-list": {
       "label": "读取 AI 反馈",
-      "area": "engagement",
+      "area": "behavior",
       "section": "feedback",
       "sources": [
-        "root.v2-feedback"
+        "behavior.feedback"
       ]
     },
     "feedback-clear": {
       "label": "清空 AI 反馈",
-      "area": "engagement",
+      "area": "behavior",
       "section": "feedback",
       "sources": [
-        "root.v2-feedback-clear"
+        "behavior.feedback-clear"
       ]
     },
     "tool-log": {
       "label": "读取工具日志",
-      "area": "engagement",
+      "area": "behavior",
       "section": "feedback",
       "sources": [
-        "root.v2-tool-log"
+        "behavior.tool-log"
       ]
     },
     "tool-log-clear": {
       "label": "清空工具日志",
-      "area": "engagement",
+      "area": "behavior",
       "section": "feedback",
       "sources": [
-        "root.v2-tool-log-clear"
+        "behavior.tool-log-clear"
       ]
     },
     "send-outbox": {
       "label": "查看待发送队列",
-      "area": "engagement",
+      "area": "behavior",
       "section": "feedback",
-      "sources": [],
-      "detail": "The Participation and Wake page will show the send outbox in Feedback."
+      "sources": [
+        "behavior.send-outbox"
+      ]
     },
     "spend-series": {
       "label": "令牌与花费趋势",
       "area": "models",
       "section": "spend",
       "sources": [
-        "root.token-series"
+        "models.spend-series"
       ]
     },
     "spend-session": {
@@ -640,7 +673,7 @@
       "area": "models",
       "section": "spend",
       "sources": [
-        "root.token-summary"
+        "models.spend-summary"
       ]
     },
     "spend-provider": {
@@ -648,7 +681,10 @@
       "area": "models",
       "section": "spend",
       "sources": [
-        "root.token-provider"
+        "models.spend-provider"
+      ],
+      "readOnlySources": [
+        "models.spend-provider"
       ]
     },
     "spend-attribution": {
@@ -656,7 +692,10 @@
       "area": "models",
       "section": "spend",
       "sources": [
-        "root.usage-attribution"
+        "models.usage-attribution"
+      ],
+      "readOnlySources": [
+        "models.usage-attribution"
       ]
     },
     "spend-reset": {
@@ -664,7 +703,7 @@
       "area": "models",
       "section": "spend",
       "sources": [
-        "root.token-reset"
+        "models.spend-reset"
       ]
     },
     "spend-turns": {
@@ -672,7 +711,7 @@
       "area": "models",
       "section": "calls",
       "sources": [
-        "root.token-turns"
+        "models.spend-turns"
       ]
     },
     "spend-recent": {
@@ -680,7 +719,10 @@
       "area": "models",
       "section": "calls",
       "sources": [
-        "root.token-recent"
+        "models.spend-recent"
+      ],
+      "readOnlySources": [
+        "models.spend-recent"
       ]
     },
     "model-prices": {
@@ -688,7 +730,10 @@
       "area": "models",
       "section": "calls",
       "sources": [
-        "root.token-prices"
+        "models.spend-prices"
+      ],
+      "readOnlySources": [
+        "models.spend-prices"
       ]
     },
     "schedule-upcoming": {
@@ -752,10 +797,10 @@
     },
     "lifecycle": {
       "label": "切换运行状态",
-      "area": "schedule",
+      "area": "system",
       "section": "tasks",
       "sources": [
-        "schedule.lifecycle"
+        "system.lifecycle"
       ]
     },
     "run-history": {
@@ -787,96 +832,96 @@
     },
     "backup-settings": {
       "label": "备份设置",
-      "area": "schedule",
+      "area": "system",
       "section": "backups",
       "sources": [
-        "schedule.backup-settings"
+        "system.backup-settings"
       ]
     },
     "backup-run": {
       "label": "立即备份",
-      "area": "schedule",
+      "area": "system",
       "section": "backups",
       "sources": [
-        "schedule.backup-run"
+        "system.backup-run"
       ]
     },
     "backup-list": {
       "label": "查看备份记录",
-      "area": "schedule",
+      "area": "system",
       "section": "backups",
       "sources": [
-        "schedule.backup-list"
+        "system.backup-list"
       ]
     },
     "backup-preview": {
       "label": "预览备份还原",
-      "area": "schedule",
+      "area": "system",
       "section": "backups",
       "sources": [
-        "schedule.backup-preview"
+        "system.backup-preview"
       ]
     },
     "backup-restore": {
       "label": "还原备份",
-      "area": "schedule",
+      "area": "system",
       "section": "backups",
       "sources": [
-        "schedule.backup-restore"
+        "system.backup-restore"
       ]
     },
     "release-status": {
       "label": "查看 HER 更新状态",
-      "area": "schedule",
+      "area": "system",
       "section": "updates",
       "sources": [
-        "schedule.release-status"
+        "system.release-status"
       ],
       "readOnlySources": [
-        "schedule.release-status"
+        "system.release-status"
       ]
     },
     "release-approve": {
       "label": "批准 HER 更新",
-      "area": "schedule",
+      "area": "system",
       "section": "updates",
       "sources": [
-        "schedule.release-approve"
+        "system.release-approve"
       ]
     },
     "release-policy": {
       "label": "设置 HER 更新策略",
-      "area": "schedule",
+      "area": "system",
       "section": "updates",
       "sources": [
-        "schedule.release-policy"
+        "system.release-policy"
       ]
     },
     "dependencies-list": {
       "label": "查看依赖版本",
-      "area": "schedule",
+      "area": "system",
       "section": "updates",
       "sources": [
-        "schedule.dependencies"
+        "system.dependencies"
       ],
       "readOnlySources": [
-        "schedule.dependencies"
+        "system.dependencies"
       ]
     },
     "dependencies-check": {
       "label": "检查依赖更新",
-      "area": "schedule",
+      "area": "system",
       "section": "updates",
       "sources": [
-        "schedule.dependencies-check"
+        "system.dependencies-check"
       ]
     },
     "dependencies-approve": {
       "label": "批准依赖更新",
-      "area": "schedule",
+      "area": "system",
       "section": "updates",
       "sources": [
-        "schedule.dependencies-approve"
+        "system.dependencies-approve"
       ]
     },
     "registry-list": {
@@ -884,10 +929,10 @@
       "area": "settings",
       "section": "registry",
       "sources": [
-        "registry.list"
+        "settings.list"
       ],
       "readOnlySources": [
-        "registry.list"
+        "settings.list"
       ]
     },
     "registry-set": {
@@ -895,7 +940,7 @@
       "area": "settings",
       "section": "registry",
       "sources": [
-        "registry.set"
+        "settings.set"
       ]
     },
     "registry-reset": {
@@ -903,50 +948,49 @@
       "area": "settings",
       "section": "registry",
       "sources": [
-        "registry.reset"
+        "settings.reset"
       ]
     },
     "conversation-settings-list": {
       "label": "查看会话设置覆盖",
-      "area": "settings",
+      "area": "conversations",
       "section": "conversation-settings",
       "sources": [
-        "conversations.list"
+        "conversations.settings-list"
       ],
       "readOnlySources": [
-        "conversations.list"
+        "conversations.settings-list"
       ]
     },
     "conversation-setting-set": {
       "label": "保存会话设置覆盖",
-      "area": "settings",
+      "area": "conversations",
       "section": "conversation-settings",
       "sources": [
-        "conversations.set"
+        "conversations.settings-set"
       ]
     },
     "conversation-engine": {
       "label": "切换会话引擎",
-      "area": "settings",
+      "area": "conversations",
       "section": "conversation-settings",
       "sources": [
-        "conversations.switch"
+        "conversations.engine-switch"
       ]
     },
     "conversation-reset": {
       "label": "重置会话设置",
-      "area": "settings",
+      "area": "conversations",
       "section": "conversation-settings",
       "sources": [
-        "conversations.reset"
+        "conversations.settings-reset"
       ]
     },
     "model-chain": {
       "label": "全局模型候选链",
-      "area": "settings",
+      "area": "models",
       "section": "model-routing",
       "sources": [
-        "root.model-chain",
         "models.view"
       ],
       "readOnlySources": [
@@ -955,19 +999,17 @@
     },
     "model-route-override": {
       "label": "设置会话模型路由",
-      "area": "settings",
+      "area": "models",
       "section": "model-routing",
       "sources": [
-        "root.session-model-save",
         "models.set"
       ]
     },
     "model-route-reset": {
       "label": "会话使用全局模型顺序",
-      "area": "settings",
+      "area": "models",
       "section": "model-routing",
       "sources": [
-        "root.session-model-clear",
         "models.reset"
       ]
     },
@@ -975,29 +1017,32 @@
       "label": "更改管理员密码",
       "area": "security",
       "section": "browser-access",
-      "sources": [],
-      "detail": "The Security page will offer administrator password changes."
+      "sources": [
+        "security.password-change"
+      ]
     },
     "local-password": {
       "label": "本机也需要密码",
       "area": "security",
       "section": "browser-access",
-      "sources": [],
-      "detail": "The Security page will expose the local password requirement."
+      "sources": [
+        "security.local-password"
+      ]
     },
     "browser-sessions": {
       "label": "已登录的浏览器",
       "area": "security",
       "section": "browser-access",
-      "sources": [],
-      "detail": "The Security page will list signed-in browsers."
+      "sources": [
+        "security.browser-sessions"
+      ]
     },
     "allow-list": {
       "label": "允许列表",
       "area": "security",
       "section": "access-control",
       "sources": [
-        "root.whitelist"
+        "security.allow-list"
       ]
     },
     "deny-list": {
@@ -1005,7 +1050,7 @@
       "area": "security",
       "section": "access-control",
       "sources": [
-        "root.deny"
+        "security.deny-list"
       ]
     },
     "owner": {
@@ -1013,7 +1058,7 @@
       "area": "security",
       "section": "access-control",
       "sources": [
-        "root.owner"
+        "security.owner"
       ]
     },
     "security-notify": {
@@ -1021,7 +1066,7 @@
       "area": "security",
       "section": "access-control",
       "sources": [
-        "root.security-notify"
+        "security.security-notify"
       ]
     },
     "security-harden": {
@@ -1029,38 +1074,39 @@
       "area": "security",
       "section": "access-control",
       "sources": [
-        "root.security-harden"
+        "security.security-harden"
       ]
     },
     "security-setting-confirm": {
       "label": "确认敏感设置变更",
-      "area": "security",
+      "area": "settings",
       "section": "access-control",
       "sources": [
-        "registry.security-confirm"
+        "settings.security-confirm"
       ]
     },
     "authorize-read": {
       "label": "检查读取授权",
       "area": "security",
       "section": "access-control",
-      "sources": [],
-      "detail": "The Security page will offer read-authorization checks."
+      "sources": [
+        "security.authorize-read"
+      ]
     },
     "memory-access": {
       "label": "管理记忆读取权限",
       "area": "security",
       "section": "access-control",
-      "sources": [],
-      "detail": "The Security page will manage memory read permissions."
+      "sources": [
+        "security.memory-access"
+      ]
     },
     "token-rotate": {
       "label": "轮换控制台令牌",
       "area": "security",
       "section": "token",
       "sources": [
-        "root.token-save",
-        "root.token-generate"
+        "security.token-rotate"
       ]
     },
     "audit-recent": {
@@ -1068,11 +1114,10 @@
       "area": "audit",
       "section": "audit-history",
       "sources": [
-        "registry.history",
-        "conversations.history"
+        "audit.recent"
       ],
       "readOnlySources": [
-        "registry.history"
+        "audit.recent"
       ]
     },
     "audit-older": {
@@ -1080,7 +1125,7 @@
       "area": "audit",
       "section": "audit-history",
       "sources": [
-        "registry.older"
+        "audit.older"
       ]
     },
     "audit-undo": {
@@ -1088,74 +1133,91 @@
       "area": "audit",
       "section": "audit-history",
       "sources": [
-        "registry.undo",
-        "conversations.undo"
+        "audit.undo"
       ]
     },
     "turns-stuck": {
       "label": "查看卡住的对话轮次",
       "area": "audit",
       "section": "recovery",
-      "sources": [],
-      "detail": "The Audit and Recovery page will list stuck turns."
+      "sources": [
+        "audit.turns-stuck"
+      ],
+      "readOnlySources": [
+        "audit.turns-stuck"
+      ]
     },
     "turns-resolve": {
       "label": "处理卡住的轮次",
       "area": "audit",
       "section": "recovery",
-      "sources": [],
-      "detail": "The Audit and Recovery page will offer stuck-turn resolution."
+      "sources": [
+        "audit.turns-resolve"
+      ]
     },
     "inbound-gaps": {
       "label": "查看入站消息缺口",
       "area": "audit",
       "section": "recovery",
-      "sources": [],
-      "detail": "The Audit and Recovery page will list inbound gaps."
+      "sources": [
+        "audit.inbound-gaps"
+      ],
+      "readOnlySources": [
+        "audit.inbound-gaps"
+      ]
     },
     "inbound-retry": {
       "label": "重试入站消息缺口",
       "area": "audit",
       "section": "recovery",
-      "sources": [],
-      "detail": "The Audit and Recovery page will offer inbound gap retries."
+      "sources": [
+        "audit.inbound-retry"
+      ]
     },
     "recovery-record": {
       "label": "查看恢复记录",
       "area": "audit",
       "section": "recovery",
-      "sources": [],
-      "detail": "The Audit and Recovery page will show the recovery record."
+      "sources": [
+        "audit.recovery-record"
+      ],
+      "readOnlySources": [
+        "audit.recovery-record"
+      ]
     },
     "qq-login": {
       "label": "查看 QQ 登录状态",
-      "area": "operations",
+      "area": "system",
       "section": "bridge",
-      "sources": [],
-      "detail": "The Operations page will show QQ login status."
+      "sources": [
+        "system.qq-login"
+      ],
+      "readOnlySources": [
+        "system.qq-login"
+      ]
     },
     "test-send": {
       "label": "发送测试消息",
-      "area": "operations",
+      "area": "system",
       "section": "bridge",
       "sources": [
-        "root.test-send"
+        "system.test-send"
       ]
     },
     "restart": {
       "label": "重启 QQ 桥接",
-      "area": "operations",
+      "area": "system",
       "section": "bridge",
       "sources": [
-        "root.restart"
+        "system.restart"
       ]
     },
     "workspace-reset": {
       "label": "重置 QQ 聊天工作区",
-      "area": "operations",
+      "area": "system",
       "section": "bridge",
       "sources": [
-        "root.workspace-reset"
+        "system.workspace-reset"
       ]
     },
     "v1-timeout": {
@@ -1163,7 +1225,7 @@
       "area": "legacy",
       "section": "social-v1",
       "sources": [
-        "root.v1-timeout"
+        "legacy.v1-timeout"
       ]
     },
     "v1-burst": {
@@ -1171,7 +1233,7 @@
       "area": "legacy",
       "section": "social-v1",
       "sources": [
-        "root.v1-burst"
+        "legacy.v1-burst"
       ]
     },
     "v1-topic": {
@@ -1179,7 +1241,7 @@
       "area": "legacy",
       "section": "social-v1",
       "sources": [
-        "root.v1-topic"
+        "legacy.v1-topic"
       ]
     },
     "v1-flush": {
@@ -1187,7 +1249,7 @@
       "area": "legacy",
       "section": "social-v1",
       "sources": [
-        "root.v1-flush"
+        "legacy.v1-flush"
       ]
     },
     "v1-phase": {
@@ -1195,7 +1257,7 @@
       "area": "legacy",
       "section": "social-v1",
       "sources": [
-        "root.v1-phase"
+        "legacy.v1-phase"
       ]
     },
     "dsh-model": {
@@ -1203,7 +1265,7 @@
       "area": "legacy",
       "section": "dsh",
       "sources": [
-        "root.dsh-model"
+        "legacy.dsh-model"
       ]
     },
     "dsh-effort": {
@@ -1211,7 +1273,7 @@
       "area": "legacy",
       "section": "dsh",
       "sources": [
-        "root.dsh-effort"
+        "legacy.dsh-effort"
       ]
     },
     "dsh-notify": {
@@ -1219,7 +1281,7 @@
       "area": "legacy",
       "section": "dsh",
       "sources": [
-        "root.notify-dsh"
+        "legacy.dsh-notify"
       ]
     },
     "dsh-reference": {
@@ -1227,22 +1289,27 @@
       "area": "legacy",
       "section": "dsh",
       "sources": [
-        "root.tool-reference"
+        "legacy.dsh-reference"
+      ],
+      "readOnlySources": [
+        "legacy.dsh-reference"
       ]
     },
     "login-password": {
       "label": "登录控制台",
-      "area": "login",
+      "area": "auth",
       "section": "sign-in",
-      "sources": [],
-      "detail": "The Login page will offer password sign-in."
+      "sources": [
+        "auth.login"
+      ]
     },
     "setup-password": {
       "label": "首次设置管理员密码",
-      "area": "setup",
+      "area": "auth",
       "section": "first-run",
-      "sources": [],
-      "detail": "The Setup page will offer initial administrator password creation."
+      "sources": [
+        "auth.setup"
+      ]
     }
   }
 }

@@ -78,7 +78,10 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): voi
 }
 
 export function isDesktopOrigin(): boolean {
-  return typeof window !== 'undefined' && window.location.hostname === '127.0.0.1';
+  return (
+    typeof window !== 'undefined' &&
+    (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost')
+  );
 }
 
 export function captureDesktopTokenFromUrl(): void {
@@ -100,7 +103,7 @@ export function captureDesktopTokenFromUrl(): void {
   }
 }
 
-function readDesktopBearer(): string {
+export function readDesktopBearer(): string {
   if (typeof window === 'undefined' || !isDesktopOrigin()) {
     return '';
   }
@@ -112,6 +115,18 @@ function readDesktopBearer(): string {
     );
   } catch {
     return '';
+  }
+}
+
+export function clearDesktopBearer(): void {
+  if (typeof window === 'undefined' || !isDesktopOrigin()) {
+    return;
+  }
+  try {
+    window.sessionStorage.removeItem('consoleToken');
+    window.localStorage.removeItem('consoleToken');
+  } catch {
+    // Storage may be restricted; keep best-effort behavior.
   }
 }
 

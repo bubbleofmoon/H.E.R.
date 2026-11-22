@@ -7,10 +7,13 @@ import {
   RestorePreview,
   RunView,
   beginBackupSave,
+  beginScheduleWrite,
   bumpSettingsWriteGen,
   executeBackupRestore,
   finishBackupSave,
+  finishScheduleWrite,
   hasActiveBackupSaves,
+  hasPendingBackupDirSaves,
   markSharedScheduleStale,
   previewBackupRestore,
   refreshSharedScheduleSettings,
@@ -196,27 +199,28 @@ export const BackupsTab: React.FC<BackupsTabProps> = ({
     savingBackupRef.current = true;
     beginBackupSave(hasDirChange);
     if (hasTimeChange) {
-      bumpSettingsWriteGen();
+      beginScheduleWrite();
       markSharedScheduleStale();
     }
     setBusy(true);
     let finalized = false;
-    const finalizeSave = () => {
+    const finalizeBackup = () => {
       if (!finalized) {
         finalized = true;
         finishBackupSave(hasDirChange, mountId);
+      }
+    };
+    let scheduleWriteFinished = false;
+    const finalizeScheduleWrite = () => {
+      if (hasTimeChange && !scheduleWriteFinished) {
+        scheduleWriteFinished = true;
+        finishScheduleWrite();
       }
     };
 
     try {
       const res = await saveBackupSettings(payload);
       backupSetGenRef.current += 1;
-      savingBackupRef.current = false;
-      finalizeSave();
-      if (hasTimeChange) {
-        bumpSettingsWriteGen();
-        void refreshSharedScheduleSettings();
-      }
       if (mountedRef.current) {
         setBackupSettings(res.settings);
         setBackupSettingsStale(false);
@@ -239,6 +243,13 @@ export const BackupsTab: React.FC<BackupsTabProps> = ({
           setBackupsStale(true);
         }
       }
+      savingBackupRef.current = false;
+      finalizeBackup();
+      if (hasTimeChange) {
+        bumpSettingsWriteGen();
+        await refreshSharedScheduleSettings();
+        finalizeScheduleWrite();
+      }
       pushToast('已保存备份策略设置', 'success');
       await Promise.all([
         mountedRef.current ? onRefreshAll() : Promise.resolve(),
@@ -246,14 +257,20 @@ export const BackupsTab: React.FC<BackupsTabProps> = ({
       ]);
     } catch (err) {
       savingBackupRef.current = false;
-      finalizeSave();
+      finalizeBackup();
       pushToast(formatErrorMessage(err, '保存备份策略失败'), 'danger');
       const isDefinitiveClientReject =
         err instanceof ApiRequestError && err.status >= 400 && err.status < 500;
-      if (!isDefinitiveClientReject) {
+      if (isDefinitiveClientReject) {
+        finalizeScheduleWrite();
+        if (mountedRef.current && hasDirChange && !hasPendingBackupDirSaves()) {
+          await onRefreshAll();
+        }
+      } else {
         if (hasTimeChange) {
           bumpSettingsWriteGen();
-          void refreshSharedScheduleSettings();
+          await refreshSharedScheduleSettings();
+          finalizeScheduleWrite();
         }
         if (mountedRef.current) {
           setBackupSettingsStale(true);
@@ -267,7 +284,8 @@ export const BackupsTab: React.FC<BackupsTabProps> = ({
       }
     } finally {
       savingBackupRef.current = false;
-      finalizeSave();
+      finalizeBackup();
+      finalizeScheduleWrite();
       if (mountedRef.current) setBusy(false);
     }
   };

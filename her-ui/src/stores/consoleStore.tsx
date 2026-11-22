@@ -4,6 +4,7 @@ import {
   ConversationStateSummary,
   SettingItemView,
   captureDesktopTokenFromUrl,
+  clearDesktopBearer,
   fetchAuthStatus,
   fetchConsoleStatus,
   fetchConversationStates,
@@ -12,6 +13,7 @@ import {
   fetchReleaseStatus,
   fetchSettingsList,
   isDesktopOrigin,
+  readDesktopBearer,
   resetSettingValue,
   saveSettingValue,
   setUnauthorizedHandler,
@@ -420,7 +422,10 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
       }
       await refreshLiveData();
     } catch {
-      // Initial auth check may fail if legacy fixture mocks only partial endpoints.
+      // Legacy non-isolated runtimes do not expose /api/auth/status; load live data when bearer token exists.
+      if (readDesktopBearer()) {
+        await refreshLiveData();
+      }
     } finally {
       setAuthLoading(false);
     }
@@ -633,9 +638,16 @@ export const ConsoleProvider: React.FC<{ children: React.ReactNode }> = ({ child
   const signOut = useCallback(async () => {
     try {
       await submitLogout();
-    } catch {
-      // Still transition to /login so local view drops session state.
+    } catch (err) {
+      if (!isDesktopOrigin()) {
+        pushToast(
+          err instanceof Error && err.message ? err.message : '退出登录失败，请稍后重试',
+          'danger',
+        );
+        return;
+      }
     }
+    clearDesktopBearer();
     setAuthStatus((prev) => (prev ? { ...prev, authenticated: false, authKind: null } : prev));
     inspectorDirtyRef.current = false;
     setInspectorState(null);

@@ -1,25 +1,5 @@
-// The registry: its entries, each checked through its kind, and the settings page that lists them.
+// The registry: its entries, each checked through its kind, and the settings API routes that expose them.
 use super::*;
-
-#[test]
-fn settings_page_parses_the_route_list_before_sending_to_the_set_route() {
-    let (_root, context) = settings_fixture("route list editor");
-    let (status, _, page) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&context),
-        "GET",
-        "/settings",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!(status, 200);
-    assert!(page.contains("const routeList=type==='route list'") && page.contains("createElement(text||routeList?'textarea':'input')"));
-    assert!(page.contains("input.value=s.redacted||s.value==null?'':JSON.stringify(s.value,null,2)"));
-    assert!(page.contains("value=JSON.parse(input.value);"), "the Set button sends a JSON value rather than the source text");
-    assert!(page.contains("Enter a JSON array of model routes."));
-    assert!(page.contains("send('/api/settings/set',{setting:s.key,value})"));
-    assert!(page.contains("send('/api/settings/reset',{setting:s.key})") && page.contains("api('/api/settings/undo',body)"));
-    assert!(!page.contains("innerHTML"), "route field values are never parsed as HTML");
-}
 
 #[test]
 fn settings_registry_is_complete_and_agrees_with_its_reader() {
@@ -75,83 +55,24 @@ fn no_registry_setting_is_cached_on_the_config_stamp() {
 }
 
 #[test]
-fn settings_followups_page_shows_the_mirror_error_in_its_message_line() {
-    let (_root, context) = settings_fixture("settings page mirror message");
-    let (status, _, page) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&context),
-        "GET",
-        "/settings",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!(status, 200);
-    assert!(
-        page.contains("$('#msg').textContent=j.ok?(j.mirrorError||"),
-        "the settings message line must show mirrorError from a successful change"
-    );
-}
-
-#[test]
 fn settings_page_lists_the_registry_and_sets_through_the_route() {
     let (root, context) = settings_fixture("settings page");
-    let (status, content_type, page) = crate::console_settings::route(
-        crate::console_front::AdminCaller::new(&context),
-        "GET",
-        "/settings",
-        &HashMap::new(),
-        "",
-    );
-    assert_eq!(status, 200, "{page}");
-    assert_eq!(content_type, "text/html; charset=utf-8");
     let (status, _) = admin_request(&context, "GET", "/settings", None);
-    assert_eq!(status, 200, "the page is served behind the console front");
+    assert_eq!(status, 200, "the SPA route is served behind the console front");
     let (status, body) = agent_request(&context, "GET", "/settings", None, "fixture-agent-token");
     assert_eq!(status, 403, "{body}");
-    // The page renders what the list route returns and sends what the set route reads.
     let view = quiet_view(&context);
     for field in ["key", "label", "hint", "value", "default", "applies"] {
-        assert!(page.contains(&format!("s.{field}")), "the page shows {field}");
         assert!(!view[field].is_null(), "the list route returns {field}");
     }
-    assert!(page.contains("s.kind.min") && page.contains("s.kind.max"), "the input takes the bounds");
     assert_eq!(view["kind"]["min"], 1);
-    assert!(page.contains("const type=s.kind.type") && page.contains("type==='integer'"), "the page picks the input by the kind");
-    assert!(page.contains("input.type='checkbox'") && page.contains("type==='id list'"), "a switch and an id list have inputs");
-    assert!(page.contains("if(type==='number'||type==='probability')input.step='any'"), "number settings allow fractional input");
-    assert!(!page.contains("maxLength"), "a model id input sets no UTF-16 length: the set route counts characters");
-    assert!(page.contains("input.value=s.value==null?'':s.value"), "a model id that is not configured shows empty");
     let (status, body) = admin_request(&context, "GET", "/api/settings", None);
     assert_eq!(status, 200, "{body}");
     let model = body["settings"].as_array().unwrap().iter().find(|entry| entry["key"] == "harness.model").unwrap();
     assert_eq!(model["kind"], json!({"type": "model id", "maxChars": 200}));
-    assert!(page.contains("api('/api/settings')"), "the page lists through the route");
-    assert!(
-        page.contains("send('/api/settings/set',{setting:s.key,value})")
-            && page.contains("(type==='integer'||type==='number'||type==='probability')?Number(input.value)"),
-        "the page sends numeric values for integer and number settings and text for model ids"
-    );
-    assert!(page.contains("send('/api/settings/reset',{setting:s.key})"), "the page resets through the route");
-    assert!(
-        page.contains("const body={entry:e.entry}") && page.contains("api('/api/settings/undo',body)"),
-        "the page undoes through the route"
-    );
-    // #154: a security setting is changed only after the page asked, and the request says so.
-    assert!(page.contains("if(s.confirm){if(!ask(s.key))return;body.confirm=true}"), "a set or reset asks first");
-    assert!(page.contains("if(security.has(e.setting)){if(!ask(e.setting))return;body.confirm=true}"), "an undo asks first");
-    assert!(page.contains("confirm('Change the security setting '"), "the page asks with window.confirm");
-    assert!(page.contains("s.overriddenBy"), "the page shows the owner the admin agent mode puts in force");
-    assert!(
-        page.contains("'/api/settings/history'") && page.contains("'?before='+next"),
-        "the page lists the history one page at a time"
-    );
-    for field in ["entry", "atMs", "setting", "old", "new", "source", "actor"] {
-        assert!(page.contains(&format!("e.{field}")), "the history shows {field}");
-    }
-    assert!(page.contains("'x-console-token'"), "the page sends the console credential");
-    assert!(!page.contains("innerHTML"), "text is never parsed as HTML");
-    assert!(!settings_db(&root).exists(), "showing the page creates no store");
+    assert!(!settings_db(&root).exists(), "listing the registry creates no store");
     let request = json!({"setting": QUIET_KEY, "value": 4500});
     let (status, body) = admin_request(&context, "POST", "/api/settings/set", Some(&request));
     assert_eq!(status, 200, "{body}");
-    assert_eq!(quiet_view(&context)["value"], 4500, "the page's next list shows the new value");
+    assert_eq!(quiet_view(&context)["value"], 4500, "the next list shows the new value");
 }

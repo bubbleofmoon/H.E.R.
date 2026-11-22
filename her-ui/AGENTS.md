@@ -11,6 +11,7 @@ Vite, React, TypeScript and Tailwind CSS v4 SPA embedded into `her` via `her/bui
 - **Local checks:** Before pushing UI changes, run:
   - `npm --prefix her-ui run typecheck`
   - `npm --prefix her-ui run build`
+  - `npm --prefix her/tests/ui test -- --validate-catalogue`
   - `git grep -n -E 'style=\{' -- her-ui/src` (expect 0 matches)
   - `python scripts/check-repo.py`
   - `python scripts/scan-public.py --root .`

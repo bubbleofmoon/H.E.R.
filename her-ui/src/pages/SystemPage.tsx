@@ -224,7 +224,7 @@ export const SystemPage: React.FC = () => {
 
   useEffect(() => {
     void loadAll();
-    return subscribeSystemSync(mountIdRef.current, {
+    const unsub = subscribeSystemSync(mountIdRef.current, {
       onBackupDirStarted: () => {
         if (!mountedRef.current) return;
         previewSeqRef.current += 1;
@@ -250,6 +250,13 @@ export const SystemPage: React.FC = () => {
         setReleaseSaveActive(hasActiveReleaseSaves());
       },
     });
+    // Reconcile immediately after subscribing so settlements between render and effect mount are never missed.
+    setBackupSaveActive(hasActiveBackupSaves());
+    setReleaseSaveActive(hasActiveReleaseSaves());
+    setBackupSettingsStale(hasActiveBackupSaves());
+    setBackupsStale(hasPendingBackupDirSaves());
+    setReleasesStale(hasActiveReleaseSaves());
+    return unsub;
   }, [loadAll]);
 
   // Reconcile reverted drafts whenever a verified baseline refresh lands or a save attempt finishes.

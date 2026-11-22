@@ -13,6 +13,7 @@ import {
   ScheduleEntry,
   ScheduleHistoryRow,
   TaskRow,
+  beginExternalBackupTimeSave,
   beginScheduleWrite,
   bumpSettingsWriteGen,
   commitSharedSettingsRead,
@@ -20,6 +21,7 @@ import {
   fetchScheduleHistory,
   fetchTaskRuns,
   fetchTasks,
+  finishExternalBackupTimeSave,
   finishScheduleWrite,
   getSettingsWriteGen,
   getSharedScheduleState,
@@ -389,8 +391,10 @@ export const SchedulePage: React.FC = () => {
             return;
           }
           const startGen = settingEditGenRef.current[setting.key] ?? 0;
+          const touchesBackupTime = setting.key === 'backup.time';
           inFlightWritesRef.current += 1;
           beginScheduleWrite();
+          if (touchesBackupTime) beginExternalBackupTimeSave();
           try {
             const res = await resetSettingValue(setting.key, Boolean(setting.confirm));
             if (typeof res.mirrorError === 'string' && res.mirrorError) {
@@ -419,6 +423,7 @@ export const SchedulePage: React.FC = () => {
             }
           } finally {
             inFlightWritesRef.current = Math.max(0, inFlightWritesRef.current - 1);
+            if (touchesBackupTime) finishExternalBackupTimeSave();
             finishScheduleWrite();
           }
         },
@@ -436,8 +441,15 @@ export const SchedulePage: React.FC = () => {
     ) {
       return;
     }
+    const clickGenByKey: Record<string, number> = {};
+    for (const s of dirtySettings) {
+      clickGenByKey[s.key] = settingEditGenRef.current[s.key] ?? 0;
+    }
+    const touchesBackupTime = dirtySettings.some((s) => s.key === 'backup.time');
+
     inFlightWritesRef.current += 1;
     beginScheduleWrite();
+    if (touchesBackupTime) beginExternalBackupTimeSave();
     setBusy(true);
 
     const errors: string[] = [];
@@ -473,7 +485,7 @@ export const SchedulePage: React.FC = () => {
         .map((s) => ({
           setting: s,
           value: dirtyDrafts[s.key],
-          startGen: settingEditGenRef.current[s.key] ?? 0,
+          startGen: clickGenByKey[s.key] ?? 0,
         }))
         .filter((item) => {
           if (item.value === null || item.value === undefined || item.value === '') {
@@ -737,6 +749,7 @@ export const SchedulePage: React.FC = () => {
       }
     } finally {
       inFlightWritesRef.current = Math.max(0, inFlightWritesRef.current - 1);
+      if (touchesBackupTime) finishExternalBackupTimeSave();
       finishScheduleWrite();
       if (mountedRef.current) {
         setBusy(false);
