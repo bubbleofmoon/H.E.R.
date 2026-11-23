@@ -26,6 +26,17 @@ impl Part {
 }
 
 #[derive(Serialize)]
+pub struct LiveStatus {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    groups: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct Verdict {
     v: u8,
     pub ok: bool,
@@ -43,6 +54,11 @@ pub struct Verdict {
     /// Upgrade guidance for configured CLI candidates. It does not make the other health parts fail.
     #[serde(rename = "cliModelNotice", skip_serializing_if = "Option::is_none")]
     cli_model_notice: Option<&'static str>,
+    /// Advisory state of the configured or held live bridge (`not-running`, `waiting-for-gateway`,
+    /// `ready`, `unready`, `unverified`). Never uses a previous owner's stale heartbeat and never
+    /// fails `parts` or `ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live: Option<LiveStatus>,
 }
 
 fn owner(data: &Path, role: OwnerRole) -> Part {
@@ -105,6 +121,7 @@ pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Op
                 scope_notices: Vec::new(),
                 model_routes: None,
                 cli_model_notice: None,
+                live: None,
             };
         }
     };
@@ -147,6 +164,7 @@ pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Op
                 scope_notices: Vec::new(),
                 model_routes: None,
                 cli_model_notice: None,
+                live: None,
             };
         }
     };
@@ -207,6 +225,7 @@ pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Op
     parts.insert("snowluma", snowluma);
     parts.insert("dsh", dsh);
     parts.insert("dshLogin", dsh_login);
+    let live = live_status(&context, &cfg);
     Verdict {
         v: 1,
         ok: parts.values().all(|part| part.verdict == "pass"),
@@ -215,6 +234,90 @@ pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Op
         scope_notices: crate::watchdog::rollout_scope_gaps(&cfg).lines(),
         model_routes: crate::harness::route_health::report(&context, &cfg),
         cli_model_notice: crate::backend::cli_model_notice(&context, &cfg),
+        live,
+    }
+}
+
+fn live_status(context: &RuntimeContext, cfg: &serde_json::Value) -> Option<LiveStatus> {
+    live_status_with(&mut lifecycle::LiveLifecycle, context.data_dir(), cfg)
+}
+
+fn live_status_with(
+    backend: &mut dyn lifecycle::LifecycleBackend,
+    data: &Path,
+    cfg: &serde_json::Value,
+) -> Option<LiveStatus> {
+    let configured_groups = crate::watchdog::live_target_from_config(cfg)
+        .ok()
+        .map(|target| target.groups)
+        .unwrap_or_default();
+    let observation = lifecycle::verify_owner(
+        backend,
+        data,
+        OwnerRole::Live,
+        &lifecycle::ImagePolicy::HealthReadOnly,
+        lifecycle::ProbeMode::Existing,
+    );
+    match observation {
+        lifecycle::OwnerObservation::Free { .. } => {
+            if configured_groups.is_empty() {
+                None
+            } else {
+                Some(LiveStatus {
+                    state: "not-running",
+                    pid: None,
+                    groups: Some(configured_groups),
+                    reason: Some("live owner is not held".into()),
+                })
+            }
+        }
+        lifecycle::OwnerObservation::Verified(owner) => {
+            let expected_groups = if !configured_groups.is_empty() {
+                configured_groups
+            } else {
+                owner.marker.groups.clone().unwrap_or_default()
+            };
+            match lifecycle::check_live_heartbeat(backend, data, &owner.marker, &expected_groups) {
+                Ok(lifecycle::LiveHeartbeatState::Ready) => Some(LiveStatus {
+                    state: "ready",
+                    pid: Some(owner.marker.identity.pid),
+                    groups: owner.marker.groups,
+                    reason: None,
+                }),
+                Ok(lifecycle::LiveHeartbeatState::WaitingForGateway) => Some(LiveStatus {
+                    state: "waiting-for-gateway",
+                    pid: Some(owner.marker.identity.pid),
+                    groups: owner.marker.groups,
+                    reason: Some("live bridge is waiting for the OneBot gateway".into()),
+                }),
+                Err(reason) => Some(LiveStatus {
+                    state: "unready",
+                    pid: Some(owner.marker.identity.pid),
+                    groups: owner.marker.groups,
+                    reason: Some(reason),
+                }),
+            }
+        }
+        lifecycle::OwnerObservation::Mismatch {
+            marker: Some(_), ..
+        } => Some(LiveStatus {
+            state: "unverified",
+            pid: None,
+            groups: (!configured_groups.is_empty()).then_some(configured_groups),
+            reason: Some("live owner process identity cannot be verified".into()),
+        }),
+        lifecycle::OwnerObservation::Mismatch { .. } => Some(LiveStatus {
+            state: "unverified",
+            pid: None,
+            groups: (!configured_groups.is_empty()).then_some(configured_groups),
+            reason: Some("live owner cannot be identified".into()),
+        }),
+        lifecycle::OwnerObservation::Unknown(reason) => Some(LiveStatus {
+            state: "unverified",
+            pid: None,
+            groups: (!configured_groups.is_empty()).then_some(configured_groups),
+            reason: Some(reason),
+        }),
     }
 }
 
@@ -449,5 +552,121 @@ mod tests {
         let parts: Vec<&str> = verdict["parts"].as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(parts, ["console", "desired", "dsh", "dshLogin", "snowluma", "supervisor"], "route health is never a part");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_status_never_presents_previous_owners_stale_heartbeat() {
+        use crate::lifecycle::{FakeLifecycle, Liveness, OwnerMarker, OwnerProbe, ProcessIdentity};
+
+        let cfg = json!({
+            "backends": {"mcpRustBridge": true},
+            "rollout": {"rustGroups": ["group:1"]}
+        });
+        let unused = Path::new("/unused");
+        let mut fake = FakeLifecycle::default();
+        fake.now_ms = 510_000;
+        // Leftover fresh-looking heartbeat from a previous live owner (pid 100).
+        fake.heartbeat = Some(Ok(json!({
+            "ts": 505_000,
+            "pid": 100,
+            "live": true,
+            "groups": ["group:1"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string()
+        .into_bytes()));
+
+        // 1. Live gate is free: must report not-running, never ready or pid 100.
+        let status =
+            serde_json::to_value(live_status_with(&mut fake, unused, &cfg).unwrap()).unwrap();
+        assert_eq!(status["state"], "not-running", "{status}");
+        assert!(status.get("pid").is_none(), "{status}");
+
+        // 2. Live gate is held by an unverified/mismatch process: must report unverified.
+        let new_marker = OwnerMarker {
+            v: 1,
+            role: "live".into(),
+            identity: ProcessIdentity {
+                pid: 200,
+                start: 20_000,
+                exe: "/opt/her/her".into(),
+            },
+            acquired_at: 508_000,
+            refreshed_at: 508_000,
+            groups: Some(vec!["group:1".into()]),
+        };
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(new_marker.clone()),
+            },
+        );
+        fake.liveness.insert(200, Liveness::Mismatch("reused pid".into()));
+        let status =
+            serde_json::to_value(live_status_with(&mut fake, unused, &cfg).unwrap()).unwrap();
+        assert_eq!(status["state"], "unverified", "{status}");
+        assert!(status.get("pid").is_none(), "{status}");
+
+        // 3. Verified live owner pid 200, but heartbeat still belongs to previous pid 100.
+        fake.liveness.insert(200, Liveness::Matches);
+        let status =
+            serde_json::to_value(live_status_with(&mut fake, unused, &cfg).unwrap()).unwrap();
+        assert_eq!(status["state"], "unready", "{status}");
+        assert_eq!(status["pid"], 200, "{status}");
+        assert!(
+            status["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("does not belong to the current owner"),
+            "{status}"
+        );
+
+        // 4. Verified live owner pid 200 with ts < acquired_at (e.g. recycled pid).
+        fake.heartbeat = Some(Ok(json!({
+            "ts": 507_999,
+            "pid": 200,
+            "live": true,
+            "groups": ["group:1"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string()
+        .into_bytes()));
+        let status =
+            serde_json::to_value(live_status_with(&mut fake, unused, &cfg).unwrap()).unwrap();
+        assert_eq!(status["state"], "unready", "{status}");
+
+        // 5. Verified live owner pid 200 waiting for gateway.
+        fake.heartbeat = Some(Ok(json!({
+            "ts": 508_000,
+            "pid": 200,
+            "live": true,
+            "groups": ["group:1"],
+            "state": "waiting-for-gateway",
+            "gatewayConnected": false
+        })
+        .to_string()
+        .into_bytes()));
+        let status =
+            serde_json::to_value(live_status_with(&mut fake, unused, &cfg).unwrap()).unwrap();
+        assert_eq!(status["state"], "waiting-for-gateway", "{status}");
+        assert_eq!(status["pid"], 200, "{status}");
+
+        // 6. Verified live owner pid 200 transitions to ready.
+        fake.heartbeat = Some(Ok(json!({
+            "ts": 509_000,
+            "pid": 200,
+            "live": true,
+            "groups": ["group:1"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string()
+        .into_bytes()));
+        let status =
+            serde_json::to_value(live_status_with(&mut fake, unused, &cfg).unwrap()).unwrap();
+        assert_eq!(status["state"], "ready", "{status}");
+        assert_eq!(status["pid"], 200, "{status}");
     }
 }
