@@ -6,7 +6,6 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 struct Active {
     task: tokio::task::JoinHandle<(Result<usize, String>, bool)>,
@@ -2939,14 +2938,32 @@ impl Hub {
             groups,
             live_all,
             mode_stamp,
-            reset_stamp: context.read_social_state().map(|s| s["resetEpoch"].clone()).unwrap_or(Value::Null),
+            reset_stamp: crate::conversation_state::ConversationState::for_runtime(context)
+                .read_optional_document()
+                .map(|s| s.reset_epoch())
+                .unwrap_or(Value::Null),
             held: HashMap::new(),
             dsh_wait: DshWait::default(),
             tokens: HashMap::new(),
             retries: HashMap::new(),
             rollback_pending: HashMap::new(),
             failures: HashMap::new(),
-            closing_seen: context.read_social_state().ok().and_then(|s| s["conversations"].as_object().cloned()).unwrap_or_default().into_iter().map(|(k,c)| (k,c["wakeConfig"]["confirmedAt"].clone())).collect(),
+            closing_seen: crate::conversation_state::ConversationState::for_runtime(context)
+                .read_optional_document()
+                .map(|s| {
+                    s.conversations()
+                        .map(|(k, c)| {
+                            (
+                                k.to_string(),
+                                c.field("wakeConfig")
+                                    .and_then(|w| w.get("confirmedAt"))
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             closing_misses: HashMap::new(),
             slang: {
                 let slang = crate::slang_learn::SlangLearning::new(context);
@@ -2983,31 +3000,39 @@ impl Hub {
         }
     }
 
-    fn state(&self) -> Result<Value, String> {
+    fn state_doc(&self) -> Result<crate::conversation_state::SocialDocument, String> {
         #[cfg(test)]
         if let Some(remaining) = self.state_read_failure_after.take() {
             if remaining == 0 { return Err("synthetic social-state read failure".into()); }
             self.state_read_failure_after.set(Some(remaining - 1));
         }
-        self.context
-            .read_optional_text(RuntimeArea::Data, "social-v2.json")
-            .map_err(|e| e.to_string())?
-            .map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-            .unwrap_or_else(|| Ok(json!({"conversations":{}})))
+        crate::conversation_state::ConversationState::for_runtime(&self.context)
+            .read_optional_document()
+            .map_err(|(_, e)| e)
+    }
+
+    fn state(&self) -> Result<Value, String> {
+        self.state_doc().map(crate::conversation_state::SocialDocument::into_value)
     }
 
     /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.
-    fn rotation_state(&self, cfg: &Value, step: &'static str, now: i64) -> Result<Value, String> {
+    fn rotation_state_doc(&self, cfg: &Value, step: &'static str, now: i64) -> Result<crate::conversation_state::SocialDocument, String> {
         let keys: std::collections::BTreeSet<_> = self.maintenance.keys().chain(self.drivers.keys()).collect();
         if keys.iter().any(|key| crate::session_rotation::read_retry_at(&self.context, key, step) > now) {
             return Err("session rotation read retry deferred".into());
         }
-        let result = self.state();
+        let result = self.state_doc();
         let status = result.as_ref().map(|_| ()).map_err(Clone::clone);
         for key in keys {
             let _ = crate::session_rotation::rotation_read(&self.context, cfg, key, step, now, status.clone());
         }
         result
+    }
+
+    /// Keep read backoff separate from scan scheduling: a deferred recovery still blocks dispatch.
+    fn rotation_state(&self, cfg: &Value, step: &'static str, now: i64) -> Result<Value, String> {
+        self.rotation_state_doc(cfg, step, now)
+            .map(crate::conversation_state::SocialDocument::into_value)
     }
 
     /// Forget every queued, held, retried and awaited job (their ingress is settled).
@@ -3106,16 +3131,19 @@ impl Hub {
             if let Some(hook) = self.epoch_contended_hook.take() { let _ = hook.send(()); }
         }
         let minted = active.map(|a| a.minted.lock().unwrap_or_else(|p| p.into_inner()));
-        let state = self.state()?;
-        let current = state["conversations"][key]["agentToken"].as_str().unwrap_or("");
-        let valid = state["resetEpoch"] == self.reset_stamp && !current.is_empty();
-        let published = minted.as_ref().is_some_and(|m| m.as_deref() == Some(current));
+        let doc = self.state_doc()?;
+        let current = doc
+            .conversation(key)
+            .and_then(|c| c.token().map(str::to_string))
+            .unwrap_or_default();
+        let valid = doc.reset_epoch() == self.reset_stamp && !current.is_empty();
+        let published = minted.as_ref().is_some_and(|m| m.as_deref() == Some(current.as_str()));
         if valid && published {
-            self.tokens.insert(key.to_string(), current.to_string());
+            self.tokens.insert(key.to_string(), current.clone());
         }
         let in_turn = valid && (active.is_some_and(|a| a.token == current || published)
-            || self.recovered.get(key).is_some_and(|(_, owned)| owned == current));
-        Ok((state, in_turn))
+            || self.recovered.get(key).is_some_and(|(_, owned)| owned == &current));
+        Ok((doc.into_value(), in_turn))
     }
 
     /// Queue a wake that cannot be dispatched while DSH is down. A full conversation drops its oldest wake (JS shifts its
@@ -3504,7 +3532,9 @@ impl Hub {
             self.journal.mark_handled(vec![inbound_key], now).await?;
             return Ok(());
         }
-        let token = conv["agentToken"].as_str().unwrap_or("").to_string();
+        let token = crate::conversation_state::Conversation::from_value(conv)
+            .and_then(|c| c.token().map(str::to_string))
+            .unwrap_or_default();
         if self.tokens.get(&key).is_some_and(|old| old != &token) {
             self.invalidate_key(&key, now).await?;
         }
@@ -3594,14 +3624,15 @@ impl Hub {
     }
 
     async fn refresh_recovered(&mut self, cfg: &Value, now: i64) -> Result<(), String> {
-        let state = self.rotation_state(cfg, "guard-read", now)?;
+        let doc = self.rotation_state_doc(cfg, "guard-read", now)?;
         // An unreadable ledger cannot prove that an attached turn ended.
         let Ok(records) = crate::turn_ledger::read_records(&self.context) else { return Ok(()) };
         let (turns, _) = crate::turn_ledger::fold(&records);
         let mut running = HashMap::new();
-        if console::runtime_mode(&self.context) == "reserved2" && state["paused"] != true {
+        if console::runtime_mode(&self.context) == "reserved2" && !doc.paused() {
             for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
-                let token = state["conversations"][&turn.key]["agentToken"].as_str().unwrap_or("");
+                let conv = doc.conversation(&turn.key);
+                let token = conv.as_ref().and_then(|c| c.token()).unwrap_or("");
                 if !token.is_empty() && console::inbound_admitted(cfg, &turn.key)
                     && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
                     && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
@@ -3613,7 +3644,7 @@ impl Hub {
             .map(|(key, owned)| (key.clone(), owned.clone())).collect();
         self.recovered = running;
         for (key, (turn_id, token)) in ended {
-            if state["conversations"][&key]["agentToken"].as_str() == Some(token.as_str())
+            if doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).as_deref() == Some(token.as_str())
                 && turns.iter().any(|t| t.id == turn_id && t.state == crate::turn_ledger::State::Completed) {
                 self.settle_turn_coverage(cfg, &key, &token, &turn_id, now).await?;
             }
@@ -3696,7 +3727,8 @@ impl Hub {
                     self.maintenance.insert(key,m);
                 }
                 MaintenanceResult::Digest(crate::session_rotation::DigestResult::Done{ran,retire_unknown})=>{
-                    if current["agentToken"].as_str().is_some_and(|token| !token.is_empty() && token != m.plan.epoch) {
+                    let current_typed = crate::conversation_state::Conversation::from_value(&current);
+                    if current_typed.as_ref().and_then(|c| c.token()).is_some_and(|token| token != m.plan.epoch) {
                         crate::session_rotation::recovery_complete(&self.context,&key);
                         continue;
                     }
@@ -3704,7 +3736,9 @@ impl Hub {
                     // Unverifiable work must lose its old token before queued ingress can
                     // use a fresh session, even when the old DSH cancel route is broken.
                     let guard=if retire_unknown {current} else {m.plan.guard.clone()};
-                    if retire_unknown && guard["agentToken"].as_str()!=Some(m.plan.epoch.as_str()) {continue;}
+                    let guard_token = crate::conversation_state::Conversation::from_value(&guard)
+                        .and_then(|c| c.token().map(str::to_string));
+                    if retire_unknown && guard_token.as_deref().unwrap_or("") != m.plan.epoch.as_str() {continue;}
                     let retired=console::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
                     if retired.is_err() || (retire_unknown && !retired.as_ref().is_ok_and(|token|token.is_some())) {
                         if retired.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");}
@@ -3798,12 +3832,14 @@ impl Hub {
             // Never compare a newly published token against tick's earlier snapshot.
             // A second owned rotation can finish before this lock is acquired.
             (state, _) = self.observe_turn_epoch(&key)?;
-            let predicate = if suspended || state["paused"] == true { "suspended" }
+            let doc = crate::conversation_state::SocialDocument::from_value(state.clone())
+                .map_err(|(_, e)| e)?;
+            let predicate = if suspended || doc.paused() { "suspended" }
                 else if !self.taken(&key) { "notTaken" }
                 else if !console::inbound_admitted(&cfg, &key) { "notAllowed" }
-                else if state["conversations"].get(key.as_str()).is_none() { "missing" }
+                else if !doc.has_conversation(key.as_str()) { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
-                    old.as_str() != state["conversations"][&key]["agentToken"].as_str().unwrap_or("")
+                    old.as_str() != doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).unwrap_or_default()
                 }) { "tokenChanged" }
                 else { continue; };
             invalid.push((key, predicate));
@@ -3874,7 +3910,11 @@ impl Hub {
             d.refresh_observed_state(conv, now);
             self.tokens
                 .entry(key.clone())
-                .or_insert_with(|| conv["agentToken"].as_str().unwrap_or("").to_string());
+                .or_insert_with(|| {
+                    crate::conversation_state::Conversation::from_value(conv)
+                        .and_then(|c| c.token().map(str::to_string))
+                        .unwrap_or_default()
+                });
             d.arm_proactive_now(now);
             d.sched.prompt_running = self.active.contains_key(key) || self.recovered.contains_key(key) || self.maintenance.contains_key(key);
         }
@@ -3900,8 +3940,12 @@ impl Hub {
                 && active.reason != "wakeReminder" && active.previous["wakeConfig"]["sleepUntil"].is_string()
             {
                 // A wake refused at the gate never got to consume its durable timer claim.
-                let token = state["conversations"][&key]["agentToken"].as_str().unwrap_or_default();
-                console::consume_reserved2_deadline(&self.context, &key, token, active.at, &active.previous)?;
+                let token = crate::conversation_state::SocialDocument::from_value(state.clone())
+                    .ok()
+                    .and_then(|doc| doc.conversation(&key))
+                    .and_then(|c| c.token().map(str::to_string))
+                    .unwrap_or_default();
+                console::consume_reserved2_deadline(&self.context, &key, &token, active.at, &active.previous)?;
             }
             let active = self.active.remove(&key).unwrap();
             let admitted_token = active.admitted_token();
@@ -4167,8 +4211,15 @@ impl Hub {
                 // was queued (revoke and re-grant while it waited).
                 let expected = self.tokens.get(&key).filter(|t| !t.is_empty()).cloned();
                 let (previous, dispatch_token) = if reason == "wakeReminder" {
-                    let conv = self.state()?["conversations"][&key].clone();
-                    let token = conv["agentToken"].as_str().unwrap_or("").to_string();
+                    let conv_typed = self.state_doc()?.conversation(&key);
+                    let token = conv_typed
+                        .as_ref()
+                        .and_then(|c| c.token())
+                        .unwrap_or("")
+                        .to_string();
+                    let conv = conv_typed
+                        .map(|c| c.to_value())
+                        .unwrap_or(Value::Null);
                     if expected.as_ref().is_some_and(|t| *t != token) {
                         return Err(STALE_WAKE.to_string());
                     }

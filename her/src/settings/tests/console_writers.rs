@@ -118,7 +118,7 @@ fn settings_writers_take_the_configuration_gate_before_the_store_gate() {
     // authority, the chat tools' `memory_actions::handle`) and takes the store gate inside it. The settings module
     // never takes the configuration gate, so no writer holds the store gate while it waits for the configuration gate.
     for (file, source) in SETTINGS_SOURCES {
-        for needle in ["acquire_social_state_gate", "config_gate("] {
+        for needle in ["acquire_social_state_gate", "config_gate(", "conversation_state::acquire"] {
             assert!(!source.contains(needle), "{file} takes the configuration gate ({needle})");
         }
     }

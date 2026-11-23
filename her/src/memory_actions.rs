@@ -91,7 +91,7 @@ fn handle_inner(
     // Serialize with session reset/token rotation, and re-read configuration after waiting.
     // SQLite writers and ACL revocation below share this gate with MCP calls.
     let _gate = if context.is_isolated() {
-        Some(crate::console::acquire_social_state_gate(context)?)
+        Some(crate::conversation_state::acquire(context)?)
     } else {
         None
     };
@@ -221,8 +221,12 @@ fn handle_inner(
             let out = if let Some(message_id) = b.get("messageId") {
                 let message_id = message_id.as_str().filter(|id| !id.is_empty())
                     .ok_or((400, "messageId 无效".to_string()))?;
-                let conversation = authority::conversation(context, &key).map_err(unavailable)?
-                    .unwrap_or_default();
+                let conversation = crate::conversation_state::ConversationState::for_runtime(context)
+                    .read(&key)
+                    .map_err(|(_, e)| e)
+                    .map_err(unavailable)?
+                    .map(|c| c.to_value())
+                    .unwrap_or_else(|| json!({}));
                 let message = verified_message(&conversation, &key, message_id, &content)
                     .ok_or((400, "内容必须与本会话的原消息一致".to_string()))?;
                 reader.write_message(message, supersedes).map_err(write_failed)?
@@ -294,7 +298,12 @@ fn handle_inner(
             // 否则"预览"和"实际注入"会慢慢走偏，而这个接口的全部意义就是验证后者。
             // 传的是**该会话的** state（同提示词那条链），不是根 state ——
             // 传错会让 recall 拿不到 unread/recentMessages，检索词为空，第一层直接空掉。
-            let conv = authority::conversation(context, &key).map_err(unavailable)?.unwrap_or_else(|| json!({}));
+            let conv = crate::conversation_state::ConversationState::for_runtime(context)
+                .read(&key)
+                .map_err(|(_, e)| e)
+                .map_err(unavailable)?
+                .map(|c| c.to_value())
+                .unwrap_or_else(|| json!({}));
             let block = crate::prompt::recall_block_with_runtime(context, cfg, &conv, &key);
             Ok(json!({ "ok": true, "chars": block.encode_utf16().count(), "block": block }))
         }

@@ -27,10 +27,10 @@ type Failure = (u16, String);
 
 /// Checked by every write before the library lock is taken; the returned guard is held until the
 /// write commits (the console: configuration gate + fresh credential; `/persona`: gate + fresh owner).
-pub type Authority<'a> = &'a dyn Fn() -> Result<Option<std::fs::File>, (u16, String)>;
+pub type Authority<'a> = &'a dyn Fn() -> Result<Option<crate::conversation_state::Gate>, (u16, String)>;
 
 #[cfg(test)]
-pub(crate) fn open_authority() -> Result<Option<std::fs::File>, (u16, String)> {
+pub(crate) fn open_authority() -> Result<Option<crate::conversation_state::Gate>, (u16, String)> {
     Ok(None)
 }
 
@@ -488,8 +488,7 @@ pub fn assign(context: &RuntimeContext, body: &Value, authority: Authority<'_>) 
 /// memory and history stay. Without a mapped session the next wake starts a fresh one anyway.
 pub(crate) fn rebrief(context: &RuntimeContext, key: &str) -> Result<bool, String> {
     let Some(sid) = crate::session_map::lookup(context, key)? else { return Ok(false) };
-    let state = context.read_social_state()?;
-    let Some(epoch) = state["conversations"][key]["agentToken"].as_str().map(str::to_string) else { return Ok(false) };
+    let Some(epoch) = crate::conversation_state::read_agent_token(context, key)? else { return Ok(false) };
     crate::session_map::update_context(context, key, &sid, &epoch, crate::briefing_delivery::next_generation)
 }
 
@@ -668,7 +667,7 @@ mod tests {
     #[test]
     fn persona_writes_commit_only_while_the_authority_holds() {
         let (root, context) = fixture("authority");
-        let revoked = || -> Result<Option<std::fs::File>, (u16, String)> { Err((401, "console credential was revoked".to_string())) };
+        let revoked = || Err((401, "console credential was revoked".to_string()));
         assert_eq!(super::create(&context, &json!({"name": "甲", "core": "核心。"}), &revoked).unwrap_err().0, 401);
         let revoked_context = crate::console_front::revoked_admin_context(&context);
         let (status, _, body) = crate::console_persona::route(

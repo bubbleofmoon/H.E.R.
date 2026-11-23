@@ -261,7 +261,7 @@ fn wake(caller: front::AdminCaller<'_>, cfg: &Value, key: &str, reason: &str) ->
 fn set_sleep(caller: front::AdminCaller<'_>, key: &str, fields: Option<&serde_json::Map<String, Value>>) -> Reply {
     let context = caller.context();
     drop(caller.gate()?);
-    mutate_social_state_for(context, |state| {
+    crate::conversation_state::ConversationState::for_runtime(context).update(key, |conv| {
         // Rechecked under the social-state gate: a rotation may have completed since the check above.
         let current = selected_config_for_handler(context)?;
         let until = fields.map(|fields| {
@@ -271,11 +271,10 @@ fn set_sleep(caller: front::AdminCaller<'_>, key: &str, fields: Option<&serde_js
             }
             Ok(at)
         }).transpose()?;
-        let conversation_wake = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(|c| c.get_mut("wakeConfig"))
+        let mut conversation_wake = conv
+            .field("wakeConfig")
             .filter(|w| w.is_object())
+            .cloned()
             .ok_or((404, "该会话没有唤醒配置".to_string()))?;
         if conversation_wake.get("infinite").and_then(Value::as_bool) == Some(true) || !conversation_wake.get("sleepUntil").is_some_and(Value::is_string) {
             return Err((409, "该会话没有有限潜水".to_string()));
@@ -287,6 +286,7 @@ fn set_sleep(caller: front::AdminCaller<'_>, key: &str, fields: Option<&serde_js
                 conversation_wake["sleepUntil"] = Value::Null;
             }
         }
+        conv.set_field("wakeConfig", conversation_wake);
         Ok(())
     })?;
     Ok((200, json!({"ok": true, "id": format!("sleep:{key}")})))
