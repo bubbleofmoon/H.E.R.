@@ -821,6 +821,11 @@ fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair
     Ok((prepared, RestorePair { config, token: token.effective }))
 }
 
+enum FullPublication<'a> {
+    Forward(&'a Prepared),
+    Rollback(&'a RestorePair),
+}
+
 enum ReplaceMode<'a> {
     Forward {
         memory_only: bool,
