@@ -64,6 +64,11 @@ pub fn open_read_only_for_runtime(context: &RuntimeContext) -> Result<Connection
 /// Console, MCP, and other callers share path selection while retaining their existing connection
 /// settings and legacy override contract.
 pub fn open_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
+    let _restore_gate = crate::restore::writer_gate_shared(context)?;
+    open_for_runtime_unlocked(context)
+}
+
+fn open_for_runtime_unlocked(context: &RuntimeContext) -> Result<Connection, String> {
     let path = validated_db_path_for_runtime(context)?;
     if context.is_isolated() {
         Connection::open_with_flags(
@@ -80,14 +85,30 @@ pub fn open_for_runtime(context: &RuntimeContext) -> Result<Connection, String> 
 
 /// Open the selected runtime's database at the current memory schema version.
 pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, String> {
-    her_memory::prepare_connection(open_for_runtime(context)?)
+    let _restore_gate = crate::restore::writer_gate_shared(context)?;
+    her_memory::prepare_connection(open_for_runtime_unlocked(context)?)
+}
+
+/// Open the selected runtime's database at the current memory schema version, retaining the
+/// shared writer restore gate until the caller drops the returned guard.
+pub(crate) fn open_ready_guarded_for_runtime(
+    context: &RuntimeContext,
+) -> Result<(Connection, Option<std::fs::File>), String> {
+    let restore_gate = crate::restore::writer_gate_shared(context)?;
+    let conn = her_memory::prepare_connection(open_for_runtime_unlocked(context)?)?;
+    Ok((conn, restore_gate))
 }
 
 pub fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, String> {
-    MemoryStore::open_prepared(
-        open_for_runtime(context)?,
+    let restore_gate = crate::restore::writer_gate_shared(context)?;
+    let store = MemoryStore::open_prepared(
+        open_for_runtime_unlocked(context)?,
         crate::conversation_authority::owner_conversation(cfg),
-    )
+    )?;
+    Ok(match restore_gate {
+        Some(guard) => store.with_guard(guard),
+        None => store,
+    })
 }
 
 #[cfg(test)]

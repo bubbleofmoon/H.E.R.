@@ -88,6 +88,16 @@ fn handle_inner(
     capability: ConsoleCapability,
     browser_acl: Option<BrowserAcl>,
 ) -> Result<Value, (u16, String)> {
+    // Block/defer unstopped memory.db and chat-tool settings.db/config.json writers during an
+    // active restore before acquiring the social/configuration gate.
+    let _restore_gate =
+        if context.is_isolated() && (browser_acl.is_some() || action != "settings-get") {
+            Some(
+                crate::restore::writer_gate_shared(context).map_err(|error| (503, error))?,
+            )
+        } else {
+            None
+        };
     // Serialize with session reset/token rotation, and re-read configuration after waiting.
     // SQLite writers and ACL revocation below share this gate with MCP calls.
     let _gate = if context.is_isolated() {
