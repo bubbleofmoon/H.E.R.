@@ -414,12 +414,14 @@ fn crate_identity_equal(a: &str, b: &str) -> bool {
 pub fn launch(root: &InstallRoot, target: &str, old: &ProcessIdentity) -> Result<u32, String> {
     launch_mode(root, target, old, false, false)
 }
-pub fn launch_automatic(
+pub fn launch_with_gate(
     root: &InstallRoot,
     target: &str,
     old: &ProcessIdentity,
+    automatic: bool,
+    gate: fs::File,
 ) -> Result<u32, String> {
-    launch_mode(root, target, old, false, true)
+    launch_mode_with_gate(root, target, old, false, automatic, gate)
 }
 pub fn launch_recovery(
     root: &InstallRoot,
@@ -435,10 +437,20 @@ fn launch_mode(
     recovery: bool,
     automatic: bool,
 ) -> Result<u32, String> {
-    use std::process::Stdio;
     let gate = release_store::installation_gate(
         &root.root().join("runtime/data/locks/update-restore.lock"),
     )?;
+    launch_mode_with_gate(root, target, old, recovery, automatic, gate)
+}
+fn launch_mode_with_gate(
+    root: &InstallRoot,
+    target: &str,
+    old: &ProcessIdentity,
+    recovery: bool,
+    automatic: bool,
+    gate: fs::File,
+) -> Result<u32, String> {
+    use std::process::Stdio;
     // Publish exactly the helper bytes that were verified; never reread the file.
     let bytes = if recovery {
         let (current, last_good, _) = startup_selection(root)?;

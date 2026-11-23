@@ -1088,20 +1088,22 @@ impl RuntimeContext {
             let target = self
                 .resolve_path(area, to, PathIntent::WriteFile)
                 .map_err(str::to_string)?;
-            if target.exists() {
-                return Err("runtime destination already exists".to_string());
+            if self.resolve_path(area, from, PathIntent::ReadFile).map_err(str::to_string)? != source
+                || self.resolve_path(area, to, PathIntent::WriteFile).map_err(str::to_string)? != target
+            {
+                return Err("runtime path is unavailable".to_string());
             }
             if let Some((ref expected_source, ref expected_target)) = expected_paths {
                 if &source != expected_source || &target != expected_target {
                     return Err("runtime path is unavailable".to_string());
                 }
             } else {
-                if self.resolve_path(area, from, PathIntent::ReadFile).map_err(str::to_string)? != source
-                    || self.resolve_path(area, to, PathIntent::WriteFile).map_err(str::to_string)? != target
-                {
-                    return Err("runtime path is unavailable".to_string());
-                }
                 expected_paths = Some((source.clone(), target.clone()));
+            }
+            match fs::symlink_metadata(&target) {
+                Ok(_) => return Err("runtime destination already exists".to_string()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("cannot inspect runtime destination: {error}")),
             }
             match fs::rename(&source, &target) {
                 Ok(()) => return Ok(()),

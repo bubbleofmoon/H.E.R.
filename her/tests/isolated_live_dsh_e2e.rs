@@ -1699,7 +1699,6 @@ fn serve_failing_dsh(
             Err(error) if error.contains("timed out") => continue,
             Err(error) => return Err(error),
         };
-        let _ = stream.set_nonblocking(false);
         // A connection that never sends a byte (the bridge closes a reconnect in flight at exit)
         // carries no request; skip it instead of failing the whole fixture.
         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
