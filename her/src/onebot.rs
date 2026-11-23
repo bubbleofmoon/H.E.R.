@@ -248,7 +248,9 @@ pub(crate) fn classify_send_reply(http_status: u16, raw: &str) -> Result<serde_j
 /// OneBot HTTP 客户端。
 #[derive(Clone)]
 pub struct OneBot {
+    #[cfg(test)]
     host: String,
+    #[cfg(test)]
     port: u16,
     token: String,
     endpoint: Option<crate::loopback_http::LoopbackEndpoint>,
@@ -376,37 +378,32 @@ mod voice_send_tests {
 impl OneBot {
     pub fn new(http_url: &str, token: String) -> Self {
         let base = http_url.trim_end_matches('/');
-        if let Ok(ep) = crate::loopback_http::LoopbackEndpoint::parse(base) {
-            return Self {
-                host: ep.host().to_string(),
-                port: ep.port(),
-                token,
-                endpoint: Some(ep),
-                strict: false,
-                transport: std::sync::Arc::new(crate::loopback_http::TcpTransport),
-            };
-        }
-        let host = base
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .unwrap_or("127.0.0.1")
-            .split(':')
-            .next()
-            .unwrap_or("127.0.0.1")
-            .to_string();
-        let port = base
-            .trim_start_matches("http://")
-            .split('/')
-            .next()
-            .and_then(|hp| hp.split(':').nth(1))
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(3000);
+        let endpoint = crate::loopback_http::LoopbackEndpoint::parse(base).ok();
+        #[cfg(test)]
+        let (host, port) = match &endpoint {
+            Some(ep) => (ep.host().to_string(), ep.port()),
+            None => {
+                let authority = base
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or("127.0.0.1");
+                let host = authority.split(':').next().unwrap_or("127.0.0.1").to_string();
+                let port = authority
+                    .split(':')
+                    .nth(1)
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(3000);
+                (host, port)
+            }
+        };
         Self {
+            #[cfg(test)]
             host,
+            #[cfg(test)]
             port,
             token,
-            endpoint: None,
+            endpoint,
             strict: false,
             transport: std::sync::Arc::new(crate::loopback_http::TcpTransport),
         }
@@ -453,7 +450,9 @@ impl OneBot {
         transport: std::sync::Arc<dyn crate::loopback_http::Transport>,
     ) -> Self {
         Self {
+            #[cfg(test)]
             host: ep.host().to_string(),
+            #[cfg(test)]
             port: ep.port(),
             token,
             endpoint: Some(ep),
@@ -644,19 +643,8 @@ impl OneBot {
         deadlines: crate::loopback_http::Deadlines,
         limits: crate::loopback_http::ResponseLimits,
     ) -> Result<crate::loopback_http::HttpResponse, crate::loopback_http::HttpError> {
-        let endpoint = self.require_endpoint()?;
-        let auth = self.bearer_header();
-        let mut headers = vec![("Content-Type", "application/json")];
-        if let Some(auth) = auth.as_deref() {
-            headers.push(("Authorization", auth));
-        }
-        let req = crate::loopback_http::HttpRequest {
-            method: "POST",
-            path,
-            headers: &headers,
-            body: Some(body.as_bytes()),
-        };
-        crate::loopback_http::request(&*self.transport, endpoint, &req, deadlines, limits)
+        self.transmit_http("POST", path, Some(body.as_bytes()), deadlines)?
+            .read(limits)
     }
 
     pub(crate) fn get_raw_path(
@@ -665,28 +653,16 @@ impl OneBot {
         timeout: std::time::Duration,
         max_body_bytes: usize,
     ) -> Result<crate::loopback_http::HttpResponse, crate::loopback_http::HttpError> {
-        let endpoint = self.require_endpoint()?;
-        let auth = self.bearer_header();
-        let mut headers = Vec::new();
-        if let Some(auth) = auth.as_deref() {
-            headers.push(("Authorization", auth));
-        }
-        let req = crate::loopback_http::HttpRequest {
-            method: "GET",
+        self.transmit_http(
+            "GET",
             path,
-            headers: &headers,
-            body: None,
-        };
-        crate::loopback_http::request(
-            &*self.transport,
-            endpoint,
-            &req,
+            None,
             crate::loopback_http::Deadlines::with_shared_transmit(
                 std::time::Duration::from_secs(10),
                 timeout,
             ),
-            crate::loopback_http::ResponseLimits::new(max_body_bytes),
-        )
+        )?
+        .read(crate::loopback_http::ResponseLimits::new(max_body_bytes))
     }
 
     fn transmit_raw(
@@ -694,28 +670,41 @@ impl OneBot {
         path: &str,
         body: &str,
     ) -> Result<crate::loopback_http::PendingHttpResponse, crate::loopback_http::HttpError> {
-        let endpoint = self.require_endpoint()?;
-        let auth = self.bearer_header();
-        let mut headers = vec![("Content-Type", "application/json")];
-        if let Some(auth) = auth.as_deref() {
-            headers.push(("Authorization", auth));
-        }
-        let req = crate::loopback_http::HttpRequest {
-            method: "POST",
+        self.transmit_http(
+            "POST",
             path,
-            headers: &headers,
-            body: Some(body.as_bytes()),
-        };
-        crate::loopback_http::transmit(
-            &*self.transport,
-            endpoint,
-            &req,
+            Some(body.as_bytes()),
             crate::loopback_http::Deadlines::split(
                 crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
                 crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
                 crate::loopback_http::DEFAULT_READ_TIMEOUT,
             ),
         )
+    }
+
+    fn transmit_http(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        deadlines: crate::loopback_http::Deadlines,
+    ) -> Result<crate::loopback_http::PendingHttpResponse, crate::loopback_http::HttpError> {
+        let endpoint = self.require_endpoint()?;
+        let auth = self.bearer_header();
+        let mut headers = Vec::new();
+        if body.is_some() {
+            headers.push(("Content-Type", "application/json"));
+        }
+        if let Some(auth) = auth.as_deref() {
+            headers.push(("Authorization", auth));
+        }
+        let req = crate::loopback_http::HttpRequest {
+            method,
+            path,
+            headers: &headers,
+            body,
+        };
+        crate::loopback_http::transmit(&*self.transport, endpoint, &req, deadlines)
     }
 
     fn require_endpoint(&self) -> Result<&crate::loopback_http::LoopbackEndpoint, crate::loopback_http::HttpError> {

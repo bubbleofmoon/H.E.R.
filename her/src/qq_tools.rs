@@ -128,11 +128,19 @@ pub fn registered_tools(cfg: &Value) -> Vec<Value> {
 
 // ----- HTTP plumbing --------------------------------------------------------------------------------------
 
-pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str) -> Result<String, String> {
-    let port = context.console_port().or_else(|| cfg["consolePort"].as_u64().and_then(|p| u16::try_from(p).ok())).ok_or("wake snapshot console port unavailable")?;
+fn post_wake_snapshot(
+    context: &RuntimeContext,
+    cfg: &Value,
+    body: Value,
+    label: &str,
+) -> Result<Value, String> {
+    let port = context
+        .console_port()
+        .or_else(|| cfg["consolePort"].as_u64().and_then(|p| u16::try_from(p).ok()))
+        .ok_or_else(|| format!("{label} console port unavailable"))?;
     let endpoint = crate::loopback_http::LoopbackEndpoint::localhost_v4(port)?;
     let console_token = context.effective_console_token(cfg);
-    let body = serde_json::json!({"key":key,"token":token,"turnId":turn}).to_string();
+    let body = body.to_string();
     let reply = crate::loopback_http::request(
         &crate::loopback_http::TcpTransport,
         &endpoint,
@@ -152,8 +160,21 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
         crate::loopback_http::ResponseLimits::new(crate::loopback_http::DEFAULT_MAX_BODY_BYTES),
     )
     .map_err(|err| err.to_qq_tools_message())?;
-    if reply.status != 200 { return Err(format!("wake snapshot refused: {}", reply.status)); }
-    let (packet, _) = reply.parse_json::<Value>(crate::loopback_http::JsonSurrogates::Strict)?;
+    if reply.status != 200 {
+        return Err(format!("{label} refused: {}", reply.status));
+    }
+    reply
+        .parse_json::<Value>(crate::loopback_http::JsonSurrogates::Strict)
+        .map(|(packet, _)| packet)
+}
+
+pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str) -> Result<String, String> {
+    let packet = post_wake_snapshot(
+        context,
+        cfg,
+        serde_json::json!({"key": key, "token": token, "turnId": turn}),
+        "wake snapshot",
+    )?;
     if packet.is_null() { return Ok(String::new()); }
     let delivery_cfg = crate::model_view::with_blacklist(context, cfg);
     let packet = crate::model_view::strip_model_chat_data(&packet, &delivery_cfg);
@@ -164,31 +185,12 @@ pub(crate) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, to
 
 /// Query only positive urgent-message delivery evidence; never grant new receipts.
 pub(crate) fn wake_delivered_urgent(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, turn: &str) -> Result<Vec<i64>, String> {
-    let port = context.console_port().or_else(|| cfg["consolePort"].as_u64().and_then(|p|u16::try_from(p).ok())).ok_or("wake evidence console port unavailable")?;
-    let endpoint = crate::loopback_http::LoopbackEndpoint::localhost_v4(port)?;
-    let console_token = context.effective_console_token(cfg);
-    let body = serde_json::json!({"key":key,"token":token,"turnId":turn,"readOnly":true}).to_string();
-    let reply = crate::loopback_http::request(
-        &crate::loopback_http::TcpTransport,
-        &endpoint,
-        &crate::loopback_http::HttpRequest {
-            method: "POST",
-            path: "/api/socialV2/wake-snapshot",
-            headers: &[
-                ("x-console-token", console_token.as_str()),
-                ("Content-Type", "application/json"),
-            ],
-            body: Some(body.as_bytes()),
-        },
-        crate::loopback_http::Deadlines::with_shared_transmit(
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_secs(5),
-        ),
-        crate::loopback_http::ResponseLimits::new(crate::loopback_http::DEFAULT_MAX_BODY_BYTES),
-    )
-    .map_err(|err| err.to_qq_tools_message())?;
-    if reply.status != 200 { return Err(format!("wake evidence refused: {}",reply.status)); }
-    let (packet, _) = reply.parse_json::<Value>(crate::loopback_http::JsonSurrogates::Strict)?;
+    let packet = post_wake_snapshot(
+        context,
+        cfg,
+        serde_json::json!({"key": key, "token": token, "turnId": turn, "readOnly": true}),
+        "wake evidence",
+    )?;
     serde_json::from_value(packet["urgentDeliveredSeqs"].clone()).map_err(|e|e.to_string())
 }
 
@@ -222,7 +224,6 @@ fn onebot_for_tools(context: &RuntimeContext, cfg: &Value) -> Result<crate::oneb
             .and_then(|u| u.as_str())
             .unwrap_or("http://127.0.0.1:3000")
             .trim_end_matches('/')
-            .to_string()
     };
     let token = cfg
         .get("snowluma")
@@ -230,7 +231,7 @@ fn onebot_for_tools(context: &RuntimeContext, cfg: &Value) -> Result<crate::oneb
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
-    crate::onebot::OneBot::try_new_url(&url, token).map_err(|_| {
+    crate::onebot::OneBot::try_new_url(url, token).map_err(|_| {
         if context.is_isolated() {
             "isolated runtime OneBot dependency is invalid".to_string()
         } else {

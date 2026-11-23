@@ -12,7 +12,6 @@ pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const DEFAULT_MAX_HEAD_BYTES: usize = 16 * 1024;
 pub(crate) const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-const CHUNK_FRAMING_SLACK_BYTES: usize = 16 * 1024;
 const MAX_CHUNK_SIZE_LINE_BYTES: usize = 1024;
 const MAX_TRAILER_BYTES: usize = 16 * 1024;
 const MAX_SOCKET_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -289,16 +288,7 @@ impl HttpResponse {
         surrogates: JsonSurrogates,
     ) -> Result<(T, bool), String> {
         let text = self.body_utf8()?;
-        match surrogates {
-            JsonSurrogates::Strict => serde_json::from_str::<T>(text)
-                .map(|value| (value, false))
-                .map_err(|error| format!("response is not JSON: {error}")),
-            JsonSurrogates::ReplaceLoneWithFffd => {
-                crate::aux_text::parse_json_replacing_lone_surrogates::<T>(text)
-                    .map(|(value, repaired)| (value, repaired.is_some()))
-                    .map_err(|error| format!("response is not JSON: {error}"))
-            }
-        }
+        parse_json_text(text, surrogates).map_err(|error| format!("response is not JSON: {error}"))
     }
 
     pub(crate) fn parse_json_lossy<T: DeserializeOwned>(
@@ -306,12 +296,19 @@ impl HttpResponse {
         surrogates: JsonSurrogates,
     ) -> Result<(T, bool), serde_json::Error> {
         let text = self.body_lossy();
-        match surrogates {
-            JsonSurrogates::Strict => serde_json::from_str::<T>(&text).map(|value| (value, false)),
-            JsonSurrogates::ReplaceLoneWithFffd => {
-                crate::aux_text::parse_json_replacing_lone_surrogates::<T>(&text)
-                    .map(|(value, repaired)| (value, repaired.is_some()))
-            }
+        parse_json_text(&text, surrogates)
+    }
+}
+
+fn parse_json_text<T: DeserializeOwned>(
+    text: &str,
+    surrogates: JsonSurrogates,
+) -> Result<(T, bool), serde_json::Error> {
+    match surrogates {
+        JsonSurrogates::Strict => serde_json::from_str::<T>(text).map(|value| (value, false)),
+        JsonSurrogates::ReplaceLoneWithFffd => {
+            crate::aux_text::parse_json_replacing_lone_surrogates::<T>(text)
+                .map(|(value, repaired)| (value, repaired.is_some()))
         }
     }
 }
@@ -762,14 +759,6 @@ fn read_chunked_body(
     initial: &[u8],
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, HttpError> {
-    let max_wire_body = max_body_bytes.saturating_add(CHUNK_FRAMING_SLACK_BYTES);
-    let mut wire_bytes_seen = initial.len();
-    if wire_bytes_seen > max_wire_body {
-        return Err(HttpError::unknown(
-            false,
-            "read response: chunked wire size exceeds limit",
-        ));
-    }
     let mut buf = initial.to_vec();
     let mut pos = 0usize;
     let mut decoded = Vec::new();
@@ -895,13 +884,6 @@ fn read_chunked_body(
             return Err(HttpError::unknown(
                 false,
                 "read response: truncated chunked body",
-            ));
-        }
-        wire_bytes_seen = wire_bytes_seen.saturating_add(n);
-        if wire_bytes_seen > max_wire_body {
-            return Err(HttpError::unknown(
-                false,
-                "read response: chunked wire size exceeds limit",
             ));
         }
         buf.extend_from_slice(&block[..n]);
@@ -1240,6 +1222,30 @@ mod tests {
         let err = request(&t4, &ep, &req, deadlines, ResponseLimits::new(10)).unwrap_err();
         assert_eq!(err.status, CommitStatus::Unknown);
         assert!(err.detail.contains("exceeds limit"), "{}", err.detail);
+
+        // Many small valid chunks (>16 KiB wire framing) succeed when decoded payload fits max_body_bytes.
+        let mut many_chunks = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for _ in 0..4000 {
+            many_chunks.extend_from_slice(b"1\r\na\r\n");
+        }
+        many_chunks.extend_from_slice(b"0\r\n\r\n");
+        let t5 = MemoryTransport::new(vec![Step::Stream(ScriptedStreamConfig::reply_bytes(
+            many_chunks,
+        ))]);
+        let ok = request(&t5, &ep, &req, deadlines, ResponseLimits::new(4096)).unwrap();
+        assert_eq!(ok.body.len(), 4000);
+
+        // Oversized chunk trailers (> 16 KiB) are rejected.
+        let big_trailer = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX-Big: {}\r\n\r\n",
+            "t".repeat(17 * 1024)
+        );
+        let t6 = MemoryTransport::new(vec![Step::Stream(ScriptedStreamConfig::reply_bytes(
+            big_trailer.into_bytes(),
+        ))]);
+        let err = request(&t6, &ep, &req, deadlines, ResponseLimits::new(4096)).unwrap_err();
+        assert_eq!(err.status, CommitStatus::Unknown);
+        assert!(err.detail.contains("trailers exceed"), "{}", err.detail);
     }
 
     #[test]

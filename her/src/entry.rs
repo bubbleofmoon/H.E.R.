@@ -1943,7 +1943,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             .map_err(|_| "isolated runtime requires a valid loopback OneBot HTTP endpoint")?
     } else {
         onebot::OneBot::try_new_url(http_base.trim_end_matches('/'), http_token.clone())
-            .unwrap_or_else(|_| onebot::OneBot::new(&http_base, http_token.clone()))
+            .map_err(|error| format!("live runtime requires a valid loopback OneBot HTTP endpoint: {error}"))?
     };
 
     // 断线缺口与重放（ticket 07）。每次（重）连接：先按网关历史能力补收未解决的缺口，
