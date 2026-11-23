@@ -959,6 +959,73 @@ fn prepare_live_pipeline(
     }
 }
 
+fn prepare_live_startup(
+    context: &runtime::RuntimeContext,
+    cfg_raw: &Value,
+    live_mode: bool,
+) -> Result<(Vec<String>, bool, Option<pipeline::Pipeline>), Box<dyn std::error::Error>> {
+    let live_groups = std::env::args()
+        .position(|arg| arg == "--live-groups")
+        .and_then(|index| std::env::args().nth(index + 1));
+    let live_groups = parse_live_groups(live_groups.as_deref());
+    if let Some(missing) = if live_mode { rollout_mismatch(cfg_raw, &live_groups) } else { None } {
+        println!("[her] ❌ 灰度配置不一致，拒绝启动：");
+        println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
+        println!("           命令行 --live-groups = {live_groups:?}");
+        println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
+        println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
+        std::process::exit(2);
+    }
+    let live_all = std::env::args().any(|a| a == "--live-all");
+    let pipeline = prepare_live_pipeline(context, cfg_raw, live_mode, &live_groups, live_all)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    Ok((live_groups, live_all, pipeline))
+}
+
+fn publish_live_heartbeat(
+    context: &runtime::RuntimeContext,
+    name: &str,
+    groups: &[String],
+    gateway_connected: bool,
+) {
+    let state = if gateway_connected {
+        "ready"
+    } else {
+        "waiting-for-gateway"
+    };
+    let payload = json!({
+        "ts": now_ms(),
+        "pid": std::process::id(),
+        "live": !groups.is_empty(),
+        "groups": groups,
+        "state": state,
+        "gatewayConnected": gateway_connected,
+    });
+    if context.is_isolated() {
+        let _ = context.write_atomic(
+            runtime::RuntimeArea::Data,
+            name,
+            payload.to_string().as_bytes(),
+        );
+    } else {
+        let _ = std::fs::write(
+            format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
+            payload.to_string(),
+        );
+    }
+}
+
+fn set_gateway_connected(tx: &tokio::sync::watch::Sender<bool>, ready: bool) {
+    tx.send_if_modified(|connected| {
+        if *connected == ready {
+            false
+        } else {
+            *connected = ready;
+            true
+        }
+    });
+}
+
 /// Feed one group message to the slang window and, when due, start an extraction in the background.
 fn feed_slang(learning: &slang_learn::SlangLearning, auto: bool, cfg_raw: &Value, key: &str, sender: &str, body: &str) {
     let feed = learning.try_feed_window(key, sender, body);
@@ -1787,36 +1854,49 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     // reconnects, and the refusals not recorded yet.
     let mut held: Vec<String> = Vec::new();
     let mut refusals = UnreadableRefusals::default();
+    // Validate local live state (rollout scope, session map, DSH credentials, dependencies)
+    // before publishing any heartbeat or contacting the gateway. Once local initialization
+    // succeeds, publish the waiting-for-gateway heartbeat immediately and spawn the single
+    // heartbeat task so a down gateway does not cause a supervisor startup kill.
+    let initial_startup = prepare_live_startup(&runtime_context, &cfg_raw, live_mode)?;
+    if !initial_startup.0.is_empty() {
+        println!("[her] 灰度接管：{:?}", initial_startup.0);
+    }
+    let heartbeat_name = if live_mode {
+        "rust-heartbeat-live.json"
+    } else {
+        "rust-heartbeat.json"
+    };
+    publish_live_heartbeat(&runtime_context, heartbeat_name, &initial_startup.0, false);
+    let (gateway_tx, mut gateway_rx) = tokio::sync::watch::channel(false);
+    {
+        let groups = initial_startup.0.clone();
+        let heartbeat_context = runtime_context.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    changed = gateway_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+                let connected = *gateway_rx.borrow_and_update();
+                publish_live_heartbeat(&heartbeat_context, heartbeat_name, &groups, connected);
+            }
+        });
+    }
+    let mut initial_startup = Some(initial_startup);
     'reconnect: loop {
         // Isolated startup validates all selected-root state before contacting its WebSocket.
         // Keep this inside the reconnect loop: a failed handshake drops this candidate pipeline,
         // and the next attempt repeats local validation before dialing again. The selected-root
         // gate is already held, so pipeline setup may create only its selected workspace folder.
-        let isolated_live_startup = if runtime_context.is_isolated() {
-            let live_groups = std::env::args()
-                .position(|arg| arg == "--live-groups")
-                .and_then(|index| std::env::args().nth(index + 1));
-            let live_groups = parse_live_groups(live_groups.as_deref());
-            if let Some(missing) = if live_mode { rollout_mismatch(&cfg_raw, &live_groups) } else { None } {
-                println!("[her] ❌ 灰度配置不一致，拒绝启动：");
-                println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
-                println!("           命令行 --live-groups = {live_groups:?}");
-                println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
-                println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
-                std::process::exit(2);
-            }
-            let live_all = std::env::args().any(|arg| arg == "--live-all");
-            let pipeline = prepare_live_pipeline(
-                &runtime_context,
-                &cfg_raw,
-                live_mode,
-                &live_groups,
-                live_all,
-            )
-            .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            Some((live_groups, live_all, pipeline))
+        let (live_groups, live_all, mut pipeline) = if let Some(prepared) = initial_startup.take() {
+            prepared
         } else {
-            None
+            prepare_live_startup(&runtime_context, &cfg_raw, live_mode)?
         };
 
         let mut request = ws.as_str().into_client_request()?;
@@ -1831,6 +1911,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 let mut wait = gateway_backoff.on_failure(dependency::jitter_unit(now_ms() as i64, u64::from(gateway_backoff.streak())));
                 println!("[her] 连接失败：{e}；{} 秒后重试（连续第 {} 次）", wait / 1000, gateway_backoff.streak());
                 gateway_health::with(|h| h.connected = false);
+                set_gateway_connected(&gateway_tx, false);
                 recovery_log::record(
                     &runtime_context,
                     run_record::Trigger::Timer,
@@ -1855,6 +1936,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     &mut ws, &mut token, &mut heal_http_token, &mut cfg_raw,
                 ).await {
                     wait = 500;
+                }
+                if lock_touched.elapsed().as_secs() >= 10 {
+                    let _ = lock.refresh(now_ms() as i64);
+                    lock_touched = std::time::Instant::now();
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                 continue 'reconnect;
@@ -1993,51 +2078,6 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         println!("[her] 重放已保存但未处理完的入站事件 {} 条", replay_queue.len());
     }
 
-    // 灰度：只接管列出来的会话（"group:123,private:456"）。空 = 不接管任何会话。
-    let (live_groups, live_all, mut pipeline) = match isolated_live_startup {
-        Some((live_groups, live_all, pipeline)) => {
-            if !live_groups.is_empty() {
-                println!("[her] 灰度接管：{live_groups:?}");
-            }
-            (live_groups, live_all, pipeline)
-        }
-        None => {
-    let live_groups = std::env::args()
-        .position(|arg| arg == "--live-groups")
-        .and_then(|index| std::env::args().nth(index + 1));
-    let live_groups = parse_live_groups(live_groups.as_deref());
-    if !live_groups.is_empty() {
-        println!("[her] 灰度接管：{live_groups:?}");
-    }
-    // 交接一致性：JS 的闸门是 `rollout.rustGroups`（配置文件），Rust 实际服务的是
-    // 命令行 `--live-groups`。两者不一致的后果是**静默失联**：
-    // JS 看到 rustGroups 就把这些会话的唤醒让给 Rust，而 Rust 没打算服务它们 ——
-    // 两边都不回，群里就是"机器人突然哑了"，而且没有任何报错。
-    //
-    // 所以发现不一致就**直接退出**：Rust 退出后心跳停更，JS 在 TTL 内自动收回这些会话，
-    // 最坏是短暂停顿。比起"永久哑掉直到有人发现"，这个失败方式好得多。
-    if let Some(missing) = if live_mode { rollout_mismatch(&cfg_raw, &live_groups) } else { None } {
-        println!("[her] ❌ 灰度配置不一致，拒绝启动：");
-        println!("           config.json 的 rollout.rustGroups 里有 {missing:?}");
-        println!("           命令行 --live-groups = {live_groups:?}");
-        println!("           这些会话会被 JS 让出、Rust 又不服务 —— 等于静默失联。");
-        println!("           要么把它们加到 --live-groups，要么从 rollout.rustGroups 里去掉。");
-        std::process::exit(2);
-    }
-    let live_all = std::env::args().any(|a| a == "--live-all");
-    // Do this before the heartbeat task starts. An isolated candidate that cannot load its own
-    // session/credentials/dependencies must exit without claiming the selected groups.
-    let pipeline = prepare_live_pipeline(
-        &runtime_context,
-        &cfg_raw,
-        live_mode,
-        &live_groups,
-        live_all,
-    )
-    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
-            (live_groups, live_all, pipeline)
-        }
-    };
     // 回合恢复（ticket 10）：先向 DSH 与发送账本核对上次中断的回合，再决定重放、等待还是暂停。
     if pipeline.is_some() {
         turn_recovery::spawn(runtime_context.clone());
@@ -2057,39 +2097,9 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         None
     };
-    // Publish the live heartbeat consumed by the Rust supervisor.
-    {
-        let groups = live_groups.clone();
-        let heartbeat_context = runtime_context.clone();
-        let name = if live_mode {
-            "rust-heartbeat-live.json"
-        } else {
-            "rust-heartbeat.json"
-        };
-        tokio::spawn(async move {
-            loop {
-                let payload = json!({
-                    "ts": now_ms(),
-                    "pid": std::process::id(),
-                    "live": !groups.is_empty(),
-                    "groups": groups,
-                });
-                if heartbeat_context.is_isolated() {
-                    let _ = heartbeat_context.write_atomic(
-                        runtime::RuntimeArea::Data,
-                        name,
-                        payload.to_string().as_bytes(),
-                    );
-                } else {
-                    let _ = std::fs::write(
-                        format!("{}/qq-bridge/state/{name}", crate::legacy_path!()),
-                        payload.to_string(),
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            }
-        });
-    }
+    // Transition the heartbeat state to ready now that the gateway connection and
+    // local recovery setup are active.
+    set_gateway_connected(&gateway_tx, true);
     // 每个会话最近几句，用来构造唤醒提示（完整版应该按 JS 的 buildWakePromptV2 来）
     let mut recent_by_key: HashMap<String, Vec<String>> = HashMap::new();
     // DSH 的完整提示也要看当前 Rust 进程收到的消息。与字符串版 CLI 窗口分开保存，
@@ -2979,6 +2989,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             break 'reconnect;
         }
         gateway_health::with(|h| h.connected = false);
+        set_gateway_connected(&gateway_tx, false);
         if got_traffic {
             gateway_backoff.on_traffic();
         }
@@ -3115,6 +3126,66 @@ mod tests {
             "candidate initialization failure must not create a live owner heartbeat"
         );
         assert!(!root.join("data/logs/rbridge-live.jsonl").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn publish_live_heartbeat_transitions_waiting_for_gateway_to_ready() {
+        let root = isolated_runtime_fixture("live-heartbeat-state");
+        let context = runtime::RuntimeContext::from_root(&root)
+            .unwrap()
+            .with_console_port(43112);
+        let groups = vec!["group:42".to_string()];
+        let marker = lifecycle::OwnerMarker {
+            v: lifecycle::FORMAT_VERSION,
+            role: "live".into(),
+            identity: lifecycle::ProcessIdentity {
+                pid: std::process::id(),
+                start: 1,
+                exe: "her".into(),
+            },
+            acquired_at: 0,
+            refreshed_at: 0,
+            groups: Some(groups.clone()),
+        };
+
+        publish_live_heartbeat(&context, "rust-heartbeat-live.json", &groups, false);
+        let waiting_bytes = std::fs::read(root.join("data/rust-heartbeat-live.json")).unwrap();
+        let waiting_json: Value = serde_json::from_slice(&waiting_bytes).unwrap();
+        assert_eq!(waiting_json["state"], "waiting-for-gateway");
+        assert_eq!(waiting_json["gatewayConnected"], false);
+        assert_eq!(waiting_json["live"], true);
+        assert_eq!(waiting_json["groups"], json!(["group:42"]));
+        assert_eq!(waiting_json["pid"], std::process::id());
+        assert_eq!(
+            watchdog::read_heartbeat_for_owner(
+                Ok(waiting_bytes),
+                Some(&marker),
+                now_ms() as i64,
+            ),
+            watchdog::Heartbeat::WaitingForGateway {
+                live: true,
+                groups: groups.clone(),
+            }
+        );
+
+        publish_live_heartbeat(&context, "rust-heartbeat-live.json", &groups, true);
+        let ready_bytes = std::fs::read(root.join("data/rust-heartbeat-live.json")).unwrap();
+        let ready_json: Value = serde_json::from_slice(&ready_bytes).unwrap();
+        assert_eq!(ready_json["state"], "ready");
+        assert_eq!(ready_json["gatewayConnected"], true);
+        assert_eq!(
+            watchdog::read_heartbeat_for_owner(
+                Ok(ready_bytes),
+                Some(&marker),
+                now_ms() as i64,
+            ),
+            watchdog::Heartbeat::Fresh {
+                live: true,
+                groups,
+            }
+        );
+
         std::fs::remove_dir_all(root).unwrap();
     }
 
