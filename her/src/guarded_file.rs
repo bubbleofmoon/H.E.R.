@@ -269,7 +269,7 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-fn transient(error: &io::Error) -> bool {
+pub(crate) fn transient(error: &io::Error) -> bool {
     cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 

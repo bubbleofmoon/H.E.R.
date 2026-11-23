@@ -214,6 +214,7 @@ fn restore_failure_waits_for_a_slow_administrator_notification_before_cli_exit()
                 other => panic!("failure alert did not reach the gateway: {other:?}"),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();

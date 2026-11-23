@@ -248,9 +248,15 @@ fn handle_release_approve(context: &RuntimeContext, req: &Request) -> Result<Val
     let tag = body["tag"]
         .as_str()
         .ok_or((400, "displayed release tag is required".into()))?;
-    let _gate = config_gate(context)?;
-    let cfg = selected_config_for_handler(context)?;
-    crate::release::approve(context, &cfg, tag).map_err(|error| (409, error))
+    crate::release::approve_authorized(context, tag, || {
+        let gate = config_gate(context)?;
+        let cfg = selected_config_for_handler(context)?;
+        Ok((gate, cfg))
+    })
+    .map_err(|error| match error {
+        crate::release::ApproveError::Release(message) => (409, message),
+        crate::release::ApproveError::Authorize(error) => error,
+    })
 }
 
 

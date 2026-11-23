@@ -220,12 +220,19 @@ pub fn handle_update_command(
         "准备更新 HER：{} → {tag}。",
         state["current"].as_str().unwrap_or("未知版本")
     ))?;
-    let _gate = crate::conversation_state::acquire(context).map_err(|(_, error)| error)?;
-    let latest = context.load_config().map_err(str::to_string)?;
-    if !is_owner_key(&latest, key) || owner_qq(&latest) != sender {
-        return Err("administrator changed".into());
-    }
-    crate::release::approve(context, &latest, tag).map(|_| ())
+    crate::release::approve_authorized_under_turn_guard(context, tag, || {
+        let gate = crate::conversation_state::acquire(context).map_err(|(_, error)| error)?;
+        let latest = context.load_config().map_err(str::to_string)?;
+        if !is_owner_key(&latest, key) || owner_qq(&latest) != sender {
+            return Err("administrator changed".into());
+        }
+        Ok((gate, latest))
+    })
+    .map(|_| ())
+    .map_err(|error| match error {
+        crate::release::ApproveError::Release(error)
+        | crate::release::ApproveError::Authorize(error) => error,
+    })
 }
 
 /// The /update reply when nothing can be approved: a discovery refusal or error is

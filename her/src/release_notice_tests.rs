@@ -283,6 +283,7 @@ fn notice_worker_child() {
                 .any(|line| line.contains("owner-alert-release-available") && line.contains(reason))
         });
         // Observe the completed poll, after any definite-refusal claim release.
+        wait(|| state()["notified"] == json!([]));
         let mut gate = None;
         wait(|| {
             gate = context
