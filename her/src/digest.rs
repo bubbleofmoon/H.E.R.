@@ -6,7 +6,7 @@ mod model;
 mod tests;
 
 pub(crate) use conversation::{Digest, DigestError, Limits, Outcome};
-pub(crate) use model::{model_for, DigestModel, ModelError};
+pub(crate) use model::{model_for, summarise_async, DigestModel, ModelError};
 use conversation::Hold;
 #[cfg(test)]
 pub(crate) use model::install_test_model;
@@ -60,9 +60,9 @@ fn check_min_messages(cfg: &Value) -> usize {
 }
 
 pub fn run(context: &RuntimeContext, def: &TaskDef, log: &mut RunHandle, cancel: &AtomicBool) -> Finish {
-    let current = match context.runtime_root().and_then(|root| RuntimeContext::from_root(root).ok()) {
-        Some(context) => context,
-        None => return failed("selected digest runtime unavailable"),
+    let current = match context.refreshed() {
+        Ok(context) => context,
+        Err(_) => return failed("selected digest runtime unavailable"),
     };
     let context = &current;
     // Once stop is observed, it stays in force for the whole job.

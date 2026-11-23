@@ -8,12 +8,12 @@
 //! denied term the chat it summarises does not name.
 use super::store::{History, Round};
 use super::{budget, check_bound, filter_model_messages, preview_tool_results, rotation, store, Failure, TurnRequest};
-use crate::digest::DigestModel;
 use crate::run_record::{Component, Outcome, Trigger};
 use crate::runtime::RuntimeContext;
 use genai::chat::{ChatMessage, ChatRole, ContentPart};
 use serde_json::{json, Value};
 use std::ops::Range;
+#[cfg(test)]
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -324,19 +324,21 @@ fn render(messages: &[ChatMessage]) -> String {
     lines.join("\n")
 }
 
-/// Sets its flag when dropped: a summary's walk sends nothing more once the summary has stopped waiting for it.
+/// Sets its flag when dropped: a summary's test fake sends nothing more once the summary has stopped waiting for it.
+#[cfg(test)]
 struct AbandonOnExit(Arc<AtomicBool>);
 
+#[cfg(test)]
 impl Drop for AbandonOnExit {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
     }
 }
 
-/// One summary of `transcript` from the digest's model port (`digest::model_for`: a route walk over `memory.digest.model`
-/// alone, else over the harness chain), bounded by `memory.digest.timeoutSecs` and by the turn's `deadline` less
-/// `SUMMARY_RESERVE`; the walk sends no request once this returns. The outer error ends the turn (cancellation); the
-/// inner one is the summary's content-free failure class, `timeout` when the deadline bound passes.
+/// One summary of `transcript` from the digest's model port (`digest::summarise_async`: a route walk over
+/// `memory.digest.model` alone, else over the harness chain), bounded by `memory.digest.timeoutSecs` and by the turn's
+/// `deadline` less `SUMMARY_RESERVE`; the walk stops at once on cancellation. The outer error ends the turn
+/// (cancellation); the inner one is the summary's content-free failure class, `timeout` when the deadline bound passes.
 pub(crate) async fn summarise_text(
     context: &RuntimeContext,
     cfg: &Value,
@@ -344,32 +346,47 @@ pub(crate) async fn summarise_text(
     cancelled: &mut watch::Receiver<bool>,
     deadline: tokio::time::Instant,
 ) -> Result<Result<String, &'static str>, Failure> {
-    let model = match crate::digest::model_for(context, cfg) {
-        Ok(model) => model,
-        Err(error) => return Ok(Err(error.0)),
-    };
     let bound = deadline.checked_sub(SUMMARY_RESERVE).unwrap_or_else(tokio::time::Instant::now);
-    // A summary whose bound has already passed is not sent: no provider call is made or billed for it.
+    #[cfg(test)]
+    if let Some(model) = context.test_one_shot(crate::harness::one_shot::Job::Digest) {
+        if tokio::time::Instant::now() >= bound {
+            return Ok(Err("timeout"));
+        }
+        let input = transcript.to_string();
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _abandon = AbandonOnExit(abandoned.clone());
+        let within = bound.saturating_duration_since(tokio::time::Instant::now());
+        let task = tokio::task::spawn_blocking(move || model.complete_within(SUMMARY_PROMPT, &input, within, &abandoned));
+        let joined = tokio::select! { biased;
+            _ = cancelled.changed() => return Err(Failure::Cancelled),
+            joined = tokio::time::timeout_at(bound, task) => joined,
+        };
+        return Ok(match joined {
+            Err(_elapsed) => Err("timeout"),
+            Ok(Err(_join)) => Err("worker"),
+            Ok(Ok(Ok(text))) => accept(transcript, &text),
+            Ok(Ok(Err(error))) => Err(error.0),
+        });
+    }
     if tokio::time::Instant::now() >= bound {
+        // Still check configuration before returning timeout so unconfigured runtimes report `unconfigured`.
+        if let Err(error) = crate::digest::model_for(context, cfg) {
+            return Ok(Err(error.0));
+        }
         return Ok(Err("timeout"));
     }
-    let input = transcript.to_string();
-    // The walk is abandoned however this returns: a cancelled or timed-out summary sends no further request, and an
-    // answer that comes after the cancellation or the bound is dropped.
-    let abandoned = Arc::new(AtomicBool::new(false));
-    let _abandon = AbandonOnExit(abandoned.clone());
     let within = bound.saturating_duration_since(tokio::time::Instant::now());
-    let task = tokio::task::spawn_blocking(move || model.complete_within(SUMMARY_PROMPT, &input, within, &abandoned));
-    let joined = tokio::select! { biased;
+    let mut cancel = super::routes::Cancellation::from_watch(cancelled.clone());
+    let result = tokio::select! { biased;
         _ = cancelled.changed() => return Err(Failure::Cancelled),
-        joined = tokio::time::timeout_at(bound, task) => joined,
+        result = tokio::time::timeout_at(bound, crate::digest::summarise_async(context, cfg, SUMMARY_PROMPT, transcript, within, &mut cancel)) => result,
     };
-    Ok(match joined {
-        Err(_elapsed) => Err("timeout"),
-        Ok(Err(_join)) => Err("worker"),
-        Ok(Ok(Ok(text))) => accept(transcript, &text),
-        Ok(Ok(Err(error))) => Err(error.0),
-    })
+    match result {
+        Err(_elapsed) => Ok(Err("timeout")),
+        Ok(Err(crate::digest::ModelError("cancelled"))) => Err(Failure::Cancelled),
+        Ok(Err(error)) => Ok(Err(error.0)),
+        Ok(Ok(text)) => Ok(accept(transcript, &text)),
+    }
 }
 
 /// A summary the history may carry: trimmed and not empty (`empty-response`), naming no #142 denied term
