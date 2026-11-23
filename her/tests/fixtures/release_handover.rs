@@ -920,6 +920,7 @@ impl UpdateGateway {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -1277,6 +1278,14 @@ fn auto_update_rechecks_a_turn_paused_during_trial_before_retirement() {
     );
     fixture.assert_healthy("v0.0.0");
     fixture.assert_adopted();
+    // Wait for the aborted auto-handover helper child to finish exiting and release
+    // update-restore.lock before sending manual approval on slow CI runners.
+    let lock_path = fixture.runtime().join("data/locks/update-restore.lock");
+    fixture.wait(|| match fs::OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(file) => file.try_lock().is_ok(),
+        Err(_) => false,
+    });
     // Manual approval retains its existing drain semantics: a durable pause
     // with no active pipeline does not veto the owner's explicit decision.
     let port = cfg["consolePort"].as_u64().unwrap() as u16;

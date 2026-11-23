@@ -757,7 +757,12 @@ fn spawn_dsh_server(
 fn accept_fixture(listener: &TcpListener, deadline: Instant) -> Result<TcpStream, String> {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return Ok(stream),
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .map_err(|error| format!("set fake HTTP stream blocking: {error}"))?;
+                return Ok(stream);
+            }
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.raw_os_error() == Some(10035) =>
@@ -847,6 +852,7 @@ fn serve_unused_model_endpoint(
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
+                let _ = stream.set_nonblocking(false);
                 count += 1;
                 let _ = send_sync_json(&mut stream, 404, &json!({"error":"unexpected model dependency request"}));
             }

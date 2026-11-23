@@ -1079,21 +1079,41 @@ impl RuntimeContext {
         from: &str,
         to: &str,
     ) -> Result<(), String> {
-        let source = self
-            .resolve_path(area, from, PathIntent::ReadFile)
-            .map_err(str::to_string)?;
-        let target = self
-            .resolve_path(area, to, PathIntent::WriteFile)
-            .map_err(str::to_string)?;
-        if target.exists() {
-            return Err("runtime destination already exists".to_string());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut expected_paths: Option<(PathBuf, PathBuf)> = None;
+        loop {
+            let source = self
+                .resolve_path(area, from, PathIntent::ReadFile)
+                .map_err(str::to_string)?;
+            let target = self
+                .resolve_path(area, to, PathIntent::WriteFile)
+                .map_err(str::to_string)?;
+            if target.exists() {
+                return Err("runtime destination already exists".to_string());
+            }
+            if let Some((ref expected_source, ref expected_target)) = expected_paths {
+                if &source != expected_source || &target != expected_target {
+                    return Err("runtime path is unavailable".to_string());
+                }
+            } else {
+                if self.resolve_path(area, from, PathIntent::ReadFile).map_err(str::to_string)? != source
+                    || self.resolve_path(area, to, PathIntent::WriteFile).map_err(str::to_string)? != target
+                {
+                    return Err("runtime path is unavailable".to_string());
+                }
+                expected_paths = Some((source.clone(), target.clone()));
+            }
+            match fs::rename(&source, &target) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if crate::guarded_file::transient(&error)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(format!("cannot rename runtime file: {error}")),
+            }
         }
-        if self.resolve_path(area, from, PathIntent::ReadFile).map_err(str::to_string)? != source
-            || self.resolve_path(area, to, PathIntent::WriteFile).map_err(str::to_string)? != target
-        {
-            return Err("runtime path is unavailable".to_string());
-        }
-        fs::rename(source, target).map_err(|e| format!("cannot rename runtime file: {e}"))
     }
 
     pub fn dependency_url(&self, name: &str) -> Option<&str> {
@@ -3060,6 +3080,48 @@ pub(crate) mod tests {
         }
         cleanup(&root);
         let _ = fs::remove_file(outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rename_file_retries_transient_sharing_hold_and_refuses_existing_destination() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = fixture_root("rename-transient-sharing");
+        let context = RuntimeContext::from_root(&root).unwrap();
+        context
+            .write_atomic(RuntimeArea::Data, "armed.json", b"{\"ok\":true}")
+            .unwrap();
+        let armed_path = root.join("data/armed.json");
+        let claimed_path = root.join("data/claimed.json");
+        let holder = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2)
+            .open(&armed_path)
+            .unwrap();
+        let direct = fs::rename(&armed_path, &claimed_path).unwrap_err();
+        assert!(crate::guarded_file::transient(&direct), "{direct:?}");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(holder);
+        });
+        context
+            .rename_file(RuntimeArea::Data, "armed.json", "claimed.json")
+            .unwrap();
+        release.join().unwrap();
+        assert!(!armed_path.exists());
+        assert_eq!(
+            context.read_text(RuntimeArea::Data, "claimed.json").unwrap(),
+            "{\"ok\":true}"
+        );
+
+        context
+            .write_atomic(RuntimeArea::Data, "armed.json", b"{\"second\":true}")
+            .unwrap();
+        let error = context
+            .rename_file(RuntimeArea::Data, "armed.json", "claimed.json")
+            .unwrap_err();
+        assert_eq!(error, "runtime destination already exists");
+        cleanup(&root);
     }
 }
 

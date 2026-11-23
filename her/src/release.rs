@@ -431,7 +431,10 @@ impl Default for CheckState {
     }
 }
 fn read_state(context: &RuntimeContext) -> Result<CheckState, String> {
-    let trust = cache_authority()?;
+    read_state_for(&InstallRoot::configured()?, context)
+}
+fn read_state_for(root: &InstallRoot, context: &RuntimeContext) -> Result<CheckState, String> {
+    let trust = cache_authority_for(root)?;
     let Some(text) = context
         .read_optional_text(crate::runtime::RuntimeArea::Data, "releases.json")
         .map_err(str::to_string)?
@@ -455,12 +458,19 @@ fn stamp_of(authority: &Result<crate::update::Authority, String>) -> String {
         .as_ref()
         .map_or_else(|_| REFUSED_STAMP.into(), |authority| authority.stamp.clone())
 }
-fn cache_authority() -> Result<String, String> {
-    Ok(stamp_of(&crate::update::authority(&InstallRoot::configured()?)))
+fn cache_authority_for(root: &InstallRoot) -> Result<String, String> {
+    Ok(stamp_of(&crate::update::authority(root)))
 }
 fn save_state(context: &RuntimeContext, state: &CheckState) -> Result<(), String> {
+    save_state_for(&InstallRoot::configured()?, context, state)
+}
+fn save_state_for(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    state: &CheckState,
+) -> Result<(), String> {
     // Never stamp decisions with authority newer than the one that verified them.
-    if state.trust != cache_authority()? {
+    if state.trust != cache_authority_for(root)? {
         return Err("current release changed during discovery".into());
     }
     context.write_atomic(
@@ -508,21 +518,65 @@ fn approval_installation(context: &RuntimeContext) -> Result<InstallRoot, String
     Ok(root)
 }
 
+const GATE_RETRY_WINDOW: Duration = Duration::from_millis(500);
+const GATE_RETRY_STEP: Duration = Duration::from_millis(20);
+
+fn retry_contended_gate<T>(
+    is_contended: impl Fn(&str) -> bool,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let deadline = Instant::now() + GATE_RETRY_WINDOW;
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_contended(&error) && Instant::now() < deadline => {
+                std::thread::sleep(GATE_RETRY_STEP);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Approval binds to the version displayed by discovery; it never silently chooses a newer tag.
+///
+/// Lock ordering: always acquire `runtime/data/locks/update-restore.lock` before
+/// `locks/release-check.lock` (matching `poll()` and `retire_cli`) so concurrent
+/// discovery/retirement and console approvals never invert lock acquisition order.
 pub fn approve(context: &RuntimeContext, cfg: &Value, tag: &str) -> Result<Value, String> {
     let root = approval_installation(context)?;
+    approve_in_root(&root, context, cfg, tag)
+}
+
+fn approve_in_root(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    cfg: &Value,
+    tag: &str,
+) -> Result<Value, String> {
     // Do not queue a second attempt while a helper is judging this candidate.
     // In particular, a drained /update reply must not reapprove it for rollback.
-    let _installation = crate::release_store::installation_gate(
-        &root.root().join("runtime/data/locks/update-restore.lock"),
+    // Briefly retry only gate contention so millisecond holds by poll(), gate_contended(),
+    // dependency_upgrade, or an exiting helper do not cause spurious 409s.
+    let _installation = retry_contended_gate(
+        |error| error == "another release installation or restore is running",
+        || {
+            crate::release_store::installation_gate(
+                &root.root().join("runtime/data/locks/update-restore.lock"),
+            )
+        },
     )?;
-    let _gate = context.open_locked_file(
-        crate::runtime::RuntimeArea::Data,
-        "locks/release-check.lock",
+    let _gate = retry_contended_gate(
+        |error| error == "runtime file is already locked",
+        || {
+            context.open_locked_file(
+                crate::runtime::RuntimeArea::Data,
+                "locks/release-check.lock",
+            )
+        },
     )?;
-    let mut state = read_state(context)?;
+    let mut state = read_state_for(root, context)?;
     let settings = settings(cfg)?;
-    let current = current(&root).ok_or("current release unavailable")?;
+    let current = current(root).ok_or("current release unavailable")?;
     let release = state
         .available
         .as_ref()
@@ -544,7 +598,7 @@ pub fn approve(context: &RuntimeContext, cfg: &Value, tag: &str) -> Result<Value
         automatic: false,
     });
     state.update_error = None;
-    save_state(context, &state)?;
+    save_state_for(root, context, &state)?;
     Ok(json!({"ok":true,"current":current,"approved":tag}))
 }
 
@@ -580,118 +634,179 @@ fn ledger_idle(context: &RuntimeContext) -> Result<bool, String> {
 
 /// Only the supervisor consumes approvals. Auto attempts once per admitted discovery check;
 /// an administrator can explicitly retry a candidate that was already staged.
+///
+/// `locks/release-check.lock` is held only for short `releases.json` reads/writes (never across
+/// `install()` or `handover_with_policy()`, which acquire `update-restore.lock`), avoiding
+/// lock-order inversion with `approve()` and `poll()`.
 fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
-    let _gate = context.open_locked_file(
-        crate::runtime::RuntimeArea::Data,
-        "locks/release-check.lock",
-    )?;
-    let mut state = read_state(context)?;
-    let cfg = context.load_config().map_err(str::to_string)?;
-    let settings = settings(&cfg)?;
-    if state.approval.is_none()
-        && settings["policy"] == "auto"
-        && settings["feedUrl"] == state.feed_url
-    {
-        let root = approval_installation(context)?;
-        let current = current(&root).ok_or("current release unavailable")?;
-        if let Some(release) = state.available.as_ref().filter(|release| {
-            newer(release, Some(&current)) && state.auto_attempted.as_deref() != Some(&release.tag)
-        }) {
-            state.approval = Some(Approval {
-                current,
-                release: release.clone(),
-                feed_url: state.feed_url.clone(),
-                automatic: true,
-            });
-        }
-    }
-    let Some(approval) = state.approval.clone() else {
-        return Ok(());
-    };
-    let mut idle = if approval.automatic {
-        let guard = match context
-            .open_locked_file(crate::runtime::RuntimeArea::Data, "locks/turn-update.lock")
+    let (approval, settings, mut lost_alerted, idle) = {
+        let _gate = retry_contended_gate(
+            |error| error == "runtime file is already locked",
+            || {
+                context.open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+            },
+        )?;
+        let mut state = read_state(context)?;
+        let cfg = context.load_config().map_err(str::to_string)?;
+        let settings = settings(&cfg)?;
+        if state.approval.is_none()
+            && settings["policy"] == "auto"
+            && settings["feedUrl"] == state.feed_url
         {
-            Ok(guard) => guard,
-            Err(error) if error == "runtime file is already locked" => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        if !ledger_idle(context)? {
-            return Ok(());
+            let root = approval_installation(context)?;
+            let current = current(&root).ok_or("current release unavailable")?;
+            if let Some(release) = state.available.as_ref().filter(|release| {
+                newer(release, Some(&current))
+                    && state.auto_attempted.as_deref() != Some(&release.tag)
+            }) {
+                state.approval = Some(Approval {
+                    current,
+                    release: release.clone(),
+                    feed_url: state.feed_url.clone(),
+                    automatic: true,
+                });
+            }
         }
-        Some(guard)
-    } else {
-        None
-    };
-    let result: Result<(), String> = (|| {
+        let Some(approval) = state.approval.clone() else {
+            return Ok(());
+        };
+        let idle = if approval.automatic {
+            let guard = match context
+                .open_locked_file(crate::runtime::RuntimeArea::Data, "locks/turn-update.lock")
+            {
+                Ok(guard) => guard,
+                Err(error) if error == "runtime file is already locked" => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if !ledger_idle(context)? {
+                return Ok(());
+            }
+            Some(guard)
+        } else {
+            None
+        };
         let root = approval_installation(context)?;
         if current(&root).as_deref() != Some(&approval.current)
             || settings["policy"] == "off"
             || settings["feedUrl"] != approval.feed_url
             || approval.automatic && settings["policy"] != "auto"
         {
-            return Err("approved release or update settings changed; approve again".into());
+            let reason = "approved release or update settings changed; approve again".to_string();
+            state.approval = None;
+            state.update_error = Some(reason.clone());
+            save_state(context, &state)?;
+            return Err(reason);
         }
         if approval.automatic {
             state.auto_attempted = Some(approval.release.tag.clone());
+            save_state(context, &state)?;
         }
-        save_state(context, &state)?;
+        (approval, settings, state.lost_alerted.clone(), idle)
+    };
+
+    let install_result: Result<(), String> = (|| {
+        let root = approval_installation(context)?;
         let path = root.root().join("releases").join(&approval.release.tag);
         if fs::symlink_metadata(&path).is_ok() {
             crate::update::verify(&root, &approval.release.tag)?;
         } else {
-            install(context, &approval.release, &mut state.lost_alerted)?;
+            install(context, &approval.release, &mut lost_alerted)?;
         }
         // Configuration can change while a download is in progress.
         let latest = settings_of_context(context)?;
         if latest != settings {
             return Err("update settings changed during installation; approve again".into());
         }
-        state.approval = None;
-        state.update_error = None;
-        save_state(context, &state)?;
-        // Release the staging fence before launch. The helper takes its own fence after
-        // the trial, drains any intervening turn and retains it after this supervisor exits.
-        drop(idle.take());
-        handover_with_policy(context, &approval.release.tag, approval.automatic)?;
         Ok(())
     })();
-    state.approval = None;
-    state.update_error = result.as_ref().err().cloned();
-    save_state(context, &state)?;
-    result
+
+    // Release the staging fence before acquiring release-check.lock (matching Phase 1
+    // lock order) and before launching the helper. The helper takes its own fence after the
+    // trial, drains any intervening turn and retains it after this supervisor exits.
+    drop(idle);
+
+    {
+        let _gate = retry_contended_gate(
+            |error| error == "runtime file is already locked",
+            || {
+                context.open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+            },
+        )?;
+        let mut state = read_state(context)?;
+        state.lost_alerted = lost_alerted;
+        state.approval = None;
+        state.update_error = install_result.as_ref().err().cloned();
+        save_state(context, &state)?;
+    }
+    install_result?;
+
+    if let Err(error) = handover_with_policy(context, &approval.release.tag, approval.automatic) {
+        let _gate = retry_contended_gate(
+            |error| error == "runtime file is already locked",
+            || {
+                context.open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+            },
+        )?;
+        let mut state = read_state(context)?;
+        state.update_error = Some(error.clone());
+        save_state(context, &state)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn settings_of_context(context: &RuntimeContext) -> Result<Value, String> {
     settings(&context.load_config().map_err(str::to_string)?)
 }
 
-
+/// Lock ordering: never hold `locks/release-check.lock` across network feed I/O. When
+/// publishing discovery results after I/O, always acquire `runtime/data/locks/update-restore.lock`
+/// before `locks/release-check.lock` (matching `approve()` and `retire_cli`) so there is no
+/// lock-order inversion.
 fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
     let settings = settings(cfg)?;
     if settings["policy"] == "off" {
         return Ok(());
     }
-    let _gate = context.open_locked_file(
-        crate::runtime::RuntimeArea::Data,
-        "locks/release-check.lock",
-    )?;
-    let mut state = read_state(context)?;
     let feed = settings["feedUrl"].as_str().unwrap();
-    if state.feed_url != feed {
-        state.feed_url = feed.into();
-        state.last_checked_at = None;
-        state.available = None;
-        state.error = None;
-    }
-    if state
-        .last_checked_at
-        .is_none_or(|last| now.saturating_sub(last) >= CHECK_INTERVAL_MS)
-    {
-        // Persist admission before I/O: restarts and failures cannot turn into a request storm.
-        state.last_checked_at = Some(now);
-        state.auto_attempted = None;
-        save_state(context, &state)?;
+    let should_check = {
+        let _gate = retry_contended_gate(
+            |error| error == "runtime file is already locked",
+            || {
+                context.open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+            },
+        )?;
+        let mut state = read_state(context)?;
+        if state.feed_url != feed {
+            state.feed_url = feed.into();
+            state.last_checked_at = None;
+            state.available = None;
+            state.error = None;
+        }
+        let due = state
+            .last_checked_at
+            .is_none_or(|last| now.saturating_sub(last) >= CHECK_INTERVAL_MS);
+        if due {
+            // Persist admission before I/O: restarts and failures cannot turn into a request storm.
+            state.last_checked_at = Some(now);
+            state.auto_attempted = None;
+            save_state(context, &state)?;
+        }
+        due
+    };
+    if should_check {
         loop {
             let root = InstallRoot::configured()?;
             let authority = crate::update::authority(&root);
@@ -701,23 +816,45 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
             };
             // Installation/handover can proceed during network I/O. Publish only
             // while the exact verifying context is still current, fenced against switch.
-            let _installation = installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))?;
+            // Lock ordering: `update-restore.lock` before `locks/release-check.lock`.
+            let _installation = retry_contended_gate(
+                |error| error == "another release installation or restore is running",
+                || installation_gate(&root.root().join("runtime/data/locks/update-restore.lock")),
+            )?;
+            let _gate = retry_contended_gate(
+                |error| error == "runtime file is already locked",
+                || {
+                    context.open_locked_file(
+                        crate::runtime::RuntimeArea::Data,
+                        "locks/release-check.lock",
+                    )
+                },
+            )?;
             let stamp = stamp_of(&authority);
-            if stamp != cache_authority()? {
-                state = CheckState { trust: cache_authority()?, feed_url: feed.into(),
-                    last_checked_at: Some(now), ..CheckState::default() };
+            if stamp != cache_authority_for(&root)? {
                 continue;
             }
+            let mut state = read_state_for(&root, context)?;
             state.trust = stamp;
+            state.feed_url = feed.into();
+            state.last_checked_at = Some(now);
             // This check is admission. A lost current alerts once per lost tag whatever
             // the feed did; a refusal once per new cached discovery error.
             if authority.is_ok() {
-                crate::update::admission_alert(&root, &authority, Some(&_installation), &mut state.lost_alerted)?;
+                crate::update::admission_alert(
+                    &root,
+                    &authority,
+                    Some(&_installation),
+                    &mut state.lost_alerted,
+                )?;
             }
             match result {
                 Ok(available) => {
                     state.available = available;
-                    state.error = authority.as_ref().ok().and_then(|authority| authority.lost.as_ref())
+                    state.error = authority
+                        .as_ref()
+                        .ok()
+                        .and_then(|authority| authority.lost.as_ref())
                         .map(|_| crate::update::LOST_CURRENT.to_string());
                 }
                 Err(error) => {
@@ -725,7 +862,12 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
                     state.approval = None;
                     if state.error.as_ref() != Some(&error) {
                         if authority.is_err() {
-                            crate::update::admission_alert(&root, &authority, Some(&_installation), &mut state.lost_alerted)?;
+                            crate::update::admission_alert(
+                                &root,
+                                &authority,
+                                Some(&_installation),
+                                &mut state.lost_alerted,
+                            )?;
                         } else {
                             signature_notice(context, cfg, &error);
                         }
@@ -733,7 +875,7 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
                     state.error = Some(error);
                 }
             }
-            save_state(context, &state)?;
+            save_state_for(&root, context, &state)?;
             break;
         }
     }
@@ -741,30 +883,42 @@ fn poll(context: &RuntimeContext, cfg: &Value, now: i64) -> Result<(), String> {
     let latest = context.load_config().map_err(str::to_string)?;
     let latest_settings = self::settings(&latest)?;
     if latest_settings["policy"] == "notify" && latest_settings["feedUrl"] == settings["feedUrl"] {
-        let current = current(&InstallRoot::configured()?);
-        if let Some(release) = state
-            .available
-            .as_ref()
-            .filter(|release| newer(release, current.as_deref()))
-        {
-            let tag = release.tag.clone();
-            if !state.notified.contains(&tag) && crate::admin_alert::owner_id(&latest).is_some() {
-                // Claim before admission/delivery so a crash leaves an uncertain send
-                // deduplicated. Only a definite non-admission releases the claim.
-                state.notified.push(tag.clone());
-                save_state(context, &state)?;
-                let admitted = crate::admin_alert::notify_notice(
-                    context,
-                    &latest,
-                    &format!(
-                        "HER 更新可用：{} → {tag}。请在控制台查看更新策略。",
-                        current.as_deref().unwrap_or("未知版本")
-                    ),
-                    &format!("release-available:{tag}"),
-                );
-                if !admitted {
-                    state.notified.retain(|notified| notified != &tag);
+        let _gate = retry_contended_gate(
+            |error| error == "runtime file is already locked",
+            || {
+                context.open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+            },
+        )?;
+        let mut state = read_state(context)?;
+        if state.feed_url == latest_settings["feedUrl"].as_str().unwrap() {
+            let current = current(&InstallRoot::configured()?);
+            if let Some(release) = state
+                .available
+                .as_ref()
+                .filter(|release| newer(release, current.as_deref()))
+            {
+                let tag = release.tag.clone();
+                if !state.notified.contains(&tag) && crate::admin_alert::owner_id(&latest).is_some() {
+                    // Claim before admission/delivery so a crash leaves an uncertain send
+                    // deduplicated. Only a definite non-admission releases the claim.
+                    state.notified.push(tag.clone());
                     save_state(context, &state)?;
+                    let admitted = crate::admin_alert::notify_notice(
+                        context,
+                        &latest,
+                        &format!(
+                            "HER 更新可用：{} → {tag}。请在控制台查看更新策略。",
+                            current.as_deref().unwrap_or("未知版本")
+                        ),
+                        &format!("release-available:{tag}"),
+                    );
+                    if !admitted {
+                        state.notified.retain(|notified| notified != &tag);
+                        save_state(context, &state)?;
+                    }
                 }
             }
         }
@@ -1216,5 +1370,146 @@ pub fn before_supervisor_start(runtime: &Path) -> Result<bool, String> {
         Ok(_) => Ok(true),
         Err(error) if error == "another release installation or restore is running" => Ok(true),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempInstall(PathBuf);
+    impl TempInstall {
+        fn new(name: &str) -> (Self, InstallRoot, RuntimeContext) {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let base = crate::install_root::development_root(std::env::temp_dir().join(format!(
+                "her-release-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )));
+            for dir in [
+                "releases/v0.0.0",
+                "runtime/config",
+                "runtime/data/locks",
+                "runtime/resources",
+            ] {
+                fs::create_dir_all(base.join(dir)).unwrap();
+            }
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(base.join("releases/v0.0.0"), base.join("current")).unwrap();
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let out = std::process::Command::new("cmd.exe")
+                    .args(["/d", "/c", "mklink", "/J"])
+                    .arg(base.join("current"))
+                    .arg(base.join("releases/v0.0.0"))
+                    .creation_flags(0x0800_0000)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+            }
+            let runtime = base.join("runtime");
+            fs::write(
+                runtime.join("config/config.json"),
+                json!({
+                    "consoleToken": "fixture-token",
+                    "update": {
+                        "policy": "notify",
+                        "feedUrl": "http://127.0.0.1:9999/feed"
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(runtime.join("data/social-v2.json"), "{}").unwrap();
+            fs::write(
+                runtime.join("dependencies.json"),
+                json!({
+                    "dsh": "http://127.0.0.1:1",
+                    "model": "http://127.0.0.1:1",
+                    "onebot": "http://127.0.0.1:1"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let root = InstallRoot::new(&base).unwrap();
+            let context = RuntimeContext::from_root(&runtime).unwrap();
+            (Self(base), root, context)
+        }
+    }
+    impl Drop for TempInstall {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn seed_available(root: &InstallRoot, context: &RuntimeContext, tag: &str) -> Value {
+        let cfg = context.load_config().unwrap();
+        let state = CheckState {
+            version: 3,
+            trust: cache_authority_for(root).unwrap(),
+            feed_url: "http://127.0.0.1:9999/feed".into(),
+            last_checked_at: Some(1),
+            available: Some(Release {
+                tag: tag.into(),
+                assets: Vec::new(),
+            }),
+            notified: Vec::new(),
+            error: None,
+            approval: None,
+            update_error: None,
+            auto_attempted: None,
+            lost_alerted: None,
+        };
+        save_state_for(root, context, &state).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn approve_retries_transient_restore_lock_and_rejects_persistent_hold() {
+        let (_guard, root, context) = TempInstall::new("approve-lock-retry");
+        let cfg = seed_available(&root, &context, "v1.2.3");
+        let restore_lock = root.root().join("runtime/data/locks/update-restore.lock");
+
+        // Brief (~60ms) transient hold on update-restore.lock succeeds within the 500ms window.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder_path = restore_lock.clone();
+        let holder = std::thread::spawn(move || {
+            let gate = crate::release_store::installation_gate(&holder_path).unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            drop(gate);
+        });
+        locked_rx.recv().unwrap();
+        let approved = approve_in_root(&root, &context, &cfg, "v1.2.3").unwrap();
+        holder.join().unwrap();
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["approved"], "v1.2.3");
+
+        // Brief (~60ms) transient hold on locks/release-check.lock also succeeds.
+        let cfg = seed_available(&root, &context, "v1.2.4");
+        let (check_tx, check_rx) = std::sync::mpsc::channel();
+        let check_context = context.clone();
+        let check_holder = std::thread::spawn(move || {
+            let gate = check_context
+                .open_locked_file(crate::runtime::RuntimeArea::Data, "locks/release-check.lock")
+                .unwrap();
+            check_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(60));
+            drop(gate);
+        });
+        check_rx.recv().unwrap();
+        let approved = approve_in_root(&root, &context, &cfg, "v1.2.4").unwrap();
+        check_holder.join().unwrap();
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["approved"], "v1.2.4");
+
+        // A persistently held update-restore.lock (>500ms) still fails with 409 text.
+        let cfg = seed_available(&root, &context, "v1.2.5");
+        let _held = crate::release_store::installation_gate(&restore_lock).unwrap();
+        let started = Instant::now();
+        let error = approve_in_root(&root, &context, &cfg, "v1.2.5").unwrap_err();
+        assert_eq!(error, "another release installation or restore is running");
+        assert!(started.elapsed() >= Duration::from_millis(450));
     }
 }
