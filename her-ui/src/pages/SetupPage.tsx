@@ -13,6 +13,7 @@ export const SetupPage: React.FC = () => {
   const [submitting, setSubmitting] = useState(false);
 
   const tokenFile = authStatus?.tokenFile || 'data/console-token';
+  const fromConfig = tokenFile === 'config/config.json';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -67,8 +68,22 @@ export const SetupPage: React.FC = () => {
         </div>
 
         <div className="mt-4 rounded-md border border-[var(--border-hairline)] bg-[var(--bg-subtle)] p-3 text-xs text-[var(--text-secondary)]">
-          请从本机 HER 运行目录下的 <code className="font-mono font-semibold">{tokenFile}</code>{' '}
-          复制控制台令牌，并设置至少 8 位管理员密码。
+          {fromConfig ? (
+            <>
+              请从本机 HER 运行目录下的{' '}
+              <code className="font-mono font-semibold">config/config.json</code> 中复制{' '}
+              <code className="font-mono font-semibold">consoleToken</code> 字段值，并设置至少 8
+              位管理员密码。
+            </>
+          ) : (
+            <>
+              请从本机 HER 运行目录下的{' '}
+              <code className="font-mono font-semibold">{tokenFile}</code> 复制控制台令牌（若已在{' '}
+              <code className="font-mono font-semibold">config/config.json</code> 中设置{' '}
+              <code className="font-mono font-semibold">consoleToken</code>{' '}
+              则以该字段为准），并设置至少 8 位管理员密码。
+            </>
+          )}
         </div>
 
         <form onSubmit={(e) => void handleSubmit(e)} className="mt-4 space-y-3 text-xs">
@@ -90,7 +105,11 @@ export const SetupPage: React.FC = () => {
               type="password"
               value={token}
               onChange={(e) => setToken(e.target.value)}
-              placeholder={`粘贴 ${tokenFile} 内容…`}
+              placeholder={
+                fromConfig
+                  ? '粘贴 config/config.json 中的 consoleToken…'
+                  : `粘贴 ${tokenFile} 或 config.json 中的 consoleToken…`
+              }
               className="h-9 w-full rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-3 text-[13px] text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
             />
           </div>
