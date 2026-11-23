@@ -5,9 +5,7 @@
 //! `crate::guarded_file`, and `crate::process_identity` — never on `runtime`, `console*`,
 //! `supervisor*`, or `desktop`.
 
-pub(crate) use crate::guarded_file::{
-    ensure_plain_directory, file_link_count, is_link, sync_directory,
-};
+pub(crate) use crate::guarded_file::{file_link_count, is_link, sync_directory};
 
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -219,7 +217,8 @@ pub(crate) fn restrict_entry(
 }
 
 /// Apply and verify `policy` DACL/mode on an already-open handle.
-#[cfg(any(windows, test))]
+/// On Windows, the caller's handle must include `WRITE_DAC | READ_CONTROL`.
+#[cfg(test)]
 pub(crate) fn restrict_handle(
     file: &File,
     path: &Path,
@@ -827,7 +826,7 @@ mod windows {
             // SAFETY: CreateFileW returned a valid owned handle, transferred to File once.
             Ok(unsafe { File::from_raw_handle(handle) })
         })
-        .map_err(|error| io::Error::other(String::from(error)))?
+        .map_err(io::Error::from)?
     }
 
     pub(super) fn restrict_path(
@@ -987,6 +986,74 @@ mod windows {
         Ok(())
     }
 
+    fn check_owner_and_acl_trustees(
+        owner: *mut std::ffi::c_void,
+        acl: *mut ACL,
+        sids: &[Vec<u8>],
+        reject_inherited: bool,
+        required_grant_sid: Option<&[u8]>,
+    ) -> Result<(), AclError> {
+        // SAFETY: `sid` points into either `descriptor` or local `sids` vectors kept alive here.
+        let sid_allowed = |sid: *mut std::ffi::c_void| unsafe {
+            !sid.is_null()
+                && IsValidSid(sid) != 0
+                && sids
+                    .iter()
+                    .any(|trusted| EqualSid(sid, trusted.as_ptr().cast_mut().cast()) != 0)
+        };
+        // SAFETY: `acl` belongs to retained `descriptor.0`.
+        if !sid_allowed(owner) || acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
+            return Err(AclError::Refused(
+                "file owner or DACL is untrusted".into(),
+            ));
+        }
+        let mut saw_required = required_grant_sid.is_none();
+        // SAFETY: IsValidAcl validated header and ACE bounds.
+        let count = unsafe { (*acl).AceCount } as u32;
+        for index in 0..count {
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: valid ACL and in-range index; `descriptor.0` remains allocated.
+            unsafe {
+                if GetAce(acl, index, &mut ace) == 0 || ace.is_null() {
+                    return Err(AclError::Refused("GetAce failed".into()));
+                }
+                let header = &*ace.cast::<ACE_HEADER>();
+                if reject_inherited && (u32::from(header.AceFlags) & INHERITED_ACE) != 0 {
+                    return Err(AclError::Refused("DACL contains an inherited ACE".into()));
+                }
+                match header.AceType {
+                    0 => {
+                        if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+                            return Err(AclError::Refused("malformed ACCESS_ALLOWED_ACE".into()));
+                        }
+                        let entry = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                        let sid_ptr = std::ptr::addr_of!(entry.SidStart).cast_mut().cast();
+                        if entry.Mask != 0 {
+                            if !sid_allowed(sid_ptr) {
+                                return Err(AclError::Refused(
+                                    "DACL grants access to an untrusted SID".into(),
+                                ));
+                            }
+                            if let Some(required) = required_grant_sid {
+                                if EqualSid(sid_ptr, required.as_ptr().cast_mut().cast()) != 0 {
+                                    saw_required = true;
+                                }
+                            }
+                        }
+                    }
+                    1 => {} // ACCESS_DENIED_ACE_TYPE cannot broaden access.
+                    _ => return Err(AclError::Refused("unexpected ACE type in DACL".into())),
+                }
+            }
+        }
+        if !saw_required {
+            return Err(AclError::Refused(
+                "DACL does not grant access to the required trustee".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn verify_handle_trustees(file: &File, policy: AclPolicy) -> Result<(), AclError> {
         let sids = policy_sids(Path::new("handle"), policy)?;
         let mut owner = std::ptr::null_mut();
@@ -1010,50 +1077,7 @@ mod windows {
                 "GetSecurityInfo failed (Win32 error {result})"
             )));
         }
-        // SAFETY: `sid` points into either `descriptor` or local `sids` vectors kept alive here.
-        let sid_allowed = |sid: *mut std::ffi::c_void| unsafe {
-            !sid.is_null()
-                && IsValidSid(sid) != 0
-                && sids
-                    .iter()
-                    .any(|trusted| EqualSid(sid, trusted.as_ptr().cast_mut().cast()) != 0)
-        };
-        // SAFETY: `acl` belongs to retained `descriptor.0`.
-        if !sid_allowed(owner) || acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
-            return Err(AclError::Refused(
-                "file owner or DACL is untrusted".into(),
-            ));
-        }
-        // SAFETY: IsValidAcl validated header and ACE bounds.
-        let count = unsafe { (*acl).AceCount } as u32;
-        for index in 0..count {
-            let mut ace = std::ptr::null_mut();
-            // SAFETY: valid ACL and in-range index; `descriptor.0` remains allocated.
-            unsafe {
-                if GetAce(acl, index, &mut ace) == 0 || ace.is_null() {
-                    return Err(AclError::Refused("GetAce failed".into()));
-                }
-                let header = &*ace.cast::<ACE_HEADER>();
-                match header.AceType {
-                    0 => {
-                        if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
-                            return Err(AclError::Refused("malformed ACCESS_ALLOWED_ACE".into()));
-                        }
-                        let entry = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-                        if entry.Mask != 0
-                            && !sid_allowed(std::ptr::addr_of!(entry.SidStart).cast_mut().cast())
-                        {
-                            return Err(AclError::Refused(
-                                "DACL grants access to an untrusted SID".into(),
-                            ));
-                        }
-                    }
-                    1 => {} // ACCESS_DENIED_ACE_TYPE cannot broaden access.
-                    _ => return Err(AclError::Refused("unexpected ACE type in DACL".into())),
-                }
-            }
-        }
-        Ok(())
+        check_owner_and_acl_trustees(owner, acl, &sids, false, None)
     }
 
     pub(super) fn is_directory_hardened(dir: &Path, policy: AclPolicy) -> bool {
@@ -1063,7 +1087,7 @@ mod windows {
         let Ok(sids) = policy_sids(dir, policy) else {
             return false;
         };
-        let user_sid = &sids[0];
+        let mut owner = std::ptr::null_mut();
         let mut acl = std::ptr::null_mut();
         let mut descriptor = LocalDescriptor(std::ptr::null_mut());
         // SAFETY: open handle and initialized output pointers.
@@ -1071,8 +1095,8 @@ mod windows {
             GetSecurityInfo(
                 file.as_raw_handle(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
                 std::ptr::null_mut(),
                 &mut acl,
                 std::ptr::null_mut(),
@@ -1087,53 +1111,10 @@ mod windows {
         // SAFETY: valid descriptor from GetSecurityInfo.
         if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0
             || (control & SE_DACL_PROTECTED) == 0
-            || acl.is_null()
-            || unsafe { IsValidAcl(acl) } == 0
         {
             return false;
         }
-        let mut saw_user_grant = false;
-        // SAFETY: IsValidAcl validated header and ACE bounds.
-        let count = unsafe { (*acl).AceCount } as u32;
-        for index in 0..count {
-            let mut ace = std::ptr::null_mut();
-            // SAFETY: valid ACL and in-range index.
-            unsafe {
-                if GetAce(acl, index, &mut ace) == 0 || ace.is_null() {
-                    return false;
-                }
-                let header = &*ace.cast::<ACE_HEADER>();
-                if u32::from(header.AceFlags) & INHERITED_ACE != 0 {
-                    return false;
-                }
-                match header.AceType {
-                    0 => {
-                        if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
-                            return false;
-                        }
-                        let entry = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-                        let sid_ptr = std::ptr::addr_of!(entry.SidStart).cast_mut().cast();
-                        if IsValidSid(sid_ptr) == 0 {
-                            return false;
-                        }
-                        if entry.Mask != 0 {
-                            if !sids
-                                .iter()
-                                .any(|trusted| EqualSid(sid_ptr, trusted.as_ptr().cast_mut().cast()) != 0)
-                            {
-                                return false;
-                            }
-                            if EqualSid(sid_ptr, user_sid.as_ptr().cast_mut().cast()) != 0 {
-                                saw_user_grant = true;
-                            }
-                        }
-                    }
-                    1 => {}
-                    _ => return false,
-                }
-            }
-        }
-        saw_user_grant
+        check_owner_and_acl_trustees(owner, acl, &sids, true, Some(&sids[0])).is_ok()
     }
 }
 
@@ -1229,6 +1210,26 @@ mod tests {
 
         remove_protected_file_with(&path, || fs::remove_file(&path).map_err(|e| e.to_string())).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn restrict_handle_applies_and_verifies_policy_on_open_handle() {
+        let dir = TempDir::new("restrict-handle");
+        let path = dir.0.join("secret.bin");
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+            options.access_mode(GENERIC_READ | GENERIC_WRITE | WRITE_DAC | READ_CONTROL);
+        }
+        let file = options.open(&path).unwrap();
+        restrict_handle(&file, &path, false, AclPolicy::OwnerOnly).unwrap();
+        assert!(verify_file_private(&path, AclPolicy::OwnerOnly));
+        restrict_handle(&file, &path, false, AclPolicy::OwnerSystemAdmins).unwrap();
+        assert!(verify_file_private(&path, AclPolicy::OwnerSystemAdmins));
     }
 
     #[cfg(unix)]

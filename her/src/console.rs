@@ -6319,7 +6319,7 @@ fn harden_dir(dir: &str) -> (bool, String) {
         std::path::Path::new(dir),
         crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
     ) {
-        Ok(()) => (true, "win32".to_string()),
+        Ok(()) => (true, "native".to_string()),
         Err(error) => (false, error),
     }
 }
