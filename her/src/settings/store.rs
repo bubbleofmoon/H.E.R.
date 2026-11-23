@@ -33,7 +33,8 @@ use super::{
 };
 use super::registry::{ALLOW_GROUPS, ALLOW_PRIVATE, ROLLOUT_GROUPS};
 use crate::console_auth::AdministratorPasswordHash;
-use crate::runtime::{file_link_count, PathIntent, RuntimeArea, RuntimeContext};
+use crate::guarded_fs::file_link_count;
+use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
@@ -836,15 +837,18 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     drop(inspect(context)?);
     let path = check_paths(context, PathIntent::WriteFile)?;
     // Protect existing files before opening a write connection. SQLite's Unix sidecars use the database mode.
-    match crate::guarded_credentials::create_settings_file(&path) {
+    match crate::guarded_fs::create_protected_file(
+        &path,
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    ) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return Err(STORAGE_ERROR.to_string()),
     }
     for file in std::iter::once(path.clone()).chain(SIDECARS.map(|name| path.with_file_name(name))) {
-        match crate::guarded_credentials::restrict_settings_file(&file) {
+        match crate::guarded_fs::restrict_file(&file, crate::guarded_fs::AclPolicy::OwnerSystemAdmins) {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && file != path => {}
+            Err(crate::guarded_fs::AclError::Missing(_)) if file != path => {}
             Err(_) => return Err(STORAGE_ERROR.to_string()),
         }
     }
@@ -865,8 +869,11 @@ fn open_for_write(context: &RuntimeContext) -> Result<Connection, String> {
     // The journal used for switching to WAL carries SQLite's database header page only.
     #[cfg(windows)]
     for name in &SIDECARS[..2] {
-        crate::guarded_credentials::restrict_settings_file(&path.with_file_name(name))
-            .map_err(|_| STORAGE_ERROR.to_string())?;
+        crate::guarded_fs::restrict_file(
+            &path.with_file_name(name),
+            crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+        )
+        .map_err(|_| STORAGE_ERROR.to_string())?;
     }
     match schema_version(&tx)? {
         0 => {
