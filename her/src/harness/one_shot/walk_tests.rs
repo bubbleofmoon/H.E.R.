@@ -1,9 +1,11 @@
 //! #238: the digest's route walk (`RouteWalk`) on a scripted loopback relay; no real model service is contacted.
 use super::*;
+use crate::harness::{route_health, usage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// The harness credential of every fixture; one test puts it into a route id and a model.
 const SECRET: &str = "synthetic-model-key-238";

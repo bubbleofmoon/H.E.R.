@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 use genai::{
     chat::{
         Binary, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatStreamEvent, ContentPart,
-        ReasoningEffort, StopReason, StreamEnd, ToolCall, ToolResponse,
+        ReasoningEffort, StopReason, StreamEnd, ToolCall, ToolResponse, Usage,
     },
     Client, ModelSpec,
 };
@@ -801,7 +801,7 @@ struct TurnStep<'turn> {
     store: &'turn store::Store,
     request: &'turn TurnRequest,
     delivery: &'turn TurnDelivery,
-    rounds: &'turn [store::Round],
+    rounds: &'turn [std::ops::Range<usize>],
     messages: &'turn [ChatMessage],
     checkpoint_clipped: bool,
     progress: &'turn std::sync::Mutex<Progress>,

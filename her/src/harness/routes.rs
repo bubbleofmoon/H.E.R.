@@ -1051,6 +1051,7 @@ pub(crate) struct ChainConfig {
 }
 
 /// Result of a successful `ChainExecutor::next_answer` call.
+#[derive(Debug)]
 pub(crate) struct StepSuccess<T> {
     pub value: T,
     pub spent_tokens: u32,
@@ -2030,24 +2031,28 @@ mod tests {
                 summary: "model/backend empty-response (EMPTY_ANSWER)".into(),
                 response_usage: Some(Some(sample_usage())),
                 tokens_charged: 15,
+                observe_health: true,
             },
             ScriptAction::Missed {
                 miss: Miss::Empty,
                 summary: "model/backend empty-response (EMPTY_ANSWER)".into(),
                 response_usage: Some(Some(sample_usage())),
                 tokens_charged: 15,
+                observe_health: true,
             },
             ScriptAction::Missed {
                 miss: Miss::Empty,
                 summary: "model/backend empty-response (EMPTY_ANSWER)".into(),
                 response_usage: Some(Some(sample_usage())),
                 tokens_charged: 15,
+                observe_health: true,
             },
             ScriptAction::Missed {
                 miss: Miss::Empty,
                 summary: "model/backend empty-response (EMPTY_ANSWER)".into(),
                 response_usage: Some(Some(sample_usage())),
                 tokens_charged: 15,
+                observe_health: true,
             },
             ScriptAction::Answer {
                 text: "from-b".into(),
