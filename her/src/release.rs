@@ -329,14 +329,27 @@ pub fn install(
     let root = installation()?;
     version(&release.tag).ok_or("release tag must be vX.Y.Z")?;
     required_assets(release)?;
-    let _update = installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))?;
-    if !newer(release, current(&root).as_deref()) {
+    let update_gate =
+        installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))?;
+    install_with_gate(context, &root, release, lost_alerted, &update_gate)
+}
+
+fn install_with_gate(
+    context: &RuntimeContext,
+    root: &InstallRoot,
+    release: &Release,
+    lost_alerted: &mut Option<String>,
+    update_gate: &fs::File,
+) -> Result<InstalledRelease, String> {
+    version(&release.tag).ok_or("release tag must be vX.Y.Z")?;
+    required_assets(release)?;
+    if !newer(release, current(root).as_deref()) {
         return Err(release_signature::REFUSED.into());
     }
     let releases = root.root().join("releases");
     directory(&releases)?;
     let _gate = installation_gate(&releases.join(".install.lock"))?;
-    recover_staging(&root, &releases)?;
+    recover_staging(root, &releases)?;
     let target = releases.join(&release.tag);
     if fs::symlink_metadata(&target).is_ok() {
         return Err("release folder already exists; it will not be overwritten".into());
@@ -349,7 +362,7 @@ pub fn install(
             .expect("required_assets checked")
             .url
     };
-    let authority = crate::update::admitted_authority(&root, Some(&_update), lost_alerted)?;
+    let authority = crate::update::admitted_authority(root, Some(update_gate), lost_alerted)?;
     let (checksum, signature) = signed_list(release, &authority).inspect_err(|error| {
         if let Ok(cfg) = context.load_config() {
             signature_notice(context, &cfg, error);
@@ -528,7 +541,9 @@ fn approval_installation(context: &RuntimeContext) -> Result<InstallRoot, String
 /// Every caller across `release.rs`, `update.rs`, `handover.rs`, `dependency_upgrade.rs`,
 /// `engine_switch.rs`, `restore.rs`, `console.rs`, and `chat.rs` acquires locks strictly in
 /// ascending order (`1 -> 2 -> 3 -> 4`) and never waits on a lower-numbered lock while holding
-/// a higher-numbered one.
+/// a higher-numbered one. Callers already holding shared `(2) turn-update.lock` (such as
+/// `chat::handle_update_command` via `approve_authorized_under_turn_guard`) acquire `(3) -> (4)`
+/// and only probe `(1)` non-blockingly via `gate_contended` without holding or waiting on `(1)`.
 const GATE_RETRY_WINDOW: Duration = Duration::from_millis(500);
 const GATE_RETRY_STEP: Duration = Duration::from_millis(20);
 
@@ -593,6 +608,21 @@ where
     approve_authorized_in_root(&root, context, tag, authorize)
 }
 
+/// Approval variant for callers that already hold shared `(2) turn-update.lock` (`turn_guard`):
+/// follows `2 -> 3 -> 4` and probes `(1) update-restore.lock` non-blockingly via `gate_contended`
+/// without holding or waiting on `(1)`.
+pub fn approve_authorized_under_turn_guard<G, E, F>(
+    context: &RuntimeContext,
+    tag: &str,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
+    let root = approval_installation(context).map_err(ApproveError::Release)?;
+    approve_authorized_under_turn_guard_in_root(&root, context, tag, authorize)
+}
+
 fn approve_authorized_in_root<G, E, F>(
     root: &InstallRoot,
     context: &RuntimeContext,
@@ -605,8 +635,42 @@ where
     // Do not queue a second attempt while a helper is judging this candidate.
     // In particular, a drained /update reply must not reapprove it for rollback.
     let _installation = restore_gate(root).map_err(ApproveError::Release)?;
+    approve_with_release_check(root, context, tag, false, authorize)
+}
+
+fn approve_authorized_under_turn_guard_in_root<G, E, F>(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    tag: &str,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
+    approve_with_release_check(root, context, tag, true, authorize)
+}
+
+fn approve_with_release_check<G, E, F>(
+    root: &InstallRoot,
+    context: &RuntimeContext,
+    tag: &str,
+    probe_restore_gate: bool,
+    authorize: F,
+) -> Result<Value, ApproveError<E>>
+where
+    F: FnOnce() -> Result<(G, Value), E>,
+{
     let _gate = release_check_gate(context).map_err(ApproveError::Release)?;
     let (_config_gate, cfg) = authorize().map_err(ApproveError::Authorize)?;
+    if probe_restore_gate
+        && crate::release_store::gate_contended(
+            &root.root().join("runtime/data/locks/update-restore.lock"),
+        )
+    {
+        return Err(ApproveError::Release(
+            "another release installation or restore is running".into(),
+        ));
+    }
     approve_with_gates(root, context, &cfg, tag).map_err(ApproveError::Release)
 }
 
@@ -677,10 +741,11 @@ fn ledger_idle(context: &RuntimeContext) -> Result<bool, String> {
 /// Only the supervisor consumes approvals. Auto attempts once per admitted discovery check;
 /// an administrator can explicitly retry a candidate that was already staged.
 ///
-/// Follows the canonical 4-lock hierarchy (`1 -> 2 -> 3`): peeks state under (3), acquires
-/// `locks/turn-update.lock` (2) outside (3), re-reads/claims under (3) strictly in `2 -> 3`
-/// order, downloads/verifies outside (1) and (3), then takes `restore_gate` (1) -> `release_check_gate`
-/// (3) to publish and hand the held `restore_gate` directly into `handover_with_policy_gate`.
+/// Follows the canonical 4-lock hierarchy (`1 -> 2 -> 3`): peeks state under (3); for auto
+/// acquires `update-restore.lock` (1) BEFORE `locks/turn-update.lock` (2) outside (3),
+/// re-reads/claims under (3) strictly in `1 -> 2 -> 3` order, downloads/verifies under `(1, 2)`
+/// (or outside all gates for manual), drops (2), then holds `(1) -> (3)` to publish and pass
+/// the held `update-restore.lock` directly into `handover_with_policy_gate`.
 fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
     // Step A (Peek): check whether a manual approval or eligible auto candidate exists.
     let need_auto_fence = {
@@ -706,8 +771,18 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
         }
     };
 
-    // Step B (Auto turn fence): acquire turn-update.lock (2) outside release-check.lock (3).
-    let mut idle = if need_auto_fence {
+    // Step B (Auto restore + turn fence): acquire update-restore.lock (1) BEFORE
+    // turn-update.lock (2), both outside release-check.lock (3).
+    let (mut update_gate, mut idle) = if need_auto_fence {
+        let root = approval_installation(context)?;
+        let gate = match installation_gate(&root.root().join("runtime/data/locks/update-restore.lock"))
+        {
+            Ok(gate) => gate,
+            Err(error) if error == "another release installation or restore is running" => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let guard = match context
             .open_locked_file(crate::runtime::RuntimeArea::Data, "locks/turn-update.lock")
         {
@@ -718,12 +793,12 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
         if !ledger_idle(context)? {
             return Ok(());
         }
-        Some(guard)
+        (Some(gate), Some(guard))
     } else {
-        None
+        (None, None)
     };
 
-    // Step C (Confirm & Claim): re-read and claim under release-check.lock (strictly 2 -> 3).
+    // Step C (Confirm & Claim): re-read and claim under release-check.lock (strictly 1 -> 2 -> 3).
     let (approval, settings, orig_lost_alerted) = {
         let _gate = release_check_gate(context)?;
         let mut state = read_state(context)?;
@@ -744,10 +819,8 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
                 save_state(context, &state)?;
                 return Err(reason);
             }
-            if !existing.automatic {
-                drop(idle.take());
-            } else {
-                if idle.is_none() {
+            if existing.automatic {
+                if idle.is_none() || update_gate.is_none() {
                     return Ok(());
                 }
                 state.approval = None;
@@ -784,14 +857,21 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
             (approval, settings, orig)
         }
     };
+    if !approval.automatic {
+        drop(idle.take());
+        drop(update_gate.take());
+    }
 
-    // Step D (Download/Verify): keep idle (2, if auto) outside release-check.lock (3).
+    // Step D (Download/Verify): auto reuses held update_gate (1) under idle (2) without re-acquiring (1);
+    // manual runs outside both (1) and (3).
     let mut lost_alerted = orig_lost_alerted.clone();
     let install_result: Result<(), String> = (|| {
         let root = approval_installation(context)?;
         let path = root.root().join("releases").join(&approval.release.tag);
         if fs::symlink_metadata(&path).is_ok() {
             crate::update::verify(&root, &approval.release.tag)?;
+        } else if let Some(gate) = update_gate.as_ref() {
+            install_with_gate(context, &root, &approval.release, &mut lost_alerted, gate)?;
         } else {
             install(context, &approval.release, &mut lost_alerted)?;
         }
@@ -802,11 +882,11 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
         }
         Ok(())
     })();
-    // Release the staging fence before taking update-restore.lock (1) or release-check.lock (3).
+    // Release the staging turn fence before Step E; keep update_gate (1) for Step E (`1 -> 3`).
     drop(idle);
 
-    // Step E (Publish & Atomic Handover Fence): hold restore_gate (1) -> release_check_gate (3),
-    // verify manual approval still stands, then pass the held restore_gate directly to launcher.
+    // Step E (Publish & Atomic Handover Fence): hold update-restore.lock (1) -> release_check_gate (3),
+    // verify manual approval still stands, then pass the held gate directly to launcher.
     let record_error = |error: &str, lost: &Option<String>| -> Result<(), String> {
         let _gate = release_check_gate(context)?;
         let mut state = read_state(context)?;
@@ -823,12 +903,15 @@ fn apply_approval(context: &RuntimeContext) -> Result<(), String> {
         record_error(&error, &lost_alerted)?;
         return Err(error);
     }
-    let gate = match approval_installation(context).and_then(|root| restore_gate(&root)) {
-        Ok(gate) => gate,
-        Err(error) => {
-            record_error(&error, &lost_alerted)?;
-            return Err(error);
-        }
+    let gate = match update_gate {
+        Some(gate) => gate,
+        None => match approval_installation(context).and_then(|root| restore_gate(&root)) {
+            Ok(gate) => gate,
+            Err(error) => {
+                record_error(&error, &lost_alerted)?;
+                return Err(error);
+            }
+        },
     };
     let should_handover = {
         let _gate = release_check_gate(context)?;
@@ -1661,5 +1744,41 @@ mod tests {
             err,
             ApproveError::Authorize((503, ref msg)) if msg == "selected runtime social state is busy"
         ));
+    }
+
+    #[test]
+    fn approve_under_turn_guard_probes_restore_gate_without_waiting() {
+        let (_guard, root, context) = TempInstall::new("approve-under-turn-guard");
+        let cfg = seed_available(&root, &context, "v1.2.3");
+        let restore_lock = root.root().join("runtime/data/locks/update-restore.lock");
+
+        let held = crate::release_store::installation_gate(&restore_lock).unwrap();
+        let started = Instant::now();
+        let err = approve_authorized_under_turn_guard_in_root(&root, &context, "v1.2.3", || {
+            assert!(context
+                .open_locked_file(
+                    crate::runtime::RuntimeArea::Data,
+                    "locks/release-check.lock",
+                )
+                .is_err());
+            Ok::<_, String>(((), cfg.clone()))
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err,
+            ApproveError::Release(ref message) if message == "another release installation or restore is running"
+        ));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        drop(held);
+
+        let approved =
+            approve_authorized_under_turn_guard_in_root(&root, &context, "v1.2.3", || {
+                Ok::<_, String>(((), cfg.clone()))
+            })
+            .ok()
+            .unwrap();
+        assert_eq!(approved["ok"], true);
+        assert_eq!(approved["approved"], "v1.2.3");
     }
 }

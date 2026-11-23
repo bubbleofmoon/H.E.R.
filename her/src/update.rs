@@ -414,6 +414,7 @@ fn crate_identity_equal(a: &str, b: &str) -> bool {
 pub fn launch(root: &InstallRoot, target: &str, old: &ProcessIdentity) -> Result<u32, String> {
     launch_mode(root, target, old, false, false)
 }
+#[allow(dead_code)]
 pub fn launch_with_gate(
     root: &InstallRoot,
     target: &str,
