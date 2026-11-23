@@ -92,9 +92,7 @@ fn handle_inner(
     // active restore before acquiring the social/configuration gate.
     let _restore_gate =
         if context.is_isolated() && (browser_acl.is_some() || action != "settings-get") {
-            Some(
-                crate::restore::writer_gate_shared(context).map_err(|error| (503, error))?,
-            )
+            Some(crate::restore::writer_gate_shared(context).map_err(|error| (503, error))?)
         } else {
             None
         };

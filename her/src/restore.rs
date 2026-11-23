@@ -289,10 +289,11 @@ pub fn operation_gate(context: &RuntimeContext) -> Result<File, String> {
 /// 7. `locks/authority.lock`
 /// 8. `locks/settings-store.lock` (`settings::restore_gate` / `store_gate`)
 ///
-/// Unstopped writers (`memory_actions::handle_inner`, `memory::open_*`) acquire this gate shared
-/// before `locks/social-v2.lock` or opening `memory.db`, and never take outer restore/lifecycle
-/// locks while holding it. Restore acquires it exclusively only after `quiesce` stops live,
-/// console, and ordinary task owners, and releases it with `Stopped` before `resume`/health.
+/// Unstopped writers (`memory_actions::handle_inner`, `memory::open_store`,
+/// `memory::open_ready_guarded_for_runtime`) acquire this gate shared before `locks/social-v2.lock`
+/// or opening `memory.db`, and never take outer restore/lifecycle locks while holding it.
+/// Restore acquires it exclusively only after `quiesce` stops live, console, and ordinary task
+/// owners, and releases it with `Stopped` before `resume`/health.
 const WRITER_RESTORE_GATE: &str = "locks/restore-writers.lock";
 const WRITER_RESTORE_WAIT: Duration = Duration::from_secs(5);
 
@@ -1146,7 +1147,7 @@ fn execute_with(
         )?;
         let mut previous: Option<PathBuf> = None;
         let mut rollback: Option<Prepared> = None;
-        let attempt = (|| -> Result<(), Step> {
+        let attempt = (|| -> Result<PathBuf, Step> {
             stop_and_replace(
                 context,
                 by,
@@ -1159,8 +1160,8 @@ fn execute_with(
                 },
                 control,
             )?;
-            let previous = previous
-                .as_ref()
+            let previous_path = previous
+                .clone()
                 .ok_or_else(|| Step::Refused("pre-restore backup unavailable".into()))?;
             if !memory_only {
                 let _config = crate::console::config_gate(context).map_err(|(_, e)| Step::Failed(e))?;
@@ -1169,16 +1170,13 @@ fn execute_with(
             resume(context, by)?;
             control.restart(context)?;
             control.health(context, Duration::from_secs(120))?;
-            crate::backup::protect_pre_restore(previous, &|| Ok(()))?;
+            crate::backup::protect_pre_restore(&previous_path, &|| Ok(()))?;
             if !memory_only { finish_recovery(context, RestorePhase::Committed)?; }
-            Ok(())
+            Ok(previous_path)
         })();
         match attempt {
-            Ok(()) => {
-                let previous = previous
-                    .as_ref()
-                    .expect("completed restore recorded pre-restore backup");
-                let mut reply = json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(previous)});
+            Ok(previous_path) => {
+                let mut reply = json!({"ok":true,"result":"succeeded","preRestoreBackup":ordinary_path(&previous_path)});
                 if !memory_only {
                     if let Ok(effective) = context.load_config() {
                         let notices = crate::watchdog::rollout_scope_gaps(&effective).lines();

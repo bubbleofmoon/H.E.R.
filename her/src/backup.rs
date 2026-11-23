@@ -1296,12 +1296,8 @@ fn verify_file_inner(
         if file.size() != expected.size {
             return Err(format!("backup size mismatch: {name}"));
         }
-        let mut db = if ArchiveScope::Full {
-            include_state: true,
-        }
-        .databases()
-        .contains(&name.as_str())
-        {
+        let full_dbs = ArchiveScope::for_restore(false).databases();
+        let mut db = if full_dbs.contains(&name.as_str()) {
             Some(File::create(scratch.0.join(&name)).map_err(|e| e.to_string())?)
         } else {
             None
@@ -1332,11 +1328,7 @@ fn verify_file_inner(
     }
     let mut credentials = crate::settings::ArchivedCredentials::default();
     let mut settings_overlay = Vec::new();
-    for &name in ArchiveScope::Full {
-        include_state: true,
-    }
-    .databases()
-    {
+    for &name in ArchiveScope::for_restore(false).databases() {
         if !manifest.files.contains_key(name) {
             continue;
         }
