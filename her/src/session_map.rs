@@ -357,8 +357,8 @@ pub fn update_context(
     context: &RuntimeContext, key: &str, sid: &str, epoch: &str,
     change: impl FnOnce(&mut Value),
 ) -> Result<bool, String> {
-    let _social = crate::console::acquire_social_state_gate(context).map_err(|(_, e)| e)?;
-    if crate::console::conversation_token(context, key)?.as_deref() != Some(epoch) {
+    let _social = crate::conversation_state::acquire(context).map_err(|(_, e)| e)?;
+    if crate::conversation_state::read_agent_token(context, key)?.as_deref() != Some(epoch) {
         return Ok(false);
     }
     modify(context, |doc| {

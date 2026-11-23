@@ -334,8 +334,8 @@ impl<'a> AdminCaller<'a> {
         self.context
     }
 
-    pub(crate) fn gate(&self) -> Result<Option<std::fs::File>, (u16, String)> {
-        super::config_gate(self.context)
+    pub(crate) fn gate(&self) -> Result<Option<crate::conversation_state::Gate>, (u16, String)> {
+        crate::conversation_state::acquire_config_gate(self.context)
     }
 
     pub(crate) fn with_authority<T>(

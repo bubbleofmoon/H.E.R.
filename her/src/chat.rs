@@ -200,7 +200,7 @@ pub fn handle_update_command(
         // this exact report has a confirmed QQ receipt and the owner is rechecked.
         say(&lines.join("\n"))?;
         let Some((name, version)) = proposed else { return Ok(()); };
-        let _gate = crate::console::acquire_social_state_gate(context).map_err(|(_, error)| error)?;
+        let _gate = crate::conversation_state::acquire(context).map_err(|(_, error)| error)?;
         let latest = context.load_config().map_err(str::to_string)?;
         if !is_owner_key(&latest, key) || owner_qq(&latest) != sender { return Err("administrator changed".into()); }
         return crate::supervisor_dependencies::upgrades::approve(context, &latest, name, &version).map(|_| ());
@@ -220,7 +220,7 @@ pub fn handle_update_command(
         "准备更新 HER：{} → {tag}。",
         state["current"].as_str().unwrap_or("未知版本")
     ))?;
-    let _gate = crate::console::acquire_social_state_gate(context).map_err(|(_, error)| error)?;
+    let _gate = crate::conversation_state::acquire(context).map_err(|(_, error)| error)?;
     let latest = context.load_config().map_err(str::to_string)?;
     if !is_owner_key(&latest, key) || owner_qq(&latest) != sender {
         return Err("administrator changed".into());
