@@ -1942,7 +1942,8 @@ mod tests {
             {"id": format!("a-{secret}"), "model": format!("m-a-{secret}")},
             {"id": "b", "model": "model-b", "reasoningEffort": "high", "maxOutputTokens": 900},
             {"id": "c", "model": "model-c"},
-            {"id": "d", "model": "model-d"}
+            {"id": "d", "model": "model-d"},
+            {"id": "e", "model": "model-e"}
         ]});
         let fixture = TestFixture::new("failover-sticky", cfg_routes, secret);
         let mut route = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
@@ -1978,7 +1979,7 @@ mod tests {
         assert!(failovers[0].contains("a-[REDACTED]") && failovers[0].contains("next route b"), "{failovers:?}");
         assert!(!failovers[0].contains(secret), "credentials never reach run records: {failovers:?}");
 
-        // Next turn starts on sticky degraded route `b`.
+        // Next turn starts on sticky degraded route `b` with a fresh RETRY_CAP budget (2 failovers: b -> c -> d).
         let mut route2 = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
         select_start(&fixture.context, &mut route2, "group:100", "gen-1");
         assert_eq!(route2.start, 1, "sticky degraded route b starts the next turn");
@@ -1998,15 +1999,38 @@ mod tests {
                 tokens_charged: 0,
                 observe_health: true,
             },
+            ScriptAction::Missed {
+                miss: Miss::Failed { class: "backend" },
+                summary: "model/backend backend (504)".into(),
+                response_usage: None,
+                tokens_charged: 0,
+                observe_health: true,
+            },
         ]);
         let err = exec2.next_answer(&mut step2, &mut cancel).await.err().unwrap();
-        assert_eq!(err, ChainError::Missed { class: "backend", summary: "model/backend backend (503)".into() });
+        assert_eq!(err, ChainError::Missed { class: "backend", summary: "model/backend backend (504)".into() });
         assert_eq!(
             step2.calls.iter().map(|c| c.route_id.as_str()).collect::<Vec<_>>(),
-            ["b", "c"],
-            "RETRY_CAP stops at c without reaching d"
+            ["b", "c", "d"],
+            "RETRY_CAP stops at d without reaching e"
         );
         assert_eq!(fixture.records("route-failed").len(), 1);
+
+        // Uncompleted turn holds its spent RETRY_CAP budget into the next turn on sticky route `d`.
+        let mut route3 = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
+        select_start(&fixture.context, &mut route3, "group:100", "gen-1");
+        assert_eq!(route3.start, 3, "sticky degraded route d starts the next turn");
+        let mut exec3 = ChainExecutor::new(turn_chain_cfg(&fixture.context, route3, "group:100"));
+        let mut step3 = ScriptedStep::new(vec![ScriptAction::Missed {
+            miss: Miss::Failed { class: "backend" },
+            summary: "model/backend backend (505)".into(),
+            response_usage: None,
+            tokens_charged: 0,
+            observe_health: true,
+        }]);
+        let err3 = exec3.next_answer(&mut step3, &mut cancel).await.err().unwrap();
+        assert_eq!(err3, ChainError::Missed { class: "backend", summary: "model/backend backend (505)".into() });
+        assert_eq!(step3.calls.iter().map(|c| c.route_id.as_str()).collect::<Vec<_>>(), ["d"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2068,7 +2092,25 @@ mod tests {
             ["a", "a", "a", "a", "a", "b"],
             "1 rate-limit retry + 3 empty retries on a, then 4th empty fails over to b"
         );
-        assert_eq!(fixture.records("route-retry").len(), 4);
+        assert_eq!(
+            step.transitions,
+            vec![
+                Next::Retry { wait: Duration::from_millis(1) },
+                Next::Retry { wait: Duration::from_millis(1) },
+                Next::Retry { wait: Duration::from_millis(2) },
+                Next::Retry { wait: Duration::from_millis(4) },
+                Next::FailOver,
+            ]
+        );
+        let retry_records: Vec<_> = crate::recovery_log::page(&fixture.context, &crate::run_record::Query::default())
+            .unwrap()
+            .records
+            .into_iter()
+            .filter(|r| r.event == "route-retry")
+            .collect();
+        // `run_record` collapses identical-shape `EMPTY_ANSWER` retries inside the window and flushes `repeat: 2` on `failover-step`.
+        assert_eq!(retry_records.len(), 3);
+        assert_eq!(retry_records.iter().map(|r| r.repeat.unwrap_or(1)).sum::<u32>(), 4);
         assert_eq!(fixture.health(), (vec!["a=failed".into(), "b=ok".into()], false));
         let usage_rows = fixture.usage_rows();
         assert_eq!(usage_rows.len(), 5, "429 has no response end; 4 empties + 1 answer record 5 rows");
