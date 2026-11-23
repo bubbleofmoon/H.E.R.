@@ -1533,3 +1533,244 @@ fn rig_drop_stops_a_console_the_supervisor_started_when_the_test_panics() {
     let console = console.expect("the console was started before the panic");
     assert_stopped_after_drop(&console);
 }
+
+#[test]
+fn supervisor_starts_live_bridge_before_gateway_without_kill_and_connects_when_gateway_appears() {
+    struct DelayedGateway {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        up: Arc<std::sync::atomic::AtomicBool>,
+        connected: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        url: String,
+    }
+    impl DelayedGateway {
+        fn new() -> Self {
+            let listener = support::ports::reserve().into_listener();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let is_up = up.clone();
+            let is_connected = connected.clone();
+            let thread = std::thread::spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    if !is_up.load(Ordering::SeqCst) {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
+                        );
+                        continue;
+                    }
+                    let Ok(mut socket) = tokio_tungstenite::tungstenite::accept(stream) else {
+                        continue;
+                    };
+                    is_connected.store(true, Ordering::SeqCst);
+                    while !stopping.load(Ordering::Relaxed) {
+                        match socket.read() {
+                            Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
+                                if let Ok(request) = serde_json::from_str::<Value>(&text) {
+                                    let data = if request["action"] == "get_login_info" {
+                                        json!({"user_id": 10001, "nickname": "delayed gateway"})
+                                    } else {
+                                        json!({})
+                                    };
+                                    let reply = json!({
+                                        "status": "ok",
+                                        "retcode": 0,
+                                        "echo": request["echo"],
+                                        "data": data
+                                    });
+                                    if socket
+                                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                                            reply.to_string(),
+                                        ))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio_tungstenite::tungstenite::Error::Io(e))
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                                ) => {}
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+            Self {
+                stop,
+                up,
+                connected,
+                thread: Some(thread),
+                url,
+            }
+        }
+    }
+    impl Drop for DelayedGateway {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    let mut rig = Rig::new();
+    let root = rig.fixture.0.clone();
+    assert_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || root.join("data/backup-notices.json").exists(),
+        || "supervisor initialization did not finish".into(),
+    );
+
+    let gateway = DelayedGateway::new();
+    let deps_path = root.join("dependencies.json");
+    let mut deps: Value = serde_json::from_slice(&std::fs::read(&deps_path).unwrap()).unwrap();
+    deps["onebot_ws"] = json!(gateway.url);
+    std::fs::write(&deps_path, deps.to_string()).unwrap();
+
+    // Plant a fresh-looking heartbeat from a non-existent previous owner before live starts.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    std::fs::write(
+        root.join("data/rust-heartbeat-live.json"),
+        json!({
+            "ts": now_ms,
+            "pid": 999_999,
+            "live": true,
+            "groups": ["group:123456"],
+            "state": "ready",
+            "gatewayConnected": true
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    rig.config["backends"]["mcpRustBridge"] = json!(true);
+    rig.config["rollout"]["rustGroups"] = json!(["group:123456"]);
+    rig.config["tasks"]["watchdog"]["enabled"] = json!(true);
+    rig.save_config();
+
+    // Health check must never report a stale previous-owner heartbeat as running or ready.
+    let (code, before) = rig.fixture.check(&[]);
+    assert_eq!(code, 0, "{before}");
+    assert_eq!(before["live"]["state"], "not-running", "{before}");
+    assert!(before["live"].get("pid").is_none(), "{before}");
+
+    // Trigger immediate watchdog reconciliation through a fresh desired-state revision.
+    let mut set = hidden(env!("CARGO_BIN_EXE_her-cli"));
+    set.args(["lifecycle", "set", "running", "--runtime-root"])
+        .arg(&root);
+    let running = run_bounded(&mut set, Duration::from_secs(12)).unwrap();
+    assert!(running.status.success(), "{}", String::from_utf8_lossy(&running.stderr));
+
+    // Supervisor must start the live bridge cleanly while the gateway is down and wait in
+    // `waiting-for-gateway` without killing it at the 15s deadline.
+    let read_live_identity = || -> Option<ProcessIdentity> {
+        let bytes = std::fs::read(root.join("data/logs/rbridge-live.lock.owner.json")).ok()?;
+        let marker: Value = serde_json::from_slice(&bytes).ok()?;
+        serde_json::from_value(marker["identity"].clone()).ok()
+    };
+    let read_hb = || -> Option<Value> {
+        let bytes = std::fs::read(root.join("data/rust-heartbeat-live.json")).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let mut started_identity = None;
+    assert_eventually(
+        Duration::from_secs(25),
+        Duration::from_millis(50),
+        || {
+            let mut runs_cmd = hidden(env!("CARGO_BIN_EXE_her-cli"));
+            runs_cmd
+                .args(["tasks", "runs", "--task", "watchdog", "--limit", "5", "--runtime-root"])
+                .arg(&root);
+            let Ok(out) = run_bounded(&mut runs_cmd, Duration::from_secs(10)) else {
+                return false;
+            };
+            let runs: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+            let Some(latest) = runs["runs"].as_array().and_then(|list| list.first()) else {
+                return false;
+            };
+            if latest["state"] == "failed" {
+                panic!("watchdog failed instead of accepting waiting-for-gateway: {latest}");
+            }
+            if latest["state"] != "succeeded" {
+                return false;
+            }
+            let Some(id) = read_live_identity() else {
+                return false;
+            };
+            if process_identity::check_identity(&id) != Liveness::Matches {
+                return false;
+            }
+            let Some(hb) = read_hb() else {
+                return false;
+            };
+            if hb["pid"] == id.pid
+                && hb["state"] == "waiting-for-gateway"
+                && hb["gatewayConnected"] == false
+                && hb["live"] == true
+                && hb["groups"] == json!(["group:123456"])
+            {
+                started_identity = Some(id);
+                true
+            } else {
+                false
+            }
+        },
+        || {
+            format!(
+                "live bridge did not enter waiting-for-gateway cleanly; hb={:?}, identity={:?}",
+                read_hb(),
+                read_live_identity()
+            )
+        },
+    );
+    let live_identity = started_identity.unwrap();
+    assert!(!gateway.connected.load(Ordering::SeqCst));
+
+    let (code, waiting_verdict) = rig.fixture.check(&[]);
+    assert_eq!(code, 0, "{waiting_verdict}");
+    assert_eq!(waiting_verdict["live"]["state"], "waiting-for-gateway", "{waiting_verdict}");
+    assert_eq!(waiting_verdict["live"]["pid"], live_identity.pid, "{waiting_verdict}");
+
+    // Bring the gateway up: the running live bridge connects automatically without a restart.
+    gateway.up.store(true, Ordering::SeqCst);
+    assert_eventually(
+        Duration::from_secs(20),
+        Duration::from_millis(50),
+        || {
+            gateway.connected.load(Ordering::SeqCst)
+                && read_hb().is_some_and(|hb| {
+                    hb["pid"] == live_identity.pid
+                        && hb["state"] == "ready"
+                        && hb["gatewayConnected"] == true
+                        && hb["live"] == true
+                })
+        },
+        || format!("live bridge did not transition to ready; hb={:?}", read_hb()),
+    );
+    assert_eq!(
+        read_live_identity().as_ref(),
+        Some(&live_identity),
+        "live owner must connect without being killed or restarted"
+    );
+
+    let (code, ready_verdict) = rig.fixture.check(&[]);
+    assert_eq!(code, 0, "{ready_verdict}");
+    assert_eq!(ready_verdict["live"]["state"], "ready", "{ready_verdict}");
+    assert_eq!(ready_verdict["live"]["pid"], live_identity.pid, "{ready_verdict}");
+}

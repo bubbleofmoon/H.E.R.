@@ -685,7 +685,7 @@ impl Effects for RealEffects {
                 return false;
             };
             owner.marker.identity.pid == pid
-                && lifecycle::verify_live_heartbeat(
+                && lifecycle::check_live_heartbeat(
                     &mut LiveLifecycle,
                     self.context.data_dir(),
                     &owner.marker,
@@ -745,14 +745,22 @@ fn watchdog_tick(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mut 
     let target = watchdog::live_target_from_config(&cfg);
     let console = target.as_ref().map(|t| console_probe(context, t.console_port))
         .unwrap_or_else(|e| ConsoleProbe::Unknown(e.clone()));
+    let live = checked_live(context);
+    let live_marker = match &live {
+        watchdog::LiveObservation::Held { marker, .. } => Some(marker),
+        _ => None,
+    };
+    let heartbeat = watchdog::read_heartbeat_for_owner(
+        LiveLifecycle.read_heartbeat(context.data_dir()),
+        live_marker,
+        now,
+    );
     let observation = Observation {
-        desired: desired(context), target, console,
-        live: checked_live(context),
-        heartbeat: match context.read_optional_text(RuntimeArea::Data, "rust-heartbeat-live.json") {
-            Ok(Some(text)) => watchdog::read_heartbeat(Ok(text.into_bytes()), now),
-            Ok(None) => watchdog::Heartbeat::Missing,
-            Err(_) => watchdog::Heartbeat::Unknown("heartbeat is unreadable".into()),
-        },
+        desired: desired(context),
+        target,
+        console,
+        live,
+        heartbeat,
     };
     let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
     let decision = watchdog::decide(&observation, &state);
