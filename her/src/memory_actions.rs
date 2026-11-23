@@ -91,7 +91,7 @@ fn handle_inner(
     // Serialize with session reset/token rotation, and re-read configuration after waiting.
     // SQLite writers and ACL revocation below share this gate with MCP calls.
     let _gate = if context.is_isolated() {
-        Some(crate::console::acquire_social_state_gate(context)?)
+        Some(crate::conversation_state::acquire(context)?)
     } else {
         None
     };

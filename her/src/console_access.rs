@@ -187,7 +187,7 @@ pub(super) fn whitelist_post(context: &RuntimeContext, body: &str) -> Result<Val
     // The revocation compares the policy the runtime authorizes with (canonical lists and the
     // closed-agent owner overlay), read under the same gate as the write.
     let (before, after, file, pending) = {
-        let _gate = acquire_social_state_gate(context)?;
+        let _gate = crate::conversation_state::acquire(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         // #192: the file as read, to tell a write that failed before publication from one that published.
         let unchanged = read_config_object(context)?;
@@ -309,7 +309,7 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
     let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
     finish_pending_before_change(context, &interaction)?;
     let (before, after, changed, pending, mirror_error) = {
-        let _gate = acquire_social_state_gate(context)?;
+        let _gate = crate::conversation_state::acquire(context)?;
         let effective_before = context.load_config().map_err(|e| (503, e.to_string()))?;
         // #192: the file as read, to tell a write that failed before publication from one that published.
         let unchanged = read_config_object(context)?;
@@ -465,12 +465,8 @@ fn candidate_keys(context: &RuntimeContext, before: &Value, after: &Value) -> (V
         Ok(mappings) => keys.extend(mappings.into_iter().map(|(key, _)| key)),
         Err(error) => failures.push(format!("读取会话映射失败：{error}")),
     }
-    match load_social_state_for(context) {
-        Ok(state) => {
-            if let Some(conversations) = state.get("conversations").and_then(Value::as_object) {
-                keys.extend(conversations.keys().cloned());
-            }
-        }
+    match crate::conversation_state::ConversationState::for_runtime(context).read_document() {
+        Ok(doc) => keys.extend(doc.conversation_keys()),
         Err((_, error)) => failures.push(format!("读取会话状态失败：{error}")),
     }
     match crate::reserved::known_keys(context) {
@@ -633,16 +629,10 @@ fn revoke_key(context: &RuntimeContext, cfg: &Value, key: &str, why: &str) -> Re
             stop = Some(session.clone());
         }
     }
-    if let Err((_, error)) = mutate_social_state_for(context, |state| {
-        if let Some(conversation) = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
-        {
-            conversation.insert("agentToken".into(), json!(fresh_agent_token()));
-            conversation.insert("bootstrapSent".into(), json!(false));
-            conversation.remove("engineHandover");
-        }
+    if let Err((_, error)) = crate::conversation_state::ConversationState::for_runtime(context).update_existing(key, |conversation| {
+        conversation.rotate_token();
+        conversation.set_field("bootstrapSent", json!(false));
+        conversation.remove_field("engineHandover");
         Ok(())
     }) {
         failures.push(format!("轮换会话令牌失败：{error}"));
@@ -1254,7 +1244,7 @@ fn js_truthy(value: &Value) -> bool {
 pub(super) fn security_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let body = parse_object_body(body)?;
     if body.get("rehardenStateDir") == Some(&json!(true)) {
-        let _gate = acquire_social_state_gate(context)?;
+        let _gate = crate::conversation_state::acquire(context)?;
         let dir = state_dir(context).map_err(|error| (503, error))?;
         let (ok, detail) = harden_state_dir(&dir);
         if !ok {
@@ -1266,7 +1256,7 @@ pub(super) fn security_post(context: &RuntimeContext, body: &str) -> Result<Valu
     // `"confirm": true` (409 otherwise, nothing written), is validated by the registry (400) and is stored through the
     // settings store; the file keeps its registry members as the store wrote them back and gets the other members.
     let confirm = crate::settings::confirm_field(&body)?;
-    let _gate = acquire_social_state_gate(context)?;
+    let _gate = crate::conversation_state::acquire(context)?;
     let unchanged = read_config_object(context)?;
     let mut file = unchanged.clone();
     crate::settings::mirror_into(context, &mut file).map_err(|e| (503, e))?;
@@ -1352,12 +1342,8 @@ pub(super) fn social_v2_reset(context: &RuntimeContext) -> Result<Value, (u16, S
     let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
     // Recorded before anything changes: if it cannot be written, nothing is reset.
     crate::turn_ledger::record_reset_why(context, "*", "socialV2-reset").map_err(|e| (503, e))?;
-    let state = load_social_state_for(context)?;
-    let keys: Vec<String> = state
-        .get("conversations")
-        .and_then(Value::as_object)
-        .map(|c| c.keys().cloned().collect())
-        .unwrap_or_default();
+    let doc = crate::conversation_state::ConversationState::for_runtime(context).read_document()?;
+    let keys = doc.conversation_keys();
     // Queued ingress of these conversations is discarded with them (JS drops the timers and
     // queues), also across a restart before the scheduler's next tick. A failure is reported: the
     // events would be replayed after a restart.
@@ -1382,22 +1368,22 @@ pub(super) fn social_v2_reset(context: &RuntimeContext) -> Result<Value, (u16, S
             }
         }
     }
-    mutate_social_state_for(context, |state| {
-        let previous = state.get("conversations").and_then(Value::as_object).cloned().unwrap_or_default();
+    crate::conversation_state::ConversationState::for_runtime(context).update_document(|doc| {
         let mut kept = serde_json::Map::new();
-        for (key, conversation) in previous {
+        for (key, conversation) in doc.conversations() {
+            let conv_val = conversation.to_value();
             // Pending sticker liabilities keep their (revoked) identity so quota stays counted,
             // as in the single-conversation reset; everything else goes.
             if ["stickerSendProtected", "stickerSendPending", "stickerCollectPending"]
                 .iter()
-                .any(|f| conversation.get(*f).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
+                .any(|f| conv_val.get(*f).and_then(Value::as_array).is_some_and(|a| !a.is_empty()))
             {
-                let mut replacement = new_conversation(context);
-                preserve_reset_sticker_liabilities(&conversation, &mut replacement);
-                kept.insert(key, replacement);
+                let mut replacement = crate::conversation_state::Conversation::new_default(context).to_value();
+                preserve_reset_sticker_liabilities(&conv_val, &mut replacement);
+                kept.insert(key.to_string(), replacement);
             }
         }
-        *state = json!({"conversations": kept, "resetEpoch": crate::turn_ledger::mint_id("reset-")});
+        doc.replace_all_with_reset(kept, crate::turn_ledger::mint_id("reset-"));
         Ok(())
     })?;
     for key in &keys {
@@ -1454,7 +1440,7 @@ pub(super) fn social_v2_wake_with(
     }
     let canonical = canonical_v2_key(&key).ok_or((400, format!("无效的会话 key：{key}")))?;
     let at = now_ms();
-    let (first, effective) = mutate_social_state_for(context, |state| {
+    let (first, effective) = crate::conversation_state::ConversationState::for_runtime(context).update_or_init(&canonical, |conversation| {
         // Checked again under the gate: a mode change, revocation or reset may have completed
         // while this request waited for it.
         let mode = current_mode_for(context)?;
@@ -1468,32 +1454,22 @@ pub(super) fn social_v2_wake_with(
         if !agent::mode_allowed(&fresh, &mode, &key) {
             return Err((403, "目标不在当前模式允许范围内".to_string()));
         }
-        if !state["conversations"].is_object() {
-            state["conversations"] = json!({});
-        }
-        if state["conversations"].get(&canonical).is_none() {
-            state["conversations"][&canonical] = new_conversation(context);
-        }
-        let conversation = &mut state["conversations"][&canonical];
-        let first = conversation.get("bootstrapSent").and_then(Value::as_bool) != Some(true);
+        let first = conversation.field("bootstrapSent").and_then(Value::as_bool) != Some(true);
         if first {
-            conversation["bootstrapSent"] = json!(true);
+            conversation.set_field("bootstrapSent", json!(true));
         }
         let effective = if first { "bootstrap".to_string() } else { reason.clone() };
-        let epoch = conversation
-            .get("agentToken")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(crate::send_outbox::token_epoch)
+        let epoch = conversation.generation().unwrap_or_default();
+        let mut queue = conversation
+            .field("adminWakes")
+            .and_then(Value::as_array)
+            .cloned()
             .unwrap_or_default();
-        if !conversation["adminWakes"].is_array() {
-            conversation["adminWakes"] = json!([]);
-        }
-        let queue = conversation["adminWakes"].as_array_mut().expect("array set above");
         queue.push(json!({"reason": effective, "epoch": epoch, "at": at}));
         if queue.len() > ADMIN_WAKE_QUEUE {
             queue.drain(..queue.len() - ADMIN_WAKE_QUEUE);
         }
+        conversation.set_field("adminWakes", Value::Array(queue));
         Ok((first, effective))
     })?;
     crate::safe_println!(
@@ -1507,30 +1483,26 @@ pub(super) fn social_v2_wake_with(
 /// tick, so a second request meets the first one's turn as JS's busy queue does). Returns it only
 /// when it was made under the conversation's current token epoch.
 pub(crate) fn take_admin_wake(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
-    mutate_social_state_for(context, |state| {
-        let Some(conversation) = state.get_mut("conversations").and_then(|c| c.get_mut(key)) else {
-            return Ok(None);
-        };
-        let Some(queue) = conversation.get_mut("adminWakes").and_then(Value::as_array_mut) else {
-            return Ok(None);
-        };
-        if queue.is_empty() {
-            return Ok(None);
-        }
-        let request = queue.remove(0);
-        if queue.is_empty() {
-            conversation.as_object_mut().map(|c| c.remove("adminWakes"));
-        }
-        let current = conversation
-            .get("agentToken")
-            .and_then(Value::as_str)
-            .filter(|t| !t.is_empty())
-            .map(crate::send_outbox::token_epoch)
-            .unwrap_or_default();
-        if request.get("epoch").and_then(Value::as_str).unwrap_or("") != current {
-            return Ok(None);
-        }
-        Ok(request.get("reason").and_then(Value::as_str).map(str::to_string))
-    })
-    .map_err(|(_, e)| e)
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .update_existing(key, |conversation| {
+            let Some(mut queue) = conversation.field("adminWakes").and_then(Value::as_array).cloned() else {
+                return Ok(None);
+            };
+            if queue.is_empty() {
+                return Ok(None);
+            }
+            let request = queue.remove(0);
+            if queue.is_empty() {
+                conversation.remove_field("adminWakes");
+            } else {
+                conversation.set_field("adminWakes", Value::Array(queue));
+            }
+            let current = conversation.generation().unwrap_or_default();
+            if request.get("epoch").and_then(Value::as_str).unwrap_or("") != current {
+                return Ok(None);
+            }
+            Ok(request.get("reason").and_then(Value::as_str).map(str::to_string))
+        })
+        .map(Option::flatten)
+        .map_err(|(_, e)| e)
 }

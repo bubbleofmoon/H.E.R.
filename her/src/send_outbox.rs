@@ -21,24 +21,15 @@
 //! Writers go through `recorded_send.rs`; this module owns the record format and folding.
 
 use serde_json::{json, Value};
+
+pub(crate) use crate::conversation_state::{token_epoch, token_epoch_matches};
+
 use crate::runtime::{RuntimeArea, RuntimeContext};
 
 /// Rust-owned legacy outbox; written only by this process (same pattern as the Rust token ledger).
 pub const LEGACY_OUTBOX_FILE: &str = crate::legacy_path!("state/send-outbox-rust.jsonl");
 /// Relative name inside the selected runtime data area.
 pub const ISOLATED_OUTBOX_FILE: &str = "send-outbox.jsonl";
-
-/// Non-reversible identity of the agent token a batch was created under.
-pub fn token_epoch(token: &str) -> String {
-    crate::console_auth::credential_digest(token)[..8].iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub(crate) fn token_epoch_matches(token: &str, epoch: &str) -> bool {
-    !token.is_empty() && crate::console_auth::decode_digest::<8>(epoch).is_some_and(|expected| {
-        let digest = crate::console_auth::credential_digest(token);
-        crate::console_auth::digests_equal(&expected, digest.first_chunk::<8>().unwrap())
-    })
-}
 
 /// Read every outbox record in append order. A truncated record (crash mid-append) is skipped with a
 /// warning; any other damaged line is an error (see `runtime::parse_evidence_jsonl`).

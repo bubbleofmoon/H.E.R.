@@ -2,16 +2,20 @@
 //! only the live hub schedules turns. Timers and jobs never survive a process generation.
 use crate::{
     chat, console,
+    conversation_state::{
+        read_reserved_document as read, reserved_document_exists,
+        update_reserved_document as mutate, ReservedConversation as Conversation,
+        ReservedGeneration, ReservedMessage as Message, ReservedState as State,
+        RESERVED_FILE as FILE,
+    },
     inbound::SharedJournal,
     pipeline::Pipeline,
     runtime::{RuntimeArea, RuntimeContext},
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-const FILE: &str = "social-v1.json";
 const SPLIT_HINT: &str = "想分多条消息时用空格分隔；不想分条就不要加空格，用标点连接。注意：中英文/数字之间的空格也会被当作分条信号。";
 const DIRECTION: &str = "注意：消息里的 [引用 某人：...] 表示这句话是在回应被引用的人；引用的是你的消息才是在找你，引用别人时别默认是在找你。";
 fn now() -> i64 {
@@ -62,124 +66,18 @@ fn range(seed: &mut u32, cfg: &Value, lo: &str, hi: &str) -> i64 {
     a.saturating_add((random(seed) * (b.saturating_sub(a) as f64 + 1.0)).floor() as i64)
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct Message {
-    sender: String,
-    text: String,
-    plain: String,
-    quote_target_is_self: bool,
-    is_owner: bool,
-    media: Vec<Value>,
-    message_id: String,
-    event_key: String,
-    time: i64,
-}
-impl Message {
-    fn line(&self, owner: bool) -> String {
-        format!(
-            "{}{}：{}{}",
-            if owner && self.is_owner {
-                "【管理员】"
-            } else {
-                ""
-            },
-            self.sender,
-            self.text,
-            chat::media_hint(&self.message_id, self.media.len())
-        )
-    }
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct Conversation {
-    phase: String,
-    last_check_at: i64,
-    next_check_at: i64,
-    last_active_message_at: i64,
-    active_entered_at: i64,
-    active_deadline_at: i64,
-    active_exit_at: i64,
-    last_ai_reply_at: i64,
-    probe_deadline: i64,
-    proactive_next_check_at: i64,
-    generation: String,
-    recent: Vec<Message>,
-    summary: Vec<Message>,
-    silent: Vec<Message>,
-}
-impl Default for Conversation {
-    fn default() -> Self {
-        Self {
-            phase: "idle".into(),
-            last_check_at: 0,
-            next_check_at: 0,
-            last_active_message_at: 0,
-            active_entered_at: 0,
-            active_deadline_at: 0,
-            active_exit_at: 0,
-            last_ai_reply_at: 0,
-            probe_deadline: 0,
-            proactive_next_check_at: 0,
-            generation: crate::turn_ledger::mint_id("v1-"),
-            recent: vec![],
-            summary: vec![],
-            silent: vec![],
-        }
-    }
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct State {
-    owner: String,
-    seed: u32,
-    console_config_stamp: String,
-    console_social_config: Option<Value>,
-    conversations: BTreeMap<String, Conversation>,
-    flush: BTreeMap<String, Flush>,
-}
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-struct Flush {
-    key: String,
-    status: String,
-    remaining: usize,
-}
-fn read(context: &RuntimeContext) -> Result<State, String> {
-    match context
-        .read_optional_text(RuntimeArea::Data, FILE)
-        .map_err(|e| e.to_string())?
-    {
-        Some(s) => serde_json::from_str(&s).map_err(|_| "reserved state is invalid".into()),
-        None => Ok(State::default()),
-    }
-}
-fn mutate<T>(
-    context: &RuntimeContext,
-    f: impl FnOnce(&mut State) -> Result<T, String>,
-) -> Result<T, String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let _gate = loop {
-        match context.open_locked_file(RuntimeArea::Data, "locks/social-v1.lock") {
-            Ok(g) => break g,
-            Err(e) if e == "runtime file is already locked" && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10))
-            }
-            Err(e) => return Err(format!("reserved state gate: {e}")),
-        }
-    };
-    let mut state = read(context)?;
-    let result = f(&mut state)?;
-    context
-        .write_atomic(
-            RuntimeArea::Data,
-            FILE,
-            serde_json::to_vec_pretty(&state)
-                .map_err(|e| e.to_string())?
-                .as_slice(),
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(result)
+fn message_line(message: &Message, owner: bool) -> String {
+    format!(
+        "{}{}：{}{}",
+        if owner && message.is_owner {
+            "【管理员】"
+        } else {
+            ""
+        },
+        message.sender,
+        message.text,
+        chat::media_hint(&message.message_id, message.media.len())
+    )
 }
 fn enter(c: &mut Conversation, seed: &mut u32, cfg: &Value, key: &str, at: i64) {
     c.phase = "active".into();
@@ -221,7 +119,7 @@ fn context_block(c: &Conversation, cfg: &Value) -> String {
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
-        .map(|m| m.line(true))
+        .map(|m| message_line(m, true))
         .collect::<Vec<_>>()
         .join("\n");
     if lines.is_empty() {
@@ -366,11 +264,7 @@ fn settle_buffer(context: &RuntimeContext, c: &Conversation) -> Result<(), Strin
 }
 /// Reset settles queued ingress before removing the old conversation generation.
 pub fn reset_conversation(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    if context
-        .read_optional_text(RuntimeArea::Data, FILE)
-        .map_err(|e| e.to_string())?
-        .is_none()
-    {
+    if !reserved_document_exists(context)? {
         return Ok(());
     }
     mutate(context, |s| {
@@ -453,7 +347,7 @@ pub fn retire_mode_state(context: &RuntimeContext) -> Result<(), String> {
 #[derive(Clone)]
 pub struct Authority {
     owner: String,
-    generation: String,
+    generation: ReservedGeneration,
     mode: String,
     social: bool,
     pub token: String,
@@ -473,8 +367,7 @@ impl Authority {
         }
         let state = read(context)?;
         if state.owner != self.owner
-            || state.conversations.get(key).map(|c| c.generation.as_str())
-                != Some(self.generation.as_str())
+            || state.conversations.get(key).map(|c| &c.generation) != Some(&self.generation)
         {
             return Err("reserved generation changed".into());
         }
@@ -927,7 +820,7 @@ impl Hub {
             {
                 c.phase = "exiting".into();
                 c.active_exit_at = now();
-                c.generation = crate::turn_ledger::mint_id("exit-");
+                c.generation.retire();
                 c.summary.push(message.clone());
                 job=Some((format!("{prefix}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",context_block(c,&sc)),true));
             } else if c.phase == "active" || c.phase == "probing" {
@@ -1101,7 +994,7 @@ impl Hub {
                     let lines = c
                         .summary
                         .iter()
-                        .map(|m| m.line(true))
+                        .map(|m| message_line(m, true))
                         .collect::<Vec<_>>()
                         .join("\n");
                     planned.push((key.clone(),format!("{prefix}【群聊摘要】过去一段时间群里发生了这些（你未逐条参与）：\n{lines}\n\n【最近对话】\n{}\n\n你不需要回复，只需记住这些内容，后续聊天会更自然。",context_block(c,&sc)),false,c.summary.clone(),id.clone(),0));
@@ -1160,7 +1053,7 @@ impl Hub {
                         {
                             c.phase = "exiting".into();
                             c.active_exit_at = now();
-                            c.generation = crate::turn_ledger::mint_id("exit-");
+                            c.generation.retire();
                             farewell = true;
                             prompt=Some(format!("{}【群聊上下文】\n{}\n\n你已经参与群聊有一阵子了，现在该自然地收尾/潜水了。请说一句简短的退场话（例如“我先潜水了”“你们聊，我摸鱼去了”），说完后就安静下来，不再继续接话。",role_prefix(&context,&cfg,key),context_block(c,&sc)));
                         } else if now() >= c.next_check_at {
@@ -1202,7 +1095,7 @@ impl Hub {
                                     messages.extend(new);
                                     let lines = messages
                                         .iter()
-                                        .map(|m| m.line(true))
+                                        .map(|m| message_line(m, true))
                                         .collect::<Vec<_>>()
                                         .join("\n");
                                     media = messages;
@@ -1501,6 +1394,57 @@ mod tests {
     }
 
     #[test]
+    fn reserved_generation_retires_independently_of_the_v2_token() {
+        let fixture = crate::runtime::tests::runtime_fixture(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../.test-fixtures")
+                .join(turn_ledger::mint_id("reserved-generation-")),
+            &json!({"consoleToken": "fixture-token", "allow": {"groups": [42]}}),
+            &json!({
+                "dsh": "http://127.0.0.1:1",
+                "model": "http://127.0.0.1:2",
+                "onebot": "http://127.0.0.1:3"
+            }),
+        );
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        context
+            .write_atomic(RuntimeArea::Data, "mode.json", br#"{"mode":"reserved"}"#)
+            .unwrap();
+        let key = "group:42";
+        context
+            .write_atomic(
+                RuntimeArea::Data,
+                FILE,
+                br#"{"conversations":{"group:42":{"generation":"older-generation"}}}"#,
+            )
+            .unwrap();
+        let authority = authority_for_test(&context, key).unwrap();
+        authority.check(&context, key).unwrap();
+
+        let token = console::ensure_or_rotate_agent_token(&context, key, true).unwrap();
+        authority.check_generation(&context, key).unwrap();
+        assert_eq!(
+            authority.check(&context, key).unwrap_err(),
+            "reserved token changed"
+        );
+        let authority = authority_for_test(&context, key).unwrap();
+        mutate(&context, |state| {
+            state.conversations.get_mut(key).unwrap().generation.retire();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            authority.check_generation(&context, key).err().as_deref(),
+            Some("reserved generation changed"),
+            "retiring the reserved generation must invalidate its captured authority"
+        );
+        assert_eq!(
+            console::conversation_token(&context, key).unwrap(),
+            Some(token)
+        );
+    }
+
+    #[test]
     fn gap_ledger_known_keys_reports_an_unreadable_state_instead_of_hiding_it() {
         let (root, context) = fixture();
         assert_eq!(known_keys(&context).unwrap(), Vec::<String>::new(), "no state yet is no keys");
@@ -1641,7 +1585,7 @@ mod tests {
             farewell: false,
             summary: vec![],
             flush: String::new(),
-            authority: Authority { owner: "o".into(), generation: "g".into(), mode: "m".into(), social: true, token: "t".into() },
+            authority: Authority { owner: "o".into(), generation: ReservedGeneration::new(), mode: "m".into(), social: true, token: "t".into() },
             inbound: vec![format!("event-{text}")],
             attempt: 0,
         }

@@ -7,6 +7,7 @@
 //!   · 响应必须带 `no-store`，否则管理台改完配置刷新看不到新值
 
 use crate::console_auth::{credential_digest, credential_eq, digests_equal};
+use crate::conversation_state::{Conversation, ConversationState, SocialDocument};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::settings::tool_enabled;
 use serde_json::{json, Value};
@@ -17,7 +18,6 @@ use std::net::{TcpListener, TcpStream};
 const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
 /// 写类端点改的那份文件（与 CONFIG_PATH 同一个，单独命名是为了让读/写意图在代码里可辨）
 const CFG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
-const SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 /// DSH Web 总账文件名：events 里的 day/model/cost/tokens 是**所有入口**（含 Web GUI / CLI）的用量。
 /// No-root callers find it under the explicit DSH home; isolated callers use `user/dsh`.
 const DSH_USAGE_FILE_NAME: &str = ".dshw-usage.json";
@@ -46,6 +46,13 @@ pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
     revoke as revoke_agent_token, token as conversation_token,
 };
+pub(crate) use crate::conversation_state::{
+    acquire as acquire_social_state_gate, acquire_config_gate as config_gate,
+    fresh_agent_token, new_conversation, read_console_document as load_social_state_for,
+    update_raw as mutate_social_state_for,
+};
+#[cfg(test)]
+use crate::conversation_state::update_selected_raw as update_selected_social_state;
 #[cfg(test)]
 use crate::memory_actions::handle as handle_memory_action;
 #[cfg(test)]
@@ -352,18 +359,6 @@ fn note_config_before_request(context: &RuntimeContext) {
             *writes = Some((before, after));
         }
     });
-}
-
-/// Ticket 24: every selected-runtime `config.json` read-modify-write holds the social-state gate
-/// (one gate, `SOCIAL_STATE_GATE_WAIT`) from a fresh read of the file to its atomic write, so no
-/// writer puts back an allow list or token another writer replaced meanwhile. Legacy contexts are
-/// not coordinated.
-pub(crate) fn config_gate(context: &RuntimeContext) -> Result<Option<std::fs::File>, (u16, String)> {
-    if context.is_isolated() {
-        acquire_social_state_gate(context).map(Some)
-    } else {
-        Ok(None)
-    }
 }
 
 pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
@@ -1230,7 +1225,10 @@ mod desktop_grants {
 
 /// File-backed administrator status fields; `agent::finish_status` adds the agent readiness probe.
 fn handle_status(cfg: &Value) -> Value {
-    let state = read_json(SOCIAL_STATE).unwrap_or_else(|| json!({}));
+    let state = ConversationState::for_runtime(&RuntimeContext::legacy())
+        .read_optional_document()
+        .map(SocialDocument::into_value)
+        .unwrap_or_else(|_| json!({}));
     handle_status_with_state(cfg, state)
 }
 
@@ -1323,15 +1321,10 @@ const ROLES_DIR: &str = crate::legacy_path!("qq-bridge/roles");
 /// JS 只回 7 个字段：wakeConfig / wakeSafety / unreadCount / recentCount /
 /// lastWakeReason / lastAiReplyAt。之前我把 social-v2.json 里那一段整个回过去，
 /// 结果多出 18 个字段（recentMessages / unread / wakeTimes …），对拍直接爆。
-fn social_state_summary_for_keys(state: &Value, lookup_key: &str, response_key: &str) -> Value {
-    let sess = state
-        .get("conversations")
-        .and_then(|c| c.get(lookup_key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
+fn social_state_summary_for_doc(doc: &SocialDocument, lookup_key: &str, response_key: &str) -> Value {
+    let sess = doc.conversation(lookup_key).unwrap_or_default();
     let wc = sess
-        .get("wakeConfig")
+        .field("wakeConfig")
         .cloned()
         .unwrap_or_else(|| json!({}));
 
@@ -1345,15 +1338,16 @@ fn social_state_summary_for_keys(state: &Value, lookup_key: &str, response_key: 
         "key": response_key,
         "wakeConfig": wc,
         "wakeSafety": wake_safety(&wc, now),
-        "unreadCount": sess.get("unread").and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0),
-        "recentCount": sess.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
-        "lastWakeReason": sess.get("lastWakeReason").cloned().unwrap_or(Value::Null),
-        "lastAiReplyAt": sess.get("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
+        "unreadCount": sess.unread_count(),
+        "recentCount": sess.field("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
+        "lastWakeReason": sess.field("lastWakeReason").cloned().unwrap_or(Value::Null),
+        "lastAiReplyAt": sess.field("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
     })
 }
 
-fn social_state_summary(state: &Value, key: &str) -> Value {
-    social_state_summary_for_keys(state, key, key)
+fn social_state_summary_for_keys(state: &Value, lookup_key: &str, response_key: &str) -> Value {
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    social_state_summary_for_doc(&doc, lookup_key, response_key)
 }
 
 fn projection_storage_key(requested_key: &str) -> Result<String, (u16, String)> {
@@ -1377,8 +1371,9 @@ fn social_state_summary_for_request(
 }
 
 fn handle_social_state(context: &RuntimeContext, key: &str) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
-    social_state_summary_for_request(&state, key)
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    let canonical_key = projection_storage_key(key)?;
+    Ok(social_state_summary_for_doc(&doc, &canonical_key, key))
 }
 
 /// JS 的 `computeWakeSafetyV2`。
@@ -1621,12 +1616,11 @@ fn role_inject_max(context: &RuntimeContext) -> usize {
 /// （身份行 / 表情上下文 / 短期记忆 / 参与度），不重写一遍文案 ——
 /// 文案一旦两份，改一边忘另一边就是必然。
 fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
-    let state = read_json_for(context, SOCIAL_STATE).unwrap_or_else(|| json!({}));
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let doc = ConversationState::for_runtime(context)
+        .read_optional_document()
+        .unwrap_or_else(|_| SocialDocument::empty());
+    let conv = doc.conversation(key).unwrap_or_default();
+    let st = conv.to_value();
 
     // 机器人身份：Rust 侧目前从环境变量/默认值取（影子启动时也能从 OneBot 拿到，
     // 但还没有落盘）。这里跟 prompt::build 用同一份来源，保证两边一致。
@@ -1654,8 +1648,8 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
         crate::prompt::role_hint_v1(context, cfg, key)
     };
 
-    let wc = st.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
-    let wake_safety = social_state_summary(&state, key)
+    let wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+    let wake_safety = social_state_summary_for_doc(&doc, key, key)
         .get("wakeSafety")
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -1762,12 +1756,12 @@ fn handle_prompt(context: &RuntimeContext, cfg: &Value, key: &str) -> Value {
             "quietMinMs": reply_window.min, "quietMaxMs": reply_window.max,
             "typing": true, "revisionLimit": 3,
         },
-        "unreadCount": st.get("unread").and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0),
+        "unreadCount": conv.unread_count(),
         "recentCount": st.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
         "currentWakeConfig": wc,
         "wakeSafety": wake_safety,
-        "memory": crate::prompt::memory_formatted(&st, &cfg),
-        "participation": crate::prompt::participation_block(&st).trim_end(),
+        "memory": crate::prompt::memory_formatted_conversation(&conv, &cfg),
+        "participation": crate::prompt::participation_block_conversation(&conv).trim_end(),
         "slang": {
             "enabled": cfg.get("slang").and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(true),
             "entries": crate::slang::confirmed_list(&slang_entries, slang_max),
@@ -2043,12 +2037,11 @@ fn read_through_seq(st: &Value) -> i64 {
                 .collect()
         })
         .unwrap_or_default();
-    let unread: Vec<i64> = st
-        .get("unread")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| m.get("seq").and_then(js_safe_integer))
+    let unread: Vec<i64> = Conversation::from_value(st)
+        .map(|conv| {
+            conv.unread()
+                .iter()
+                .filter_map(|m| m.safe_seq())
                 .filter(|s| *s > 0 && *s <= MAX_SAFE_INTEGER)
                 .collect()
         })
@@ -2101,7 +2094,7 @@ fn handle_unread(
     after_seq: Option<i64>,
     is_agent: bool,
 ) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let state = ConversationState::for_runtime(context).read_document()?.into_value();
     handle_unread_from_state(context, state, key, limit, after_seq, is_agent)
 }
 
@@ -2125,16 +2118,10 @@ fn handle_unread_from_state_with_auth(
     is_agent: bool,
     write_auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<Value, (u16, String)> {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let all: Vec<Value> = st
-        .get("unread")
-        .and_then(|u| u.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    let conv_typed = doc.conversation(key).unwrap_or_default();
+    let all = conv_typed.unread_values();
+    let st = conv_typed.to_value();
     let limit = limit.clamp(1, 100) as usize;
     let messages: Vec<Value> = match after_seq {
         None => {
@@ -2325,17 +2312,14 @@ fn note_model_seen_with_auth(
     // selected runtime it is still recorded under the shared state gate against the committed state, so a
     // session that was revoked, replaced or paused while the request waited records nothing.
     if context.is_isolated() {
-        let _gate = acquire_social_state_gate(context)?;
-        let mut fresh = load_social_state_for(context)?;
+        let _gate = crate::conversation_state::acquire(context)?;
+        let fresh_doc = ConversationState::for_runtime(context).read_document()?;
         if let Some(auth) = auth {
-            social_projection_write_denial(context, &fresh, key, auth)?;
+            social_projection_write_denial_doc(context, &fresh_doc, key, auth)?;
         }
-        let fresh_unread = fresh
-            .get("conversations")
-            .and_then(|conversations| conversations.get(key))
-            .and_then(|conversation| conversation.get("unread"))
-            .and_then(Value::as_array)
-            .cloned()
+        let mut fresh = fresh_doc.into_value();
+        let fresh_unread = Conversation::from_value(&fresh["conversations"][key])
+            .map(|c| c.unread_values())
             .unwrap_or_default();
         if let Some(conv) = fresh.get("conversations").and_then(|c| c.get(key)) {
             agent::note_receipts(context, key, conv, &fresh_unread, seen_msgs);
@@ -2345,8 +2329,8 @@ fn note_model_seen_with_auth(
         return Ok(());
     }
     if let Some(auth) = auth {
-        let fresh = load_social_state_for(context)?;
-        social_projection_write_denial(context, &fresh, key, auth)?;
+        let fresh_doc = ConversationState::for_runtime(context).read_document()?;
+        social_projection_write_denial_doc(context, &fresh_doc, key, auth)?;
     }
     if let Some(conv) = state.get("conversations").and_then(|c| c.get(key)) {
         agent::note_receipts(context, key, conv, unread, seen_msgs);
@@ -2395,10 +2379,8 @@ fn handle_recent_from_state_with_auth(
     let (start, end) = recent_slice_bounds(all.len(), limit, offset);
     let messages = if start < end { all[start..end].to_vec() } else { Vec::new() };
     let st = if is_agent {
-        let unread = st
-            .get("unread")
-            .and_then(Value::as_array)
-            .cloned()
+        let unread = Conversation::from_value(&st)
+            .map(|c| c.unread_values())
             .unwrap_or_default();
         note_model_seen_with_auth(context, &mut state, key, &unread, &messages, write_auth)?;
         state
@@ -2551,24 +2533,23 @@ fn handle_active_members_from_state(state: &Value, key: &str, limit: i64) -> Val
 /// 比 `/api/socialV2/state` 多了 `noActionCount`、少了 `wakeSafety` —— 两个接口
 /// 的形状**不一样**，别看名字像就当成同一个。
 fn handle_states(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let doc = ConversationState::for_runtime(context).read_document()?;
     let mut out = Vec::new();
-    if let Some(map) = state.get("conversations").and_then(|c| c.as_object()) {
-        for (key, sess) in map {
-            out.push(json!({
-                "key": key,
-                "wakeConfig": sess.get("wakeConfig").cloned().unwrap_or_else(|| json!({})),
-                "unreadCount": sess.get("unread").and_then(|u| u.as_array()).map(|a| a.len()).unwrap_or(0),
-                "recentCount": sess.get("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
-                "lastWakeReason": sess.get("lastWakeReason").cloned().unwrap_or(Value::Null),
-                "lastAiReplyAt": sess.get("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
-                "noActionCount": sess.get("wakeConfig")
-                    .and_then(|wake| wake.get("noActionCount"))
-                    .filter(|value| js_truthy(value))
-                    .cloned()
-                    .unwrap_or(json!(0)),
-            }));
-        }
+    for (key, sess) in doc.conversations() {
+        let wc = sess.field("wakeConfig");
+        out.push(json!({
+            "key": key,
+            "wakeConfig": wc.cloned().unwrap_or_else(|| json!({})),
+            "unreadCount": sess.unread_count(),
+            "recentCount": sess.field("recentMessages").and_then(|r| r.as_array()).map(|a| a.len()).unwrap_or(0),
+            "lastWakeReason": sess.field("lastWakeReason").cloned().unwrap_or(Value::Null),
+            "lastAiReplyAt": sess.field("lastAiReplyAt").and_then(|v| v.as_i64()).unwrap_or(0),
+            "noActionCount": wc
+                .and_then(|wake| wake.get("noActionCount"))
+                .filter(|value| js_truthy(value))
+                .cloned()
+                .unwrap_or(json!(0)),
+        }));
     }
     Ok(json!({ "ok": true, "conversations": out }))
 }
@@ -3823,10 +3804,10 @@ fn handle_whitelist_post(context: &RuntimeContext, cfg_path: &str, body: &str) -
 
 /// `/api/socialV2/activity`：暂停标志（管理台的"暂停/恢复"按钮读它）。
 fn handle_activity(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let doc = ConversationState::for_runtime(context).read_document()?;
     Ok(json!({
         "ok": true,
-        "paused": state.get("paused").and_then(|p| p.as_bool()).unwrap_or(false),
+        "paused": doc.paused(),
     }))
 }
 
@@ -3845,19 +3826,15 @@ fn handle_memory(
     agent_token: Option<&str>,
     cfg: &Value,
 ) -> Result<Value, (u16, String)> {
-    let state = load_social_state_for(context)?;
+    let doc = ConversationState::for_runtime(context).read_document()?;
     if let Some(token) = agent_token {
         if let Some(denial) =
-            agent_memory_denial(&state, cfg, key, token, "qq_memory_query")
+            agent_memory_denial_doc(&doc, cfg, key, token, "qq_memory_query")
         {
             return Err(denial);
         }
     }
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let conv = doc.conversation(key).unwrap_or_default();
 
     let tail20 = |v: Option<&Value>| -> Vec<Value> {
         let arr = v.and_then(|a| a.as_array()).cloned().unwrap_or_default();
@@ -3869,8 +3846,8 @@ fn handle_memory(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let mut topics = tail20(st.get("activeTopics"));
-    let mut thoughts: Vec<Value> = tail20(st.get("pendingThoughts"))
+    let mut topics = tail20(conv.field("activeTopics"));
+    let mut thoughts: Vec<Value> = tail20(conv.field("pendingThoughts"))
         .into_iter()
         .filter(|t| {
             t.get("expiresAt")
@@ -3879,10 +3856,7 @@ fn handle_memory(
                 .unwrap_or(true)
         })
         .collect();
-    let mut impressions = st
-        .get("memberImpressions")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
+    let mut impressions = conv.impressions_to_value();
 
     match category {
         "activeTopic" => {
@@ -3900,14 +3874,13 @@ fn handle_memory(
         _ => {}
     }
 
-    let merged = json!({
-        "activeTopics": topics,
-        "pendingThoughts": thoughts,
-        "memberImpressions": impressions,
-        "unread": st.get("unread").cloned().unwrap_or_else(|| json!([])),
-        "recentMessages": st.get("recentMessages").cloned().unwrap_or_else(|| json!([])),
-    });
-    let formatted = crate::prompt::memory_formatted(&merged, cfg);
+    let mut filtered = conv.clone();
+    filtered.set_field("activeTopics", Value::Array(topics.clone()));
+    filtered.set_field("pendingThoughts", Value::Array(thoughts.clone()));
+    if category == "activeTopic" || category == "pendingThought" {
+        filtered.clear_impressions();
+    }
+    let formatted = crate::prompt::memory_formatted_conversation(&filtered, cfg);
 
     Ok(json!({
         "ok": true,
@@ -3922,98 +3895,6 @@ fn handle_memory(
     }))
 }
 
-// ── 二代轻量记忆的写类端点（append / update / remove / clear）──────────────
-//
-// 状态在 `state/social-v2.json`，整个文件读-改-写。**已知差异**：JS 的
-// `getSocialV2State(key)` 对不存在的 key 会自动建一个会话（含随机 agentToken
-// 和一整套默认唤醒配置）；这里对不存在的 key 直接 404。理由：凭空造会话意味着
-// 要在这里复制「会话注册」的全套默认值，而那套东西属于 P6 的生命周期模块，
-// 不是记忆模块该管的。等会话注册搬过来再补自动建。
-
-fn load_social_state() -> Value {
-    read_json(SOCIAL_STATE).unwrap_or_else(|| json!({ "conversations": {} }))
-}
-
-pub(crate) fn load_social_state_for(
-    context: &RuntimeContext,
-) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        let state = context
-            .read_social_state()
-            .map_err(|error| (500, format!("social-state/read: {error}")))?;
-        if !state.is_object() {
-            return Err((500, "runtime data is invalid".to_string()));
-        }
-        let mut state = state;
-        agent::strip_receipts(&mut state);
-        Ok(state)
-    } else {
-        let mut state = load_social_state();
-        agent::strip_receipts(&mut state);
-        Ok(state)
-    }
-}
-
-fn write_social_state_for(context: &RuntimeContext, state: &Value) -> Result<(), String> {
-    let mut state = state.clone();
-    agent::strip_receipts(&mut state);
-    write_json_atomic_for(context, SOCIAL_STATE, &state)
-}
-
-const SOCIAL_STATE_GATE: &str = "locks/social-v2.lock";
-/// Upper bound on how long a writer queues for `locks/social-v2.lock` before the request is
-/// refused with 503 (fail closed: no write happens without the gate).
-///
-/// The gate is held across read, mutate and a durable write (fsync plus write-through replace) of
-/// `social-v2.json`. A representative measurement showed that a
-/// hold is normally 3-25 ms, but a single fsync stalls for 0.4-2.4 s in about 4% of holds, even
-/// without added load. The frozen JS never refuses a concurrent writer (single event loop, in-memory
-/// state, no lock), so a bound shorter than one stall turned deterministic outcomes (the third of
-/// three sends is a 429) into 503s. 5 s covers the worst measured stall plus a short queue of
-/// writers behind it; a holder that is still alive after that (deadlock, hung disk) is refused.
-/// The OS releases the lock when its owner dies, so a crashed owner is never a stale lock.
-const SOCIAL_STATE_GATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
-pub(crate) fn acquire_social_state_gate(context: &RuntimeContext) -> Result<std::fs::File, (u16, String)> {
-    let deadline = std::time::Instant::now() + SOCIAL_STATE_GATE_WAIT;
-    loop {
-        match context.open_locked_file(RuntimeArea::Data, SOCIAL_STATE_GATE) {
-            Ok(file) => {
-                if let Some(proof) = &context.console_authority {
-                    let cfg = selected_config_for_handler(context)?;
-                    proof.recheck(context, &cfg)?;
-                }
-                return Ok(file);
-            },
-            Err(error) if error == "runtime file is already locked" => {
-                if std::time::Instant::now() >= deadline {
-                    return Err((
-                        503,
-                        "selected runtime social state is busy".to_string(),
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err((503, format!("social-state/gate: {error}"))),
-        }
-    }
-}
-
-fn update_selected_social_state<T>(
-    context: &RuntimeContext,
-    update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
-) -> Result<(Value, T), (u16, String)> {
-    if !context.is_isolated() {
-        return Err((500, "selected runtime is required".to_string()));
-    }
-    let _gate = acquire_social_state_gate(context)?;
-    let mut state = load_social_state_for(context)?;
-    let result = update(&mut state)?;
-    write_social_state_for(context, &state)
-        .map_err(|error| (500, format!("social-state/write: {error}")))?;
-    Ok((state, result))
-}
-
 #[derive(Clone, Copy)]
 struct SocialProjectionWriteAuth<'a> {
     token: &'a str,
@@ -4021,16 +3902,16 @@ struct SocialProjectionWriteAuth<'a> {
     tool_name: &'a str,
 }
 
-fn social_projection_write_denial(
+fn social_projection_write_denial_doc(
     context: &RuntimeContext,
-    state: &Value,
+    doc: &SocialDocument,
     key: &str,
     auth: SocialProjectionWriteAuth<'_>,
 ) -> Result<(), (u16, String)> {
     if auth.token.is_empty() {
         return Err((403, "agent token 不能为空".to_string()));
     }
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
+    if doc.paused() {
         return Err((
             403,
             "当前已暂停，不允许执行 v2 工具".to_string(),
@@ -4056,8 +3937,8 @@ fn social_projection_write_denial(
         Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
         Err(error) => return Err(error),
     }
-    if let Some(denial) = social_projection_agent_denial(
-        state,
+    if let Some(denial) = social_projection_agent_denial_doc(
+        doc,
         &cfg,
         key,
         auth.token,
@@ -4067,24 +3948,6 @@ fn social_projection_write_denial(
         return Err(denial);
     }
     Ok(())
-}
-
-/// 需要脱敏的已知令牌：所有会话当前的 agentToken。
-///
-/// JS 还留着每个会话「上一代」的令牌（模型上下文里最可能残留的那一个）；
-/// Rust 目前只记当前代，所以上一代令牌如果被写进记忆，这里不会被打码。
-fn social_tokens(state: &Value) -> Vec<String> {
-    state
-        .get("conversations")
-        .and_then(|c| c.as_object())
-        .map(|m| {
-            m.values()
-                .filter_map(|c| c.get("agentToken").and_then(|t| t.as_str()))
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// 取出会话并发号，统一处理 key 归一化与「会话不存在」。
@@ -4097,7 +3960,7 @@ fn with_conversation<F>(
     f: F,
 ) -> Result<Value, (u16, String)>
 where
-    F: FnOnce(&mut Value, &[String], &Value) -> Result<Value, (u16, String)>,
+    F: FnOnce(&mut Conversation, &[String], &Value) -> Result<Value, (u16, String)>,
 {
     let Ok(req) = serde_json::from_str::<Value>(body) else {
         return Err((400, "请求体不是合法 JSON".to_string()));
@@ -4106,96 +3969,54 @@ where
     let Some(key) = canonical_v2_key(&raw_key) else {
         return Err((400, format!("无效的会话 key：{raw_key}")));
     };
-    if context.is_isolated() {
-        return with_selected_conversation(context, &key, agent_token, tool_name, &req, f);
-    }
-    let mut state = load_social_state_for(context)?;
-    if state.get("conversations").and_then(|c| c.get(&key)).is_none() {
-        if agent_token.is_some() {
-            return Err((403, "agent token 无效".to_string()));
+    ConversationState::for_runtime(context).update_document(|doc| {
+        if agent_token == Some("") {
+            return Err((403, "agent token 不能为空".to_string()));
         }
-        return Err((404, format!("会话不存在：{key}")));
-    }
-    let tokens = social_tokens(&state);
-    let out = {
-        let conv = state["conversations"].get_mut(&key).expect("上面刚确认存在");
-        f(conv, &tokens, &req)?
-    };
-    if let Some(token) = agent_token {
-        if let Some(denial) = agent_memory_denial(&state, cfg, &key, token, tool_name) {
-            return Err(denial);
+        if context.is_isolated() {
+            if let Some(token) = agent_token {
+                if doc.paused() {
+                    return Err((403, "当前已暂停，不允许执行 v2 工具".to_string()));
+                }
+                let fresh_cfg = context
+                    .load_config()
+                    .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+                if fresh_cfg
+                    .get("socialV2")
+                    .and_then(|social| social.get("enabled"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                {
+                    return Err((403, "二代模式已关闭，当前不允许执行 v2 工具".to_string()));
+                }
+                match current_mode_for(context) {
+                    Ok(mode) if mode == "reserved2" => {}
+                    Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
+                    Err(error) => return Err(error),
+                }
+                if let Some(denial) = agent_memory_denial_doc(doc, &fresh_cfg, &key, token, tool_name) {
+                    return Err(denial);
+                }
+            }
         }
-    }
-    write_social_state_for(context, &state).map_err(|e| (500, e))?;
-    Ok(out)
-}
-
-/// Perform an inline-memory read/modify/write against the selected state while
-/// holding the shared social-state OS gate. Authorization is re-evaluated from
-/// the selected state/config after acquiring the gate, so a request that waited
-/// behind another writer cannot commit against an obsolete agent token or mode.
-fn with_selected_conversation<F>(
-    context: &RuntimeContext,
-    key: &str,
-    agent_token: Option<&str>,
-    tool_name: &str,
-    req: &Value,
-    f: F,
-) -> Result<Value, (u16, String)>
-where
-    F: FnOnce(&mut Value, &[String], &Value) -> Result<Value, (u16, String)>,
-{
-    let _gate = acquire_social_state_gate(context)?;
-    if agent_token == Some("") {
-        return Err((403, "agent token 不能为空".to_string()));
-    }
-
-    let mut state = load_social_state_for(context)?;
-    if let Some(token) = agent_token {
-        if state.get("paused").and_then(Value::as_bool) == Some(true) {
-            return Err((
-                403,
-                "当前已暂停，不允许执行 v2 工具".to_string(),
-            ));
+        let Some(mut conv) = doc.conversation(&key) else {
+            if agent_token.is_some() {
+                return Err((403, "agent token 无效".to_string()));
+            }
+            return Err((404, format!("会话不存在：{key}")));
+        };
+        if !context.is_isolated() {
+            if let Some(token) = agent_token {
+                if let Some(denial) = agent_memory_denial_doc(doc, cfg, &key, token, tool_name) {
+                    return Err(denial);
+                }
+            }
         }
-        let cfg = context
-            .load_config()
-            .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-        if cfg
-            .get("socialV2")
-            .and_then(|social| social.get("enabled"))
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            return Err((
-                403,
-                "二代模式已关闭，当前不允许执行 v2 工具".to_string(),
-            ));
-        }
-        match current_mode_for(context) {
-            Ok(mode) if mode == "reserved2" => {}
-            Ok(_) => return Err((403, "该接口仅 reserved2 模式可用".to_string())),
-            Err(error) => return Err(error),
-        }
-        if let Some(denial) = agent_memory_denial(&state, &cfg, key, token, tool_name) {
-            return Err(denial);
-        }
-    }
-
-    let tokens = social_tokens(&state);
-    let Some(conversation) = state
-        .get_mut("conversations")
-        .and_then(Value::as_object_mut)
-        .and_then(|conversations| conversations.get_mut(key))
-    else {
-        if agent_token.is_some() {
-            return Err((403, "agent token 无效".to_string()));
-        }
-        return Err((404, format!("会话不存在：{key}")));
-    };
-    let out = f(conversation, &tokens, req)?;
-    write_social_state_for(context, &state).map_err(|_| (500, "runtime data is unavailable".to_string()))?;
-    Ok(out)
+        let tokens = doc.active_tokens();
+        let out = f(&mut conv, &tokens, &req)?;
+        doc.set_conversation(&key, conv);
+        Ok(out)
+    })
 }
 
 /// `POST /api/socialV2/memory-append`
@@ -4227,7 +4048,7 @@ fn handle_memory_append(
             "key": key,
             "category": category,
             "content": content,
-            "memory": crate::prompt::memory_formatted(conv, cfg),
+            "memory": crate::prompt::memory_formatted_conversation(conv, cfg),
         }))
     })
 }
@@ -4273,7 +4094,7 @@ fn handle_memory_update(
             now_ms(),
             &crate::social_mem::ImpressionPolicy::from_cfg(cfg),
         )?;
-        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted(conv, cfg) }))
+        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted_conversation(conv, cfg) }))
     })
 }
 
@@ -4303,7 +4124,7 @@ fn handle_memory_remove(
             return Err((400, "该类别需要 content 指定要删除的记忆内容".to_string()));
         }
         crate::social_mem::remove_memory(conv, &category, &content, &target);
-        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted(conv, cfg) }))
+        Ok(json!({ "ok": true, "key": key, "category": category, "memory": crate::prompt::memory_formatted_conversation(conv, cfg) }))
     })
 }
 
@@ -4326,7 +4147,7 @@ fn handle_memory_clear(
             "ok": true,
             "key": key,
             "category": if category.is_empty() { "all".to_string() } else { category },
-            "memory": crate::prompt::memory_formatted(conv, cfg),
+            "memory": crate::prompt::memory_formatted_conversation(conv, cfg),
         }))
     })
 }
@@ -4950,17 +4771,7 @@ pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
 
 /// 校验会话令牌（读 state 里的 agentToken）。
 fn agent_token_ok(key: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let state = load_social_state();
-    let expected = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .and_then(|c| c.get("agentToken"))
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    credential_eq(expected, token)
+    agent_token_ok_for(&RuntimeContext::legacy(), key, token).unwrap_or(false)
 }
 
 fn agent_token_ok_for(
@@ -4971,27 +4782,28 @@ fn agent_token_ok_for(
     if token.is_empty() {
         return Ok(false);
     }
-    let state = load_social_state_for(context)?;
-    Ok(agent_token_matches_state(&state, key, token))
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    Ok(agent_token_matches_doc(&doc, key, token))
 }
 
-fn agent_token_matches_state(state: &Value, key: &str, token: &str) -> bool {
+fn agent_token_matches_doc(doc: &SocialDocument, key: &str, token: &str) -> bool {
     if token.is_empty() {
         return false;
     }
     let canonical_key = canonical_v2_key(key);
     let lookup_key = canonical_key.as_deref().unwrap_or(key);
-    let expected = state
-        .get("conversations")
-        .and_then(|c| c.get(lookup_key))
-        .and_then(|t| t.get("agentToken"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    credential_eq(expected, token)
+    doc.conversation(lookup_key)
+        .is_some_and(|conv| conv.matches_token(token))
 }
 
-fn agent_memory_denial(
-    state: &Value,
+fn agent_token_matches_state(state: &Value, key: &str, token: &str) -> bool {
+    SocialDocument::from_value(state.clone())
+        .ok()
+        .is_some_and(|doc| agent_token_matches_doc(&doc, key, token))
+}
+
+fn agent_memory_denial_doc(
+    doc: &SocialDocument,
     cfg: &Value,
     key: &str,
     token: &str,
@@ -5000,7 +4812,7 @@ fn agent_memory_denial(
     if token.is_empty() {
         return Some((403, "agent token 不能为空".to_string()));
     }
-    if !agent_token_matches_state(state, key, token) {
+    if !agent_token_matches_doc(doc, key, token) {
         return Some((403, "agent token 无效".to_string()));
     }
     if !social_v2_session_allowed(cfg, key) {
@@ -5038,10 +4850,11 @@ pub(super) fn handle_wait_post(
         }
     }
     let agent_token = headers.get("x-agent-token").map(String::as_str);
-    let (state, is_agent) = social_projection_request_state(context, cfg, &raw_key, agent_token, "waitMessages", "qq_wait_for_messages")?;
+    let (doc, is_agent) = social_projection_request_doc(context, cfg, &raw_key, agent_token, "waitMessages", "qq_wait_for_messages")?;
     let key = projection_storage_key(&raw_key)?;
-    let conv = state.get("conversations").and_then(|c| c.get(&key)).cloned().unwrap_or_else(|| new_conversation(context));
-    if state.get("paused").and_then(|v| v.as_bool()) == Some(true) {
+    let conv_typed = doc.conversation(&key).unwrap_or_else(|| Conversation::new_default(context));
+    let conv = conv_typed.to_value();
+    if doc.paused() {
         return Ok(json!({
             "ok": true,
             "key": raw_key,
@@ -5050,8 +4863,8 @@ pub(super) fn handle_wait_post(
             "timeout": false,
             "waitedMs": 0,
             "newMessages": [],
-            "readThroughSeq": agent::through_of(context, &key, &conv),
-            "unreadCount": unread_count_of(&conv),
+            "readThroughSeq": agent::through_of_conv(context, &key, &conv_typed),
+            "unreadCount": unread_count_of(&conv_typed),
         }));
     }
     let wait_cfg = wait_section(cfg);
@@ -5068,19 +4881,22 @@ pub(super) fn handle_wait_post(
     let batch = wait_policy(cfg);
     // Reserve atomically before polling. Superseded calls still consumed a model/tool round trip.
     let admission = if is_agent {
-        mutate_social_state_for(context, |state| {
+        ConversationState::for_runtime(context).update_document(|doc| {
             let auth = SocialProjectionWriteAuth { token: agent_token.unwrap_or(""), tool_flag: "waitMessages", tool_name: "qq_wait_for_messages" };
-            social_projection_write_denial(context, state, &key, auth)?;
-            let current = &mut state["conversations"][&key];
-            let (scope, used) = wait_usage(context, &key, current)?;
+            social_projection_write_denial_doc(context, doc, &key, auth)?;
+            let mut current_conv = doc.conversation(&key).unwrap_or_default();
+            let (scope, used) = wait_usage(context, &key, &current_conv)?;
             if used >= batch.max_per_turn { return Ok(None); }
             let used = used + 1;
+            let mut current = current_conv.to_value();
             // Refunds for messages for her are counted per turn (scope) like the slots themselves.
             let refunds = Some(current["waitBudget"]["refunds"].clone())
                 .filter(|r| !r.is_null() && current["waitBudget"]["scope"].as_str() == Some(scope.as_str()));
             current["waitBudget"] = json!({"scope":scope,"used":used});
             if let Some(refunds) = refunds { current["waitBudget"]["refunds"] = refunds; }
-            let observe = used == batch.max_per_turn && crate::wake::pre_sleep_remaining(current, cfg, now_ms()).is_some();
+            current_conv.set_field("waitBudget", current["waitBudget"].clone());
+            let observe = used == batch.max_per_turn && crate::wake::pre_sleep_remaining(&current, cfg, now_ms()).is_some();
+            doc.set_conversation(&key, current_conv);
             Ok(Some((used, observe, scope)))
         })?
     } else { Some((0, false, String::new())) };
@@ -5088,7 +4904,7 @@ pub(super) fn handle_wait_post(
         let mut out = json!({"ok":true,"key":raw_key,"purpose":if reply_wait {"reply"} else {"messages"},
             "arrived":false,"timeout":false,"waitedMs":0,"newMessages":[],
             "preSleepWaitSatisfied":false,"preSleepWaitObserved":false,
-            "readThroughSeq":agent::through_of(context,&key,&conv),"unreadCount":unread_count_of(&conv)});
+            "readThroughSeq":agent::through_of_conv(context,&key,&conv_typed),"unreadCount":unread_count_of(&conv_typed)});
         note_wait_budget(&mut out, batch.max_per_turn, batch.max_per_turn);
         // An engaged turn out of wait slots ends as a clean sleep, never as a missed close. Best
         // effort: a failure here is logged and the limit result (end the turn) still returns.
@@ -5126,15 +4942,21 @@ pub(super) fn handle_wait_post(
     };
     // A message for her past the baseline (bridge hint `forYou`).
     let for_her = |c: &Value| -> bool {
-        ["unread", "recentMessages"].iter()
-            .filter_map(|field| c.get(*field).and_then(Value::as_array)).flatten()
+        let unread = Conversation::from_value(c)
+            .map(|conv| conv.unread_values())
+            .unwrap_or_default();
+        let recent = c.get("recentMessages").and_then(Value::as_array).into_iter().flatten();
+        unread.iter().chain(recent)
             .any(|m| m["seq"].as_i64().unwrap_or(0) > baseline && m["isSelf"] != true
                 && crate::question::for_you(m, &key).0)
     };
     // An urgent message (an @ of her or the owner's) past the baseline.
     let urgent = |c: &Value| -> bool {
-        ["unread", "recentMessages"].iter()
-            .filter_map(|field| c.get(*field).and_then(Value::as_array)).flatten()
+        let unread = Conversation::from_value(c)
+            .map(|conv| conv.unread_values())
+            .unwrap_or_default();
+        let recent = c.get("recentMessages").and_then(Value::as_array).into_iter().flatten();
+        unread.iter().chain(recent)
             .any(|m| m["seq"].as_i64().unwrap_or(0) > baseline && m["isSelf"] != true
                 && (m["atSelf"] == true || m["isOwner"] == true))
     };
@@ -5148,7 +4970,7 @@ pub(super) fn handle_wait_post(
             let mut out = json!({"ok":true,"key":raw_key,"purpose":if reply_wait {"reply"} else {"messages"},
                 "arrived":false,"timeout":false,"waitedMs":0,"newMessages":[],
                 "preSleepWaitSatisfied":false,"preSleepWaitObserved":false,
-                "readThroughSeq":agent::through_of(context,&key,&conv),"unreadCount":unread_count_of(&conv)});
+                "readThroughSeq":agent::through_of_conv(context,&key,&conv_typed),"unreadCount":unread_count_of(&conv_typed)});
             note_wait_budget(&mut out, wait_used, batch.max_per_turn);
             note_turn_budget_ended(&mut out);
             return Ok(out);
@@ -5174,13 +4996,13 @@ pub(super) fn handle_wait_post(
             let mut out = json!({"ok":true,"key":raw_key,"purpose":"messages",
                 "arrived":!new_messages.is_empty(),"timeout":false,"waitedMs":0,"newMessages":new_messages,
                 "preSleepWaitSatisfied":true,"preSleepWaitObserved":false,
-                "readThroughSeq":agent::through_of(context,&key,&conv),"unreadCount":unread_count_of(&conv)});
+                "readThroughSeq":agent::through_of_conv(context,&key,&conv_typed),"unreadCount":unread_count_of(&conv_typed)});
             if is_agent { note_wait_budget(&mut out, wait_used, batch.max_per_turn); }
             note_engagement_ended(&mut out);
             if is_agent {
-                let unread = conv.get("unread").and_then(Value::as_array).cloned().unwrap_or_default();
+                let unread = conv_typed.unread_values();
                 agent::note_receipts(context, &key, &conv, &unread, out["newMessages"].as_array().unwrap());
-                out["readThroughSeq"] = json!(agent::through_of(context, &key, &conv));
+                out["readThroughSeq"] = json!(agent::through_of_conv(context, &key, &conv_typed));
             }
             return Ok(out);
         }
@@ -5222,13 +5044,13 @@ pub(super) fn handle_wait_post(
     // A failed read (replace window, parse error) proves nothing: that poll is skipped (`None`).
     // Only a state that was read shows a reset: a different token or no conversation.
     let poll_conversation = || -> Result<Option<Value>, (u16, String)> {
-        let Ok(state) = load_social_state_for(context) else { return Ok(None) };
-        let current = state.get("conversations").and_then(|c| c.get(&key)).cloned();
-        let live_token = current.as_ref().and_then(|c| c.get("agentToken")).and_then(Value::as_str).unwrap_or("");
+        let Ok(doc) = ConversationState::for_runtime(context).read_document() else { return Ok(None) };
+        let current = doc.conversation(&key);
+        let live_token = current.as_ref().and_then(|c| c.raw_token_str()).unwrap_or("");
         if is_agent && !credential_eq(live_token, agent_token.unwrap_or("")) {
             return Err((403, CHANGED.to_string()));
         }
-        Ok(Some(current.unwrap_or_else(|| json!({}))))
+        Ok(Some(current.map(|c| c.to_value()).unwrap_or_else(|| json!({}))))
     };
     let superseded_result = || {
         let mut out = json!({
@@ -5358,7 +5180,7 @@ pub(super) fn handle_wait_post(
 
     let auth = agent_token.map(|token| SocialProjectionWriteAuth { token, tool_flag: "waitMessages", tool_name: "qq_wait_for_messages" });
     let mut superseded_at_write = false;
-    let out = mutate_social_state_for(context, |st| {
+    let out = ConversationState::for_runtime(context).update_document(|doc| {
     // Recheck under the state gate: takeover may happen while this handler queues for it.
     // Returning Err skips persistence; the private signal becomes a normal superseded result below.
     if !lease.still_current() {
@@ -5367,13 +5189,15 @@ pub(super) fn handle_wait_post(
     }
     // The session may have been reset, its token rotated or its permissions changed while we waited.
     if let Some(auth) = auth {
-        if social_projection_write_denial(context, st, &key, auth).is_err() {
+        if social_projection_write_denial_doc(context, doc, &key, auth).is_err() {
             return Err((403, CHANGED.to_string()));
         }
     }
-    let Some(entry) = st.get_mut("conversations").and_then(|c| c.get_mut(&key)) else {
+    let Some(entry_conv) = doc.conversation(&key) else {
         return Err((403, CHANGED.to_string()));
     };
+    let mut entry_val = entry_conv.to_value();
+    let entry = &mut entry_val;
     let pre_sleep_ms = crate::wake::pre_sleep_wait_ms(cfg);
     let blocked = crate::wake::pre_sleep_remaining(entry, &cfg, now_ms());
     let pre_sleep_remaining_ms = blocked.unwrap_or(0);
@@ -5438,8 +5262,8 @@ pub(super) fn handle_wait_post(
     let new_messages = if reply_wait || arrived { pending } else { Vec::new() };
     let for_you = new_messages.iter().any(|m| m["forYou"] == true);
 
-    let read_through = agent::through_of(context, &key, entry);
-    let unread_total = unread_count_of(entry);
+    let read_through = agent::through_of_conv(context, &key, &entry_conv);
+    let unread_total = unread_count_of(&entry_conv);
     let observed_flag = entry.get("preSleepWaitObservedAt").and_then(|v| v.as_i64()).unwrap_or(0) > 0;
     let last_new = new_messages
         .last()
@@ -5525,7 +5349,9 @@ pub(super) fn handle_wait_post(
         }
         note_engagement_ended(&mut out);
     }
-    Ok((out, entry.clone()))
+    let committed_conv = Conversation::from_value(entry).unwrap_or(entry_conv);
+    doc.set_conversation(&key, committed_conv.clone());
+    Ok((out, committed_conv))
     });
     if superseded_at_write {
         return Ok(superseded_result());
@@ -5534,9 +5360,10 @@ pub(super) fn handle_wait_post(
     // Only a successfully prepared and persisted result offers messages to the model.
     // Publishing inside the mutation would falsely cover an urgent wake on write failure.
     if is_agent {
-        let unread = committed.get("unread").and_then(Value::as_array).cloned().unwrap_or_default();
-        agent::note_receipts(context, &key, &committed, &unread, out["newMessages"].as_array().unwrap());
-        out["readThroughSeq"] = json!(agent::through_of(context, &key, &committed));
+        let unread = committed.unread_values();
+        let committed_val = committed.to_value();
+        agent::note_receipts(context, &key, &committed_val, &unread, out["newMessages"].as_array().unwrap());
+        out["readThroughSeq"] = json!(agent::through_of_conv(context, &key, &committed));
     }
     Ok(out)
 }
@@ -5550,7 +5377,9 @@ fn wait_pending(entry: &Value, cfg: &Value, key: &str, baseline: i64, reply_wait
     let mut history: Vec<Value> = Vec::new();
     if reply_wait {
         if unread_ok {
-            history.extend(entry.get("unread").and_then(|v| v.as_array()).cloned().unwrap_or_default());
+            if let Some(conv) = Conversation::from_value(entry) {
+                history.extend(conv.unread_values());
+            }
         }
         if recent_ok {
             history.extend(entry.get("recentMessages").and_then(|v| v.as_array()).cloned().unwrap_or_default());
@@ -5625,12 +5454,14 @@ impl WaitLease {
             let live = context.open_locked_file(RuntimeArea::Data, &path).map_err(|e| (503, e))?;
             self.live = Some((context.clone(), live, path));
         }
-        mutate_social_state_for(context, |state| {
-            social_projection_write_denial(context, state, &self.key, SocialProjectionWriteAuth {
+        ConversationState::for_runtime(context).update_document(|doc| {
+            social_projection_write_denial_doc(context, doc, &self.key, SocialProjectionWriteAuth {
                 token, tool_flag:"waitMessages", tool_name:"qq_wait_for_messages" })?;
             if !self.still_current() { return Ok(()); }
-            state["conversations"][&self.key]["activeWait"] = json!({"id":marker,"console":console,"turn":turn,
-                "epoch":crate::send_outbox::token_epoch(token),"purpose":purpose});
+            let mut conv = doc.conversation(&self.key).unwrap_or_default();
+            conv.set_field("activeWait", json!({"id":marker,"console":console,"turn":turn,
+                "epoch":crate::conversation_state::token_epoch(token),"purpose":purpose}));
+            doc.set_conversation(&self.key, conv);
             Ok(())
         })?;
         self.published = Some((context.clone(), marker));
@@ -5654,9 +5485,9 @@ impl Drop for WaitLease {
             }
         }
         if let Some((context, marker)) = self.published.take() {
-            if mutate_social_state_for(&context, |state| {
-                if state["conversations"][&self.key]["activeWait"]["id"] == marker {
-                    state["conversations"][&self.key].as_object_mut().unwrap().remove("activeWait");
+            if ConversationState::for_runtime(&context).update_existing(&self.key, |conv| {
+                if conv.field("activeWait").and_then(|w| w.get("id")).and_then(Value::as_str) == Some(marker.as_str()) {
+                    conv.remove_field("activeWait");
                 }
                 Ok(())
             }).is_err() { eprintln!("[wait] active wait cleanup failed"); }
@@ -5690,17 +5521,17 @@ pub(crate) fn wait_policy(cfg: &Value) -> WaitPolicy {
 
 /// Selected turns keep their durable identity across console restarts and DSH re-attachment.
 /// No-ledger callers use the persisted legacy turn ID, retaining lastWakeAt for older records.
-fn wait_usage(context: &RuntimeContext, key: &str, conv: &Value) -> Result<(String, u64), (u16, String)> {
-    let epoch = crate::send_outbox::token_epoch(conv["agentToken"].as_str().unwrap_or(""));
+fn wait_usage(context: &RuntimeContext, key: &str, conv: &Conversation) -> Result<(String, u64), (u16, String)> {
+    let epoch = crate::conversation_state::token_epoch(conv.raw_token_str().unwrap_or(""));
     let turn = if context.is_isolated() {
         let records = crate::turn_ledger::read_records(context).map_err(|_| (503, "wait turn ledger is unavailable".to_string()))?;
         crate::turn_ledger::fold(&records).0.into_iter().rev()
             .find(|t| t.key == key && t.epochs.contains(&epoch)).map(|t| t.id)
     } else { None };
-    let scope = format!("{epoch}:{}", turn.or_else(|| conv["waitTurnId"].as_str().map(str::to_owned))
-        .unwrap_or_else(|| format!("wake:{}", conv["wakeConfig"]["lastWakeAt"].as_i64().unwrap_or(0))));
-    let used = if conv["waitBudget"]["scope"].as_str() == Some(&scope) {
-        conv["waitBudget"]["used"].as_u64().unwrap_or(0)
+    let scope = format!("{epoch}:{}", turn.or_else(|| conv.field("waitTurnId").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| format!("wake:{}", conv.field("wakeConfig").and_then(|w| w.get("lastWakeAt")).and_then(Value::as_i64).unwrap_or(0))));
+    let used = if conv.field("waitBudget").and_then(|b| b.get("scope")).and_then(Value::as_str) == Some(&scope) {
+        conv.field("waitBudget").and_then(|b| b.get("used")).and_then(Value::as_u64).unwrap_or(0)
     } else { 0 };
     Ok((scope, used))
 }
@@ -5763,10 +5594,12 @@ fn turn_wait_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &st
 }
 
 fn mark_turn_budget_ended(context: &RuntimeContext, key: &str, token: &str, turn: &str) -> Result<(), (u16, String)> {
-    mutate_social_state_for(context, |state| {
-        social_projection_write_denial(context, state, key, SocialProjectionWriteAuth {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        social_projection_write_denial_doc(context, doc, key, SocialProjectionWriteAuth {
             token, tool_flag:"waitMessages", tool_name:"qq_wait_for_messages" })?;
-        state["conversations"][key]["turnBudgetEnded"] = json!(turn);
+        let mut conv = doc.conversation(key).unwrap_or_default();
+        conv.set_field("turnBudgetEnded", json!(turn));
+        doc.set_conversation(key, conv);
         Ok(())
     })
 }
@@ -5790,10 +5623,11 @@ fn note_engagement_ended(out: &mut Value) {
 pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
     let Some(mute) = crate::group_mute::active(context, key) else { return Ok(()) };
     if !token.is_empty() {
-        let epoch = crate::send_outbox::token_epoch(token);
-        let marked = load_social_state_for(context).and_then(|state| {
-            let Some(conv) = state["conversations"].get(key).cloned() else { return Ok(()) };
-            match turn_wait_budget(context, cfg, key, &epoch, &conv)? {
+        let epoch = crate::conversation_state::token_epoch(token);
+        let marked = ConversationState::for_runtime(context).read(key).and_then(|conv| {
+            let Some(conv) = conv else { return Ok(()) };
+            let conv_val = conv.to_value();
+            match turn_wait_budget(context, cfg, key, &epoch, &conv_val)? {
                 Some((turn, _)) => mark_turn_budget_ended(context, key, token, &turn),
                 None => Ok(()),
             }
@@ -5825,21 +5659,26 @@ pub(crate) fn hold_test_observation_wait(
     let console = wait_console_generation();
     let request = crate::turn_ledger::mint_id("wait-");
     let lock = context.open_locked_file(RuntimeArea::Data, &wait_live_path(console, &request)).unwrap();
-    mutate_social_state_for(context, |state| {
-        state["conversations"][key]["activeWait"] = json!({
+    ConversationState::for_runtime(context).update(key, |conv| {
+        conv.set_field("activeWait", json!({
             "id":request,"console":console,"turn":turn,"purpose":"messages",
-            "epoch":crate::send_outbox::token_epoch(token)
-        });
+            "epoch":crate::conversation_state::token_epoch(token)
+        }));
         Ok(())
     }).unwrap();
     lock
 }
 
 pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
-    let state = load_social_state_for(context).map_err(|(_, e)|e)?;
-    let conv = &state["conversations"][key];
-    let pending = &conv["activeWait"];
-    let epoch = crate::send_outbox::token_epoch(conv["agentToken"].as_str().unwrap_or(""));
+    let conv = ConversationState::for_runtime(context)
+        .read(key)
+        .map_err(|(_, e)| e)?
+        .unwrap_or_default();
+    let Some(pending) = conv.field("activeWait") else { return Ok(None); };
+    let epoch = conv
+        .raw_token_str()
+        .map(crate::conversation_state::token_epoch)
+        .unwrap_or_else(|| crate::conversation_state::token_epoch(""));
     if pending["purpose"] != "messages" || pending["epoch"] != epoch { return Ok(None); }
     let (Some(console), Some(request), Some(turn)) = (pending["console"].as_str(), pending["id"].as_str(), pending["turn"].as_str()) else { return Ok(None); };
     // The pipeline and console are different processes. Only the live owning request
@@ -5855,7 +5694,12 @@ pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Resu
 }
 
 pub(crate) fn turn_budget_ended(context: &RuntimeContext, key: &str, turn: &str) -> bool {
-    load_social_state_for(context).ok().is_some_and(|s| s["conversations"][key]["turnBudgetEnded"] == turn)
+    ConversationState::for_runtime(context)
+        .read(key)
+        .ok()
+        .flatten()
+        .and_then(|c| c.field("turnBudgetEnded").cloned())
+        .is_some_and(|v| v == turn)
 }
 
 fn note_wait_budget(out: &mut Value, used: u64, max: u64) {
@@ -5912,8 +5756,8 @@ fn last_unread_seq(conv: &Value) -> i64 {
     conv.get("lastUnreadSeq").and_then(|v| v.as_i64()).unwrap_or(0)
 }
 
-fn unread_count_of(conv: &Value) -> usize {
-    conv.get("unread").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0)
+fn unread_count_of(conv: &Conversation) -> usize {
+    conv.unread_count()
 }
 
 /// `POST /api/dsh/effort`：热更新思考强度。
@@ -7151,10 +6995,10 @@ fn has_wake_defaults(wake: &Value) -> bool {
 pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
     // An empty runtime has no plans to repair. Leave its lock file uncreated. Once
     // there are conversations, read the current state and settings together under the gate.
-    if load_social_state_for(context)?["conversations"].as_object().is_none_or(|conversations| conversations.is_empty()) {
+    if ConversationState::for_runtime(context).read_document()?.is_empty_conversations() {
         return context.load_config_requiring_settings().map(drop).map_err(|error| (503, error));
     }
-    let _gate = config_gate(context)?;
+    let _gate = crate::conversation_state::acquire_config_gate(context)?;
     reconcile_default_wake_configs(context, None)
 }
 
@@ -7162,7 +7006,7 @@ pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(
 /// deadline, so a live configuration writer supplies the range in effect before its write.
 fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Value>) -> Result<(), (u16, String)> {
     let cfg = context.load_config_requiring_settings().map_err(|error| (503, error))?;
-    let mut state = load_social_state_for(context)?;
+    let mut state = crate::conversation_state::read_console_document(context)?;
     let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) else { return Ok(()) };
     let defaults = crate::wake::default_wake_plan(&cfg);
     let target = crate::session::wake_config_from_json(Some(&defaults));
@@ -7212,7 +7056,8 @@ fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Valu
         changed |= reconcile_default_keywords(plan, &defaults["triggers"]["keywords"], before, current.keywords != target.keywords);
     }
     if changed {
-        write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
+        crate::conversation_state::write_console_document(context, &state)
+            .map_err(|error| (500, format!("social-state/write: {error}")))?;
     }
     Ok(())
 }
@@ -7263,9 +7108,10 @@ pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority:
         .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
     let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
     let _authority = authority()?;
-    let mut state = load_social_state_for(context)?;
+    let mut state = crate::conversation_state::read_console_document(context)?;
     let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
-    write_social_state_for(context, &state).map_err(|error| (500, format!("social-state/write: {error}")))?;
+    crate::conversation_state::write_console_document(context, &state)
+        .map_err(|error| (500, format!("social-state/write: {error}")))?;
     Ok(result)
 }
 /// 本进程内"已见过的转发 id"（按会话）。JS 用内存 Set，Rust 用它兜住嵌套转发：
@@ -7292,14 +7138,21 @@ fn remember_forward_id(key: &str, id: &str) {
     }
 }
 
-fn forward_id_known(key: &str, id: &str, conv: Option<&Value>) -> bool {
-    for buf in ["recentMessages", "unread"] {
-        if let Some(arr) = conv.and_then(|c| c.get(buf)).and_then(|v| v.as_array()) {
+fn forward_id_known(key: &str, id: &str, conv: Option<&Conversation>) -> bool {
+    if let Some(c) = conv {
+        if let Some(arr) = c.field("recentMessages").and_then(|v| v.as_array()) {
             for m in arr {
                 if let Some(ids) = m.get("forwardIds").and_then(|v| v.as_array()) {
                     if ids.iter().any(|x| js_scalar(Some(x)) == id) {
                         return true;
                     }
+                }
+            }
+        }
+        for m in c.unread() {
+            if let Some(ids) = m.forward_ids() {
+                if ids.iter().any(|x| js_scalar(Some(x)) == id) {
+                    return true;
                 }
             }
         }
@@ -7359,11 +7212,10 @@ fn handle_forward_message(
     if !enabled {
         return Err((403, "工具未启用：qq_get_forward_msg".to_string()));
     }
-    let st = load_social_state_for(context)?;
     let storage_key = if context.is_isolated() { projection_storage_key(&key)? } else { key.clone() };
-    let conv = st.get("conversations").and_then(|c| c.get(&storage_key));
+    let conv = ConversationState::for_runtime(context).read(&storage_key)?;
     let scope_key = format!("{}|{}", context.runtime_root().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), storage_key);
-    if !forward_id_known(&scope_key, &id, conv) {
+    if !forward_id_known(&scope_key, &id, conv.as_ref()) {
         return Err((
             404,
             "该转发消息 id 不在当前会话可见范围内，拒绝读取".to_string(),
@@ -7519,22 +7371,31 @@ fn handle_images_message(
         }
     }
     // 找媒体：recentMessages 优先，再 unread（未读可能比最近窗口活得久）
-    let st = load_social_state_for(context)?;
     let storage_key = if context.is_isolated() { projection_storage_key(&key)? } else { key.clone() };
-    let conv = st.get("conversations").and_then(|c| c.get(&storage_key));
+    let conv = ConversationState::for_runtime(context).read(&storage_key)?;
     let mut media_list: Vec<Value> = Vec::new();
-    for buf in ["recentMessages", "unread"] {
-        if let Some(arr) = conv.and_then(|c| c.get(buf)).and_then(|v| v.as_array()) {
-            let hit = arr.iter().find(|m| {
-                m.get("messageId").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
-                    || m.get("seq").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+    if let Some(arr) = conv.as_ref().and_then(|c| c.field("recentMessages")).and_then(|v| v.as_array()) {
+        let hit = arr.iter().find(|m| {
+            m.get("messageId").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+                || m.get("seq").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+        });
+        if let Some(m) = hit {
+            if let Some(media) = m.get("media").and_then(|v| v.as_array()) {
+                if !media.is_empty() {
+                    media_list = media.clone();
+                }
+            }
+        }
+    }
+    if media_list.is_empty() {
+        if let Some(conv) = &conv {
+            let hit = conv.unread().iter().find(|m| {
+                m.message_id().map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
+                    || m.field("seq").map(|x| js_scalar(Some(x))).as_deref() == Some(message_id.as_str())
             });
-            if let Some(m) = hit {
-                if let Some(media) = m.get("media").and_then(|v| v.as_array()) {
-                    if !media.is_empty() {
-                        media_list = media.clone();
-                        break;
-                    }
+            if let Some(media) = hit.and_then(|m| m.media()) {
+                if !media.is_empty() {
+                    media_list = media.to_vec();
                 }
             }
         }
@@ -7614,8 +7475,8 @@ where
         return Err((400, "key 和 messageId/seq 不能为空".to_string()));
     }
     let agent_token = headers.get("x-agent-token").map(String::as_str);
-    let mut st = if context.is_isolated() {
-        social_projection_request_state(
+    let conv_opt = if context.is_isolated() {
+        social_projection_request_conv(
             context,
             cfg,
             &key,
@@ -7626,7 +7487,7 @@ where
         .0
     } else {
         let _is_agent = sticker_agent_allowed(context, cfg, &key, headers, "collectSticker", "qq_collect_sticker")?;
-        load_social_state_for(context)?
+        ConversationState::for_runtime(context).read(&key)?
     };
     let storage_key = if context.is_isolated() {
         projection_storage_key(&key)?
@@ -7652,7 +7513,7 @@ where
             .resolve_path(RuntimeArea::Data, "stickers.json", PathIntent::WriteFile)
             .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
         context
-            .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+            .resolve_path(RuntimeArea::Data, crate::conversation_state::FILE, PathIntent::WriteFile)
             .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     }
     let now = now_ms();
@@ -7660,12 +7521,11 @@ where
     let max_hour = crate::settings::COLLECT_HOUR.integer(cfg);
     let reservation = crate::turn_ledger::mint_id("sticker-collect-");
     if context.is_isolated() {
-        reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::send_outbox::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
+        reserve_sticker_quota(context, &storage_key, "stickerCollectTimes", "stickerCollectPending", &reservation, now, max_min, max_hour, agent_token.map(crate::conversation_state::token_epoch).as_deref(), "收藏表情太频繁了，请过一会儿再偷图")?;
     } else {
-    let times: Vec<i64> = st
-        .get("conversations")
-        .and_then(|c| c.get(&storage_key))
-        .and_then(|c| c.get("stickerCollectTimes"))
+    let times: Vec<i64> = conv_opt
+        .as_ref()
+        .and_then(|c| c.field("stickerCollectTimes"))
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
         .unwrap_or_default();
@@ -7678,10 +7538,9 @@ where
     let mut retain_reservation = false;
     let result = (|| -> Result<Value, (u16, String)> {
     // 找消息
-    let found = st
-        .get("conversations")
-        .and_then(|c| c.get(&storage_key))
-        .and_then(|c| c.get("recentMessages"))
+    let found = conv_opt
+        .as_ref()
+        .and_then(|c| c.field("recentMessages"))
         .and_then(|m| m.as_array())
         .and_then(|arr| {
             arr.iter()
@@ -7834,19 +7693,20 @@ where
         .unwrap_or(Value::Null);
     // 记账
     if !context.is_isolated() {
-    if let Some(conv) = st.get_mut("conversations").and_then(|c| c.get_mut(&storage_key)) {
-        let arr = conv
-            .as_object_mut()
-            .map(|o| o.entry("stickerCollectTimes").or_insert(json!([])));
-        if let Some(a) = arr.and_then(|v| v.as_array_mut()) {
+        let _ = ConversationState::for_runtime(context).update_existing(&storage_key, |conv| {
+            let mut a = conv
+                .field("stickerCollectTimes")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             a.push(json!(now));
             if a.len() > 500 {
                 let keep = a.len() - 500;
                 a.drain(0..keep);
             }
-        }
-    }
-    let _ = write_json_atomic(SOCIAL_STATE, &st);
+            conv.set_field("stickerCollectTimes", Value::Array(a));
+            Ok(())
+        });
     }
     crate::safe_println!("[console] 收藏表情 {key}: {emoji_id_new}");
     crate::activity::append(
@@ -8069,16 +7929,10 @@ fn handle_stickers_note(context: &RuntimeContext, body: &str) -> Result<Value, (
 fn handle_activity_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let paused = req.get("paused").and_then(|v| v.as_bool()) == Some(true);
-    if context.is_isolated() {
-        update_selected_social_state(context, |state| {
-            state["paused"] = json!(paused);
-            Ok(())
-        })?;
-    } else {
-        let mut state = load_social_state_for(context)?;
-        state["paused"] = json!(paused);
-        write_social_state_for(context, &state).map_err(|e| (500, e))?;
-    }
+    ConversationState::for_runtime(context).update_document(|doc| {
+        doc.set_paused(paused);
+        Ok(())
+    })?;
     Ok(json!({ "ok": true, "paused": paused }))
 }
 /// `GET /api/preset/sim-prompt/backups`：列出某个预设的备份文件。
@@ -8182,11 +8036,10 @@ fn handle_session_reset_for(
     }
     write_json_atomic(SESSIONS_FILE, &store).map_err(|e| (500, e))?;
     // 二代会话状态也一并清掉（JS 里是 socialV2.conversations.delete(key)）
-    let mut v2 = load_social_state();
-    if let Some(obj) = v2.get_mut("conversations").and_then(|c| c.as_object_mut()) {
-        obj.remove(&key);
-    }
-    write_json_atomic(SOCIAL_STATE, &v2).map_err(|e| (500, e))?;
+    ConversationState::for_runtime(&RuntimeContext::legacy()).update_document(|doc| {
+        doc.remove_conversation(&key);
+        Ok(())
+    })?;
     crate::safe_println!(
         "[console] 已清除会话上下文 {key}（旧会话 {old_session}；注意：未调用 DSH 归档/停止）"
     );
@@ -8243,7 +8096,7 @@ fn handle_session_reset_isolated(
     // Read and validate both selected files before changing either one. A missing social-state
     // file or malformed session document must not turn this reset into a legacy-path operation.
     let social_text = context
-        .read_optional_text(RuntimeArea::Data, "social-v2.json")
+        .read_optional_text(RuntimeArea::Data, crate::conversation_state::FILE)
         .map_err(|_| (503, "runtime data is unavailable".to_string()))?
         .ok_or_else(|| (503, "runtime data is unavailable".to_string()))?;
     let social: Value = serde_json::from_str(&social_text)
@@ -8263,7 +8116,7 @@ fn handle_session_reset_isolated(
         .resolve_path(RuntimeArea::Data, "sessions.json", PathIntent::WriteFile)
         .map_err(|_| (503, "runtime session data is unavailable".to_string()))?;
     context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+        .resolve_path(RuntimeArea::Data, crate::conversation_state::FILE, PathIntent::WriteFile)
         .map_err(|_| (503, "runtime data is unavailable".to_string()))?;
 
     let old = crate::session_map::lookup(context, &key).map_err(|error| (503, error))?;
@@ -8403,10 +8256,8 @@ fn handle_mode_post_locked(context: &RuntimeContext, body: &str, sync_dsh: bool)
     let revision = if changed { crate::turn_ledger::mint_id("mode-") } else { existing["revision"].as_str().unwrap_or("").to_string() };
     if changed {
         // Rotate before publishing the new mode; even an immediate round trip revokes old tools.
-        mutate_social_state_for(context, |state| {
-            if let Some(conversations) = state["conversations"].as_object_mut() {
-                for conv in conversations.values_mut() { conv["agentToken"] = json!(fresh_agent_token()); }
-            }
+        ConversationState::for_runtime(context).update_document(|doc| {
+            doc.rotate_all_tokens();
             Ok(())
         })?;
         // Queued ingress must stay invalid after a restart before the driver's next tick.
@@ -9034,11 +8885,10 @@ where
         }
     }
 
-    let social = load_social_state_for(context)?;
-    let conv = social
-        .get("conversations")
-        .and_then(|conversations| conversations.get(&storage_key))
+    let conv_typed = ConversationState::for_runtime(context)
+        .read(&storage_key)?
         .ok_or((404, format!("会话不存在：{key}")))?;
+    let conv = conv_typed.to_value();
     if conv.get("recentMessages").is_some_and(|value| !value.is_array()) {
         return Err((503, "selected runtime social state is invalid".to_string()));
     }
@@ -9046,12 +8896,12 @@ where
         .resolve_path(RuntimeArea::Data, "stickers.json", PathIntent::WriteFile)
         .map_err(|_| (503, "selected sticker data is unavailable".to_string()))?;
     context
-        .resolve_path(RuntimeArea::Data, "social-v2.json", PathIntent::WriteFile)
+        .resolve_path(RuntimeArea::Data, crate::conversation_state::FILE, PathIntent::WriteFile)
         .map_err(|_| (503, "selected runtime data is unavailable".to_string()))?;
     let now = now_ms();
     let max_minute = crate::settings::send::RATE_MIN.integer(cfg);
     let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
-    let epoch = crate::send_outbox::token_epoch(token);
+    let epoch = crate::conversation_state::token_epoch(token);
     let reservation = crate::turn_ledger::mint_id("sticker-send-");
     reserve_sticker_quota(context, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, max_minute, max_hour, Some(&epoch), "发送频率超限，请稍后再试")?;
     let mut retain_reservation = false;
@@ -9243,99 +9093,111 @@ where
 
     // The network-confirmed sticker send is a fact even if one selected store has become
     // unavailable or invalid. Try both independent deltas and report each unconfirmed store.
-    let social_update = update_selected_social_state(context, |fresh_state| {
-        let fresh_conv = fresh_state
-            .get_mut("conversations")
-            .and_then(|conversations| conversations.get_mut(&storage_key))
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        let fresh_conv = fresh_conv
-            .as_object_mut()
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        if fresh_conv
-            .get("sendTimes")
-            .is_some_and(|value| !value.is_array())
-            || fresh_conv
-                .get("recentMessages")
+    let social_update = if !context.is_isolated() {
+        Err((500, "selected runtime is required".to_string()))
+    } else {
+        ConversationState::for_runtime(context).update_document(|doc| {
+            let conv_typed = doc
+                .conversation(&storage_key)
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            let mut conv_val = conv_typed.to_value();
+            let fresh_conv = conv_val
+                .as_object_mut()
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            if fresh_conv
+                .get("sendTimes")
                 .is_some_and(|value| !value.is_array())
-            || fresh_conv
-                .get("wakeConfig")
-                .is_some_and(|value| !value.is_object())
-        {
-            return Err((503, "selected runtime social state is invalid".to_string()));
-        }
+                || fresh_conv
+                    .get("recentMessages")
+                    .is_some_and(|value| !value.is_array())
+                || fresh_conv
+                    .get("wakeConfig")
+                    .is_some_and(|value| !value.is_object())
+            {
+                return Err((503, "selected runtime social state is invalid".to_string()));
+            }
 
-        let recent_messages = fresh_conv
-            .entry("recentMessages".to_string())
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        let text = format!(
-            "[表情包:{}]",
-            entry_for_history
-                .get("desc")
-                .or_else(|| entry_for_history.get("localNote"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("表情包")
-        );
-        let message_id = response
-            .get("data")
-            .and_then(|data| data.get("message_id"))
-            .map(|value| js_scalar(Some(value)));
-        recent_messages.push(json!({
-            "messageId": message_id,
-            "replyToMessageId": actual_reply,
-            "replyToUserId": quoted["userId"],
-            "atUserId": at_user,
-            "sender": "我",
-            "text": text.chars().take(200).collect::<String>(),
-            "plain": text.chars().take(200).collect::<String>(),
-            "quoteTargetIsSelf": false,
-            "isOwner": true,
-            "ownerLabel": "我",
-            "isSelf": true,
-            "media": [],
-            "hasMedia": false,
-            "forwardIds": [],
-            "hasForward": false,
-            "sticker": {
-                "id": entry_for_history.get("id").cloned().unwrap_or(json!(sticker_id)),
-                "desc": entry_for_history.get("desc").cloned().unwrap_or(json!("")),
-                "localNote": entry_for_history.get("localNote").cloned().unwrap_or(json!("")),
-            },
-            "time": used_at,
-        }));
-        let recent_limit = cfg
-            .get("socialV2")
-            .and_then(|social| social.get("context"))
-            .and_then(|context| context.get("recentLimit"))
-            .and_then(Value::as_i64)
-            .filter(|limit| *limit > 0)
-            .unwrap_or(100) as usize;
-        if recent_messages.len() > recent_limit {
-            let excess = recent_messages.len() - recent_limit;
-            recent_messages.drain(0..excess);
-        }
-        fresh_conv.insert("lastAiReplyAt".to_string(), json!(now));
-        fresh_conv.insert("lastActionAt".to_string(), json!(now));
-        fresh_conv.insert("engagedAt".to_string(), json!(now));
-        let wake = fresh_conv
-            .entry("wakeConfig".to_string())
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .ok_or((503, "selected runtime social state is invalid".to_string()))?;
-        wake.insert("noActionCount".to_string(), json!(0));
-        for field in [
-            "preSleepWaitSatisfiedAt",
-            "preSleepWaitObservedAt",
-            "preSleepWaitAccumMs",
-        ] {
-            fresh_conv.insert(field.to_string(), json!(0));
-        }
-        // The confirmed send consumes its quota slot in the same write as its history entry, so a
-        // settle failure can never turn a delivered sticker into an error response.
-        apply_sticker_settlement(fresh_state, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, true)
-    });
+            let recent_messages = fresh_conv
+                .entry("recentMessages".to_string())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            let text = format!(
+                "[表情包:{}]",
+                entry_for_history
+                    .get("desc")
+                    .or_else(|| entry_for_history.get("localNote"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("表情包")
+            );
+            let message_id = response
+                .get("data")
+                .and_then(|data| data.get("message_id"))
+                .map(|value| js_scalar(Some(value)));
+            recent_messages.push(json!({
+                "messageId": message_id,
+                "replyToMessageId": actual_reply,
+                "replyToUserId": quoted["userId"],
+                "atUserId": at_user,
+                "sender": "我",
+                "text": text.chars().take(200).collect::<String>(),
+                "plain": text.chars().take(200).collect::<String>(),
+                "quoteTargetIsSelf": false,
+                "isOwner": true,
+                "ownerLabel": "我",
+                "isSelf": true,
+                "media": [],
+                "hasMedia": false,
+                "forwardIds": [],
+                "hasForward": false,
+                "sticker": {
+                    "id": entry_for_history.get("id").cloned().unwrap_or(json!(sticker_id)),
+                    "desc": entry_for_history.get("desc").cloned().unwrap_or(json!("")),
+                    "localNote": entry_for_history.get("localNote").cloned().unwrap_or(json!("")),
+                },
+                "time": used_at,
+            }));
+            let recent_limit = cfg
+                .get("socialV2")
+                .and_then(|social| social.get("context"))
+                .and_then(|context| context.get("recentLimit"))
+                .and_then(Value::as_i64)
+                .filter(|limit| *limit > 0)
+                .unwrap_or(100) as usize;
+            if recent_messages.len() > recent_limit {
+                let excess = recent_messages.len() - recent_limit;
+                recent_messages.drain(0..excess);
+            }
+            fresh_conv.insert("lastAiReplyAt".to_string(), json!(now));
+            fresh_conv.insert("lastActionAt".to_string(), json!(now));
+            fresh_conv.insert("engagedAt".to_string(), json!(now));
+            let wake = fresh_conv
+                .entry("wakeConfig".to_string())
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .ok_or((503, "selected runtime social state is invalid".to_string()))?;
+            wake.insert("noActionCount".to_string(), json!(0));
+            for field in [
+                "preSleepWaitSatisfiedAt",
+                "preSleepWaitObservedAt",
+                "preSleepWaitAccumMs",
+            ] {
+                fresh_conv.insert(field.to_string(), json!(0));
+            }
+            let mut state_tmp = doc.clone().into_value();
+            if let Some(map) = state_tmp.get_mut("conversations").and_then(Value::as_object_mut) {
+                map.insert(storage_key.clone(), conv_val);
+            }
+            // The confirmed send consumes its quota slot in the same write as its history entry, so a
+            // settle failure can never turn a delivered sticker into an error response.
+            apply_sticker_settlement(&mut state_tmp, &storage_key, "sendTimes", "stickerSendPending", &reservation, now, true)?;
+            if let Some(updated) = state_tmp.get("conversations").and_then(|c| c.get(&storage_key)).and_then(Conversation::from_value) {
+                doc.set_conversation(&storage_key, updated);
+            }
+            Ok(())
+        })
+    };
     quota_settled = true;
 
     let mut update_errors = Vec::new();
@@ -9550,74 +9412,32 @@ fn handle_stickers_remark(
 /// `gapMode=auto` 用随机间隔 —— 那条路径的 `delays` 两边**天生不同**，
 /// 对拍只比固定/按字数两种模式。
 const SEND_CANCELLED_MESSAGE: &str = "发送已取消：会话、模式或白名单已变化";
-static LEGACY_SOCIAL_SEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Read-modify-write of the social state for send bookkeeping. Isolated roots go through the
-/// selected state gate (one atomic update); the legacy path serializes in-process.
-pub(crate) fn mutate_social_state_for<T>(
-    context: &RuntimeContext,
-    update: impl FnOnce(&mut Value) -> Result<T, (u16, String)>,
-) -> Result<T, (u16, String)> {
-    if context.is_isolated() {
-        return update_selected_social_state(context, update).map(|(_, value)| value);
-    }
-    let _guard = LEGACY_SOCIAL_SEND_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut state = load_social_state_for(context)?;
-    let value = update(&mut state)?;
-    write_social_state_for(context, &state).map_err(|error| (500, error))?;
-    Ok(value)
-}
 
 // ── ticket 10：会话令牌（回合代际）与回合账本的管理端视图 ───────────────────────────
 
 /// Persist one wait identity at the legacy turn boundary, before any backend attempts.
 pub(crate) fn begin_legacy_wait_turn(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        state["conversations"][key]["waitTurnId"] = json!(crate::turn_ledger::mint_id("wait-"));
+    ConversationState::for_runtime(context).update(key, |conv| {
+        conv.set_field("waitTurnId", json!(crate::turn_ledger::mint_id("wait-")));
         Ok(())
     }).map_err(|(_, error)| error)
 }
 
 pub(crate) fn set_legacy_wait_deadline(context: &RuntimeContext, key: &str, deadline: i64) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        state["conversations"][key]["waitTurnDeadlineAt"] = json!(deadline);
+    ConversationState::for_runtime(context).update(key, |conv| {
+        conv.set_field("waitTurnDeadlineAt", json!(deadline));
         Ok(())
     }).map_err(|(_, error)| error)
-}
-
-
-/// Fresh agent token (48 hex chars from two OS-seeded ids).
-pub(crate) fn fresh_agent_token() -> String {
-    format!("{}{}", crate::turn_ledger::mint_id(""), crate::turn_ledger::mint_id(""))
-}
-
-/// A conversation record as the JS bridge creates it lazily on first contact: default wake
-/// configuration (so the chat answers its first @ after a reset), empty message windows and a
-/// fresh agent token. The Rust inbound path never creates conversation records itself.
-pub(crate) fn new_conversation(context: &RuntimeContext) -> Value {
-    let cfg = context.load_config().unwrap_or_else(|_| json!({}));
-    let random = u64::from_str_radix(&crate::turn_ledger::mint_id("")[..8], 16).unwrap_or(0) as f64 / 4_294_967_296.0;
-    json!({
-        "wakeConfig": crate::wake::default_wake_config(&cfg, crate::turn_ledger::now_ms(), random),
-        "recentMessages": [], "unread": [], "lastWakeReason": "", "lastAiReplyAt": 0, "lastActionAt": 0,
-        "agentToken": fresh_agent_token(), "bootstrapSent": false, "wakeTimes": [], "sendTimes": [],
-    })
 }
 
 /// Journaled ingress reaches the same bounded recent/unread streams the public tools read.
 /// Replays after a crash between this write and dispatch keep their original sequence.
 pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, key: &str, event_key: &str, mut message: Value) -> Result<i64, String> {
-    mutate_social_state_for(context, |state| {
-        if state["conversations"].get(key).is_none() {
-            state["conversations"][key] = new_conversation(context);
-        }
-        let conv = &mut state["conversations"][key];
-        if let Some(seq) = conv["recentMessages"].as_array().and_then(|a| a.iter().find(|m| m["inboundKey"] == event_key)).and_then(|m| m["seq"].as_i64()) {
+    ConversationState::for_runtime(context).update_or_init(key, |conv| {
+        if let Some(seq) = conv.field("recentMessages").and_then(|v| v.as_array()).and_then(|a| a.iter().find(|m| m["inboundKey"] == event_key)).and_then(|m| m["seq"].as_i64()) {
             return Ok(seq);
         }
-        let seq = conv["lastUnreadSeq"].as_i64().unwrap_or(0) + 1;
+        let seq = conv.field("lastUnreadSeq").and_then(Value::as_i64).unwrap_or(0) + 1;
         message["seq"] = json!(seq);
         message["inboundKey"] = json!(event_key);
         // A member with an impression speaking is the observed interaction the prompt reports.
@@ -9625,30 +9445,33 @@ pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, k
             let name = if key.starts_with("private:") { None } else { message["sender"].as_str() };
             crate::social_mem::note_member_seen(conv, message["userId"].as_str(), name, message["time"].as_i64().unwrap_or(0));
         }
-        conv["lastUnreadSeq"] = json!(seq);
+        conv.set_field("lastUnreadSeq", json!(seq));
         if message["quietNeutral"] != true {
-            conv["lastReplyIncomingAt"] = message["time"].clone();
-        } else if conv.get("lastReplyIncomingAt").is_none() {
+            conv.set_field("lastReplyIncomingAt", message["time"].clone());
+        } else if conv.field("lastReplyIncomingAt").is_none() {
             // First neutral arrival after upgrading a conversation retains its earlier anchor.
-            conv["lastReplyIncomingAt"] = conv.get("lastIncomingAt").filter(|v|v.as_i64().is_some_and(|t|t>0))
-                .cloned().unwrap_or_else(||message["time"].clone());
+            let anchor = conv.field("lastIncomingAt").filter(|v| v.as_i64().is_some_and(|t| t > 0))
+                .cloned().unwrap_or_else(|| message["time"].clone());
+            conv.set_field("lastReplyIncomingAt", anchor);
         }
         let urgent = message["isOwner"] == true || message["atSelf"] == true;
         if message["quietNeutral"] != true || urgent {
-            conv["lastReplyUrgent"] = json!(urgent);
+            conv.set_field("lastReplyUrgent", json!(urgent));
         }
-        conv["lastIncomingAt"] = message["time"].clone();
-        for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] { conv[field] = json!(0); }
-        for (field, setting, default) in [("recentMessages", "recentLimit", 100), ("unread", "unreadLimit", 30)] {
-            if !conv[field].is_array() { conv[field] = json!([]); }
-            let limit = cfg.pointer(&format!("/socialV2/context/{setting}")).and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(default) as usize;
-            let list = conv[field].as_array_mut().unwrap();
-            let mut copy = message.clone();
-            // The full text of a long message is stored once, in `recentMessages` (what message detail reads).
-            if field == "unread" { copy.as_object_mut().map(|m| m.remove("fullText")); }
-            list.push(copy);
-            if list.len() > limit { list.drain(..list.len() - limit); }
+        conv.set_field("lastIncomingAt", message["time"].clone());
+        for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] {
+            conv.set_field(field, json!(0));
         }
+        let recent_limit = cfg.pointer("/socialV2/context/recentLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(100) as usize;
+        let mut recent = conv.field("recentMessages").and_then(Value::as_array).cloned().unwrap_or_default();
+        recent.push(message.clone());
+        if recent.len() > recent_limit {
+            recent.drain(..recent.len() - recent_limit);
+        }
+        conv.set_field("recentMessages", Value::Array(recent));
+        let unread_limit = cfg.pointer("/socialV2/context/unreadLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(30) as usize;
+        let unread_msg = crate::conversation_state::UnreadMessage::from_value(&message).unwrap_or_default();
+        conv.push_unread(unread_msg, unread_limit);
         Ok(seq)
     }).map_err(|(_, e)| e)
 }
@@ -9657,54 +9480,68 @@ pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, k
 /// `expected`: the token the queued wake was seen under; a different current token refuses the
 /// claim (`queued wake token invalidated`) before anything changes.
 pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: &str, now: i64, expected: Option<&str>) -> Result<(Value,String), String> {
-    mutate_social_state_for(context, |state| {
+    ConversationState::for_runtime(context).update_document(|doc| {
         let cfg = context.load_config().map_err(|e|(503,e.to_string()))?;
-        if runtime_mode(context) != "reserved2" || state["paused"] == true || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(&cfg,key) {
+        if runtime_mode(context) != "reserved2" || doc.paused() || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(&cfg,key) {
             return Err((403,"wake invalidated by current settings".to_string()));
         }
-        let conv = &mut state["conversations"][key];
-        let previous = conv.clone();
-        let token = conv["agentToken"].as_str().ok_or((503,"wake has no agent token".to_string()))?.to_string();
+        let Some(mut conv) = doc.conversation(key) else {
+            return Err((503,"wake has no agent token".to_string()));
+        };
+        let previous = conv.to_value();
+        let token = conv.raw_token_str().ok_or((503,"wake has no agent token".to_string()))?.to_string();
         if expected.is_some_and(|expected| !credential_eq(expected, &token)) {
             return Err((409, "queued wake token invalidated".to_string()));
         }
-        conv["wakeConfig"]["lastWakeAt"] = json!(now);
-        conv["wakeConfig"]["wakeCount"] = json!(previous["wakeConfig"]["wakeCount"].as_i64().unwrap_or(0)+1);
-        conv["lastWakeReason"] = json!(reason);
-        for field in ["preSleepWaitSatisfiedAt","preSleepWaitObservedAt","preSleepWaitAccumMs","engagedAt"] { conv[field] = json!(0); }
-        if !conv["wakeTimes"].is_array() { conv["wakeTimes"] = json!([]); }
-        let times = conv["wakeTimes"].as_array_mut().unwrap();
+        let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+        wc["lastWakeAt"] = json!(now);
+        wc["wakeCount"] = json!(previous["wakeConfig"]["wakeCount"].as_i64().unwrap_or(0)+1);
+        conv.set_field("wakeConfig", wc);
+        conv.set_field("lastWakeReason", json!(reason));
+        for field in ["preSleepWaitSatisfiedAt","preSleepWaitObservedAt","preSleepWaitAccumMs","engagedAt"] {
+            conv.set_field(field, json!(0));
+        }
+        let mut times = conv.field("wakeTimes").and_then(Value::as_array).cloned().unwrap_or_default();
         times.push(json!(now));
         times.retain(|v|v.as_i64().is_some_and(|at| now-at < 3_600_000));
         if times.len()>200 { times.drain(..times.len()-200); }
+        conv.set_field("wakeTimes", Value::Array(times));
+        doc.set_conversation(key, conv);
         Ok((previous,token))
     }).map_err(|(_,e)|e)
 }
 
 /// Called only after the turn and its wake claim are durable. Preserve newer tool configuration.
 pub(crate) fn consume_reserved2_deadline(context: &RuntimeContext, key: &str, token: &str, at: i64, previous: &Value) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        let conv = &mut state["conversations"][key];
-        if !credential_eq(conv["agentToken"].as_str().unwrap_or(""), token) {
+    ConversationState::for_runtime(context).update(key, |conv| {
+        if !credential_eq(conv.raw_token_str().unwrap_or(""), token) {
             return Err((403, "queued wake token invalidated".into()));
         }
-        if conv["wakeConfig"]["lastWakeAt"].as_i64() == Some(at)
-            && conv["wakeConfig"]["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-            && conv["wakeConfig"]["sleepUntil"] == previous["wakeConfig"]["sleepUntil"] {
-            conv["wakeConfig"]["sleepUntil"] = Value::Null;
+        if let Some(mut wc) = conv.field("wakeConfig").cloned() {
+            if wc["lastWakeAt"].as_i64() == Some(at)
+                && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
+                && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"] {
+                wc["sleepUntil"] = Value::Null;
+                conv.set_field("wakeConfig", wc);
+            }
         }
         Ok(())
     }).map_err(|(_, e)| e)
 }
 
 pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,previous:&Value)->Result<(),String> {
-    mutate_social_state_for(context,|state| {
-        let conv=&mut state["conversations"][key];
-        if let Some(times)=conv["wakeTimes"].as_array_mut() { if let Some(i)=times.iter().rposition(|v|v.as_i64()==Some(at)) { times.remove(i); } }
-        if conv["wakeConfig"]["lastWakeAt"].as_i64()==Some(at) {
-            for field in ["lastWakeAt","wakeCount"] { conv["wakeConfig"][field]=previous["wakeConfig"][field].clone(); }
-            conv["lastWakeReason"]=previous["lastWakeReason"].clone();
-            if conv["wakeConfig"]["confirmedAt"]==previous["wakeConfig"]["confirmedAt"] { conv["wakeConfig"]["sleepUntil"]=previous["wakeConfig"]["sleepUntil"].clone(); }
+    ConversationState::for_runtime(context).update(key, |conv| {
+        if let Some(mut times)=conv.field("wakeTimes").and_then(Value::as_array).cloned() {
+            if let Some(i)=times.iter().rposition(|v|v.as_i64()==Some(at)) { times.remove(i); }
+            conv.set_field("wakeTimes", Value::Array(times));
+        }
+        if let Some(mut wc)=conv.field("wakeConfig").cloned() {
+            if wc["lastWakeAt"].as_i64()==Some(at) {
+                for field in ["lastWakeAt","wakeCount"] { wc[field]=previous["wakeConfig"][field].clone(); }
+                conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
+                if wc["confirmedAt"]==previous["wakeConfig"]["confirmedAt"] { wc["sleepUntil"]=previous["wakeConfig"]["sleepUntil"].clone(); }
+                conv.set_field("wakeConfig", wc);
+            }
         }
         Ok(())
     }).map_err(|(_,e)|e)
@@ -9712,58 +9549,55 @@ pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,pr
 
 /// Completion is separate from wake admission: reminders do not consume another wake.
 pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, started: Option<i64>, closing_seen: &Value, miss: u32) -> Result<(bool, Value), String> {
-    mutate_social_state_for(context, |state| {
-        let conv = &mut state["conversations"][key];
-        if !credential_eq(conv["agentToken"].as_str().unwrap_or(""), token) {
+    ConversationState::for_runtime(context).update(key, |conv| {
+        if !credential_eq(conv.raw_token_str().unwrap_or(""), token) {
             return Err((403, "completed turn token invalidated".into()));
         }
-        let stamp = conv["wakeConfig"]["confirmedAt"].clone();
-        let closed = stamp != *closing_seen && matches!(conv["wakeConfig"]["confirmedBy"].as_str(), Some("mark_read" | "set_wake_config"));
+        let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+        let stamp = wc["confirmedAt"].clone();
+        let closed = stamp != *closing_seen && matches!(wc["confirmedBy"].as_str(), Some("mark_read" | "set_wake_config"));
         let now = crate::now_ms() as i64;
         if let Some(started) = started {
-            let acted = conv["lastActionAt"].as_i64().unwrap_or(0) >= started || conv["lastAiReplyAt"].as_i64().unwrap_or(0) >= started;
-            let no_action = if acted { 0 } else { conv["wakeConfig"]["noActionCount"].as_u64().unwrap_or(0) + 1 };
-            conv["wakeConfig"]["noActionCount"] = json!(no_action);
+            let acted = conv.field("lastActionAt").and_then(Value::as_i64).unwrap_or(0) >= started
+                || conv.field("lastAiReplyAt").and_then(Value::as_i64).unwrap_or(0) >= started;
+            let no_action = if acted { 0 } else { wc["noActionCount"].as_u64().unwrap_or(0) + 1 };
+            wc["noActionCount"] = json!(no_action);
             let limit = crate::settings::wake_timing::NO_ACTION.integer(cfg) as u64;
             if no_action >= limit {
-                let keywords = conv["wakeConfig"]["triggers"]["keywords"].clone();
-                let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
-                conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
-                let reset = &mut conv["wakeConfig"];
-                if keywords.as_array().is_some_and(|a| !a.is_empty()) && keywords != reset["triggers"]["keywords"] {
-                    reset.as_object_mut().unwrap().remove("inheritsKeywords");
-                    reset["customKeywordsFor"] = reset["triggers"]["keywords"].clone();
-                    reset["triggers"]["keywords"] = keywords;
+                let keywords = wc["triggers"]["keywords"].clone();
+                let dropped = wc["triggers"]["dropNames"].clone();
+                wc = crate::wake::default_wake_config(cfg, now, rand01());
+                if keywords.as_array().is_some_and(|a| !a.is_empty()) && keywords != wc["triggers"]["keywords"] {
+                    wc.as_object_mut().unwrap().remove("inheritsKeywords");
+                    wc["customKeywordsFor"] = wc["triggers"]["keywords"].clone();
+                    wc["triggers"]["keywords"] = keywords;
                 }
-                if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
-                conv["bootstrapSent"] = json!(true);
+                if dropped.as_array().is_some_and(|a| !a.is_empty()) { wc["triggers"]["dropNames"] = dropped; }
+                conv.set_field("bootstrapSent", json!(true));
             }
         }
         let max = crate::settings::wake_timing::REMINDERS.integer(cfg) as u64;
         if closed {
-            crate::wake::ensure_wakeable(&mut conv["wakeConfig"], cfg, now, rand01());
+            crate::wake::ensure_wakeable(&mut wc, cfg, now, rand01());
         } else if u64::from(miss) >= max {
-            let dropped = conv["wakeConfig"]["triggers"]["dropNames"].clone();
-            conv["wakeConfig"] = crate::wake::default_wake_config(cfg, now, rand01());
-            if dropped.as_array().is_some_and(|a| !a.is_empty()) { conv["wakeConfig"]["triggers"]["dropNames"] = dropped; }
+            let dropped = wc["triggers"]["dropNames"].clone();
+            wc = crate::wake::default_wake_config(cfg, now, rand01());
+            if dropped.as_array().is_some_and(|a| !a.is_empty()) { wc["triggers"]["dropNames"] = dropped; }
         }
+        conv.set_field("wakeConfig", wc);
         Ok((!closed && u64::from(miss) < max, stamp))
     }).map_err(|(_, e)| e)
 }
 
 /// A replaced DSH session starts without the operator's first-wake injection (JS `retireSession`).
 pub(crate) fn mark_conversation_unbootstrapped(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    mutate_social_state_for(context, |state| {
-        if let Some(conversation) = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
-        {
-            conversation.insert("bootstrapSent".to_string(), json!(false));
-        }
-        Ok(())
-    })
-    .map_err(|(_, message)| message)
+    ConversationState::for_runtime(context)
+        .update_existing(key, |conversation| {
+            conversation.set_field("bootstrapSent", json!(false));
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|(_, message)| message)
 }
 
 /// The first wake of a reserved2 conversation is a `bootstrap` wake (JS `bootstrapSent`): it
@@ -9777,23 +9611,24 @@ pub(crate) fn claim_first_wake(context: &RuntimeContext, cfg: &Value, key: &str)
     if current_mode_for(context).map_err(|(_, m)| m)? != "reserved2" {
         return Ok(false);
     }
-    let pending = |state: &Value| -> bool {
-        state.get("paused").and_then(Value::as_bool) != Some(true)
-            && state
-                .get("conversations")
-                .and_then(|c| c.get(key))
-                .and_then(Value::as_object)
-                .is_some_and(|c| c.get("bootstrapSent").and_then(Value::as_bool) != Some(true))
+    let pending = |doc: &SocialDocument| -> bool {
+        !doc.paused()
+            && doc
+                .conversation(key)
+                .is_some_and(|c| c.field("bootstrapSent").and_then(Value::as_bool) != Some(true))
     };
     // Read-only look first: the common case (already bootstrapped) must not rewrite the state.
-    if !pending(&load_social_state_for(context).map_err(|(_, m)| m)?) {
+    if !pending(&ConversationState::for_runtime(context).read_document().map_err(|(_, m)| m)?) {
         return Ok(false);
     }
-    mutate_social_state_for(context, |state| {
-        if !pending(state) {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        if !pending(doc) {
             return Ok(false);
         }
-        state["conversations"][key]["bootstrapSent"] = json!(true);
+        if let Some(mut conv) = doc.conversation(key) {
+            conv.set_field("bootstrapSent", json!(true));
+            doc.set_conversation(key, conv);
+        }
         Ok(true)
     })
     .map_err(|(_, message)| message)
@@ -9826,10 +9661,8 @@ pub(crate) fn apply_closed_agent_owner(context: &RuntimeContext, owner: &Value) 
     if existing.as_ref() == Some(&policy) { return Ok(()); }
     context.write_atomic(RuntimeArea::Data, "closed-agent-owner.json", policy.to_string().as_bytes())?;
     if !changed { return Ok(()); }
-    mutate_social_state_for(context, |state| {
-        if let Some(conversations) = state["conversations"].as_object_mut() {
-            for conv in conversations.values_mut() { conv["agentToken"] = json!(fresh_agent_token()); }
-        }
+    ConversationState::for_runtime(context).update_document(|doc| {
+        doc.rotate_all_tokens();
         Ok(())
     }).map_err(|(_, e)| e)?;
     for (key, session) in crate::session_map::all(context)? {
@@ -9954,11 +9787,12 @@ fn conversation_scope_change_waiting(
 /// Shared session-reset mutation. Idle rotation preserves conversation data and refuses a changed
 /// message/wake/epoch under the social gate; explicit reset retains the existing fresh-record behavior.
 fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Option<&str>, guard: Option<&Value>) -> Result<Option<String>, String> {
-    mutate_social_state_for(context, |state| {
-        let previous = &state["conversations"][key];
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let prev_conv = doc.conversation(key);
+        let previous = prev_conv.as_ref().map(Conversation::to_value).unwrap_or(Value::Null);
         if let Some(expected) = guard {
             let cfg=context.load_config().map_err(|e|(503,e.to_string()))?;
-            if runtime_mode(context)!="reserved2" || state["paused"]==true || !inbound_admitted(&cfg,key)
+            if runtime_mode(context)!="reserved2" || doc.paused() || !inbound_admitted(&cfg,key)
                 || cfg.pointer("/socialV2/enabled")==Some(&json!(false))
                 || ["agentToken","lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
                 return Ok(None);
@@ -9967,8 +9801,9 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
             if crate::turn_ledger::blocking_turn(&turns,key).is_some() {return Ok(None);}
         }
         let mapped=crate::session_map::lookup(context,key).map_err(|e|(503,e))?;
+        let prev_token = prev_conv.as_ref().and_then(|c| c.raw_token_str()).unwrap_or("");
         let partial_rotation=guard.is_some() && old.is_some() && mapped.is_none()
-            && crate::session_map::unrevoked_rotation(context,key,previous["agentToken"].as_str().unwrap_or("")).map_err(|e|(503,e))?.as_deref()==old;
+            && crate::session_map::unrevoked_rotation(context,key,prev_token).map_err(|e|(503,e))?.as_deref()==old;
         if mapped.as_deref()!=old && !partial_rotation {return Ok(None);}
         crate::turn_ledger::record_reset(context,key).map_err(|e|(503,e))?;
         crate::reserved::reset_conversation(context,key).map_err(|e|(503,e))?;
@@ -9977,16 +9812,18 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
                 if !crate::session_map::retire_if(context,key,old).map_err(|e|(503,e))? {return Ok(None);}
             }
         }
-        let mut replacement = if guard.is_some() {previous.clone()} else {new_conversation(context)};
-        if guard.is_some() {
-            replacement["agentToken"]=json!(fresh_agent_token());
-            replacement["bootstrapSent"]=json!(true);
+        let replacement = if let Some(mut existing) = prev_conv.filter(|_| guard.is_some()) {
+            let token = existing.rotate_token();
+            existing.set_field("bootstrapSent", json!(true));
+            doc.set_conversation(key, existing);
+            return Ok(Some(token));
         } else {
-            preserve_reset_sticker_liabilities(previous,&mut replacement);
-        }
-        let token=replacement["agentToken"].as_str().unwrap_or("").to_string();
-        if !state["conversations"].is_object() {state["conversations"]=json!({});}
-        state["conversations"][key]=replacement;
+            let mut replacement_val = Conversation::new_default(context).to_value();
+            preserve_reset_sticker_liabilities(&previous,&mut replacement_val);
+            Conversation::from_value(&replacement_val).unwrap_or_else(|| Conversation::new_default(context))
+        };
+        let token = replacement.raw_token_str().unwrap_or("").to_string();
+        doc.set_conversation(key, replacement);
         Ok(Some(token))
     }).map_err(|(_,e)|e)
 }
@@ -10074,12 +9911,8 @@ pub(crate) fn handle_turns_resolve(context: &RuntimeContext, body: &str) -> Resu
 }
 
 /// Whether the conversation's current agent token is the one this batch was created under.
-fn conversation_matches_epoch(conversation: &Value, epoch: &str) -> bool {
-    epoch.is_empty()
-        || conversation
-        .get("agentToken")
-        .and_then(Value::as_str)
-        .is_some_and(|token| crate::send_outbox::token_epoch_matches(token, epoch))
+fn conversation_matches_epoch(conversation: &Conversation, epoch: &str) -> bool {
+    conversation.matches_generation(epoch)
 }
 
 // Reset revokes pending operations but must not erase their possible remote effects.
@@ -10103,8 +9936,8 @@ fn preserve_reset_sticker_liabilities(previous: &Value, replacement: &mut Value)
 }
 
 fn require_sticker_reservation(context: &RuntimeContext, key: &str, field: &str, id: &str) -> Result<(), (u16, String)> {
-    let state = load_social_state_for(context).map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
-    let owned = state.get("conversations").and_then(|c| c.get(key)).and_then(|c| c.get(field))
+    let conv = ConversationState::for_runtime(context).read(key).map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
+    let owned = conv.as_ref().and_then(|c| c.field(field))
         .and_then(Value::as_array).is_some_and(|entries| entries.iter().any(|entry|
             entry.get("id").and_then(Value::as_str) == Some(id)
                 && entry.get("revoked").and_then(Value::as_bool) != Some(true)));
@@ -10127,10 +9960,11 @@ fn sticker_pending_counts(fields: &serde_json::Map<String, Value>, field: &str, 
 
 /// `limit_message` is the JS 429 text of the calling route (send and collect differ).
 fn reserve_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str, pending_field: &str, id: &str, now: i64, max_min: i64, max_hour: i64, epoch: Option<&str>, limit_message: &str) -> Result<(), (u16, String)> {
-    mutate_social_state_for(context, |state| {
-        let conv = state.get_mut("conversations").and_then(|c| c.get_mut(key)).ok_or((404, format!("会话不存在：{key}")))?;
-        if epoch.is_some_and(|epoch| !conversation_matches_epoch(conv, epoch)) { return Err((403, "agent token 无效".to_string())); }
-        let fields = conv.as_object_mut().ok_or((503, "selected runtime social state is invalid".to_string()))?;
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let conv_typed = doc.conversation(key).ok_or((404, format!("会话不存在：{key}")))?;
+        if epoch.is_some_and(|epoch| !conversation_matches_epoch(&conv_typed, epoch)) { return Err((403, "agent token 无效".to_string())); }
+        let mut conv_val = conv_typed.to_value();
+        let fields = conv_val.as_object_mut().ok_or((503, "selected runtime social state is invalid".to_string()))?;
         purge_abandoned_sticker_reservations(fields, pending_field);
         let pending = sticker_pending_counts(fields, pending_field, now)?;
         let times = fields.entry(times_field.to_string()).or_insert_with(|| json!([])).as_array().ok_or((503, "selected runtime social state is invalid".to_string()))?;
@@ -10140,6 +9974,7 @@ fn reserve_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str,
         let pending = fields.entry(pending_field.to_string()).or_insert_with(|| json!([])).as_array_mut().ok_or((503, "selected runtime social state is invalid".to_string()))?;
         pending.retain(|entry| entry.get("time").and_then(Value::as_i64).is_some_and(|time| now.saturating_sub(time) < 3_600_000));
         pending.push(json!({"id": id, "time": now}));
+        doc.set_conversation(key, Conversation::from_value(&conv_val).unwrap_or(conv_typed));
         Ok(())
     })
 }
@@ -10147,7 +9982,14 @@ fn reserve_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str,
 fn settle_sticker_quota(context: &RuntimeContext, key: &str, times_field: &str, pending_field: &str, id: &str, fallback_time: i64, retain: bool) -> Result<(), (u16, String)> {
     #[cfg(test)]
     STICKER_SETTLE_FAULT_HOOK.with(|hook| match hook.borrow_mut().as_mut() { Some(hook) => hook(retain), None => Ok(()) })?;
-    mutate_social_state_for(context, |state| apply_sticker_settlement(state, key, times_field, pending_field, id, fallback_time, retain))
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let mut state = doc.clone().into_value();
+        apply_sticker_settlement(&mut state, key, times_field, pending_field, id, fallback_time, retain)?;
+        if let Some(conv) = state.get("conversations").and_then(|c| c.get(key)).and_then(Conversation::from_value) {
+            doc.set_conversation(key, conv);
+        }
+        Ok(())
+    })
 }
 
 /// Moves one identified pending entry into the settled arrays (`retain`) or drops it (release).
@@ -10223,14 +10065,14 @@ fn settle_sticker_quota_best_effort(context: &RuntimeContext, key: &str, times_f
 fn collect_sticker_guard(context: &RuntimeContext, _cfg: &Value, key: &str, token: Option<&str>) -> Result<(), (u16, String)> {
     let cancelled = || (409, SEND_CANCELLED_MESSAGE.to_string());
     let cfg = context.load_config().map_err(|_| cancelled())?;
-    let state = load_social_state_for(context).map_err(|_| cancelled())?;
+    let doc = ConversationState::for_runtime(context).read_document().map_err(|_| cancelled())?;
     if !crate::sticker::enabled(&cfg)
         || !crate::settings::COLLECT_ENABLED.switch(&cfg) { return Err(cancelled()); }
     if let Some(token) = token {
-        if state.get("paused").and_then(Value::as_bool) == Some(true)
+        if doc.paused()
             || cfg.get("socialV2").and_then(|v| v.get("enabled")).and_then(Value::as_bool) == Some(false)
             || current_mode_for(context).map_err(|_| cancelled())? != "reserved2" { return Err(cancelled()); }
-        if social_projection_agent_denial(&state, &cfg, key, token, "collectSticker", "qq_collect_sticker").is_some() { return Err(cancelled()); }
+        if social_projection_agent_denial_doc(&doc, &cfg, key, token, "collectSticker", "qq_collect_sticker").is_some() { return Err(cancelled()); }
     }
     Ok(())
 }
@@ -10298,15 +10140,13 @@ fn reserve_send_quota(
     let max_min = crate::settings::send::RATE_MIN.integer(cfg);
     let max_hour = crate::settings::send::RATE_HOUR.integer(cfg);
     let n = count as i64;
-    mutate_social_state_for(context, |state| {
-        let conv = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .ok_or((404, format!("会话不存在：{key}")))?;
-        if !conversation_matches_epoch(conv, epoch) {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let conv_typed = doc.conversation(key).ok_or((404, format!("会话不存在：{key}")))?;
+        if !conversation_matches_epoch(&conv_typed, epoch) {
             return Err((403, "agent token 无效".to_string()));
         }
-        let fields = conv
+        let mut conv_val = conv_typed.to_value();
+        let fields = conv_val
             .as_object_mut()
             .ok_or((503, "selected runtime social state is invalid".to_string()))?;
         if context.is_isolated()
@@ -10338,6 +10178,7 @@ fn reserve_send_quota(
             let keep = times.len() - 500;
             times.drain(0..keep);
         }
+        doc.set_conversation(key, Conversation::from_value(&conv_val).unwrap_or(conv_typed));
         Ok(())
     })
 }
@@ -10365,9 +10206,11 @@ fn release_reserved_times(conv: &mut Value, now: i64, count: usize) {
 
 /// Give back reservations for a send refused before any OneBot request.
 fn release_send_quota(context: &RuntimeContext, key: &str, now: i64, count: usize) {
-    let _ = mutate_social_state_for(context, |state| {
-        if let Some(conv) = state.get_mut("conversations").and_then(|c| c.get_mut(key)) {
-            release_reserved_times(conv, now, count);
+    let _ = ConversationState::for_runtime(context).update_existing(key, |conv_typed| {
+        let mut conv_val = conv_typed.to_value();
+        release_reserved_times(&mut conv_val, now, count);
+        if let Some(updated) = Conversation::from_value(&conv_val) {
+            *conv_typed = updated;
         }
         Ok(())
     });
@@ -10397,21 +10240,17 @@ fn finish_send_batch(
         .filter(|v| *v > 0)
         .unwrap_or(100) as usize;
     let console_token = context.effective_console_token(cfg);
-    mutate_social_state_for(context, |state| {
-        let Some(conv) = state
-            .get_mut("conversations")
-            .and_then(|c| c.get_mut(key))
-            .and_then(Value::as_object_mut)
-        else {
+    ConversationState::for_runtime(context).update_document(|doc| {
+        let Some(conv_typed) = doc.conversation(key) else {
             return Err((404, format!("会话不存在：{key}")));
         };
+        let mut conv_value = conv_typed.to_value();
         if context.is_isolated()
-            && (conv.get("sendTimes").is_some_and(|v| !v.is_array())
-                || conv.get("wakeConfig").is_some_and(|v| !v.is_object()))
+            && (conv_value.get("sendTimes").is_some_and(|v| !v.is_array())
+                || conv_value.get("wakeConfig").is_some_and(|v| !v.is_object()))
         {
             return Err((503, "selected runtime social state is invalid".to_string()));
         }
-        let mut conv_value = Value::Object(std::mem::take(conv));
         release_reserved_times(&mut conv_value, now, release);
         if !sent_texts.is_empty() {
             let mut targeting = targeting.cloned().unwrap_or(Value::Null);
@@ -10424,7 +10263,7 @@ fn finish_send_batch(
                     targeting["replyToUserId"] = user.clone();
                 }
             }
-            let tokens: Vec<String> = [console_token.clone(), conv_value.get("agentToken").and_then(Value::as_str).unwrap_or("").to_string()]
+            let tokens: Vec<String> = [console_token.clone(), conv_typed.token().unwrap_or("").to_string()]
                 .into_iter()
                 .filter(|t| !t.is_empty())
                 .collect();
@@ -10468,8 +10307,8 @@ fn finish_send_batch(
                 wake.insert("noActionCount".to_string(), json!(0));
             }
         }
-        if let Value::Object(fields) = conv_value {
-            *conv = fields;
+        if let Some(updated) = Conversation::from_value(&conv_value) {
+            doc.set_conversation(key, updated);
         }
         Ok(())
     })
@@ -10501,15 +10340,12 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
     } else {
         cfg
     };
-    let state = load_social_state_for(context).map_err(|_| cancelled())?;
-    let conv = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .ok_or_else(cancelled)?;
-    if state.get("paused").and_then(Value::as_bool) == Some(true)
+    let doc = ConversationState::for_runtime(context).read_document().map_err(|_| cancelled())?;
+    let conv = doc.conversation(key).ok_or_else(cancelled)?;
+    if doc.paused()
         || cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) == Some(false)
         || !(if tool_flag == "sendVoice" { voice_http::send_voice_tool_enabled(cfg) } else { tool_enabled(cfg, tool_flag) })
-        || !conversation_matches_epoch(conv, epoch) {
+        || !conversation_matches_epoch(&conv, epoch) {
         return Err(cancelled());
     }
     let mode = current_mode_for(context).map_err(|_| cancelled())?;
@@ -10608,8 +10444,8 @@ fn run_send_items(
     }
     for (pos, item) in plan.iter().enumerate() {
         if report.stop.is_none() {
-            let baseline = if pos==0 {initial.clone()} else {match load_social_state_for(context) {
-                Ok(state) => state["conversations"][key].clone(),
+            let baseline = if pos==0 {initial.clone()} else {match ConversationState::for_runtime(context).read(key) {
+                Ok(conv) => conv.map(|c| c.to_value()).unwrap_or(Value::Null),
                 Err(stop) => { report.stop = Some(stop); Value::Null }
             }};
             if pos > 0 {
@@ -10751,9 +10587,10 @@ fn resume_send_batch(
     token: &str,
     batch_id: &str,
 ) -> Result<(u16, Value), (u16, String)> {
-    use crate::send_outbox::{fold_batch, progress_json, read_records, token_epoch, ItemState};
+    use crate::conversation_state::token_epoch;
+    use crate::send_outbox::{fold_batch, progress_json, read_records, ItemState};
     let epoch = token_epoch(token);
-    let initial = load_social_state_for(context)?["conversations"][key].clone();
+    let initial = ConversationState::for_runtime(context).read(key)?.map(|c| c.to_value()).unwrap_or(Value::Null);
     // One runner per batch: a concurrent resume (or the original send still running) would
     // otherwise read the same pending item and send it twice.
     let recorded = crate::recorded_send::Recorded::resume(context, now_ms, batch_id)
@@ -11739,8 +11576,7 @@ fn slang_submit(
     if !crate::slang_learn::enabled(cfg) {
         return Err((403, "黑话学习已关闭（slang.enabled=false）".to_string()));
     }
-    let state = load_social_state_for(context)?;
-    let tokens = social_tokens(&state);
+    let tokens = crate::conversation_state::read_active_tokens(context)?;
     let content = crate::social_mem::redact_tokens(&agent::body_text(&req, "content"), &tokens).trim().to_string();
     let evidence_text = crate::social_mem::redact_tokens(&agent::body_text(&req, "context"), &tokens).trim().to_string();
     if content.is_empty() { return Err((400, "content 不能为空".to_string())); }
@@ -11999,7 +11835,7 @@ fn isolated_request_preflight(req: &Request, context: &RuntimeContext) -> Result
     }
     let required_file = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/status") | ("GET", "/api/socialV2/state") => {
-            Some((RuntimeArea::Data, "social-v2.json".to_string()))
+            Some((RuntimeArea::Data, crate::conversation_state::FILE.to_string()))
         }
         ("GET", "/api/sessions") => Some((RuntimeArea::Data, "sessions.json".to_string())),
         _ => None,
@@ -12115,11 +11951,11 @@ fn tool_log_agent_denial(
         return Some((403, "agent token 不能为空".to_string()));
     }
 
-    let state = match load_social_state_for(context) {
-        Ok(state) => state,
+    let doc = match ConversationState::for_runtime(context).read_document() {
+        Ok(doc) => doc,
         Err((status, message)) => return Some((status, message)),
     };
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
+    if doc.paused() {
         return Some((
             403,
             "当前已暂停，不允许执行 v2 工具".to_string(),
@@ -12209,11 +12045,11 @@ fn social_agent_policy_denial(
         return Some((403, "该接口仅控制台可用".to_string()));
     }
 
-    let state = match load_social_state_for(context) {
-        Ok(state) => state,
+    let doc = match ConversationState::for_runtime(context).read_document() {
+        Ok(doc) => doc,
         Err((status, message)) => return Some((status, message)),
     };
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
+    if doc.paused() {
         return Some((
             403,
             "当前已暂停，不允许执行 v2 工具".to_string(),
@@ -12248,8 +12084,8 @@ fn social_agent_policy_denial(
     None
 }
 
-fn social_projection_agent_denial(
-    state: &Value,
+fn social_projection_agent_denial_doc(
+    doc: &SocialDocument,
     cfg: &Value,
     key: &str,
     token: &str,
@@ -12259,7 +12095,7 @@ fn social_projection_agent_denial(
     if token.is_empty() {
         return Some((403, "agent token 不能为空".to_string()));
     }
-    if !agent_token_matches_state(state, key, token) {
+    if !agent_token_matches_doc(doc, key, token) {
         return Some((403, "agent token 无效".to_string()));
     }
     if !social_v2_projection_session_allowed(cfg, key) {
@@ -12271,9 +12107,54 @@ fn social_projection_agent_denial(
     None
 }
 
+fn social_projection_agent_denial(
+    state: &Value,
+    cfg: &Value,
+    key: &str,
+    token: &str,
+    tool_flag: &str,
+    tool_name: &str,
+) -> Option<(u16, String)> {
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    social_projection_agent_denial_doc(&doc, cfg, key, token, tool_flag, tool_name)
+}
+
 /// Load one selected social-state snapshot and authorize an optional agent token
 /// against that same snapshot. Mutating projection handlers reuse this state so
 /// a stale token check cannot authorize a later selected-root write.
+fn social_projection_request_doc(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    agent_token: Option<&str>,
+    tool_flag: &str,
+    tool_name: &str,
+) -> Result<(SocialDocument, bool), (u16, String)> {
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    if let Some(token) = agent_token {
+        if let Some(denial) =
+            social_projection_agent_denial_doc(&doc, cfg, key, token, tool_flag, tool_name)
+        {
+            return Err(denial);
+        }
+    }
+    Ok((doc, agent_token.is_some()))
+}
+
+fn social_projection_request_conv(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    agent_token: Option<&str>,
+    tool_flag: &str,
+    tool_name: &str,
+) -> Result<(Option<Conversation>, bool), (u16, String)> {
+    let (doc, is_agent) =
+        social_projection_request_doc(context, cfg, key, agent_token, tool_flag, tool_name)?;
+    let storage_key = projection_storage_key(key)?;
+    Ok((doc.conversation(&storage_key), is_agent))
+}
+
 fn social_projection_request_state(
     context: &RuntimeContext,
     cfg: &Value,
@@ -12282,15 +12163,9 @@ fn social_projection_request_state(
     tool_flag: &str,
     tool_name: &str,
 ) -> Result<(Value, bool), (u16, String)> {
-    let state = load_social_state_for(context)?;
-    if let Some(token) = agent_token {
-        if let Some(denial) =
-            social_projection_agent_denial(&state, cfg, key, token, tool_flag, tool_name)
-        {
-            return Err(denial);
-        }
-    }
-    Ok((state, agent_token.is_some()))
+    let (doc, is_agent) =
+        social_projection_request_doc(context, cfg, key, agent_token, tool_flag, tool_name)?;
+    Ok((doc.into_value(), is_agent))
 }
 
 fn sticker_agent_allowed(
@@ -12305,8 +12180,8 @@ fn sticker_agent_allowed(
         return Ok(false);
     };
     if context.is_isolated() {
-        let state = load_social_state_for(context)?;
-        if let Some(denial) = social_projection_agent_denial(&state, cfg, key, token, tool_flag, tool_name) {
+        let doc = ConversationState::for_runtime(context).read_document()?;
+        if let Some(denial) = social_projection_agent_denial_doc(&doc, cfg, key, token, tool_flag, tool_name) {
             return Err(denial);
         }
         return Ok(true);
@@ -12347,11 +12222,11 @@ fn send_message_global_agent_denial(
     if token.is_empty() {
         return Some((403, "agent token 不能为空".to_string()));
     }
-    let state = match load_social_state_for(context) {
-        Ok(state) => state,
+    let doc = match ConversationState::for_runtime(context).read_document() {
+        Ok(doc) => doc,
         Err((status, message)) => return Some((status, message)),
     };
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
+    if doc.paused() {
         return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
     }
     if cfg

@@ -6,6 +6,7 @@
 //! handlers whose JS code has no equivalent in the older Rust console.
 
 use super::*;
+use crate::conversation_state::{Conversation, ConversationState, SocialDocument};
 use std::collections::{BTreeSet, HashMap as StdHashMap};
 use std::sync::Mutex;
 
@@ -28,11 +29,14 @@ fn receipt_scope(context: &RuntimeContext) -> String {
 }
 
 /// Token epoch of a conversation record ("" when it has no token).
+fn epoch_of_conv(conv: &Conversation) -> String {
+    conv.generation().unwrap_or_default()
+}
+
+/// Token epoch of a raw conversation JSON value ("" when it has no token).
 fn epoch_of(conv: &Value) -> String {
-    conv.get("agentToken")
-        .and_then(Value::as_str)
-        .filter(|t| !t.is_empty())
-        .map(crate::send_outbox::token_epoch)
+    Conversation::from_value(conv)
+        .and_then(|c| c.generation())
         .unwrap_or_default()
 }
 
@@ -121,14 +125,19 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
     let key = body_text(&input, "key");
     let token = body_text(&input, "token");
     let evidence_only = input.get("readOnly") == Some(&json!(true));
-    let _gate = (context.is_isolated() && !evidence_only).then(|| acquire_social_state_gate(context)).transpose()?;
-    let state = load_social_state_for(context)?;
-    if current_mode_for(context)? != "reserved2" || state["paused"] == true
+    let _gate = (!evidence_only)
+        .then(|| crate::conversation_state::acquire_config_gate(context))
+        .transpose()?
+        .flatten();
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    if current_mode_for(context)? != "reserved2" || doc.paused()
         || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(cfg, &key)
-        || !agent_token_matches_state(&state, &key, &token) {
+        || !agent_token_matches_doc(&doc, &key, &token) {
         return Err((403, "wake snapshot invalidated".into()));
     }
-    let conv = &state["conversations"][&key];
+    let conv_typed = doc.conversation(&key).unwrap_or_default();
+    let conv_val = conv_typed.to_value();
+    let conv = &conv_val;
     if evidence_only {
         let turn = body_text(&input, "turnId");
         let store = urgent_delivery_store().lock().unwrap_or_else(|p|p.into_inner());
@@ -137,14 +146,14 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
             .map(|(_, seqs)| seqs.iter().copied().collect()).unwrap_or_default();
         return Ok(json!({"urgentDeliveredSeqs":delivered}));
     }
-    let epoch = epoch_of(conv);
+    let epoch = epoch_of_conv(&conv_typed);
     let turn = body_text(&input, "turnId");
     let (_, mut budget) = captured_turn_budget(context, cfg, &key, &epoch, conv, false)?
         .filter(|(id, _)| !turn.is_empty() && id == &turn)
         .ok_or_else(|| (409, "wake snapshot turn changed".to_owned()))?;
     let slot = (receipt_scope(context), key.clone());
     snapshot_grants().lock().unwrap_or_else(|p| p.into_inner()).remove(&slot);
-    let Some(mut packet) = build_wake_snapshot(context, cfg, &key, conv) else {
+    let Some(mut packet) = build_wake_snapshot_conv(context, cfg, &key, &conv_typed) else {
         return Ok(Value::Null);
     };
     // A later engagement cannot extend authority beyond the deadline of this offer.
@@ -154,18 +163,30 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
         .filter_map(|message| js_safe_integer(&message["seq"]).filter(|seq| *seq > 0)).collect();
     let grant = SnapshotGrant { epoch, budget, seqs };
     snapshot_grants().lock().unwrap_or_else(|p| p.into_inner()).insert(slot, grant);
-    packet["readThroughSeq"] = json!(through_of(context, &key, conv));
+    packet["readThroughSeq"] = json!(through_of_conv(context, &key, &conv_typed));
     Ok(packet)
 }
 
 /// JS buildWakeSnapshotV2 selection, shared with the tool-free CLI renderer.
 /// Computing a packet does not grant tool read receipts; the authenticated route does that.
 pub(crate) fn build_wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &str, conv: &Value) -> Option<Value> {
+    let conv_typed = Conversation::from_value(conv).unwrap_or_default();
+    build_wake_snapshot_conv(context, cfg, key, &conv_typed)
+}
+
+pub(crate) fn build_wake_snapshot_conv(
+    context: &RuntimeContext,
+    cfg: &Value,
+    key: &str,
+    conv_typed: &Conversation,
+) -> Option<Value> {
     if cfg.pointer("/socialV2/context/inlineWakeMessages") == Some(&json!(false))
         || (!tool_enabled(cfg, "getUnread") && !tool_enabled(cfg, "getRecent")) {
         return None;
     }
-    let unread = conv["unread"].as_array().cloned().unwrap_or_default();
+    let unread = conv_typed.unread_values();
+    let conv_val = conv_typed.to_value();
+    let conv = &conv_val;
     let bounded = |name: &str, fallback: f64, min: f64, max: f64| {
         // JS Number(context[name] ?? fallback); retain coerced zero until clamping.
         cfg.pointer(&format!("/socialV2/context/{name}")).filter(|v| !v.is_null()).map(social_v1_number)
@@ -174,7 +195,7 @@ pub(crate) fn build_wake_snapshot(context: &RuntimeContext, cfg: &Value, key: &s
     let max_chars = bounded("wakeMaxChars", 6000.0, 500.0, 20000.0);
     let max_unread = bounded("wakeMessageLimit", 12.0, 1.0, 100.0);
     let max_recent = bounded("wakeRecentLimit", 4.0, 0.0, 20.0);
-    let mut packet = json!({"messages":[],"recent":[],"unreadCount":unread.len(),"includedUnreadCount":0,"readThroughSeq":through_of(context,&key,conv),"partial":!unread.is_empty()});
+    let mut packet = json!({"messages":[],"recent":[],"unreadCount":unread.len(),"includedUnreadCount":0,"readThroughSeq":through_of_conv(context,key,conv_typed),"partial":!unread.is_empty()});
     let seen_before = receipts_of(context, key, conv);
     let candidate_through = |packet: &Value| {
         let mut offered = conv.clone();
@@ -226,17 +247,6 @@ pub(super) fn attach_state_receipts(context: &RuntimeContext, state: &mut Value,
     }
 }
 
-/// Remove stored receipts from a state that was read or is about to be written (older builds persisted them).
-pub(super) fn strip_receipts(state: &mut Value) {
-    if let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) {
-        for conv in conversations.values_mut() {
-            if let Some(obj) = conv.as_object_mut() {
-                obj.remove("modelSeenSeqs");
-            }
-        }
-    }
-}
-
 /// JS `noteModelMessagesV2` bookkeeping: receipts are bounded by the unread buffer, only seqs that
 /// are in it count. `conv` is the conversation record (its token decides which session the receipts
 /// belong to).
@@ -266,14 +276,8 @@ fn note_offered_receipts(context: &RuntimeContext, key: &str, conv: &Value, unre
 // ----- the central agent gate -------------------------------------------------------------------------------
 
 fn is_live_agent_token(context: &RuntimeContext, token: &str) -> Result<bool, (u16, String)> {
-    let state = load_social_state_for(context)?;
-    let Some(conversations) = state.get("conversations").and_then(Value::as_object) else {
-        return Ok(false);
-    };
-    Ok(conversations.values().any(|conv| {
-        let expected = conv.get("agentToken").and_then(Value::as_str).unwrap_or("");
-        crate::console_auth::credential_eq(expected, token)
-    }))
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    Ok(doc.conversations().any(|(_, conv)| conv.matches_token(token)))
 }
 
 const ADMIN_ONLY_V2_PATHS: [&str; 6] = [
@@ -318,9 +322,9 @@ pub(super) fn agent_global_denial(req: &Request, cfg: &Value, context: &RuntimeC
     }
     let v2_surface = path.starts_with("/api/socialV2/") || path.starts_with("/api/send/") || path.starts_with("/api/images/");
     if v2_surface {
-        match load_social_state_for(context) {
-            Ok(state) => {
-                if state.get("paused").and_then(Value::as_bool) == Some(true) {
+        match ConversationState::for_runtime(context).read_document() {
+            Ok(doc) => {
+                if doc.paused() {
                     return Some((403, "当前已暂停，不允许执行 v2 工具".to_string()));
                 }
             }
@@ -486,8 +490,7 @@ fn send_poke_inner(
     if !tool_enabled(cfg, "sendPoke") {
         return Err((403, "工具未启用：qq_send_poke".to_string()));
     }
-    let state = load_social_state_for(context)?;
-    if state.get("paused").and_then(Value::as_bool) == Some(true) {
+    if ConversationState::for_runtime(context).read_document()?.paused() {
         return Err((403, "当前已暂停，不能发送拍一拍".to_string()));
     }
     let Some((kind, id_s, id)) = parse_key(&key) else {
@@ -560,38 +563,39 @@ fn send_poke_inner(
                 .filter(|n| *n != 0.0)
                 .unwrap_or(100.0) as usize;
             let target_id = if target.is_empty() { id_s.to_string() } else { target.clone() };
-            mutate_social_state_for(context, |state| {
-                let conv = state
-                    .get_mut("conversations")
-                    .and_then(|c| c.get_mut(&storage_key))
-                    .and_then(Value::as_object_mut)
-                    .ok_or((404, format!("会话不存在：{storage_key}")))?;
-                conv.insert("lastActionAt".to_string(), json!(now));
-                conv.insert("lastAiReplyAt".to_string(), json!(now));
-                if let Some(wake) = conv.get_mut("wakeConfig").and_then(Value::as_object_mut) {
-                    wake.insert("noActionCount".to_string(), json!(0));
-                }
-                let record = json!({
-                    "messageId": Value::Null, "sender": "我", "text": poke_text, "plain": poke_text, "tail": poke_text,
-                    "kind": "poke", "quoteTargetIsSelf": false, "isOwner": true, "ownerLabel": "我", "isSelf": true,
-                    "media": [], "hasMedia": false, "forwardIds": [], "hasForward": false,
-                    "poke": { "targetId": target_id, "targetIsSelf": false, "groupId": if kind == "group" { json!(id_s) } else { Value::Null } },
-                    "time": now_ms()
-                });
-                let recent = conv.entry("recentMessages".to_string()).or_insert_with(|| json!([]));
-                if let Some(list) = recent.as_array_mut() {
+            ConversationState::for_runtime(context)
+                .update_existing(&storage_key, |conv| {
+                    conv.set_field("lastActionAt", json!(now));
+                    conv.set_field("lastAiReplyAt", json!(now));
+                    if let Some(mut wake) = conv.field("wakeConfig").filter(|w| w.is_object()).cloned() {
+                        wake["noActionCount"] = json!(0);
+                        conv.set_field("wakeConfig", wake);
+                    }
+                    let record = json!({
+                        "messageId": Value::Null, "sender": "我", "text": poke_text, "plain": poke_text, "tail": poke_text,
+                        "kind": "poke", "quoteTargetIsSelf": false, "isOwner": true, "ownerLabel": "我", "isSelf": true,
+                        "media": [], "hasMedia": false, "forwardIds": [], "hasForward": false,
+                        "poke": { "targetId": target_id, "targetIsSelf": false, "groupId": if kind == "group" { json!(id_s) } else { Value::Null } },
+                        "time": now_ms()
+                    });
+                    let mut list = conv
+                        .field("recentMessages")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
                     list.push(record);
                     if list.len() > recent_limit {
                         let excess = list.len() - recent_limit;
                         list.drain(0..excess);
                     }
-                }
-                conv.insert("preSleepWaitSatisfiedAt".to_string(), json!(0));
-                conv.insert("preSleepWaitObservedAt".to_string(), json!(0));
-                conv.insert("preSleepWaitAccumMs".to_string(), json!(0));
-                conv.insert("engagedAt".to_string(), json!(now_ms()));
-                Ok(())
-            })?;
+                    conv.set_field("recentMessages", Value::Array(list));
+                    conv.set_field("preSleepWaitSatisfiedAt", json!(0));
+                    conv.set_field("preSleepWaitObservedAt", json!(0));
+                    conv.set_field("preSleepWaitAccumMs", json!(0));
+                    conv.set_field("engagedAt", json!(now_ms()));
+                    Ok(())
+                })?
+                .ok_or((404, format!("会话不存在：{storage_key}")))?;
             crate::safe_println!("[console] send-poke {key} 成功");
             crate::activity::append(
                 context,
@@ -745,11 +749,10 @@ pub(super) fn resolve_quote_js(
     if reference.is_empty() {
         return None;
     }
-    let state = load_social_state_for(context).ok()?;
-    let found = state
-        .get("conversations")
-        .and_then(|c| c.get(storage_key))
-        .and_then(|c| c.get("recentMessages"))
+    let conv = ConversationState::for_runtime(context).read(storage_key).ok().flatten();
+    let found = conv
+        .as_ref()
+        .and_then(|c| c.field("recentMessages"))
         .and_then(Value::as_array)
         .and_then(|list| list.iter().find(|m| m.get("seq").map(social_policy_js_string).as_deref() == Some(reference)).cloned());
     let from_local = |found: &Value, real: &str| {
@@ -802,7 +805,10 @@ pub(super) fn execute_send(context: &RuntimeContext, cfg: &Value, call: &SendCal
     let (messages, at_user, flavor, policy) = (&normalized, call.at_user, call.flavor, call.policy);
     mute_send_denial(context, cfg, key, token)?;
     let ob = onebot_for_runtime(context, cfg).map_err(|error| (503, error))?;
-    let initial = load_social_state_for(context)?["conversations"][key].clone();
+    let initial = ConversationState::for_runtime(context)
+        .read(key)?
+        .map(|c| c.to_value())
+        .unwrap_or(Value::Null);
     let chain = send_chain();
     let fresh = if context.is_isolated() {
         Some(context.load_config().map_err(|_| (503, "send settings are unavailable".to_string()))?)
@@ -1170,8 +1176,8 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     if mode == "chat" || mode == "reserved" {
         return Err((403, "发送工具仅限 closed-agent / reserved2 模式使用".to_string()));
     }
-    let state = load_social_state_for(context)?;
-    if state.get("paused").and_then(Value::as_bool) == Some(true) && !token.is_empty() {
+    let doc = ConversationState::for_runtime(context).read_document()?;
+    if doc.paused() && !token.is_empty() {
         return Err((403, "当前已暂停，不允许执行发送工具".to_string()));
     }
     if target_id.is_empty() || message.is_empty() {
@@ -1228,12 +1234,9 @@ fn direct_inner(context: &RuntimeContext, cfg: &Value, path: &str, body: &str) -
     }
     if token.is_empty() {
         // Closed-agent (administrator chat) sends carry no session token; JS creates the conversation lazily.
-        mutate_social_state_for(context, |state| {
-            if state.get("conversations").and_then(|c| c.get(&storage_key)).is_none() {
-                if !state.get("conversations").map(Value::is_object).unwrap_or(false) {
-                    state["conversations"] = json!({});
-                }
-                state["conversations"][&storage_key] = new_conversation(context);
+        ConversationState::for_runtime(context).update_document(|doc| {
+            if !doc.has_conversation(&storage_key) {
+                doc.set_conversation(&storage_key, Conversation::new_default(context));
             }
             Ok(())
         })?;
@@ -1267,14 +1270,8 @@ pub(super) fn through_of(context: &RuntimeContext, key: &str, conv: &Value) -> i
     read_through_seq(&with_receipts)
 }
 
-/// JS `getSocialV2State(key)`: the conversation record, created with defaults when the key is new.
-fn ensure_conversation(context: &RuntimeContext, state: &mut Value, key: &str) {
-    if !state.get("conversations").map(Value::is_object).unwrap_or(false) {
-        state["conversations"] = json!({});
-    }
-    if state["conversations"].get(key).is_none() {
-        state["conversations"][key] = new_conversation(context);
-    }
+pub(super) fn through_of_conv(context: &RuntimeContext, key: &str, conv: &Conversation) -> i64 {
+    through_of(context, key, &conv.to_value())
 }
 
 fn force_short_rewake(wake: &mut Value, now: i64) {
@@ -1282,8 +1279,8 @@ fn force_short_rewake(wake: &mut Value, now: i64) {
     wake["sleepUntil"] = json!(crate::sticker::iso_at(now.saturating_add(30_000)));
 }
 
-fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Value, now: i64, what: &str) -> Option<(u16, String)> {
-    let remaining = crate::wake::pre_sleep_remaining(conv, cfg, now)?;
+fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Conversation, conv_val: &Value, now: i64, what: &str) -> Option<(u16, String)> {
+    let remaining = crate::wake::pre_sleep_remaining(conv_val, cfg, now)?;
     // The observation the prompt asks for; the reserved2 turn budget covers it.
     let pre_sleep_ms = crate::wake::prompt_pre_sleep_wait_ms(cfg);
     let used = match wait_usage(context, key, conv) {
@@ -1305,9 +1302,9 @@ fn pre_sleep_error(context: &RuntimeContext, key: &str, cfg: &Value, conv: &Valu
 }
 
 /// JS `requestedReadThroughSeqV2`: Ok(None) when the request has no `throughSeq` member at all.
-fn requested_through(raw: Option<&Value>, conv: &Value, through_now: i64, is_agent: bool) -> Result<Option<i64>, (u16, String)> {
+fn requested_through(raw: Option<&Value>, conv: &Conversation, through_now: i64, is_agent: bool) -> Result<Option<i64>, (u16, String)> {
     let Some(raw) = raw else { return Ok(None) };
-    let last_unread = conv.get("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0);
+    let last_unread = conv.field("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0);
     let max = if is_agent { through_now } else { last_unread };
     match js_safe_integer(raw) {
         Some(seq) if seq >= 0 && seq <= max && seq <= last_unread => Ok(Some(seq)),
@@ -1319,51 +1316,36 @@ fn requested_through(raw: Option<&Value>, conv: &Value, through_now: i64, is_age
 }
 
 /// JS `acknowledgeMessagesV2`: drops the acknowledged unread messages and moves the persistent mark.
-fn acknowledge(context: &RuntimeContext, key: &str, conv: &mut Value, through: Option<i64>) -> usize {
-    let before = conv.get("unread").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-    let last_unread = conv.get("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0);
-    match through {
-        None => {
-            conv["unread"] = json!([]);
-            conv["lastReadThroughSeq"] = json!(last_unread);
-        }
-        Some(seq) => {
-            let kept: Vec<Value> = conv
-                .get("unread")
-                .and_then(Value::as_array)
-                .map(|list| list.iter().filter(|m| m.get("seq").and_then(js_safe_integer).map(|s| s > seq).unwrap_or(true)).cloned().collect())
-                .unwrap_or_default();
-            conv["unread"] = json!(kept);
-            let previous = conv.get("lastReadThroughSeq").and_then(js_safe_integer).unwrap_or(0);
-            conv["lastReadThroughSeq"] = json!(previous.max(seq));
-        }
-    }
-    let unread = conv.get("unread").and_then(Value::as_array).cloned().unwrap_or_default();
-    note_receipts(context, key, conv, &unread, &[]);
-    before - unread.len()
+fn acknowledge(context: &RuntimeContext, key: &str, conv: &mut Conversation, through: Option<i64>) -> usize {
+    let marked = conv.acknowledge_unread(through);
+    let conv_val = conv.to_value();
+    let unread_vals = conv.unread_values();
+    note_receipts(context, key, &conv_val, &unread_vals, &[]);
+    marked
 }
 
 fn agent_header_token(headers: &HashMap<String, String>) -> Option<&str> {
     headers.get("x-agent-token").map(String::as_str)
 }
 
-fn note_acknowledged_urgent(context: &RuntimeContext, before: Option<&Value>, body: &str, reply: &Value) {
+fn note_acknowledged_urgent(context: &RuntimeContext, before: Option<&SocialDocument>, body: &str, reply: &Value) {
     // A configuration-only call or failed write is not an acknowledgement. Use the
     // requested prefix, never the response cursor (which can skip retained gaps).
     if reply["markedCount"].as_u64().unwrap_or(0) == 0 { return; }
-    let Some(state) = before else { return };
+    let Some(doc) = before else { return };
     let key = reply["key"].as_str().unwrap_or("");
-    let conv = &state["conversations"][key];
+    let Some(conv) = doc.conversation(key) else { return };
+    let conv_val = conv.to_value();
     let input: Value = serde_json::from_str(body).unwrap_or_default();
     let through = js_safe_integer(&input["throughSeq"])
-        .unwrap_or_else(|| conv["lastUnreadSeq"].as_i64().unwrap_or(-1));
-    let acknowledged: Vec<_> = conv["unread"].as_array().into_iter().flatten()
-        .filter(|m| js_safe_integer(&m["seq"]).is_some_and(|seq| seq <= through)).cloned().collect();
-    note_urgent_delivery(context, key, conv, &acknowledged);
+        .unwrap_or_else(|| conv.field("lastUnreadSeq").and_then(Value::as_i64).unwrap_or(-1));
+    let acknowledged: Vec<_> = conv.unread_values().into_iter()
+        .filter(|m| js_safe_integer(&m["seq"]).is_some_and(|seq| seq <= through)).collect();
+    note_urgent_delivery(context, key, &conv_val, &acknowledged);
 }
 
 pub(super) fn mark_read(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, String>, body: &str) -> (u16, Value) {
-    let before = load_social_state_for(context).ok();
+    let before = ConversationState::for_runtime(context).read_document().ok();
     match mark_read_inner(context, cfg, headers, body) {
         Ok(reply) => {
             if agent_header_token(headers).is_some_and(|token| !token.is_empty()) {
@@ -1382,38 +1364,38 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
         return Err((400, "key 不能为空".to_string()));
     }
     let agent_token = agent_header_token(headers);
-    let (_, is_agent) = social_projection_request_state(context, cfg, &key, agent_token, "markRead", "qq_mark_read")?;
+    let (_, is_agent) = social_projection_request_doc(context, cfg, &key, agent_token, "markRead", "qq_mark_read")?;
     let storage_key = projection_storage_key(&key)?;
     let auth = agent_token.map(|token| SocialProjectionWriteAuth { token, tool_flag: "markRead", tool_name: "qq_mark_read" });
-    mutate_social_state_for(context, |state| {
+    ConversationState::for_runtime(context).update_document(|doc| {
         // The token is checked again under the state gate: a token rotated while the request waited
         // (a cancelled or replaced turn) must not be able to acknowledge anything.
         if let Some(auth) = auth {
-            social_projection_write_denial(context, state, &storage_key, auth)?;
+            social_projection_write_denial_doc(context, doc, &storage_key, auth)?;
         }
-        ensure_conversation(context, state, &storage_key);
-        let conv = &mut state["conversations"][&storage_key];
+        let mut conv = doc.conversation(&storage_key).unwrap_or_else(|| Conversation::new_default(context));
         let now = now_ms();
-        let (_, wait_used) = wait_usage(context, &storage_key, conv)?;
+        let (_, wait_used) = wait_usage(context, &storage_key, &conv)?;
         let wait_max = wait_policy(cfg).max_per_turn;
         let exhausted = wait_used >= wait_max;
-        let short_rewake = exhausted && crate::wake::pre_sleep_remaining(conv, cfg, now).is_some();
+        let conv_val = conv.to_value();
+        let short_rewake = exhausted && crate::wake::pre_sleep_remaining(&conv_val, cfg, now).is_some();
         // Back to diving right after talking is refused until the pre-sleep observation was done
         // (private chats are exempt, as in JS).
-        let wake = conv.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+        let wake = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
         if !storage_key.starts_with("private:") && crate::wake::is_sleeping_config(&wake) {
-            if let Some(error) = pre_sleep_error(context, &storage_key, cfg, conv, now, "mark_read") {
+            if let Some(error) = pre_sleep_error(context, &storage_key, cfg, &conv, &conv_val, now, "mark_read") {
                 return Err(error);
             }
         }
         // An agent omitting the cursor requests the whole unread prefix. Check its grant too.
-        let last_unread = json!(conv.get("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0));
+        let last_unread = json!(conv.field("lastUnreadSeq").and_then(js_safe_integer).unwrap_or(0));
         let requested = b.get("throughSeq").or(is_agent.then_some(&last_unread));
-        let through = requested_through(requested, conv, through_of(context, &storage_key, conv), is_agent)
+        let through = requested_through(requested, &conv, through_of_conv(context, &storage_key, &conv), is_agent)
             .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;
-        let marked = acknowledge(context, &storage_key, conv, through);
-        conv["lastActionAt"] = json!(now);
-        let mut wc = conv.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+        let marked = acknowledge(context, &storage_key, &mut conv, through);
+        conv.set_field("lastActionAt", json!(now));
+        let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
         wc["noActionCount"] = json!(0);
         if wc.get("infinite").and_then(Value::as_bool) != Some(true) && wc.get("sleepUntil").map(Value::is_null).unwrap_or(true) {
             wc["infinite"] = json!(true);
@@ -1422,9 +1404,10 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
         wc["confirmedAt"] = json!(now);
         wc["confirmedBy"] = json!("mark_read");
         if short_rewake { force_short_rewake(&mut wc, now); }
-        conv["wakeConfig"] = wc.clone();
-        let unread_count = conv.get("unread").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-        let read_through = through_of(context, &storage_key, conv);
+        conv.set_field("wakeConfig", wc.clone());
+        let unread_count = conv.unread_count();
+        let read_through = through_of_conv(context, &storage_key, &conv);
+        doc.set_conversation(&storage_key, conv);
         let safety = wake_safety(&wc, now);
         let mut out = json!({
             "ok": true, "key": key, "markedCount": marked, "unreadCount": unread_count, "readThroughSeq": read_through,
@@ -1437,7 +1420,7 @@ fn mark_read_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<Stri
 }
 
 pub(super) fn wake_config(context: &RuntimeContext, cfg: &Value, headers: &HashMap<String, String>, body: &str) -> (u16, Value) {
-    let before = load_social_state_for(context).ok();
+    let before = ConversationState::for_runtime(context).read_document().ok();
     match wake_config_inner(context, cfg, headers, body) {
         Ok(reply) => {
             if agent_header_token(headers).is_some_and(|token| !token.is_empty()) {
@@ -1456,34 +1439,34 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
         return Err((400, "key 不能为空".to_string()));
     }
     let agent_token = agent_header_token(headers);
-    let (_, is_agent) = social_projection_request_state(context, cfg, &key, agent_token, "setWakeConfig", "qq_set_wake_config")?;
+    let (_, is_agent) = social_projection_request_doc(context, cfg, &key, agent_token, "setWakeConfig", "qq_set_wake_config")?;
     let storage_key = projection_storage_key(&key)?;
     let auth = agent_token.map(|token| SocialProjectionWriteAuth { token, tool_flag: "setWakeConfig", tool_name: "qq_set_wake_config" });
-    mutate_social_state_for(context, |state| {
+    ConversationState::for_runtime(context).update_document(|doc| {
         if let Some(auth) = auth {
-            social_projection_write_denial(context, state, &storage_key, auth)?;
+            social_projection_write_denial_doc(context, doc, &storage_key, auth)?;
         }
-        ensure_conversation(context, state, &storage_key);
-        let conv = &mut state["conversations"][&storage_key];
+        let mut conv = doc.conversation(&storage_key).unwrap_or_else(|| Conversation::new_default(context));
         let now = now_ms();
-        let (_, wait_used) = wait_usage(context, &storage_key, conv)?;
+        let (_, wait_used) = wait_usage(context, &storage_key, &conv)?;
         let wait_max = wait_policy(cfg).max_per_turn;
         let exhausted = wait_used >= wait_max;
-        let short_rewake = exhausted && crate::wake::pre_sleep_remaining(conv, cfg, now).is_some();
+        let conv_val = conv.to_value();
+        let short_rewake = exhausted && crate::wake::pre_sleep_remaining(&conv_val, cfg, now).is_some();
 
-        let current = conv.get("wakeConfig").cloned().unwrap_or_else(|| json!({}));
+        let current = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
         let input = b.get("config").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({}));
         let next = crate::wake::normalize_wake_config(&current, &input, cfg, &storage_key, now, rand01())?;
         if !storage_key.starts_with("private:") && crate::wake::is_sleeping_config(&next) {
-            if let Some(error) = pre_sleep_error(context, &storage_key, cfg, conv, now, "wake_config") {
+            if let Some(error) = pre_sleep_error(context, &storage_key, cfg, &conv, &conv_val, now, "wake_config") {
                 return Err(error);
             }
         }
-        let through = requested_through(b.get("throughSeq"), conv, through_of(context, &storage_key, conv), is_agent)
+        let through = requested_through(b.get("throughSeq"), &conv, through_of_conv(context, &storage_key, &conv), is_agent)
             .map_err(|(status, error)| (status, if exhausted { format!("{error} {END_TURN}") } else { error }))?;
         // With the markRead tool switched off the mark is ignored and only the configuration is set.
         let acknowledge_on_close = through.is_some() && tool_enabled(cfg, "markRead");
-        let marked = if acknowledge_on_close { acknowledge(context, &storage_key, conv, through) } else { 0 };
+        let marked = if acknowledge_on_close { acknowledge(context, &storage_key, &mut conv, through) } else { 0 };
         let mut wc = next.clone();
         if let Some(obj) = wc.as_object_mut() {
             obj.insert("lastWakeAt".into(), obj.get("lastWakeAt").filter(|v| truthy_json(v)).cloned().unwrap_or(json!(0)));
@@ -1494,14 +1477,20 @@ fn wake_config_inner(context: &RuntimeContext, cfg: &Value, headers: &HashMap<St
         }
         if short_rewake { force_short_rewake(&mut wc, now); }
         // Her (agent) and console changes of keywords or dropNames are logged and undoable (`wake_words.rs`).
-        let _ = crate::wake_words::record(conv, &current, &wc, if is_agent { "her" } else { "console" }, now);
-        conv["wakeConfig"] = wc.clone();
-        conv["lastActionAt"] = json!(now);
-        conv["preSleepWaitSatisfiedAt"] = json!(0);
-        conv["preSleepWaitObservedAt"] = json!(0);
-        conv["preSleepWaitAccumMs"] = json!(0);
-        let unread_count = conv.get("unread").and_then(Value::as_array).map(Vec::len).unwrap_or(0);
-        let read_through = through_of(context, &storage_key, conv);
+        let mut recorded_val = conv.to_value();
+        if crate::wake_words::record(&mut recorded_val, &current, &wc, if is_agent { "her" } else { "console" }, now).is_some() {
+            if let Some(updated) = Conversation::from_value(&recorded_val) {
+                conv = updated;
+            }
+        }
+        conv.set_field("wakeConfig", wc.clone());
+        conv.set_field("lastActionAt", json!(now));
+        conv.set_field("preSleepWaitSatisfiedAt", json!(0));
+        conv.set_field("preSleepWaitObservedAt", json!(0));
+        conv.set_field("preSleepWaitAccumMs", json!(0));
+        let unread_count = conv.unread_count();
+        let read_through = through_of_conv(context, &storage_key, &conv);
+        doc.set_conversation(&storage_key, conv);
         let mut out = json!({
             "ok": true, "key": key, "markedCount": marked, "unreadCount": unread_count, "readThroughSeq": read_through,
             "wakeConfig": wc.clone(), "wakeSafety": wake_safety(&wc, now),
@@ -1538,16 +1527,15 @@ fn message_detail_inner(
     if key.is_empty() || message_id.is_empty() {
         return Err((400, "key 和 messageId 不能为空".to_string()));
     }
-    let (state, _) = social_projection_request_state(context, cfg, &key, agent_header_token(headers), "getMessageDetail", "qq_get_message_detail")?;
+    let (conv_opt, _) = social_projection_request_conv(context, cfg, &key, agent_header_token(headers), "getMessageDetail", "qq_get_message_detail")?;
     let Some((kind, id_s_raw, _)) = parse_key(&key) else {
         return Err((400, KEY_FORMAT_ERROR.to_string()));
     };
     let storage_key = projection_storage_key(&key)?;
     let id_s = id_s_raw.parse::<f64>().map(|n| (n as i64).to_string()).unwrap_or_else(|_| id_s_raw.to_string());
-    let found = state
-        .get("conversations")
-        .and_then(|c| c.get(&storage_key))
-        .and_then(|c| c.get("recentMessages"))
+    let found = conv_opt
+        .as_ref()
+        .and_then(|c| c.field("recentMessages"))
         .and_then(Value::as_array)
         .and_then(|list| {
             list.iter()
