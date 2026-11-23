@@ -1175,7 +1175,8 @@ mod desktop_grants {
     }
 
     pub(super) fn read(context: &RuntimeContext) -> Result<Option<Registry>, (u16, String)> {
-        let Some(bytes) = crate::console_auth::read_protected_auth_file(context, DESKTOP_GRANTS_FILE, 128 * 1024)
+        let Some(bytes) = context
+            .read_protected_data_file(DESKTOP_GRANTS_FILE, 128 * 1024)
             .map_err(|_| unavailable())? else { return Ok(None) };
         let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
         let mut ids = std::collections::HashSet::new();
@@ -6141,104 +6142,27 @@ fn handle_social_v1_config(context: &RuntimeContext, body: &str) -> Result<Value
 // 正斜杠在 Windows 上看着就别扭，而且和 JS 的 path.resolve 输出不一致。
 const STATE_DIR: &str = crate::legacy_path!(windows "qq-bridge\\state");
 
-/// 宽松主体：Authenticated Users / BUILTIN\Users / Everyone（按 SID，不受显示语言影响）。
-const PERMISSIVE_SIDS: [&str; 3] = ["*S-1-5-11", "*S-1-5-32-545", "*S-1-1-0"];
-
-/// 调 icacls，返回 (退出码, stdout+stderr)。
-fn icacls(args: &[&str]) -> (i32, String) {
-    match crate::subprocess::command_without_console("icacls").args(args).output() {
-        Ok(o) => (
-            o.status.code().unwrap_or(-1),
-            format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            ),
-        ),
-        Err(e) => (-1, e.to_string()),
-    }
-}
-
-/// 是否还有**继承来的**权限 ACE。
-///
-/// **必须排除 `Mandatory Label` 那一行**：DSH 的沙箱会给工作区打 Low 完整性标记，
-/// 那行的 `(I)(OI)(CI)(NW)` 永远带 (I)。不排除的话"已收紧"会被判成"未收紧"，
-/// 于是每次启动都重跑一遍带破坏性的 icacls 命令（JS 里这个 bug 真实发生过）。
-fn has_inherited_permission_ace(out: &str) -> bool {
-    out.split(['\n', '\r'])
-        .filter(|line| !line.to_lowercase().contains("mandatory label"))
-        .any(|line| line.contains("(I)"))
-}
-
-/// 是否还有本机任意用户可读的宽松主体授权。
-fn has_permissive_trustee(out: &str) -> bool {
-    let lower = out.to_lowercase();
-    lower.contains("authenticated users") || lower.contains("builtin\\users") || lower.contains("everyone")
-}
-
 /// 目标路径的权限是否已收紧。
 fn is_hardened(target: &str) -> bool {
-    let (code, out) = icacls(&[target]);
-    code == 0 && !has_inherited_permission_ace(&out) && !has_permissive_trustee(&out)
+    crate::guarded_fs::is_directory_hardened(
+        std::path::Path::new(target),
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    )
 }
 
 /// 给管理员的手工命令（控制台直接展示、可复制）。
 fn manual_dir_command(dir: &str) -> String {
-    let d = format!("\"{dir}\"");
-    [
-        format!("icacls {d} /T /C /Q /grant \"%USERNAME%:F\" /grant \"*S-1-5-18:F\" /grant \"*S-1-5-32-544:F\""),
-        format!("icacls {d} /Q /grant \"%USERNAME%:(OI)(CI)F\" /grant \"*S-1-5-18:(OI)(CI)F\" /grant \"*S-1-5-32-544:(OI)(CI)F\""),
-        format!("icacls {d} /inheritance:r /C /Q"),
-        format!("icacls {d} /remove:g \"*S-1-5-11\" \"*S-1-5-32-545\" \"*S-1-1-0\" /T /C /Q"),
-    ]
-    .join("\n             ")
+    crate::guarded_fs::manual_harden_command(std::path::Path::new(dir))
 }
 
 /// 收紧目录 ACL，返回 (ok, detail)。
-///
-/// Grant the operator, SYSTEM and Administrators access before removing inherited
-/// access. Otherwise an inherited-only DACL becomes empty and a failed recursive
-/// walk returns before the grants, leaving the runtime unreadable. Apply leaf
-/// grants recursively; apply (OI)(CI) only to the directory for future files.
 fn harden_dir(dir: &str) -> (bool, String) {
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    if user.is_empty() {
-        return (false, "无法确定当前用户名（%USERNAME% 为空）".to_string());
-    }
-    let grant_leaf = format!("{user}:F");
-    let grant_leaf_inh = format!("{user}:(OI)(CI)F");
-    let steps: Vec<Vec<&str>> = vec![
-        vec![
-            dir, "/T", "/C", "/Q", "/grant", &grant_leaf, "/grant", "*S-1-5-18:F", "/grant",
-            "*S-1-5-32-544:F",
-        ],
-        vec![
-            dir, "/Q", "/grant", &grant_leaf_inh, "/grant", "*S-1-5-18:(OI)(CI)F", "/grant",
-            "*S-1-5-32-544:(OI)(CI)F",
-        ],
-        vec![dir, "/inheritance:r", "/C", "/Q"],
-        {
-            let mut v = vec![dir, "/remove:g"];
-            v.extend_from_slice(&PERMISSIVE_SIDS);
-            v.extend_from_slice(&["/T", "/C", "/Q"]);
-            v
-        },
-    ];
-    for args in steps {
-        let (code, out) = icacls(&args);
-        if code != 0 {
-            return (false, out);
-        }
-        // `/C` 会让 icacls 继续处理剩余文件、即使全失败退出码仍是 0，所以必须看输出
-        if out.to_lowercase().contains("access is denied") {
-            let tail: Vec<&str> = out.split('\n').filter(|s| !s.trim().is_empty()).rev().take(3).collect();
-            return (false, tail.into_iter().rev().collect::<Vec<_>>().join(" / "));
-        }
-    }
-    // 自检：属主必须仍能读到目录内容（防"把 DACL 清空"这种成功）
-    match std::fs::read_dir(dir) {
-        Ok(_) => (true, "icacls".to_string()),
-        Err(e) => (false, format!("收紧后目录已不可读，请检查 ACL（{e}）")),
+    match crate::guarded_fs::harden_directory_tree(
+        std::path::Path::new(dir),
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    ) {
+        Ok(()) => (true, "native".to_string()),
+        Err(error) => (false, error),
     }
 }
 

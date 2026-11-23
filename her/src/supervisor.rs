@@ -94,7 +94,7 @@ pub(crate) fn queue_console_restart(context: &RuntimeContext, body: &str) -> Res
 }
 
 fn read_restart_request(context: &RuntimeContext) -> Result<Option<RestartRequest>, String> {
-    let Some(bytes) = crate::console_auth::read_protected_auth_file(context, RESTART_REQUEST, 4096)? else {
+    let Some(bytes) = context.read_protected_data_file(RESTART_REQUEST, 4096)? else {
         return Ok(None);
     };
     let invalid = || "restart request is invalid".to_string();
@@ -121,7 +121,7 @@ fn inspect_restart_request(context: &RuntimeContext) -> Result<Option<RestartReq
 fn clear_restart_request(context: &RuntimeContext, id: &str) {
     let Ok(_guard) = crate::conversation_state::acquire(context) else { return };
     if read_restart_request(context).ok().flatten().is_some_and(|record| record.id == id) {
-        if let Err(error) = crate::console_auth::remove_auth_file(context, RESTART_REQUEST) {
+        if let Err(error) = context.remove_protected_data_file(RESTART_REQUEST) {
             crate::safe_eprintln!("[supervisor] restart request cleanup failed: {error}");
         }
     }

@@ -633,10 +633,12 @@ fn install_snow(
     guard_destination(&staging)?;
     fs::create_dir(&staging).map_err(|_| "SnowLuma staging cannot be created")?;
     let result = (|| {
-        os::private(
+        crate::guarded_fs::restrict_entry(
             &staging,
             &fs::metadata(&staging).map_err(|_| "SnowLuma staging is unavailable")?,
-        )?;
+            crate::guarded_fs::AclPolicy::OwnerOnly,
+        )
+        .map_err(String::from)?;
         let bytes = crate::release::fetch(
             candidate
                 .archive

@@ -1164,34 +1164,23 @@ fn state_dir(context: &RuntimeContext) -> Result<String, String> {
     crate::subprocess::external_path(context.data_dir())
 }
 
-#[cfg(windows)]
 fn state_dir_hardened(dir: &str) -> bool {
-    is_hardened(dir)
+    crate::guarded_fs::is_directory_hardened(
+        std::path::Path::new(dir),
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    )
 }
-#[cfg(not(windows))]
-fn state_dir_hardened(dir: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(dir).map(|m| m.permissions().mode() & 0o077 == 0).unwrap_or(false)
-}
-#[cfg(windows)]
 fn harden_state_dir(dir: &str) -> (bool, String) {
-    harden_dir(dir)
-}
-#[cfg(not(windows))]
-fn harden_state_dir(dir: &str) -> (bool, String) {
-    use std::os::unix::fs::PermissionsExt;
-    match std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
-        Ok(()) => (true, "chmod 700".to_string()),
-        Err(error) => (false, error.to_string()),
+    match crate::guarded_fs::harden_directory_tree(
+        std::path::Path::new(dir),
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+    ) {
+        Ok(()) => (true, "native".to_string()),
+        Err(error) => (false, error),
     }
 }
-#[cfg(windows)]
 fn state_dir_command(dir: &str) -> String {
-    manual_dir_command(dir)
-}
-#[cfg(not(windows))]
-fn state_dir_command(dir: &str) -> String {
-    format!("chmod -R go-rwx \"{dir}\"")
+    crate::guarded_fs::manual_harden_command(std::path::Path::new(dir))
 }
 
 /// JS `hardenStateDirAcl` at console start: the selected data area holds the console token,

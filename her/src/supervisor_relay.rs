@@ -295,68 +295,11 @@ mod probe_tests {
     }
 }
 
-/// Why one relay entry could not be made private.
-#[derive(Debug)]
-pub(super) enum Unprotected {
-    /// The OS reported the entry missing (`vanished`); `protect` decides whether it really is
-    /// gone. The diagnostic is kept for the refusal when it is not.
-    Missing(String),
-    /// Any other failure.
-    Refused(String),
-}
-
-impl From<Unprotected> for String {
-    fn from(failure: Unprotected) -> Self {
-        match failure {
-            Unprotected::Missing(reason) | Unprotected::Refused(reason) => reason,
-        }
-    }
-}
-
-/// Whether an I/O error reports the entry itself missing: Win32 ERROR_FILE_NOT_FOUND (2) or
-/// ERROR_PATH_NOT_FOUND (3), Unix ENOENT. Every other error is a refusal.
-fn vanished(error: &std::io::Error) -> bool {
-    #[cfg(windows)]
-    {
-        error
-            .raw_os_error()
-            .and_then(|code| u32::try_from(code).ok())
-            .is_some_and(win32_vanished)
-    }
-    #[cfg(not(windows))]
-    {
-        error.kind() == std::io::ErrorKind::NotFound
-    }
-}
+use crate::guarded_fs::{sanitized_path as shown, vanished, AclError, AclPolicy};
 
 /// Whether `path` itself is now reported missing.
 fn gone(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_err_and(|error| vanished(&error))
-}
-
-/// Characters that hide or reorder displayed text: control characters, the Unicode bidirectional
-/// controls (Bidi_Control, which includes U+061C), line and paragraph separators, zero-width
-/// characters and the byte-order mark.
-fn formatting(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061c}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{2029}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{feff}'
-        )
-}
-
-/// A path as diagnostics show it. Such characters become `?`, so an entry name cannot add lines
-/// to a log or notice or reorder its text.
-fn shown(path: &Path) -> String {
-    let text = path.display().to_string();
-    text.chars()
-        .map(|c| if formatting(c) { '?' } else { c })
-        .collect()
 }
 
 /// A sweep diagnostic naming the path that failed, as the ACL diagnostics do.
@@ -483,15 +426,15 @@ fn protect(
     path: &Path,
     meta: std::fs::Metadata,
     listed: bool,
-    mut private: impl FnMut(&Path, &std::fs::Metadata) -> Result<(), Unprotected>,
+    mut private: impl FnMut(&Path, &std::fs::Metadata) -> Result<(), AclError>,
 ) -> Result<bool, String> {
     let mut meta = meta;
     let mut retried = false;
     loop {
         let reason = match private(path, &meta) {
             Ok(()) => return Ok(true),
-            Err(Unprotected::Refused(reason)) => return Err(reason),
-            Err(Unprotected::Missing(reason)) => reason,
+            Err(AclError::Refused(reason)) => return Err(reason),
+            Err(AclError::Missing(reason)) => reason,
         };
         match inspect(path, listed)? {
             None => return Ok(false),
@@ -582,335 +525,13 @@ fn sweep(folder: &Path, seam: &mut dyn FnMut(Seam, &Path)) -> Result<usize, Stri
     seam(Seam::Hardening, folder);
     // Parent first closes external access before processing its children.
     for (path, meta, listed) in entries.into_iter().rev() {
-        if !protect(&path, meta, listed, super::os::private)? {
+        if !protect(&path, meta, listed, |p, m| {
+            crate::guarded_fs::restrict_entry(p, m, AclPolicy::OwnerOnly)
+        })? {
             skipped += 1;
         }
     }
     Ok(skipped)
-}
-
-#[cfg(unix)]
-pub(super) fn unix_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if meta.is_dir() {
-        0o700
-    } else {
-        (meta.permissions().mode() & 0o700) | 0o600
-    };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|error| {
-        let reason = failure(
-            "relay private permissions could not be applied",
-            path,
-            "set_permissions",
-            &error,
-        );
-        if vanished(&error) {
-            Unprotected::Missing(reason)
-        } else {
-            Unprotected::Refused(reason)
-        }
-    })
-}
-
-#[cfg(windows)]
-fn credential_sids(path: &Path, settings: bool) -> Result<Vec<Vec<u8>>, Unprotected> {
-    use windows_sys::Win32::Security::{
-        CreateWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
-    };
-
-    let user = identity::current_user().map_err(|error| {
-        Unprotected::Refused(format!(
-            "relay private ACL {}: process token SID: {error}",
-            shown(path)
-        ))
-    })?;
-    let mut sids = vec![user];
-    if settings {
-        for kind in [WinLocalSystemSid, WinBuiltinAdministratorsSid] {
-            let mut buffer = [0u32; 17];
-            let mut size = std::mem::size_of_val(&buffer) as u32;
-            // SAFETY: aligned writable SECURITY_MAX_SID_SIZE storage and a valid size pointer.
-            if unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut size) } == 0 {
-                return Err(Unprotected::Refused(windows_acl_error(
-                    path, "CreateWellKnownSid", std::io::Error::last_os_error().raw_os_error().unwrap_or_default() as u32,
-                )));
-            }
-            // SAFETY: the native call initialized this many bytes in the retained buffer.
-            let sid = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size as usize) };
-            if !sids.iter().any(|known| known.as_slice() == sid) {
-                sids.push(sid.to_vec());
-            }
-        }
-    }
-    Ok(sids)
-}
-
-#[cfg(windows)]
-fn private_acl<T>(
-    path: &Path,
-    directory: bool,
-    settings: bool,
-    use_acl: impl FnOnce(*mut windows_sys::Win32::Security::ACL, &[Vec<u8>]) -> T,
-) -> Result<T, Unprotected> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE,
-        SET_ACCESS, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
-    };
-    use windows_sys::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-
-    let mut sids = credential_sids(path, settings)?;
-    let entries: Vec<_> = sids.iter_mut().map(|sid| EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: if directory {
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-        } else {
-            0
-        },
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: sid.as_mut_ptr().cast(),
-        },
-    }).collect();
-    let mut acl = std::ptr::null_mut();
-    // SAFETY: the SID allocations and entries stay live. A null old ACL creates only these grants.
-    let result = unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), std::ptr::null(), &mut acl) };
-    if result != 0 {
-        return Err(Unprotected::Refused(windows_acl_error(path, "SetEntriesInAclW", result)));
-    }
-    let value = use_acl(acl, &sids);
-    // SAFETY: SetEntriesInAclW allocated acl with LocalAlloc.
-    unsafe { LocalFree(acl.cast()) };
-    Ok(value)
-}
-
-#[cfg(windows)]
-pub(super) fn windows_create_credential(path: &Path, settings: bool) -> std::io::Result<std::fs::File> {
-    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::{
-        InitializeSecurityDescriptor, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-        SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
-    };
-    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ};
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    private_acl(path, false, settings, |acl, _| {
-        let mut descriptor = std::mem::MaybeUninit::<SECURITY_DESCRIPTOR>::uninit();
-        let ptr = descriptor.as_mut_ptr().cast();
-        // SAFETY: the absolute security descriptor has aligned storage and the ACL outlives CreateFileW.
-        if unsafe { InitializeSecurityDescriptor(ptr, 1) } == 0
-            || unsafe { SetSecurityDescriptorDacl(ptr, 1, acl, 0) } == 0
-            || unsafe { SetSecurityDescriptorControl(ptr, SE_DACL_PROTECTED, SE_DACL_PROTECTED) } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: ptr,
-            bInheritHandle: 0,
-        };
-        // SAFETY: path is NUL-terminated, attrs and its descriptor live through the call.
-        let handle = unsafe {
-            CreateFileW(wide.as_ptr(), GENERIC_WRITE, FILE_SHARE_READ, &attrs, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut())
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: CreateFileW returned a valid owned handle, transferred to File once.
-        Ok(unsafe { std::fs::File::from_raw_handle(handle) })
-    }).map_err(|error| std::io::Error::other(String::from(error)))?
-}
-
-#[cfg(windows)]
-pub(super) fn windows_private(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    windows_protect(path, meta.is_dir(), false)
-}
-
-#[cfg(windows)]
-pub(super) fn windows_private_settings(path: &Path, meta: &std::fs::Metadata) -> Result<(), Unprotected> {
-    if !meta.is_file() {
-        return Err(Unprotected::Refused("settings ACL requires a regular file".into()));
-    }
-    windows_protect(path, false, true)
-}
-
-#[cfg(windows)]
-fn windows_protect(path: &Path, directory: bool, settings: bool) -> Result<(), Unprotected> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
-    private_acl(path, directory, settings, |acl, sids| {
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: NUL-terminated path and retained ACL; PROTECTED disables parent inheritance.
-        // Only WRITE_DAC is required: do not set the owner or request ownership privileges.
-        let result = unsafe {
-            SetNamedSecurityInfoW(
-                wide.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                acl,
-                std::ptr::null(),
-            )
-        };
-        if result != 0 {
-            return Err(windows_unprotected(path, "SetNamedSecurityInfoW", result));
-        }
-        let sids: Vec<_> = sids.iter().map(Vec::as_slice).collect();
-        windows_verify_grants(path, directory, &sids)
-    })?
-}
-
-#[cfg(windows)]
-fn windows_acl_error(path: &Path, step: &str, code: u32) -> String {
-    format!(
-        "relay private ACL {}: {step} failed (Win32 error {code})",
-        shown(path)
-    )
-}
-
-/// Win32 ERROR_FILE_NOT_FOUND (2) and ERROR_PATH_NOT_FOUND (3).
-#[cfg(windows)]
-fn win32_vanished(code: u32) -> bool {
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-    code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND
-}
-
-/// A failed native step on `path`: `Missing` when Windows reports the entry missing.
-#[cfg(windows)]
-fn windows_unprotected(path: &Path, step: &str, code: u32) -> Unprotected {
-    let reason = windows_acl_error(path, step, code);
-    if win32_vanished(code) {
-        Unprotected::Missing(reason)
-    } else {
-        Unprotected::Refused(reason)
-    }
-}
-
-#[cfg(all(test, windows))]
-pub(super) fn credential_file_is_private(path: &Path, settings: bool) -> bool {
-    credential_sids(path, settings).is_ok_and(|sids| {
-        let sids: Vec<_> = sids.iter().map(Vec::as_slice).collect();
-        windows_verify_grants(path, false, &sids).is_ok()
-    })
-}
-
-#[cfg(all(test, windows))]
-fn windows_verify_private(path: &Path, directory: bool, user: &[u8]) -> Result<(), Unprotected> {
-    windows_verify_grants(path, directory, &[user])
-}
-
-#[cfg(windows)]
-fn windows_verify_grants(path: &Path, directory: bool, sids: &[&[u8]]) -> Result<(), Unprotected> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{GetLastError, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        GetAce, GetSecurityDescriptorControl, IsValidAcl, ACCESS_ALLOWED_ACE, ACE_HEADER,
-        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, INHERITED_ACE, OBJECT_INHERIT_ACE,
-        SE_DACL_PROTECTED,
-    };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
-
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut descriptor = std::ptr::null_mut();
-    let mut acl = std::ptr::null_mut();
-    // SAFETY: terminated path and initialized out-pointers. ACL storage belongs to descriptor.
-    let result = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut acl,
-            std::ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if result != 0 {
-        return Err(windows_unprotected(
-            path,
-            "GetNamedSecurityInfoW (verify)",
-            result,
-        ));
-    }
-    let invalid = |reason| {
-        format!(
-            "relay private ACL {}: verify failed: {reason}",
-            shown(path)
-        )
-    };
-    // Keep every verification return inside the closure so the descriptor is always freed.
-    let verified = (|| {
-        let mut control = 0;
-        let mut revision = 0;
-        // SAFETY: descriptor was returned successfully and remains allocated below.
-        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
-            return Err(windows_acl_error(
-                path,
-                "GetSecurityDescriptorControl (verify)",
-                unsafe { GetLastError() },
-            ));
-        }
-        if control & SE_DACL_PROTECTED == 0 {
-            return Err(invalid(
-                "DACL is not protected; parent inheritance is enabled",
-            ));
-        }
-        // SAFETY: a non-null ACL belongs to the retained security descriptor.
-        if acl.is_null() || unsafe { IsValidAcl(acl) } == 0 {
-            return Err(invalid("DACL is missing or invalid"));
-        }
-        // SAFETY: IsValidAcl checked the header and ACE bounds.
-        if usize::from(unsafe { (*acl).AceCount }) != sids.len() {
-            return Err(invalid("DACL contains an unexpected number of grants"));
-        }
-        let flags = if directory {
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
-        } else {
-            0
-        };
-        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
-        let mut remaining = sids.to_vec();
-        for index in 0..sids.len() {
-            let mut ace = std::ptr::null_mut();
-            // SAFETY: valid ACL, in-range ACE index and initialized output pointer.
-            if unsafe { GetAce(acl, index as u32, &mut ace) } == 0 {
-                return Err(windows_acl_error(path, "GetAce (verify)", unsafe { GetLastError() }));
-            }
-            // SAFETY: GetAce returned a validated ACE header within the retained ACL.
-            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
-            if u32::from(header.AceFlags) & INHERITED_ACE != 0
-                || header.AceType != 0
-                || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
-            {
-                return Err(invalid("DACL contains an unexpected ACE type or flags"));
-            }
-            let bytes = usize::from(header.AceSize) - sid_offset;
-            // SAFETY: the allowed ACE's fixed fields and SID bytes fit in the checked ACL bounds.
-            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
-            let sid = unsafe { std::slice::from_raw_parts(ace.cast::<u8>().add(sid_offset), bytes) };
-            let Some(found) = remaining.iter().position(|expected| *expected == sid) else {
-                return Err(invalid("DACL contains a repeated or unexpected SID"));
-            };
-            remaining.swap_remove(found);
-            if allowed.Mask != FILE_ALL_ACCESS || u32::from(header.AceFlags) != flags {
-                return Err(invalid("ACE has incorrect access or inheritance flags"));
-            }
-        }
-        Ok(())
-    })();
-    // SAFETY: GetNamedSecurityInfoW allocated descriptor with LocalAlloc.
-    unsafe { LocalFree(descriptor) };
-    verified.map_err(Unprotected::Refused)
 }
 
 #[cfg(all(test, windows))]
@@ -1006,21 +627,6 @@ mod native_tests {
     }
 
     #[test]
-    fn ticket219_private_credential_creation_allows_read_sharing() {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-
-        let fixture = Fixture::new();
-        let path = fixture.0.join("capture.out");
-        let _writer = windows_create_credential(&path, false).unwrap();
-        let reader = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(&path);
-        assert!(reader.is_ok(), "credential creation refused a concurrent reader");
-    }
-
-    #[test]
     fn relay_preparation_protects_existing_files_and_future_login_tokens() {
         let fixture = Fixture::new();
         let login = fixture.0.join("login");
@@ -1046,8 +652,8 @@ mod native_tests {
         let refresh = login.join("refresh.json");
         std::fs::write(&refresh, b"synthetic refreshed token").unwrap();
         assert_dacl(&refresh, false, 16); // Only the HER ACE, inherited from the private directory.
-        let Err(Unprotected::Refused(error)) =
-            windows_verify_private(&refresh, false, &identity::current_user().unwrap())
+        let Err(AclError::Refused(error)) =
+            crate::guarded_fs::verify_path_exact_acl(&refresh, false, AclPolicy::OwnerOnly)
         else {
             panic!("an inherited DACL must be refused");
         };
@@ -1063,44 +669,6 @@ mod native_tests {
         assert_dacl(&refresh, true, 0);
         assert_dacl(&later_dir, true, 3);
         assert_dacl(&later_token, true, 0);
-    }
-
-    #[test]
-    fn relay_acl_failure_identifies_file_step_and_win32_code() {
-        let fixture = Fixture::new();
-        let meta = std::fs::metadata(&fixture.0).unwrap();
-        // A missing entry is reported as missing, with the whole diagnostic kept for a refusal.
-        for (missing, code) in [
-            (fixture.0.join("missing.key"), "Win32 error 2"), // ERROR_FILE_NOT_FOUND
-            (fixture.0.join("gone").join("missing.key"), "Win32 error 3"), // ERROR_PATH_NOT_FOUND
-        ] {
-            let Err(Unprotected::Missing(error)) = windows_private(&missing, &meta) else {
-                panic!("a missing entry must be reported as missing");
-            };
-            assert!(error.contains("SetNamedSecurityInfoW"), "{error}");
-            assert!(error.contains(code), "{error}");
-            assert!(error.contains(&missing.display().to_string()), "{error}");
-        }
-        // Any other failure is a refusal: '<' is not a valid character in a Windows file name.
-        let invalid = fixture.0.join("invalid<name.key");
-        let Err(Unprotected::Refused(error)) = windows_private(&invalid, &meta) else {
-            panic!("an invalid name must be refused");
-        };
-        assert!(error.contains("SetNamedSecurityInfoW"), "{error}");
-        assert!(error.contains("Win32 error"), "{error}");
-        assert!(error.contains(&invalid.display().to_string()), "{error}");
-    }
-
-    #[test]
-    fn only_file_and_path_not_found_count_as_vanished() {
-        assert!(win32_vanished(2)); // ERROR_FILE_NOT_FOUND
-        assert!(win32_vanished(3)); // ERROR_PATH_NOT_FOUND
-        for code in [0, 5, 32, 123] {
-            assert!(!win32_vanished(code), "Win32 error {code}");
-        }
-        assert!(vanished(&std::io::Error::from_raw_os_error(2)));
-        assert!(vanished(&std::io::Error::from_raw_os_error(3)));
-        assert!(!vanished(&std::io::Error::from_raw_os_error(5)));
     }
 
     /// The version folder with `logs/` holding two synthetic request-log parts.
@@ -1227,8 +795,8 @@ mod native_tests {
                 0
             );
         }
-        let Err(Unprotected::Refused(error)) =
-            windows_verify_private(&file, false, &identity::current_user().unwrap())
+        let Err(AclError::Refused(error)) =
+            crate::guarded_fs::verify_path_exact_acl(&file, false, AclPolicy::OwnerOnly)
         else {
             panic!("a foreign SID grant must be refused");
         };
@@ -1311,8 +879,8 @@ mod unix_tests {
         (path, meta)
     }
 
-    fn missing() -> Unprotected {
-        Unprotected::Missing("synthetic missing".into())
+    fn missing() -> AclError {
+        AclError::Missing("synthetic missing".into())
     }
 
     #[test]
@@ -1592,7 +1160,7 @@ mod unix_tests {
         let result = protect(&path, meta, true, |entry, _| {
             calls += 1;
             std::fs::remove_file(entry).unwrap();
-            Err(Unprotected::Refused("synthetic refusal".into()))
+            Err(AclError::Refused("synthetic refusal".into()))
         });
         assert_eq!(result, Err("synthetic refusal".to_string()));
         assert_eq!(calls, 1);
@@ -1676,15 +1244,15 @@ mod unix_tests {
         let meta = std::fs::symlink_metadata(&file).unwrap();
         // Without search permission on the directory, the file's mode cannot be changed.
         set_mode(&dir, 0o600);
-        let result = unix_private(&file, &meta);
+        let result = crate::guarded_fs::restrict_entry(&file, &meta, AclPolicy::OwnerOnly);
         set_mode(&dir, 0o700);
-        let Err(Unprotected::Refused(error)) = result else {
+        let Err(AclError::Refused(error)) = result else {
             panic!("a denied permission change must be refused");
         };
         assert_eq!(
             error,
             format!(
-                "relay private permissions could not be applied: {}: set_permissions failed (errno {})",
+                "private permissions could not be applied: {}: set_permissions failed (errno {})",
                 file.display(),
                 libc::EACCES
             )
