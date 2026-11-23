@@ -1,6 +1,7 @@
 mod dsh;
 mod dsh_credential;
 mod digest;
+mod loopback_http;
 mod onebot;
 mod outbound_message;
 mod mcp;
@@ -834,32 +835,10 @@ fn is_loopback_ws_url(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Extract the authority from the explicit OneBot HTTP dependency. Isolated runtimes only accept
-/// `http://<loopback-ip>:<non-zero-port>` endpoints; keep brackets around IPv6 so both the socket
-/// address and HTTP Host header remain valid.
+#[cfg(test)]
 fn loopback_http_endpoint(url: &str) -> Option<(String, u16)> {
-    let authority = url.strip_prefix("http://")?;
-    if authority.is_empty() || authority.chars().any(|ch| matches!(ch, '/' | '?' | '#' | '@')) {
-        return None;
-    }
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let (host, rest) = bracketed.split_once(']')?;
-        let port = rest.strip_prefix(':')?;
-        (host, port)
-    } else {
-        authority.rsplit_once(':')?
-    };
-    let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
-    let address = host.parse::<std::net::IpAddr>().ok()?;
-    if !address.is_loopback() {
-        return None;
-    }
-    let host = if address.is_ipv6() {
-        format!("[{address}]")
-    } else {
-        address.to_string()
-    };
-    Some((host, port))
+    let ep = loopback_http::LoopbackEndpoint::parse(url).ok()?;
+    Some((ep.host().to_string(), ep.port()))
 }
 
 fn parse_live_groups(value: Option<&str>) -> Vec<String> {
@@ -1003,30 +982,13 @@ fn feed_slang(learning: &slang_learn::SlangLearning, auto: bool, cfg_raw: &Value
     }
 }
 
-/// 极简 HTTP/1.1 POST（只用于本机 OneBot HTTP API，不需要 TLS）。
-fn http_post_json(host: &str, port: u16, path: &str, token: &str, body: &str) -> Option<String> {
-    use std::io::{Read, Write};
-    let addr = format!("{host}:{port}");
-    let mut s = std::net::TcpStream::connect(addr).ok()?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(8))).ok()?;
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    s.write_all(req.as_bytes()).ok()?;
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).ok()?;
-    let (_, body) = raw.split_once("\r\n\r\n")?;
-    Some(body.to_string())
-}
-
 /// 查某条消息是不是自己发的（引用回复的判定）。JS 用 resolveReplyInfo 做同样的事。
-fn fetch_msg_sender_is_self(host: &str, port: u16, token: &str, msg_id: i64, self_id: i64) -> bool {
-    let body = format!(r#"{{"message_id":{msg_id}}}"#);
-    let Some(text) = http_post_json(host, port, "/get_msg", token, &body) else {
-        return false;
-    };
-    let Ok((v, _)) = aux_text::parse_json_replacing_lone_surrogates::<serde_json::Value>(&text) else {
+fn fetch_msg_sender_is_self(ob: &onebot::OneBot, msg_id: i64, self_id: i64) -> bool {
+    let Some(v) = ob.request_with_timeout(
+        "get_msg",
+        json!({ "message_id": msg_id }),
+        std::time::Duration::from_secs(8),
+    ) else {
         return false;
     };
     let sender = v
@@ -1039,10 +1001,12 @@ fn fetch_msg_sender_is_self(host: &str, port: u16, token: &str, msg_id: i64, sel
 }
 
 /// 查某个群里自己的群名片。
-fn fetch_group_card(host: &str, port: u16, token: &str, gid: i64, self_id: i64) -> Option<String> {
-    let body = format!(r#"{{"group_id":{gid},"user_id":{self_id},"no_cache":false}}"#);
-    let text = http_post_json(host, port, "/get_group_member_info", token, &body)?;
-    let (v, _) = aux_text::parse_json_replacing_lone_surrogates::<serde_json::Value>(&text).ok()?;
+fn fetch_group_card(ob: &onebot::OneBot, gid: i64, self_id: i64) -> Option<String> {
+    let v = ob.request_with_timeout(
+        "get_group_member_info",
+        json!({ "group_id": gid, "user_id": self_id, "no_cache": false }),
+        std::time::Duration::from_secs(8),
+    )?;
     v.get("data")?
         .get("card")?
         .as_str()
@@ -1942,18 +1906,19 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             .and_then(|s| s.http_url.clone())
             .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
     };
-    let (http_host, http_port) = if runtime_context.is_isolated() {
-        loopback_http_endpoint(&http_base)
-            .ok_or("isolated runtime requires a valid loopback OneBot HTTP endpoint")?
-    } else {
-        loopback_http_endpoint(&http_base).unwrap_or_else(|| ("127.0.0.1".to_string(), 3000))
-    };
     let http_token = heal_http_token.clone().unwrap_or_else(|| {
         cfg.snowluma
             .as_ref()
             .and_then(|s| s.access_token.clone())
             .unwrap_or_default()
     });
+    let http_ob = if runtime_context.is_isolated() {
+        onebot::OneBot::try_new_url(&http_base, http_token.clone())
+            .map_err(|_| "isolated runtime requires a valid loopback OneBot HTTP endpoint")?
+    } else {
+        onebot::OneBot::try_new_url(http_base.trim_end_matches('/'), http_token.clone())
+            .map_err(|error| format!("live runtime requires a valid loopback OneBot HTTP endpoint: {error}"))?
+    };
 
     // 断线缺口与重放（ticket 07）。每次（重）连接：先按网关历史能力补收未解决的缺口，
     // 再把已保存但尚未处理完的实时事件按原顺序重放，然后才读取新帧。
@@ -1976,11 +1941,11 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         tokio::task::spawn_blocking(move || {
             dependency_watch::report_unresolved_gaps(&notice_context, &notice_cfg, "inbound-gap-opened");
         }).await?;
-        let (host, port, token) = (http_host.clone(), http_port, http_token.clone());
+        let history_ob = http_ob.clone();
         let recovery_context = runtime_context.clone();
         let spawned = inbound::spawn_gap_recovery(
             move || inbound::Journal::open(&recovery_context),
-            move |group_id, seq| inbound::fetch_group_history(&host, port, &token, group_id, seq),
+            move |group_id, seq| inbound::fetch_group_history(&history_ob, group_id, seq),
             now_ms() as i64,
             {
                 let (gap_context, gap_cfg) = (runtime_context.clone(), cfg_raw.clone());
@@ -2418,7 +2383,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                 let admitted = runtime_context.load_config().map(|now_cfg| console::admitted_ids(&now_cfg, "group")).unwrap_or_default();
                 for g in &admitted {
                     if let Ok(gid) = g.parse::<i64>() {
-                        match fetch_group_card(&http_host, http_port, &http_token, gid, self_id) {
+                        match fetch_group_card(&http_ob, gid, self_id) {
                             Some(card) => {
                                 println!("[her] 群 {gid} 的群名片：{card}");
                                 self_cards.insert(gid, card);
@@ -2713,7 +2678,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         let body = if plain.is_empty() { ev.raw_message.clone() } else { plain };
         // 引用了我的消息 = 在对我说话（对齐 JS 的 isQuoteTargetSelf）
         let quote_self = match (reply_id, self_id != 0) {
-            (Some(mid), true) => fetch_msg_sender_is_self(&http_host, http_port, &http_token, mid, self_id),
+            (Some(mid), true) => fetch_msg_sender_is_self(&http_ob, mid, self_id),
             _ => false,
         };
         let at_self = at_self_direct || quote_self;
