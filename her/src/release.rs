@@ -1288,8 +1288,11 @@ fn retire_cli(args: &[String]) -> i32 {
     let args = if automatic { &args[1..] } else { args };
     let mut stopped = false;
     let result = (|| -> Result<(), String> {
-        use crate::lifecycle::{OwnerGate, OwnerProbe};
-        use crate::process_identity::{self, KillOutcome, Liveness, ProcessIdentity};
+        use crate::lifecycle::{
+            collect_verified_owners, retire_verified_owners, ImagePolicy, LiveLifecycle,
+            OwnerRole, ProbeMode,
+        };
+        use crate::process_identity::ProcessIdentity;
         if args.len() != 6
             || args[0] != "--old-pid"
             || args[2] != "--old-start"
@@ -1305,50 +1308,28 @@ fn retire_cli(args: &[String]) -> i32 {
         };
         let current = crate::update::link_tag(&root, "current")?
             .ok_or("current release unavailable")?;
-        if !crate::update::release_owner_image(&root, &current, &old.exe) {
+        let policy = ImagePolicy::ReleaseTag {
+            root: root.clone(),
+            tag: current,
+        };
+        if !policy.matches("", &old.exe) {
             return Err("retirement image is not current".into());
         }
         let data = root.root().join("runtime/data");
-        crate::lifecycle::validate_existing_owner_gate_paths(&data)?;
-        let mut owners = Vec::new();
-        for (name, role) in [
-            (crate::lifecycle::SUPERVISOR_LOCK, "supervisor"),
-            (crate::lifecycle::LIVE_LOCK, "live"),
-            ("rbridge-console.lock", "console"),
-        ] {
-            let gate = OwnerGate::new(data.join("logs").join(name));
-            let marker = match gate.probe_existing() {
-                OwnerProbe::Free { .. }
-                    if role != "supervisor"
-                        || old.pid == 0
-                        || matches!(
-                            process_identity::check_liveness(old.pid, old.start),
-                            Liveness::Gone | Liveness::Mismatch(_)
-                        ) =>
-                {
-                    continue
-                }
-                OwnerProbe::Held {
-                    marker: Some(marker),
-                } if marker.role == role => marker,
-                _ => return Err(format!("{role} owner is not identified")),
-            };
-            if !crate::update::release_owner_image(&root, &current, &marker.identity.exe)
-                || role == "supervisor" && !process_identity::same_identity(&old, &marker.identity)
-            {
-                return Err(format!("{role} owner is not the old release"));
-            }
-            if process_identity::check_identity(&marker.identity) != Liveness::Matches {
-                return Err(format!("{role} identity cannot be verified"));
-            }
-            owners.push((gate, marker, role));
-        }
-        #[cfg(feature = "parity-clock")]
-        let mut retired = 0u64;
+        let mut backend = LiveLifecycle;
+        let owners = collect_verified_owners(
+            &mut backend,
+            &data,
+            &[OwnerRole::Supervisor, OwnerRole::Live, OwnerRole::Console],
+            &policy,
+            ProbeMode::Existing,
+            Some(&old),
+        )?;
         #[cfg(feature = "parity-clock")]
         let fault_after = crate::update::handover_control(&root)?
             .and_then(|(_, value)| value["retireFailAfter"].as_u64());
-        #[cfg(feature = "parity-clock")]
+        #[cfg(not(feature = "parity-clock"))]
+        let fault_after: Option<u64> = None;
         if fault_after == Some(0) {
             return Err("injected retirement failure".into());
         }
@@ -1371,28 +1352,19 @@ fn retire_cli(args: &[String]) -> i32 {
                 return Err(reason);
             }
         }
-        for (gate, marker, role) in owners {
-            match process_identity::kill_verified(&marker.identity) {
-                KillOutcome::Gone | KillOutcome::Killed => stopped = true,
-                _ => return Err(format!("{role} owner could not be retired")),
-            }
-            #[cfg(feature = "parity-clock")]
-            {
-                retired += 1;
-                if fault_after == Some(retired) {
-                    return Err("injected retirement failure".into());
-                }
-            }
-            let end = Instant::now() + Duration::from_secs(5);
-            loop {
-                match gate.probe_existing() {
-                    OwnerProbe::Free { .. } => break,
-                    _ if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
-                    _ => return Err(format!("{role} owner did not release")),
-                }
-            }
-        }
-        Ok(())
+        retire_verified_owners(
+            &mut backend,
+            &data,
+            &owners,
+            ProbeMode::Existing,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            fault_after,
+        )
+        .map_err(|failure| {
+            stopped = failure.stopped;
+            failure.reason
+        })
     })();
     match result {
         Ok(()) => 0,
@@ -1419,6 +1391,9 @@ fn handover_with_policy_gate(
     automatic: bool,
     gate: Option<fs::File>,
 ) -> Result<u32, String> {
+    use crate::lifecycle::{
+        verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation, OwnerRole, ProbeMode,
+    };
     let root = installation()?;
     if context.runtime_root()
         != Some(
@@ -1429,26 +1404,32 @@ fn handover_with_policy_gate(
     {
         return Err("handover requires the install runtime".into());
     }
-    let owner_gate = crate::lifecycle::OwnerGate::new(
-        context
-            .data_dir()
-            .join("logs")
-            .join(crate::lifecycle::SUPERVISOR_LOCK),
-    );
-    let old = match owner_gate.probe_existing() {
-        crate::lifecycle::OwnerProbe::Held {
+    let current_tag = current(&root).ok_or("current image unavailable")?;
+    let old = match verify_owner(
+        &mut LiveLifecycle,
+        &context.data_dir(),
+        OwnerRole::Supervisor,
+        &ImagePolicy::ReleaseTag {
+            root: root.clone(),
+            tag: current_tag,
+        },
+        ProbeMode::Existing,
+    ) {
+        OwnerObservation::Verified(owner) => owner.marker.identity,
+        OwnerObservation::Mismatch {
+            marker: Some(_),
+            liveness: Some(_),
+            ..
+        } => return Err("supervisor identity cannot be verified".into()),
+        OwnerObservation::Mismatch {
             marker: Some(marker),
-        } if marker.role == "supervisor" => marker.identity,
+            liveness: None,
+            ..
+        } if marker.role == OwnerRole::Supervisor.as_str() => {
+            return Err("supervisor is not the current release".into());
+        }
         _ => return Err("supervisor owner cannot be identified".into()),
     };
-    let current = fs::canonicalize(root.root().join("current/her.exe"))
-        .map_err(|_| "current image unavailable")?;
-    if !crate::update::same_release_image(&current.to_string_lossy(), &old.exe) {
-        return Err("supervisor is not the current release".into());
-    }
-    if crate::process_identity::check_identity(&old) != crate::process_identity::Liveness::Matches {
-        return Err("supervisor identity cannot be verified".into());
-    }
     match gate {
         Some(gate) => crate::update::launch_with_gate(&root, target, &old, automatic, gate),
         None => {
@@ -1460,6 +1441,9 @@ fn handover_with_policy_gate(
 
 fn retire_current_cli(args: &[String]) -> i32 {
     let result = (|| -> Result<Vec<String>, String> {
+        use crate::lifecycle::{
+            verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation, OwnerRole, ProbeMode,
+        };
         if args.len() != 2 || args[0] != "--tag" {
             return Err("invalid retirement tag".into());
         }
@@ -1468,16 +1452,20 @@ fn retire_current_cli(args: &[String]) -> i32 {
             return Err("retirement tag is not current".into());
         }
         let image = crate::update::release_path(&root, &args[1])?.join("her.exe");
-        let gate = crate::lifecycle::OwnerGate::new(
-            root.root()
-                .join("runtime/data/logs")
-                .join(crate::lifecycle::SUPERVISOR_LOCK),
-        );
-        let identity = match gate.probe_existing() {
-            crate::lifecycle::OwnerProbe::Held {
-                marker: Some(marker),
-            } if marker.role == "supervisor" => marker.identity,
-            crate::lifecycle::OwnerProbe::Free { .. } => crate::process_identity::ProcessIdentity {
+        let data = root.root().join("runtime/data");
+        let policy = ImagePolicy::ReleaseTag {
+            root: root.clone(),
+            tag: args[1].clone(),
+        };
+        let identity = match verify_owner(
+            &mut LiveLifecycle,
+            &data,
+            OwnerRole::Supervisor,
+            &policy,
+            ProbeMode::Existing,
+        ) {
+            OwnerObservation::Verified(owner) => owner.marker.identity,
+            OwnerObservation::Free { .. } => crate::process_identity::ProcessIdentity {
                 pid: 0,
                 start: 0,
                 exe: image.to_string_lossy().into(),
@@ -1505,7 +1493,7 @@ fn retire_current_cli(args: &[String]) -> i32 {
 /// Count installed current starts before parsing runtime config. A duplicate
 /// launch while an owner is held is not an unhealthy supervisor start.
 pub fn before_supervisor_start(runtime: &Path) -> Result<bool, String> {
-    use crate::lifecycle::{OwnerGate, OwnerProbe};
+    use crate::lifecycle::{LifecycleBackend as _, LiveLifecycle, OwnerProbe, OwnerRole, ProbeMode};
     let root = InstallRoot::configured()?;
     let selected = root.root().join("runtime");
     if runtime != selected
@@ -1542,12 +1530,11 @@ pub fn before_supervisor_start(runtime: &Path) -> Result<bool, String> {
         return Ok(false);
     }
     if matches!(
-        OwnerGate::new(
-            selected
-                .join("data/logs")
-                .join(crate::lifecycle::SUPERVISOR_LOCK)
-        )
-        .probe_existing(),
+        LiveLifecycle.probe_owner(
+            &selected.join("data"),
+            OwnerRole::Supervisor,
+            ProbeMode::Existing,
+        ),
         OwnerProbe::Held { .. }
     ) {
         return Ok(false);

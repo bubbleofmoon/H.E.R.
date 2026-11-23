@@ -1,6 +1,10 @@
 //! Selected-root supervisor and the real effects used by the watchdog task.
 
-use crate::lifecycle::{self, Acquire, DesiredStore, Effective, OwnerGate, OwnerProbe, SUPERVISOR_LOCK};
+use crate::lifecycle::{
+    self, Acquire, DesiredRead, DesiredState, DesiredStore, Effective, ImagePolicy,
+    LifecycleBackend as _, LiveLifecycle, OwnerGate, OwnerObservation, OwnerProbe, OwnerRole,
+    ProbeMode, SUPERVISOR_LOCK,
+};
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::task_runs::{Finish, RunHandle, RunSource, StoreLimits, TaskStore};
 use crate::tasks::{self, Clock, CommandExecutor, Dispatcher, Executor, Scheduler, SystemClock, TaskDef, TaskId};
@@ -64,12 +68,17 @@ pub(crate) fn queue_console_restart(context: &RuntimeContext, body: &str) -> Res
     if !matches!(desired(context), Effective::Act { wants, .. } if wants.console && wants.jobs) {
         return Err((409, "desired state does not permit restart".into()));
     }
-    let supervisor = owner_gate(context, SUPERVISOR_LOCK).map_err(|e| (503, e))?.probe();
-    match supervisor {
-        OwnerProbe::Held { marker: Some(marker) } if marker.role == "supervisor"
-            && executable_matches(&marker.identity).unwrap_or(false)
-            && matches!(lifecycle::check_identity(&marker.identity), lifecycle::Liveness::Matches) => {}
-        _ => return Err((503, "supervisor ownership is unavailable".into())),
+    if !matches!(
+        lifecycle::verify_owner(
+            &mut LiveLifecycle,
+            context.data_dir(),
+            OwnerRole::Supervisor,
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        ),
+        OwnerObservation::Verified(_)
+    ) {
+        return Err((503, "supervisor ownership is unavailable".into()));
     }
     match inspect_restart_request(context).map_err(|e| (503, e))? {
         Some(pending) if pending.id == id => {
@@ -163,10 +172,16 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
         let cfg = context.load_config().map_err(str::to_string)?;
         let desired_gate = lifecycle::lock_with_wait(&context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
         if !matches!(desired(context), Effective::Act { wants, .. } if wants.console && wants.jobs) { return Err("desired state no longer permits restart".into()); }
-        let supervisor = owner_gate(context, SUPERVISOR_LOCK)?.probe();
         let me = lifecycle::current_identity()?;
-        match supervisor {
-            OwnerProbe::Held { marker: Some(marker) } if marker.role == "supervisor" && lifecycle::same_identity(&marker.identity, &me) => {}
+        match lifecycle::verify_owner(
+            &mut LiveLifecycle,
+            context.data_dir(),
+            OwnerRole::Supervisor,
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        ) {
+            OwnerObservation::Verified(owner)
+                if lifecycle::same_identity(&owner.marker.identity, &me) => {}
             _ => return Err("only the supervisor can restart the console".into()),
         }
         let target = watchdog::live_target_from_config(&cfg)?;
@@ -174,19 +189,29 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
             ConsoleProbe::Managed { pid } => pid,
             _ => return Err("console owner cannot be verified".into()),
         };
-        let console_gate = owner_gate(context, "rbridge-console.lock")?;
-        let owner = match console_gate.probe() {
-            OwnerProbe::Held { marker: Some(marker) } if marker.role == "console" && marker.identity.pid == pid => marker,
+        let owner = match lifecycle::verify_owner(
+            &mut LiveLifecycle,
+            context.data_dir(),
+            OwnerRole::Console,
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        ) {
+            OwnerObservation::Verified(owner) if owner.marker.identity.pid == pid => owner,
             _ => return Err("console owner changed".into()),
         };
-        if !executable_matches(&owner.identity)? { return Err("console executable does not match the supervisor".into()); }
         proof.recheck(&context.clone().with_console_port(target.console_port), &cfg).map_err(|(_, error)| error)?;
-        match lifecycle::kill_verified(&owner.identity) {
-            lifecycle::KillOutcome::Killed | lifecycle::KillOutcome::Gone => {}
-            other => return Err(format!("console stop was not confirmed: {other:?}")),
-        }
+        lifecycle::retire_verified_owners(
+            &mut LiveLifecycle,
+            context.data_dir(),
+            &[owner],
+            ProbeMode::Create,
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            None,
+        )
+        .map_err(|failure| failure.reason)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !matches!(console_gate.probe(), OwnerProbe::Free { .. }) || !matches!(console_probe(context, target.console_port), ConsoleProbe::Absent) {
+        while !matches!(console_probe(context, target.console_port), ConsoleProbe::Absent) {
             if std::time::Instant::now() >= deadline { return Err("console did not release its owner and port".into()); }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -413,29 +438,13 @@ fn desired_observation(context: &RuntimeContext) -> (Effective, Option<u64>) {
     (lifecycle::effective(&read, crate::parity_clock::now_ms()), revision)
 }
 
-fn executable_matches(identity: &lifecycle::ProcessIdentity) -> Result<bool, String> {
-    let own = lifecycle::current_identity()?;
-    Ok(if cfg!(windows) {
-        own.exe.replace('/', "\\").eq_ignore_ascii_case(&identity.exe.replace('/', "\\"))
-    } else { own.exe == identity.exe })
-}
-
-fn checked_live(probe: OwnerProbe) -> watchdog::LiveObservation {
-    match probe {
-        OwnerProbe::Held { marker: Some(marker) } => {
-            let liveness = if marker.role != "live" {
-                lifecycle::Liveness::Mismatch("owner role is not live".into())
-            } else {
-                match executable_matches(&marker.identity) {
-                    Ok(true) => lifecycle::check_identity(&marker.identity),
-                    Ok(false) => lifecycle::Liveness::Mismatch("owner executable is not this bridge".into()),
-                    Err(error) => lifecycle::Liveness::Unknown(error),
-                }
-            };
-            watchdog::LiveObservation::Held { marker, liveness }
-        }
-        other => watchdog::observe_live(other, lifecycle::check_identity),
-    }
+fn checked_live(context: &RuntimeContext) -> watchdog::LiveObservation {
+    lifecycle::live_observation(
+        &mut LiveLifecycle,
+        context.data_dir(),
+        &ImagePolicy::SameReleaseTwin,
+        ProbeMode::Create,
+    )
 }
 
 /// A listening socket is managed only if its health pid matches the held console gate and OS identity.
@@ -501,36 +510,38 @@ fn console_probe_with(context: &RuntimeContext, port: u16, allow_sibling: bool, 
     let Some(pid) = body.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok()) else {
         return ConsoleProbe::Unknown("console health has no valid pid".into());
     };
-    let probe = if allow_sibling {
-        if let Err(error) = lifecycle::validate_existing_owner_gate_paths(context.data_dir()) {
-            return ConsoleProbe::Unknown(error);
-        }
-        let path = match context.resolve_path(RuntimeArea::Data, "logs/rbridge-console.lock", PathIntent::ReadFile) {
-            Ok(path) => path,
-            Err(error) => return ConsoleProbe::Unknown(error.into()),
-        };
-        OwnerGate::new(path).probe_existing()
+    let (policy, mode) = if allow_sibling {
+        (ImagePolicy::HealthReadOnly, ProbeMode::Existing)
     } else {
-        let gate = match owner_gate(context, "rbridge-console.lock") { Ok(g) => g, Err(e) => return ConsoleProbe::Unknown(e) };
-        gate.probe()
+        (ImagePolicy::SameReleaseTwin, ProbeMode::Create)
     };
-    match probe {
-        OwnerProbe::Held { marker: Some(marker) } if marker.identity.pid == pid && marker.role == "console" => {
-            let image_matches = if allow_sibling {
-                lifecycle::current_identity().map(|me| crate::update::health_image(&me.exe, &marker.identity.exe))
-            } else { executable_matches(&marker.identity) };
-            match image_matches {
-                Ok(true) => {},
-                Ok(false) => return ConsoleProbe::Foreign { pid },
-                Err(error) => return ConsoleProbe::Unknown(error),
-            }
-            match lifecycle::check_identity(&marker.identity) {
-                lifecycle::Liveness::Matches => ConsoleProbe::Managed { pid },
-                other => ConsoleProbe::Unknown(format!("console owner identity is {other:?}")),
-            }
+    match lifecycle::verify_owner(
+        &mut LiveLifecycle,
+        context.data_dir(),
+        OwnerRole::Console,
+        &policy,
+        mode,
+    ) {
+        OwnerObservation::Verified(owner) if owner.marker.identity.pid == pid => {
+            ConsoleProbe::Managed { pid }
         }
-        OwnerProbe::Held { marker: None } | OwnerProbe::Unknown(_) => ConsoleProbe::Unknown("console owner cannot be verified".into()),
-        _ => ConsoleProbe::Foreign { pid },
+        OwnerObservation::Verified(_) | OwnerObservation::Free { .. } => {
+            ConsoleProbe::Foreign { pid }
+        }
+        OwnerObservation::Mismatch {
+            marker: Some(marker),
+            liveness: Some(other),
+            ..
+        } if marker.role == OwnerRole::Console.as_str() && marker.identity.pid == pid => {
+            ConsoleProbe::Unknown(format!("console owner identity is {other:?}"))
+        }
+        OwnerObservation::Mismatch {
+            marker: Some(_), ..
+        } => ConsoleProbe::Foreign { pid },
+        OwnerObservation::Mismatch { marker: None, .. } => {
+            ConsoleProbe::Unknown("console owner cannot be verified".into())
+        }
+        OwnerObservation::Unknown(reason) => ConsoleProbe::Unknown(reason),
     }
 }
 
@@ -643,14 +654,23 @@ impl Effects for RealEffects {
         if target.groups != groups { return Err("configured groups changed before startup".into()); }
         let root = self.context.runtime_root().ok_or("runtime root unavailable")?;
         self.spawn(&["--runtime-root".into(), root.to_string_lossy().into_owned(), "--console-port".into(), target.console_port.to_string(), "--live".into(), "--live-groups".into(), groups.join(",")], "rbridge-live", |pid| {
-            let verified = matches!(self.live_gate.probe(), OwnerProbe::Held { marker: Some(marker) }
-                if marker.role == "live" && marker.identity.pid == pid
-                    && matches!(lifecycle::check_identity(&marker.identity), lifecycle::Liveness::Matches));
-            let Ok(Some(text)) = self.context.read_optional_text(RuntimeArea::Data, "rust-heartbeat-live.json") else { return false };
-            let matching_pid = serde_json::from_str::<Value>(&text).ok()
-                .and_then(|value| value.get("pid").and_then(Value::as_u64)) == Some(pid as u64);
-            verified && matching_pid && matches!(watchdog::read_heartbeat(Ok(text.into_bytes()), crate::parity_clock::now_ms()),
-                watchdog::Heartbeat::Fresh { live: true, groups: actual } if actual.as_slice() == groups)
+            let OwnerObservation::Verified(owner) = lifecycle::verify_owner(
+                &mut LiveLifecycle,
+                self.context.data_dir(),
+                OwnerRole::Live,
+                &ImagePolicy::SameReleaseTwin,
+                ProbeMode::Create,
+            ) else {
+                return false;
+            };
+            owner.marker.identity.pid == pid
+                && lifecycle::verify_live_heartbeat(
+                    &mut LiveLifecycle,
+                    self.context.data_dir(),
+                    &owner.marker,
+                    groups,
+                )
+                .is_ok()
         })
     }
     fn start_console(&mut self, port: u16) -> Result<(), String> {
@@ -663,28 +683,29 @@ impl Effects for RealEffects {
         self.await_console(child, port)
     }
     fn stop_console(&mut self, pid: u32) -> Result<(), String> {
-        let _transition = lifecycle::lock_with_wait(&self.context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
-        match desired(&self.context) {
-            Effective::Act { wants, .. } if !wants.console => {},
+        let data = self.context.data_dir();
+        let expected_revision = match DesiredStore::new(data.join("lifecycle")).read() {
+            DesiredRead::Present(record) if record.state == DesiredState::Stopped => record.revision,
             _ => return Err("desired state no longer permits stopping the console".into()),
-        }
-        drop(_transition);
-        let _tasks = lifecycle::hold_stopped_task_gates(self.context.data_dir())?;
-        let _transition = lifecycle::lock_with_wait(&self.context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
-        match desired(&self.context) {
-            Effective::Act { wants, .. } if !wants.console && !wants.jobs => {},
-            _ => return Err("desired state no longer permits stopping the console".into()),
-        }
-        let gate = owner_gate(&self.context, "rbridge-console.lock")?;
-        let marker = match gate.probe() {
-            OwnerProbe::Held { marker: Some(marker) } if marker.role == "console" && marker.identity.pid == pid => marker,
-            _ => return Err("console owner is no longer verified".into()),
         };
-        if !executable_matches(&marker.identity)? { return Err("console executable does not match the supervisor".into()); }
-        match lifecycle::kill_verified(&marker.identity) {
-            lifecycle::KillOutcome::Killed | lifecycle::KillOutcome::Gone => Ok(()),
-            other => Err(format!("console identity could not be stopped: {other:?}")),
+        match lifecycle::verify_owner(
+            &mut LiveLifecycle,
+            data,
+            OwnerRole::Console,
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        ) {
+            OwnerObservation::Verified(owner) if owner.marker.identity.pid == pid => {}
+            _ => return Err("console owner is no longer verified".into()),
         }
+        lifecycle::stop_verified_owners_transaction(
+            &mut LiveLifecycle,
+            data,
+            expected_revision,
+            &[OwnerRole::Console],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        )
     }
     fn wait_ms(&mut self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)); }
 }
@@ -698,32 +719,37 @@ fn watchdog_tick(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mut 
             // Wait for tasks without holding the desired gate; they may need that
             // gate to complete. Recheck the desired state under the gate before
             // retiring any owner, including after a concurrent resume.
+            let data = context.data_dir();
             let task_gates = if matches!(desired(context), Effective::Act { wants, .. } if !wants.jobs) {
-                lifecycle::hold_stopped_task_gates(context.data_dir()).ok()
+                lifecycle::hold_stopped_task_gates(data).ok()
             } else { None };
-            match lifecycle::lock_with_wait(&context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5)) {
+            match LiveLifecycle.lock_desired_gate(data, Duration::from_secs(5)) {
                 Ok(_desired_gate) => if let Effective::Act { wants, .. } = desired(context) {
-                    for (name, role, stop) in [
-                        (lifecycle::LIVE_LOCK, "live", !wants.live),
-                        ("rbridge-console.lock", "console", !wants.console),
+                    for (role, stop) in [
+                        (OwnerRole::Live, !wants.live),
+                        (OwnerRole::Console, !wants.console),
                     ] {
                         if !stop { continue; }
-                        if role == "console" && task_gates.is_none() {
+                        if role == OwnerRole::Console && task_gates.is_none() {
                             run.log(crate::task_runs::LogStream::Meta, "running tasks did not stop; console left running");
                             continue;
                         }
-                        let owner = owner_gate(context, name).map(|gate| gate.probe());
-                        match owner {
-                            Ok(OwnerProbe::Free { .. }) => {}
-                            Ok(OwnerProbe::Held { marker: Some(marker) }) if marker.role == role
-                                && executable_matches(&marker.identity).unwrap_or(false) => {
-                                match lifecycle::kill_verified(&marker.identity) {
+                        match lifecycle::verify_owner(
+                            &mut LiveLifecycle,
+                            data,
+                            role,
+                            &ImagePolicy::SameReleaseTwin,
+                            ProbeMode::Create,
+                        ) {
+                            OwnerObservation::Free { .. } => {}
+                            OwnerObservation::Verified(owner) => {
+                                match lifecycle::kill_verified(&owner.marker.identity) {
                                     lifecycle::KillOutcome::Killed | lifecycle::KillOutcome::Gone =>
-                                        run.log(crate::task_runs::LogStream::Meta, &format!("stopped verified {role} owner while configuration was unreadable")),
-                                    _ => run.log(crate::task_runs::LogStream::Meta, &format!("could not verify stopping {role} owner")),
+                                        run.log(crate::task_runs::LogStream::Meta, &format!("stopped verified {} owner while configuration was unreadable", role.as_str())),
+                                    _ => run.log(crate::task_runs::LogStream::Meta, &format!("could not verify stopping {} owner", role.as_str())),
                                 }
                             }
-                            _ => run.log(crate::task_runs::LogStream::Meta, &format!("{role} owner is unknown; no process stopped")),
+                            _ => run.log(crate::task_runs::LogStream::Meta, &format!("{} owner is unknown; no process stopped", role.as_str())),
                         }
                     }
                 },
@@ -742,7 +768,7 @@ fn watchdog_tick(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mut 
         .unwrap_or_else(|e| ConsoleProbe::Unknown(e.clone()));
     let observation = Observation {
         desired: desired(context), target, console,
-        live: checked_live(gate.probe()),
+        live: checked_live(context),
         heartbeat: match context.read_optional_text(RuntimeArea::Data, "rust-heartbeat-live.json") {
             Ok(Some(text)) => watchdog::read_heartbeat(Ok(text.into_bytes()), now),
             Ok(None) => watchdog::Heartbeat::Missing,

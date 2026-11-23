@@ -842,4 +842,64 @@ mod tests {
         let out = apply(&d, &mut fx);
         assert!(out.failed && out.alerts[0].contains("spawn failed"));
     }
+
+    #[test]
+    fn fake_lifecycle_drives_live_observation_and_stale_heartbeat_restart() {
+        use crate::lifecycle::{
+            live_observation, verify_live_heartbeat, FakeLifecycle, ImagePolicy, OwnerMarker,
+            OwnerProbe, OwnerRole, ProbeMode,
+        };
+        let mut fake = FakeLifecycle::default();
+        let owner_id = ProcessIdentity {
+            pid: 77,
+            start: 700,
+            exe: "/opt/her/her".into(),
+        };
+        let marker = OwnerMarker {
+            v: 1,
+            role: "live".into(),
+            identity: owner_id.clone(),
+            acquired_at: 500_000,
+            refreshed_at: 500_000,
+            groups: Some(groups(&["g1", "g2"])),
+        };
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(marker.clone()),
+            },
+        );
+        fake.now_ms = 510_000;
+        fake.heartbeat = Some(Ok(
+            json!({"ts": 499_999, "pid": 77, "live": true, "groups": ["g1", "g2"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        assert!(
+            verify_live_heartbeat(
+                &mut fake,
+                std::path::Path::new("/unused"),
+                &marker,
+                &groups(&["g1", "g2"]),
+            )
+            .is_err()
+        );
+        let live = live_observation(
+            &mut fake,
+            std::path::Path::new("/unused"),
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Existing,
+        );
+        let o = obs(running(), live, Heartbeat::Stale { age_ms: 95_000 });
+        let first = decide(&o, &WatchState::default());
+        assert!(first.actions.is_empty());
+        let second = decide(&o, &first.state);
+        assert_eq!(
+            second.actions,
+            vec![Action::StopLive {
+                identity: owner_id,
+                restart: Some(groups(&["g1", "g2"])),
+            }]
+        );
+    }
 }

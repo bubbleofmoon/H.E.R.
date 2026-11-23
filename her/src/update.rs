@@ -339,6 +339,7 @@ pub(crate) fn signature_refusal(
 }
 
 /// Only HER images in the same physical release can authorize each other.
+#[allow(dead_code)]
 pub fn same_release_image(expected: &str, observed: &str) -> bool {
     let (Ok(a), Ok(b)) = (fs::canonicalize(expected), fs::canonicalize(observed)) else {
         return false;
@@ -353,8 +354,22 @@ pub fn same_release_image(expected: &str, observed: &str) -> bool {
     her(&a) && her(&b) && a.parent() == b.parent()
 }
 
+/// Exact caller/owner executable (including normalized Windows case/separators or canonical
+/// resolution) or same-directory `her`/`her-cli` sibling twin.
+#[allow(dead_code)]
+pub fn same_release_twin(expected: &str, observed: &str) -> bool {
+    if crate_identity_equal(expected, observed) || same_release_image(expected, observed) {
+        return true;
+    }
+    fs::canonicalize(expected)
+        .ok()
+        .zip(fs::canonicalize(observed).ok())
+        .is_some_and(|(a, b)| a == b)
+}
+
 /// Release membership for retiring recorded owners even after an image is lost.
 /// This alone grants no process authority: callers must still verify PID/start/exe.
+#[allow(dead_code)]
 pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) -> bool {
     let image = Path::new(image);
     if !image
@@ -379,8 +394,9 @@ pub(crate) fn release_owner_image(root: &InstallRoot, tag: &str, image: &str) ->
 
 /// Trial authority is read-only and restricted to the installed current release.
 /// It never participates in process adoption or termination authorization.
+#[allow(dead_code)]
 pub fn health_image(caller: &str, owner: &str) -> bool {
-    if same_release_image(caller, owner) || crate_identity_equal(caller, owner) {
+    if same_release_twin(caller, owner) {
         return true;
     }
     let Some(selected) = std::env::var_os("HER_TRIAL_CURRENT") else {
@@ -407,6 +423,31 @@ fn crate_identity_equal(a: &str, b: &str) -> bool {
     } else {
         a == b
     }
+}
+
+/// Probe an existing owner gate without creating files or following links.
+/// Returns `Some(identity)` only when the OS lock is actively held and its
+/// bounded, non-redirected `.owner.json` marker matches `v == 1` and `expected_role`.
+#[allow(dead_code)]
+pub(crate) fn probe_held_owner_identity(
+    lock_path: &Path,
+    expected_role: &str,
+) -> Option<ProcessIdentity> {
+    let lock = crate::guarded_file::open_gate(lock_path, crate::guarded_file::Gate::Existing).ok()?;
+    match lock.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => {}
+        _ => return None,
+    }
+    drop(lock);
+    let mut marker_os = lock_path.as_os_str().to_os_string();
+    marker_os.push(".owner.json");
+    let marker_path = PathBuf::from(marker_os);
+    let bytes = crate::guarded_file::read_bounded_no_follow(&marker_path, 64 * 1024, false).ok()??;
+    let marker: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if marker["v"].as_u64() != Some(1) || marker["role"].as_str() != Some(expected_role) {
+        return None;
+    }
+    serde_json::from_value::<ProcessIdentity>(marker["identity"].clone()).ok()
 }
 
 /// Publish the verified helper outside releases and run it hidden. The helper
