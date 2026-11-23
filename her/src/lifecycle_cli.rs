@@ -481,14 +481,15 @@ pub fn run_conversation(args: &[String]) -> i32 {
             return 2;
         }
     };
-    match crate::console::conversation_scope_change(&context, &conversation, &action) {
+    match crate::social_state::change_conversation_scope(&context, &conversation, &action) {
         Ok(reply) => {
             println!("{reply}");
             0
         }
-        Err((status, message)) => {
-            eprintln!("[conversation] refused ({status}): {message}");
-            if status == 400 { 2 } else { 3 }
+        Err(error) => {
+            let status = error.http_status();
+            eprintln!("[conversation] refused ({status}): {error}");
+            if matches!(error, crate::social_state::SocialError::BadInput(_)) { 2 } else { 3 }
         }
     }
 }

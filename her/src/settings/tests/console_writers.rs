@@ -114,7 +114,7 @@ fn settings_console_writer_keeps_the_copy_before_it_mirrors() {
 
 #[test]
 fn settings_writers_take_the_configuration_gate_before_the_store_gate() {
-    // Gate order: every writer of the store holds the configuration gate (`console::config_gate`: the routes'
+    // Gate order: every writer of the store holds the configuration gate (`social_state::acquire_config_gate`: the
     // authority, the chat tools' `memory_actions::handle`) and takes the store gate inside it. The settings module
     // never takes the configuration gate, so no writer holds the store gate while it waits for the configuration gate.
     for (file, source) in SETTINGS_SOURCES {

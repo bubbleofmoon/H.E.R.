@@ -43,7 +43,7 @@ impl Mute {
             (false, Some(until)) => { let t = clock(until, now, cfg); format!("被禁言至 {t}（muted in this group until {t}）") }
             _ => "被禁言，结束时间未知（muted in this group, end unknown）".to_string(),
         };
-        format!("你在这个群{when}，消息没有发出，也不会重发。禁言结束前不要再在这个群发消息。{}", crate::console::END_TURN)
+        format!("你在这个群{when}，消息没有发出，也不会重发。禁言结束前不要再在这个群发消息。{}", crate::social_state::END_TURN)
     }
 }
 
@@ -614,9 +614,9 @@ mod tests {
     fn refusal_text_names_the_end_and_ends_the_turn() {
         let timed = Mute { until: Some(NOW + 600_000), whole_group: false };
         let text = timed.refusal_text(NOW, &json!({"time":{"zone":"Asia/Shanghai"}}));
-        assert!(text.contains("muted in this group until") && text.contains(crate::console::END_TURN), "{text}");
+        assert!(text.contains("muted in this group until") && text.contains(crate::social_state::END_TURN), "{text}");
         let open_ended = Mute { until: None, whole_group: true };
         let text = open_ended.refusal_text(NOW, &json!({}));
-        assert!(text.contains("end unknown") && text.contains(crate::console::END_TURN), "{text}");
+        assert!(text.contains("end unknown") && text.contains(crate::social_state::END_TURN), "{text}");
     }
 }

@@ -494,7 +494,8 @@ fn first_run_with_password_work(
     let hash = derive(password)?;
     let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
     let unauth = unauthenticated_context(context);
-    let _config = crate::console::config_gate(&unauth).map_err(|_| PasswordError::Unavailable)?;
+    let _config = crate::social_state::acquire_config_gate(&unauth)
+        .map_err(|_| PasswordError::Unavailable)?;
     check_first_run_proof(&unauth, proof)?;
     crate::settings::set_initial_administrator_password(&unauth, &hash, actor).map_err(
         |(code, _)| {
@@ -550,7 +551,8 @@ pub(crate) fn auth_first_run_browser(
     let hash = AdministratorPasswordHash::derive(password)?;
     let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
     let unauth = unauthenticated_context(context);
-    let _config = crate::console::config_gate(&unauth).map_err(|_| PasswordError::Unavailable)?;
+    let _config = crate::social_state::acquire_config_gate(&unauth)
+        .map_err(|_| PasswordError::Unavailable)?;
     check_first_run_proof(&unauth, proof)?;
     let digest = current_token_digest(&unauth).map_err(|_| PasswordError::Unavailable)?;
     crate::settings::set_initial_administrator_password_with_session(
@@ -598,8 +600,8 @@ pub(crate) fn auth_login(
                 attempted_clamp = true;
                 let _credential = credential_mutation_gate(context).map_err(|_| LoginError::Busy)?;
                 let unauth = unauthenticated_context(context);
-                let _config =
-                    crate::console::config_gate(&unauth).map_err(|_| LoginError::Unavailable)?;
+                let _config = crate::social_state::acquire_config_gate(&unauth)
+                    .map_err(|_| LoginError::Unavailable)?;
                 let (failures, wait_ms) = crate::settings::clamp_throttle_deadline(&unauth)
                     .map_err(|(code, _)| {
                         if code == 409 {
@@ -624,7 +626,8 @@ pub(crate) fn auth_login(
 
     let _credential = credential_mutation_gate(context).map_err(|_| LoginError::Busy)?;
     let unauth = unauthenticated_context(context);
-    let _config = crate::console::config_gate(&unauth).map_err(|_| LoginError::Unavailable)?;
+    let _config = crate::social_state::acquire_config_gate(&unauth)
+        .map_err(|_| LoginError::Unavailable)?;
     let digest = current_token_digest(&unauth).map_err(|_| LoginError::Unavailable)?;
 
     if !matched {
@@ -672,7 +675,8 @@ pub(crate) fn auth_local_browser_auto_sign_in(
     let _credential = credential_mutation_gate(context)
         .map_err(|error| (503, error))?;
     let unauth = unauthenticated_context(context);
-    let _config = crate::console::config_gate(&unauth)?;
+    let _config = crate::social_state::acquire_config_gate(&unauth)
+        .map_err(crate::social_state::SocialError::into_http)?;
     let cfg = unauth
         .load_config()
         .map_err(|error| (503, error.to_string()))?;
@@ -728,8 +732,8 @@ pub(crate) fn auth_change_password(
         AdministratorPasswordHash::derive(new_password).map_err(|_| ChangePasswordError::Unavailable)?;
 
     let _credential = credential_mutation_gate(context).map_err(|_| ChangePasswordError::Busy)?;
-    let _config = crate::console::config_gate(context).map_err(|(code, _)| {
-        if code == 401 {
+    let _config = crate::social_state::acquire_config_gate(context).map_err(|err| {
+        if matches!(err, crate::social_state::SocialError::Unauthorized(_)) {
             ChangePasswordError::Revoked
         } else {
             ChangePasswordError::Unavailable
@@ -796,7 +800,8 @@ fn set_password_cli(context: &RuntimeContext) -> Result<(), PasswordError> {
 
 fn reset_password_cli(context: &RuntimeContext) -> Result<(), PasswordError> {
     let _credential = credential_mutation_gate(context).map_err(|_| PasswordError::Busy)?;
-    let _config = crate::console::config_gate(context).map_err(|_| PasswordError::Unavailable)?;
+    let _config = crate::social_state::acquire_config_gate(context)
+        .map_err(|_| PasswordError::Unavailable)?;
     ensure_credentials_ready(context).map_err(|_| PasswordError::Unavailable)?;
     crate::settings::reset_administrator_password(context).map_err(|_| PasswordError::Unavailable)
 }
@@ -892,7 +897,7 @@ pub(crate) mod tests {
     #[test]
     fn console_auth_generation_refuses_redirected_and_malformed_files() {
         let (root, context) = runtime(false);
-        let _config = crate::console::config_gate(&context).unwrap();
+        let _config = crate::social_state::acquire_config_gate(&context).unwrap();
         let marker = root.0.join("data").join(RESTORE_GENERATION_FILE);
         assert_eq!(restore_generation(&context).unwrap(), None);
 
@@ -980,7 +985,7 @@ pub(crate) mod tests {
             assert!(page.get(field).is_none());
         }
 
-        let _config = crate::console::config_gate(&context).unwrap();
+        let _config = crate::social_state::acquire_config_gate(&context).unwrap();
         let batch = vec![(&crate::settings::ADMINISTRATOR_PASSWORD, Value::Null)];
         let result = crate::settings::apply_changes(&context, batch, "administrator", "console");
         assert!(matches!(result, Err((409, _))));
@@ -1044,7 +1049,7 @@ pub(crate) mod tests {
         let before = probe.value(KEY);
         crate::settings::FAIL_BEFORE_AUDIT.with(|fail| fail.set(true));
         {
-            let _config = crate::console::config_gate(&context).unwrap();
+            let _config = crate::social_state::acquire_config_gate(&context).unwrap();
             assert!(crate::settings::reset_administrator_password(&context).is_err());
         }
         assert!(

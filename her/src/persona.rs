@@ -575,7 +575,7 @@ fn role_cards(context: &RuntimeContext) -> Result<Vec<(String, String)>, Failure
             continue;
         }
         let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_string) else { continue };
-        if name.is_empty() || name == "README" || crate::console::sanitize_role_name(&name) != name {
+        if name.is_empty() || name == "README" || crate::role::sanitize_name(&name) != name {
             continue;
         }
         let content = context.read_text(RuntimeArea::Resources, &format!("roles/{name}.md")).map_err(|_| unavailable())?;
@@ -602,7 +602,7 @@ pub(crate) fn briefing_identity(context: &RuntimeContext, key: &str) -> Option<S
 
 /// Companion modes (chat, reserved, reserved2) use personas; closed-agent keeps role cards.
 pub(crate) fn applies(context: &RuntimeContext) -> bool {
-    context.is_isolated() && crate::console::runtime_mode(context) != "closed-agent"
+    context.is_isolated() && crate::social_state::mode(context) != "closed-agent"
 }
 
 /// `【人设】<name>\n<core>\n\n` for the conversation's persona (override, else default), or empty.
@@ -749,7 +749,7 @@ mod tests {
         super::approve(&context, &json!({"id": id, "version": 1}), open()).unwrap();
         crate::session_map::bind(&context, "group:1", "sid-1", None).unwrap();
         // The social gate stays busy longer than a re-brief waits: the assignment is saved, its re-brief fails.
-        let held = crate::console::acquire_social_state_gate(&context).unwrap();
+        let held = crate::social_state::acquire_gate(&context).unwrap();
         let first = super::assign(&context, &json!({"default": id}), open()).unwrap();
         drop(held);
         assert_eq!(first["rebriefFailed"][0]["conversation"], "group:1", "{first}");

@@ -28,7 +28,7 @@ pub(super) struct Batch {
 }
 
 pub(super) fn space(context: &RuntimeContext) -> &'static str {
-    if crate::console::runtime_mode(context) == "reserved2" { "msg" } else { "inbound" }
+    if crate::social_state::mode(context) == "reserved2" { "msg" } else { "inbound" }
 }
 
 pub(super) fn conversations(context: &RuntimeContext) -> Result<Vec<String>, String> {

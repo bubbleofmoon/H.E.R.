@@ -460,7 +460,7 @@ impl Harness {
             };
             let witnessed_cap = matches!(&result, Status::Failed(reason) if reason == DEADLINE_EXCEEDED)
                 && delivery.reserved2_budget.is_some()
-                && crate::console::observation_wait_turn(&context, &request.conversation)
+                && crate::social_state::observation_wait_turn(&context, &request.conversation)
                     .ok().flatten().as_deref() == Some(request.id.as_str());
             if (task_observation.load(Ordering::SeqCst) || witnessed_cap)
                 && matches!(result, Status::Failed(_) | Status::Cancelled)

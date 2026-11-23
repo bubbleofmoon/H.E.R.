@@ -152,7 +152,7 @@ async fn rig(
         hold: AtomicBool::new(false),
     });
     crate::digest::install_test_model(&context, summariser.clone());
-    let token = crate::conversation_authority::ensure_or_rotate(&context, OWNER, false).unwrap();
+    let token = crate::social_state::ensure_or_rotate(&context, OWNER, false).unwrap();
     let generation = crate::send_outbox::token_epoch(&token);
     Rig {
         root,
@@ -169,7 +169,7 @@ impl Rig {
     /// Re-reads the conversation's generation after a stopped turn: a stop revokes the admitted token
     /// (`harness.rs`, the cancel path calls `Tools::revoke`), and the generation is that token's epoch.
     fn renew_generation(&mut self) {
-        let token = crate::conversation_authority::token(&self.context, OWNER).unwrap().unwrap();
+        let token = crate::social_state::token(&self.context, OWNER).unwrap().unwrap();
         self.generation = crate::send_outbox::token_epoch(&token);
     }
 
@@ -442,13 +442,13 @@ async fn harness_summary_a_summary_still_running_at_the_turn_deadline_fails_as_a
     let mut rig = rig("summary-deadline", window_40k(), |n| Ok(format!("第{n}次摘要：周六爬山。"))).await;
     rig.seed(1..=19, long_prompt, json!({}));
     let users = rig.events("user").len();
-    let token = crate::conversation_authority::token(&rig.context, OWNER).unwrap();
+    let token = crate::social_state::token(&rig.context, OWNER).unwrap();
     // The summariser holds past the turn's 8 s deadline; `SUMMARY_RESERVE` (5 s) bounds the summary to 3 s of it.
     rig.deadline = Duration::from_secs(8);
     rig.summariser.hold.store(true, Ordering::SeqCst);
     let body = rig.turn("summary-deadline-20", "现在回复", answer("好", 12)).await;
     rig.summariser.hold.store(false, Ordering::SeqCst);
-    assert_eq!(crate::conversation_authority::token(&rig.context, OWNER).unwrap(), token, "no revoke: the token stands");
+    assert_eq!(crate::social_state::token(&rig.context, OWNER).unwrap(), token, "no revoke: the token stands");
     assert_eq!(rig.summaries().len(), 1, "the summary was asked for");
     let failed = rig.events("checkpoint_failed");
     assert_eq!(failed.len(), 1);

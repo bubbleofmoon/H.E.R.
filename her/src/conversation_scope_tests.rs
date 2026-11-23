@@ -212,24 +212,40 @@ fn t186_cli_entry_waits_for_background_session_stops_within_its_limit() {
         "t186 cli wait",
         json!({"allow": {"groups": [420042], "private": []}, "rollout": {"enabled": true, "rustGroups": [GROUP]}}),
     );
+    let tracker = std::sync::Arc::new(crate::social_state::StopTracker::new());
     // A background stop that ends after 300 ms: the CLI entry returns only after it.
-    let stop = access::BackgroundStopForTest::start();
+    let stop = tracker.start_for_test();
     let release = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(300));
         drop(stop);
     });
     let started = std::time::Instant::now();
-    let reply = conversation_scope_change(&context, "group:420043", "admit").expect("the admit applies");
+    let reply = crate::social_state::change_conversation_scope_waiting_with(
+        &context,
+        "group:420043",
+        "admit",
+        std::time::Duration::from_secs(10),
+        &tracker,
+        crate::social_state::default_stopper(),
+    )
+    .expect("the admit applies");
     assert!(started.elapsed() >= std::time::Duration::from_millis(300), "returned before the background stop finished");
     assert!(reply.get("sessionStops").is_none(), "{reply}");
     release.join().unwrap();
     // A stop that outlives the wait is reported, never waited for without end.
-    let stuck = access::BackgroundStopForTest::start();
-    let reply = conversation_scope_change_waiting(&context, "group:420043", "admit", std::time::Duration::from_millis(100))
-        .expect("the admit applies again");
+    let stuck = tracker.start_for_test();
+    let reply = crate::social_state::change_conversation_scope_waiting_with(
+        &context,
+        "group:420043",
+        "admit",
+        std::time::Duration::from_millis(100),
+        &tracker,
+        crate::social_state::default_stopper(),
+    )
+    .expect("the admit applies again");
     assert_eq!(reply["sessionStops"], "unfinished: check the retired sessions' tasks in DSH", "{reply}");
     drop(stuck);
-    assert!(access::wait_background_stops(std::time::Duration::from_secs(10)));
+    assert!(tracker.wait(std::time::Duration::from_secs(10)));
 }
 
 #[test]
@@ -254,7 +270,7 @@ fn t186_concurrent_admits_lose_no_update() {
     let (release_tx, release) = std::sync::mpsc::channel::<()>();
     let release = std::sync::Mutex::new(release);
     let reached = signal_tx.clone();
-    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| {
+    *crate::social_state::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| {
         if key == "group:420051" {
             let _ = reached.send(Signal::Reached);
             // Returns when released, or when the test drops the sender while unwinding.
@@ -278,7 +294,7 @@ fn t186_concurrent_admits_lose_no_update() {
         let _ = release_tx.send(());
         (first.join().unwrap(), second, during)
     });
-    *access::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *crate::social_state::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let second = second.expect("the first admit ended before it reached the point between its read and its write");
     assert!(second.is_err(), "the second admit must be refused while the first holds the gates: {second:?}");
     assert_eq!(second.unwrap_err().0, 503, "a busy gate refuses with 503");

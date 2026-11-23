@@ -394,7 +394,7 @@ mod tests {
         result.unwrap();
         assert!(hub.maintenance.contains_key(key));
         assert!(hub.active.is_empty());
-        assert_eq!(console::conversation_token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
+        assert_eq!(social_state::token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
         // Run the next verifier immediately, keeping the normal maintained result handling.
         hub.maintenance.remove(key).unwrap().task.abort();
         let result=crate::session_rotation::digest(hub.context.clone(),cfg.clone(),plan.clone(),Arc::new(AtomicBool::new(false))).await;
@@ -406,8 +406,8 @@ mod tests {
         while !task.is_finished() {tokio::task::yield_now().await;}
         hub.maintenance.insert(key.into(),Maintenance{plan,cancel:Arc::new(AtomicBool::new(true)),task,digested:false});
         hub.maintain_sessions(&cfg,false,crate::now_ms() as i64).await.unwrap();
-        assert_ne!(console::conversation_token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
-        assert_eq!(hub.tokens[key],console::conversation_token(&hub.context,key).unwrap().unwrap());
+        assert_ne!(social_state::token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
+        assert_eq!(hub.tokens[key],social_state::token(&hub.context,key).unwrap().unwrap());
         assert_eq!(hub.awaiting[key],vec![format!("{key}|message:1")]);
         let event=format!("{key}|message:1");
         assert_eq!(hub.journal.run(move |j|j.stage_of(&event)).await.unwrap().as_deref(),Some("received"));
@@ -452,11 +452,11 @@ mod tests {
         }
         assert!(hub.active.is_empty());
         assert!(crate::session_map::lookup(&hub.context, key).unwrap().is_none());
-        assert_eq!(console::conversation_token(&hub.context, key).unwrap().as_deref(), Some("test-token"));
+        assert_eq!(social_state::token(&hub.context, key).unwrap().as_deref(), Some("test-token"));
         // Retry through the real tick, while the periodic scan is still throttled.
         hub.tick("bot", 9001).await.unwrap();
         assert!(hub.active.is_empty(), "queued ingress dispatched before retirement completed");
-        assert_ne!(console::conversation_token(&hub.context, key).unwrap().as_deref(), Some("test-token"));
+        assert_ne!(social_state::token(&hub.context, key).unwrap().as_deref(), Some("test-token"));
         assert_eq!(hub.awaiting[key], vec![format!("{key}|message:1")]);
         let event = format!("{key}|message:1");
         assert_eq!(hub.journal.run(move |j| j.stage_of(&event)).await.unwrap().as_deref(), Some("received"));
@@ -533,7 +533,7 @@ mod tests {
             hub.state_read_failure_after.set(Some(if scan { 0 } else { 1 }));
             assert!(hub.maintain_sessions(&cfg, false, now + attempt * 5_000).await.is_err());
             assert!(hub.active.is_empty());
-            assert_eq!(console::conversation_token(&hub.context, key).unwrap().as_deref(), Some("test-token"));
+            assert_eq!(social_state::token(&hub.context, key).unwrap().as_deref(), Some("test-token"));
             assert_eq!(hub.awaiting[key], vec![format!("{key}|message:1")]);
         }
         hub.state_read_failure_after.set(Some(0));
@@ -551,7 +551,7 @@ mod tests {
             }).await.unwrap();
             hub.maintain_sessions(&cfg, false, recovered_at).await.unwrap();
         }
-        let revoked = console::conversation_token(&hub.context, key).unwrap().as_deref() != Some("test-token");
+        let revoked = social_state::token(&hub.context, key).unwrap().as_deref() != Some("test-token");
         assert_eq!(crate::session_rotation::read_retry_ms(&hub.context, key), 60_000,
             "healthy reads and token revocation alone must retain the failure count");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -796,7 +796,7 @@ mod tests {
             result.unwrap();
             let timeouts = hub.ready.iter().filter(|(_,r)| r == "turnTimeout").count();
             let pending = hub.drivers[key].sched.pending.len();
-            let token = console::conversation_token(&hub.context,key).unwrap().unwrap();
+            let token = social_state::token(&hub.context,key).unwrap().unwrap();
             let adopted_token = hub.tokens[key].clone();
             // The next tick must preserve the driver and awaited ingress after our own rotation.
             hub.tick("bot",9001).await.unwrap();
@@ -881,7 +881,7 @@ mod tests {
         let cfg = hub.context.load_config().unwrap();
         let now = crate::now_ms() as i64;
         let cap = hub.drivers[key].sched.cfg.turn_hard_cap_ms;
-        let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let token = social_state::token(&hub.context, key).unwrap().unwrap();
         let previous = hub.state().unwrap()["conversations"][key].clone();
         let (stop_server, server) = fake_dsh(&root, &mut hub, key, false);
         hub.active.insert(key.into(), Active {
@@ -942,7 +942,7 @@ mod tests {
     }
 
     fn set_harness_cap_engagement(context: &RuntimeContext, engaged_at: Value) {
-        console::mutate_social_state_for(context, |state| {
+        conversation_state::update_raw(context, |state| {
             state["conversations"][HARNESS_CAP_KEY]["engagedAt"] = engaged_at;
             Ok(())
         }).unwrap();
@@ -962,7 +962,7 @@ mod tests {
     ) -> CancelHarnessCapFixture {
         let key = HARNESS_CAP_KEY;
         let cfg = hub.context.load_config().unwrap();
-        let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let token = social_state::token(&hub.context, key).unwrap().unwrap();
         let previous = hub.state().unwrap()["conversations"][key].clone();
         let inbound = hub.awaiting.remove(key).unwrap();
         let now = crate::turn_ledger::now_ms();
@@ -1075,7 +1075,7 @@ mod tests {
 
     async fn snapshot_grant_fixture(label: &str) -> (CleanupRoot, Hub, tokio::net::TcpListener, String, String) {
         let (root, hub, console) = harness_cap_fixture(label, None).await;
-        console::mutate_social_state_for(&hub.context, |state| {
+        conversation_state::update_raw(&hub.context, |state| {
             let conv = &mut state["conversations"][HARNESS_CAP_KEY];
             conv["unread"] = json!([{"seq":1},{"seq":2}]);
             conv["lastUnreadSeq"] = json!(2);
@@ -1084,7 +1084,7 @@ mod tests {
             conv["wakeConfig"]["infinite"] = json!(false);
             Ok(())
         }).unwrap();
-        let token = console::conversation_token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
+        let token = social_state::token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
         let turn = begin_receipt_turn(&hub.context, &token, crate::turn_ledger::now_ms() - 1);
         (root, hub, console, token, turn)
     }
@@ -1132,11 +1132,11 @@ mod tests {
         assert_eq!(read["messages"].as_array().unwrap().len(), 1);
         assert_eq!(read["messages"][0]["seq"], 1);
         set_harness_cap_engagement(&hub.context, Value::Null);
-        let lock = console::acquire_social_state_gate(&hub.context).unwrap();
+        let lock = social_state::acquire_gate(&hub.context).unwrap();
         let error = pipeline::revoke_reserved2_epoch(&hub.context, key, &token, None).unwrap_err();
         drop(lock);
         assert!(error.contains("busy"), "{error}");
-        assert_eq!(console::conversation_token(&hub.context, key).unwrap().as_deref(), Some(token.as_str()));
+        assert_eq!(social_state::token(&hub.context, key).unwrap().as_deref(), Some(token.as_str()));
         for route in ["/api/socialV2/mark-read", "/api/socialV2/wake-config"] {
             let (status, _) = console::agent_request(&hub.context, "POST", route,
                 Some(&json!({"key":key,"throughSeq":2})), &token);
@@ -1156,7 +1156,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let (_root, mut hub, console) = harness_cap_fixture("harness-cap-unseen-receipts", None).await;
             let key = HARNESS_CAP_KEY;
-            console::mutate_social_state_for(&hub.context, |state| {
+            conversation_state::update_raw(&hub.context, |state| {
                 let conv = &mut state["conversations"][key];
                 conv["unread"] = json!((1..=12).map(|seq| json!({"seq":seq,"text":"fixture"})).collect::<Vec<_>>());
                 conv["lastUnreadSeq"] = json!(12);
@@ -1176,7 +1176,7 @@ mod tests {
             let mut cfg = hub.context.load_config().unwrap();
             cfg["socialV2"]["context"]["wakeMessageLimit"] = json!(1);
             hub.context.write_atomic(RuntimeArea::Config, "config.json", cfg.to_string().as_bytes()).unwrap();
-            let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+            let token = social_state::token(&hub.context, key).unwrap().unwrap();
             let turn = begin_receipt_turn(&hub.context, &token, crate::turn_ledger::now_ms() + 60_000);
             let (status, next) = console::admin_request(&hub.context, "POST", "/api/socialV2/wake-snapshot",
                 Some(&json!({"key":key,"token":token,"turnId":turn})));
@@ -1195,7 +1195,7 @@ mod tests {
             let (_root, mut hub, _console) = harness_cap_fixture("harness-cap-finite-sleep", None).await;
             let key = HARNESS_CAP_KEY;
             let due = crate::parity_clock::now_ms() - 1_000;
-            console::mutate_social_state_for(&hub.context, |state| {
+            conversation_state::update_raw(&hub.context, |state| {
                 let conv = &mut state["conversations"][key];
                 conv["engagedAt"] = json!(0);
                 conv["wakeConfig"]["confirmedAt"] = json!(2);
@@ -1297,7 +1297,7 @@ mod tests {
         set_harness_cap_engagement(&hub.context, Value::Null);
         release_check.send(()).unwrap();
         wait_for_harness_cap_wake(hub).await;
-        let current = console::conversation_token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
+        let current = social_state::token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
         assert_ne!(current, hub.active[HARNESS_CAP_KEY].admitted_token(), "the cap check must rotate the token");
         turn_id.to_owned()
     }
@@ -1321,7 +1321,7 @@ mod tests {
             hub.awaiting.insert(HARNESS_CAP_KEY.into(), vec![urgent.clone()]);
             hub.queued_messages.insert(HARNESS_CAP_KEY.into(), vec![(2, urgent.clone())]);
             hub.ready.push((HARNESS_CAP_KEY.into(), "atMention".into()));
-            let current = console::conversation_token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
+            let current = social_state::token(&hub.context, HARNESS_CAP_KEY).unwrap().unwrap();
             let receipt = async {
                 let (request, evidence) = harness_cap_request(&console, "/api/socialV2/wake-snapshot").await;
                 assert_eq!(evidence, json!({"key":HARNESS_CAP_KEY,"token":current,"turnId":turn_id,"readOnly":true}));
@@ -1381,10 +1381,10 @@ mod tests {
             let turn_id = begun["turn"].as_str().unwrap();
             let token = hub.active[HARNESS_CAP_KEY].admitted_token();
             let generation = crate::send_outbox::token_epoch(&token);
-            let _lease = console::hold_test_observation_wait(&hub.context, HARNESS_CAP_KEY, &token, turn_id);
+            let _lease = social_state::hold_test_observation_wait(&hub.context, HARNESS_CAP_KEY, &token, turn_id);
             set_harness_cap_engagement(&hub.context, Value::Null);
             release_check.send(()).unwrap();
-            while console::conversation_token(&hub.context, HARNESS_CAP_KEY).unwrap().as_deref() == Some(token.as_str()) {
+            while social_state::token(&hub.context, HARNESS_CAP_KEY).unwrap().as_deref() == Some(token.as_str()) {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             harness_cap_http_response(wait, "403 Forbidden", "application/json", "{}").await;
@@ -1414,7 +1414,7 @@ mod tests {
         let cfg = hub.context.load_config().unwrap();
         let now = crate::now_ms() as i64;
         let cap = hub.drivers[key].sched.cfg.turn_hard_cap_ms;
-        let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let token = social_state::token(&hub.context, key).unwrap().unwrap();
         assert!(crate::session_map::lookup(&hub.context, key).unwrap().is_none());
         let gate = crate::engine_switch::turn_gate(&hub.context, key).await.unwrap();
         let mut pipe = pipeline::Pipeline::new_without_dsh(&hub.context, &cfg, true).unwrap();
@@ -1450,7 +1450,7 @@ mod tests {
 
         assert_eq!(result.err().as_deref(), Some(crate::turn_engine::ADMISSION_CHANGED),
             "the cap must invalidate an unmapped wake before the gate opens");
-        let current = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let current = social_state::token(&hub.context, key).unwrap().unwrap();
         assert_ne!(current, token);
         assert_eq!(hub.tokens.get(key), Some(&current));
         assert!(!crate::turn_ledger::read_records(&hub.context).unwrap().iter().any(|r| r["k"] == "begun"));
@@ -1514,7 +1514,7 @@ mod tests {
         crate::settings::apply_conversation(
             &hub.context, key, "conversation.engine", &json!("harness"), "administrator", "console",
         ).unwrap();
-        let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let token = social_state::token(&hub.context, key).unwrap().unwrap();
         let stamp = crate::reserved::mode_stamp(&hub.context).unwrap();
         let mut state = hub.state().unwrap();
         state["conversations"][key]["engineHandover"]["pending"] = json!({
@@ -1650,7 +1650,7 @@ mod tests {
                 let ev = serde_json::from_value(frame.clone()).unwrap();
                 hub.handle(&ev,&frame.to_string(),false,9001,"bot",&HashMap::new()).await
             } else { hub.tick("bot",9001).await };
-            let token = console::conversation_token(&hub.context,key).unwrap().unwrap();
+            let token = social_state::token(&hub.context,key).unwrap().unwrap();
             let adopted = hub.tokens.get(key).cloned();
             let finished_ingress = crate::activity::tail(&hub.context, 50).contains("bot after a failed stop");
             let next_tick = hub.tick("bot",9001).await;
@@ -1699,7 +1699,7 @@ mod tests {
             "message_id":29021,"message":[{"type":"at","data":{"qq":"9001"}},{"type":"text","data":{"text":"bot after a failed preempt stop"}}]});
         let ev = serde_json::from_value(frame.clone()).unwrap();
         let result = hub.handle(&ev, &frame.to_string(), false, 9001, "bot", &HashMap::new()).await;
-        let token = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let token = social_state::token(&hub.context, key).unwrap().unwrap();
         let adopted = hub.tokens.get(key).cloned();
         let finished_ingress = crate::activity::tail(&hub.context, 50).contains("bot after a failed preempt stop");
         let replacement_queued = hub.ready.iter().any(|(k, reason)| k == key && reason == "atMention");
@@ -1797,7 +1797,7 @@ mod tests {
         });
         while !hub.active[key].task.is_finished() { tokio::task::yield_now().await; }
         let result = hub.tick("bot",9001).await;
-        let token = console::conversation_token(&hub.context,key).unwrap().unwrap();
+        let token = social_state::token(&hub.context,key).unwrap().unwrap();
         let _ = stop_server.send(());
         let methods = server.join().unwrap();
         for active in hub.active.values() { active.task.abort(); }
@@ -1839,7 +1839,7 @@ mod tests {
             publish_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         }));
         persisted_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let next = console::conversation_token(&hub.context, key).unwrap().unwrap();
+        let next = social_state::token(&hub.context, key).unwrap().unwrap();
         assert_ne!(next, "test-token", "the tick must see the persisted rotation");
         let (ticked, ticked_rx) = std::sync::mpsc::channel();
         let tick = std::thread::spawn(move || {
@@ -1894,10 +1894,10 @@ mod tests {
             driver.sched.prompt_running = true;
             driver.apply(session::Input::Message {reason:"nameMention".into(),seq:2,at_ms:now});
             // The cap cancellation rotated and the hub adopted that epoch.
-            let cap_token = console::ensure_or_rotate_agent_token(&hub.context, key, true).unwrap();
+            let cap_token = social_state::ensure_or_rotate(&hub.context, key, true).unwrap();
             hub.tokens.insert(key.into(), cap_token);
             // Then the collector abandons the attempt (own) or someone else rotates the token.
-            let next = console::ensure_or_rotate_agent_token(&hub.context, key, true).unwrap();
+            let next = social_state::ensure_or_rotate(&hub.context, key, true).unwrap();
             if own { *minted.lock().unwrap() = Some(next.clone()); }
             hub.tick("bot",9001).await.unwrap();
             let retained = hub.drivers.contains_key(key) && hub.awaiting.contains_key(key)
@@ -2033,7 +2033,7 @@ mod tests {
             let mut abandon = pipeline::Pipeline::new_with_runtime(&hub.context,&cfg,true).unwrap();
             abandon.share_minted_epoch(minted.clone());
             assert!(abandon.abandon_attempt_for_test(key,"missing-session",|| {}).is_err());
-            assert_ne!(console::conversation_token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
+            assert_ne!(social_state::token(&hub.context,key).unwrap().as_deref(),Some("test-token"));
             assert_eq!(hub.tokens[key],"test-token");
         }
         hub.tick("bot",9001).await.unwrap();
@@ -2519,12 +2519,12 @@ mod tests {
         state["conversations"][key]["wakeConfig"]["sleepUntil"] = json!("2000-01-01T00:00:00.000Z");
         hub.context.write_atomic(RuntimeArea::Data, "social-v2.json", state.to_string().as_bytes()).unwrap();
         let at = crate::now_ms() as i64;
-        let (previous, token) = console::claim_reserved2_wake(&hub.context, key, "timeout", at, None).unwrap();
-        console::consume_reserved2_deadline(&hub.context, key, &token, at, &previous).unwrap();
+        let (previous, token) = social_state::claim_reserved2_wake(&hub.context, key, "timeout", at, None).unwrap();
+        social_state::consume_reserved2_deadline(&hub.context, key, &token, at, &previous).unwrap();
         // Startup can create the idle driver before asynchronous recovery restores this lease.
         hub.tick("bot", 9001).await.unwrap();
         assert!(!hub.active.contains_key(key));
-        console::rollback_reserved2_wake(&hub.context, key, at, &previous).unwrap();
+        social_state::rollback_reserved2_wake(&hub.context, key, at, &previous).unwrap();
         hub.tick("bot", 9001).await.unwrap();
         assert!(hub.active.contains_key(key), "recovery restored a deadline but the already-synced driver never noticed it");
         hub.active[key].task.abort();
@@ -2796,12 +2796,12 @@ mod tests {
         };
         let (status, reply) = snapshot();
         assert_eq!(status, 200, "allowed: the wake snapshot answers: {reply}");
-        console::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None).expect("allowed: the wake claim succeeds");
+        social_state::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None).expect("allowed: the wake claim succeeds");
         t186_deny_keeping_allow(&root, 420042);
         let (status, reply) = snapshot();
         assert_eq!(status, 403, "a denied conversation's wake snapshot must be refused: {reply}");
-        let refused = console::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None);
-        assert_eq!(refused.unwrap_err(), "wake invalidated by current settings");
+        let refused = social_state::claim_reserved2_wake(&hub.context, key, "timeout", crate::now_ms() as i64, None);
+        assert_eq!(refused.unwrap_err().message(), "wake invalidated by current settings");
         drop(hub);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -3272,7 +3272,7 @@ impl Hub {
             .filter(|(key, d)| {
                 let key = key.as_str();
                 self.taken(key)
-                    && console::inbound_admitted(cfg, key)
+                    && social_state::inbound_admitted(cfg, key)
                     && (!dsh_down || !self.wake_needs_dsh(cfg, key))
                     && !self.active.contains_key(key)
                     && !self.recovered.contains_key(key)
@@ -3390,7 +3390,7 @@ impl Hub {
             _ => None,
         };
         // #186: this event's configuration decides (allow and deny); `taken` is the `--live-groups` list of this process.
-        let Some(key) = key.filter(|k| self.taken(k) && console::inbound_admitted(&cfg, k)) else {
+        let Some(key) = key.filter(|k| self.taken(k) && social_state::inbound_admitted(&cfg, k)) else {
             return Ok(());
         };
         let is_poke = ev.sub_type == "poke";
@@ -3503,7 +3503,7 @@ impl Hub {
             message["textTruncated"] = json!(true);
         }
         let seq =
-            console::record_reserved2_incoming(&self.context, &cfg, &key, &inbound_key, message)?;
+            social_state::record_reserved2_incoming(&self.context, &cfg, &key, &inbound_key, message)?;
         if ev.post_type == "message" && ev.message_type == "group" && cfg.pointer("/slang/enabled") != Some(&json!(false)) {
             crate::feed_slang(&self.slang, true, &cfg, &key, &sender, &body);
         }
@@ -3551,7 +3551,7 @@ impl Hub {
         let (mut wake, mut reason) = in_turn_decision(in_turn, at_self, is_owner && ev.post_type == "message", &owner_qq)
             .unwrap_or_else(|| crate::decide(ev, &body, at_self || quote_self, nick, cards, &tr,
                 crate::question::directed(ev, &body, quote_self, conv, &cfg, now)));
-        if !in_turn && console::claim_first_wake(&self.context, &cfg, &key)? {
+        if !in_turn && social_state::claim_first_wake(&self.context, &cfg, &key)? {
             wake = true;
             reason = "bootstrap".into();
         }
@@ -3629,11 +3629,11 @@ impl Hub {
         let Ok(records) = crate::turn_ledger::read_records(&self.context) else { return Ok(()) };
         let (turns, _) = crate::turn_ledger::fold(&records);
         let mut running = HashMap::new();
-        if console::runtime_mode(&self.context) == "reserved2" && !doc.paused() {
+        if social_state::mode(&self.context) == "reserved2" && !doc.paused() {
             for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
                 let conv = doc.conversation(&turn.key);
                 let token = conv.as_ref().and_then(|c| c.token()).unwrap_or("");
-                if !token.is_empty() && console::inbound_admitted(cfg, &turn.key)
+                if !token.is_empty() && social_state::inbound_admitted(cfg, &turn.key)
                     && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
                     && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
                     running.insert(turn.key.clone(), (turn.id.clone(), token.to_string()));
@@ -3697,7 +3697,7 @@ impl Hub {
         use std::sync::atomic::Ordering;
         for (key,m) in &self.maintenance {
             let current=self.rotation_state(cfg,"guard-read",now)?["conversations"][key].clone();
-            if suspended || !self.taken(key) || !console::inbound_admitted(cfg,key)
+            if suspended || !self.taken(key) || !social_state::inbound_admitted(cfg,key)
                 || m.plan.policy != json!({"rotation":cfg.pointer("/dsh/rotation"),"cacheTtlMinutes":cfg.pointer("/dsh/cacheTtlMinutes")})
                 || ["lastIncomingAt","lastUnreadSeq","adminWakes"].iter().any(|field|current[*field]!=m.plan.guard[*field])
                 || self.ready.iter().any(|(k,_)|k==key) {
@@ -3739,7 +3739,7 @@ impl Hub {
                     let guard_token = crate::conversation_state::Conversation::from_value(&guard)
                         .and_then(|c| c.token().map(str::to_string));
                     if retire_unknown && guard_token.as_deref().unwrap_or("") != m.plan.epoch.as_str() {continue;}
-                    let retired=console::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
+                    let retired=social_state::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
                     if retired.is_err() || (retire_unknown && !retired.as_ref().is_ok_and(|token|token.is_some())) {
                         if retired.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");}
                         // A changed message guard or storage refusal is not permission to
@@ -3758,7 +3758,7 @@ impl Hub {
                             let (context,cfg,key2,sid)=(self.context.clone(),cfg.clone(),key.clone(),m.plan.sid.clone());
                             m.digested=ran;
                             m.task=tokio::spawn(async move {
-                                let result=tokio::task::spawn_blocking(move ||console::stop_and_archive_session(&context,&cfg,&key2,&sid)).await.unwrap_or_else(|e|Err(e.to_string()));
+                                let result=tokio::task::spawn_blocking(move ||social_state::stop_and_archive_session(&context,&cfg,&key2,&sid)).await.unwrap_or_else(|e|Err(e.to_string()));
                                 MaintenanceResult::Archived(result)
                             });
                             self.maintenance.insert(key,m);
@@ -3779,7 +3779,7 @@ impl Hub {
         let dsh_down=crate::dsh_health::is_down(&self.context);
         if now < self.maintenance_scan_at {return Ok(());}
         let state=self.rotation_state(cfg,"scan-state",now)?;
-        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && console::inbound_admitted(cfg,key)).cloned().collect()).unwrap_or_default();
+        let keys:Vec<_>=state["conversations"].as_object().map(|convs|convs.keys().filter(|key|self.taken(key) && social_state::inbound_admitted(cfg,key)).cloned().collect()).unwrap_or_default();
         for key in keys {
             if self.active.contains_key(&key) || self.recovered.contains_key(&key) || self.maintenance.contains_key(&key) {continue;}
             if crate::session_rotation::read_retry_at(&self.context,&key,"recovery-scan") > now {
@@ -3815,7 +3815,7 @@ impl Hub {
         self.adopt_mode(&cfg, now).await?;
         self.refresh_recovered(&cfg, now).await?;
         let state = self.rotation_state(&cfg,"guard-read",now)?;
-        let suspended = console::runtime_mode(&self.context) != "reserved2"
+        let suspended = social_state::mode(&self.context) != "reserved2"
             || state["paused"] == true
             || cfg.pointer("/socialV2/enabled") == Some(&json!(false));
         self.maintain_sessions(&cfg,suspended,now).await?;
@@ -3836,7 +3836,7 @@ impl Hub {
                 .map_err(|(_, e)| e)?;
             let predicate = if suspended || doc.paused() { "suspended" }
                 else if !self.taken(&key) { "notTaken" }
-                else if !console::inbound_admitted(&cfg, &key) { "notAllowed" }
+                else if !social_state::inbound_admitted(&cfg, &key) { "notAllowed" }
                 else if !doc.has_conversation(key.as_str()) { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
                     old.as_str() != doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).unwrap_or_default()
@@ -3851,13 +3851,13 @@ impl Hub {
                 &json!({"ts":now,"key":key,"reason":"settings-invalidated","predicate":predicate}),
             )?;
         }
-        if console::runtime_mode(&self.context) == "reserved2"
+        if social_state::mode(&self.context) == "reserved2"
             && state["paused"] != true
             && cfg.pointer("/socialV2/enabled") != Some(&json!(false))
         {
             if let Some(conversations) = state["conversations"].as_object() {
                 for (key, conv) in conversations {
-                    if self.taken(key) && console::inbound_admitted(&cfg, key) {
+                    if self.taken(key) && social_state::inbound_admitted(&cfg, key) {
                         self.closing_seen.entry(key.clone()).or_insert_with(|| conv["wakeConfig"]["confirmedAt"].clone());
                         self.drivers.entry(key.clone()).or_insert_with(|| {
                             session::Driver::new(
@@ -3945,7 +3945,7 @@ impl Hub {
                     .and_then(|doc| doc.conversation(&key))
                     .and_then(|c| c.token().map(str::to_string))
                     .unwrap_or_default();
-                console::consume_reserved2_deadline(&self.context, &key, &token, active.at, &active.previous)?;
+                social_state::consume_reserved2_deadline(&self.context, &key, &token, active.at, &active.previous)?;
             }
             let active = self.active.remove(&key).unwrap();
             let admitted_token = active.admitted_token();
@@ -3961,9 +3961,9 @@ impl Hub {
             println!("[reserved2] {key} turn ended: {result:?}");
             // The pipeline already wrote the turn-error line and told the administrator when the turn ended in a model error.
             let model_error = pipeline::take_model_error(&self.context, &key);
-            let current_token = console::conversation_token(&self.context, &key).ok().flatten().unwrap_or_default();
-            let in_scope = console::runtime_mode(&self.context) == "reserved2"
-                && console::inbound_admitted(&cfg, &key)
+            let current_token = social_state::token(&self.context, &key).ok().flatten().unwrap_or_default();
+            let in_scope = social_state::mode(&self.context) == "reserved2"
+                && social_state::inbound_admitted(&cfg, &key)
                 && self.mode_stamp == active.mode_stamp;
             let still_valid = in_scope && current_token == admitted_token;
             let owned_token = current_token == admitted_token
@@ -4008,7 +4008,7 @@ impl Hub {
             let wait_for_dsh = retry && !uses_cli
                 && crate::dsh_health::is_down(&self.context) && self.wake_needs_dsh(&cfg, &key);
             if held || retry {
-                console::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
+                social_state::rollback_reserved2_wake(&self.context, &key, active.at, &active.previous)?;
                 if held && active.inbound.is_empty() {
                     self.held.insert(key.clone(), active.reason.clone());
                 }
@@ -4053,7 +4053,7 @@ impl Hub {
                         .and_then(|r| r["t"].as_i64());
                     let miss = self.closing_misses.get(&key).copied().unwrap_or(0) + 1;
                     let seen = self.closing_seen.get(&key).cloned().unwrap_or(Value::Null);
-                    let (remind, stamp) = console::complete_reserved2_turn(&self.context, &cfg, &key, &current_token, started, &seen, miss)?;
+                    let (remind, stamp) = social_state::complete_reserved2_turn(&self.context, &cfg, &key, &current_token, started, &seen, miss)?;
                     self.closing_seen.insert(key.clone(), stamp);
                     // A failed text-only CLI cannot configure its wake through MCP. Its failed
                     // ledger/input is settled: a closing reminder must not replay that prompt.
@@ -4138,11 +4138,11 @@ impl Hub {
             if !self.taken(&key) {
                 continue;
             }
-            let Some(reason) = console::take_admin_wake(&self.context, &key)? else {
+            let Some(reason) = social_state::take_admin_wake(&self.context, &key)? else {
                 println!("[reserved2] {key} 手动唤醒已失效（令牌代际已变），丢弃");
                 continue;
             };
-            if suspended || !console::inbound_admitted(&cfg, &key) || !self.drivers.contains_key(&key) {
+            if suspended || !social_state::inbound_admitted(&cfg, &key) || !self.drivers.contains_key(&key) {
                 println!("[reserved2] {key} 手动唤醒未执行：当前不允许唤醒（{reason}）");
                 continue;
             }
@@ -4173,7 +4173,7 @@ impl Hub {
                 }
                 continue;
             }
-            if suspended || !self.taken(&key) || !console::inbound_admitted(&cfg, &key) {
+            if suspended || !self.taken(&key) || !social_state::inbound_admitted(&cfg, &key) {
                 continue;
             }
             if crate::group_mute::active(&self.context, &key).is_some() {
@@ -4193,13 +4193,13 @@ impl Hub {
             // Keep each drained job until a task or a bounded retry owns it.
             let prepared = async {
                 if let Some((at, previous)) = self.rollback_pending.get(&key) {
-                    console::rollback_reserved2_wake(&self.context, &key, *at, previous)?;
+                    social_state::rollback_reserved2_wake(&self.context, &key, *at, previous)?;
                     self.rollback_pending.remove(&key);
                 }
                 // Imported conversations can predate agent tokens. Mint their first epoch
                 // before claiming a wake; a previously nonempty epoch still invalidates normally.
                 if self.tokens.get(&key).is_some_and(String::is_empty) {
-                    let token = console::ensure_or_rotate_agent_token(&self.context, &key, false)?;
+                    let token = social_state::ensure_or_rotate(&self.context, &key, false)?;
                     self.tokens.insert(key.clone(), token);
                 }
                 if reason != "wakeReminder" {
@@ -4225,7 +4225,7 @@ impl Hub {
                     }
                     (conv, token)
                 } else {
-                    let claim = console::claim_reserved2_wake(&self.context, &key, &reason, now, expected.as_deref())?;
+                    let claim = social_state::claim_reserved2_wake(&self.context, &key, &reason, now, expected.as_deref())?;
                     claimed = Some(claim.0.clone());
                     claim
                 };
@@ -4253,7 +4253,7 @@ impl Hub {
                 Err(error) => {
                     println!("[reserved2] {key} dispatch preparation failed: {error}");
                     if let Some(previous) = claimed {
-                        if let Err(error) = console::rollback_reserved2_wake(&self.context, &key, now, &previous) {
+                        if let Err(error) = social_state::rollback_reserved2_wake(&self.context, &key, now, &previous) {
                             println!("[reserved2] {key} dispatch rollback failed: {error}");
                             self.rollback_pending.insert(key.clone(), (now, previous));
                         }

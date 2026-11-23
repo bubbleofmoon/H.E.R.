@@ -293,7 +293,7 @@ fn prepare_admission(
     if !wanted.supports(mode) {
         return Err((409, crate::turn_engine::UNSUPPORTED_MODE.into()));
     }
-    if mode == "reserved2" && !crate::console::inbound_admitted(cfg, key) {
+    if mode == "reserved2" && !crate::social_state::inbound_admitted(cfg, key) {
         return Err((409, NOT_ADMITTED.into()));
     }
     let conversation = ConversationState::for_runtime(context).read(key)?;
@@ -348,12 +348,12 @@ fn prepare_admission(
 
     let permitted = |current_cfg: &Value| -> Result<(), (u16, String)> {
         if !crate::settings::conversation_admitted(current_cfg, key)
-            || !crate::console::access_allowed(current_cfg, mode, key)
-            || (mode == "reserved2" && !crate::console::inbound_admitted(current_cfg, key))
+            || !crate::social_state::access_allowed(current_cfg, mode, key)
+            || (mode == "reserved2" && !crate::social_state::inbound_admitted(current_cfg, key))
         {
             return Err((409, NOT_ADMITTED.into()));
         }
-        if crate::console::runtime_mode(context) != mode
+        if crate::social_state::mode(context) != mode
             || crate::reserved::mode_stamp(context).map_err(refused)? != *stamp.as_ref().map_err(Clone::clone)? {
             return Err((409, CHANGED.into()));
         }
@@ -436,7 +436,7 @@ fn prepare_admission(
             let previous = record.summary.as_deref().filter(|_| record.epoch.as_deref() == Some(generation.as_str()));
             let rows = match source {
                 Engine::Dsh => match &session {
-                    Some(sid) => crate::dsh::switch_history(&crate::console::dsh_rpc_for(context, cfg).map_err(refused)?, sid, HISTORY_ROWS).map_err(refused)?,
+                    Some(sid) => crate::dsh::switch_history(&crate::dsh::rpc_for(context, cfg).map_err(refused)?, sid, HISTORY_ROWS).map_err(refused)?,
                     None => Vec::new(),
                 },
                 Engine::Harness => crate::harness::store::switch_history(context, key, &generation, HISTORY_ROWS).map_err(refused)?,
@@ -500,7 +500,7 @@ fn finish_pending(
     minted: Option<&crate::pipeline::MintedEpoch>,
 ) -> Result<String, (u16, String)> {
     if let Some(sid) = pending.session.clone() {
-        let rpc = crate::console::dsh_rpc_for(context, cfg).map_err(refused)?;
+        let rpc = crate::dsh::rpc_for(context, cfg).map_err(refused)?;
         ConversationState::for_runtime(context).update(key, |conv| {
             let current_cfg = context.load_config().map_err(|error| (503, error.to_string()))?;
             recheck_choice(&current_cfg)?;

@@ -105,10 +105,10 @@ impl Snapshot {
 }
 
 fn owner_current(context: &RuntimeContext, key: &str, epoch: &str) -> bool {
-    crate::console::runtime_mode(context) == "closed-agent"
+    crate::social_state::mode(context) == "closed-agent"
         && context.load_config().is_ok_and(|cfg| crate::chat::is_owner_key(&cfg, key))
-        && crate::conversation_authority::token(context, key).is_ok_and(|token| {
-            token.is_some_and(|token| crate::conversation_authority::generation(&token) == epoch)
+        && crate::social_state::token(context, key).is_ok_and(|token| {
+            token.is_some_and(|token| crate::social_state::generation(&token) == epoch)
         })
 }
 
@@ -328,7 +328,7 @@ impl Binding<'_> {
         let message = crate::outbound_message::normalize(text);
         let cfg = context.load_config().map_err(Failure::from)?;
         let known = record_credentials(context)?;
-        if !crate::console::approved_group_allowed(&cfg, &key, &message)
+        if !crate::social_state::approved_group_allowed(&cfg, &key, &message)
             || crate::activity::mask_log_text(&message, &known) != message
         {
             return Ok(tools::error("Group send refused by current settings."));
@@ -350,7 +350,7 @@ impl Binding<'_> {
         tokio::task::spawn_blocking(move || {
             let authorized = || !*cancelled.borrow() && Instant::now() < deadline
                 && owner_current(&context, &owner, &epoch)
-                && context.load_config().is_ok_and(|cfg| crate::console::approved_group_allowed(&cfg, &key, &message))
+                && context.load_config().is_ok_and(|cfg| crate::social_state::approved_group_allowed(&cfg, &key, &message))
                 && record_credentials(&context).is_ok_and(|known| crate::activity::mask_log_text(&message, &known) == message);
             if !authorized() {
                 return tools::error("Group send cancelled.");
@@ -556,7 +556,7 @@ mod tests {
                 key: OWNER_KEY.into(),
                 session_id: "session-fixture".into(),
                 turn: TURN.into(),
-                epoch: crate::conversation_authority::generation(TOKEN),
+                epoch: crate::social_state::generation(TOKEN),
                 expires_at: crate::parity_clock::now_ms() as i64
                     + expires.saturating_duration_since(Instant::now()).as_millis() as i64,
                 display: Value::Null,
@@ -597,7 +597,7 @@ mod tests {
         let context = &fixture.mailbox.context;
         let tools = tools::Tools::capture(
             context, &context.load_config().unwrap(), "closed-agent", OWNER_KEY,
-            &crate::conversation_authority::generation(TOKEN),
+            &crate::social_state::generation(TOKEN),
         ).unwrap();
         let turn = super::super::settle_turn(
             wait_for_reply(&lease, reply, None, &mut interaction_cancelled),

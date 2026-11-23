@@ -86,7 +86,7 @@ pub fn open_ready_for_runtime(context: &RuntimeContext) -> Result<Connection, St
 pub fn open_store(context: &RuntimeContext, cfg: &Value) -> Result<MemoryStore, String> {
     MemoryStore::open_prepared(
         open_for_runtime(context)?,
-        crate::conversation_authority::owner_conversation(cfg),
+        crate::social_state::owner_conversation(cfg),
     )
 }
 

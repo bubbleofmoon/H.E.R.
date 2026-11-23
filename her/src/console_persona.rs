@@ -32,7 +32,12 @@ pub fn route(
         ("POST", "/api/personas/assign") => object().and_then(|b| caller.with_authority(|a| crate::persona::assign(context, &b, a))),
         ("POST", "/api/personas/import-roles") => caller.with_authority(|a| crate::persona::import_roles(context, a)),
         ("GET", "/api/personas/wake-words") => crate::wake_words::view(context, query.get("conversation").map(String::as_str).unwrap_or("")),
-        ("POST", "/api/personas/wake-words/undo") => object().and_then(|b| caller.with_authority(|a| crate::console::undo_wake_words(context, &b, a))),
+        ("POST", "/api/personas/wake-words/undo") => object().and_then(|b| {
+            caller.with_authority(|a| {
+                crate::social_state::undo_wake_words_locked(context, &b, a)
+                    .map_err(crate::social_state::SocialError::into_http)
+            })
+        }),
         _ => Err((404, "unknown persona route".to_string())),
     };
     match result {

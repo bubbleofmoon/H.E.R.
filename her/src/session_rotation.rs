@@ -293,7 +293,7 @@ pub(crate) async fn digest(
         &plan.key,
         "token-read",
         crate::parity_clock::now_ms(),
-        crate::console::conversation_token(&context, &plan.key),
+        crate::social_state::token(&context, &plan.key).map_err(String::from),
     ) {
         Ok(Some(epoch)) if epoch != plan.epoch => {
             return DigestResult::Done {

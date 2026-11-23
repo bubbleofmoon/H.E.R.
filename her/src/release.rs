@@ -536,7 +536,7 @@ fn approval_installation(context: &RuntimeContext) -> Result<InstallRoot, String
 /// 1. `runtime/data/locks/update-restore.lock` (`restore_gate`)
 /// 2. `locks/turn-update.lock`
 /// 3. `locks/release-check.lock` (`release_check_gate`)
-/// 4. `locks/social-v2.lock` (`SOCIAL_STATE_GATE` / `console::config_gate` / `conversation_state::acquire`)
+/// 4. `locks/social-v2.lock` (`SOCIAL_STATE_GATE` / `social_state::acquire_config_gate` / `conversation_state::acquire`)
 ///
 /// Every caller across `release.rs`, `update.rs`, `handover.rs`, `dependency_upgrade.rs`,
 /// `engine_switch.rs`, `restore.rs`, `console.rs`, and `chat.rs` acquires locks strictly in

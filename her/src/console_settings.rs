@@ -28,7 +28,12 @@ pub fn route(
     let context = caller.context();
     // The model route list only reads state, even if startup left a legacy engine map.
     if (method, path) != ("GET", "/api/settings/models") {
-        if let Err((status, error)) = crate::console::import_engine_choices(context) {
+        if let Err((status, error)) = crate::social_state::import_engine_choices_with(
+            context,
+            Some(&crate::console::record_config_publication),
+        )
+        .map_err(crate::social_state::SocialError::into_http)
+        {
             return failure(status, &error);
         }
     }
@@ -49,7 +54,7 @@ pub fn route(
         Ok(mut value) => {
             if let Some(setting) = value["setting"].as_str().filter(|_| value["changed"] != false) {
                 if crate::settings::wake_timing::refreshes_default_plan(setting)
-                    && crate::console::refresh_default_wake_configs(context).is_err()
+                    && crate::social_state::refresh_default_wake_configs(context).is_err()
                 {
                     value["wakeRefreshError"] = json!("Settings saved. The default wake plans could not be refreshed.");
                 }
@@ -128,7 +133,19 @@ thread_local! {
 }
 
 /// `{"setting": <registry key>, "value": <value>}`, plus `"confirm": true` for a security setting. A change of an
-/// access setting revokes like a whitelist write (`console::access_setting_change`).
+/// access setting revokes like a whitelist write (`social_state::access_setting_change`).
+fn access_change(
+    context: &RuntimeContext,
+    authority: crate::persona::Authority<'_>,
+    change: &crate::settings::Change<'_>,
+    commit: impl FnOnce() -> Result<Value, (u16, String)>,
+) -> Result<Value, (u16, String)> {
+    crate::social_state::access_setting_change(context, authority, change, || {
+        commit().map_err(crate::social_state::SocialError::from_http)
+    })
+    .map_err(crate::social_state::SocialError::into_http)
+}
+
 fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     let context = caller.context();
     let fields = body_fields(body, &["setting", "value", "confirm"])?;
@@ -142,7 +159,7 @@ fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     };
     if found.is_some_and(|found| found.access()) {
         let change = crate::settings::Change::Set { key: setting, value };
-        return caller.with_authority(|authority| crate::console::access_setting_change(context, authority, &change, commit));
+        return caller.with_authority(|authority| access_change(context, authority, &change, commit));
     }
     let _gate = caller.gate()?;
     commit()
@@ -161,7 +178,7 @@ fn reset(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     };
     if found.is_some_and(|found| found.access()) {
         let change = crate::settings::Change::Reset { key: setting };
-        return caller.with_authority(|authority| crate::console::access_setting_change(context, authority, &change, commit));
+        return caller.with_authority(|authority| access_change(context, authority, &change, commit));
     }
     let _gate = caller.gate()?;
     commit()
@@ -217,7 +234,7 @@ fn undo(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     };
     if access {
         return caller.with_authority(|authority| {
-            crate::console::access_setting_change(context, authority, &crate::settings::Change::Undo { entry }, commit)
+            access_change(context, authority, &crate::settings::Change::Undo { entry }, commit)
         });
     }
     let _gate = caller.gate()?;

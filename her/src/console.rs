@@ -36,24 +36,70 @@ mod feedback_routes;
 mod voice_http;
 #[path = "console_access.rs"]
 mod access;
-pub(crate) use access::take_admin_wake;
-pub(crate) use access::access_setting_change;
 #[path = "console_schedule.rs"]
 mod schedule_routes;
 #[path = "console_front.rs"]
 pub(crate) mod front;
-pub(crate) use crate::conversation_authority::{
-    ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
-    token as conversation_token,
+use crate::dsh::rpc_for as dsh_rpc_for;
+use crate::role::sanitize_name as sanitize_role_name;
+use crate::social_state::{
+    self, approved_group_allowed, canonical_key as canonical_v2_key,
+    is_js_trim_char as social_policy_js_trim_char, js_string as social_policy_js_string,
+    projection_session_allowed as social_v2_projection_session_allowed,
+    session_allowed as social_v2_session_allowed, social_v1_number, social_v1_spread,
+    turn_send_cap, wait_console_generation, wait_live_path, wait_policy, SocialError, END_TURN,
 };
-pub(crate) use crate::conversation_state::{
-    acquire as acquire_social_state_gate, acquire_config_gate as config_gate,
-};
+
+fn config_gate(
+    context: &RuntimeContext,
+) -> Result<Option<crate::conversation_state::Gate>, (u16, String)> {
+    social_state::acquire_config_gate(context).map_err(SocialError::into_http)
+}
+
+fn acquire_social_state_gate(
+    context: &RuntimeContext,
+) -> Result<crate::conversation_state::Gate, (u16, String)> {
+    social_state::acquire_gate(context).map_err(SocialError::into_http)
+}
+
+fn reconcile_default_wake_configs(
+    context: &RuntimeContext,
+    before: Option<&Value>,
+) -> Result<(), (u16, String)> {
+    social_state::reconcile_default_wake_configs(context, before).map_err(SocialError::into_http)
+}
+
 #[cfg(test)]
-pub(crate) use crate::conversation_state::{
+use crate::conversation_state::{
     new_conversation, read_console_document as load_social_state_for,
     update_raw as mutate_social_state_for,
 };
+#[cfg(test)]
+use crate::social_state::{
+    hold_test_observation_wait, key_in_allowlist, observation_wait_turn, rotate_idle_session,
+    turn_budget_ended,
+};
+#[cfg(test)]
+fn conversation_token(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
+    social_state::token(context, key).map_err(String::from)
+}
+#[cfg(test)]
+fn ensure_or_rotate_agent_token(
+    context: &RuntimeContext,
+    key: &str,
+    rotate: bool,
+) -> Result<String, String> {
+    social_state::ensure_or_rotate(context, key, rotate).map_err(String::from)
+}
+#[cfg(test)]
+fn conversation_scope_change(
+    context: &RuntimeContext,
+    conversation: &str,
+    action: &str,
+) -> Result<Value, (u16, String)> {
+    social_state::change_conversation_scope(context, conversation, action)
+        .map_err(SocialError::into_http)
+}
 #[cfg(test)]
 use crate::conversation_state::update_selected_raw as update_selected_social_state;
 #[cfg(test)]
@@ -300,42 +346,8 @@ thread_local! {
     static CONFIG_WRITES: std::cell::RefCell<Option<(Result<String, String>, String)>> = const { std::cell::RefCell::new(None) };
 }
 
-/// The one write path of the selected `config.json` (handlers, whitelist, security, token, undo). An ordinary setting's
-/// member is never changed here (#177, `settings::keep_file_members`): one the document lacks or holds as `null` is put
-/// back from the stored file, and any other change of one is refused with nothing written, because console pages change
-/// registry settings through the store (`settings::console_changes`). Stored settings are then put back at their
-/// registry pointers (`settings::mirror_into`), so no writer puts back an older value of one.
 fn write_selected_config_text(context: &RuntimeContext, text: &str) -> Result<(), String> {
-    let mut doc: Value = serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(text))
-        .map_err(|_| "runtime config is invalid".to_string())?;
-    let kept = if context.is_isolated() {
-        // An unreadable file holds no registry member, so any registry member in the document is refused.
-        let current = context
-            .read_optional_text(RuntimeArea::Config, "config.json")
-            .ok()
-            .flatten()
-            .and_then(|current| serde_json::from_str::<Value>(current.trim_start_matches('\u{feff}')).ok())
-            .unwrap_or(Value::Null);
-        crate::settings::keep_file_members(&current, &mut doc).map_err(crate::settings::direct_change_error)?
-    } else {
-        false
-    };
-    let mirrored = crate::settings::mirror_into(context, &mut doc)?;
-    let backup = doc.get("backup").is_some();
-    if backup {
-        doc["backup"] = crate::config::backup_config(&doc)?;
-    }
-    let normalized = if backup || mirrored || kept {
-        Some(serde_json::to_string_pretty(&doc).map_err(|error| error.to_string())?)
-    } else { None };
-    let text = normalized.as_deref().unwrap_or(text);
-    let before = context
-        .read_optional_text(RuntimeArea::Config, "config.json")
-        .map(Option::unwrap_or_default)
-        .map_err(|e| format!("cannot read config.json before the write: {e}"));
-    context.write_atomic(RuntimeArea::Config, "config.json", text.as_bytes())?;
-    record_config_publication(before, text);
-    Ok(())
+    social_state::write_selected_config_text_with(context, text, Some(&record_config_publication))
 }
 
 pub(crate) fn record_config_publication(before: Result<String, String>, text: &str) {
@@ -352,10 +364,6 @@ fn take_config_writes() -> Option<(Result<String, String>, String)> {
     CONFIG_WRITES.with(|writes| writes.borrow_mut().take())
 }
 
-/// Notes the selected `config.json` as this request found it, before a settings write-back changes it (#177). The
-/// write-back is not a write of `write_selected_config_text`, so without this the request's audit record would take its
-/// before-state from the file after the write-back, and an undo would not see the registry change. The request's own
-/// write then sets the after-state, as for any other write.
 fn note_config_before_request(context: &RuntimeContext) {
     let before = context
         .read_optional_text(RuntimeArea::Config, "config.json")
@@ -370,49 +378,17 @@ fn note_config_before_request(context: &RuntimeContext) {
     });
 }
 
-pub(crate) fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    if !crate::settings::has_legacy_engine_choices(context)? { return Ok(()); }
-    let _gate = config_gate(context)?;
-    if let Some(config) = crate::settings::import_engine_choices(context)? {
-        write_selected_config_text(context, &config.to_string())
-            .map_err(|_| (503, "conversation engine import could not update config.json".into()))?;
-    }
-    Ok(())
+fn import_engine_choices(context: &RuntimeContext) -> Result<(), (u16, String)> {
+    social_state::import_engine_choices_with(context, Some(&record_config_publication))
+        .map_err(SocialError::into_http)
 }
 
-/// Startup and turn admission have no HTTP request to own the writer's record.
-pub(crate) fn import_engine_choices_outside_request(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    let previous = take_config_writes();
-    let result = import_engine_choices(context);
-    CONFIG_WRITES.with(|writes| *writes.borrow_mut() = previous);
-    result
-}
-
-/// The raw selected `config.json` object a writer modifies; never the effective view from
-/// `load_config` (canonical defaults and the closed-agent owner overlay are not file contents).
 fn raw_config_for_write(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let text = context
-        .read_text(RuntimeArea::Config, "config.json")
-        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
-    // A file the runtime cannot load is refused as before (writers never repair it partially).
-    if !value.is_object() || crate::config::canonical_config(&value).is_err() {
-        return Err((503, "runtime config is invalid".to_string()));
-    }
-    Ok(value)
+    social_state::raw_config_for_write(context).map_err(SocialError::into_http)
 }
 
-/// The selected `config.json` object as it is on disk, for the registry members a social page save keeps
-/// (`settings::keep_registry_values`): the object check of `raw_config_for_write`, without its canonical check.
 fn raw_config_object(context: &RuntimeContext) -> Result<Value, (u16, String)> {
-    let text = context
-        .read_text(RuntimeArea::Config, "config.json")
-        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-    let value: Value = serde_json::from_str(&text).map_err(|_| (503, "runtime config is invalid".to_string()))?;
-    if !value.is_object() {
-        return Err((503, "runtime config is invalid".to_string()));
-    }
-    Ok(value)
+    social_state::raw_config_object(context).map_err(SocialError::into_http)
 }
 
 /// Ticket 25 (SnowLuma token self-heal, JS `persistSnowLumaEndpoint`): write the confirmed access token and, when given,
@@ -1542,25 +1518,8 @@ fn handle_roles(context: &RuntimeContext) -> Result<Value, (u16, String)> {
     }))
 }
 
-fn default_role_state() -> Value {
-    json!({ "role": null, "mode": "active" })
-}
-
-fn read_role_state(context: &RuntimeContext) -> Result<Value, &'static str> {
-    if !context.is_isolated() {
-        return Ok(read_json_for(context, ROLE_STATE_FILE).unwrap_or_else(default_role_state));
-    }
-    let Some(text) = context
-        .read_optional_text(RuntimeArea::Data, "current-role.json")
-        .map_err(|_| "runtime role state is unavailable")?
-    else {
-        return Ok(default_role_state());
-    };
-    let state: Value = serde_json::from_str(&text).map_err(|_| "runtime role state is invalid")?;
-    if !state.is_object() {
-        return Err("runtime role state is invalid");
-    }
-    Ok(state)
+fn read_role_state(context: &RuntimeContext) -> Result<Value, String> {
+    social_state::role_state(context).map_err(String::from)
 }
 
 fn parse_role_management_body(
@@ -1979,29 +1938,6 @@ fn handle_dsh_model(context: &RuntimeContext, cfg: &Value) -> Value {
 }
 
 /// `/api/presets`：DSH 的 agent 预设列表（`agentPresets/list`）。
-///
-/// 每个请求新建一次 `Rpc` —— 它只是在本机铸一个 cookie，成本可以忽略，
-/// 换来的是「DSH 没起来时控制台其他端点照常工作」。
-///
-/// 失败时**回 500 并带原因**，不静默回空数组：空数组在页面上看起来就是
-/// 「一个预设都没有」，会被当成真实状态。实测碰到过一次瞬时 401，
-/// 当时如果回 `{presets: []}`，排查方向会被带偏到 DSH 的 preset 配置上。
-pub(crate) fn dsh_rpc_for(context: &RuntimeContext, cfg: &Value) -> Result<crate::dsh::Rpc, String> {
-    let base = if context.is_isolated() {
-        context
-            .dependency_url("dsh")
-            .ok_or_else(|| "selected DSH dependency is unavailable".to_string())?
-    } else {
-        let base = cfg
-            .get("dsh")
-            .and_then(|d| d.get("baseUrl"))
-            .and_then(|b| b.as_str())
-            .unwrap_or("http://127.0.0.1:3080");
-        base
-    };
-    crate::dsh::Rpc::connect_with_runtime(context, base)
-}
-
 fn handle_presets(context: &RuntimeContext, cfg: &Value) -> Result<Value, String> {
     let rpc = dsh_rpc_for(context, cfg)?;
     // 401 重试一次：实测控制台进程里这条路会间歇性 401（6 次里坏 3 次），
@@ -3381,24 +3317,6 @@ fn handle_pending(_context: &RuntimeContext) -> Value {
     json!({ "pending": [] })
 }
 
-/// 规范会话 key：`group:数字` / `private:数字`，数字必须是正 JS safe integer。
-fn canonical_v2_key(key: &str) -> Option<String> {
-    let (kind, id) = key
-        .trim_matches(social_policy_js_trim_char)
-        .split_once(':')?;
-    if kind != "group" && kind != "private" {
-        return None;
-    }
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let n: i64 = id.parse().ok()?;
-    if n <= 0 || n > 9_007_199_254_740_991 {
-        return None;
-    }
-    Some(format!("{kind}:{n}"))
-}
-
 /// 归一化操作者输入：去 BOM、统一行尾、删控制字符、只裁首尾空白（保留段落换行）。
 fn normalize_initial_prompt_text(raw: &str) -> String {
     let stripped = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
@@ -3460,20 +3378,9 @@ fn handle_initial_prompt_post(context: &RuntimeContext, cfg: &Value, body: &str)
 }
 
 const ROLES_DIR_PATH: &str = crate::legacy_path!("qq-bridge/roles");
-const ROLE_STATE_FILE: &str = crate::legacy_path!("qq-bridge/state/current-role.json");
 const ROLE_NAME_MAX: usize = 40;
 /// 内容上限 64KB：create/update 要校验。
 const ROLE_CONTENT_MAX_BYTES: usize = 64 * 1024;
-
-/// 人格名清洗：与 JS 的 `/[^\w\u4e00-\u9fff-]/g` **同义**。
-///
-/// 注意不能图省事写 `is_alphanumeric()` —— Rust 那个含西里尔、希腊、全角数字，
-/// 会把 JS 会删掉的字符留下，改名/建卡时就可能造出 JS 侧打不开的文件名。
-pub(crate) fn sanitize_role_name(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || ((0x4e00..=0x9fff).contains(&(*c as u32))))
-        .collect()
-}
 
 /// 校验人格名。返回 Err(提示文案)，与 JS 的抛错文案逐字一致。
 fn validate_role_name(raw: &str) -> Result<String, String> {
@@ -3531,8 +3438,7 @@ fn handle_roles_rename(context: &RuntimeContext, body: &str) -> Result<Value, (u
     let switched = current == from;
     if switched {
         let mode = state.get("mode").and_then(|v| v.as_str()).unwrap_or("active");
-        write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": to, "mode": mode }))
-            .map_err(|e| (500, e))?;
+        social_state::write_role_state(context, Some(&to), mode).map_err(SocialError::into_http)?;
     }
     Ok(json!({ "ok": true, "role": to, "renamed": true, "currentFollowed": switched }))
 }
@@ -3557,8 +3463,7 @@ fn handle_roles_delete(context: &RuntimeContext, body: &str) -> Result<Value, (u
     let cleared = current == name;
     if cleared {
         let mode = state.get("mode").and_then(|v| v.as_str()).unwrap_or("active");
-        write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": Value::Null, "mode": mode }))
-            .map_err(|e| (500, e))?;
+        social_state::write_role_state(context, None, mode).map_err(SocialError::into_http)?;
     }
     Ok(json!({ "ok": true, "deleted": name, "clearedCurrent": cleared }))
 }
@@ -4552,43 +4457,10 @@ fn passthrough_error(msg: String) -> String {
     }
 }
 
-/// 会话是否在当前模式的白名单里（JS 的 `isSessionAllowedInCurrentMode`）。
-///
-/// 这里只做「白名单」这一层：JS 还要看当前模式（reserved2 / closed-agent），
-/// Rust 侧目前只有 reserved2，模式判定等 P10-c 的 /api/mode 落地后再补。
-/// 当前模式：以 `state/mode.json` 为准（JS 也是这么定的）。
-/// 缺文件时按 `reserved2` —— 这个桥接实际只在二代仿真模式下跑，
-/// 而 `chat`/`reserved` 会让所有发送类端点直接 403，缺省成那边等于"什么都没法用"。
-fn current_mode() -> String {
-    read_json(crate::legacy_path!("qq-bridge/state/mode.json"))
-        .and_then(|v| v.get("mode").and_then(|m| m.as_str()).map(|s| s.to_string()))
-        .map(|s| crate::config::normalize_mode(&s).map(str::to_string).unwrap_or(s))
-        .unwrap_or_else(|| "reserved2".to_string())
+fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
+    social_state::mode_checked(context).map_err(SocialError::into_http)
 }
 
-pub(crate) fn current_mode_for(context: &RuntimeContext) -> Result<String, (u16, String)> {
-    if !context.is_isolated() {
-        return Ok(current_mode());
-    }
-    let text = context
-        .read_optional_text(RuntimeArea::Data, "mode.json")
-        .map_err(|_| (500, "runtime mode is unavailable".to_string()))?;
-    let Some(text) = text else {
-        return Ok("reserved2".to_string());
-    };
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|_| (500, "runtime mode is invalid".to_string()))?;
-    let Some(object) = value.as_object() else {
-        return Err((500, "runtime mode is invalid".to_string()));
-    };
-    match object.get("mode") {
-        Some(Value::String(mode)) => Ok(crate::config::normalize_mode(mode)
-            .map(str::to_string)
-            .unwrap_or_else(|| mode.clone())),
-        None => Ok("reserved2".to_string()),
-        Some(_) => Err((500, "runtime mode is invalid".to_string())),
-    }
-}
 /// 会话是否在当前模式的白名单里（JS 的 isSessionAllowedInCurrentMode）。
 fn session_allowed(cfg: &Value, key: &str) -> bool {
     let Some((kind, id)) = key.split_once(':') else {
@@ -4622,167 +4494,6 @@ fn session_allowed(cfg: &Value, key: &str) -> bool {
     }
 }
 
-/// JS `isSessionAllowedInCurrentMode` behavior for selected-root social-v2 tools.
-/// This is kept separate from the legacy route preflight while that wider route
-/// family is still being migrated.
-pub(crate) fn social_policy_js_string(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(value) => value.to_string(),
-        Value::Number(value) => value
-            .as_f64()
-            .map(|number| {
-                if number == 0.0 {
-                    // ECMAScript String(-0) is "0".
-                    "0".to_string()
-                } else if number.abs() >= 1.0e21 {
-                    // ECMAScript switches to exponent notation at 1e21; such
-                    // values therefore do not pass the decimal-ID filter.
-                    format!("{number:e}")
-                } else {
-                    number.to_string()
-                }
-            })
-            .unwrap_or_else(|| value.to_string()),
-        Value::String(value) => value.clone(),
-        Value::Array(values) => values
-            .iter()
-            .map(|value| {
-                if value.is_null() {
-                    String::new()
-                } else {
-                    social_policy_js_string(value)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-        Value::Object(_) => "[object Object]".to_string(),
-    }
-}
-
-fn social_policy_normalized_id(value: &Value) -> Option<String> {
-    let value = social_policy_js_string(value);
-    let value = value.trim_matches(social_policy_js_trim_char);
-    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| value.to_string())
-}
-
-fn social_policy_js_trim_char(ch: char) -> bool {
-    // ECMAScript WhiteSpace + LineTerminator code points for String.trim().
-    // Rust's broader `char::is_whitespace` includes U+0085, which JS does not.
-    matches!(
-        ch,
-        '\u{0009}'
-            | '\u{000a}'
-            | '\u{000b}'
-            | '\u{000c}'
-            | '\u{000d}'
-            | '\u{0020}'
-            | '\u{00a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
-    )
-}
-
-fn social_policy_list(cfg: &Value, root: &str, kind: &str) -> Option<Vec<String>> {
-    let policy = cfg.get(root)?;
-    // Match bridge.js nullish alias precedence: group uses groups ?? group;
-    // private uses private ?? privates. A present non-array value normalizes
-    // to an empty list rather than falling through to the alternate alias.
-    let (preferred, fallback) = match kind {
-        "group" => ("groups", "group"),
-        "private" => ("private", "privates"),
-        _ => return None,
-    };
-    let values = policy
-        .get(preferred)
-        .filter(|value| !value.is_null())
-        .or_else(|| policy.get(fallback))?
-        .as_array()?;
-    Some(values.iter().filter_map(social_policy_normalized_id).collect())
-}
-
-fn social_v2_session_allowed(cfg: &Value, key: &str) -> bool {
-    let Some(canonical) = canonical_v2_key(key) else {
-        return false;
-    };
-    let Some((kind, id)) = canonical.split_once(':') else {
-        return false;
-    };
-    let deny = social_policy_list(cfg, "deny", kind).unwrap_or_default();
-    if deny.iter().any(|value| value == id) {
-        return false;
-    }
-    let allow = social_policy_list(cfg, "allow", kind).unwrap_or_default();
-    if allow.is_empty() {
-        cfg.get("allowAllWhenEmpty").and_then(Value::as_bool) == Some(true)
-    } else {
-        allow.iter().any(|value| value == id)
-    }
-}
-
-/// Frozen social-v2 projection middleware checks a numeric session key before
-/// the handler applies `canonical_v2_key`'s safe-integer storage constraint.
-/// It compares `String(Number(id))` against normalized allow/deny strings; this
-/// intentionally permits a seeded unsafe raw key through policy so the storage
-/// handler can return its later 400.
-fn social_v2_projection_session_allowed(cfg: &Value, key: &str) -> bool {
-    let Some((kind, raw_id)) = key
-        .trim_matches(social_policy_js_trim_char)
-        .split_once(':')
-    else {
-        return false;
-    };
-    if !matches!(kind, "group" | "private")
-        || raw_id.is_empty()
-        || !raw_id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let Ok(number) = raw_id.parse::<f64>() else {
-        return false;
-    };
-    let id = if number.is_infinite() {
-        if number.is_sign_negative() {
-            "-Infinity".to_string()
-        } else {
-            "Infinity".to_string()
-        }
-    } else if let Some(number) = serde_json::Number::from_f64(number) {
-        social_policy_js_string(&Value::Number(number))
-    } else {
-        "NaN".to_string()
-    };
-    let deny = social_policy_list(cfg, "deny", kind).unwrap_or_default();
-    if deny.iter().any(|value| value == &id) {
-        return false;
-    }
-    let allow = social_policy_list(cfg, "allow", kind).unwrap_or_default();
-    if allow.is_empty() {
-        cfg.get("allowAllWhenEmpty").and_then(Value::as_bool) == Some(true)
-    } else {
-        allow.iter().any(|value| value == &id)
-    }
-}
-
-/// Additional menu gates imposed by the reserved2 console routes.
-pub(crate) fn reserved2_menu_tool(cfg: &Value, key: &str, name: &str) -> bool {
-    match name {
-        "qq_send_private_message" => key.starts_with("private:"),
-        "qq_send_group_message" | "qq_reply" | "qq_send_burst" => key.starts_with("group:"),
-        "qq_send_voice" | "qq_list_voices" =>
-            voice_http::voice_cfg(cfg).enabled && voice_http::send_voice_tool_enabled(cfg),
-        "qq_set_sticker_remark" => tool_enabled(cfg, "setStickerRemark"),
-        _ => true,
-    }
-}
-
 /// 校验会话令牌（读 state 里的 agentToken）。
 fn agent_token_ok(key: &str, token: &str) -> bool {
     agent_token_ok_for(&RuntimeContext::legacy(), key, token).unwrap_or(false)
@@ -4793,23 +4504,14 @@ fn agent_token_ok_for(
     key: &str,
     token: &str,
 ) -> Result<bool, (u16, String)> {
-    if token.is_empty() {
-        return Ok(false);
-    }
-    let doc = ConversationState::for_runtime(context).read_document()?;
-    Ok(agent_token_matches_doc(&doc, key, token))
+    social_state::token_ok(context, key, token).map_err(SocialError::into_http)
 }
 
 fn agent_token_matches_doc(doc: &SocialDocument, key: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let canonical_key = canonical_v2_key(key);
-    let lookup_key = canonical_key.as_deref().unwrap_or(key);
-    doc.conversation(lookup_key)
-        .is_some_and(|conv| conv.matches_token(token))
+    social_state::token_matches_doc(doc, key, token)
 }
 
+#[cfg(test)]
 fn agent_token_matches_state(state: &Value, key: &str, token: &str) -> bool {
     SocialDocument::from_value(state.clone())
         .ok()
@@ -4883,13 +4585,13 @@ pub(super) fn handle_wait_post(
     }
     let wait_cfg = wait_section(cfg);
     let num = |k: &str, d: i64| -> i64 { wait_number(&wait_cfg, k, d) };
-    let WaitBounds { min_quiet_after_new, max_quiet_ms } = wait_bounds(cfg);
+    let (min_quiet_after_new, max_quiet_ms) = social_state::wait_quiet_bounds(cfg);
 
     let mut reply_wait = req.get("purpose").and_then(|v| v.as_str()) == Some("reply");
     // JS: Math.max(1, Math.round(Number(body.minNewMessages) || 1))
     let mut min_new = js_round(agent::js_number_or(req.get("minNewMessages"), 1.0)).max(1);
     let default_ms = num("defaultMs", 30_000);
-    let (min_ms, max_ms) = wait_timeout_bounds(cfg);
+    let (min_ms, max_ms) = social_state::wait_timeout_range(cfg);
     // JS: Math.min(maxMs, Math.max(minMs, Math.round(Number(body.timeoutMs) || defaultMs)))
     let mut timeout_ms = js_round(agent::js_number_or(req.get("timeoutMs"), default_ms as f64)).max(min_ms).min(max_ms);
     let batch = wait_policy(cfg);
@@ -5517,22 +5219,6 @@ fn wait_section(cfg: &Value) -> Value {
     cfg.get("socialV2").and_then(|s| s.get("wait")).cloned().unwrap_or_else(|| json!({}))
 }
 
-pub(crate) struct WaitPolicy {
-    pub window_ms: i64,
-    pub max_ms: i64,
-    pub max_per_turn: u64,
-}
-
-/// Invalid overrides never prevent config loading; bounded batches fit the turn's quiet budget.
-pub(crate) fn wait_policy(cfg: &Value) -> WaitPolicy {
-    let section = wait_section(cfg);
-    let duration = |name: &str, default: i64| section.get(name).and_then(Value::as_i64)
-        .filter(|n| (1..=120_000).contains(n)).unwrap_or(default);
-    WaitPolicy { window_ms: duration("batchWindowMs", 8_000), max_ms: crate::settings::wake_timing::WAIT_BATCH_MAX.integer(cfg),
-        max_per_turn: section.get("maxPerTurn").and_then(Value::as_u64)
-            .filter(|n| (1..=9_007_199_254_740_991).contains(n)).unwrap_or(4) }
-}
-
 /// Selected turns keep their durable identity across console restarts and DSH re-attachment.
 /// No-ledger callers use the persisted legacy turn ID, retaining lastWakeAt for older records.
 fn wait_usage(context: &RuntimeContext, key: &str, conv: &Conversation) -> Result<(String, u64), (u16, String)> {
@@ -5550,19 +5236,7 @@ fn wait_usage(context: &RuntimeContext, key: &str, conv: &Conversation) -> Resul
     Ok((scope, used))
 }
 
-/// Effective per-turn text-send cap (`socialV2.send.maxPerTurn`, positive safe integer, default 20).
-pub(crate) fn turn_send_cap(cfg: &Value) -> u64 {
-    crate::settings::send::TURN_MAX.integer(cfg) as u64
-}
-
-pub(crate) const END_TURN: &str = "end this turn now: produce your final answer and make no further tool calls";
 const TURN_CLOSE_MARGIN_MS: i64 = 20_000;
-
-/// Effective deadline shared by live simulation and the console's durable wait budget.
-pub(crate) fn reserved2_deadline(deadline: i64, cap: i64, ceiling: i64, start: i64, conv: &Value) -> i64 {
-    conv["engagedAt"].as_i64().filter(|at| *at > 0 && *at >= start)
-        .map_or(deadline, |at| deadline.max(at.saturating_add(cap)).min(ceiling.max(deadline)))
-}
 
 /// Captured simulation budget shared by observation waits and snapshot read grants.
 fn captured_turn_budget(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str, conv: &Value, infer_legacy_wait: bool)
@@ -5634,7 +5308,7 @@ fn note_engagement_ended(out: &mut Value) {
 
 /// #46: a send to a group where QQ has muted her is refused here, before quota, quote or gateway
 /// work. The result says until when; an open turn is marked ended so it closes as a clean sleep.
-pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
+pub(super) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str, token: &str) -> Result<(), (u16, String)> {
     let Some(mute) = crate::group_mute::active(context, key) else { return Ok(()) };
     if !token.is_empty() {
         let epoch = crate::conversation_state::token_epoch(token);
@@ -5654,68 +5328,6 @@ pub(crate) fn mute_send_denial(context: &RuntimeContext, cfg: &Value, key: &str,
     Err((403, mute.refusal_text(crate::parity_clock::now_ms(), cfg)))
 }
 
-fn wait_console_generation() -> &'static str {
-    static GENERATION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    GENERATION.get_or_init(|| crate::turn_ledger::mint_id("console-")).as_str()
-}
-
-fn wait_live_path(console: &str, request: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("{console}:{request}").as_bytes());
-    format!("locks/observation-wait-{digest:x}.lock")
-}
-
-#[cfg(test)]
-pub(crate) fn hold_test_observation_wait(
-    context: &RuntimeContext, key: &str, token: &str, turn: &str,
-) -> std::fs::File {
-    // Hold the same request witness as the console without taking the process-wide wait lease.
-    let console = wait_console_generation();
-    let request = crate::turn_ledger::mint_id("wait-");
-    let lock = context.open_locked_file(RuntimeArea::Data, &wait_live_path(console, &request)).unwrap();
-    ConversationState::for_runtime(context).update(key, |conv| {
-        conv.set_field("activeWait", json!({
-            "id":request,"console":console,"turn":turn,"purpose":"messages",
-            "epoch":crate::conversation_state::token_epoch(token)
-        }));
-        Ok(())
-    }).unwrap();
-    lock
-}
-
-pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Result<Option<String>, String> {
-    let conv = ConversationState::for_runtime(context)
-        .read(key)
-        .map_err(|(_, e)| e)?
-        .unwrap_or_default();
-    let Some(pending) = conv.field("activeWait") else { return Ok(None); };
-    let epoch = conv
-        .token()
-        .map(crate::conversation_state::token_epoch)
-        .unwrap_or_else(|| crate::conversation_state::token_epoch(""));
-    if pending["purpose"] != "messages" || pending["epoch"] != epoch { return Ok(None); }
-    let (Some(console), Some(request), Some(turn)) = (pending["console"].as_str(), pending["id"].as_str(), pending["turn"].as_str()) else { return Ok(None); };
-    // The pipeline and console are different processes. Only the live owning request
-    // holds this generation/request-specific OS witness; disk state alone proves nothing.
-    let relative = wait_live_path(console, request);
-    let path = context.resolve_path(RuntimeArea::Data, &relative, crate::runtime::PathIntent::ReadOptionalFile).map_err(str::to_string)?;
-    if !path.is_file() { return Ok(None); }
-    match context.open_locked_file(RuntimeArea::Data, &relative) {
-        Err(error) if error == "runtime file is already locked" => Ok(Some(turn.to_string())),
-        Ok(_) => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn turn_budget_ended(context: &RuntimeContext, key: &str, turn: &str) -> bool {
-    ConversationState::for_runtime(context)
-        .read(key)
-        .ok()
-        .flatten()
-        .and_then(|c| c.field("turnBudgetEnded").cloned())
-        .is_some_and(|v| v == turn)
-}
-
 fn note_wait_budget(out: &mut Value, used: u64, max: u64) {
     out["waitCallsUsed"] = json!(used);
     out["waitCallsRemaining"] = json!(max.saturating_sub(used));
@@ -5729,41 +5341,6 @@ fn note_wait_budget(out: &mut Value, used: u64, max: u64) {
 
 fn wait_number(wait_cfg: &Value, key: &str, default: i64) -> i64 {
     wait_cfg.get(key).and_then(|v| v.as_i64()).filter(|n| *n != 0).unwrap_or(default)
-}
-
-/// The final admitted call can become a full observation even after a short caller timeout.
-pub(crate) fn wait_client_timeout_ms(cfg: &Value, args: &Value) -> u64 {
-    let section = wait_section(cfg);
-    let (min_ms, max_ms) = wait_timeout_bounds(cfg);
-    let timeout = js_round(agent::js_number_or(args.get("timeoutMs"), wait_number(&section, "defaultMs", 30_000) as f64))
-        .max(min_ms).min(max_ms);
-    let observation = crate::wake::pre_sleep_wait_ms(cfg).max(crate::wake::prompt_pre_sleep_wait_ms(cfg));
-    timeout.max(observation).saturating_add(wait_policy(cfg).max_ms).saturating_add(20_000)
-        .clamp(1_000, 725_000) as u64
-}
-
-/// `socialV2.wait` minMs/maxMs as the wait handler clamps timeouts.
-fn wait_timeout_bounds(cfg: &Value) -> (i64, i64) {
-    use crate::settings::wake_timing::{WAIT_MAX, WAIT_MIN};
-    let min_ms = WAIT_MIN.integer(cfg).max(100);
-    (min_ms, WAIT_MAX.integer(cfg).max(min_ms))
-}
-
-struct WaitBounds {
-    min_quiet_after_new: i64,
-    max_quiet_ms: i64,
-}
-
-/// Quiet bounds of a messages wait. The reserved2 turn budget reads the same values.
-fn wait_bounds(cfg: &Value) -> WaitBounds {
-    let (_, max_ms) = wait_timeout_bounds(cfg);
-    let min_quiet_after_new = crate::settings::wake_timing::WAIT_QUIET.integer(cfg);
-    WaitBounds { min_quiet_after_new, max_quiet_ms: min_quiet_after_new.max((120_000i64).min(max_ms)) }
-}
-
-/// The longest quiet extension a messages wait may add after its timeout (plus 5000 ms of polling slack).
-pub(crate) fn wait_max_quiet_ms(cfg: &Value) -> i64 {
-    wait_bounds(cfg).max_quiet_ms.max(wait_policy(cfg).max_ms)
 }
 
 fn last_unread_seq(conv: &Value) -> i64 {
@@ -5927,61 +5504,6 @@ pub(crate) fn warn_configured_voice_duration(cfg: &Value) {
     }
 }
 
-pub(crate) fn social_v1_number(value: &Value) -> f64 {
-    match value {
-        Value::Null => 0.0,
-        Value::Bool(value) => {
-            if *value {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        Value::Number(value) => value.as_f64().unwrap_or(f64::NAN),
-        Value::String(_) | Value::Array(_) => {
-            let text = social_policy_js_string(value);
-            let text = text.trim_matches(social_policy_js_trim_char);
-            if text.is_empty() {
-                return 0.0;
-            }
-            let (radix, digits) = if let Some(digits) = text
-                .strip_prefix("0x")
-                .or_else(|| text.strip_prefix("0X"))
-            {
-                (16_u32, Some(digits))
-            } else if let Some(digits) = text
-                .strip_prefix("0b")
-                .or_else(|| text.strip_prefix("0B"))
-            {
-                (2_u32, Some(digits))
-            } else if let Some(digits) = text
-                .strip_prefix("0o")
-                .or_else(|| text.strip_prefix("0O"))
-            {
-                (8_u32, Some(digits))
-            } else {
-                (10_u32, None)
-            };
-            if let Some(digits) = digits {
-                if digits.is_empty() {
-                    return f64::NAN;
-                }
-                let mut number = 0.0;
-                for ch in digits.chars() {
-                    let Some(digit) = ch.to_digit(radix) else {
-                        return f64::NAN;
-                    };
-                    number = number * f64::from(radix) + f64::from(digit);
-                }
-                number
-            } else {
-                text.parse::<f64>().unwrap_or(f64::NAN)
-            }
-        }
-        Value::Object(_) => f64::NAN,
-    }
-}
-
 fn social_v1_json_number(number: f64) -> Value {
     if !number.is_finite() {
         return Value::Null;
@@ -6004,23 +5526,6 @@ fn social_v1_truthy(value: &Value) -> bool {
         Value::Number(value) => value.as_f64().map(|n| n != 0.0).unwrap_or(false),
         Value::String(value) => !value.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
-pub(crate) fn social_v1_spread(value: Option<&Value>) -> serde_json::Map<String, Value> {
-    match value {
-        Some(Value::Object(values)) => values.clone(),
-        Some(Value::Array(values)) => values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| (index.to_string(), value.clone()))
-            .collect(),
-        Some(Value::String(value)) => value
-            .chars()
-            .enumerate()
-            .map(|(index, value)| (index.to_string(), json!(value.to_string())))
-            .collect(),
-        _ => serde_json::Map::new(),
     }
 }
 
@@ -6928,129 +6433,6 @@ fn has_wake_defaults(wake: &Value) -> bool {
     ].iter().any(|key| wake.get(*key).is_some())
 }
 
-/// Settings writers call this after releasing their configuration gate.
-pub(crate) fn refresh_default_wake_configs(context: &RuntimeContext) -> Result<(), (u16, String)> {
-    // An empty runtime has no plans to repair. Leave its lock file uncreated. Once
-    // there are conversations, read the current state and settings together under the gate.
-    if ConversationState::for_runtime(context).read_document()?.is_empty_conversations() {
-        return context.load_config_requiring_settings().map(drop).map_err(|error| (503, error));
-    }
-    let _gate = crate::conversation_state::acquire_config_gate(context)?;
-    reconcile_default_wake_configs(context, None)
-}
-
-/// The caller holds the social state/configuration gate. Older finite plans only stored a
-/// deadline, so a live configuration writer supplies the range in effect before its write.
-fn reconcile_default_wake_configs(context: &RuntimeContext, before: Option<&Value>) -> Result<(), (u16, String)> {
-    let cfg = context.load_config_requiring_settings().map_err(|error| (503, error))?;
-    let mut state = crate::conversation_state::read_console_document(context)?;
-    let Some(conversations) = state.get_mut("conversations").and_then(Value::as_object_mut) else { return Ok(()) };
-    let defaults = crate::wake::default_wake_plan(&cfg);
-    let target = crate::session::wake_config_from_json(Some(&defaults));
-    let batch = crate::settings::wake_timing::BATCH.integer(&cfg);
-    let range = crate::wake::default_sleep_range(&cfg);
-    let previous_range = before.map(crate::wake::default_sleep_range);
-    let mut changed = false;
-    for conversation in conversations.values_mut() {
-        let Some(plan) = conversation.get_mut("wakeConfig").filter(|w| w["confirmedBy"] == "default") else { continue };
-        let current = crate::session::wake_config_from_json(Some(plan));
-        let range_changed = plan.get("sleepRangeMs").or(previous_range.as_ref()).is_some_and(|old| old != &range);
-        if target.infinite && !current.infinite {
-            let fields = plan.as_object_mut().unwrap();
-            fields.remove("sleepUntil");
-            fields.remove("sleepRangeMs");
-        } else if !target.infinite && (current.infinite || range_changed) {
-            crate::wake::draw_default_sleep(plan, &cfg, now_ms(), rand01());
-            changed = true;
-        }
-        for (field, stale) in [
-            ("mode", current.mode_active != target.mode_active),
-            ("infinite", current.infinite != target.infinite),
-            ("batchWindowMs", current.batch_window_ms.unwrap_or(batch).max(1000) != batch),
-        ] {
-            if stale {
-                plan[field] = defaults[field].clone();
-                changed = true;
-            }
-        }
-        for (field, stale) in [
-            ("atMention", current.at_mention != target.at_mention),
-            ("nameMention", current.name_mention != target.name_mention),
-            ("question", current.question_boolean != target.question_boolean),
-            ("poke", current.poke != target.poke),
-            ("anyMessage", current.any_message != target.any_message),
-            ("probability", current.probability != target.probability),
-            ("speakerIds", !current.speaker_ids.is_empty() || !crate::wake::normalize_speaker_ids(plan["triggers"].get("speakerIds")).is_empty()),
-        ] {
-            if stale {
-                if !plan["triggers"].is_object() {
-                    plan["triggers"] = json!({});
-                }
-                plan["triggers"][field] = defaults["triggers"][field].clone();
-                changed = true;
-            }
-        }
-        changed |= reconcile_default_keywords(plan, &defaults["triggers"]["keywords"], before, current.keywords != target.keywords);
-    }
-    if changed {
-        crate::conversation_state::write_console_document(context, &state)
-            .map_err(|error| (500, format!("social-state/write: {error}")))?;
-    }
-    Ok(())
-}
-
-/// A no-action reset copies custom words into an otherwise inherited plan. Its recorded
-/// recommendation identifies which later edits should replace those words. Older plans
-/// without a source keep local words when there is no recommendation to replace them.
-fn reconcile_default_keywords(plan: &mut Value, recommended: &Value, before: Option<&Value>, stale: bool) -> bool {
-    let words = &plan["triggers"]["keywords"];
-    let copied_for = plan.get("customKeywordsFor");
-    let empty = recommended.as_array().is_none_or(Vec::is_empty);
-    let inherited = plan["inheritsKeywords"] == true
-        || before.and_then(|cfg| cfg.pointer("/socialV2/wake/recommendedKeywords")) == Some(words);
-    if copied_for == Some(recommended) {
-        return false;
-    }
-    if empty && copied_for.is_some() {
-        // Setting the former recommendation again after clearing it is a change.
-        plan["customKeywordsFor"] = recommended.clone();
-        return true;
-    }
-    if (empty && !inherited) || (!stale && copied_for.is_none()) {
-        return false;
-    }
-    if stale {
-        if !plan["triggers"].is_object() {
-            plan["triggers"] = json!({});
-        }
-        plan["triggers"]["keywords"] = recommended.clone();
-    }
-    let fields = plan.as_object_mut().unwrap();
-    fields.remove("customKeywordsFor");
-    if empty {
-        fields.remove("inheritsKeywords");
-    } else {
-        plan["inheritsKeywords"] = json!(true);
-    }
-    true
-}
-
-/// `POST /api/personas/wake-words/undo` (`console_persona.rs`, administrators only): under the persona
-/// route's authority (the social gate after a fresh credential check) reverts one logged wake-word
-/// change (`wake_words::undo`); a refusal writes nothing.
-pub(crate) fn undo_wake_words(context: &RuntimeContext, body: &Value, authority: crate::persona::Authority<'_>) -> Result<Value, (u16, String)> {
-    let key = body["conversation"]
-        .as_str()
-        .and_then(crate::initial_prompts::canonical_key)
-        .ok_or_else(|| (400, "conversation must be group:<id> or private:<id>".to_string()))?;
-    let id = body["id"].as_u64().ok_or_else(|| (400, "id is required".to_string()))?;
-    let _authority = authority()?;
-    let mut state = crate::conversation_state::read_console_document(context)?;
-    let result = crate::wake_words::undo(&mut state, &key, id, now_ms())?;
-    crate::conversation_state::write_console_document(context, &state)
-        .map_err(|error| (500, format!("social-state/write: {error}")))?;
-    Ok(result)
-}
 /// 本进程内"已见过的转发 id"（按会话）。JS 用内存 Set，Rust 用它兜住嵌套转发：
 /// 外层消息里的嵌套 id 只在上层读取时才被登记，之后 AI 要单独读它就靠这份记录。
 static SEEN_FORWARD_IDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
@@ -7942,303 +7324,35 @@ fn handle_sticker_alias(
 ///
 /// JS 要清十几张内存表（pending/queued/定时器/静默计数…），Rust 的控制台是**每次请求
 /// 读文件**、没有常驻内存，所以真正要落盘的只有两样：`sessions.json` 里的映射和
-/// `sessionPolicies`。剩下的（social-v2 的会话状态）单独处理。
-///
-/// JS 还会调 DSH 的 `stopSessionWork` + `archiveSession` 把旧会话停掉并归档 ——
-/// 那两步 Rust 暂时没做，所以在日志里明说"旧会话未归档"，
-/// 免得以后有人看到映射没了就以为 DSH 那边也干净了。
 fn handle_session_reset_for(
     context: &RuntimeContext,
     body: &str,
 ) -> Result<Value, (u16, String)> {
-    if context.is_isolated() {
-        return handle_session_reset_isolated(context, body);
-    }
-
-    // Keep the legacy process-wide behavior for callers without a runtime root.
-    let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let key = req.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let mut store = read_json(SESSIONS_FILE).unwrap_or_else(|| json!({}));
-    let sessions = store.get("sessions").cloned().unwrap_or_else(|| json!({}));
-    if key.is_empty() || sessions.get(&key).is_none() {
-        return Err((404, "会话不存在".to_string()));
-    }
-    let old_session = js_scalar(sessions.get(&key));
-    if let Some(obj) = store.get_mut("sessions").and_then(|s| s.as_object_mut()) {
-        obj.remove(&key);
-    }
-    // 权限元数据必须跟映射一起删，否则会永久残留在 sessions.json 里
-    if let Some(obj) = store.get_mut("sessionPolicies").and_then(|s| s.as_object_mut()) {
-        obj.remove(&key);
-    }
-    write_json_atomic(SESSIONS_FILE, &store).map_err(|e| (500, e))?;
-    // 二代会话状态也一并清掉（JS 里是 socialV2.conversations.delete(key)）
-    ConversationState::for_runtime(&RuntimeContext::legacy()).update_document(|doc| {
-        doc.remove_conversation(&key);
-        Ok(())
-    })?;
-    crate::safe_println!(
-        "[console] 已清除会话上下文 {key}（旧会话 {old_session}；注意：未调用 DSH 归档/停止）"
-    );
-    Ok(json!({ "ok": true, "key": key, "archived": old_session }))
-}
-
-fn handle_session_reset_isolated(
-    context: &RuntimeContext,
-    body: &str,
-) -> Result<Value, (u16, String)> {
-    let _interaction_gate = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-    let req: Value = serde_json::from_str(body)
-        .map_err(|_| (400, "请求必须是 JSON 对象".to_string()))?;
-    if !req.is_object() {
-        return Err((400, "请求必须是 JSON 对象".to_string()));
-    }
-    let key = req.get("key").and_then(Value::as_str).unwrap_or("").to_string();
-
-    let sessions_text = context
-        .read_optional_text(RuntimeArea::Data, "sessions.json")
-        .map_err(|_| (503, "runtime session data is unavailable".to_string()))?;
-    let store = match sessions_text {
-        Some(text) => {
-            let value: Value = serde_json::from_str(&text)
-                .map_err(|_| (503, "runtime session data is invalid".to_string()))?;
-            if !value.is_object() {
-                return Err((503, "runtime session data is invalid".to_string()));
-            }
-            value
+    let key = if context.is_isolated() {
+        let req: Value = serde_json::from_str(body)
+            .map_err(|_| (400, "请求必须是 JSON 对象".to_string()))?;
+        if !req.is_object() {
+            return Err((400, "请求必须是 JSON 对象".to_string()));
         }
-        None => json!({}),
-    };
-    let cfg = context.load_config().map_err(|_| (503, "runtime configuration is unavailable".to_string()))?;
-    // A conversation whose turn engine needs no DSH resets without a DSH session mapping.
-    let mode = runtime_mode(context);
-    let harness = !crate::turn_engine::Engine::read_choice(context, &cfg, &key, &mode)
-        .map_err(|error| (503, error))?
-        .uses_dsh();
-    let mapped = match store.get("sessions") {
-        None => false,
-        Some(Value::Object(sessions)) => sessions.contains_key(&key),
-        Some(_) => return Err((503, "runtime session data is invalid".to_string())),
-    };
-    if key.is_empty() || (!mapped && !harness) {
-        return Err((404, "会话不存在".to_string()));
-    }
-    if store
-        .get("sessionPolicies")
-        .is_some_and(|policies| !policies.is_object())
-    {
-        return Err((503, "runtime session data is invalid".to_string()));
-    }
-
-    // Read and validate both selected files before changing either one. A missing social-state
-    // file or malformed session document must not turn this reset into a legacy-path operation.
-    let social_text = context
-        .read_optional_text(RuntimeArea::Data, crate::conversation_state::FILE)
-        .map_err(|_| (503, "runtime data is unavailable".to_string()))?
-        .ok_or_else(|| (503, "runtime data is unavailable".to_string()))?;
-    let social: Value = serde_json::from_str(&social_text)
-        .map_err(|_| (503, "runtime data is invalid".to_string()))?;
-    if !social.is_object()
-        || social
-            .get("conversations")
-            .is_some_and(|conversations| !conversations.is_object())
-    {
-        return Err((503, "runtime data is invalid".to_string()));
-    }
-
-    // Preflight both write leaves before mutating either selected document. The two atomic
-    // replacements are not a cross-file transaction; an I/O failure during the second replace
-    // can still leave the first replacement committed and is reported explicitly below.
-    context
-        .resolve_path(RuntimeArea::Data, "sessions.json", PathIntent::WriteFile)
-        .map_err(|_| (503, "runtime session data is unavailable".to_string()))?;
-    context
-        .resolve_path(RuntimeArea::Data, crate::conversation_state::FILE, PathIntent::WriteFile)
-        .map_err(|_| (503, "runtime data is unavailable".to_string()))?;
-
-    let old = crate::session_map::lookup(context, &key).map_err(|error| (503, error))?;
-    if old.is_none() && !harness {
-        return Err((404, "会话不存在".to_string()));
-    }
-    reset_selected_session_record(context, &key, old.as_deref(), None)
-        .map_err(|error| (500, error))?
-        .ok_or_else(|| (409, "会话已变化，重置未应用，请重试".to_string()))?;
-    let old_session = old.unwrap_or_default();
-
-
-    // Resolve inactive turns immediately; live harness turns retain settlement ownership.
-    // An uncertain live effect must stay available for administrator resolution.
-    // The mapping is already revoked, so a turn that cannot be settled (a busy finalization gate
-    // outlasting the retrying wait) must not skip the remaining turns or the DSH stop/archive:
-    // collect the failure and report it after the cleanup ran.
-    let mut deferred: Option<(u16, String)> = None;
-    if let Ok(records) = crate::turn_ledger::read_records(context) {
-        let (turns, _) = crate::turn_ledger::fold(&records);
-        for turn in turns.iter().filter(|t| {
-            t.key == key && (t.state.is_open() || t.state == crate::turn_ledger::State::Paused)
-        }) {
-            if turn.backend == "harness" {
-                if !crate::harness::resolve_reset(context, &turn.id)
-                    .map_err(|error| (500, format!("harness reset partially failed: {error}")))?
-                {
-                    // Generation revocation fences further dispatch. The live harness keeps
-                    // its running rows until the submitted handler has durably settled.
-                    continue;
-                }
-            }
-            // No hub lock is held here, so the recorder keeps its bounded retrying gate wait.
-            if let Err(error) = crate::turn_ledger::Recorder::attach(context, &turn.id, &key)
-                .end("cancelled", "session-reset") {
-                crate::safe_println!("[console] ⚠️ 重置时未能结算回合 {}：{error}", turn.id);
-                deferred.get_or_insert((500, format!("turn {} was not settled: {error}", turn.id)));
-            }
-        }
-    }
-    // DSH keeps queued prompts across a plain cancel, so clear the queue first, then cancel and
-    // archive. Failure leaves the mapping already revoked and is logged for the operator.
-    if mapped {
-        let _ = stop_and_archive_session(context, &cfg, &key, &old_session);
-    }
-    if let Some(error) = deferred {
-        return Err(error);
-    }
-
-    crate::safe_println!("[console] 已清除选定运行环境中的会话上下文 {key}（旧会话 {old_session}）");
-    Ok(json!({ "ok": true, "key": key, "archived": old_session }))
-}
-/// `POST /api/mode`：切模式（chat / closed-agent / reserved / reserved2）。
-///
-/// 落盘 `state/mode.json` 的是**内部拼写**（`simulation` 会写成 `reserved2`）：
-/// 下游所有判断都是 `== "reserved2"`，存规范名会让它们全部失效。
-///
-/// JS 还会把模式写穿到 DSH 设置（不写就会被它每 5 秒的轮询回滚）。
-/// Rust 侧暂时只写本地并如实回报 `dshSynced: false` —— 假装同步成功比不同步更糟。
-fn handle_mode_post(body: &str) -> Result<Value, (u16, String)> {
-    let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let raw = req.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let mode = match raw.to_ascii_lowercase().as_str() {
-        "chat" => "chat",
-        "closed-agent" => "closed-agent",
-        "reserved" => "reserved",
-        // simulation 是 reserved2 的规范名
-        "reserved2" | "simulation" => "reserved2",
-        _ => {
-            return Err((
-                400,
-                "mode 必须是 chat / reserved / reserved2 / closed-agent（simulation 为 reserved2 的规范名）"
-                    .to_string(),
-            ))
-        }
-    };
-    let existing = read_json(crate::legacy_path!("qq-bridge/state/mode.json")).unwrap_or_else(|| json!({}));
-    let preset = match req.get("closedAgentPreset") {
-        Some(v) => js_scalar(Some(v)),
-        None => existing
-            .get("closedAgentPreset")
-            .and_then(|v| v.as_str())
+        req.get("key")
+            .and_then(Value::as_str)
             .unwrap_or("")
-            .to_string(),
+            .to_string()
+    } else {
+        let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+        req.get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
     };
-    let next = json!({ "mode": mode, "closedAgentPreset": preset });
-    write_json_atomic(crate::legacy_path!("qq-bridge/state/mode.json"), &next).map_err(|e| (500, e))?;
-    // 写穿到 DSH 设置：不写的话，DSH 每 5 秒的轮询会把本地值覆盖回去
-    // （JS 注释里写过这个坑）。写穿用的是**内部拼写**，因为 DSH 里那份值会被读回来当下游判断用。
-    let dsh_synced = write_mode_to_dsh(mode).is_ok();
-    if !dsh_synced {
-        crate::safe_println!("[console] 模式写穿 DSH 失败；本次仅写本地，下次 DSH 轮询会覆盖回滚");
-    }
-    crate::safe_println!("[console] 模式已设置为 {mode}");
-    Ok(json!({
-        "ok": true,
-        "mode": mode,
-        "closedAgentPreset": preset,
-        "dshSynced": dsh_synced,
-    }))
+    social_state::reset_conversation(context, &key).map_err(SocialError::into_http)
 }
 
-/// `POST /api/mode` for a selected runtime: the mode lives in the runtime's own `mode.json`, which
-/// is what the running bridge reads before every message, so a successful answer means the bridge
-/// serves the new mode from its next message on. DSH write-through uses only the selected
-/// dependency and credentials; failure leaves the local change in place, as in frozen JS.
 fn handle_mode_post_for(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
-    if !context.is_isolated() {
-        return handle_mode_post(body);
-    }
-    let _interaction_gate = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-    handle_mode_post_locked(context, body, true)
-}
-
-fn handle_mode_post_locked(context: &RuntimeContext, body: &str, sync_dsh: bool) -> Result<Value, (u16, String)> {
     let req: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
-    let raw = req.get("mode").and_then(|v| v.as_str()).unwrap_or("").trim();
-    let Some(mode) = crate::config::normalize_mode(raw) else {
-        return Err((
-            400,
-            "mode 必须是 chat / reserved / reserved2 / closed-agent（simulation 为 reserved2 的规范名）".to_string(),
-        ));
-    };
-    let existing = match context
-        .read_optional_text(RuntimeArea::Data, "mode.json")
-        .map_err(|_| (503, "runtime mode is unavailable".to_string()))?
-    {
-        Some(text) => serde_json::from_str::<Value>(&text).map_err(|_| (503, "runtime mode is invalid".to_string()))?,
-        None => json!({}),
-    };
-    let preset = match req.get("closedAgentPreset") {
-        Some(v) => js_scalar(Some(v)),
-        None => existing.get("closedAgentPreset").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-    };
-    let changed = existing.get("mode").and_then(Value::as_str) != Some(mode)
-        || (mode == "closed-agent" && existing.get("closedAgentPreset").and_then(Value::as_str).unwrap_or("") != preset);
-    let revision = if changed { crate::turn_ledger::mint_id("mode-") } else { existing["revision"].as_str().unwrap_or("").to_string() };
-    if changed {
-        // Rotate before publishing the new mode; even an immediate round trip revokes old tools.
-        ConversationState::for_runtime(context).update_document(|doc| {
-            doc.rotate_all_tokens();
-            Ok(())
-        })?;
-        // Queued ingress must stay invalid after a restart before the driver's next tick.
-        let journal = crate::inbound::Journal::open(context).map_err(|e| (503,e))?;
-        let keys = journal.replayable().map_err(|e| (503,e))?.into_iter().map(|e| e.event_key).collect::<Vec<_>>();
-        journal.mark_handled(&keys, now_ms()).map_err(|e| (503,e))?;
-        if existing["mode"] == "reserved" && mode != "reserved" {
-            crate::reserved::retire_mode_state(context).map_err(|e| (503, e))?;
-        }
-    }
-    // Frozen JS reconciles session policies on each actual mode transition. Revoke
-    // the captured mapping even when the operator switches away and back between ticks.
-    let mut retired = Vec::new();
-    if changed {
-        for (key, session) in crate::session_map::all(context).map_err(|e| (503, e))? {
-            if crate::session_map::retire_if(context, &key, &session).map_err(|e| (503, e))? {
-                retired.push((key, session));
-            }
-        }
-    }
-    let next = json!({ "mode": mode, "closedAgentPreset": preset, "revision":revision });
-    context
-        .write_atomic(RuntimeArea::Data, "mode.json", serde_json::to_string_pretty(&next).unwrap_or_default().as_bytes())
-        .map_err(|_| (503, "runtime mode is unavailable".to_string()))?;
-    let cfg = context.load_config().map_err(|e| (503, e.to_string()))?;
-    let dsh_synced = sync_dsh && dsh_rpc_for(context, &cfg)
-        .and_then(|rpc| rpc.call("settings.update", json!({"ns":"qq-mode","patch":{"mode":mode}})))
-        .is_ok();
-    if !retired.is_empty() {
-        for (key, session) in retired {
-            let _ = stop_and_archive_session(context, &cfg, &key, &session);
-        }
-    }
-    crate::safe_println!("[console] 选定运行环境的模式已设置为 {mode}");
-    Ok(json!({ "ok": true, "mode": mode, "closedAgentPreset": preset, "dshSynced": dsh_synced }))
-}
-
-/// Apply a DSH mode read only if no console mode write raced the settings request.
-pub(crate) fn apply_dsh_mode(context: &RuntimeContext, mode: &str, observed: Option<String>) -> Result<bool, String> {
-    let _interaction_gate = crate::closed_agent::lock(context)?;
-    let current = context.read_optional_text(RuntimeArea::Data, "mode.json").map_err(str::to_string)?;
-    if current != observed { return Ok(false); }
-    if runtime_mode(context) == mode { return Ok(true); }
-    handle_mode_post_locked(context, &json!({"mode":mode}).to_string(), false).map(|_| true).map_err(|(_, e)| e)
+    let raw = req.get("mode").and_then(Value::as_str).unwrap_or("");
+    let preset = req.get("closedAgentPreset");
+    social_state::set_mode(context, raw, preset, true).map_err(SocialError::into_http)
 }
 
 /// `GET /api/status` of a selected runtime reports what is stored there: the mode, the closed-agent
@@ -8248,7 +7362,10 @@ fn overlay_runtime_status(context: &RuntimeContext, payload: &mut Value) {
         payload["mode"] = json!(mode);
     }
     if let Ok(Some(text)) = context.read_optional_text(RuntimeArea::Data, "mode.json") {
-        if let Some(preset) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("closedAgentPreset").and_then(|p| p.as_str()).map(str::to_string)) {
+        if let Some(preset) = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v.get("closedAgentPreset").and_then(|p| p.as_str()).map(str::to_string))
+        {
             payload["closedAgentPreset"] = json!(preset);
         }
     }
@@ -8256,35 +7373,6 @@ fn overlay_runtime_status(context: &RuntimeContext, payload: &mut Value) {
         payload["role"] = state.get("role").cloned().unwrap_or(Value::Null);
         payload["roleMode"] = json!(state.get("mode").and_then(|m| m.as_str()).unwrap_or("active"));
     }
-}
-
-/// 把模式写进 DSH 的 `qq-mode` 设置命名空间。
-fn write_mode_to_dsh(mode: &str) -> Result<(), String> {
-    let cfg = read_json(CONFIG_PATH).unwrap_or_else(|| json!({}));
-    let base = cfg
-        .get("dsh")
-        .and_then(|d| d.get("baseUrl"))
-        .and_then(|b| b.as_str())
-        .unwrap_or("http://127.0.0.1:3080");
-    let rpc = crate::dsh::Rpc::connect(base)?;
-    let v = match rpc.call(
-        "settings.update",
-        json!({ "ns": "qq-mode", "patch": { "mode": mode } }),
-    ) {
-        Ok(v) => v,
-        Err(e) if e.contains("401") => {
-            std::thread::sleep(std::time::Duration::from_millis(120));
-            rpc.call(
-                "settings.update",
-                json!({ "ns": "qq-mode", "patch": { "mode": mode } }),
-            )?
-        }
-        Err(e) => return Err(e),
-    };
-    if v.get("ok").and_then(|o| o.as_bool()) == Some(false) {
-        return Err("settings.update 返回 ok=false".to_string());
-    }
-    Ok(())
 }
 
 /// A generated console token: 24 bytes of operating-system randomness as 48 hex characters (JS
@@ -9352,328 +8440,44 @@ const SEND_CANCELLED_MESSAGE: &str = "发送已取消：会话、模式或白名
 
 // ── ticket 10：会话令牌（回合代际）与回合账本的管理端视图 ───────────────────────────
 
-/// Persist one wait identity at the legacy turn boundary, before any backend attempts.
-pub(crate) fn begin_legacy_wait_turn(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    ConversationState::for_runtime(context).update(key, |conv| {
-        conv.set_field("waitTurnId", json!(crate::turn_ledger::mint_id("wait-")));
-        Ok(())
-    }).map_err(|(_, error)| error)
-}
-
-pub(crate) fn set_legacy_wait_deadline(context: &RuntimeContext, key: &str, deadline: i64) -> Result<(), String> {
-    ConversationState::for_runtime(context).update(key, |conv| {
-        conv.set_field("waitTurnDeadlineAt", json!(deadline));
-        Ok(())
-    }).map_err(|(_, error)| error)
-}
-
-/// Journaled ingress reaches the same bounded recent/unread streams the public tools read.
-/// Replays after a crash between this write and dispatch keep their original sequence.
-pub(crate) fn record_reserved2_incoming(context: &RuntimeContext, cfg: &Value, key: &str, event_key: &str, mut message: Value) -> Result<i64, String> {
-    ConversationState::for_runtime(context).update_or_init(key, |conv| {
-        if let Some(seq) = conv.field("recentMessages").and_then(|v| v.as_array()).and_then(|a| a.iter().find(|m| m["inboundKey"] == event_key)).and_then(|m| m["seq"].as_i64()) {
-            return Ok(seq);
-        }
-        let seq = conv.field("lastUnreadSeq").and_then(Value::as_i64).unwrap_or(0) + 1;
-        message["seq"] = json!(seq);
-        message["inboundKey"] = json!(event_key);
-        // A member with an impression speaking is the observed interaction the prompt reports.
-        if message["isSelf"] != true {
-            let name = if key.starts_with("private:") { None } else { message["sender"].as_str() };
-            crate::social_mem::note_member_seen(conv, message["userId"].as_str(), name, message["time"].as_i64().unwrap_or(0));
-        }
-        conv.set_field("lastUnreadSeq", json!(seq));
-        if message["quietNeutral"] != true {
-            conv.set_field("lastReplyIncomingAt", message["time"].clone());
-        } else if conv.field("lastReplyIncomingAt").is_none() {
-            // First neutral arrival after upgrading a conversation retains its earlier anchor.
-            let anchor = conv.field("lastIncomingAt").filter(|v| v.as_i64().is_some_and(|t| t > 0))
-                .cloned().unwrap_or_else(|| message["time"].clone());
-            conv.set_field("lastReplyIncomingAt", anchor);
-        }
-        let urgent = message["isOwner"] == true || message["atSelf"] == true;
-        if message["quietNeutral"] != true || urgent {
-            conv.set_field("lastReplyUrgent", json!(urgent));
-        }
-        conv.set_field("lastIncomingAt", message["time"].clone());
-        for field in ["preSleepWaitSatisfiedAt", "preSleepWaitObservedAt", "preSleepWaitAccumMs"] {
-            conv.set_field(field, json!(0));
-        }
-        let recent_limit = cfg.pointer("/socialV2/context/recentLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(100) as usize;
-        let mut recent = conv.field("recentMessages").and_then(Value::as_array).cloned().unwrap_or_default();
-        recent.push(message.clone());
-        if recent.len() > recent_limit {
-            recent.drain(..recent.len() - recent_limit);
-        }
-        conv.set_field("recentMessages", Value::Array(recent));
-        let unread_limit = cfg.pointer("/socialV2/context/unreadLimit").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(30) as usize;
-        let unread_msg = crate::conversation_state::UnreadMessage::from_value(&message).unwrap_or_default();
-        conv.push_unread(unread_msg, unread_limit);
-        Ok(seq)
-    }).map_err(|(_, e)| e)
-}
-
-/// Claim wake bookkeeping before prompt construction. The deadline survives until a ledger turn owns it.
-/// `expected`: the token the queued wake was seen under; a different current token refuses the
-/// claim (`queued wake token invalidated`) before anything changes.
-pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: &str, now: i64, expected: Option<&str>) -> Result<(Value,String), String> {
-    ConversationState::for_runtime(context).update_document(|doc| {
-        let cfg = context.load_config().map_err(|e|(503,e.to_string()))?;
-        if runtime_mode(context) != "reserved2" || doc.paused() || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(&cfg,key) {
-            return Err((403,"wake invalidated by current settings".to_string()));
-        }
-        let Some(mut conv) = doc.conversation(key) else {
-            return Err((503,"wake has no agent token".to_string()));
-        };
-        let previous = conv.to_value();
-        let token = conv.token().ok_or((503,"wake has no agent token".to_string()))?.to_string();
-        if expected.is_some_and(|expected| !credential_eq(expected, &token)) {
-            return Err((409, "queued wake token invalidated".to_string()));
-        }
-        let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
-        wc["lastWakeAt"] = json!(now);
-        wc["wakeCount"] = json!(previous["wakeConfig"]["wakeCount"].as_i64().unwrap_or(0)+1);
-        conv.set_field("wakeConfig", wc);
-        conv.set_field("lastWakeReason", json!(reason));
-        for field in ["preSleepWaitSatisfiedAt","preSleepWaitObservedAt","preSleepWaitAccumMs","engagedAt"] {
-            conv.set_field(field, json!(0));
-        }
-        let mut times = conv.field("wakeTimes").and_then(Value::as_array).cloned().unwrap_or_default();
-        times.push(json!(now));
-        times.retain(|v|v.as_i64().is_some_and(|at| now-at < 3_600_000));
-        if times.len()>200 { times.drain(..times.len()-200); }
-        conv.set_field("wakeTimes", Value::Array(times));
-        doc.set_conversation(key, conv);
-        Ok((previous,token))
-    }).map_err(|(_,e)|e)
-}
-
-/// Called only after the turn and its wake claim are durable. Preserve newer tool configuration.
-pub(crate) fn consume_reserved2_deadline(context: &RuntimeContext, key: &str, token: &str, at: i64, previous: &Value) -> Result<(), String> {
-    ConversationState::for_runtime(context).update(key, |conv| {
-        if !credential_eq(conv.token().unwrap_or(""), token) {
-            return Err((403, "queued wake token invalidated".into()));
-        }
-        if let Some(mut wc) = conv.field("wakeConfig").cloned() {
-            if wc["lastWakeAt"].as_i64() == Some(at)
-                && wc["confirmedAt"] == previous["wakeConfig"]["confirmedAt"]
-                && wc["sleepUntil"] == previous["wakeConfig"]["sleepUntil"] {
-                wc["sleepUntil"] = Value::Null;
-                conv.set_field("wakeConfig", wc);
-            }
-        }
-        Ok(())
-    }).map_err(|(_, e)| e)
-}
-
-pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,previous:&Value)->Result<(),String> {
-    ConversationState::for_runtime(context).update(key, |conv| {
-        if let Some(mut times)=conv.field("wakeTimes").and_then(Value::as_array).cloned() {
-            if let Some(i)=times.iter().rposition(|v|v.as_i64()==Some(at)) { times.remove(i); }
-            conv.set_field("wakeTimes", Value::Array(times));
-        }
-        if let Some(mut wc)=conv.field("wakeConfig").cloned() {
-            if wc["lastWakeAt"].as_i64()==Some(at) {
-                for field in ["lastWakeAt","wakeCount"] { wc[field]=previous["wakeConfig"][field].clone(); }
-                conv.set_field("lastWakeReason", previous["lastWakeReason"].clone());
-                if wc["confirmedAt"]==previous["wakeConfig"]["confirmedAt"] { wc["sleepUntil"]=previous["wakeConfig"]["sleepUntil"].clone(); }
-                conv.set_field("wakeConfig", wc);
-            }
-        }
-        Ok(())
-    }).map_err(|(_,e)|e)
-}
-
-/// Completion is separate from wake admission: reminders do not consume another wake.
-pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, started: Option<i64>, closing_seen: &Value, miss: u32) -> Result<(bool, Value), String> {
-    ConversationState::for_runtime(context).update(key, |conv| {
-        if !credential_eq(conv.token().unwrap_or(""), token) {
-            return Err((403, "completed turn token invalidated".into()));
-        }
-        let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
-        let stamp = wc["confirmedAt"].clone();
-        let closed = stamp != *closing_seen && matches!(wc["confirmedBy"].as_str(), Some("mark_read" | "set_wake_config"));
-        let now = crate::now_ms() as i64;
-        if let Some(started) = started {
-            let acted = conv.field("lastActionAt").and_then(Value::as_i64).unwrap_or(0) >= started
-                || conv.field("lastAiReplyAt").and_then(Value::as_i64).unwrap_or(0) >= started;
-            let no_action = if acted { 0 } else { wc["noActionCount"].as_u64().unwrap_or(0) + 1 };
-            wc["noActionCount"] = json!(no_action);
-            let limit = crate::settings::wake_timing::NO_ACTION.integer(cfg) as u64;
-            if no_action >= limit {
-                let keywords = wc["triggers"]["keywords"].clone();
-                let dropped = wc["triggers"]["dropNames"].clone();
-                wc = crate::wake::default_wake_config(cfg, now, rand01());
-                if keywords.as_array().is_some_and(|a| !a.is_empty()) && keywords != wc["triggers"]["keywords"] {
-                    wc.as_object_mut().unwrap().remove("inheritsKeywords");
-                    wc["customKeywordsFor"] = wc["triggers"]["keywords"].clone();
-                    wc["triggers"]["keywords"] = keywords;
-                }
-                if dropped.as_array().is_some_and(|a| !a.is_empty()) { wc["triggers"]["dropNames"] = dropped; }
-                conv.set_field("bootstrapSent", json!(true));
-            }
-        }
-        let max = crate::settings::wake_timing::REMINDERS.integer(cfg) as u64;
-        if closed {
-            crate::wake::ensure_wakeable(&mut wc, cfg, now, rand01());
-        } else if u64::from(miss) >= max {
-            let dropped = wc["triggers"]["dropNames"].clone();
-            wc = crate::wake::default_wake_config(cfg, now, rand01());
-            if dropped.as_array().is_some_and(|a| !a.is_empty()) { wc["triggers"]["dropNames"] = dropped; }
-        }
-        conv.set_field("wakeConfig", wc);
-        Ok((!closed && u64::from(miss) < max, stamp))
-    }).map_err(|(_, e)| e)
-}
-
-/// A replaced DSH session starts without the operator's first-wake injection (JS `retireSession`).
-pub(crate) fn mark_conversation_unbootstrapped(context: &RuntimeContext, key: &str) -> Result<(), String> {
-    ConversationState::for_runtime(context)
-        .update_existing(key, |conversation| {
-            conversation.set_field("bootstrapSent", json!(false));
-            Ok(())
-        })
-        .map(|_| ())
-        .map_err(|(_, message)| message)
-}
-
-/// The first wake of a reserved2 conversation is a `bootstrap` wake (JS `bootstrapSent`): it
-/// carries the operator's initial prompt. Returns true exactly once per conversation until a
-/// session reset or replacement clears the flag again. Nothing is claimed while the AI is paused,
-/// the second-generation mode is off, or the runtime is not in reserved2.
-pub(crate) fn claim_first_wake(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, String> {
-    if cfg.get("socialV2").and_then(|s| s.get("enabled")).and_then(Value::as_bool) == Some(false) {
-        return Ok(false);
-    }
-    if current_mode_for(context).map_err(|(_, m)| m)? != "reserved2" {
-        return Ok(false);
-    }
-    let pending = |doc: &SocialDocument| -> bool {
-        !doc.paused()
-            && doc
-                .conversation(key)
-                .is_some_and(|c| c.field("bootstrapSent").and_then(Value::as_bool) != Some(true))
-    };
-    // Read-only look first: the common case (already bootstrapped) must not rewrite the state.
-    if !pending(&ConversationState::for_runtime(context).read_document().map_err(|(_, m)| m)?) {
-        return Ok(false);
-    }
-    ConversationState::for_runtime(context).update_document(|doc| {
-        if !pending(doc) {
-            return Ok(false);
-        }
-        if let Some(mut conv) = doc.conversation(key) {
-            conv.set_field("bootstrapSent", json!(true));
-            doc.set_conversation(key, conv);
-        }
-        Ok(true)
-    })
-    .map_err(|(_, message)| message)
-}
-
-/// Role state (`current-role.json`) for the chat commands.
-pub(crate) fn chat_role_state(context: &RuntimeContext) -> Result<Value, String> {
-    read_role_state(context).map_err(|error| error.to_string())
-}
-
-/// Write `current-role.json` (`/role`, `/silent`, `/active`).
-pub(crate) fn chat_write_role_state(context: &RuntimeContext, role: Option<&str>, mode: &str) -> Result<(), String> {
-    write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": role, "mode": mode }))
-}
-
-/// The owner's `/reset`: the same reset the admin console performs. Harness conversations
-/// invalidate their generation without requiring a DSH session mapping.
-pub(crate) fn chat_reset_conversation(context: &RuntimeContext, key: &str) -> Result<(), (u16, String)> {
-    handle_session_reset_isolated(context, &json!({ "key": key }).to_string()).map(|_| ())
-}
-
-/// Publish the DSH owner override and retire sessions made under the previous policy.
-pub(crate) fn apply_closed_agent_owner(context: &RuntimeContext, owner: &Value) -> Result<(), String> {
-    let _interaction_gate = crate::closed_agent::lock(context)?;
-    let cfg = context.load_config().map_err(str::to_string)?;
-    let changed = runtime_mode(context) == "closed-agent" && cfg.get("ownerQQ") != Some(owner);
-    let policy = json!({"ownerQQ":owner});
-    let existing = context.read_optional_text(RuntimeArea::Data, "closed-agent-owner.json").map_err(str::to_string)?
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    if existing.as_ref() == Some(&policy) { return Ok(()); }
-    context.write_atomic(RuntimeArea::Data, "closed-agent-owner.json", policy.to_string().as_bytes())?;
-    if !changed { return Ok(()); }
-    ConversationState::for_runtime(context).update_document(|doc| {
-        doc.rotate_all_tokens();
-        Ok(())
-    }).map_err(|(_, e)| e)?;
-    for (key, session) in crate::session_map::all(context)? {
-        if crate::session_map::retire_if(context, &key, &session)? {
-            let _ = stop_and_archive_session(context, &cfg, &key, &session);
-        }
-    }
-    Ok(())
-}
-
-/// Whether `key` is inside the configured allow-lists.
-/// Whether `key` may act in `mode` under `cfg` (closed-agent: only the owner's private chat;
-/// otherwise the allow/deny policy), the rule access reconciliation revokes by.
-pub(crate) fn access_allowed(cfg: &Value, mode: &str, key: &str) -> bool {
-    agent::mode_allowed(cfg, mode, key)
-}
-
-/// #186: the inbound gate. `key` is admitted when its id is listed in its allow list and is not in its deny list,
-/// both read from the configuration the caller loaded for this event (`allowAllWhenEmpty` admits nothing here).
-/// Reserved2 ingress, tick invalidation and dispatch, wake claims, turn validity, turn recovery and wake snapshots
-/// all decide by this rule; there is no allow-only check.
-pub(crate) fn inbound_admitted(cfg: &Value, key: &str) -> bool {
-    key_in_allowlist(cfg, key) && social_v2_session_allowed(cfg, key)
-}
-
-pub(crate) fn approved_group_allowed(cfg: &Value, key: &str, message: &str) -> bool {
-    let limit = crate::settings::send::MAX_CHARS.integer(cfg).min(500) as usize;
-    key.starts_with("group:") && canonical_v2_key(key).as_deref() == Some(key)
-        && inbound_admitted(cfg, key)
-        && tool_enabled(cfg, "sendGroup")
-        && !message.is_empty() && message.encode_utf16().count() <= limit
-        && crate::pipeline::configured_outbound_violation(cfg, message, &[]).is_none()
-}
-
-#[cfg(test)]
-#[test]
-fn approved_group_requires_explicit_canonical_scope_and_bounded_preview() {
-    let allowed = json!({"allow":{"groups":[42]},"socialV2":{"send":{"maxMessageChars":900}}});
-    assert!(approved_group_allowed(&allowed, "group:42", &"🎨".repeat(250)));
-    assert!(!approved_group_allowed(&allowed, "group:42", &format!("{}x", "🎨".repeat(250))), "approved preview accepted a message beyond its fixed cap");
-    assert!(!approved_group_allowed(&allowed, "group:042", "hey"));
-    assert!(!approved_group_allowed(&allowed, "group:43", "hey"));
-    assert!(!approved_group_allowed(&allowed, "private:42", "hey"));
-    let denied = json!({"allow":{"groups":[42]},"deny":{"groups":[42]}});
-    assert!(!approved_group_allowed(&denied, "group:42", "hey"));
-    let off = json!({"allow":{"groups":[42]},"socialV2":{"tools":{"sendGroup":false}}});
-    assert!(!approved_group_allowed(&off, "group:42", "hey"));
-}
-
 /// Internal continuation. Only the live interaction passes the one-use owner decision.
 pub(crate) fn send_approved_group(
-    context: &RuntimeContext, key: &str, message: &str, turn: &str, authorized: &dyn Fn() -> bool,
+    context: &RuntimeContext,
+    key: &str,
+    message: &str,
+    turn: &str,
+    authorized: &dyn Fn() -> bool,
 ) -> Result<(u16, Value), (u16, String)> {
-    let cfg = context.load_config().map_err(|_| (503, "send settings unavailable".into()))?;
-    if !authorized() || !approved_group_allowed(&cfg, key, message) || silent_blocks_send(context, &cfg, key)? {
+    let cfg = context
+        .load_config()
+        .map_err(|_| (503, "send settings unavailable".into()))?;
+    if !authorized()
+        || !approved_group_allowed(&cfg, key, message)
+        || silent_blocks_send(context, &cfg, key)?
+    {
         return Err((403, "approved group send refused".into()));
     }
-    let (_, id_s, _) = agent::parse_key(key).ok_or((400, "invalid group".into()))?;
-    let token = crate::conversation_authority::ensure_or_rotate(context, key, false).map_err(|e| (503, e))?;
-    agent::execute_send(context, &cfg, &agent::SendCall {
-        key, kind: "group", id_s, token: &token, messages: vec![message.into()],
-        reply_ref: String::new(), at_user: None, gap_mode: "auto", body: &Value::Null,
-        flavor: agent::SendFlavor::Direct, policy: GuardPolicy::ApprovedGroup { turn, authorized }, resolved_quote: None,
-    })
-}
-
-/// #186: the ids of one kind (`group` or `private`) the inbound gate admits under `cfg`, in allow-list order, for
-/// per-connection work (gap recovery, mute refresh, group cards).
-pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
-    social_policy_list(cfg, "allow", kind)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|id| inbound_admitted(cfg, &format!("{kind}:{id}")))
-        .collect()
+    let (_, id_s, _) = social_state::parse_key(key).ok_or((400, "invalid group".into()))?;
+    let token = social_state::ensure_or_rotate(context, key, false)
+        .map_err(|e| (503, e.to_string()))?;
+    agent::execute_send(
+        context,
+        &cfg,
+        &agent::SendCall {
+            key,
+            kind: "group",
+            id_s,
+            token: &token,
+            messages: vec![message.into()],
+            reply_ref: String::new(),
+            at_user: None,
+            gap_mode: "auto",
+            body: &Value::Null,
+            flavor: agent::SendFlavor::Direct,
+            policy: GuardPolicy::ApprovedGroup { turn, authorized },
+            resolved_quote: None,
+        },
+    )
 }
 
 /// #186: `POST /api/conversations/scope`, with its console log line (the handler itself prints nothing, so
@@ -9681,116 +8485,22 @@ pub(crate) fn admitted_ids(cfg: &Value, kind: &str) -> Vec<String> {
 fn conversation_scope_route(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     import_engine_choices(context)?;
     let reply = access::conversation_scope(context, body)?;
-    let changed: Vec<&str> = reply["changed"].as_array().map(|c| c.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+    let changed: Vec<&str> = reply["changed"]
+        .as_array()
+        .map(|c| c.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     crate::safe_println!(
         "[console] conversation scope: {} {} ({}); live restart {}",
         reply["action"].as_str().unwrap_or(""),
         reply["conversation"].as_str().unwrap_or(""),
-        if changed.is_empty() { "no change".to_string() } else { changed.join(", ") },
+        if changed.is_empty() {
+            "no change".to_string()
+        } else {
+            changed.join(", ")
+        },
         reply["liveRestart"]["state"].as_str().unwrap_or("unknown")
     );
     Ok(reply)
-}
-
-/// #186: `POST /api/conversations/scope` outside a console request (`her-cli conversation`): the same handler,
-/// gates and revocation; the console audit trail records only console requests. A short-lived caller waits for the
-/// background stop of every retired DSH session before it returns, so the process can exit.
-pub(crate) fn conversation_scope_change(context: &RuntimeContext, conversation: &str, action: &str) -> Result<Value, (u16, String)> {
-    conversation_scope_change_waiting(context, conversation, action, std::time::Duration::from_secs(10))
-}
-
-/// `conversation_scope_change` with its wait for background session stops bounded by `limit`.
-fn conversation_scope_change_waiting(
-    context: &RuntimeContext,
-    conversation: &str,
-    action: &str,
-    limit: std::time::Duration,
-) -> Result<Value, (u16, String)> {
-    // #154: `her-cli conversation` requires `--confirm`, which confirms a change of a security setting.
-    let body = json!({"conversation": conversation, "action": action, "confirm": true}).to_string();
-    import_engine_choices_outside_request(context)?;
-    let result = access::conversation_scope(context, &body);
-    // No request takes the write record here (`persist_snowluma_endpoint` does the same).
-    let _ = take_config_writes();
-    let stopped = access::wait_background_stops(limit);
-    result.map(|mut reply| {
-        if !stopped {
-            reply["sessionStops"] = json!("unfinished: check the retired sessions' tasks in DSH");
-        }
-        reply
-    })
-}
-
-/// Shared session-reset mutation. Idle rotation preserves conversation data and refuses a changed
-/// message/wake/epoch under the social gate; explicit reset retains the existing fresh-record behavior.
-fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Option<&str>, guard: Option<&Value>) -> Result<Option<String>, String> {
-    ConversationState::for_runtime(context).update_document(|doc| {
-        let prev_conv = doc.conversation(key);
-        let previous = prev_conv.as_ref().map(Conversation::to_value).unwrap_or(Value::Null);
-        if let Some(expected) = guard {
-            let cfg=context.load_config().map_err(|e|(503,e.to_string()))?;
-            if runtime_mode(context)!="reserved2" || doc.paused() || !inbound_admitted(&cfg,key)
-                || cfg.pointer("/socialV2/enabled")==Some(&json!(false))
-                || ["agentToken","lastIncomingAt","lastUnreadSeq","wakeConfig","adminWakes"].iter().any(|field|previous[*field]!=expected[*field]) {
-                return Ok(None);
-            }
-            let (turns,_)=crate::turn_ledger::fold(&crate::turn_ledger::read_records(context).map_err(|e|(503,e))?);
-            if crate::turn_ledger::blocking_turn(&turns,key).is_some() {return Ok(None);}
-        }
-        let mapped=crate::session_map::lookup(context,key).map_err(|e|(503,e))?;
-        let prev_token = prev_conv.as_ref().and_then(|c| c.token()).unwrap_or("");
-        let partial_rotation=guard.is_some() && old.is_some() && mapped.is_none()
-            && crate::session_map::unrevoked_rotation(context,key,prev_token).map_err(|e|(503,e))?.as_deref()==old;
-        if mapped.as_deref()!=old && !partial_rotation {return Ok(None);}
-        crate::turn_ledger::record_reset(context,key).map_err(|e|(503,e))?;
-        crate::reserved::reset_conversation(context,key).map_err(|e|(503,e))?;
-        if !partial_rotation {
-            if let Some(old) = old {
-                if !crate::session_map::retire_if(context,key,old).map_err(|e|(503,e))? {return Ok(None);}
-            }
-        }
-        let replacement = if let Some(mut existing) = prev_conv.filter(|_| guard.is_some()) {
-            let token = existing.rotate_token();
-            existing.set_field("bootstrapSent", json!(true));
-            doc.set_conversation(key, existing);
-            return Ok(Some(token));
-        } else {
-            let mut replacement_val = Conversation::new_default(context).to_value();
-            preserve_reset_sticker_liabilities(&previous,&mut replacement_val);
-            Conversation::from_value(&replacement_val).unwrap_or_else(|| Conversation::new_default(context))
-        };
-        let token = replacement.token().unwrap_or("").to_string();
-        doc.set_conversation(key, replacement);
-        Ok(Some(token))
-    }).map_err(|(_,e)|e)
-}
-
-pub(crate) fn rotate_idle_session(context: &RuntimeContext, key: &str, sid: &str, guard: &Value) -> Result<Option<String>, String> {
-    let _interaction_gate=crate::closed_agent::lock(context)?;
-    reset_selected_session_record(context,key,Some(sid),Some(guard))
-}
-
-/// Stop and archive retired DSH work with the existing bounded reset deadline.
-pub(crate) fn stop_and_archive_session(context: &RuntimeContext, cfg: &Value, key: &str, session_id: &str) -> Result<(), String> {
-    let rpc = dsh_rpc_for(context, cfg)?;
-    let session = session_id.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let stopped = crate::dsh::stop_session_work(&rpc, &session);
-        let archived = crate::dsh::archive_session(&rpc, &session);
-        let _ = tx.send(stopped.map(|_| ()).and(archived));
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(8)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            crate::safe_println!("[console] ⚠️ 停止/归档旧会话失败 {key} -> {session_id}：{error}；请在 DSH 检查旧任务");
-            Err(error)
-        }
-        Err(_) => {
-            crate::safe_println!("[console] ⚠️ 停止/归档旧会话超时 {key} -> {session_id}；请在 DSH 检查旧任务");
-            Err("停止旧会话超时".to_string())
-        }
-    }
 }
 
 /// `GET /api/turns`：回合账本的管理端视图——输入、DSH 回合、工具和发送结果的关联，
@@ -9853,24 +8563,6 @@ fn conversation_matches_epoch(conversation: &Conversation, epoch: &str) -> bool 
 }
 
 // Reset revokes pending operations but must not erase their possible remote effects.
-// Marking each ID also prevents an administrative collection (which has no agent token)
-// from submitting after reset while allowing an already submitted operation to settle.
-fn preserve_reset_sticker_liabilities(previous: &Value, replacement: &mut Value) {
-    // Settled history is not kept (JS deletes the whole record); only operations that may still
-    // reach, or already reached, the gateway keep their liability.
-    for field in ["stickerSendProtected", "stickerSendPending", "stickerCollectPending"] {
-        if let Some(value) = previous.get(field) {
-            replacement[field] = value.clone();
-        }
-    }
-    for field in ["stickerSendPending", "stickerCollectPending"] {
-        if let Some(entries) = replacement.get_mut(field).and_then(Value::as_array_mut) {
-            for entry in entries {
-                if let Some(object) = entry.as_object_mut() { object.insert("revoked".to_string(), json!(true)); }
-            }
-        }
-    }
-}
 
 fn require_sticker_reservation(context: &RuntimeContext, key: &str, field: &str, id: &str) -> Result<(), (u16, String)> {
     let conv = ConversationState::for_runtime(context).read(key).map_err(|_| (409, SEND_CANCELLED_MESSAGE.to_string()))?;
@@ -10306,9 +8998,7 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
 
 /// Silent mode blocks every non-owner send (JS `shouldBlockSilentReply`).
 fn silent_blocks_send(context: &RuntimeContext, cfg: &Value, key: &str) -> Result<bool, (u16, String)> {
-    let role = read_role_state(context).map_err(|_| (503, "runtime role state is unavailable".to_string()))?;
-    let owner_key = format!("private:{}", cfg.get("ownerQQ").and_then(Value::as_i64).unwrap_or(0));
-    Ok(role.get("mode").and_then(Value::as_str) == Some("silent") && key != owner_key)
+    social_state::silent_blocks_send(context, cfg, key).map_err(SocialError::into_http)
 }
 
 #[cfg(test)]
@@ -11322,13 +10012,13 @@ fn handle_role_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
             if !file_exists_for(context, &role_file_path(&name)) {
                 return Err((400, format!("角色「{name}」不存在（roles/{name}.md）")));
             }
-            write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": name, "mode": mode }))
-                .map_err(|e| (500, e))?;
+            social_state::write_role_state(context, Some(&name), &mode)
+                .map_err(|e| (500, e.to_string()))?;
             Ok(json!({ "ok": true, "role": name }))
         }
         None => {
-            write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": Value::Null, "mode": mode }))
-                .map_err(|e| (500, e))?;
+            social_state::write_role_state(context, None, &mode)
+                .map_err(|e| (500, e.to_string()))?;
             Ok(json!({ "ok": true, "role": Value::Null }))
         }
     }
@@ -11338,14 +10028,13 @@ fn handle_role_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16,
 fn handle_role_mode_post(context: &RuntimeContext, body: &str) -> Result<Value, (u16, String)> {
     let req = parse_role_management_body(context, body)?;
     let rs = read_role_state(context).map_err(|e| (503, e.to_string()))?;
-    let role = rs.get("role").cloned().unwrap_or(Value::Null);
+    let role = rs.get("role").and_then(Value::as_str);
     let mode = if req.get("mode").and_then(|v| v.as_str()) == Some("silent") {
         "silent"
     } else {
         "active"
     };
-    write_json_atomic_for(context, ROLE_STATE_FILE, &json!({ "role": role, "mode": mode }))
-        .map_err(|e| (500, e))?;
+    social_state::write_role_state(context, role, mode).map_err(|e| (500, e.to_string()))?;
     Ok(json!({ "ok": true, "roleMode": mode }))
 }
 
@@ -11794,34 +10483,6 @@ fn isolated_request_preflight(req: &Request, context: &RuntimeContext) -> Result
             .map_err(|_| (404, format!("人格「{name}」不存在")))?;
     }
     Ok(())
-}
-
-/// TD-2：`key` 是否落在 `allow.groups` / `allow.private` 里。
-///
-/// 配置里的号码**两种写法都见过**（`allow.groups` 是数字、`allow.private` 是字符串），
-/// 所以不能只按一种类型比 —— 按 `canonical_v2_key` 归一后，字符串比字符串、数字比数字。
-/// 格式不合法（不是 `group:数字` / `private:数字`）一律算「不在白名单」。
-fn key_in_allowlist(cfg: &Value, key: &str) -> bool {
-    let Some(canonical) = canonical_v2_key(key) else {
-        return false;
-    };
-    let (kind, id) = canonical
-        .split_once(':')
-        .expect("canonical_v2_key 保证带冒号");
-    let field = if kind == "group" { "groups" } else { "private" };
-    let Some(list) = cfg
-        .get("allow")
-        .and_then(|a| a.get(field))
-        .and_then(|v| v.as_array())
-    else {
-        return false;
-    };
-    let want: i64 = id.parse().unwrap_or(0);
-    list.iter().any(|x| match x {
-        Value::String(s) => s.trim() == id,
-        Value::Number(n) => n.as_i64() == Some(want),
-        _ => false,
-    })
 }
 
 #[cfg(test)]
@@ -15042,7 +13703,8 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
         // Access changes are serialized with closed-agent receipts and mode changes; the config
         // read-modify-write (stale check and restore) runs under the social-state gate.
         let interaction = crate::closed_agent::lock(context).map_err(|e| (503, e))?;
-        access::finish_pending_before_change(context, &interaction)?;
+        social_state::finish_pending_before_change(context, &interaction)
+            .map_err(SocialError::into_http)?;
         // Registry settings whose backup value differed from the current file's (`settings::keep_registry_values`).
         let mut settings_kept: Vec<&'static str> = Vec::new();
         let mut wake_error = None;
@@ -15111,15 +13773,29 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     if stored {
                         note_config_before_request(context);
                     }
-                    let change = access::begin_access_change(context, &config_before, &after, "audit-undo")?;
-                    access::store_access_changes(context, security, &previewed, &change, "audit-undo")?;
+                    let change = social_state::begin_access_change(
+                        context,
+                        &config_before,
+                        &after,
+                        "audit-undo",
+                    )
+                    .map_err(SocialError::into_http)?;
+                    social_state::store_access_changes(
+                        context,
+                        security,
+                        &previewed,
+                        &change,
+                        "audit-undo",
+                    )
+                    .map_err(SocialError::into_http)?;
                     // The store's write-back changed registry members: the restored file keeps them as they are now.
-                    access::keep_stored_members(context, &mut restored_config)?;
+                    social_state::keep_stored_members(context, &mut restored_config)
+                        .map_err(SocialError::into_http)?;
                     wake_changed = current["socialV2"]["wake"] != restored_config["socialV2"]["wake"];
                     let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
                     planned = Some((after, load_error, change));
                     // Once the store holds the change, a failed file write keeps the pending revocation.
-                    unchanged_config = if stored { Value::Null } else { access::config_snapshot(context) };
+                    unchanged_config = if stored { Value::Null } else { social_state::config_snapshot(context) };
                     text
                 } else {
                     old
@@ -15127,7 +13803,7 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                 if let Err(error) = audit_write_file(context, &file, &text) {
                     let mut message = format!("写回失败 {file}: {error}");
                     if let Some((_, _, change)) = planned.as_ref().filter(|_| file == "config/config.json") {
-                        message.push_str(&access::settle_failed_write(context, &unchanged_config, change));
+                        message.push_str(&social_state::settle_failed_write(context, &unchanged_config, change));
                     }
                     return Err((500, message));
                 }
@@ -15148,7 +13824,14 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                 Err(error) => (json!({}), Some(format!("读取恢复后的配置失败：{error}")), None),
             },
         };
-        let (revoked, mut failures) = access::finish_access_change(context, &interaction, &config_before, &after, "audit-undo", change);
+        let (revoked, mut failures) = social_state::finish_access_change(
+            context,
+            &interaction,
+            &config_before,
+            &after,
+            "audit-undo",
+            change,
+        );
         drop(interaction);
         failures.extend(load_error);
         if !failures.is_empty() {
@@ -15432,7 +14115,7 @@ fn selected_startup_config(context: &RuntimeContext) -> Result<Option<Value>, St
 
 fn initialize_console(context: &RuntimeContext, cfg: &Value) {
     access::harden_selected_state_dir(context);
-    if let Err((_, error)) = import_engine_choices_outside_request(context) {
+    if let Err(error) = social_state::import_engine_choices(context) {
         crate::safe_println!("[console] conversation engine import: {error}");
     }
     // Before the start stamp of config.json is noted: the write-back may change the file.
@@ -15440,7 +14123,7 @@ fn initialize_console(context: &RuntimeContext, cfg: &Value) {
     access::note_config_start(context);
     // #192: an access change cut off between its configuration write and its revocation is finished before the
     // console answers any request.
-    match access::finish_pending_revocations(context) {
+    match social_state::finish_pending_revocations(context) {
         Ok((revoked, failures)) => {
             if !revoked.is_empty() {
                 crate::safe_println!("[console] finished the revocation an earlier access change left pending: {}", revoked.join(","));

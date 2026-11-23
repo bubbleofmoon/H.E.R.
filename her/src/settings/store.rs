@@ -1119,7 +1119,7 @@ fn remove_from_config(context: &RuntimeContext, setting: &Setting) -> Result<(),
     context.write_atomic(RuntimeArea::Config, CONFIG, text.as_bytes()).map_err(|_| CONFIG_ERROR.to_string())
 }
 
-/// Runs one write under the store gate. The caller holds the configuration gate (`console::config_gate`: the console's
+/// Runs one write under the store gate. The caller holds the configuration gate (`social_state::acquire_config_gate`: the console's
 /// settings routes take it through their authority, the chat settings tools through `memory_actions::handle`), so the
 /// order is always the configuration gate, then the store gate, never the reverse. The store gate is taken (waiting up
 /// to `WAL_SWITCH_WAIT`, else 503) before the inspection and held until the connection closes, so no other writer of
@@ -1769,7 +1769,7 @@ pub(crate) fn direct_change_error(key: &str) -> String {
     format!("{key} changes only through the settings store")
 }
 
-/// For a console write of `config.json` (`console::write_selected_config_text`, #177): every ordinary registry member of `next`
+/// For a console write of `config.json` (`social_state::write_selected_config_text_with`, #177): every ordinary registry member of `next`
 /// must be the one `current`, the stored file, holds. A member `next` lacks or holds as `null` is put back from
 /// `current` (removed when `current` has none), because a console writer never removes a registry setting; any other
 /// value that differs is refused with the setting's key, because a console writer changes a registry setting through

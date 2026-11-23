@@ -16,7 +16,7 @@
 //! `config.json` (`seed`: every registry setting never in the store, with one `migration` audit row each) and keeps
 //! `config/config.json.pre-settings`; after it, `write_back` mirrors ordinary stored values into `config.json`, so a
 //! release without the store reads the current values. Every writer holds the configuration gate
-//! (`console::config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
+//! (`social_state::acquire_config_gate`) and takes the store gate inside it, never the reverse. A legacy (no-root) context has no
 //! store. The registry owns each setting's default and bounds: a reader reads its setting through `Setting::read` (or
 //! `integer`, `text`, `switch`) on the loader's document, never with a default of its own. Backups copy the
 //! store through `backup_source`; a restore names it through `store_path`.
@@ -30,7 +30,7 @@
 //! Security settings (#154, `registry/access.rs`: the allow and deny lists, the owner, the outbound guard switches)
 //! change only with an explicit confirmation (`confirm_field`, `check_confirmation`) on every route that changes one;
 //! a change of a list or the owner is an access change (`Setting::access`), revoked as a whitelist write is
-//! (`console::access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
+//! (`social_state::access_setting_change`). A security setting is seeded only by a write of itself, so a write of another
 //! setting never takes the access lists over from `config.json`.
 //!
 //! Scopes (#218): a setting of `registry()` is global. A setting of `conversation_registry()` (`ConversationSetting`)
