@@ -33,7 +33,7 @@ impl Staging {
         }
         builder.create(&path).map_err(|e| e.to_string())?;
         let staging = Self(path);
-        crate::guarded_credentials::restrict_credential(&staging.0)
+        crate::guarded_fs::restrict_path(&staging.0, crate::guarded_fs::AclPolicy::OwnerOnly)
             .map_err(|_| "restore staging permissions unavailable".to_string())?;
         Ok(staging)
     }
@@ -301,7 +301,7 @@ impl Prepared {
                 context.runtime_root().ok_or("runtime root missing")?,
                 &config,
             )?;
-            console_auth::read_protected_auth_file(context, console_auth::TOKEN_FILE, 1024 * 1024)?;
+            context.read_protected_data_file(console_auth::TOKEN_FILE, 1024 * 1024)?;
             if check_destination && configured_token(text.as_bytes())?.is_none() {
                 let live = console_auth::raw_token_config(context)?;
                 if context.effective_console_token(&live).is_empty() { return Err(recovery_error()); }
@@ -667,7 +667,7 @@ const DESTINATION_TOKEN: &str = "console-restore-recovery/destination-token";
 
 pub(crate) fn recovery_pending(context: &RuntimeContext) -> bool {
     context.is_isolated()
-        && !matches!(console_auth::read_protected_auth_file(context, RECOVERY_INTENT, 4096), Ok(None))
+        && !matches!(context.read_protected_data_file(RECOVERY_INTENT, 4096), Ok(None))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -740,7 +740,8 @@ fn protected_stash_dir(context: &RuntimeContext) -> Result<(), String> {
     if context.resolve_path(RuntimeArea::Data, RECOVERY_DIR, PathIntent::ReadDirectory)? != path {
         return Err(recovery_error());
     }
-    crate::guarded_credentials::restrict_credential(&path).map_err(|_| recovery_error())?;
+    crate::guarded_fs::restrict_path(&path, crate::guarded_fs::AclPolicy::OwnerOnly)
+        .map_err(|_| recovery_error())?;
     crate::guarded_file::sync_directory(context.data_dir()).map_err(|_| recovery_error())
 }
 
@@ -753,7 +754,7 @@ fn configured_token(raw: &[u8]) -> Result<Option<String>, String> {
 }
 
 fn checked_recovery_bytes(context: &RuntimeContext, name: &str, digest: [u8; 32]) -> Result<Vec<u8>, String> {
-    let bytes = console_auth::read_protected_auth_file(context, name, 16 * 1024 * 1024)?
+    let bytes = context.read_protected_data_file(name, 16 * 1024 * 1024)?
         .ok_or_else(recovery_error)?;
     if !console_auth::digests_equal(&digest, &Sha256::digest(&bytes).into()) {
         return Err(recovery_error());
@@ -762,14 +763,14 @@ fn checked_recovery_bytes(context: &RuntimeContext, name: &str, digest: [u8; 32]
 }
 
 fn read_recovery_intent(context: &RuntimeContext, name: &str) -> Result<Option<RecoveryIntent>, String> {
-    let Some(bytes) = console_auth::read_protected_auth_file(context, name, 4096)? else { return Ok(None) };
+    let Some(bytes) = context.read_protected_data_file(name, 4096)? else { return Ok(None) };
     let intent: RecoveryIntent = serde_json::from_slice(&bytes).map_err(|_| recovery_error())?;
     if intent.v != 1 { return Err(recovery_error()); }
     Ok(Some(intent))
 }
 
 pub(crate) fn verifying_recovery(context: &RuntimeContext) -> Option<[u8; 32]> {
-    let bytes = console_auth::read_protected_auth_file(context, RECOVERY_INTENT, 4096).ok()??;
+    let bytes = context.read_protected_data_file(RECOVERY_INTENT, 4096).ok()??;
     let intent: RecoveryIntent = serde_json::from_slice(&bytes).ok()?;
     (intent.v == 1 && intent.phase == RestorePhase::Verifying).then(|| Sha256::digest(&bytes).into())
 }
@@ -787,9 +788,9 @@ fn set_restore_phase(context: &RuntimeContext, phase: RestorePhase) -> Result<()
 
 fn clear_finished_recovery(context: &RuntimeContext) -> Result<(), String> {
     for name in [FORWARD_CONFIG, ROLLBACK_CONFIG, ROLLBACK_ARCHIVE, DESTINATION_TOKEN] {
-        console_auth::remove_auth_file(context, name)?;
+        context.remove_protected_data_file(name)?;
     }
-    console_auth::remove_auth_file(context, RECOVERY_OUTCOME)
+    context.remove_protected_data_file(RECOVERY_OUTCOME)
 }
 
 // A terminal outcome survives namespace cleanup and lets recovery retry just the cleanup.
@@ -800,7 +801,7 @@ fn finish_recovery(context: &RuntimeContext, phase: RestorePhase) -> Result<(), 
     publish_recovery_intent(context, &intent)?;
     let bytes = serde_json::to_vec(&intent).map_err(|_| recovery_error())?;
     context.write_atomic(RuntimeArea::Data, RECOVERY_OUTCOME, &bytes)?;
-    console_auth::remove_auth_file(context, RECOVERY_INTENT)?;
+    context.remove_protected_data_file(RECOVERY_INTENT)?;
     if clear_finished_recovery(context).is_err() {
         crate::safe_eprintln!("[restore] terminal recovery cleanup remains pending");
     }
@@ -822,7 +823,7 @@ fn stage_full_restore(
     if effective.is_empty() || configured_token(rollback_config)? != mode {
         return Err(recovery_error());
     }
-    let original_file = console_auth::read_protected_auth_file(context, console_auth::TOKEN_FILE, 1024 * 1024)?;
+    let original_file = context.read_protected_data_file(console_auth::TOKEN_FILE, 1024 * 1024)?;
     let captured = DestinationToken { configured: mode.is_some(), effective, original_file };
     let serialized = serde_json::to_vec(&captured).map_err(|_| recovery_error())?;
     let archive = File::open(&rollback.zip).map_err(|_| recovery_error())?;
@@ -859,7 +860,9 @@ fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair
         return Err(recovery_error());
     }
     let archive = context.resolve_path(RuntimeArea::Data, ROLLBACK_ARCHIVE, PathIntent::ReadFile)?;
-    let file = console_auth::open_protected_auth_file(&archive)?.ok_or_else(recovery_error)?;
+    let file = crate::guarded_fs::open_protected_file(&archive)
+        .map_err(|_| recovery_error())?
+        .ok_or_else(recovery_error)?;
     if !console_auth::digests_equal(&intent.rollback_archive, &hash_file(&file)?) {
         return Err(recovery_error());
     }
@@ -906,7 +909,7 @@ fn stop_and_replace(
         control.publish_generation(context).map_err(|error| match error {
             GenerationWriteError::Unpublished(error) | GenerationWriteError::Published(error) => Step::Failed(error),
         })?;
-        console_auth::remove_auth_file(context, crate::console::DESKTOP_GRANTS_FILE)?;
+        context.remove_protected_data_file(crate::console::DESKTOP_GRANTS_FILE)?;
         apply(context, prepared, false, control, Some(&authority))?;
         control.replace(context, RuntimeArea::Data, console_auth::TOKEN_FILE, &mut pair.token.as_bytes(), Some(&authority))?;
         control.replace(context, RuntimeArea::Config, "config.json", &mut pair.config.as_slice(), Some(&authority))?;

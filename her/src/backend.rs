@@ -1286,7 +1286,7 @@ impl CliOutputFiles {
             if checked != path {
                 return Err(BackendError::Failed("runtime CLI capture path is unavailable".into()));
             }
-            crate::guarded_credentials::create_credential(path)
+            crate::guarded_fs::create_protected_file(path, crate::guarded_fs::AclPolicy::OwnerOnly)
                 .map(Stdio::from)
                 .map_err(|error| BackendError::Failed(format!("创建候选 CLI 输出文件失败：{error}")))
         } else {

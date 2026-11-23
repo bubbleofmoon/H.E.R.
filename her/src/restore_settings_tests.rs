@@ -794,7 +794,12 @@ fn credential_file_is_private(path: &Path, _settings: bool) -> bool {
 
 #[cfg(windows)]
 fn credential_file_is_private(path: &Path, settings: bool) -> bool {
-    crate::supervisor_dependencies::credential_file_is_private(path, settings)
+    let policy = if settings {
+        crate::guarded_fs::AclPolicy::OwnerSystemAdmins
+    } else {
+        crate::guarded_fs::AclPolicy::OwnerOnly
+    };
+    crate::guarded_fs::verify_file_private(path, policy)
 }
 
 #[cfg(windows)]
