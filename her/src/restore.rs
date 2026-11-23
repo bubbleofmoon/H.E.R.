@@ -50,6 +50,7 @@ struct Prepared {
     files: BTreeMap<String, (RuntimeArea, String)>,
     state_included: bool,
     config: Option<Vec<u8>>,
+    configured_token: Option<String>,
     view: Value,
 }
 
@@ -178,6 +179,7 @@ impl Prepared {
         }
         let mut state_included = true;
         let mut config_bytes = None;
+        let mut configured_token = None;
         if !memory_only {
             let mut archive = zip::ZipArchive::new(File::open(&zip).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
@@ -195,11 +197,15 @@ impl Prepared {
             )?;
             state_included = config["backup"]["includeState"] != false
                 || manifest.files.keys().any(|name| name.starts_with("state/"));
+            let archive_token = token_from_canonical_config(&config);
             context.read_protected_data_file(console_auth::TOKEN_FILE, 1024 * 1024)?;
-            if check_destination && configured_token(&bytes)?.is_none() {
+            if check_destination && archive_token.is_none() {
                 let live = console_auth::raw_token_config(context)?;
-                if context.effective_console_token(&live).is_empty() { return Err(recovery_error()); }
+                if context.effective_console_token(&live).is_empty() {
+                    return Err(recovery_error());
+                }
             }
+            configured_token = archive_token;
             config_bytes = Some(bytes);
         }
         let mut files = BTreeMap::new();
@@ -252,6 +258,7 @@ impl Prepared {
             files,
             state_included,
             config: config_bytes,
+            configured_token,
             view,
         })
     }
@@ -693,12 +700,13 @@ fn protected_stash_dir(context: &RuntimeContext) -> Result<(), String> {
     crate::guarded_file::sync_directory(context.data_dir()).map_err(|_| recovery_error())
 }
 
-fn configured_token(raw: &[u8]) -> Result<Option<String>, String> {
-    let text = std::str::from_utf8(raw).map_err(|_| recovery_error())?;
-    let raw: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|_| recovery_error())?;
-    let (cfg, _) = crate::config::canonical_config(&raw).map_err(|_| recovery_error())?;
-    Ok(cfg.get("consoleToken").and_then(Value::as_str).map(str::trim)
-        .filter(|value| !value.is_empty()).map(str::to_owned))
+fn token_from_canonical_config(config: &Value) -> Option<String> {
+    config
+        .get("consoleToken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn checked_recovery_bytes(context: &RuntimeContext, name: &str, digest: [u8; 32]) -> Result<Vec<u8>, String> {
@@ -767,8 +775,10 @@ fn stage_full_restore(
     let rollback_config = rollback.config.as_deref().ok_or_else(recovery_error)?;
     let live = console_auth::raw_token_config(context)?;
     let effective = context.effective_console_token(&live);
-    let mode = configured_token(live.to_string().as_bytes())?;
-    if effective.is_empty() || configured_token(rollback_config)? != mode {
+    let overlaid = context.overlay_config(live.clone());
+    let (live_cfg, _) = crate::config::canonical_config(&overlaid).map_err(|_| recovery_error())?;
+    let mode = token_from_canonical_config(&live_cfg);
+    if effective.is_empty() || rollback.configured_token != mode {
         return Err(recovery_error());
     }
     let original_file = context.read_protected_data_file(console_auth::TOKEN_FILE, 1024 * 1024)?;
@@ -789,7 +799,10 @@ fn stage_full_restore(
         destination_token: Sha256::digest(&serialized).into(),
     };
     let config = checked_recovery_bytes(context, FORWARD_CONFIG, intent.forward_config)?;
-    let token = configured_token(&config)?.unwrap_or(captured.effective);
+    let token = forward
+        .configured_token
+        .clone()
+        .unwrap_or(captured.effective);
     publish_recovery_intent(context, &intent)?;
     Ok(RestorePair { token, config })
 }
@@ -800,13 +813,6 @@ fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair
     let config = checked_recovery_bytes(context, ROLLBACK_CONFIG, intent.rollback_config)?;
     let token_bytes = checked_recovery_bytes(context, DESTINATION_TOKEN, intent.destination_token)?;
     let token: DestinationToken = serde_json::from_slice(&token_bytes).map_err(|_| recovery_error())?;
-    let mode = configured_token(&config)?;
-    let saved_file = token.original_file.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::trim);
-    if token.effective.is_empty() || token.configured != mode.is_some()
-        || mode.as_deref().or(saved_file) != Some(token.effective.as_str())
-    {
-        return Err(recovery_error());
-    }
     let archive = context.resolve_path(RuntimeArea::Data, ROLLBACK_ARCHIVE, PathIntent::ReadFile)?;
     let file = crate::guarded_fs::open_protected_file(&archive)
         .map_err(|_| recovery_error())?
@@ -816,6 +822,13 @@ fn rollback_artifacts(context: &RuntimeContext) -> Result<(Prepared, RestorePair
     }
     let prepared = Prepared::open_internal(context, &archive, false, false)?;
     if prepared.config.as_ref() != Some(&config) {
+        return Err(recovery_error());
+    }
+    let mode = prepared.configured_token.clone();
+    let saved_file = token.original_file.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok()).map(str::trim);
+    if token.effective.is_empty() || token.configured != mode.is_some()
+        || mode.as_deref().or(saved_file) != Some(token.effective.as_str())
+    {
         return Err(recovery_error());
     }
     Ok((prepared, RestorePair { config, token: token.effective }))
@@ -1784,30 +1797,6 @@ mod tests {
                 }
                 Err(_) => self.store_free_at_stop.push(false),
             }
-            if self.leave_conversation_sidecars && self.stops == 1 {
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    fs::write(
-                        context
-                            .runtime_root()
-                            .unwrap()
-                            .join(format!("data/conversations.db{suffix}")),
-                        b"stale conversation sidecar",
-                    )
-                    .unwrap();
-                }
-            }
-            if self.leave_settings_sidecars && self.stops == 1 {
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    fs::write(
-                        context
-                            .runtime_root()
-                            .unwrap()
-                            .join(format!("data/settings.db{suffix}")),
-                        b"stale settings sidecar",
-                    )
-                    .unwrap();
-                }
-            }
             if self.fail_rollback_stop && self.stops == 2 {
                 return Err("fixture rollback stop failed".into());
             }
@@ -1853,6 +1842,30 @@ mod tests {
             self.alerts.push(reason.into());
         }
         fn after_snapshot(&mut self, context: &RuntimeContext) -> Result<(), String> {
+            if self.leave_conversation_sidecars && self.stops == 1 {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    fs::write(
+                        context
+                            .runtime_root()
+                            .unwrap()
+                            .join(format!("data/conversations.db{suffix}")),
+                        b"stale conversation sidecar",
+                    )
+                    .unwrap();
+                }
+            }
+            if self.leave_settings_sidecars && self.stops == 1 {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    fs::write(
+                        context
+                            .runtime_root()
+                            .unwrap()
+                            .join(format!("data/settings.db{suffix}")),
+                        b"stale settings sidecar",
+                    )
+                    .unwrap();
+                }
+            }
             if let Some(hook) = self.on_after_snapshot.as_mut() {
                 hook(context)?;
             }
