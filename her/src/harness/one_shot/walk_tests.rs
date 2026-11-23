@@ -325,7 +325,7 @@ fn digest_walk_a_request_cut_by_the_walk_bound_is_no_route_health() {
     // The bound (400 ms) is less than the route's own timeout (1 s): the request it cuts is no route failure.
     let relay = Relay::start(vec![("model-a", after(5000, Kind::Answer("[]")))]);
     let fixture = Fixture::new("cut", &relay, chain_of(&["a"]));
-    let abandoned = AtomicBool::new(false);
+    let abandoned = Arc::new(AtomicBool::new(false));
     let walk = fixture.walk(Duration::from_secs(1));
     assert_eq!(
         walk.complete_within("system", "input", Duration::from_millis(400), &abandoned),

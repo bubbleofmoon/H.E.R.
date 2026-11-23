@@ -1288,8 +1288,12 @@ fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str,
         failure.summary()
     };
     // Each job reads the selected runtime's current relay endpoint, as the digest jobs do.
-    let current = context.runtime_root().and_then(|root| RuntimeContext::from_root(root).ok());
-    let target = route.as_ref().map(|route| crate::harness::one_shot::RouteModel { id: route.id.as_str(), model: route.model.as_str() });
+    let current = context.refreshed().ok();
+    let target = route.as_ref().map(|route| crate::harness::one_shot::RouteModel {
+        id: route.id.as_str(),
+        model: route.model.as_str(),
+        effort: route.effort.as_deref(),
+    });
     let text = crate::harness::one_shot::model_for(
         current.as_ref().unwrap_or(context),
         crate::harness::one_shot::Job::SlangLearner,
@@ -3055,11 +3059,11 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         }
     }
 
-    /// Installs a scripted first route for the learner on `context`'s runtime.
+    /// Installs a scripted first route for the learner on `context`.
     fn route_fake(context: &RuntimeContext, replies: Vec<Result<&'static str, &'static str>>) -> Arc<RouteFake> {
         let fake = Arc::new(RouteFake { replies: Mutex::new(replies.into()), calls: Mutex::new(Vec::new()) });
         crate::harness::one_shot::install_test_model(
-            context.runtime_root().expect("a selected fixture runtime"),
+            context,
             crate::harness::one_shot::Job::SlangLearner,
             fake.clone(),
         );

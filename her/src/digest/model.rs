@@ -12,10 +12,10 @@ pub(crate) use crate::harness::one_shot::{ModelError, OneShot as DigestModel};
 /// The output cap of one digest request.
 const MAX_TOKENS: u32 = 2048;
 
-/// Tests: every digest run on the runtime at `root` uses `model`.
+/// Tests: every digest run on `context` uses `model`.
 #[cfg(test)]
-pub(crate) fn install_test_model(root: &std::path::Path, model: Arc<dyn DigestModel>) {
-    one_shot::install_test_model(root, Job::Digest, model);
+pub(crate) fn install_test_model(context: &RuntimeContext, model: Arc<dyn DigestModel>) {
+    one_shot::install_test_model(context, Job::Digest, model);
 }
 
 /// The digest's model on `context`: a walk over `walk_of` on the relay, bounded as a whole by `timeout`. Each response
@@ -24,11 +24,44 @@ pub(crate) fn model_for(context: &RuntimeContext, cfg: &Value) -> Result<Arc<dyn
     one_shot::walk_for(context, Job::Digest, usage::DIGEST_KEY, walk_of(cfg), timeout(cfg), MAX_TOKENS)
 }
 
+/// Async digest walk for async callers (`harness::handover::summarise_text`), bypassing the sync bridge.
+pub(crate) async fn summarise_async(
+    context: &RuntimeContext,
+    cfg: &Value,
+    system: &str,
+    input: &str,
+    within: Duration,
+    cancel: &mut crate::harness::routes::Cancellation,
+) -> Result<String, ModelError> {
+    let walk = walk_of(cfg).ok_or(ModelError("unconfigured"))?;
+    let route = crate::harness::ModelRoute::for_specs(context, walk.routes.clone(), walk.routes)
+        .map_err(|_| ModelError("unconfigured"))?;
+    one_shot::run_walk_async(
+        context.clone(),
+        route,
+        walk.chain,
+        usage::DIGEST_KEY.to_string(),
+        usage::DIGEST,
+        timeout(cfg),
+        MAX_TOKENS,
+        Duration::from_secs(1),
+        system.to_string(),
+        input.to_string(),
+        within,
+        cancel,
+    )
+    .await
+}
+
 /// The relay model of the digest's first route, without a test fake or a walk (tests of the relay itself).
 #[cfg(test)]
 pub(crate) fn relay_model(context: &RuntimeContext, cfg: &Value) -> Result<one_shot::RelayModel, ModelError> {
     let first = walk_of(cfg).and_then(|walk| walk.routes.into_iter().next()).ok_or(ModelError("unconfigured"))?;
-    let route = one_shot::RouteModel { id: first.id.as_str(), model: first.model.as_str() };
+    let route = one_shot::RouteModel {
+        id: first.id.as_str(),
+        model: first.model.as_str(),
+        effort: first.effort.as_deref(),
+    };
     one_shot::RelayModel::for_model(context, Job::Digest, usage::DIGEST_KEY, route, timeout(cfg), MAX_TOKENS)
 }
 
