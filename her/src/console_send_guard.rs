@@ -35,13 +35,14 @@ pub(super) fn admit_in_scope(
     let repeat = crate::settings::send::REPEAT.integer(&fresh) as u64;
     let cap = turn_send_cap(&fresh);
     let window = crate::settings::send::REPEAT_WINDOW.integer(&fresh) as u64;
-    let state = load_social_state_for(context)?;
-    let conversation = &state["conversations"][key];
+    let conv = crate::conversation_state::ConversationState::for_runtime(context)
+        .read(key)?
+        .unwrap_or_default();
     let (scope, wait_used) = if let Some(turn) = approved_turn {
-        let epoch = crate::send_outbox::token_epoch(conversation["agentToken"].as_str().unwrap_or(""));
+        let epoch = crate::conversation_state::token_epoch(conv.token().unwrap_or(""));
         (format!("{epoch}:{turn}"), 0)
     } else {
-        wait_usage(context, key, conversation)?
+        wait_usage(context, key, &conv)?
     };
     let records =
         read_records(context).map_err(|_| (503, "send guard outbox is unavailable".into()))?;

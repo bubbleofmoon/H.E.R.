@@ -18,6 +18,7 @@ mod model_failure;
 mod mcp_validate;
 mod memory;
 mod conversation_authority;
+mod conversation_state;
 mod memory_actions;
 mod pipeline;
 mod harness;
@@ -128,7 +129,6 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
 const CONFIG_PATH: &str = crate::legacy_path!("qq-bridge/config.json");
-const SOCIAL_PATH: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 const DECISION_LOG: &str = crate::legacy_path!("logs/rbridge-live.jsonl");
 /// 状态机真正「醒」的时刻（含合批延迟），A/B 与 P6 验收都用这份对拍。
 const WAKE_LOG: &str = crate::legacy_path!("logs/rbridge-live-wakes.jsonl");
@@ -201,18 +201,6 @@ struct Triggers {
 struct WakeConfig {
     #[serde(default)]
     triggers: Triggers,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct Conversation {
-    #[serde(rename = "wakeConfig", default)]
-    wake_config: Option<WakeConfig>,
-}
-
-#[derive(Deserialize, Debug, Default)]
-struct SocialState {
-    #[serde(default)]
-    conversations: HashMap<String, Conversation>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -896,20 +884,6 @@ fn append_runtime_json_line(
         file.write_all(&line)?;
     }
     Ok(())
-}
-
-fn runtime_json(
-    context: &runtime::RuntimeContext,
-    area: runtime::RuntimeArea,
-    relative: &str,
-    legacy_path: &str,
-) -> Option<Value> {
-    let text = if context.is_isolated() {
-        context.read_text(area, relative).ok()?
-    } else {
-        std::fs::read_to_string(legacy_path).ok()?
-    };
-    serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()
 }
 
 /// 从 config.json 提取唤醒调度参数（在线主循环与离线重放共用一份口径）。
@@ -2285,7 +2259,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
                     continue;
                 }
                 // 没有新消息也要推进定时器：合批窗口、回复检查、有限潜水全靠它。
-                if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
+                if let Some(state) = conversation_state::read_document_with_bom(&runtime_context) {
                     sync_wake_configs(&runtime_context, &cfg_raw, &state, &mut drivers, &mut wake_synced, tick_now);
                 }
                 for (k, e) in session::pump_all(&mut drivers, tick_now) {
@@ -2711,9 +2685,10 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // 与 JS 一致：**状态里没有这个会话就直接跳过**。
         // 之前这里 unwrap_or_default() 会给未知会话套上默认触发器（@/概率 0.05），
         // 于是重放出来的唤醒数比 JS 多一截 —— 数据对不上的第一来源就是这个。
-        let Some(mut tr) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
-            .and_then(|v| serde_json::from_value::<SocialState>(v).ok())
-            .and_then(|s| s.conversations.get(&key).and_then(|c| c.wake_config.clone()))
+        let Some(mut tr) = conversation_state::read_document_with_bom(&runtime_context)
+            .and_then(|v| conversation_state::Conversation::from_value(&v["conversations"][&key]))
+            .and_then(|c| c.field("wakeConfig").filter(|w| !w.is_null()).cloned())
+            .and_then(|w| serde_json::from_value::<WakeConfig>(w).ok())
             .map(|w| w.triggers)
         else {
             continue;
@@ -2732,7 +2707,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             continue;
         }
         events += 1;
-        let conv = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
+        let conv = conversation_state::read_document_with_bom(&runtime_context)
             .map(|s|s["conversations"][&key].clone()).unwrap_or(Value::Null);
         let directed = question::directed(&ev, &body, quote_self, &conv, &cfg_raw, now_ms() as i64);
         let (mut wake, mut reason) = decide(&ev, &body, at_self_direct || quote_self, &self_nick, &self_cards, &tr, directed);
@@ -2862,7 +2837,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
         // 决策喂给状态机；真正的唤醒由它按合批窗口/优先级吐出来。
         let now_i = now_ms() as i64;
         let _created = drivers.entry(key.clone()).or_insert_with(|| {
-            let sess = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH)
+            let sess = conversation_state::read_document_with_bom(&runtime_context)
                 .and_then(|s| s.get("conversations").and_then(|c| c.get(&key)).cloned())
                 .unwrap_or_else(|| serde_json::json!({}));
             let mut sched = session::scheduler_from_state(wake_cfg_of(&cfg_raw), &sess);
@@ -2876,7 +2851,7 @@ async fn run_entry(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> 
             d
         });
 
-        if let Some(state) = runtime_json(&runtime_context, runtime::RuntimeArea::Data, "social-v2.json", SOCIAL_PATH) {
+        if let Some(state) = conversation_state::read_document_with_bom(&runtime_context) {
             sync_wake_configs(&runtime_context, &cfg_raw, &state, &mut drivers, &mut wake_synced, now_i);
         }
         let driver = drivers.get_mut(&key).expect("driver exists");

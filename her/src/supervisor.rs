@@ -119,7 +119,7 @@ fn inspect_restart_request(context: &RuntimeContext) -> Result<Option<RestartReq
 }
 
 fn clear_restart_request(context: &RuntimeContext, id: &str) {
-    let Ok(_guard) = crate::console::acquire_social_state_gate(context) else { return };
+    let Ok(_guard) = crate::conversation_state::acquire(context) else { return };
     if read_restart_request(context).ok().flatten().is_some_and(|record| record.id == id) {
         if let Err(error) = context.remove_protected_data_file(RESTART_REQUEST) {
             crate::safe_eprintln!("[supervisor] restart request cleanup failed: {error}");
@@ -133,7 +133,7 @@ fn dispatch_restart(context: &RuntimeContext, dispatcher: &Arc<Dispatcher>) {
         return;
     }
     let request = {
-        let Ok(_guard) = crate::console::acquire_social_state_gate(context) else { return };
+        let Ok(_guard) = crate::conversation_state::acquire(context) else { return };
         let Ok(Some(request)) = inspect_restart_request(context) else { return };
         request
     };
@@ -150,7 +150,7 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
     let Some(id) = run.view().request_id.clone() else { return Finish::Failed { exit_code: None, reason: "restart request id is missing".into() } };
     let result = (|| -> Result<(), String> {
         let _watch = state.lock().unwrap_or_else(|p| p.into_inner());
-        let social = crate::console::acquire_social_state_gate(context).map_err(|(_, e)| e)?;
+        let social = crate::conversation_state::acquire(context).map_err(|(_, e)| e)?;
         let request = read_restart_request(context)?.ok_or("restart request is missing")?;
         if request.id != id { return Err("restart request changed".into()); }
         let now = crate::parity_clock::now_ms();
@@ -357,7 +357,9 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
             // Ticket 33: a fresh read of the owner pause, holding the Schedule store lock until the run is marked
             // running (the executor keeps the returned guard), so a pause that has answered is never overtaken by a
             // due slot. An unreadable store refuses the start.
-            return crate::schedule::ScheduleStore::new(&admission_context).admit_scheduled(def.id.as_str()).map(Some);
+            return crate::schedule::ScheduleStore::new(&admission_context)
+                .admit_scheduled(def.id.as_str())
+                .map(|lock| Some(tasks::AdmissionGuard::scheduled(lock)));
         }
         if run.view().source != RunSource::Manual || run.view().by.as_deref() != Some("console") {
             return Ok(None);
@@ -371,7 +373,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        let guard = crate::console::acquire_social_state_gate(&admission_context)
+        let guard = crate::conversation_state::acquire(&admission_context)
             .map_err(|(_, message)| message)?;
         if admission_context.console_authority.is_none() {
             return Err("HTTP task authority is unavailable".into());
@@ -379,7 +381,7 @@ pub fn task_api(context: &RuntimeContext, cfg: &Value) -> Result<crate::console_
         if !def.runs_when_held && !matches!(desired(&admission_context), Effective::Act { wants, .. } if wants.jobs) {
             return Err("desired state no longer permits background jobs".into());
         }
-        Ok(Some(guard))
+        Ok(Some(tasks::AdmissionGuard::manual(guard)))
     });
     let running_context = context.clone();
     let running_check = Box::new(move |def: &TaskDef| def.runs_when_held || !matches!(desired(&running_context), Effective::Act { wants, .. } if !wants.jobs));

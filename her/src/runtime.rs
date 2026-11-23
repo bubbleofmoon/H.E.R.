@@ -17,7 +17,6 @@ use crate::guarded_file::{is_link, no_follow};
 const LEGACY_CONFIG: &str = crate::legacy_path!("qq-bridge/config.json");
 const LEGACY_DATA: &str = crate::legacy_path!("qq-bridge/state");
 const LEGACY_RESOURCES: &str = crate::legacy_path!("qq-bridge");
-const LEGACY_SOCIAL_STATE: &str = crate::legacy_path!("qq-bridge/state/social-v2.json");
 const REQUIRED_DEPENDENCIES: [&str; 3] = ["dsh", "model", "onebot"];
 const OPTIONAL_DEPENDENCIES: [&str; 2] = ["onebot_ws", "relay"];
 #[cfg(test)]
@@ -348,14 +347,8 @@ impl RuntimeContext {
                 return Err("runtime config is invalid");
             }
 
-            let state_file = contained_path(&root, "data/social-v2.json", false)?;
-            let state_text =
-                fs::read_to_string(&state_file).map_err(|_| "runtime data is unavailable")?;
-            let state: Value =
-                serde_json::from_str(&state_text).map_err(|_| "runtime data is invalid")?;
-            if !state.is_object() {
-                return Err("runtime data is invalid");
-            }
+            let state_file = contained_path(&root, &format!("data/{}", crate::conversation_state::FILE), false)?;
+            crate::conversation_state::validate_startup_document(&state_file)?;
 
             Some(config)
         };
@@ -480,7 +473,7 @@ impl RuntimeContext {
         resolve_contained_path(root, base_rel, relative, intent).map_err(|_| "runtime path is unavailable")
     }
 
-    fn resolve_path_detailed(&self, area: RuntimeArea, relative: &str, intent: PathIntent) -> Result<PathBuf, String> {
+    pub(crate) fn resolve_path_detailed(&self, area: RuntimeArea, relative: &str, intent: PathIntent) -> Result<PathBuf, String> {
         if !self.is_isolated() { return self.resolve_path(area, relative, intent).map_err(str::to_string); }
         let root = self.runtime_root.as_deref().ok_or("runtime root is unavailable")?;
         let base = match area {
@@ -932,7 +925,7 @@ impl RuntimeContext {
         // Social writers already own social-v2.lock. Transport authority comes after it.
         let authority_file = matches!((area, relative),
             (RuntimeArea::Config, "config.json") |
-            (RuntimeArea::Data, "social-v2.json" | "mode.json" | "current-role.json"));
+            (RuntimeArea::Data, crate::conversation_state::FILE | "mode.json" | "current-role.json"));
         let _authority = if self.is_isolated() && authority_file && authority.is_none() {
             #[cfg(test)]
             AUTHORITY_WRITE_TEST_HOOK.with(|hook| {
@@ -1181,17 +1174,7 @@ impl RuntimeContext {
     }
 
     pub fn read_social_state(&self) -> Result<Value, String> {
-        let bytes = if self.is_isolated() {
-            let path = self.resolve_path_detailed(RuntimeArea::Data, "social-v2.json", PathIntent::ReadFile)?;
-            if self.resolve_path_detailed(RuntimeArea::Data, "social-v2.json", PathIntent::ReadFile)? != path {
-                return Err("path changed class=leaf".into());
-            }
-            fs::read(path).map_err(|e| runtime_io_error("leaf/read", &e))?
-        } else {
-            fs::read(LEGACY_SOCIAL_STATE).map_err(|e| runtime_io_error("leaf/read", &e))?
-        };
-        let text = String::from_utf8(bytes).map_err(|_| "kind=InvalidData class=encoding".to_string())?;
-        serde_json::from_str(&text).map_err(|e| format!("social-state/parse kind=InvalidData line={} column={}", e.line(), e.column()))
+        crate::conversation_state::read_document(self)
     }
 
     pub fn health_metadata(&self) -> Value {

@@ -12,26 +12,11 @@ use crate::runtime::RuntimeContext;
 /// 校验会话令牌：读所选运行时 `social-v2.json` 里的 agentToken。
 #[cfg(test)]
 fn token_ok(context: &RuntimeContext, key: &str, token: &str) -> bool {
-    if token.is_empty() {
-        return false;
-    }
-    let Some(state) = context.read_social_state().ok() else {
-        return false;
-    };
-    let Some(conv) = state.get("conversations").and_then(|c| c.get(key)) else {
-        return false;
-    };
-    let expected = conv
-        .get("agentToken")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
-    // 定长比较，避免按字节提前返回
-    expected.len() == token.len()
-        && expected
-            .bytes()
-            .zip(token.bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .read(key)
+        .ok()
+        .flatten()
+        .is_some_and(|conv| conv.matches_token(token))
 }
 
 #[cfg(test)]

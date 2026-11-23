@@ -958,20 +958,11 @@ impl Pipeline {
 /// 用途：判断"这一轮里模型有没有自己调发送工具"。发送路径（MCP → console →
 /// OneBot）成功后会更新这个字段，所以它比任何内存状态都可靠。
 fn last_ai_reply_at(context: &RuntimeContext, key: &str) -> i64 {
-    let state = if context.is_isolated() {
-        context.read_social_state().ok()
-    } else {
-        std::fs::read_to_string(crate::legacy_path!("qq-bridge/state/social-v2.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-    };
-    state
-        .and_then(|v| {
-            v.get("conversations")
-                .and_then(|c| c.get(key))
-                .and_then(|c| c.get("lastAiReplyAt"))
-                .and_then(|t| t.as_i64())
-        })
+    crate::conversation_state::ConversationState::for_runtime(context)
+        .read_optional_document()
+        .ok()
+        .and_then(|doc| doc.conversation(key))
+        .and_then(|conv| conv.field("lastAiReplyAt").and_then(|t| t.as_i64()))
         .unwrap_or(0)
 }
 
@@ -1640,17 +1631,21 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             return self.chat_guard(key, "").map(|()| serde_json::Value::Null);
         }
         let cfg = self.context.load_config().map_err(str::to_string)?;
-        let state = self.context.read_social_state()?;
-        let conv = &state["conversations"][key];
+        let doc = crate::conversation_state::ConversationState::for_runtime(&self.context)
+            .read_document()
+            .map_err(|(_, e)| e)?;
+        let conv_token = doc
+            .conversation(key)
+            .and_then(|c| c.token().map(str::to_string));
         if crate::harness::Tools::current_mode(&self.context) != "reserved2"
             || !crate::console::inbound_admitted(&cfg, key)
             || cfg.pointer("/socialV2/enabled") == Some(&serde_json::json!(false))
-            || state["paused"] == true
-            || conv["agentToken"].as_str() != Some(self.turn_token.as_str())
+            || doc.paused()
+            || conv_token.as_deref() != Some(self.turn_token.as_str())
         {
             return Err("mode, permission or turn generation changed".into());
         }
-        Ok(state)
+        Ok(doc.into_value())
     }
 
     fn check_harness_turn(&self, key: &str) -> Result<bool, String> {
