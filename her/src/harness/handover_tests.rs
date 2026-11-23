@@ -448,7 +448,11 @@ async fn harness_summary_a_summary_still_running_at_the_turn_deadline_fails_as_a
     rig.summariser.hold.store(true, Ordering::SeqCst);
     let body = rig.turn("summary-deadline-20", "现在回复", answer("好", 12)).await;
     rig.summariser.hold.store(false, Ordering::SeqCst);
-    assert_eq!(crate::social_state::token(&rig.context, OWNER).unwrap(), token, "no revoke: the token stands");
+    assert_eq!(
+        crate::social_state::token(&rig.context, OWNER).unwrap(),
+        token,
+        "no revoke: the token stands"
+    );
     assert_eq!(rig.summaries().len(), 1, "the summary was asked for");
     let failed = rig.events("checkpoint_failed");
     assert_eq!(failed.len(), 1);

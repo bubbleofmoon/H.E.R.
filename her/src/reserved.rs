@@ -648,12 +648,20 @@ impl Hub {
                 if crate::persona::applies(&self.context) {
                     Some(crate::persona_command::ROLE_RETIRED.to_string())
                 } else {
-                    crate::social_state::write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    crate::social_state::write_role_state(
+                        &self.context,
+                        name.as_deref(),
+                        &role_mode,
+                    )?;
                     Some(say)
                 }
             }
             chat::Decision::SetRoleMode { mode, say } => {
-                crate::social_state::write_role_state(&self.context, current_role.as_deref(), mode)?;
+                crate::social_state::write_role_state(
+                    &self.context,
+                    current_role.as_deref(),
+                    mode,
+                )?;
                 Some(say.into())
             }
             chat::Decision::Reset => {

@@ -67,7 +67,10 @@ fn ticket24_whitelist_revocation_is_immediate_and_undo_grants_only_a_new_epoch()
     let (status, reply) = admin_request(&context, "POST", "/api/audit/undo", Some(&json!({"id": revoke["id"], "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     let config = context.load_config().unwrap();
-    assert!(crate::social_state::inbound_admitted(&config, GROUP), "undo must restore the allow list");
+    assert!(
+        crate::social_state::inbound_admitted(&config, GROUP),
+        "undo must restore the allow list"
+    );
     assert_eq!(group_token(&context).as_deref(), Some(rotated.as_str()), "undo must not bring back the old token");
     assert_eq!(crate::session_map::lookup(&context, GROUP).unwrap(), None, "undo must not bring back the old session");
     let (status, _) = admin_request(&context, "POST", "/api/authorize/read", Some(&json!({"key": GROUP, "token": old})));
@@ -268,12 +271,20 @@ fn ticket24_revoking_a_conversation_without_records_ends_its_epoch() {
     let mut config = raw_config(&root);
     config["allowAllWhenEmpty"] = json!(true);
     std::fs::write(root.0.join("config/config.json"), serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-    assert!(crate::social_state::access_allowed(&context.load_config().unwrap(), "reserved2", unknown));
+    assert!(crate::social_state::access_allowed(
+        &context.load_config().unwrap(),
+        "reserved2",
+        unknown
+    ));
     let before = crate::turn_ledger::reset_count(&context, unknown).unwrap();
     let kept_before = crate::turn_ledger::reset_count(&context, GROUP).unwrap();
     let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420042]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(!crate::social_state::access_allowed(&context.load_config().unwrap(), "reserved2", unknown));
+    assert!(!crate::social_state::access_allowed(
+        &context.load_config().unwrap(),
+        "reserved2",
+        unknown
+    ));
     assert!(crate::turn_ledger::reset_count(&context, unknown).unwrap() > before, "a queued job of {unknown} (allow-all, no records) would survive the narrowing");
     assert_eq!(crate::turn_ledger::reset_count(&context, GROUP).unwrap(), kept_before, "a conversation that stays allowed keeps its queued work");
     drop(root);
@@ -788,7 +799,10 @@ fn ticket24_fix2_an_owner_only_change_revokes_an_aliased_group_immediately() {
     let mut cfg = raw_config(&root);
     cfg["allow"] = json!({"group": [420042], "private": ["7001"]});
     write_raw_config(&root, &cfg);
-    assert!(crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP), "the alias grants access");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "the alias grants access"
+    );
     let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"allow": {"groups": [420043]}, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
     assert!(!crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP));
@@ -806,7 +820,10 @@ fn ticket24_fix2_an_owner_only_change_keeps_an_aliased_allow_list() {
     write_raw_config(&root, &cfg);
     let (status, reply) = admin_request(&context, "POST", "/api/whitelist", Some(&json!({"ownerQQ": 7001, "confirm": true})));
     assert_eq!(status, 200, "{reply}");
-    assert!(crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP), "an owner-only change revoked the aliased group");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "an owner-only change revoked the aliased group"
+    );
     assert_eq!(raw_config(&root)["allow"], json!({"group": [420042], "private": ["7001"]}), "the configured allow list must stay byte-for-byte as configured");
     drop(root);
 }

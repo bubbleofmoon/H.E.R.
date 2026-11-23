@@ -202,7 +202,9 @@ fn handle_inner(
     }
     // 其余动作必须带该会话自己的 agent token；控制台令牌在 MCP 进程里也有，
     // 若 search/write 也认它，任何会话都能借 MCP 读到别的会话语料。
-    if !authority::holds_token(context, &key, &agent_token).map_err(|e| unavailable(e.to_string()))? {
+    if !authority::holds_token(context, &key, &agent_token)
+        .map_err(|e| unavailable(e.to_string()))?
+    {
         return Err((403, "agent token 无效（必须是该会话自己的令牌）".to_string()));
     }
     let store = open_store(context, cfg)?;

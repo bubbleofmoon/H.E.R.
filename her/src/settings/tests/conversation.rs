@@ -724,7 +724,10 @@ fn legacy_engine_import_skips_and_audits_one_invalid_choice() {
     let (root, context) = access_fixture("engine choices invalid entry");
     let old = json!({KEPT_GROUP: {"invalid": true}, LOST_GROUP: "harness"});
     write_config(&root, |config| config["conversationEngines"] = old.clone());
-    assert!(crate::social_state::import_engine_choices(&context).is_ok(), "one invalid choice must not abort the import");
+    assert!(
+        crate::social_state::import_engine_choices(&context).is_ok(),
+        "one invalid choice must not abort the import"
+    );
     let cfg = context.load_config().unwrap();
     assert_eq!(crate::settings::engine_choice(&context, &cfg, KEPT_GROUP, true).unwrap(), "dsh");
     assert_eq!(crate::settings::engine_choice(&context, &cfg, LOST_GROUP, true).unwrap(), "harness");

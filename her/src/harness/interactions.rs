@@ -350,7 +350,9 @@ impl Binding<'_> {
         tokio::task::spawn_blocking(move || {
             let authorized = || !*cancelled.borrow() && Instant::now() < deadline
                 && owner_current(&context, &owner, &epoch)
-                && context.load_config().is_ok_and(|cfg| crate::social_state::approved_group_allowed(&cfg, &key, &message))
+                && context.load_config().is_ok_and(|cfg| {
+                    crate::social_state::approved_group_allowed(&cfg, &key, &message)
+                })
                 && record_credentials(&context).is_ok_and(|known| crate::activity::mask_log_text(&message, &known) == message);
             if !authorized() {
                 return tools::error("Group send cancelled.");

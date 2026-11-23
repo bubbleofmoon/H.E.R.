@@ -713,7 +713,8 @@ fn apply(context: &RuntimeContext, journal: &Journal, turn: &Turn, verdict: &Ver
         Verdict::Reattach | Verdict::Defer(_) => {}
         Verdict::Pause { reason, detail, rotate } => {
             if *rotate {
-                if let Err(error) = crate::social_state::ensure_or_rotate(context, &turn.key, true) {
+                if let Err(error) = crate::social_state::ensure_or_rotate(context, &turn.key, true)
+                {
                     println!("[recovery] ⚠️ 暂停时换令牌失败 {}：{error}", turn.key);
                 }
             }
@@ -1258,7 +1259,12 @@ mod tests {
             assert_eq!(ended.state, State::Cancelled, "{verdict:?}: {records:?}");
             assert_eq!(ended.outcome_reason, "turnTimeout");
             assert_eq!(records.iter().filter(|row| row["k"] == "ended").count(), 1);
-            assert_ne!(crate::social_state::token(&context, "group:1").unwrap().as_deref(), Some("old-token"));
+            assert_ne!(
+                crate::social_state::token(&context, "group:1")
+                    .unwrap()
+                    .as_deref(),
+                Some("old-token")
+            );
             assert_eq!(journal.stage_of(&input).unwrap().as_deref(), Some("handled"));
             drop(journal);
             std::fs::remove_dir_all(root).unwrap();

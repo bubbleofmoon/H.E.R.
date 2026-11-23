@@ -34,19 +34,32 @@ fn t186_inbound_gate_admits_listed_and_not_denied_conversations_only() {
         "deny": {"groups": ["420043"]},
         "allowAllWhenEmpty": true
     });
-    assert!(inbound_admitted(&cfg, "group:420042"));
-    assert!(!inbound_admitted(&cfg, "group:420043"), "a denied conversation must be refused even when it is listed");
-    assert!(!inbound_admitted(&cfg, "group:420044"), "an unlisted conversation is refused");
-    assert!(inbound_admitted(&cfg, "private:7001"));
-    assert!(!inbound_admitted(&cfg, "private:7002"));
-    assert!(!inbound_admitted(&cfg, "channel:420042") && !inbound_admitted(&cfg, "group:"), "malformed keys are refused");
+    assert!(crate::social_state::inbound_admitted(&cfg, "group:420042"));
     assert!(
-        !inbound_admitted(&json!({"allow": {"groups": []}, "allowAllWhenEmpty": true}), "group:420042"),
+        !crate::social_state::inbound_admitted(&cfg, "group:420043"),
+        "a denied conversation must be refused even when it is listed"
+    );
+    assert!(
+        !crate::social_state::inbound_admitted(&cfg, "group:420044"),
+        "an unlisted conversation is refused"
+    );
+    assert!(crate::social_state::inbound_admitted(&cfg, "private:7001"));
+    assert!(!crate::social_state::inbound_admitted(&cfg, "private:7002"));
+    assert!(
+        !crate::social_state::inbound_admitted(&cfg, "channel:420042")
+            && !crate::social_state::inbound_admitted(&cfg, "group:"),
+        "malformed keys are refused"
+    );
+    assert!(
+        !crate::social_state::inbound_admitted(
+            &json!({"allow": {"groups": []}, "allowAllWhenEmpty": true}),
+            "group:420042"
+        ),
         "allowAllWhenEmpty never widens the inbound gate"
     );
-    assert_eq!(admitted_ids(&cfg, "group"), ["420042"]);
-    assert_eq!(admitted_ids(&cfg, "private"), ["7001"]);
-    assert!(admitted_ids(&json!({}), "group").is_empty());
+    assert_eq!(crate::social_state::admitted_ids(&cfg, "group"), ["420042"]);
+    assert_eq!(crate::social_state::admitted_ids(&cfg, "private"), ["7001"]);
+    assert!(crate::social_state::admitted_ids(&json!({}), "group").is_empty());
 }
 
 #[test]
@@ -73,7 +86,10 @@ fn t186_admit_writes_both_keys_once_and_reports_the_live_restart() {
     assert_eq!(reply["liveRestart"]["state"], "required", "{reply}");
     assert_eq!(reply["liveRestart"]["serving"], json!([GROUP]));
     assert_eq!(reply["scope"], json!({"notAllowed": [], "notServed": []}), "both keys agree after the action");
-    assert!(inbound_admitted(&context.load_config().unwrap(), "group:420043"), "admitted for the next event");
+    assert!(
+        crate::social_state::inbound_admitted(&context.load_config().unwrap(), "group:420043"),
+        "admitted for the next event"
+    );
     // The change is in the console change history, so it can be undone there.
     let (status, recent) = admin_request(&context, "GET", "/api/audit/recent?limit=10", None);
     assert_eq!(status, 200, "{recent}");
@@ -126,7 +142,7 @@ fn scope_commits_both_keys_for_the_watchdog_even_if_the_mirror_fails() {
     );
     assert_eq!(file(&root)["rollout"], before["rollout"], "the forced mirror failure leaves the old target on disk");
     let effective = context.load_config().unwrap();
-    assert!(inbound_admitted(&effective, "group:420043"));
+    assert!(crate::social_state::inbound_admitted(&effective, "group:420043"));
     let target = crate::watchdog::live_target_from_config(&effective).unwrap();
     assert_eq!(target.groups, [GROUP, "group:420043"], "the watchdog uses the committed launch order");
 }
@@ -172,7 +188,10 @@ fn t186_remove_revokes_at_once_and_refused_requests_change_nothing() {
         Some("old-scope-token-abcdefghij"),
         "the conversation token is rotated"
     );
-    assert!(!inbound_admitted(&context.load_config().unwrap(), GROUP), "refused for the next event");
+    assert!(
+        !crate::social_state::inbound_admitted(&context.load_config().unwrap(), GROUP),
+        "refused for the next event"
+    );
     // A runtime with no rollout in the file or store refuses the scope request.
     let (root, context) = scoped("t186 missing rollout", json!({}));
     let unchanged = std::fs::read(root.0.join("config/config.json")).unwrap();
@@ -270,13 +289,16 @@ fn t186_concurrent_admits_lose_no_update() {
     let (release_tx, release) = std::sync::mpsc::channel::<()>();
     let release = std::sync::Mutex::new(release);
     let reached = signal_tx.clone();
-    *crate::social_state::SCOPE_AFTER_READ.lock().unwrap_or_else(|p| p.into_inner()) = Some(std::sync::Arc::new(move |key: &str| {
+    let hook = std::sync::Arc::new(move |key: &str| {
         if key == "group:420051" {
             let _ = reached.send(Signal::Reached);
             // Returns when released, or when the test drops the sender while unwinding.
             let _ = release.lock().unwrap_or_else(|p| p.into_inner()).recv();
         }
-    }));
+    });
+    *crate::social_state::SCOPE_AFTER_READ
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(hook);
     let before = std::fs::read(root.0.join("config/config.json")).unwrap();
     let (first, second, during) = std::thread::scope(|threads| {
         // Owned by this closure, so a panic here drops it and frees the held admit.
@@ -308,7 +330,7 @@ fn t186_concurrent_admits_lose_no_update() {
     let config = file(&root);
     assert_eq!(config["allow"]["groups"], json!([420051, 420052]), "no update was lost");
     assert_eq!(config["rollout"]["rustGroups"], json!(["group:420051", "group:420052"]));
-    assert!(inbound_admitted(&context.load_config().unwrap(), "group:420052"));
+    assert!(crate::social_state::inbound_admitted(&context.load_config().unwrap(), "group:420052"));
 }
 
 #[test]
@@ -383,7 +405,10 @@ fn t186_old_spellings_and_large_lists_keep_their_meaning() {
     assert_eq!(config["allow"]["privates"], json!(["7001"]), "the other kind keeps its spelling");
     assert_eq!(config["rollout"]["rustGroups"], json!(["group:100000", GROUP]));
     let effective = context.load_config().unwrap();
-    assert!(inbound_admitted(&effective, "group:100999") && inbound_admitted(&effective, GROUP));
+    assert!(
+        crate::social_state::inbound_admitted(&effective, "group:100999")
+            && crate::social_state::inbound_admitted(&effective, GROUP)
+    );
 }
 
 #[test]

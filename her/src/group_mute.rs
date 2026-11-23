@@ -614,9 +614,16 @@ mod tests {
     fn refusal_text_names_the_end_and_ends_the_turn() {
         let timed = Mute { until: Some(NOW + 600_000), whole_group: false };
         let text = timed.refusal_text(NOW, &json!({"time":{"zone":"Asia/Shanghai"}}));
-        assert!(text.contains("muted in this group until") && text.contains(crate::social_state::END_TURN), "{text}");
+        assert!(
+            text.contains("muted in this group until")
+                && text.contains(crate::social_state::END_TURN),
+            "{text}"
+        );
         let open_ended = Mute { until: None, whole_group: true };
         let text = open_ended.refusal_text(NOW, &json!({}));
-        assert!(text.contains("end unknown") && text.contains(crate::social_state::END_TURN), "{text}");
+        assert!(
+            text.contains("end unknown") && text.contains(crate::social_state::END_TURN),
+            "{text}"
+        );
     }
 }

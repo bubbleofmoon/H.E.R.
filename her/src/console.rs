@@ -45,6 +45,7 @@ use crate::role::sanitize_name as sanitize_role_name;
 use crate::social_state::{
     self, approved_group_allowed, canonical_key as canonical_v2_key,
     is_js_trim_char as social_policy_js_trim_char, js_string as social_policy_js_string,
+    js_truthy, legacy_write_error, now_ms,
     projection_session_allowed as social_v2_projection_session_allowed,
     session_allowed as social_v2_session_allowed, social_v1_number, social_v1_spread,
     turn_send_cap, wait_console_generation, wait_live_path, wait_policy, SocialError, END_TURN,
@@ -76,7 +77,7 @@ use crate::conversation_state::{
 };
 #[cfg(test)]
 use crate::social_state::{
-    hold_test_observation_wait, key_in_allowlist, observation_wait_turn, rotate_idle_session,
+    key_in_allowlist, observation_wait_turn, record_reserved2_incoming, rotate_idle_session,
     turn_budget_ended,
 };
 #[cfg(test)]
@@ -1773,16 +1774,6 @@ fn handle_social_legacy(cfg: &Value) -> Value {
     })
 }
 
-fn js_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().map(|number| number != 0.0).unwrap_or(false),
-        Value::String(value) => !value.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
 fn config_js_string_or(value: Option<&Value>, fallback: &str) -> String {
     value
         .filter(|value| js_truthy(value))
@@ -3468,10 +3459,6 @@ fn handle_roles_delete(context: &RuntimeContext, body: &str) -> Result<Value, (u
     Ok(json!({ "ok": true, "deleted": name, "clearedCurrent": cleared }))
 }
 
-fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
-    if error.class().starts_with("temp/") { format!("写临时文件失败：{error}") } else { format!("改名失败：{error}") }
-}
-
 /// 原子写文本：与 `write_json_atomic` 同一套「临时文件 + 改名」。
 fn write_text_atomic(path: &str, text: &str) -> Result<(), String> {
     crate::guarded_file::write_atomic(std::path::Path::new(path), text.as_bytes()).map_err(legacy_write_error)
@@ -4072,14 +4059,6 @@ fn handle_memory_clear(
 }
 
 const MEMORY_CATEGORIES: [&str; 3] = ["activeTopic", "pendingThought", "memberImpression"];
-
-fn now_ms() -> i64 {
-    #[cfg(test)]
-    if let Some(now) = test_clock::now() {
-        return now;
-    }
-    crate::parity_clock::now_ms() as i64
-}
 
 /// Wait-handler polling pause; under a test clock it advances virtual time instead.
 fn wait_sleep(ms: u64) {
@@ -7703,7 +7682,7 @@ fn handle_send_sticker(
             return Err((403, "工具未启用：qq_send_sticker".to_string()));
         }
     }
-    if current_mode() != "reserved2" {
+    if social_state::mode(&RuntimeContext::legacy()) != "reserved2" {
         return Err((403, "该接口仅 reserved2 模式可用".to_string()));
     }
     if token.is_empty() {
@@ -8979,8 +8958,12 @@ fn send_guard_for(context: &RuntimeContext, cfg: &Value, key: &str, epoch: &str,
     }
     let mode = current_mode_for(context).map_err(|_| cancelled())?;
     let allowed = match policy {
-        GuardPolicy::ApprovedGroup { authorized, .. } => mode == "closed-agent" && key.starts_with("group:")
-            && inbound_admitted(cfg, key) && authorized(),
+        GuardPolicy::ApprovedGroup { authorized, .. } => {
+            mode == "closed-agent"
+                && key.starts_with("group:")
+                && crate::social_state::inbound_admitted(cfg, key)
+                && authorized()
+        }
         _ => (mode == "reserved2" || (matches!(policy, GuardPolicy::Reserved2OrClosedAgent) && mode == "closed-agent"))
             && agent::mode_allowed(cfg, &mode, key),
     };
@@ -10704,6 +10687,7 @@ fn social_projection_agent_denial_doc(
     None
 }
 
+#[cfg(test)]
 fn social_projection_agent_denial(
     state: &Value,
     cfg: &Value,
@@ -13795,15 +13779,25 @@ fn audit_undo(context: &RuntimeContext, body: &str) -> Result<Value, (u16, Strin
                     let text = serde_json::to_string_pretty(&restored_config).map_err(|e| (500, e.to_string()))?;
                     planned = Some((after, load_error, change));
                     // Once the store holds the change, a failed file write keeps the pending revocation.
-                    unchanged_config = if stored { Value::Null } else { social_state::config_snapshot(context) };
+                    unchanged_config = if stored {
+                        Value::Null
+                    } else {
+                        social_state::config_snapshot(context)
+                    };
                     text
                 } else {
                     old
                 };
                 if let Err(error) = audit_write_file(context, &file, &text) {
                     let mut message = format!("写回失败 {file}: {error}");
-                    if let Some((_, _, change)) = planned.as_ref().filter(|_| file == "config/config.json") {
-                        message.push_str(&social_state::settle_failed_write(context, &unchanged_config, change));
+                    if let Some((_, _, change)) =
+                        planned.as_ref().filter(|_| file == "config/config.json")
+                    {
+                        message.push_str(&social_state::settle_failed_write(
+                            context,
+                            &unchanged_config,
+                            change,
+                        ));
                     }
                     return Err((500, message));
                 }
@@ -14031,7 +14025,7 @@ fn finish_settings_write_back(context: &RuntimeContext) {
             ),
         }
     }
-    if let Err((_, error)) = refresh_default_wake_configs(context) {
+    if let Err(error) = crate::social_state::refresh_default_wake_configs(context) {
         crate::safe_println!("[console] inherited wake plans could not be refreshed: {error}");
     }
 }
@@ -16076,7 +16070,7 @@ pub(super) mod tests {
         assert_eq!(handle_wait_post(&reopened, &config, &headers, &request).unwrap()["waitCallsUsed"], 4,
             "closeout must not replenish the exhausted fallback budget");
         let before = load_social_state_for(&reopened).unwrap();
-        begin_legacy_wait_turn(&reopened, HF94_KEY).unwrap();
+        crate::social_state::begin_legacy_wait_turn(&reopened, HF94_KEY).unwrap();
         let mut after = load_social_state_for(&reopened).unwrap();
         assert!(!after["conversations"][HF94_KEY]["waitTurnId"].as_str().unwrap().is_empty());
         after["conversations"][HF94_KEY].as_object_mut().unwrap().remove("waitTurnId");
@@ -16699,7 +16693,7 @@ pub(super) mod tests {
         let mut config: Value = serde_json::from_slice(&context.read_file(RuntimeArea::Config, "config.json").unwrap()).unwrap();
         config["socialV2"] = json!({"wake": {"batchWindowMs": 6000}});
         context.write_atomic(RuntimeArea::Config, "config.json", config.to_string().as_bytes()).unwrap();
-        refresh_default_wake_configs(&context).unwrap();
+        crate::social_state::refresh_default_wake_configs(&context).unwrap();
         let state = context.read_social_state().unwrap();
         assert_eq!(state["conversations"]["group:1"]["wakeConfig"]["batchWindowMs"], 6000, "refreshed from the request, not from the config under the gate");
     }
@@ -20456,7 +20450,7 @@ pub(super) mod tests {
             "stickerSendPending":[{"id":"send", "time":now}],
             "stickerCollectPending":[{"id":"collect", "time":now}, {"id":"other", "time":now}]});
         let mut replacement = new_conversation(&context);
-        preserve_reset_sticker_liabilities(&previous, &mut replacement);
+        crate::social_state::preserve_reset_sticker_liabilities(&previous, &mut replacement);
         context.write_atomic(RuntimeArea::Data, "social-v2.json", serde_json::to_vec(&json!({"conversations":{(key):replacement}})).unwrap().as_slice()).unwrap();
         assert!(require_sticker_reservation(&context, key, "stickerSendPending", "send").is_err());
         assert!(require_sticker_reservation(&context, key, "stickerCollectPending", "collect").is_err());

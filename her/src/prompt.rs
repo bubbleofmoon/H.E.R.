@@ -491,7 +491,11 @@ fn engagement_line(window_ms: i64) -> String {
 fn wait_limit_line(cfg: &Value) -> String {
     let policy = crate::social_state::wait_policy(cfg);
     format!("【发送表情】{}\n【本轮等待】两种用途合计最多 {} 次（含沉睡观察）；返回了给你的消息（forYou=true）的等待不占次数（每轮最多 {} 次，与本轮发送上限相同）；最后一次留给观察，桥接会在需要时自动完成。未在互动窗口内时 messages 合批 {}ms，每条来信重置，最多 {}ms；@你和管理员来信立即返回。waitLimitReached=true 后唯一退出指令：end this turn now: produce your final answer and make no further tool calls。不要为退出而发消息；收尾工具在观察不足时强制 30 秒后再唤醒。\n\n",
-        crate::outbound_message::GUIDANCE, policy.max_per_turn, crate::social_state::turn_send_cap(cfg), policy.window_ms, policy.max_ms)
+        crate::outbound_message::GUIDANCE,
+        policy.max_per_turn,
+        crate::social_state::turn_send_cap(cfg),
+        policy.window_ms,
+        policy.max_ms)
 }
 
 /// A live OneBot message retained by the Rust process until its next prompt is built.

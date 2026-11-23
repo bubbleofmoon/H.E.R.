@@ -436,7 +436,12 @@ fn prepare_admission(
             let previous = record.summary.as_deref().filter(|_| record.epoch.as_deref() == Some(generation.as_str()));
             let rows = match source {
                 Engine::Dsh => match &session {
-                    Some(sid) => crate::dsh::switch_history(&crate::dsh::rpc_for(context, cfg).map_err(refused)?, sid, HISTORY_ROWS).map_err(refused)?,
+                    Some(sid) => crate::dsh::switch_history(
+                        &crate::dsh::rpc_for(context, cfg).map_err(refused)?,
+                        sid,
+                        HISTORY_ROWS,
+                    )
+                    .map_err(refused)?,
                     None => Vec::new(),
                 },
                 Engine::Harness => crate::harness::store::switch_history(context, key, &generation, HISTORY_ROWS).map_err(refused)?,

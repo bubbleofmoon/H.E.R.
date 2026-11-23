@@ -159,7 +159,8 @@ fn set(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     };
     if found.is_some_and(|found| found.access()) {
         let change = crate::settings::Change::Set { key: setting, value };
-        return caller.with_authority(|authority| access_change(context, authority, &change, commit));
+        return caller
+            .with_authority(|authority| access_change(context, authority, &change, commit));
     }
     let _gate = caller.gate()?;
     commit()
@@ -178,7 +179,8 @@ fn reset(caller: AdminCaller<'_>, body: &str) -> Result<Value, (u16, String)> {
     };
     if found.is_some_and(|found| found.access()) {
         let change = crate::settings::Change::Reset { key: setting };
-        return caller.with_authority(|authority| access_change(context, authority, &change, commit));
+        return caller
+            .with_authority(|authority| access_change(context, authority, &change, commit));
     }
     let _gate = caller.gate()?;
     commit()

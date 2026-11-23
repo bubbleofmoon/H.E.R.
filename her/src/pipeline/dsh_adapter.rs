@@ -53,11 +53,18 @@ impl Pipeline {
     }
 
     fn preset_for(&self, key: &str) -> String {
-        if self.context.is_isolated() && crate::social_state::mode(&self.context) == "closed-agent" {
+        if self.context.is_isolated()
+            && crate::social_state::mode(&self.context) == "closed-agent"
+        {
             return self.preset_closed.clone();
         }
         // Chat mode has one preset for every conversation (JS `modePreset`).
-        if self.context.is_isolated() && matches!(crate::social_state::mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             return self.preset_chat.clone();
         }
         let owner_key = format!("private:{}", self.owner_qq);
@@ -145,7 +152,12 @@ impl Pipeline {
         let preset = self.preset_for(key);
         // A conversation of a QQ group must never fall back to DSH's default preset (it carries local
         // tools): chat refuses to create a session unless DSH offers the configured preset.
-        if self.context.is_isolated() && matches!(crate::social_state::mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             self.require_preset(&preset)?;
         }
         let create = |rpc: &crate::dsh::Rpc| {
@@ -173,7 +185,12 @@ impl Pipeline {
             .ok_or_else(|| format!("session/create 没返回 sessionId：{created}"))?
             .to_string();
 
-        if self.context.is_isolated() && matches!(crate::social_state::mode(&self.context).as_str(), "chat" | "reserved") {
+        if self.context.is_isolated()
+            && matches!(
+                crate::social_state::mode(&self.context).as_str(),
+                "chat" | "reserved"
+            )
+        {
             // Chat: the JS title (`renameSessionForUi`) is resolved after the model is selected and
             // set once the first prompt is in DSH's hands.
             self.title_for = Some((sid.clone(), key.to_string()));
@@ -220,7 +237,11 @@ impl Pipeline {
         let mode = crate::social_state::mode(&self.context);
         AccessEpoch {
             mode_stamp: crate::reserved::mode_stamp(&self.context),
-            allowed: self.context.load_config().map(|cfg| crate::social_state::access_allowed(&cfg, &mode, key)).map_err(str::to_string),
+            allowed: self
+                .context
+                .load_config()
+                .map(|cfg| crate::social_state::access_allowed(&cfg, &mode, key))
+                .map_err(str::to_string),
             resets: crate::turn_ledger::reset_count(&self.context, key),
             token: crate::social_state::token(&self.context, key).map_err(String::from),
             policy: self.session_policy(key),
@@ -391,7 +412,8 @@ impl Pipeline {
             // It does not finalize the turn: crash recovery must still reconcile live work.
             let open = crate::turn_ledger::read_records(&self.context).ok()
                 .map(|records| crate::turn_ledger::fold(&records).0).unwrap_or_default();
-            let pending_wait = crate::social_state::observation_wait_turn(&self.context, key).unwrap_or(None);
+            let pending_wait = crate::social_state::observation_wait_turn(&self.context, key)
+                .unwrap_or(None);
             let sleeping = reason == "turnTimeout" && open.iter().any(|t|t.key == key && t.state.is_open()
                 && pending_wait.as_deref() == Some(t.id.as_str()));
             let terminal_reason = if sleeping { "observationSleep" } else { reason };
@@ -733,7 +755,8 @@ impl Pipeline {
 
     /// JS `shouldAuditKey`: every conversation is audited except the owner's private chat in closed-agent mode.
     fn should_audit_key(&self, cfg: &serde_json::Value, key: &str) -> bool {
-        !(crate::social_state::mode(&self.context) == "closed-agent" && crate::chat::is_owner_key(cfg, key))
+        !(crate::social_state::mode(&self.context) == "closed-agent"
+            && crate::chat::is_owner_key(cfg, key))
     }
 
     /// JS `shouldAuditKey(key) && SENSITIVE_RE.test(text) ? '（含敏感信息，已隐藏）' : text`.

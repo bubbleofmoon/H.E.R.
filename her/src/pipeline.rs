@@ -438,7 +438,13 @@ pub(crate) struct Reserved2Budget {
 
 impl Reserved2Budget {
     pub(crate) fn deadline_for(&self, conv: &serde_json::Value) -> i64 {
-        crate::social_state::reserved2_deadline(self.deadline, self.cap_ms, self.ceiling, self.began, conv)
+        crate::social_state::reserved2_deadline(
+            self.deadline,
+            self.cap_ms,
+            self.ceiling,
+            self.began,
+            conv,
+        )
     }
 
     pub(crate) fn expired(&self, conv: &serde_json::Value) -> bool {
@@ -844,7 +850,8 @@ impl Pipeline {
         }
         self.turn_final = true;
         if let Some(turn) = &self.cur_turn {
-            let budget_sleep = outcome == "completed" && crate::social_state::turn_budget_ended(&self.context, &turn.key, &turn.id);
+            let budget_sleep = outcome == "completed"
+                && crate::social_state::turn_budget_ended(&self.context, &turn.key, &turn.id);
             let reason = if budget_sleep { "observationSleep" } else { reason };
             let writer = if retry { turn.clone() } else { turn.clone().without_retry() };
             let result = match rpc_id {
@@ -910,13 +917,17 @@ impl Pipeline {
         }
         if let Some(chat) = self.chat.as_ref().filter(|c| c.reserved.is_none()) {
             let cfg = self.context.load_config().map_err(|e| e.to_string())?;
-            if crate::social_state::mode(&self.context) != chat.mode || !crate::chat::allowed_in_mode(&cfg, &chat.mode, key) {
+            if crate::social_state::mode(&self.context) != chat.mode
+                || !crate::chat::allowed_in_mode(&cfg, &chat.mode, key)
+            {
                 return Err("mode or permission changed".to_string());
             }
         }
         if self.chat.is_none() {
-            let cfg = self.context.load_config().map_err(|e|e.to_string())?;
-            if crate::social_state::mode(&self.context) != "reserved2" || !crate::social_state::inbound_admitted(&cfg,key) {
+            let cfg = self.context.load_config().map_err(|e| e.to_string())?;
+            if crate::social_state::mode(&self.context) != "reserved2"
+                || !crate::social_state::inbound_admitted(&cfg, key)
+            {
                 return Err("mode or permission changed".to_string());
             }
         }
@@ -1136,7 +1147,13 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             if let Some((at, previous)) = self.dispatch_wake.take() {
                 let claim = serde_json::json!({"at":at,"previous":previous});
                 self.cur_turn.as_ref().unwrap().wake_claim(&claim)?;
-                crate::social_state::consume_reserved2_deadline(&self.context, &key, &token, at, &previous)?;
+                crate::social_state::consume_reserved2_deadline(
+                    &self.context,
+                    &key,
+                    &token,
+                    at,
+                    &previous,
+                )?;
             }
             Ok(())
         })();
@@ -1230,7 +1247,11 @@ fn append_runtime_log(context: &RuntimeContext, relative: &str, line: &str) -> R
             {
                 return Err("静默模式已启用".into());
             }
-        } else if self.chat.as_ref().is_none_or(|chat| crate::social_state::mode(&self.context) != chat.mode) {
+        } else if self
+            .chat
+            .as_ref()
+            .is_none_or(|chat| crate::social_state::mode(&self.context) != chat.mode)
+        {
             return Err("模式已变化".to_string());
         }
         let mode = crate::social_state::mode(&self.context);

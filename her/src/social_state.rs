@@ -6,9 +6,10 @@
 
 use crate::console_auth::credential_eq;
 use crate::conversation_state::{
-    acquire as gate_acquire, acquire_config_gate as config_gate_acquire, ensure_or_rotate_agent_token,
-    read_agent_token, read_console_document, revoke_agent_token_if_current, token_epoch,
-    write_console_document, Conversation, ConversationState, Gate, FILE as SOCIAL_V2_FILE,
+    acquire as gate_acquire, acquire_config_gate as config_gate_acquire,
+    ensure_or_rotate_agent_token, read_agent_token, read_console_document,
+    revoke_agent_token_if_current, token_epoch, write_console_document, Conversation,
+    ConversationState, Gate, FILE as SOCIAL_V2_FILE,
 };
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use serde_json::{json, Value};
@@ -280,7 +281,7 @@ pub(crate) static SCOPE_AFTER_READ: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>
 
 // ── Clock & low-level storage helpers ────────────────────────────────────────────────────────────
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     #[cfg(test)]
     if let Some(now) = crate::console::test_clock::now() {
         return now;
@@ -302,7 +303,7 @@ fn legacy_read_json(path: &str) -> Option<Value> {
         .and_then(|text| serde_json::from_str(&text).ok())
 }
 
-fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
+pub(crate) fn legacy_write_error(error: crate::guarded_file::Failure) -> String {
     if error.class().starts_with("temp/") {
         format!("写临时文件失败：{error}")
     } else {
@@ -494,8 +495,10 @@ pub(crate) fn canonical_key(key: &str) -> Option<String> {
 
 pub(crate) fn key_parts(key: &str) -> Option<(&str, &str)> {
     let (kind, id) = key.split_once(':')?;
-    (matches!(kind, "group" | "private") && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-        .then_some((kind, id))
+    let ok = matches!(kind, "group" | "private")
+        && !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit());
+    ok.then_some((kind, id))
 }
 
 pub(crate) fn positive_id(id: &str) -> bool {
@@ -543,21 +546,12 @@ pub(crate) fn owner_of(cfg: &Value) -> Value {
     normalize_owner(cfg.get("ownerQQ")).unwrap_or(Value::Null)
 }
 
-/// The configured owner's private conversation (`private:<ownerQQ>`), if valid.
+/// The configured owner's private conversation (`private:<ownerQQ>`), if `ownerQQ` is a positive integer.
 pub(crate) fn owner_conversation(cfg: &Value) -> Option<String> {
-    match cfg.get("ownerQQ") {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .filter(|id| *id > 0)
-            .map(|id| format!("private:{id}")),
-        Some(Value::String(s)) => s
-            .trim()
-            .parse::<i64>()
-            .ok()
-            .filter(|id| *id > 0)
-            .map(|id| format!("private:{id}")),
-        _ => None,
-    }
+    cfg.get("ownerQQ")
+        .and_then(Value::as_i64)
+        .filter(|id| *id > 0)
+        .map(|qq| format!("private:{qq}"))
 }
 
 pub(crate) fn policy_list(cfg: &Value, root: &str, kind: &str) -> Option<Vec<String>> {
@@ -1172,6 +1166,7 @@ pub(crate) fn revoke_if_current(
     revoke_agent_token_if_current(context, key, current_token).map_err(SocialError::Storage)
 }
 
+#[cfg(test)]
 pub(crate) fn revoke(
     context: &RuntimeContext,
     key: &str,
@@ -1185,8 +1180,8 @@ pub(crate) fn holds_token(
     key: &str,
     candidate: &str,
 ) -> Result<bool, SocialError> {
-    Ok(!candidate.is_empty()
-        && matches!(token(context, key)?, Some(current) if credential_eq(&current, candidate)))
+    let live = token(context, key)?;
+    Ok(!candidate.is_empty() && matches!(live, Some(current) if credential_eq(&current, candidate)))
 }
 
 pub(crate) fn owner_holds_token(
@@ -1195,13 +1190,8 @@ pub(crate) fn owner_holds_token(
     key: &str,
     candidate: &str,
 ) -> Result<bool, SocialError> {
-    let Some(owner) = owner_conversation(cfg) else {
-        return Ok(false);
-    };
-    if key != owner {
-        return Ok(false);
-    }
-    holds_token(context, &owner, candidate)
+    let holds = holds_token(context, key, candidate)?;
+    Ok(holds && owner_conversation(cfg).as_deref() == Some(key))
 }
 
 pub(crate) fn token_matches_doc(
@@ -1845,7 +1835,9 @@ pub(crate) fn complete_reserved2_turn(
                     if keywords.as_array().is_some_and(|a| !a.is_empty())
                         && keywords != wc["triggers"]["keywords"]
                     {
-                        wc.as_object_mut().unwrap().remove("inheritsKeywords");
+                        if let Some(fields) = wc.as_object_mut() {
+                            fields.remove("inheritsKeywords");
+                        }
                         wc["customKeywordsFor"] = wc["triggers"]["keywords"].clone();
                         wc["triggers"]["keywords"] = keywords;
                     }
@@ -2154,7 +2146,8 @@ pub(crate) fn rotate_idle_session(
     guard: &Value,
 ) -> Result<Option<String>, SocialError> {
     let _interaction_gate = crate::closed_agent::lock(context).map_err(SocialError::Unavailable)?;
-    reset_selected_session_record(context, key, Some(sid), Some(guard)).map_err(SocialError::Storage)
+    reset_selected_session_record(context, key, Some(sid), Some(guard))
+        .map_err(SocialError::Storage)
 }
 
 pub(crate) fn reset_conversation(
@@ -2207,8 +2200,9 @@ pub(crate) fn reset_conversation_with(
         .map_err(|_| SocialError::Unavailable("runtime session data is unavailable".to_string()))?;
     let store = match sessions_text {
         Some(text) => {
-            let value: Value = serde_json::from_str(&text)
-                .map_err(|_| SocialError::Unavailable("runtime session data is invalid".to_string()))?;
+            let value: Value = serde_json::from_str(&text).map_err(|_| {
+                SocialError::Unavailable("runtime session data is invalid".to_string())
+            })?;
             if !value.is_object() {
                 return Err(SocialError::Unavailable(
                     "runtime session data is invalid".to_string(),
@@ -2292,8 +2286,8 @@ pub(crate) fn reset_conversation_with(
             {
                 continue;
             }
-            if let Err(error) =
-                crate::turn_ledger::Recorder::attach(context, &turn.id, key).end("cancelled", "session-reset")
+            if let Err(error) = crate::turn_ledger::Recorder::attach(context, &turn.id, key)
+                .end("cancelled", "session-reset")
             {
                 crate::safe_println!("[console] ⚠️ 重置时未能结算回合 {}：{error}", turn.id);
                 deferred.get_or_insert(SocialError::Storage(format!(
@@ -2446,9 +2440,10 @@ pub(crate) fn reconcile_default_wake_configs(
             .or(previous_range.as_ref())
             .is_some_and(|old| old != &range);
         if target.infinite && !current.infinite {
-            let fields = plan.as_object_mut().unwrap();
-            fields.remove("sleepUntil");
-            fields.remove("sleepRangeMs");
+            if let Some(fields) = plan.as_object_mut() {
+                fields.remove("sleepUntil");
+                fields.remove("sleepRangeMs");
+            }
         } else if !target.infinite && (current.infinite || range_changed) {
             crate::wake::draw_default_sleep(plan, &cfg, now_ms(), rand01());
             changed = true;
@@ -2529,12 +2524,13 @@ fn reconcile_default_keywords(
         }
         plan["triggers"]["keywords"] = recommended.clone();
     }
-    let fields = plan.as_object_mut().unwrap();
-    fields.remove("customKeywordsFor");
-    if empty {
-        fields.remove("inheritsKeywords");
-    } else {
-        plan["inheritsKeywords"] = json!(true);
+    if let Some(fields) = plan.as_object_mut() {
+        fields.remove("customKeywordsFor");
+        if empty {
+            fields.remove("inheritsKeywords");
+        } else {
+            plan["inheritsKeywords"] = json!(true);
+        }
     }
     true
 }
@@ -2637,10 +2633,9 @@ fn cancel_ledger_turns(context: &RuntimeContext, key: &str, why: &str) -> Result
         crate::turn_ledger::read_records(context).map_err(|e| format!("读取回合账本失败：{e}"))?;
     let (turns, _) = crate::turn_ledger::fold(&records);
     let mut failures = Vec::new();
-    for turn in turns
-        .iter()
-        .filter(|t| t.key == key && (t.state.is_open() || t.state == crate::turn_ledger::State::Paused))
-    {
+    for turn in turns.iter().filter(|t| {
+        t.key == key && (t.state.is_open() || t.state == crate::turn_ledger::State::Paused)
+    }) {
         if let Err(error) = crate::turn_ledger::Recorder::attach(context, &turn.id, key)
             .without_retry()
             .end("cancelled", why)
@@ -2856,7 +2851,9 @@ fn read_record(context: &RuntimeContext) -> Result<Value, String> {
         .ok()
         .filter(|record| record.get("pending").is_some_and(Value::is_array))
         .ok_or_else(|| {
-            format!("data/{PENDING_REVOCATIONS} is not a pending-revocation record; repair or remove it")
+            format!(
+                "data/{PENDING_REVOCATIONS} is not a pending-revocation record; repair or remove it"
+            )
         })
 }
 
@@ -2910,7 +2907,11 @@ fn pending_revocations(context: &RuntimeContext) -> Result<Vec<Value>, String> {
         .unwrap_or_default();
     if let Some(index) = pending.iter().position(|entry| !usable_entry(entry)) {
         return Err(format!(
-            "data/{PENDING_REVOCATIONS} entry {index} has no usable before/after policy; repair or remove it"
+            concat!(
+                "data/{} entry {} has no usable before/after policy; ",
+                "repair or remove it"
+            ),
+            PENDING_REVOCATIONS, index
         ));
     }
     let mut ids: Vec<String> = Vec::new();
@@ -3037,7 +3038,11 @@ pub(crate) fn settle_failed_write(
     }
     let published = raw_config_object(context).map_or(true, |current| &current != unchanged);
     if published {
-        return "; the configuration may have been written, so its revocation stays pending and is finished at the next console start or access change".to_string();
+        return concat!(
+            "; the configuration may have been written, so its revocation stays pending ",
+            "and is finished at the next console start or access change"
+        )
+        .to_string();
     }
     match forget_access_change(context, pending) {
         Ok(()) => String::new(),
@@ -3104,7 +3109,11 @@ fn settle_failed_store_write(
         return String::new();
     }
     if crate::settings::holds_any(context, previewed).unwrap_or(true) {
-        return "; the change may have been stored, so its revocation stays pending and is finished at the next console start or access change".to_string();
+        return concat!(
+            "; the change may have been stored, so its revocation stays pending ",
+            "and is finished at the next console start or access change"
+        )
+        .to_string();
     }
     match forget_access_change(context, pending) {
         Ok(()) => String::new(),
@@ -3121,7 +3130,11 @@ pub(crate) fn keep_stored_members(
         .map(|_| ())
         .map_err(|key| {
             SocialError::Storage(format!(
-                "config.json cannot hold {key}: a member on its path is not an object; stored settings stand"
+                concat!(
+                    "config.json cannot hold {}: a member on its path is not an object; ",
+                    "stored settings stand"
+                ),
+                key
             ))
         })
 }
@@ -3605,13 +3618,14 @@ pub(crate) fn apply_conversation_scope_with(
             .and_then(Value::as_array)
             .cloned()
         else {
-            return Err(SocialError::Conflict(
-                "rollout.rustGroups is not configured: the supervisor serves only that explicit list"
-                    .to_string(),
-            ));
+            return Err(SocialError::Conflict(concat!(
+                "rollout.rustGroups is not configured: ",
+                "the supervisor serves only that explicit list"
+            )
+            .to_string()));
         };
-        let deny_list =
-            crate::settings::find(&format!("deny.{field}")).expect("the registry holds the deny lists");
+        let deny_list = crate::settings::find(&format!("deny.{field}"))
+            .expect("the registry holds the deny lists");
         let denied_ids = deny_list.read(&file);
         let wanted = id.parse::<u64>().ok();
         if admit
@@ -3969,10 +3983,8 @@ mod tests {
             owner_conversation(&json!({ "ownerQQ": 10001 })).as_deref(),
             Some("private:10001")
         );
-        assert_eq!(
-            owner_conversation(&json!({ "ownerQQ": " 10002 " })).as_deref(),
-            Some("private:10002")
-        );
+        assert_eq!(owner_conversation(&json!({ "ownerQQ": "1" })), None);
+        assert_eq!(owner_conversation(&json!({ "ownerQQ": 1.5 })), None);
         assert_eq!(owner_conversation(&json!({ "ownerQQ": 0 })), None);
         assert_eq!(owner_conversation(&json!({ "ownerQQ": "bad" })), None);
 
@@ -4016,6 +4028,17 @@ mod tests {
         assert_ne!(after, rotated);
         assert!(!holds_token(&context, "private:7001", &rotated).unwrap());
         assert_eq!(token(&context, "private:7001").unwrap(), Some(after));
+
+        // Corrupt social-v2.json must fail closed even when presented token is empty or non-owner.
+        std::fs::write(root.0.join("data/social-v2.json"), "{corrupt").unwrap();
+        assert!(matches!(
+            holds_token(&context, "private:7001", ""),
+            Err(SocialError::Storage(_))
+        ));
+        assert!(matches!(
+            owner_holds_token(&context, &cfg, "group:42", ""),
+            Err(SocialError::Storage(_))
+        ));
     }
 
     #[test]

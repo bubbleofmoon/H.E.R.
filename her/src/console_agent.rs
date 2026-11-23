@@ -148,9 +148,12 @@ pub(super) fn wake_snapshot(context: &RuntimeContext, cfg: &Value, body: &str) -
         .transpose()?
         .flatten();
     let doc = ConversationState::for_runtime(context).read_document()?;
-    if current_mode_for(context)? != "reserved2" || doc.paused()
-        || cfg.pointer("/socialV2/enabled") == Some(&json!(false)) || !inbound_admitted(cfg, &key)
-        || !agent_token_matches_doc(&doc, &key, &token) {
+    if current_mode_for(context)? != "reserved2"
+        || doc.paused()
+        || cfg.pointer("/socialV2/enabled") == Some(&json!(false))
+        || !crate::social_state::inbound_admitted(cfg, &key)
+        || !agent_token_matches_doc(&doc, &key, &token)
+    {
         return Err((403, "wake snapshot invalidated".into()));
     }
     let conv_typed = doc.conversation(&key).unwrap_or_default();

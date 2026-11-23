@@ -492,7 +492,8 @@ pub fn decide(f: &Facts, role_exists: &dyn Fn(&str) -> bool) -> Decision {
             }
             "/active" | "/speak" => return Decision::SetRoleMode { mode: "active", say: "已退出静默模式，恢复正常回复。" },
             other if other == "/role" || other.starts_with("/role ") => {
-                let name = crate::role::sanitize_name(crate::role::js_trim(&f.plain.chars().skip(5).collect::<String>()));
+                let raw = f.plain.chars().skip(5).collect::<String>();
+                let name = crate::role::sanitize_name(crate::role::js_trim(&raw));
                 if name.is_empty() || name == "off" || name == "clear" {
                     return Decision::SetRole { name: None, say: "已清除角色，恢复正常人格。".to_string() };
                 }
@@ -934,7 +935,9 @@ impl Hub {
         let guard_key = key.to_string();
         let mode = crate::social_state::mode(&self.context);
         let guard = move || -> Result<(), String> {
-            if crate::social_state::mode(&context) != mode || !matches!(mode.as_str(), "chat" | "closed-agent") {
+            if crate::social_state::mode(&context) != mode
+                || !matches!(mode.as_str(), "chat" | "closed-agent")
+            {
                 return Err("模式已变化".to_string());
             }
             if !allowed_in_mode(&guard_cfg, &mode, &guard_key) {
@@ -976,7 +979,10 @@ impl Hub {
         }
         let owner = owner_qq(cfg);
         let is_owner = !owner.is_empty() && inb.user_id.to_string() == owner;
-        if is_owner && !plain.is_empty() && crate::social_state::mode(&self.context) == "closed-agent" {
+        if is_owner
+            && !plain.is_empty()
+            && crate::social_state::mode(&self.context) == "closed-agent"
+        {
             if let Some(interactions) = &self.interactions {
                 let reset = matches!(plain.to_ascii_lowercase().as_str(), "/reset" | "/new");
                 use crate::harness::interactions::Answer;
@@ -1045,7 +1051,11 @@ impl Hub {
                 if crate::persona::applies(&self.context) {
                     self.say(cfg, &key, crate::persona_command::ROLE_RETIRED);
                 } else {
-                    crate::social_state::write_role_state(&self.context, name.as_deref(), &role_mode)?;
+                    crate::social_state::write_role_state(
+                        &self.context,
+                        name.as_deref(),
+                        &role_mode,
+                    )?;
                     self.say(cfg, &key, &say);
                 }
                 self.settle(inbound_key).await?;
