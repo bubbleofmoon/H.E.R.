@@ -2088,4 +2088,49 @@ mod tests {
         );
         assert_eq!(missing_asset.status, 404);
     }
+
+    #[test]
+    fn auth_status_reports_configured_vs_generated_token_file() {
+        let (root, context) = super::super::tests::fixture_runtime(
+            "auth status token file",
+            "fixture-front-token",
+        );
+        let port = 3999;
+        let canonical = crate::console_auth::canonical_host(port);
+        let cfg = context.load_config().unwrap();
+
+        let configured_res = handle_http_request(
+            None,
+            &make_page_req(&canonical, "/api/auth/status", &[]),
+            &cfg,
+            &context,
+            port,
+        );
+        assert_eq!(configured_res.status, 200, "{}", configured_res.body);
+        let configured_body: Value = serde_json::from_str(&configured_res.body).unwrap();
+        assert_eq!(configured_body["tokenFile"], "config/config.json");
+
+        let config_path = root.0.join("config/config.json");
+        let mut raw: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        raw["consoleToken"] = json!("");
+        std::fs::write(&config_path, raw.to_string()).unwrap();
+        std::fs::write(
+            root.0.join("data/console-token"),
+            "generated-fixture-token-01",
+        )
+        .unwrap();
+
+        let updated_cfg = context.load_config().unwrap();
+        let generated_res = handle_http_request(
+            None,
+            &make_page_req(&canonical, "/api/auth/status", &[]),
+            &updated_cfg,
+            &context,
+            port,
+        );
+        assert_eq!(generated_res.status, 200, "{}", generated_res.body);
+        let generated_body: Value = serde_json::from_str(&generated_res.body).unwrap();
+        assert_eq!(generated_body["tokenFile"], "data/console-token");
+    }
 }

@@ -14193,6 +14193,16 @@ fn auth_status_route(
         Some(ConsoleAuthority::Machine { .. }) => json!("machine"),
         None => Value::Null,
     };
+    let configured_token = admission
+        .config
+        .get("consoleToken")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.trim().is_empty());
+    let token_file = if configured_token || !context.is_isolated() {
+        "config/config.json"
+    } else {
+        "data/console-token"
+    };
     json_reply(
         200,
         json!({
@@ -14201,7 +14211,7 @@ fn auth_status_route(
             "authenticated": admission.proof.is_some(),
             "authKind": auth_kind,
             "canonicalOrigin": crate::console_auth::canonical_origin(port),
-            "tokenFile": "data/console-token",
+            "tokenFile": token_file,
             "consecutiveFailures": snapshot.consecutive_failures,
             "retryAfterMs": snapshot.retry_after_ms,
             "retryAfterSeconds": auth_retry_seconds(snapshot.retry_after_ms),
