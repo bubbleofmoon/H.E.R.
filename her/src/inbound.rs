@@ -1931,9 +1931,11 @@ mod tests {
                 delay_per_write: Duration::ZERO,
             }),
             // HTTP 200 with non-ok retcode -> Rejected/Transient/Unclear.
-            Step::Stream(ScriptedStreamConfig::reply_bytes(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 33\r\n\r\n{\"status\":\"failed\",\"retcode\":1200}".to_vec(),
-            )),
+            Step::Stream(ScriptedStreamConfig::reply_bytes({
+                let body = r#"{"status":"failed","retcode":1200}"#;
+                let len = body.len();
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n{body}").into_bytes()
+            })),
             // HTTP 200 with empty body -> Transport.
             Step::Stream(ScriptedStreamConfig::reply_bytes(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
