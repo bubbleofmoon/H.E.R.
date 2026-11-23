@@ -323,7 +323,10 @@ impl RuntimeContext {
 
         let pending = allow_pending_restore && !matches!(
             resolve_contained_path(&root, "data", crate::restore::RECOVERY_INTENT, PathIntent::ReadOptionalFile)
-                .and_then(|path| crate::console_auth::open_protected_auth_file(&path)),
+                .and_then(|path| {
+                    crate::guarded_fs::open_protected_file(&path)
+                        .map_err(|_| "runtime path is unavailable".to_string())
+                }),
             Ok(None)
         );
         let config_file = if pending {
@@ -1019,7 +1022,11 @@ impl RuntimeContext {
             | crate::console_auth::ROTATION_FILE | crate::console::DESKTOP_GRANTS_FILE))
             || (area == RuntimeArea::Data && relative.starts_with("console-restore-recovery/"))
         {
-            crate::guarded_credentials::stage_settings_file(&target, input)
+            crate::guarded_fs::stage_protected_file(
+                &target,
+                input,
+                crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+            )
         } else {
             crate::guarded_file::stage(&target, input, None)
         }?;
@@ -1052,6 +1059,25 @@ impl RuntimeContext {
             return Err("runtime path is unavailable".to_string());
         }
         fs::remove_file(path).map_err(|e| format!("cannot remove runtime file: {e}"))
+    }
+
+    pub(crate) fn read_protected_data_file(
+        &self,
+        name: &str,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let path = self.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)?;
+        crate::guarded_fs::read_protected_file_with_recheck(&path, limit, || {
+            self.resolve_path(RuntimeArea::Data, name, PathIntent::ReadFile)
+                .map_err(str::to_string)
+        })
+    }
+
+    pub(crate) fn remove_protected_data_file(&self, name: &str) -> Result<(), String> {
+        let path = self.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)?;
+        crate::guarded_fs::remove_protected_file_with(&path, || {
+            self.remove_file(RuntimeArea::Data, name)
+        })
     }
 
     pub fn rename_file(
@@ -1447,27 +1473,6 @@ pub(crate) fn resolve_contained_path(
         return Err("runtime path policy rejected class=path".into());
     }
     Ok(canonical)
-}
-
-/// The hard links of an open file.
-#[cfg(unix)]
-pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    file.metadata().map(|metadata| metadata.nlink())
-}
-
-/// The hard links of an open file.
-#[cfg(windows)]
-pub(crate) fn file_link_count(file: &std::fs::File) -> std::io::Result<u64> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of this plain C struct.
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: the handle stays open for the call and `information` is a valid, writable out pointer.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(u64::from(information.nNumberOfLinks))
 }
 
 pub(crate) fn runtime_io_error(class: &str, error: &std::io::Error) -> String {

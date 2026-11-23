@@ -250,80 +250,16 @@ mod windows {
     use wry::{WebContext, WebViewBuilder};
 
     pub(super) fn read_private_token(context: &RuntimeContext) -> Result<String, String> {
-        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-        use windows_sys::Win32::Security::{
-            CreateWellKnownSid, EqualSid, GetAce, IsValidAcl, IsValidSid,
-            WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACE_HEADER,
-            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        };
         let error = || "protected console token file is unavailable or has unsafe ownership/ACL".to_string();
-        let path = context.resolve_path(RuntimeArea::Data, "console-token", PathIntent::ReadFile)
+        let path = context
+            .resolve_path(RuntimeArea::Data, "console-token", PathIntent::ReadFile)
             .map_err(|_| error())?;
-        // Pin the same file for inspection and reading. Deny writers and replacement until done;
-        // open a reparse node itself rather than following a late link substitution.
-        let mut file = std::fs::OpenOptions::new().read(true).share_mode(1)
-            .custom_flags(0x00200000).open(path).map_err(|_| error())?; // FILE_FLAG_OPEN_REPARSE_POINT
-        let metadata = file.metadata().map_err(|_| error())?;
-        if !metadata.is_file() || metadata.file_attributes() & 0x400 != 0 { return Err(error()); }
-        let user = process_identity::current_user()?;
-        let mut system = [0u32; 17];
-        let mut admins = [0u32; 17];
-        let mut owner = std::ptr::null_mut();
-        let mut acl = std::ptr::null_mut();
-        let mut descriptor = std::ptr::null_mut();
-        // SAFETY: owned handle and initialized out pointers; buffers hold SECURITY_MAX_SID_SIZE.
-        unsafe {
-            for (kind, buffer) in [(WinLocalSystemSid, &mut system), (WinBuiltinAdministratorsSid, &mut admins)] {
-                let mut size = std::mem::size_of_val(buffer) as u32;
-                if CreateWellKnownSid(kind, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut size) == 0 {
-                    return Err(error());
-                }
-            }
-            if GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner, std::ptr::null_mut(), &mut acl, std::ptr::null_mut(), &mut descriptor) != 0 {
-                return Err(error());
-            }
-        }
-        struct Descriptor(*mut std::ffi::c_void);
-        impl Drop for Descriptor {
-            fn drop(&mut self) {
-                // SAFETY: GetSecurityInfo allocated this descriptor with LocalAlloc.
-                unsafe { LocalFree(self.0); }
-            }
-        }
-        let _descriptor = Descriptor(descriptor);
-        // SAFETY: trustee pointers refer to the retained security descriptor or SID buffers.
-        let allowed = |sid: *mut std::ffi::c_void| unsafe {
-            !sid.is_null() && IsValidSid(sid) != 0 &&
-                [user.as_ptr().cast_mut().cast(), system.as_ptr().cast_mut().cast(), admins.as_ptr().cast_mut().cast()]
-                    .iter().any(|trusted| EqualSid(sid, *trusted) != 0)
-        };
-        if !allowed(owner) || acl.is_null() || unsafe { IsValidAcl(acl) } == 0 { return Err(error()); }
-        // Fail closed on unknown ACE formats; deny entries cannot broaden access.
-        for index in 0..unsafe { (*acl).AceCount } as u32 {
-            let mut ace = std::ptr::null_mut();
-            // SAFETY: validated ACL and in-range index; the descriptor remains allocated.
-            unsafe {
-                if GetAce(acl, index, &mut ace) == 0 || ace.is_null() { return Err(error()); }
-                let header = &*ace.cast::<ACE_HEADER>();
-                match header.AceType {
-                    0 => { // ACCESS_ALLOWED_ACE_TYPE
-                        if (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() { return Err(error()); }
-                        let entry = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-                        if entry.Mask != 0 && !allowed(std::ptr::addr_of!(entry.SidStart).cast_mut().cast()) { return Err(error()); }
-                    }
-                    1 => {} // ACCESS_DENIED_ACE_TYPE
-                    _ => return Err(error()),
-                }
-            }
-        }
-        let mut token = String::new();
-        file.read_to_string(&mut token).map_err(|_| error())?;
-        Ok(token)
+        let bytes = crate::guarded_fs::read_verified_private_file(
+            &path,
+            crate::guarded_fs::AclPolicy::OwnerSystemAdmins,
+        )
+        .map_err(|_| error())?;
+        String::from_utf8(bytes).map_err(|_| error())
     }
 
     // Always quote each argument using the Windows backslash/quote rules. In particular,
