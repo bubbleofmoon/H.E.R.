@@ -44,11 +44,14 @@ mod schedule_routes;
 pub(crate) mod front;
 pub(crate) use crate::conversation_authority::{
     ensure_or_rotate as ensure_or_rotate_agent_token, mode as runtime_mode,
-    revoke as revoke_agent_token, token as conversation_token,
+    token as conversation_token,
 };
 pub(crate) use crate::conversation_state::{
     acquire as acquire_social_state_gate, acquire_config_gate as config_gate,
-    fresh_agent_token, new_conversation, read_console_document as load_social_state_for,
+};
+#[cfg(test)]
+pub(crate) use crate::conversation_state::{
+    new_conversation, read_console_document as load_social_state_for,
     update_raw as mutate_social_state_for,
 };
 #[cfg(test)]
@@ -10668,7 +10671,6 @@ fn send_message_inner(
     cfg: &Value,
     context: &RuntimeContext,
 ) -> Result<(u16, Value), (u16, String)> {
-    use crate::send_outbox::{append_record, token_epoch};
     let b: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
     let key = b.get("key").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     let resume_batch = b
@@ -15460,6 +15462,7 @@ pub fn load_config() -> Value {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::conversation_state::{SOCIAL_STATE_GATE, SOCIAL_STATE_GATE_WAIT};
 
     #[test]
     fn quoted_voice_is_shown_to_the_model_as_the_voice_label() {
@@ -26197,7 +26200,7 @@ pub(super) mod tests {
                     first_release_rx
                         .recv_timeout(Duration::from_secs(2))
                         .expect("test must release the first state transaction");
-                    conversation["firstWriter"] = json!("committed");
+                    conversation.set_field("firstWriter", json!("committed"));
                     Ok(json!({ "ok": true }))
                 },
             );
@@ -26222,7 +26225,7 @@ pub(super) mod tests {
                 "fixture_second_writer",
                 |conversation, _, _| {
                     second_entered_tx.send(()).unwrap();
-                    conversation["secondWriter"] = json!("committed");
+                    conversation.set_field("secondWriter", json!("committed"));
                     Ok(json!({ "ok": true }))
                 },
             );

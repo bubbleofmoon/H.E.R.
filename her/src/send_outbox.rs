@@ -22,7 +22,9 @@
 
 use serde_json::{json, Value};
 
-pub(crate) use crate::conversation_state::{token_epoch, token_epoch_matches};
+pub(crate) use crate::conversation_state::token_epoch;
+#[cfg(test)]
+pub(crate) use crate::conversation_state::token_epoch_matches;
 
 use crate::runtime::{RuntimeArea, RuntimeContext};
 

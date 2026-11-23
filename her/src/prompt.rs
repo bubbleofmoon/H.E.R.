@@ -993,7 +993,7 @@ fn status_line(conv: &Conversation) -> String {
         let clipped: String = text.chars().take(30).collect();
         bits.push(format!("最近一条来自 {sender}：{clipped}"));
     }
-    if let Some(ts) = st.get("lastAiReplyAt").and_then(|v| v.as_i64()) {
+    if let Some(ts) = conv.field("lastAiReplyAt").and_then(|v| v.as_i64()) {
         if ts > 0 {
             let mins = ((now_ms() - ts).max(0) as f64 / 60_000.0).round() as i64;
             bits.push(format!("你上次发言 {mins} 分钟前"));

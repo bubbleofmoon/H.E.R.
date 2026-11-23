@@ -314,7 +314,8 @@ fn note_offered_receipts_epoch(context: &RuntimeContext, key: &str, epoch: &str,
 
 fn is_live_agent_token(context: &RuntimeContext, token: &str) -> Result<bool, (u16, String)> {
     let doc = ConversationState::for_runtime(context).read_document()?;
-    Ok(doc.conversations().any(|(_, conv)| conv.matches_token(token)))
+    let matched = doc.conversations().any(|(_, conv)| conv.matches_token(token));
+    Ok(matched)
 }
 
 const ADMIN_ONLY_V2_PATHS: [&str; 6] = [
@@ -1568,7 +1569,6 @@ fn message_detail_inner(
     let Some((kind, id_s_raw, _)) = parse_key(&key) else {
         return Err((400, KEY_FORMAT_ERROR.to_string()));
     };
-    let storage_key = projection_storage_key(&key)?;
     let id_s = id_s_raw.parse::<f64>().map(|n| (n as i64).to_string()).unwrap_or_else(|_| id_s_raw.to_string());
     let found = conv_opt
         .as_ref()

@@ -64,7 +64,13 @@ pub(crate) fn candidate(
             return Ok(None);
         }
         let closed = r["closedAtEnd"] == true;
-        if !closed || conv["adminWakes"].as_array().is_some_and(|v| !v.is_empty()) {
+        if !closed
+            || conv
+                .as_ref()
+                .and_then(|c| c.field("adminWakes"))
+                .and_then(Value::as_array)
+                .is_some_and(|v| !v.is_empty())
+        {
             return Ok(None);
         }
         let model = r["lastCall"]["model"]
@@ -97,8 +103,10 @@ pub(crate) fn candidate(
         let Some(ttl) = ttl.filter(|n| n.is_finite() && *n > 0.0) else {
             return Ok(None);
         };
-        let idle_from = conv["lastIncomingAt"]
-            .as_i64()
+        let idle_from = conv
+            .as_ref()
+            .and_then(|c| c.field("lastIncomingAt"))
+            .and_then(Value::as_i64)
             .unwrap_or(now)
             .max(r["lastEnded"].as_i64().unwrap_or(now));
         if ((now - idle_from) as f64) < (ttl - 1.0).max(0.0) * 60_000.0 {
@@ -113,7 +121,7 @@ pub(crate) fn candidate(
         key: key.into(),
         sid,
         epoch: epoch.into(),
-        guard: conv.clone(),
+        guard: conv.map(|c| c.to_value()).unwrap_or(Value::Null),
         turn_seq,
         input: r["lastCall"]["input"].as_f64().unwrap_or(0.0) as u64,
         recovering: pending,

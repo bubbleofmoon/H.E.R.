@@ -6,7 +6,6 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 struct Active {
     task: tokio::task::JoinHandle<(Result<usize, String>, bool)>,

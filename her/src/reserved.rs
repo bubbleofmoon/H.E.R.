@@ -5,8 +5,8 @@ use crate::{
     conversation_state::{
         read_reserved_document as read, reserved_document_exists,
         update_reserved_document as mutate, ReservedConversation as Conversation,
-        ReservedGeneration, ReservedMessage as Message, ReservedState as State,
-        RESERVED_FILE as FILE,
+        ReservedFlush as Flush, ReservedGeneration, ReservedMessage as Message,
+        ReservedState as State,
     },
     inbound::SharedJournal,
     pipeline::Pipeline,

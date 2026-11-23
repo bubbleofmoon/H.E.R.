@@ -600,6 +600,7 @@ impl Conversation {
         self.extra.get(name)
     }
 
+    #[cfg(test)]
     pub(crate) fn try_set_field(&mut self, name: impl Into<String>, value: Value) -> Result<(), Failure> {
         let name = name.into();
         if is_reserved_typed_field(&name) {
@@ -961,6 +962,22 @@ pub(crate) struct ReservedMessage {
     pub message_id: String,
     pub event_key: String,
     pub time: i64,
+}
+
+impl ReservedMessage {
+    pub(crate) fn line(&self, owner: bool) -> String {
+        format!(
+            "{}{}：{}{}",
+            if owner && self.is_owner {
+                "【管理员】"
+            } else {
+                ""
+            },
+            self.sender,
+            self.text,
+            crate::chat::media_hint(&self.message_id, self.media.len())
+        )
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
