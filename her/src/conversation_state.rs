@@ -194,10 +194,6 @@ impl UnreadMessage {
         self.fields.get("isSelf").and_then(Value::as_bool) == Some(true)
     }
 
-    pub(crate) fn is_owner(&self) -> bool {
-        self.fields.get("isOwner").and_then(Value::as_bool) == Some(true)
-    }
-
     pub(crate) fn at_self(&self) -> bool {
         self.fields.get("atSelf").and_then(Value::as_bool) == Some(true)
     }
@@ -258,6 +254,16 @@ impl PartialEq for MemberImpression {
 }
 
 impl MemberImpression {
+    pub(crate) fn new(traits: Vec<String>, interaction_count: i64, last_seen_at: Option<i64>) -> Self {
+        Self {
+            traits,
+            interaction_count,
+            last_seen_at,
+            extra: Map::new(),
+            key_order: Vec::new(),
+        }
+    }
+
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
         let key_order: Vec<String> = obj.keys().cloned().collect();
@@ -1150,6 +1156,7 @@ pub(crate) fn read_optional_document(context: &RuntimeContext) -> Result<Value, 
     }
 }
 
+#[cfg(test)]
 pub(crate) fn new_conversation(context: &RuntimeContext) -> Value {
     Conversation::new_default(context).to_value()
 }
@@ -1298,6 +1305,7 @@ fn acquire_for_update(context: &RuntimeContext) -> Result<Gate, Failure> {
 
 /// Raw document read-modify-write under the social gate for callers migrating remaining
 /// non-conversation-scoped or unmigrated fields.
+#[cfg(test)]
 pub(crate) fn update_raw<T>(
     context: &RuntimeContext,
     update: impl FnOnce(&mut Value) -> Result<T, Failure>,

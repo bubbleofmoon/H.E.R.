@@ -1370,6 +1370,7 @@ pub fn record_reply(context: &RuntimeContext, key: &str, at: i64) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation_state::RESERVED_FILE as FILE;
     use crate::turn_ledger::{self, Recorder};
 
     fn fixture() -> (std::path::PathBuf, RuntimeContext) {

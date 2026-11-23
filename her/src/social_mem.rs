@@ -12,7 +12,7 @@ use crate::{
     role::js_trim,
 };
 use indexmap::IndexMap;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// JS 的 `truncateText(value, max)`：按 UTF-16 码元截断，且不切出孤立代理。
 pub fn truncate_text(value: &str, max: i64) -> String {
@@ -343,20 +343,16 @@ pub(crate) fn append_memory(
             traits.drain(..traits.len() - policy.max_traits);
         }
         // Only a member speaking refreshes `lastSeenAt` (`note_member_seen`); a write starts it for a new entry.
-        let (interaction_count, last_seen_at) = match old {
-            Some(o) => (o.interaction_count.max(0), o.last_seen_at.unwrap_or(now)),
-            None => (0, now),
+        let updated = match old {
+            Some(mut entry) => {
+                entry.traits = traits;
+                entry.interaction_count = entry.interaction_count.max(0);
+                entry.last_seen_at = Some(entry.last_seen_at.unwrap_or(now));
+                entry
+            }
+            None => MemberImpression::new(traits, 0, Some(now)),
         };
-        impressions.insert(
-            target,
-            MemberImpression {
-                traits,
-                interaction_count,
-                last_seen_at: Some(last_seen_at),
-                extra: Map::new(),
-                ..Default::default()
-            },
-        );
+        impressions.insert(target, updated);
         cap_impressions(impressions, policy.max_members);
     }
 }
