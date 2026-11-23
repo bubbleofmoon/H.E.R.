@@ -3,7 +3,7 @@
 use crate::lifecycle::{
     self, Acquire, DesiredRead, DesiredState, DesiredStore, Effective, ImagePolicy,
     LifecycleBackend as _, LiveLifecycle, OwnerGate, OwnerObservation, OwnerProbe, OwnerRole,
-    ProbeMode, SUPERVISOR_LOCK,
+    ProbeMode,
 };
 use crate::runtime::{PathIntent, RuntimeArea, RuntimeContext};
 use crate::task_runs::{Finish, RunHandle, RunSource, StoreLimits, TaskStore};
@@ -170,7 +170,7 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
         }
         let proof = request.authority.ok_or("a fresh restart request is required")?;
         let cfg = context.load_config().map_err(str::to_string)?;
-        let desired_gate = lifecycle::lock_with_wait(&context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
+        let desired_gate = LiveLifecycle.lock_desired_gate(context.data_dir(), Duration::from_secs(5))?;
         if !matches!(desired(context), Effective::Act { wants, .. } if wants.console && wants.jobs) { return Err("desired state no longer permits restart".into()); }
         let me = lifecycle::current_identity()?;
         match lifecycle::verify_owner(
@@ -215,8 +215,7 @@ fn restart_console(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mu
             if std::time::Instant::now() >= deadline { return Err("console did not release its owner and port".into()); }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let live_gate = owner_gate(context, lifecycle::LIVE_LOCK)?;
-        let effects = RealEffects { context: context.clone(), live_gate };
+        let effects = RealEffects { context: context.clone() };
         let child = effects.launch_console(target.console_port)?;
         drop(social);
         drop(desired_gate);
@@ -547,7 +546,6 @@ fn console_probe_with(context: &RuntimeContext, port: u16, allow_sibling: bool, 
 
 struct RealEffects {
     context: RuntimeContext,
-    live_gate: OwnerGate,
 }
 
 impl RealEffects {
@@ -618,7 +616,8 @@ impl RealEffects {
 
 impl Effects for RealEffects {
     fn kill_verified(&mut self, identity: &lifecycle::ProcessIdentity, restart: Option<&[String]>) -> lifecycle::KillOutcome {
-        let _transition = match lifecycle::lock_with_wait(&self.context.data_dir().join("lifecycle/lifecycle.lock"), Duration::from_secs(5)) {
+        let data = self.context.data_dir();
+        let _transition = match LiveLifecycle.lock_desired_gate(data, lifecycle::DESIRED_GATE_WAIT) {
             Ok(gate) => gate,
             Err(error) => return lifecycle::KillOutcome::Unknown(error),
         };
@@ -636,19 +635,41 @@ impl Effects for RealEffects {
             None => !wants.live || target.as_ref().is_some_and(|target| target.groups.is_empty()),
         };
         if !still_needed { return lifecycle::KillOutcome::Refused("desired state or live target changed before stop".into()); }
-        match self.live_gate.probe() {
-            OwnerProbe::Held { marker: Some(marker) } if marker.role == "live" && lifecycle::same_identity(&marker.identity, identity) => {}
-            _ => return lifecycle::KillOutcome::Refused("live owner changed before stop".into()),
+        match lifecycle::verify_owner(
+            &mut LiveLifecycle,
+            data,
+            OwnerRole::Live,
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        ) {
+            OwnerObservation::Verified(owner)
+                if lifecycle::same_identity(&owner.marker.identity, identity) =>
+            {
+                LiveLifecycle.kill_verified(identity)
+            }
+            _ => lifecycle::KillOutcome::Refused("live owner changed before stop".into()),
         }
-        lifecycle::kill_verified(identity)
     }
-    fn probe_live(&mut self) -> OwnerProbe { self.live_gate.probe() }
+    fn probe_live(&mut self) -> OwnerProbe {
+        LiveLifecycle.probe_owner(self.context.data_dir(), OwnerRole::Live, ProbeMode::Create)
+    }
     fn start_live(&mut self, groups: &[String]) -> Result<(), String> {
         match desired(&self.context) {
             Effective::Act { wants, .. } if wants.live => {},
             _ => return Err("desired state no longer permits live".into()),
         }
-        if !matches!(self.live_gate.probe(), OwnerProbe::Free { .. }) { return Err("live owner is not known free".into()); }
+        if !matches!(
+            lifecycle::verify_owner(
+                &mut LiveLifecycle,
+                self.context.data_dir(),
+                OwnerRole::Live,
+                &ImagePolicy::SameReleaseTwin,
+                ProbeMode::Create,
+            ),
+            OwnerObservation::Free { .. }
+        ) {
+            return Err("live owner is not known free".into());
+        }
         let cfg = self.context.load_config().map_err(str::to_string)?;
         let target = watchdog::live_target_from_config(&cfg)?;
         if target.groups != groups { return Err("configured groups changed before startup".into()); }
@@ -688,23 +709,14 @@ impl Effects for RealEffects {
             DesiredRead::Present(record) if record.state == DesiredState::Stopped => record.revision,
             _ => return Err("desired state no longer permits stopping the console".into()),
         };
-        match lifecycle::verify_owner(
-            &mut LiveLifecycle,
-            data,
-            OwnerRole::Console,
-            &ImagePolicy::SameReleaseTwin,
-            ProbeMode::Create,
-        ) {
-            OwnerObservation::Verified(owner) if owner.marker.identity.pid == pid => {}
-            _ => return Err("console owner is no longer verified".into()),
-        }
-        lifecycle::stop_verified_owners_transaction(
+        lifecycle::stop_verified_owners_with_pids(
             &mut LiveLifecycle,
             data,
             expected_revision,
             &[OwnerRole::Console],
             &ImagePolicy::SameReleaseTwin,
             ProbeMode::Create,
+            &[(OwnerRole::Console, pid)],
         )
     }
     fn wait_ms(&mut self, ms: u64) { std::thread::sleep(Duration::from_millis(ms)); }
@@ -716,52 +728,19 @@ fn watchdog_tick(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mut 
     }) {
         Ok(cfg) => cfg,
         Err(error) => {
-            // Wait for tasks without holding the desired gate; they may need that
-            // gate to complete. Recheck the desired state under the gate before
-            // retiring any owner, including after a concurrent resume.
-            let data = context.data_dir();
-            let task_gates = if matches!(desired(context), Effective::Act { wants, .. } if !wants.jobs) {
-                lifecycle::hold_stopped_task_gates(data).ok()
-            } else { None };
-            match LiveLifecycle.lock_desired_gate(data, Duration::from_secs(5)) {
-                Ok(_desired_gate) => if let Effective::Act { wants, .. } = desired(context) {
-                    for (role, stop) in [
-                        (OwnerRole::Live, !wants.live),
-                        (OwnerRole::Console, !wants.console),
-                    ] {
-                        if !stop { continue; }
-                        if role == OwnerRole::Console && task_gates.is_none() {
-                            run.log(crate::task_runs::LogStream::Meta, "running tasks did not stop; console left running");
-                            continue;
-                        }
-                        match lifecycle::verify_owner(
-                            &mut LiveLifecycle,
-                            data,
-                            role,
-                            &ImagePolicy::SameReleaseTwin,
-                            ProbeMode::Create,
-                        ) {
-                            OwnerObservation::Free { .. } => {}
-                            OwnerObservation::Verified(owner) => {
-                                match lifecycle::kill_verified(&owner.marker.identity) {
-                                    lifecycle::KillOutcome::Killed | lifecycle::KillOutcome::Gone =>
-                                        run.log(crate::task_runs::LogStream::Meta, &format!("stopped verified {} owner while configuration was unreadable", role.as_str())),
-                                    _ => run.log(crate::task_runs::LogStream::Meta, &format!("could not verify stopping {} owner", role.as_str())),
-                                }
-                            }
-                            _ => run.log(crate::task_runs::LogStream::Meta, &format!("{} owner is unknown; no process stopped", role.as_str())),
-                        }
-                    }
-                },
-                Err(_) => run.log(crate::task_runs::LogStream::Meta, "desired-state gate is unavailable; no process stopped"),
+            for note in lifecycle::stop_unconfigured_owners(
+                &mut LiveLifecycle,
+                context.data_dir(),
+                &ImagePolicy::SameReleaseTwin,
+            ) {
+                run.log(crate::task_runs::LogStream::Meta, &note);
             }
             return Finish::Failed { exit_code: None, reason: format!("configuration unavailable: {error}") };
         }
     };
-    let gate = match owner_gate(context, lifecycle::LIVE_LOCK) {
-        Ok(gate) => gate,
-        Err(error) => return Finish::Unknown { reason: error },
-    };
+    if let Err(error) = LiveLifecycle.validate_gate_paths(context.data_dir(), ProbeMode::Create) {
+        return Finish::Unknown { reason: error };
+    }
     let now = crate::parity_clock::now_ms();
     let target = watchdog::live_target_from_config(&cfg);
     let console = target.as_ref().map(|t| console_probe(context, t.console_port))
@@ -778,7 +757,7 @@ fn watchdog_tick(context: &RuntimeContext, state: &Mutex<WatchState>, run: &mut 
     let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
     let decision = watchdog::decide(&observation, &state);
     *state = decision.state.clone();
-    let mut fx = RealEffects { context: context.clone(), live_gate: gate };
+    let mut fx = RealEffects { context: context.clone() };
     let applied = watchdog::apply(&decision, &mut fx);
     for note in decision.notes.iter().chain(applied.notes.iter()) { run.log(crate::task_runs::LogStream::Meta, note); }
     for alert in decision.alerts.iter().chain(applied.alerts.iter()) {
@@ -814,7 +793,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         Ok(cfg) => cfg,
         Err(error) => { eprintln!("[supervisor] {error}"); return 2; }
     };
-    let gate = match owner_gate(&context, SUPERVISOR_LOCK) {
+    let gate = match owner_gate(&context, OwnerRole::Supervisor.lock_file()) {
         Ok(gate) => gate,
         Err(error) => { eprintln!("[supervisor] {error}"); return 3; }
     };
@@ -822,7 +801,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         Ok(identity) => identity,
         Err(error) => { eprintln!("[supervisor] {error}"); return 3; }
     };
-    let _owner = match gate.acquire("supervisor", identity, None, crate::parity_clock::now_ms(), Duration::from_millis(500)) {
+    let _owner = match gate.acquire(OwnerRole::Supervisor.as_str(), identity, None, crate::parity_clock::now_ms(), Duration::from_millis(500)) {
         Acquire::Acquired(owner) => owner,
         other => { eprintln!("[supervisor] ownership unavailable: {other:?}"); return 3; }
     };

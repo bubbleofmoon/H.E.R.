@@ -5,8 +5,8 @@
 
 use crate::lifecycle::{
     collect_verified_owners, effective, stop_verified_owners_transaction, DesiredRead,
-    DesiredState, DesiredStore, Effective, ImagePolicy, LiveLifecycle, OwnerGate, OwnerProbe,
-    OwnerRole, ProbeMode, VerifiedOwner,
+    DesiredState, DesiredStore, Effective, ImagePolicy, LifecycleBackend as _, LiveLifecycle,
+    OwnerProbe, OwnerRole, ProbeMode, VerifiedOwner,
 };
 use crate::task_runs::{credential_redactor, RunQuery, StoreLimits, TaskStore};
 use crate::tasks::{Scheduler, TaskId, REGISTRY};
@@ -192,12 +192,13 @@ pub fn run_lifecycle(args: &[String]) -> i32 {
                 (_, Effective::Act { state, wants }) => json!({ "state": state.as_str(), "wants": wants, "record": null }),
             };
             let unknown = desired["state"] == "unknown";
+            let mut backend = LiveLifecycle;
             print(&json!({
                 "desired": desired,
                 "owners": {
-                    "live": probe_json(OwnerGate::for_role(&data, OwnerRole::Live).probe()),
-                    "console": probe_json(OwnerGate::for_role(&data, OwnerRole::Console).probe()),
-                    "supervisor": probe_json(OwnerGate::for_role(&data, OwnerRole::Supervisor).probe()),
+                    "live": probe_json(backend.probe_owner(&data, OwnerRole::Live, ProbeMode::Create)),
+                    "console": probe_json(backend.probe_owner(&data, OwnerRole::Console, ProbeMode::Create)),
+                    "supervisor": probe_json(backend.probe_owner(&data, OwnerRole::Supervisor, ProbeMode::Create)),
                 },
             }));
             if unknown {
