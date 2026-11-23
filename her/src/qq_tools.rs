@@ -329,6 +329,7 @@ impl<'a> ApiCall {
     }
 }
 
+#[derive(Debug)]
 struct ApiFailure {
     message: String,
     delivery_unknown: bool,

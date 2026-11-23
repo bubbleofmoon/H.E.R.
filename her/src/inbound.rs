@@ -1505,8 +1505,33 @@ mod tests {
 
     #[test]
     fn chunked_bodies_decode_and_history_items_parse() {
-        assert_eq!(decode_chunked("3\r\nabc\r\n0\r\n\r\n").unwrap(), "abc");
-        assert!(decode_chunked("zz\r\nabc\r\n0\r\n\r\n").is_err());
+        use crate::loopback_http::test_support::{MemoryTransport, ScriptedStreamConfig, Step};
+        use crate::loopback_http::{request, Deadlines, HttpRequest, LoopbackEndpoint, ResponseLimits};
+
+        let transport = MemoryTransport::new(vec![
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n".to_vec(),
+            )),
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n".to_vec(),
+            )),
+        ]);
+        let ep = LoopbackEndpoint::localhost_v4(43103).unwrap();
+        let req = HttpRequest {
+            method: "POST",
+            path: "/get_group_msg_history",
+            headers: &[],
+            body: Some(b"{}"),
+        };
+        let deadlines = Deadlines::split(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let ok = request(&transport, &ep, &req, deadlines, ResponseLimits::new(1024)).unwrap();
+        assert_eq!(ok.body, b"abc");
+        assert!(request(&transport, &ep, &req, deadlines, ResponseLimits::new(1024)).is_err());
+
         let parsed = parse_history_message(&json!({"message_id": 5, "time": 9, "message_seq": 3})).unwrap();
         assert_eq!((parsed.message_id.as_str(), parsed.time_ms, parsed.seq), ("5", 9000, Some(3)));
     }
