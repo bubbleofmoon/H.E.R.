@@ -1,9 +1,11 @@
 //! #238: the digest's route walk (`RouteWalk`) on a scripted loopback relay; no real model service is contacted.
 use super::*;
+use crate::harness::{route_health, usage};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Mutex;
+use std::time::Instant;
 
 /// The harness credential of every fixture; one test puts it into a route id and a model.
 const SECRET: &str = "synthetic-model-key-238";
@@ -325,7 +327,7 @@ fn digest_walk_a_request_cut_by_the_walk_bound_is_no_route_health() {
     // The bound (400 ms) is less than the route's own timeout (1 s): the request it cuts is no route failure.
     let relay = Relay::start(vec![("model-a", after(5000, Kind::Answer("[]")))]);
     let fixture = Fixture::new("cut", &relay, chain_of(&["a"]));
-    let abandoned = AtomicBool::new(false);
+    let abandoned = Arc::new(AtomicBool::new(false));
     let walk = fixture.walk(Duration::from_secs(1));
     assert_eq!(
         walk.complete_within("system", "input", Duration::from_millis(400), &abandoned),

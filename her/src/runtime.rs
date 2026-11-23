@@ -77,6 +77,23 @@ enum RuntimeMode {
     Isolated,
 }
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestOneShots(
+    std::sync::Arc<
+        std::sync::Mutex<
+            Vec<(crate::harness::one_shot::Job, std::sync::Arc<dyn crate::harness::one_shot::OneShot>)>,
+        >,
+    >,
+);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestOneShots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestOneShots").finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeContext {
     mode: RuntimeMode,
@@ -90,6 +107,8 @@ pub struct RuntimeContext {
     config: Option<Value>,
     pub(crate) browser_anchors: std::sync::Arc<crate::console_auth::BrowserAnchors>,
     pub(crate) console_authority: Option<crate::console_auth::ConsoleAuthority>,
+    #[cfg(test)]
+    pub(crate) test_one_shots: TestOneShots,
 }
 
 /// A transport authority lock for this specific runtime handle.
@@ -170,6 +189,8 @@ impl RuntimeContext {
             config: None,
             browser_anchors: Default::default(),
             console_authority: None,
+            #[cfg(test)]
+            test_one_shots: Default::default(),
         }
     }
 
@@ -407,6 +428,8 @@ impl RuntimeContext {
             config,
             browser_anchors: Default::default(),
             console_authority: None,
+            #[cfg(test)]
+            test_one_shots: Default::default(),
         })
     }
 
@@ -445,6 +468,44 @@ impl RuntimeContext {
 
     pub fn console_port(&self) -> Option<u16> {
         self.console_port
+    }
+
+    /// Re-reads the selected runtime's configuration and dependency endpoints from its root while preserving
+    /// request-scoped test overrides on this context.
+    pub(crate) fn refreshed(&self) -> Result<Self, &'static str> {
+        let root = self.runtime_root().ok_or("runtime root is unavailable")?;
+        let mut next = Self::from_root(root)?;
+        next.console_port = self.console_port;
+        #[cfg(test)]
+        {
+            next.test_one_shots = self.test_one_shots.clone();
+        }
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_one_shot(
+        &self,
+        job: crate::harness::one_shot::Job,
+        model: std::sync::Arc<dyn crate::harness::one_shot::OneShot>,
+    ) {
+        let mut models = self.test_one_shots.0.lock().unwrap_or_else(|p| p.into_inner());
+        models.retain(|(existing, _)| *existing != job);
+        models.push((job, model));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_one_shot(
+        &self,
+        job: crate::harness::one_shot::Job,
+    ) -> Option<std::sync::Arc<dyn crate::harness::one_shot::OneShot>> {
+        self.test_one_shots
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|(existing, _)| *existing == job)
+            .map(|(_, model)| model.clone())
     }
 
     /// Resolve an internal relative path under the selected runtime area. Existing symlinks,

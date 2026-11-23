@@ -92,7 +92,7 @@ impl Fixture {
         }}}).to_string()).unwrap();
         let context = RuntimeContext::from_root(&root).unwrap();
         crate::digest::install_test_model(
-            context.runtime_root().unwrap(),
+            &context,
             Arc::new(FixtureModel { root: root.clone(), fault }),
         );
         let plan = Plan {

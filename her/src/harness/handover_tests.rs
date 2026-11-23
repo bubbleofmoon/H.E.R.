@@ -151,7 +151,7 @@ async fn rig(
         answer: Box::new(answer),
         hold: AtomicBool::new(false),
     });
-    crate::digest::install_test_model(context.runtime_root().unwrap(), summariser.clone());
+    crate::digest::install_test_model(&context, summariser.clone());
     let token = crate::conversation_authority::ensure_or_rotate(&context, OWNER, false).unwrap();
     let generation = crate::send_outbox::token_epoch(&token);
     Rig {
