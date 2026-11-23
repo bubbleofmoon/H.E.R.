@@ -70,34 +70,6 @@ fn unauthenticated_context(context: &RuntimeContext) -> RuntimeContext {
     unauth
 }
 
-pub(crate) fn open_protected_auth_file(path: &Path) -> Result<Option<fs::File>, String> {
-    let open = || {
-        let mut options = fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        #[cfg(windows)]
-        crate::guarded_file::no_follow(&mut options);
-        options.open(path)
-    };
-    match open() {
-        Ok(file) => {
-            let metadata = file.metadata().map_err(|_| GENERATION_UNAVAILABLE)?;
-            if !metadata.is_file() || crate::guarded_file::is_link(&metadata)
-                || crate::runtime::file_link_count(&file).ok() != Some(1)
-            {
-                return Err(GENERATION_UNAVAILABLE.to_string());
-            }
-            Ok(Some(file))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(GENERATION_UNAVAILABLE.to_string()),
-    }
-}
-
 /// Read only under the configuration gate. A bad existing marker stays distinct from absence.
 pub(crate) fn restore_generation(context: &RuntimeContext) -> Result<Option<Generation>, String> {
     if !context.is_isolated() {
@@ -105,7 +77,9 @@ pub(crate) fn restore_generation(context: &RuntimeContext) -> Result<Option<Gene
     }
     let resolve = || context.resolve_path(RuntimeArea::Data, RESTORE_GENERATION_FILE, PathIntent::ReadOptionalFile);
     let path = resolve()?;
-    let Some(mut file) = open_protected_auth_file(&path)? else { return Ok(None) };
+    let Some(mut file) = crate::guarded_fs::open_protected_file(&path).map_err(|_| GENERATION_UNAVAILABLE)? else {
+        return Ok(None);
+    };
     if resolve()? != path {
         return Err(GENERATION_UNAVAILABLE.to_string());
     }
@@ -136,7 +110,7 @@ pub(crate) fn rotate_restore_generation(context: &RuntimeContext) -> Result<Gene
         .map_err(|failure| Unpublished(failure.to_string()))?;
     staged.commit(&mut || {
         context.revalidate_atomic_target(area, name, &target)?;
-        open_protected_auth_file(&target)?;
+        crate::guarded_fs::open_protected_file(&target).map_err(|_| GENERATION_UNAVAILABLE.to_string())?;
         Ok(())
     }).map_err(|failure| {
         // Directory sync happens after replacement. Preserve the new marker and use rollback.
@@ -234,30 +208,20 @@ struct RotationIntent {
     configured: bool,
 }
 
-pub(crate) fn read_protected_auth_file(
-    context: &RuntimeContext, name: &str, limit: u64,
+fn read_rotation_file(
+    context: &RuntimeContext,
+    name: &str,
+    limit: u64,
 ) -> Result<Option<Vec<u8>>, String> {
-    let path = context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)?;
-    let Some(file) = open_protected_auth_file(&path).map_err(|_| ROTATION_UNAVAILABLE)? else {
-        return Ok(None);
-    };
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes).map_err(|_| ROTATION_UNAVAILABLE)?;
-    if bytes.len() as u64 > limit
-        || context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadFile)? != path
-    {
-        return Err(ROTATION_UNAVAILABLE.into());
-    }
-    Ok(Some(bytes))
+    context
+        .read_protected_data_file(name, limit)
+        .map_err(|_| ROTATION_UNAVAILABLE.to_string())
 }
 
-pub(crate) fn remove_auth_file(context: &RuntimeContext, name: &str) -> Result<(), String> {
-    let path = context.resolve_path(RuntimeArea::Data, name, PathIntent::ReadOptionalFile)?;
-    if open_protected_auth_file(&path).map_err(|_| ROTATION_UNAVAILABLE)?.is_some() {
-        context.remove_file(RuntimeArea::Data, name)?;
-    }
-    let parent = path.parent().ok_or(ROTATION_UNAVAILABLE)?;
-    crate::guarded_file::sync_directory(parent).map_err(|_| ROTATION_UNAVAILABLE.into())
+fn remove_rotation_file(context: &RuntimeContext, name: &str) -> Result<(), String> {
+    context
+        .remove_protected_data_file(name)
+        .map_err(|_| ROTATION_UNAVAILABLE.to_string())
 }
 
 fn file_digest(bytes: &[u8]) -> [u8; 32] {
@@ -282,7 +246,7 @@ pub(crate) fn ensure_credentials_ready(context: &RuntimeContext) -> Result<(), (
         return Err((503, crate::restore::RECOVERY_REASON.into()));
     }
     if context.is_isolated()
-        && !matches!(read_protected_auth_file(context, ROTATION_FILE, 4096), Ok(None))
+        && !matches!(read_rotation_file(context, ROTATION_FILE, 4096), Ok(None))
     {
         return Err((503, "console credentials require recovery".into()));
     }
@@ -307,7 +271,7 @@ fn config_with_token(mut cfg: serde_json::Value, token: &str, configured: bool) 
 }
 
 pub(crate) fn reconcile_token_rotation(context: &RuntimeContext) -> Result<(), String> {
-    let Some(bytes) = read_protected_auth_file(context, ROTATION_FILE, 4096)? else {
+    let Some(bytes) = read_rotation_file(context, ROTATION_FILE, 4096)? else {
         return Ok(());
     };
     let intent: RotationIntent = serde_json::from_slice(&bytes).map_err(|_| ROTATION_UNAVAILABLE)?;
@@ -316,7 +280,7 @@ pub(crate) fn reconcile_token_rotation(context: &RuntimeContext) -> Result<(), S
     let configured = configured_digest(&cfg);
     let old_mode = optional_digest_eq(configured, intent.prior_configured);
     let new_mode = optional_digest_eq(configured, intent.configured.then_some(intent.proposed));
-    let file = read_protected_auth_file(context, TOKEN_FILE, 1024 * 1024)?;
+    let file = read_rotation_file(context, TOKEN_FILE, 1024 * 1024)?;
     let on_disk = file.as_deref().map(file_digest);
     if (old_mode || new_mode) && optional_digest_eq(on_disk, Some(intent.proposed)) {
         let token = file.as_deref().and_then(|bytes| std::str::from_utf8(bytes).ok())
@@ -329,7 +293,7 @@ pub(crate) fn reconcile_token_rotation(context: &RuntimeContext) -> Result<(), S
     } else if !(old_mode && optional_digest_eq(on_disk, intent.prior_file)) {
         return Err(ROTATION_UNAVAILABLE.into());
     }
-    remove_auth_file(context, ROTATION_FILE)
+    remove_rotation_file(context, ROTATION_FILE)
 }
 
 #[cfg(feature = "parity-clock")]
@@ -349,7 +313,7 @@ pub(crate) fn rotate_console_token(
         .map_err(|_| read_error())?.ok_or_else(read_error)?;
     let cfg = parse_token_config(&before).map_err(unavailable)?;
     let token_file_error = || (500, "console token file is unavailable".to_string());
-    let prior_file = read_protected_auth_file(context, TOKEN_FILE, 1024 * 1024).map_err(|_| token_file_error())?;
+    let prior_file = read_rotation_file(context, TOKEN_FILE, 1024 * 1024).map_err(|_| token_file_error())?;
     let (target, staged) = context.stage_atomic_from(RuntimeArea::Data, TOKEN_FILE, &mut token.as_bytes())
         .map_err(|_| token_file_error())?;
     let intent = RotationIntent {
@@ -364,13 +328,13 @@ pub(crate) fn rotate_console_token(
     let (config_target, staged_config) = context.stage_atomic_from(RuntimeArea::Config, "config.json", &mut after.as_bytes())
         .map_err(|_| (500, "console token configuration is unavailable".to_string()))?;
     crate::settings::revoke_browser_sessions(context)?;
-    remove_auth_file(context, crate::console::DESKTOP_GRANTS_FILE).map_err(unavailable)?;
+    remove_rotation_file(context, crate::console::DESKTOP_GRANTS_FILE).map_err(unavailable)?;
     context.write_atomic(RuntimeArea::Data, ROTATION_FILE, &journal).map_err(unavailable)?;
     #[cfg(feature = "parity-clock")]
     rotation_fixture_cut("before-token");
     staged.commit(&mut || {
         context.revalidate_atomic_target(RuntimeArea::Data, TOKEN_FILE, &target)?;
-        open_protected_auth_file(&target)?;
+        crate::guarded_fs::open_protected_file(&target).map_err(|_| ROTATION_UNAVAILABLE.to_string())?;
         Ok::<(), String>(())
     }).map_err(|_| unavailable(String::new()))?;
     #[cfg(feature = "parity-clock")]
@@ -387,10 +351,10 @@ pub(crate) fn rotate_console_token(
         if still_old {
             let rollback = match prior_file {
                 Some(bytes) => context.write_atomic(RuntimeArea::Data, TOKEN_FILE, &bytes),
-                None => remove_auth_file(context, TOKEN_FILE),
+                None => remove_rotation_file(context, TOKEN_FILE),
             };
             if rollback.is_ok() {
-                remove_auth_file(context, ROTATION_FILE).map_err(unavailable)?;
+                remove_rotation_file(context, ROTATION_FILE).map_err(unavailable)?;
             }
         }
         return Err(unavailable(String::new()));
@@ -398,7 +362,7 @@ pub(crate) fn rotate_console_token(
     #[cfg(feature = "parity-clock")]
     rotation_fixture_cut("after-config");
     crate::console::record_config_publication(Ok(before), &after);
-    remove_auth_file(context, ROTATION_FILE).map_err(unavailable)
+    remove_rotation_file(context, ROTATION_FILE).map_err(unavailable)
 }
 
 const MEMORY_KIB: u32 = 19 * 1024;
