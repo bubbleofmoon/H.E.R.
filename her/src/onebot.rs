@@ -10,8 +10,6 @@
 //!   限速   maxSendPerMinute=8、maxSendPerHour=60
 //!   间隔   gapBaseMs + gapPerCharMs * 字数，上限 maxGapMs
 
-use std::io::{Read, Write};
-
 #[cfg(test)]
 thread_local! {
     // A response-barrier fixture may need longer than the cosmetic production deadline for fsync.
@@ -253,22 +251,32 @@ pub struct OneBot {
     host: String,
     port: u16,
     token: String,
-    strict_address: Option<std::net::SocketAddr>,
+    endpoint: Option<crate::loopback_http::LoopbackEndpoint>,
+    strict: bool,
+    transport: std::sync::Arc<dyn crate::loopback_http::Transport>,
 }
 
-pub(crate) struct PendingResponse(std::net::TcpStream);
+pub(crate) struct PendingResponse(crate::loopback_http::PendingHttpResponse);
 
 impl PendingResponse {
     pub(crate) fn outcome(self) -> Result<serde_json::Value, SendError> {
-        let (status, raw) = OneBot::read_response(self.0, None)
-            .map_err(|(_, detail)| SendError::Unknown(format!("OneBot HTTP 连接失败：{detail}")))?;
-        classify_send_reply(status, &raw)
+        let reply = self
+            .0
+            .read(crate::loopback_http::ResponseLimits::new(
+                crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+            ))
+            .map_err(|err| SendError::Unknown(format!("OneBot HTTP 连接失败：{}", err.detail)))?;
+        let raw = reply
+            .body_utf8()
+            .map_err(|detail| SendError::Unknown(format!("OneBot HTTP 连接失败：{detail}")))?;
+        classify_send_reply(reply.status, raw)
     }
 }
 
 #[cfg(test)]
 mod bounded_media_tests {
     use super::*;
+    use std::io::{Read, Write};
     #[test]
     fn hf119_typing_status_returns_when_gateway_never_answers() {
         let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -368,6 +376,16 @@ mod voice_send_tests {
 impl OneBot {
     pub fn new(http_url: &str, token: String) -> Self {
         let base = http_url.trim_end_matches('/');
+        if let Ok(ep) = crate::loopback_http::LoopbackEndpoint::parse(base) {
+            return Self {
+                host: ep.host().to_string(),
+                port: ep.port(),
+                token,
+                endpoint: Some(ep),
+                strict: false,
+                transport: std::sync::Arc::new(crate::loopback_http::TcpTransport),
+            };
+        }
         let host = base
             .trim_start_matches("http://")
             .split('/')
@@ -384,7 +402,14 @@ impl OneBot {
             .and_then(|hp| hp.split(':').nth(1))
             .and_then(|p| p.parse().ok())
             .unwrap_or(3000);
-        Self { host, port, token, strict_address: None }
+        Self {
+            host,
+            port,
+            token,
+            endpoint: None,
+            strict: false,
+            transport: std::sync::Arc::new(crate::loopback_http::TcpTransport),
+        }
     }
 
     /// Build a client for an explicitly selected loopback endpoint.
@@ -395,289 +420,366 @@ impl OneBot {
     /// non-zero port; IPv6 authorities keep their brackets for both connect and
     /// Host header formatting.
     pub fn try_new_url(http_url: &str, token: String) -> Result<Self, String> {
-        let authority = http_url
-            .strip_prefix("http://")
-            .ok_or_else(|| "OneBot endpoint must use http://".to_string())?;
-        if authority
-            .chars()
-            .any(|ch| matches!(ch, '/' | '?' | '#' | '@' | '\\'))
-        {
-            return Err("OneBot endpoint must be a bare loopback authority".to_string());
-        }
-        let (host, port_text, bracketed_host) = if let Some(bracketed) = authority.strip_prefix('[') {
-            let (host, remainder) = bracketed
-                .split_once(']')
-                .ok_or_else(|| "OneBot endpoint has an invalid IPv6 authority".to_string())?;
-            let port = remainder
-                .strip_prefix(':')
-                .ok_or_else(|| "OneBot endpoint requires an explicit port".to_string())?;
-            (host, port, true)
-        } else {
-            let (host, port) = authority
-                .rsplit_once(':')
-                .ok_or_else(|| "OneBot endpoint requires an explicit port".to_string())?;
-            (host, port, false)
-        };
-        let address = host
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| "OneBot endpoint host must be a literal loopback IP".to_string())?;
-        if address.is_ipv6() != bracketed_host {
-            return Err("IPv6 OneBot endpoints must use bracketed authority syntax".to_string());
-        }
-        if !address.is_loopback() {
-            return Err("OneBot endpoint must use a loopback IP".to_string());
-        }
-        let port = port_text
-            .parse::<u16>()
-            .ok()
-            .filter(|port| *port != 0)
-            .ok_or_else(|| "OneBot endpoint requires an explicit non-zero port".to_string())?;
-        let host = match address {
-            std::net::IpAddr::V4(address) => address.to_string(),
-            std::net::IpAddr::V6(address) => format!("[{address}]"),
-        };
-        Ok(Self {
-            host,
-            port,
+        let ep = crate::loopback_http::LoopbackEndpoint::parse(http_url)?;
+        Ok(Self::from_endpoint(
+            ep,
             token,
-            strict_address: Some(std::net::SocketAddr::new(address, port)),
-        })
+            std::sync::Arc::new(crate::loopback_http::TcpTransport),
+        ))
+    }
+
+    pub(crate) fn try_new_authority(authority: &str, token: String) -> Result<Self, String> {
+        let ep = crate::loopback_http::LoopbackEndpoint::parse_authority(authority)?;
+        Ok(Self::from_endpoint(
+            ep,
+            token,
+            std::sync::Arc::new(crate::loopback_http::TcpTransport),
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_transport(
+        http_url: &str,
+        token: String,
+        transport: std::sync::Arc<dyn crate::loopback_http::Transport>,
+    ) -> Result<Self, String> {
+        let ep = crate::loopback_http::LoopbackEndpoint::parse(http_url)?;
+        Ok(Self::from_endpoint(ep, token, transport))
+    }
+
+    fn from_endpoint(
+        ep: crate::loopback_http::LoopbackEndpoint,
+        token: String,
+        transport: std::sync::Arc<dyn crate::loopback_http::Transport>,
+    ) -> Self {
+        Self {
+            host: ep.host().to_string(),
+            port: ep.port(),
+            token,
+            endpoint: Some(ep),
+            strict: true,
+            transport,
+        }
     }
 
     /// 调任意 OneBot action（贴纸同步等非发送类操作要用）。
     pub fn request(&self, action: &str, params: serde_json::Value) -> Option<serde_json::Value> {
-        let body = params.to_string();
-        let raw = self.post(&format!("/{action}"), &body)?;
-        serde_json::from_str(&raw).ok()
+        let reply = self
+            .post_raw(
+                &format!("/{action}"),
+                &params.to_string(),
+                crate::loopback_http::Deadlines::split(
+                    crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                    crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                    crate::loopback_http::DEFAULT_READ_TIMEOUT,
+                ),
+                crate::loopback_http::ResponseLimits::new(
+                    crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+                ),
+            )
+            .ok()?;
+        reply
+            .parse_json::<serde_json::Value>(
+                crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd,
+            )
+            .ok()
+            .map(|(v, _)| v)
     }
 
     /// Like `request`, with a longer read deadline (voice readback waits up to 30 s).
-    pub fn request_with_timeout(&self, action: &str, params: serde_json::Value, timeout: std::time::Duration) -> Option<serde_json::Value> {
-        let (_, raw) = self.post_with_timeout(&format!("/{action}"), &params.to_string(), None, timeout).ok()?;
-        serde_json::from_str(&raw).ok()
+    pub fn request_with_timeout(
+        &self,
+        action: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Option<serde_json::Value> {
+        let reply = self
+            .post_raw(
+                &format!("/{action}"),
+                &params.to_string(),
+                crate::loopback_http::Deadlines::split(
+                    crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                    crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                    timeout,
+                ),
+                crate::loopback_http::ResponseLimits::new(
+                    crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+                ),
+            )
+            .ok()?;
+        reply
+            .parse_json::<serde_json::Value>(
+                crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd,
+            )
+            .ok()
+            .map(|(v, _)| v)
     }
 
     /// Read-only metadata request, bounded across connect/write/read by one absolute deadline.
-    pub fn request_with_deadline(&self, action: &str, params: serde_json::Value, deadline: std::time::Instant) -> Result<serde_json::Value, String> {
-        if self.strict_address.is_none() { return Err("a selected loopback endpoint is required".into()); }
-        let stream = self.transmit_until(&format!("/{action}"), &params.to_string(), deadline)
-            .map_err(|(_, reason)| reason)?;
-        let (status, body) = Self::read_response_until(stream, Some(64 * 1024), Some(deadline))
-            .map_err(|(_, reason)| reason)?;
-        if status != 200 { return Err(format!("gateway returned HTTP {status}")); }
-        serde_json::from_str(&body).map_err(|_| "gateway response is not JSON".into())
+    pub fn request_with_deadline(
+        &self,
+        action: &str,
+        params: serde_json::Value,
+        deadline: std::time::Instant,
+    ) -> Result<serde_json::Value, String> {
+        if !self.strict {
+            return Err("a selected loopback endpoint is required".into());
+        }
+        let total = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| "request deadline exceeded".to_string())?;
+        let reply = self
+            .post_raw(
+                &format!("/{action}"),
+                &params.to_string(),
+                crate::loopback_http::Deadlines::within(
+                    total,
+                    crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                ),
+                crate::loopback_http::ResponseLimits::new(64 * 1024),
+            )
+            .map_err(|err| err.detail)?;
+        if reply.status != 200 {
+            return Err(format!("gateway returned HTTP {}", reply.status));
+        }
+        reply
+            .parse_json::<serde_json::Value>(
+                crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd,
+            )
+            .map(|(v, _)| v)
+            .map_err(|_| "gateway response is not JSON".into())
     }
 
     /// Cosmetic typing status: bounded connect/write/read, never a prerequisite for a send.
     pub fn set_input_status(&self, user_id: i64, event_type: u8) {
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-        let address = self.strict_address.or_else(|| {
-            let ip = if self.host == "localhost" { IpAddr::V4(Ipv4Addr::LOCALHOST) }
-                else { self.host.parse().ok()? };
-            Some(SocketAddr::new(ip,self.port))
-        });
-        // DNS resolution has no bounded std API; cosmetic status may be skipped for legacy DNS hosts.
-        let Some(address) = address else { return };
+        if self.endpoint.is_none() {
+            return;
+        }
         let budget = std::time::Duration::from_millis(250);
         #[cfg(test)]
         let (budget, returned) = INPUT_STATUS_TEST.with(|slot| {
-            slot.borrow().as_ref().map(|(budget, returned)| (*budget, Some(returned.clone())))
+            slot.borrow()
+                .as_ref()
+                .map(|(budget, returned)| (*budget, Some(returned.clone())))
                 .unwrap_or((budget, None))
         });
         #[cfg(test)]
         let _returned = InputStatusReturned(if event_type == 0 { returned } else { None });
-        let deadline = std::time::Instant::now() + budget;
-        let Ok(mut stream) = TcpStream::connect_timeout(&address,std::time::Duration::from_millis(250)) else {return};
-        let body = serde_json::json!({"user_id":user_id,"event_type":event_type}).to_string();
-        let request = format!("POST /set_input_status HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n{body}",self.host,self.port,body.len(),self.token);
-        let mut remaining = request.as_bytes();
-        while !remaining.is_empty() {
-            let Some(budget) = deadline.checked_duration_since(std::time::Instant::now()).filter(|b|!b.is_zero()) else {return};
-            if stream.set_write_timeout(Some(budget)).is_err() {return;}
-            match stream.write(remaining) {
-                Ok(0) => return,
-                Ok(count) => remaining=&remaining[count..],
-                Err(error) if error.kind()==std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
-            }
-        }
-        let mut response=[0;4096];
-        let mut read=0;
-        while read<response.len() {
-            let Some(budget) = deadline.checked_duration_since(std::time::Instant::now()).filter(|b|!b.is_zero()) else {return};
-            if stream.set_read_timeout(Some(budget)).is_err() {return;}
-            match stream.read(&mut response[read..]) {
-                Ok(0) => return,
-                Ok(count) => read+=count,
-                Err(error) if error.kind()==std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
-            }
-        }
+        let body = serde_json::json!({"user_id": user_id, "event_type": event_type}).to_string();
+        let _ = self.post_raw(
+            "/set_input_status",
+            &body,
+            crate::loopback_http::Deadlines::within(
+                budget,
+                std::time::Duration::from_millis(250),
+            ),
+            crate::loopback_http::ResponseLimits::new(4096),
+        );
     }
 
     /// Send one voice (`record` segment holding a local file path) and classify the outcome like
     /// `send_one_outcome`. The gateway converts to SILK before answering, so the deadline is 60 s.
-    pub fn send_record_outcome(&self, target: &Target, file: &str) -> Result<serde_json::Value, SendError> {
+    pub fn send_record_outcome(
+        &self,
+        target: &Target,
+        file: &str,
+    ) -> Result<serde_json::Value, SendError> {
         self.send_record_outcome_within(target, file, std::time::Duration::from_secs(60))
     }
 
-    fn send_record_outcome_within(&self, target: &Target, file: &str, deadline: std::time::Duration) -> Result<serde_json::Value, SendError> {
+    fn send_record_outcome_within(
+        &self,
+        target: &Target,
+        file: &str,
+        deadline: std::time::Duration,
+    ) -> Result<serde_json::Value, SendError> {
         let segments = serde_json::json!([{ "type": "record", "data": { "file": file } }]);
         let payload = match target {
             Target::Group(id) => serde_json::json!({ "group_id": id, "message": segments }),
             Target::Private(id) => serde_json::json!({ "user_id": id, "message": segments }),
         };
-        let (http_status, raw) = self
-            .post_with_timeout(&format!("/{}", target.action()), &payload.to_string(), None, deadline)
-            .map_err(|(reached, detail)| {
-                let message = self.send_connection_error(detail);
-                if reached { SendError::Unknown(message) } else { SendError::NotCommitted(message) }
-            })?;
-        classify_send_reply(http_status, &raw)
+        self.post_classified_outcome(
+            &format!("/{}", target.action()),
+            &payload.to_string(),
+            crate::loopback_http::Deadlines::split(
+                crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                deadline,
+            ),
+        )
     }
 
     /// Media replies must be bounded on the wire, before JSON/base64 copies.
-    pub fn request_bounded(&self, action: &str, params: serde_json::Value, max_bytes: usize) -> Option<serde_json::Value> {
-        let (_, raw) = self.post_with_status_limit(&format!("/{action}"), &params.to_string(), Some(max_bytes)).ok()?;
-        serde_json::from_str(&raw).ok()
+    pub fn request_bounded(
+        &self,
+        action: &str,
+        params: serde_json::Value,
+        max_bytes: usize,
+    ) -> Option<serde_json::Value> {
+        let reply = self
+            .post_raw(
+                &format!("/{action}"),
+                &params.to_string(),
+                crate::loopback_http::Deadlines::split(
+                    crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                    crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                    crate::loopback_http::DEFAULT_READ_TIMEOUT,
+                ),
+                crate::loopback_http::ResponseLimits::new(max_bytes),
+            )
+            .ok()?;
+        reply
+            .parse_json::<serde_json::Value>(
+                crate::loopback_http::JsonSurrogates::ReplaceLoneWithFffd,
+            )
+            .ok()
+            .map(|(v, _)| v)
     }
 
-    fn post(&self, path: &str, body: &str) -> Option<String> {
-        self.post_detailed(path, body).ok()
+    pub(crate) fn post_raw(
+        &self,
+        path: &str,
+        body: &str,
+        deadlines: crate::loopback_http::Deadlines,
+        limits: crate::loopback_http::ResponseLimits,
+    ) -> Result<crate::loopback_http::HttpResponse, crate::loopback_http::HttpError> {
+        let endpoint = self.require_endpoint()?;
+        let auth = self.bearer_header();
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(auth) = auth.as_deref() {
+            headers.push(("Authorization", auth));
+        }
+        let req = crate::loopback_http::HttpRequest {
+            method: "POST",
+            path,
+            headers: &headers,
+            body: Some(body.as_bytes()),
+        };
+        crate::loopback_http::request(&*self.transport, endpoint, &req, deadlines, limits)
+    }
+
+    pub(crate) fn get_raw_path(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+        max_body_bytes: usize,
+    ) -> Result<crate::loopback_http::HttpResponse, crate::loopback_http::HttpError> {
+        let endpoint = self.require_endpoint()?;
+        let auth = self.bearer_header();
+        let mut headers = Vec::new();
+        if let Some(auth) = auth.as_deref() {
+            headers.push(("Authorization", auth));
+        }
+        let req = crate::loopback_http::HttpRequest {
+            method: "GET",
+            path,
+            headers: &headers,
+            body: None,
+        };
+        crate::loopback_http::request(
+            &*self.transport,
+            endpoint,
+            &req,
+            crate::loopback_http::Deadlines::with_shared_transmit(
+                std::time::Duration::from_secs(10),
+                timeout,
+            ),
+            crate::loopback_http::ResponseLimits::new(max_body_bytes),
+        )
+    }
+
+    fn transmit_raw(
+        &self,
+        path: &str,
+        body: &str,
+    ) -> Result<crate::loopback_http::PendingHttpResponse, crate::loopback_http::HttpError> {
+        let endpoint = self.require_endpoint()?;
+        let auth = self.bearer_header();
+        let mut headers = vec![("Content-Type", "application/json")];
+        if let Some(auth) = auth.as_deref() {
+            headers.push(("Authorization", auth));
+        }
+        let req = crate::loopback_http::HttpRequest {
+            method: "POST",
+            path,
+            headers: &headers,
+            body: Some(body.as_bytes()),
+        };
+        crate::loopback_http::transmit(
+            &*self.transport,
+            endpoint,
+            &req,
+            crate::loopback_http::Deadlines::split(
+                crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                crate::loopback_http::DEFAULT_READ_TIMEOUT,
+            ),
+        )
+    }
+
+    fn require_endpoint(&self) -> Result<&crate::loopback_http::LoopbackEndpoint, crate::loopback_http::HttpError> {
+        self.endpoint.as_ref().ok_or_else(|| {
+            crate::loopback_http::HttpError::not_committed(
+                false,
+                "OneBot endpoint must be a valid loopback HTTP URL",
+            )
+        })
+    }
+
+    fn bearer_header(&self) -> Option<String> {
+        (!self.token.is_empty()).then(|| format!("Bearer {}", self.token))
+    }
+
+    fn post_classified_outcome(
+        &self,
+        path: &str,
+        body: &str,
+        deadlines: crate::loopback_http::Deadlines,
+    ) -> Result<serde_json::Value, SendError> {
+        let reply = self
+            .post_raw(
+                path,
+                body,
+                deadlines,
+                crate::loopback_http::ResponseLimits::new(
+                    crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+                ),
+            )
+            .map_err(|err| {
+                let message = self.send_connection_error(err.detail);
+                if err.status == crate::loopback_http::CommitStatus::Unknown {
+                    SendError::Unknown(message)
+                } else {
+                    SendError::NotCommitted(message)
+                }
+            })?;
+        let raw = reply
+            .body_utf8()
+            .map_err(|detail| SendError::Unknown(self.send_connection_error(detail)))?;
+        classify_send_reply(reply.status, raw)
     }
 
     fn post_detailed(&self, path: &str, body: &str) -> Result<String, String> {
-        self.post_classified(path, body).map_err(|(_, detail)| detail)
-    }
-
-    /// Like `post_detailed`, but reports whether the request bytes may already have reached the
-    /// gateway. `false` only for failures before any write; a write error or later failure is
-    /// conservatively reported as possibly delivered.
-    fn post_classified(&self, path: &str, body: &str) -> Result<String, (bool, String)> {
-        self.post_with_status(path, body).map(|(_, body)| body)
-    }
-
-    /// `post_classified` that also returns the HTTP status code of the reply.
-    fn post_with_status(&self, path: &str, body: &str) -> Result<(u16, String), (bool, String)> {
-        self.post_with_status_limit(path, body, None)
-    }
-
-    fn post_with_status_limit(&self, path: &str, body: &str, max_bytes: Option<usize>) -> Result<(u16, String), (bool, String)> {
-        let s = self.transmit(path, body)?;
-        Self::read_response(s, max_bytes)
-    }
-
-    /// Like `post_with_status_limit` with a caller-chosen read deadline (voice waits for SILK conversion).
-    fn post_with_timeout(&self, path: &str, body: &str, max_bytes: Option<usize>, timeout: std::time::Duration) -> Result<(u16, String), (bool, String)> {
-        let s = self.transmit(path, body)?;
-        s.set_read_timeout(Some(timeout)).map_err(|error| (true, format!("set read timeout: {error}")))?;
-        Self::read_response(s, max_bytes)
-    }
-
-    // A successful return means the entire request has been handed to the socket. Callers may
-    // release submission coordination here; waiting for the peer must not hold that gate.
-    fn transmit(&self, path: &str, body: &str) -> Result<std::net::TcpStream, (bool, String)> {
-        self.transmit_until(path, body, std::time::Instant::now() + std::time::Duration::from_secs(15))
-    }
-
-    fn transmit_until(&self, path: &str, body: &str, deadline: std::time::Instant) -> Result<std::net::TcpStream, (bool, String)> {
-        let budget = deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero())
-            .ok_or_else(|| (false, "request deadline exceeded".to_string()))?;
-        let address = self
-            .strict_address
-            .map(|address| address.to_string())
-            .unwrap_or_else(|| format!("{}:{}", self.host, self.port));
-        let mut s = match self.strict_address {
-            Some(address) => std::net::TcpStream::connect_timeout(&address, budget.min(std::time::Duration::from_secs(5))),
-            None => std::net::TcpStream::connect(&address),
-        }
-        .map_err(|error| (false, format!("connect {address}: {error} (raw_os={:?})", error.raw_os_error())))?;
-        s.set_read_timeout(Some(std::time::Duration::from_secs(15)))
-            .map_err(|error| (false, format!("set read timeout: {error}")))?;
-        if self.strict_address.is_some() {
-            s.set_write_timeout(Some(std::time::Duration::from_secs(15)))
-                .map_err(|error| (false, format!("set write timeout: {error}")))?;
-        }
-        let req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n{}",
-            self.host,
-            self.port,
-            body.len(),
-            self.token,
-            body
-        );
-        // Each write uses the remaining total budget, so a slowly draining peer cannot
-        // extend authority ownership indefinitely through repeated partial writes.
-        if self.strict_address.is_some() {
-            let mut remaining = req.as_bytes();
-            while !remaining.is_empty() {
-                let budget = deadline.checked_duration_since(std::time::Instant::now())
-                    .filter(|budget| !budget.is_zero())
-                    .ok_or_else(|| (true, "write request: transmission deadline exceeded".to_string()))?;
-                s.set_write_timeout(Some(budget))
-                    .map_err(|error| (true, format!("set write timeout: {error}")))?;
-                match s.write(remaining) {
-                    Ok(0) => return Err((true, "write request: connection closed".to_string())),
-                    Ok(count) => remaining = &remaining[count..],
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err((true, format!("write request: {error} (raw_os={:?})", error.raw_os_error()))),
-                }
-            }
-        } else {
-            // Any attempted write may leave a partial request in flight.
-            s.write_all(req.as_bytes())
-                .map_err(|error| (true, format!("write request: {error} (raw_os={:?})", error.raw_os_error())))?;
-        }
-        Ok(s)
-    }
-
-    fn read_response(s: std::net::TcpStream, max_bytes: Option<usize>) -> Result<(u16, String), (bool, String)> {
-        Self::read_response_until(s, max_bytes, None)
-    }
-
-    fn read_response_until(mut s: std::net::TcpStream, max_bytes: Option<usize>, deadline: Option<std::time::Instant>) -> Result<(u16, String), (bool, String)> {
-        let mut buf = String::new();
-        let wire_limit = max_bytes.map(|n| n.saturating_add(16 * 1024));
-        if let Some(deadline) = deadline {
-            let mut bytes = Vec::new();
-            let mut block = [0; 8192];
-            loop {
-                let remaining = deadline.checked_duration_since(std::time::Instant::now()).filter(|d| !d.is_zero())
-                    .ok_or_else(|| (true, "response deadline exceeded".to_string()))?;
-                s.set_read_timeout(Some(remaining)).map_err(|e| (true, format!("set response deadline: {e}")))?;
-                match s.read(&mut block) {
-                    Ok(0) => break,
-                    Ok(n) => bytes.extend_from_slice(&block[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err((true, format!("read response: {e}"))),
-                }
-                if wire_limit.is_some_and(|limit| bytes.len() > limit) { return Err((true, "response exceeds metadata limit".into())); }
-            }
-            buf = String::from_utf8(bytes).map_err(|_| (true, "response is not UTF-8".into()))?;
-        } else {
-            (&mut s).take(wire_limit.map(|n| n as u64 + 1).unwrap_or(u64::MAX)).read_to_string(&mut buf)
-                .map_err(|error| (true, format!("read response: {error} (raw_os={:?})", error.raw_os_error())))?;
-        }
-        if wire_limit.is_some_and(|n| buf.len() > n) {
-            return Err((true, "response exceeds media limit".to_string()));
-        }
-        let (head, b) = buf
-            .split_once("\r\n\r\n")
-            .ok_or_else(|| (true, "response has no HTTP header/body separator".to_string()))?;
-        if max_bytes.is_some_and(|n| b.len() > n || head.len() > 16 * 1024) {
-            return Err((true, "response exceeds media limit".to_string()));
-        }
-        let http_status = head
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .and_then(|code| code.parse::<u16>().ok())
-            .unwrap_or(0);
-        Ok((http_status, b.to_string()))
+        let reply = self
+            .post_raw(
+                path,
+                body,
+                crate::loopback_http::Deadlines::split(
+                    crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                    crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                    crate::loopback_http::DEFAULT_READ_TIMEOUT,
+                ),
+                crate::loopback_http::ResponseLimits::new(
+                    crate::loopback_http::DEFAULT_MAX_BODY_BYTES,
+                ),
+            )
+            .map_err(|err| err.detail)?;
+        reply.body_utf8().map(str::to_string)
     }
 
     fn send_connection_error(&self, detail: String) -> String {
-        if self.strict_address.is_some() {
+        if self.strict {
             format!("OneBot HTTP 连接失败：{detail}")
         } else {
             "OneBot HTTP 连接失败".to_string()
@@ -730,17 +832,15 @@ impl OneBot {
         action: &str,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, SendError> {
-        let (http_status, raw) = self
-            .post_with_status(&format!("/{action}"), &payload.to_string())
-            .map_err(|(reached, detail)| {
-                let message = self.send_connection_error(detail);
-                if reached {
-                    SendError::Unknown(message)
-                } else {
-                    SendError::NotCommitted(message)
-                }
-            })?;
-        classify_send_reply(http_status, &raw)
+        self.post_classified_outcome(
+            &format!("/{action}"),
+            &payload.to_string(),
+            crate::loopback_http::Deadlines::split(
+                crate::loopback_http::DEFAULT_CONNECT_TIMEOUT,
+                crate::loopback_http::DEFAULT_WRITE_TIMEOUT,
+                crate::loopback_http::DEFAULT_READ_TIMEOUT,
+            ),
+        )
     }
 
     pub(crate) fn transmit_payload(
@@ -748,11 +848,15 @@ impl OneBot {
         action: &str,
         payload: &serde_json::Value,
     ) -> Result<PendingResponse, SendError> {
-        self.transmit(&format!("/{action}"), &payload.to_string())
+        self.transmit_raw(&format!("/{action}"), &payload.to_string())
             .map(PendingResponse)
-            .map_err(|(reached, detail)| {
-                let message = self.send_connection_error(detail);
-                if reached { SendError::Unknown(message) } else { SendError::NotCommitted(message) }
+            .map_err(|err| {
+                let message = self.send_connection_error(err.detail);
+                if err.status == crate::loopback_http::CommitStatus::Unknown {
+                    SendError::Unknown(message)
+                } else {
+                    SendError::NotCommitted(message)
+                }
             })
     }
 
@@ -879,7 +983,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use std::io::{Read as _, Write as _};
     use std::net::{TcpListener, TcpStream};
 
     #[test]
@@ -1277,5 +1381,124 @@ mod tests {
         assert_eq!(Target::Private(2).action(), "send_private_msg");
         assert_eq!(Target::Group(1).key(), "group:1");
         assert_eq!(Target::Private(2).key(), "private:2");
+    }
+
+    fn chunked_http(status: &str, body: &str, split_at: usize) -> Vec<u8> {
+        let (a, b) = body.split_at(split_at.min(body.len()));
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        if !a.is_empty() {
+            out.push_str(&format!("{:x}\r\n{}\r\n", a.len(), a));
+        }
+        if !b.is_empty() {
+            out.push_str(&format!("{:x}\r\n{}\r\n", b.len(), b));
+        }
+        out.push_str("0\r\n\r\n");
+        out.into_bytes()
+    }
+
+    #[test]
+    fn issue124_onebot_decodes_chunked_responses_and_caps_decoded_body() {
+        use crate::loopback_http::test_support::{MemoryTransport, ScriptedStreamConfig, Step};
+        let payload = r#"{"status":"ok","retcode":0,"data":{"message_id":42,"note":"hi \ud83d"}}"#;
+        let wire = chunked_http("200 OK", payload, 18);
+        let transport = std::sync::Arc::new(MemoryTransport::new(vec![
+            Step::Stream(ScriptedStreamConfig::reply_bytes(wire.clone())),
+            Step::Stream(ScriptedStreamConfig::reply_bytes(wire.clone())),
+            Step::Stream(ScriptedStreamConfig::reply_bytes(wire)),
+        ]));
+        let ob = OneBot::with_transport(
+            "http://127.0.0.1:43103",
+            "tok".into(),
+            transport.clone(),
+        )
+        .unwrap();
+
+        // request() decodes chunked body and replaces lone surrogate.
+        let reply = ob.request("get_msg", serde_json::json!({"message_id": 1})).unwrap();
+        assert_eq!(reply["data"]["message_id"], 42);
+        assert_eq!(reply["data"]["note"], "hi \u{FFFD}");
+
+        // request_bounded() applies cap to decoded body length (payload.len() fits, payload.len() - 1 fails).
+        let exact = ob.request_bounded("get_image", serde_json::json!({"file": "a.png"}), payload.len());
+        assert!(exact.is_some());
+        let too_small = ob.request_bounded("get_image", serde_json::json!({"file": "a.png"}), payload.len() - 1);
+        assert!(too_small.is_none());
+        assert_eq!(transport.connect_count(), 3);
+    }
+
+    #[test]
+    fn onebot_send_failure_modes_preserve_not_committed_vs_unknown_across_transport_seam() {
+        use crate::loopback_http::test_support::{MemoryTransport, ScriptedStreamConfig, Step};
+        use std::collections::VecDeque;
+        use std::io::ErrorKind;
+
+        let transport = std::sync::Arc::new(MemoryTransport::new(vec![
+            // 1. Connect refused -> NotCommitted.
+            Step::ConnectError(ErrorKind::ConnectionRefused, "refused"),
+            // 2. Connect timeout -> NotCommitted.
+            Step::ConnectError(ErrorKind::TimedOut, "connect timed out"),
+            // 3. HTTP 403 refusal -> NotCommitted.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            )),
+            // 4. HTTP 429 -> Unknown (OneBot 429 is outside request-level refusals).
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            )),
+            // 5. HTTP 503 -> Unknown.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            )),
+            // 6. Read timeout after write -> Unknown.
+            Step::Stream(ScriptedStreamConfig {
+                write_plan: Vec::new(),
+                read_plan: VecDeque::from([Err(ErrorKind::TimedOut)]),
+                delay_per_read: std::time::Duration::ZERO,
+                delay_per_write: std::time::Duration::ZERO,
+            }),
+            // 7. HTTP 200 with empty body -> Unknown.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            )),
+            // 8. HTTP 200 with non-ok envelope (retcode 200) -> Unknown.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(chunked_http(
+                "200 OK",
+                r#"{"status":"failed","retcode":200,"wording":"timeout"}"#,
+                12,
+            ))),
+            // 9. HTTP 200 with definite refusal envelope (retcode 1404) -> NotCommitted.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(chunked_http(
+                "200 OK",
+                r#"{"status":"failed","retcode":1404,"wording":"unknown action"}"#,
+                15,
+            ))),
+            // 10. Input status posts to /set_input_status.
+            Step::Stream(ScriptedStreamConfig::reply_bytes(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            )),
+        ]));
+        let ob = OneBot::with_transport(
+            "http://127.0.0.1:43103",
+            "tok".into(),
+            transport.clone(),
+        )
+        .unwrap();
+        let target = Target::Group(101);
+
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::NotCommitted(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::NotCommitted(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::NotCommitted(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::Unknown(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::Unknown(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::Unknown(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::Unknown(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::Unknown(_))));
+        assert!(matches!(ob.send_one_outcome(&target, "a", None, None), Err(SendError::NotCommitted(_))));
+        ob.set_input_status(77, 1);
+
+        let reqs = transport.written_requests();
+        assert!(reqs.last().unwrap().starts_with("POST /set_input_status HTTP/1.1"));
     }
 }

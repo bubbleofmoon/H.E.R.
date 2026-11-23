@@ -3066,35 +3066,7 @@ fn contained_path(root: &Path, relative: &str, directory: bool) -> Result<PathBu
 }
 
 pub(crate) fn is_loopback_http_endpoint(url: &str) -> bool {
-    let Some(authority) = url.strip_prefix("http://") else {
-        return false;
-    };
-    if authority
-        .chars()
-        .any(|ch| matches!(ch, '/' | '?' | '#' | '@'))
-    {
-        return false;
-    }
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-        let Some((host, rest)) = bracketed.split_once(']') else {
-            return false;
-        };
-        let Some(port) = rest.strip_prefix(':') else {
-            return false;
-        };
-        (host, port)
-    } else {
-        let Some((host, port)) = authority.rsplit_once(':') else {
-            return false;
-        };
-        (host, port)
-    };
-    if port.parse::<u16>().map(|value| value != 0).unwrap_or(false) == false {
-        return false;
-    }
-    host.parse::<IpAddr>()
-        .map(|address| address.is_loopback())
-        .unwrap_or(false)
+    crate::loopback_http::LoopbackEndpoint::parse(url).is_ok()
 }
 
 /// Validate a single canonical live conversation key from either the CLI or a rollout array.
