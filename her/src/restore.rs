@@ -410,66 +410,60 @@ trait Control {
 
 /// Restore also requires the configured live owner to have published its own ready heartbeat.
 fn live_ready(context: &RuntimeContext) -> Result<(), String> {
-    use crate::lifecycle::{self, OwnerGate, OwnerProbe, LIVE_LOCK};
+    use crate::lifecycle::{
+        verify_live_heartbeat, verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation,
+        OwnerRole, ProbeMode,
+    };
     let cfg = context.load_config().map_err(str::to_owned)?;
     let target = crate::watchdog::live_target_from_config(&cfg)?;
     if target.groups.is_empty() {
         return Ok(());
     }
-    lifecycle::validate_existing_owner_gate_paths(context.data_dir())?;
-    let marker =
-        match OwnerGate::new(context.data_dir().join("logs").join(LIVE_LOCK)).probe_existing() {
-            OwnerProbe::Held {
-                marker: Some(marker),
-            } if marker.role == "live" => marker,
-            _ => return Err("configured live owner is not held or cannot be identified".into()),
-        };
-    let me = crate::process_identity::current_identity()?;
-    if !crate::lifecycle_cli::authorized_image(&me.exe, &marker.identity.exe)
-        || crate::process_identity::check_identity(&marker.identity)
-            != crate::process_identity::Liveness::Matches
-    {
-        return Err("live owner identity cannot be verified".into());
-    }
-    let same_groups = |actual: &[String]| {
-        actual.len() == target.groups.len() && target.groups.iter().all(|g| actual.contains(g))
-    };
-    if !marker.groups.as_deref().is_some_and(same_groups) {
-        return Err("live owner does not serve the configured groups".into());
-    }
-    let text = context
-        .read_optional_text(RuntimeArea::Data, "rust-heartbeat-live.json")?
-        .ok_or("live heartbeat is missing")?;
-    let heartbeat: Value = serde_json::from_str(&text).map_err(|_| "live heartbeat is invalid")?;
-    if heartbeat["pid"].as_u64() != Some(u64::from(marker.identity.pid))
-        || !heartbeat["ts"]
-            .as_f64()
-            .is_some_and(|ts| ts >= marker.acquired_at as f64)
-    {
-        return Err("live heartbeat does not belong to the current owner".into());
-    }
-    match crate::watchdog::read_heartbeat(Ok(text.into_bytes()), crate::parity_clock::now_ms()) {
-        crate::watchdog::Heartbeat::Fresh { live: true, groups } if same_groups(&groups) => Ok(()),
-        _ => Err("live heartbeat is not ready for the configured groups".into()),
+    let mut backend = LiveLifecycle;
+    match verify_owner(
+        &mut backend,
+        context.data_dir(),
+        OwnerRole::Live,
+        &ImagePolicy::SameReleaseTwin,
+        ProbeMode::Existing,
+    ) {
+        OwnerObservation::Verified(owner) => {
+            verify_live_heartbeat(&mut backend, context.data_dir(), &owner.marker, &target.groups)
+        }
+        OwnerObservation::Mismatch {
+            marker: Some(_), ..
+        } => Err("live owner identity cannot be verified".into()),
+        OwnerObservation::Free { .. } | OwnerObservation::Mismatch { .. } => {
+            Err("configured live owner is not held or cannot be identified".into())
+        }
+        OwnerObservation::Unknown(reason) => Err(reason),
     }
 }
 
 struct RealControl;
 impl Control for RealControl {
     fn preflight(&mut self, context: &RuntimeContext) -> Result<(), String> {
-        use crate::lifecycle::{OwnerGate, OwnerProbe, SUPERVISOR_LOCK};
-        crate::lifecycle_cli::stoppable_owners(context.data_dir(), false)?;
-        let me = crate::process_identity::current_identity()?;
-        match OwnerGate::new(context.data_dir().join("logs").join(SUPERVISOR_LOCK)).probe() {
-            OwnerProbe::Held { marker: Some(m) }
-                if m.role == "supervisor"
-                    && crate::lifecycle_cli::authorized_image(&me.exe, &m.identity.exe)
-                    && crate::process_identity::check_identity(&m.identity)
-                        == crate::process_identity::Liveness::Matches =>
-            {
-                Ok(())
-            }
-            OwnerProbe::Free { .. } => Ok(()),
+        use crate::lifecycle::{
+            collect_verified_owners, verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation,
+            OwnerRole, ProbeMode,
+        };
+        let mut backend = LiveLifecycle;
+        collect_verified_owners(
+            &mut backend,
+            context.data_dir(),
+            &[OwnerRole::Live, OwnerRole::Console],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+            None,
+        )?;
+        match verify_owner(
+            &mut backend,
+            context.data_dir(),
+            OwnerRole::Supervisor,
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        ) {
+            OwnerObservation::Verified(_) | OwnerObservation::Free { .. } => Ok(()),
             _ => Err("supervisor owner cannot be verified for restore".into()),
         }
     }
@@ -482,12 +476,20 @@ impl Control for RealControl {
         )
     }
     fn restart(&mut self, context: &RuntimeContext) -> Result<(), String> {
-        use crate::lifecycle::{OwnerGate, OwnerProbe, SUPERVISOR_LOCK};
+        use crate::lifecycle::{
+            verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation, OwnerRole, ProbeMode,
+        };
         use std::process::Stdio;
         self.preflight(context)?;
         if matches!(
-            OwnerGate::new(context.data_dir().join("logs").join(SUPERVISOR_LOCK)).probe(),
-            OwnerProbe::Held { .. }
+            verify_owner(
+                &mut LiveLifecycle,
+                context.data_dir(),
+                OwnerRole::Supervisor,
+                &ImagePolicy::SameReleaseTwin,
+                ProbeMode::Create,
+            ),
+            OwnerObservation::Verified(_)
         ) {
             return Ok(());
         }
@@ -569,9 +571,7 @@ impl Control for RealControl {
 }
 
 struct Stopped {
-    _tasks: Vec<File>,
-    _desired: File,
-    _owners: Vec<crate::lifecycle::OwnerGuard>,
+    _hold: crate::lifecycle::QuiescentHold,
 }
 fn quiesce(
     context: &RuntimeContext,
@@ -579,7 +579,9 @@ fn quiesce(
     memory_only: bool,
     control: &mut dyn Control,
 ) -> Result<Stopped, Step> {
-    use crate::lifecycle::{self, Acquire, DesiredRead, DesiredState, DesiredStore, OwnerGate};
+    use crate::lifecycle::{
+        self, DesiredState, DesiredStore, LiveLifecycle, OwnerRole, QuiesceError,
+    };
     let data = context.data_dir();
     lifecycle::validate_owner_gate_paths(data)?;
     let store = DesiredStore::new(data.join("lifecycle"));
@@ -598,34 +600,18 @@ fn quiesce(
             Step::Refused(error)
         }
     };
-    let tasks = lifecycle::hold_stopped_task_gates(data).map_err(gate_error)?;
-    let desired = lifecycle::lock_with_wait(
-        &data.join("lifecycle/lifecycle.lock"),
-        Duration::from_secs(5),
-    ).map_err(gate_error)?;
-    if !matches!(store.read(), DesiredRead::Present(r) if r.state == DesiredState::Stopped && r.revision == record.revision)
-    {
-        return Err(Step::Failed("restore stop was superseded".into()));
-    }
-    let identity = lifecycle::current_identity()?;
-    let mut owners = Vec::new();
-    for name in [lifecycle::LIVE_LOCK, "rbridge-console.lock"] {
-        match OwnerGate::new(data.join("logs").join(name)).acquire(
-            "restore",
-            identity.clone(),
-            None,
-            crate::parity_clock::now_ms(),
-            Duration::ZERO,
-        ) {
-            Acquire::Acquired(owner) => owners.push(owner),
-            _ => return Err(gate_error("bridge owner is not confirmed stopped".into())),
-        }
-    }
-    Ok(Stopped {
-        _tasks: tasks,
-        _desired: desired,
-        _owners: owners,
-    })
+    let hold = lifecycle::quiesce_stopped_gates(
+        &mut LiveLifecycle,
+        data,
+        record.revision,
+        &[OwnerRole::Live, OwnerRole::Console],
+        "restore",
+    )
+    .map_err(|error| match error {
+        QuiesceError::Superseded(message) => Step::Failed(message),
+        QuiesceError::Gate(message) => gate_error(message),
+    })?;
+    Ok(Stopped { _hold: hold })
 }
 fn resume(context: &RuntimeContext, by: &str) -> Result<(), String> {
     crate::lifecycle::DesiredStore::new(context.data_dir().join("lifecycle")).write(

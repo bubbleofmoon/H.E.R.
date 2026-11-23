@@ -120,17 +120,21 @@ fn set_lifecycle(api: &TasksApi, body: &str) -> Option<TaskResponse> {
     }
     let reason = fields.get("reason").and_then(Value::as_str).unwrap_or("");
     if state != DesiredState::Running {
-        use crate::lifecycle::{OwnerGate, OwnerProbe, Liveness, SUPERVISOR_LOCK};
+        use crate::lifecycle::{
+            verify_owner, ImagePolicy, LiveLifecycle, OwnerObservation, OwnerRole, ProbeMode,
+        };
         let desired_path = api.desired.path();
         let data = desired_path.parent()?.parent()?;
-        let managed = match OwnerGate::new(data.join("logs").join(SUPERVISOR_LOCK)).probe() {
-            OwnerProbe::Held { marker: Some(marker) } if marker.role == "supervisor" => {
-                crate::lifecycle::current_identity().is_ok_and(|own|
-                    if cfg!(windows) { own.exe.eq_ignore_ascii_case(&marker.identity.exe) } else { own.exe == marker.identity.exe })
-                    && matches!(crate::lifecycle::check_identity(&marker.identity), Liveness::Matches)
-            }
-            _ => false,
-        };
+        let managed = matches!(
+            verify_owner(
+                &mut LiveLifecycle,
+                data,
+                OwnerRole::Supervisor,
+                &ImagePolicy::SameReleaseTwin,
+                ProbeMode::Existing,
+            ),
+            OwnerObservation::Verified(_)
+        );
         if !managed {
             return reply(503, json!({"ok":false,"applied":false,"error":"supervisor is unavailable; lifecycle change was not applied; use the local lifecycle CLI"}));
         }

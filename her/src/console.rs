@@ -1164,15 +1164,21 @@ mod desktop_grants {
     }
 
     fn owner(context: &RuntimeContext) -> Option<crate::lifecycle::ProcessIdentity> {
-        let path = context.resolve_path(RuntimeArea::Data, "logs/rbridge-console.lock", PathIntent::ReadFile).ok()?;
-        match crate::lifecycle::OwnerGate::new(path).probe() {
-            crate::lifecycle::OwnerProbe::Held { marker: Some(marker) }
-                if marker.role == "console"
-                    && crate::lifecycle::current_identity().is_ok_and(|current| crate::update::health_image(&current.exe, &marker.identity.exe))
-                    && matches!(crate::lifecycle::check_identity(&marker.identity), crate::lifecycle::Liveness::Matches) =>
-            {
-                Some(marker.identity)
-            }
+        let _path = context
+            .resolve_path(
+                RuntimeArea::Data,
+                &format!("logs/{}", crate::lifecycle::CONSOLE_LOCK),
+                PathIntent::ReadFile,
+            )
+            .ok()?;
+        match crate::lifecycle::verify_owner(
+            &mut crate::lifecycle::LiveLifecycle,
+            context.data_dir(),
+            crate::lifecycle::OwnerRole::Console,
+            &crate::lifecycle::ImagePolicy::HealthReadOnly,
+            crate::lifecycle::ProbeMode::Existing,
+        ) {
+            crate::lifecycle::OwnerObservation::Verified(owner) => Some(owner.marker.identity),
             _ => None,
         }
     }

@@ -3,7 +3,11 @@
 //! Status and stop work without a valid config; maintenance operations hold the stopped owner gates.
 //! Exit codes: 0 done, 1 unhealthy (assert-running), 2 usage/root error, 3 unknown/unwritten desired state.
 
-use crate::lifecycle::{effective, DesiredRead, DesiredState, DesiredStore, Effective, OwnerGate, OwnerProbe, LIVE_LOCK, SUPERVISOR_LOCK};
+use crate::lifecycle::{
+    collect_verified_owners, effective, stop_verified_owners_transaction, DesiredRead,
+    DesiredState, DesiredStore, Effective, ImagePolicy, LifecycleBackend as _, LiveLifecycle,
+    OwnerProbe, OwnerRole, ProbeMode, VerifiedOwner,
+};
 use crate::task_runs::{credential_redactor, RunQuery, StoreLimits, TaskStore};
 use crate::tasks::{Scheduler, TaskId, REGISTRY};
 use serde_json::{json, Value};
@@ -101,48 +105,23 @@ fn print(value: &Value) {
     println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
 }
 
-/// The console and GUI images may control each other only inside the same release directory.
-pub(crate) fn authorized_image(caller: &str, owner: &str) -> bool {
-    let equal = |a: &str, b: &str| if cfg!(windows) {
-        a.replace('/', "\\").eq_ignore_ascii_case(&b.replace('/', "\\"))
-    } else { a == b };
-    if equal(caller, owner) { return true; }
-    let caller = Path::new(caller);
-    let sibling = match caller.file_name().and_then(|s| s.to_str()) {
-        Some(name) if equal(name, if cfg!(windows) { "her.exe" } else { "her" }) =>
-            caller.with_file_name(if cfg!(windows) { "her-cli.exe" } else { "her-cli" }),
-        Some(name) if equal(name, if cfg!(windows) { "her-cli.exe" } else { "her-cli" }) =>
-            caller.with_file_name(if cfg!(windows) { "her.exe" } else { "her" }),
-        _ => return false,
-    };
-    let (Ok(caller), Ok(sibling), Ok(owner)) = (
-        std::fs::canonicalize(caller), std::fs::canonicalize(sibling), std::fs::canonicalize(owner)
-    ) else { return false };
-    equal(&caller.parent().unwrap().to_string_lossy(), &sibling.parent().unwrap().to_string_lossy())
-        && equal(&sibling.to_string_lossy(), &owner.to_string_lossy())
+fn roles_for_stop(supervisor: bool) -> &'static [OwnerRole] {
+    if supervisor {
+        &OwnerRole::ALL
+    } else {
+        &[OwnerRole::Live, OwnerRole::Console]
+    }
 }
 
-pub(crate) fn stoppable_owners(data: &Path, supervisor: bool) -> Result<Vec<(OwnerGate, crate::lifecycle::OwnerMarker)>, String> {
-    crate::lifecycle::validate_owner_gate_paths(data)?;
-    let me = crate::process_identity::current_identity()?;
-    let mut owners = Vec::new();
-    let roles = [(LIVE_LOCK, "live"), ("rbridge-console.lock", "console"), (SUPERVISOR_LOCK, "supervisor")];
-    for (name, role) in roles.into_iter().take(if supervisor { 3 } else { 2 }) {
-        let gate = OwnerGate::new(data.join("logs").join(name));
-        let owner = match gate.probe() {
-            OwnerProbe::Free { .. } => continue,
-            OwnerProbe::Held { marker: Some(marker) } if marker.role == role => marker,
-            _ => return Err(format!("{role} owner cannot be identified")),
-        };
-        if !authorized_image(&me.exe, &owner.identity.exe) {
-            return Err(format!("{role} owner belongs to another executable"));
-        }
-        if crate::process_identity::check_identity(&owner.identity) != crate::process_identity::Liveness::Matches {
-            return Err(format!("{role} owner process identity cannot be verified"));
-        }
-        owners.push((gate, owner));
-    }
-    Ok(owners)
+pub(crate) fn stoppable_owners(data: &Path, supervisor: bool) -> Result<Vec<VerifiedOwner>, String> {
+    collect_verified_owners(
+        &mut LiveLifecycle,
+        data,
+        roles_for_stop(supervisor),
+        &ImagePolicy::SameReleaseTwin,
+        ProbeMode::Create,
+        None,
+    )
 }
 
 pub fn run_lifecycle(args: &[String]) -> i32 {
@@ -213,12 +192,13 @@ pub fn run_lifecycle(args: &[String]) -> i32 {
                 (_, Effective::Act { state, wants }) => json!({ "state": state.as_str(), "wants": wants, "record": null }),
             };
             let unknown = desired["state"] == "unknown";
+            let mut backend = LiveLifecycle;
             print(&json!({
                 "desired": desired,
                 "owners": {
-                    "live": probe_json(OwnerGate::new(data.join("logs").join(LIVE_LOCK)).probe()),
-                    "console": probe_json(OwnerGate::new(data.join("logs").join("rbridge-console.lock")).probe()),
-                    "supervisor": probe_json(OwnerGate::new(data.join("logs").join(SUPERVISOR_LOCK)).probe()),
+                    "live": probe_json(backend.probe_owner(&data, OwnerRole::Live, ProbeMode::Create)),
+                    "console": probe_json(backend.probe_owner(&data, OwnerRole::Console, ProbeMode::Create)),
+                    "supervisor": probe_json(backend.probe_owner(&data, OwnerRole::Supervisor, ProbeMode::Create)),
                 },
             }));
             if unknown {
@@ -312,39 +292,15 @@ pub(crate) fn stop_verified_owners(data: &Path, store: &DesiredStore, revision: 
     stop_verified_owners_with_dependencies(data, store, revision, supervisor, None)
 }
 
-fn stop_verified_owners_with_dependencies(data: &Path, store: &DesiredStore, revision: u64, supervisor: bool, dependencies: Option<&crate::runtime::RuntimeContext>) -> Result<(), String> {
-    use crate::lifecycle::OwnerProbe;
-    use crate::process_identity::KillOutcome;
-    use std::time::{Duration, Instant};
-
-    crate::lifecycle::validate_owner_gate_paths(data)?;
-    let _gate = crate::lifecycle::lock_with_wait(&data.join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
-    if !matches!(store.read(), DesiredRead::Present(record) if record.state == DesiredState::Stopped && record.revision == revision) {
-        return Err("the stop was superseded by another lifecycle transition".into());
-    }
-    // A running task may itself need the lifecycle gate. Never hold it while
-    // waiting for that task to observe the stopped state and release its gate.
-    drop(_gate);
-    let _tasks = crate::lifecycle::hold_stopped_task_gates(data)?;
-    let _gate = crate::lifecycle::lock_with_wait(&data.join("lifecycle/lifecycle.lock"), Duration::from_secs(5))?;
-    if !matches!(store.read(), DesiredRead::Present(record) if record.state == DesiredState::Stopped && record.revision == revision) {
-        return Err("the stop was superseded by another lifecycle transition".into());
-    }
-    for (owner_gate, owner) in stoppable_owners(data, supervisor)? {
-        let role = &owner.role;
-        match crate::process_identity::kill_verified(&owner.identity) {
-            KillOutcome::Killed | KillOutcome::Gone => {}
-            other => return Err(format!("{role} owner could not be stopped: {other:?}")),
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match owner_gate.probe() {
-                OwnerProbe::Free { .. } => break,
-                OwnerProbe::Held { .. } if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-                _ => return Err(format!("{role} owner did not release its gate")),
-            }
-        }
-    }
+fn stop_verified_owners_with_dependencies(data: &Path, _store: &DesiredStore, revision: u64, supervisor: bool, dependencies: Option<&crate::runtime::RuntimeContext>) -> Result<(), String> {
+    stop_verified_owners_transaction(
+        &mut LiveLifecycle,
+        data,
+        revision,
+        roles_for_stop(supervisor),
+        &ImagePolicy::SameReleaseTwin,
+        ProbeMode::Create,
+    )?;
     if let Some(context) = dependencies {
         crate::supervisor_dependencies::stop(context)?;
     }

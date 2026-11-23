@@ -22,8 +22,106 @@ use std::time::{Duration, Instant};
 
 pub const FORMAT_VERSION: u8 = 1;
 pub const LIVE_LOCK: &str = "rbridge-live.lock";
+pub const CONSOLE_LOCK: &str = "rbridge-console.lock";
 pub const SUPERVISOR_LOCK: &str = "rbridge-supervisor.lock";
 pub const DESIRED_FILE: &str = "desired-state.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OwnerRole {
+    Live,
+    Console,
+    Supervisor,
+}
+
+impl OwnerRole {
+    pub const ALL: [Self; 3] = [Self::Live, Self::Console, Self::Supervisor];
+
+    pub const fn lock_file(self) -> &'static str {
+        match self {
+            Self::Live => LIVE_LOCK,
+            Self::Console => CONSOLE_LOCK,
+            Self::Supervisor => SUPERVISOR_LOCK,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Console => "console",
+            Self::Supervisor => "supervisor",
+        }
+    }
+
+    pub fn parse(role: &str) -> Option<Self> {
+        match role {
+            "live" => Some(Self::Live),
+            "console" => Some(Self::Console),
+            "supervisor" => Some(Self::Supervisor),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImagePolicy {
+    /// Exact caller executable or same-directory `her`/`her-cli` sibling.
+    SameReleaseTwin,
+    /// Installed member image under `<root>/releases/<tag>`.
+    ReleaseTag {
+        root: crate::install_root::InstallRoot,
+        tag: String,
+    },
+    /// `SameReleaseTwin` plus the `HER_TRIAL_CURRENT` read-only current-release exception.
+    /// Strictly refused for stop, retire, adoption, or process control.
+    HealthReadOnly,
+}
+
+impl ImagePolicy {
+    pub fn is_control_safe(&self) -> bool {
+        !matches!(self, Self::HealthReadOnly)
+    }
+
+    pub fn matches(&self, caller_exe: &str, owner_exe: &str) -> bool {
+        match self {
+            Self::SameReleaseTwin => crate::update::same_release_twin(caller_exe, owner_exe),
+            Self::ReleaseTag { root, tag } => {
+                crate::update::release_owner_image(root, tag, owner_exe)
+            }
+            Self::HealthReadOnly => crate::update::health_image(caller_exe, owner_exe),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMode {
+    /// Read-only probe: validates existing gate paths and probes existing lock files without
+    /// creating directories or lock files.
+    Existing,
+    /// Control/mutation probe: prepares missing gate directories and allows gate file creation.
+    Create,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedOwner {
+    pub role: OwnerRole,
+    pub marker: OwnerMarker,
+    pub gate_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerObservation {
+    Free {
+        last: Option<OwnerMarker>,
+    },
+    Verified(VerifiedOwner),
+    Mismatch {
+        reason: String,
+        marker: Option<OwnerMarker>,
+        liveness: Option<Liveness>,
+    },
+    Unknown(String),
+}
 const DESIRED_GATE: &str = "lifecycle.lock";
 const MAX_BY_CHARS: usize = 64;
 const MAX_REASON_CHARS: usize = 300;
@@ -268,22 +366,46 @@ pub(crate) fn validate_existing_owner_gate_paths(data: &Path) -> Result<(), Stri
 fn validate_owner_gate_paths_with(data: &Path, create: bool) -> Result<(), String> {
     // These commands work even with a broken config, so validate the small set of gate paths
     // directly instead of constructing a RuntimeContext that could reject the operator's stop.
+    let base = std::fs::canonicalize(data).map_err(|_| "runtime data directory is unavailable")?;
     for name in ["lifecycle", "logs"] {
         let dir = data.join(name);
         match std::fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                std::fs::create_dir(&dir).map_err(|e| format!("gate directory is unavailable: {}", e.kind()))?;
+            Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => {
+                if std::fs::canonicalize(&dir).ok().as_deref().and_then(Path::parent) != Some(base.as_path()) {
+                    return Err("gate directory is redirected".into());
+                }
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        match std::fs::symlink_metadata(&dir) {
+                            Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => {}
+                            _ => {
+                                return Err("gate directory is redirected or unavailable".into());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(format!("gate directory is unavailable: {}", err.kind()));
+                    }
+                }
+                if std::fs::canonicalize(&dir).ok().as_deref().and_then(Path::parent)
+                    != Some(base.as_path())
+                {
+                    return Err("gate directory is redirected".into());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create && name == "lifecycle" => {}
             _ => return Err("gate directory is redirected or unavailable".into()),
         }
-        let base = std::fs::canonicalize(data).map_err(|_| "runtime data directory is unavailable")?;
-        if std::fs::canonicalize(&dir).ok().as_deref().and_then(Path::parent) != Some(base.as_path()) {
-            return Err("gate directory is redirected".into());
-        }
     }
-    for path in [data.join("lifecycle/lifecycle.lock"), data.join("logs/rbridge-live.lock"),
-        data.join("logs/rbridge-console.lock"), data.join("logs/rbridge-supervisor.lock")] {
+    for path in [
+        data.join("lifecycle").join(DESIRED_GATE),
+        OwnerGate::role_lock_path(data, OwnerRole::Live),
+        OwnerGate::role_lock_path(data, OwnerRole::Console),
+        OwnerGate::role_lock_path(data, OwnerRole::Supervisor),
+    ] {
         let mut marker = path.as_os_str().to_os_string();
         marker.push(".owner.json");
         for candidate in [path.clone(), PathBuf::from(marker)] {
@@ -305,12 +427,12 @@ pub fn acquire_quiescent(data: &Path) -> Result<QuiescentGuard, String> {
     }
     let identity = current_identity()?;
     let mut owners = Vec::new();
-    for name in [LIVE_LOCK, "rbridge-console.lock", SUPERVISOR_LOCK] {
-        match OwnerGate::new(data.join("logs").join(name)).acquire(
+    for role in OwnerRole::ALL {
+        match OwnerGate::for_role(data, role).acquire(
             "maintenance-guard", identity.clone(), None, crate::parity_clock::now_ms(), Duration::ZERO,
         ) {
             Acquire::Acquired(owner) => owners.push(owner),
-            _ => return Err(format!("owner is held or cannot be established: {name}")),
+            _ => return Err(format!("owner is held or cannot be established: {}", role.lock_file())),
         }
     }
     Ok(QuiescentGuard { _desired: gate, _owners: owners })
@@ -371,6 +493,14 @@ pub(crate) fn hold_stopped_task_gates(data: &Path) -> Result<Vec<File>, String> 
 }
 
 impl OwnerGate {
+    pub fn role_lock_path(data: &Path, role: OwnerRole) -> PathBuf {
+        data.join("logs").join(role.lock_file())
+    }
+
+    pub fn for_role(data: &Path, role: OwnerRole) -> Self {
+        Self::new(Self::role_lock_path(data, role))
+    }
+
     pub fn new(lock_path: impl Into<PathBuf>) -> Self {
         let lock_path = lock_path.into();
         let mut marker = lock_path.clone().into_os_string();
@@ -509,9 +639,854 @@ pub(crate) fn pinned_directory_path(directory: &File) -> PathBuf {
 }
 
 fn read_marker(path: &Path) -> Option<OwnerMarker> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::guarded_file::read_bounded_no_follow(path, 64 * 1024, false).ok()??;
     let marker: OwnerMarker = serde_json::from_slice(&bytes).ok()?;
     (marker.v == FORMAT_VERSION).then_some(marker)
+}
+
+// ---- unified lifecycle seam & adapters --------------------------------------------------------
+
+pub struct GateHold(Box<dyn std::any::Any + Send>);
+
+impl GateHold {
+    pub fn new<T: Send + 'static>(inner: T) -> Self {
+        Self(Box::new(inner))
+    }
+}
+
+pub struct QuiescentHold {
+    _tasks: GateHold,
+    _desired: GateHold,
+    _owners: Vec<GateHold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuiesceError {
+    Superseded(String),
+    Gate(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireFailure {
+    pub reason: String,
+    pub stopped: bool,
+}
+
+pub trait LifecycleBackend {
+    fn caller_identity(&mut self) -> Result<ProcessIdentity, String>;
+    fn validate_gate_paths(&mut self, data: &Path, mode: ProbeMode) -> Result<(), String>;
+    fn probe_owner(&mut self, data: &Path, role: OwnerRole, mode: ProbeMode) -> OwnerProbe;
+    fn acquire_owner(
+        &mut self,
+        data: &Path,
+        role: OwnerRole,
+        claimant: &str,
+        identity: ProcessIdentity,
+        now_ms: i64,
+    ) -> Result<GateHold, String>;
+    fn check_identity(&mut self, expected: &ProcessIdentity) -> Liveness;
+    fn check_liveness(&mut self, pid: u32, start: u64) -> Liveness;
+    fn image_matches(&mut self, policy: &ImagePolicy, caller_exe: &str, owner_exe: &str) -> bool;
+    fn read_desired(&mut self, data: &Path) -> DesiredRead;
+    fn lock_desired_gate(&mut self, data: &Path, wait: Duration) -> Result<GateHold, String>;
+    fn hold_stopped_task_gates(&mut self, data: &Path) -> Result<GateHold, String>;
+    fn kill_verified(&mut self, expected: &ProcessIdentity) -> KillOutcome;
+    fn read_heartbeat(&mut self, data: &Path) -> io::Result<Vec<u8>>;
+    fn now_ms(&mut self) -> i64;
+    fn monotonic_ms(&mut self) -> u64;
+    fn sleep_step(&mut self, duration: Duration);
+}
+
+pub struct LiveLifecycle;
+
+impl LifecycleBackend for LiveLifecycle {
+    fn caller_identity(&mut self) -> Result<ProcessIdentity, String> {
+        current_identity()
+    }
+
+    fn validate_gate_paths(&mut self, data: &Path, mode: ProbeMode) -> Result<(), String> {
+        match mode {
+            ProbeMode::Existing => validate_existing_owner_gate_paths(data),
+            ProbeMode::Create => validate_owner_gate_paths(data),
+        }
+    }
+
+    fn probe_owner(&mut self, data: &Path, role: OwnerRole, mode: ProbeMode) -> OwnerProbe {
+        let gate = OwnerGate::for_role(data, role);
+        match mode {
+            ProbeMode::Existing => gate.probe_existing(),
+            ProbeMode::Create => gate.probe(),
+        }
+    }
+
+    fn acquire_owner(
+        &mut self,
+        data: &Path,
+        role: OwnerRole,
+        claimant: &str,
+        identity: ProcessIdentity,
+        now_ms: i64,
+    ) -> Result<GateHold, String> {
+        match OwnerGate::for_role(data, role).acquire(
+            claimant,
+            identity,
+            None,
+            now_ms,
+            Duration::ZERO,
+        ) {
+            Acquire::Acquired(guard) => Ok(GateHold::new(guard)),
+            _ => Err(format!("{} owner is held or cannot be established", role.as_str())),
+        }
+    }
+
+    fn check_identity(&mut self, expected: &ProcessIdentity) -> Liveness {
+        check_identity(expected)
+    }
+
+    fn check_liveness(&mut self, pid: u32, start: u64) -> Liveness {
+        crate::process_identity::check_liveness(pid, start)
+    }
+
+    fn image_matches(&mut self, policy: &ImagePolicy, caller_exe: &str, owner_exe: &str) -> bool {
+        policy.matches(caller_exe, owner_exe)
+    }
+
+    fn read_desired(&mut self, data: &Path) -> DesiredRead {
+        DesiredStore::new(data.join("lifecycle")).read()
+    }
+
+    fn lock_desired_gate(&mut self, data: &Path, wait: Duration) -> Result<GateHold, String> {
+        lock_with_wait(&data.join("lifecycle").join(DESIRED_GATE), wait).map(GateHold::new)
+    }
+
+    fn hold_stopped_task_gates(&mut self, data: &Path) -> Result<GateHold, String> {
+        hold_stopped_task_gates(data).map(GateHold::new)
+    }
+
+    fn kill_verified(&mut self, expected: &ProcessIdentity) -> KillOutcome {
+        kill_verified(expected)
+    }
+
+    fn read_heartbeat(&mut self, data: &Path) -> io::Result<Vec<u8>> {
+        match crate::guarded_file::read_bounded_no_follow(
+            &data.join("rust-heartbeat-live.json"),
+            1024 * 1024,
+            false,
+        )? {
+            Some(bytes) => Ok(bytes),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    fn now_ms(&mut self) -> i64 {
+        crate::parity_clock::now_ms()
+    }
+
+    fn monotonic_ms(&mut self) -> u64 {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_millis() as u64
+    }
+
+    fn sleep_step(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+pub fn verify_owner(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    role: OwnerRole,
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+) -> OwnerObservation {
+    if let Err(error) = backend.validate_gate_paths(data, mode) {
+        return OwnerObservation::Unknown(error);
+    }
+    verify_owner_validated(backend, data, role, policy, mode)
+}
+
+fn verify_owner_validated(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    role: OwnerRole,
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+) -> OwnerObservation {
+    let gate_path = OwnerGate::role_lock_path(data, role);
+    match backend.probe_owner(data, role, mode) {
+        OwnerProbe::Free { last } => OwnerObservation::Free { last },
+        OwnerProbe::Unknown(reason) => OwnerObservation::Unknown(reason),
+        OwnerProbe::Held { marker: None } => OwnerObservation::Mismatch {
+            reason: format!("{} owner cannot be identified", role.as_str()),
+            marker: None,
+            liveness: None,
+        },
+        OwnerProbe::Held {
+            marker: Some(marker),
+        } => {
+            if marker.role != role.as_str() {
+                return OwnerObservation::Mismatch {
+                    reason: format!("{} owner cannot be identified", role.as_str()),
+                    marker: Some(marker),
+                    liveness: None,
+                };
+            }
+            let caller_exe = match policy {
+                ImagePolicy::SameReleaseTwin | ImagePolicy::HealthReadOnly => {
+                    match backend.caller_identity() {
+                        Ok(caller) => caller.exe,
+                        Err(error) => return OwnerObservation::Unknown(error),
+                    }
+                }
+                ImagePolicy::ReleaseTag { .. } => String::new(),
+            };
+            if !backend.image_matches(policy, &caller_exe, &marker.identity.exe) {
+                return OwnerObservation::Mismatch {
+                    reason: format!("{} owner belongs to another executable", role.as_str()),
+                    marker: Some(marker),
+                    liveness: None,
+                };
+            }
+            match backend.check_identity(&marker.identity) {
+                Liveness::Matches => OwnerObservation::Verified(VerifiedOwner {
+                    role,
+                    marker,
+                    gate_path,
+                }),
+                Liveness::Unknown(reason) => OwnerObservation::Unknown(reason),
+                liveness @ (Liveness::Gone | Liveness::Mismatch(_)) => OwnerObservation::Mismatch {
+                    reason: format!(
+                        "{} owner process identity cannot be verified",
+                        role.as_str()
+                    ),
+                    marker: Some(marker),
+                    liveness: Some(liveness),
+                },
+            }
+        }
+    }
+}
+
+pub fn probe_existing_role_identity(data: &Path, role: OwnerRole) -> Option<ProcessIdentity> {
+    let mut backend = LiveLifecycle;
+    if backend.validate_gate_paths(data, ProbeMode::Existing).is_err() {
+        return None;
+    }
+    match backend.probe_owner(data, role, ProbeMode::Existing) {
+        OwnerProbe::Held {
+            marker: Some(marker),
+        } if marker.role == role.as_str() => Some(marker.identity),
+        _ => None,
+    }
+}
+
+pub fn live_observation(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+) -> crate::watchdog::LiveObservation {
+    match verify_owner(backend, data, OwnerRole::Live, policy, mode) {
+        OwnerObservation::Free { .. } => crate::watchdog::LiveObservation::Free,
+        OwnerObservation::Verified(owner) => crate::watchdog::LiveObservation::Held {
+            marker: owner.marker,
+            liveness: Liveness::Matches,
+        },
+        OwnerObservation::Mismatch { marker: None, .. } => {
+            crate::watchdog::LiveObservation::HeldUnidentified
+        }
+        OwnerObservation::Mismatch {
+            marker: Some(marker),
+            liveness: Some(liveness),
+            ..
+        } => crate::watchdog::LiveObservation::Held { marker, liveness },
+        OwnerObservation::Mismatch {
+            marker: Some(marker),
+            liveness: None,
+            reason,
+        } => crate::watchdog::LiveObservation::Held {
+            marker,
+            liveness: Liveness::Mismatch(reason),
+        },
+        OwnerObservation::Unknown(reason) => crate::watchdog::LiveObservation::Unknown(reason),
+    }
+}
+
+pub fn same_groups(left: &[String], right: &[String]) -> bool {
+    let mut a = left.to_vec();
+    let mut b = right.to_vec();
+    a.sort();
+    b.sort();
+    a == b
+}
+
+pub fn verify_live_heartbeat(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    marker: &OwnerMarker,
+    expected_groups: &[String],
+) -> Result<(), String> {
+    if !marker
+        .groups
+        .as_deref()
+        .is_some_and(|actual| same_groups(actual, expected_groups))
+    {
+        return Err("live owner does not serve the configured groups".into());
+    }
+    let bytes = match backend.read_heartbeat(data) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("live heartbeat is missing".into());
+        }
+        Err(error) => {
+            return Err(format!("live heartbeat is unreadable: {}", error.kind()));
+        }
+    };
+    let heartbeat: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| "live heartbeat is invalid")?;
+    let pid_matches =
+        heartbeat.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(marker.identity.pid));
+    let ts_matches = heartbeat.get("ts").is_some_and(|ts| {
+        ts.as_i64().map_or_else(
+            || {
+                ts.as_f64()
+                    .is_some_and(|value| value.is_finite() && value >= marker.acquired_at as f64)
+            },
+            |value| value >= marker.acquired_at,
+        )
+    });
+    if !pid_matches || !ts_matches {
+        return Err("live heartbeat does not belong to the current owner".into());
+    }
+    let now_ms = backend.now_ms();
+    match crate::watchdog::read_heartbeat(Ok(bytes), now_ms) {
+        crate::watchdog::Heartbeat::Fresh { live: true, groups }
+            if same_groups(&groups, expected_groups) =>
+        {
+            Ok(())
+        }
+        _ => Err("live heartbeat is not ready for the configured groups".into()),
+    }
+}
+
+pub fn collect_verified_owners(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    roles: &[OwnerRole],
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+    expected_supervisor: Option<&ProcessIdentity>,
+) -> Result<Vec<VerifiedOwner>, String> {
+    if !policy.is_control_safe() {
+        return Err("read-only health image policy cannot authorize process control".into());
+    }
+    backend.validate_gate_paths(data, mode)?;
+    collect_verified_owners_validated(backend, data, roles, policy, mode, expected_supervisor, &[])
+}
+
+fn collect_verified_owners_validated(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    roles: &[OwnerRole],
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+    expected_supervisor: Option<&ProcessIdentity>,
+    expected_pids: &[(OwnerRole, u32)],
+) -> Result<Vec<VerifiedOwner>, String> {
+    let mut owners = Vec::new();
+    for &role in roles {
+        let expected_pid = expected_pids
+            .iter()
+            .find(|(target_role, _)| *target_role == role)
+            .map(|(_, pid)| *pid);
+        match verify_owner_validated(backend, data, role, policy, mode) {
+            OwnerObservation::Free { .. } => {
+                if expected_pid.is_some() {
+                    return Err(format!("{} owner is no longer verified", role.as_str()));
+                }
+                if let Some(old) = expected_supervisor.filter(|_| role == OwnerRole::Supervisor) {
+                    let gone = old.pid == 0
+                        || matches!(
+                            backend.check_liveness(old.pid, old.start),
+                            Liveness::Gone | Liveness::Mismatch(_)
+                        );
+                    if !gone {
+                        return Err("supervisor owner is not identified".into());
+                    }
+                }
+            }
+            OwnerObservation::Verified(owner) => {
+                if expected_pid.is_some_and(|pid| owner.marker.identity.pid != pid) {
+                    return Err(format!("{} owner is no longer verified", role.as_str()));
+                }
+                if let Some(old) = expected_supervisor.filter(|_| role == OwnerRole::Supervisor) {
+                    if !same_identity(old, &owner.marker.identity) {
+                        return Err("supervisor owner is not the old release".into());
+                    }
+                }
+                owners.push(owner);
+            }
+            OwnerObservation::Mismatch { reason, .. } => {
+                if expected_pid.is_some() {
+                    return Err(format!("{} owner is no longer verified", role.as_str()));
+                }
+                return Err(reason);
+            }
+            OwnerObservation::Unknown(reason) => {
+                return Err(format!("{} owner cannot be identified: {reason}", role.as_str()));
+            }
+        }
+    }
+    Ok(owners)
+}
+
+pub fn retire_verified_owners(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    owners: &[VerifiedOwner],
+    mode: ProbeMode,
+    gate_release_wait: Duration,
+    gate_release_poll: Duration,
+    fault_after: Option<u64>,
+) -> Result<(), RetireFailure> {
+    let mut stopped = false;
+    let mut retired = 0u64;
+    let budget_ms = gate_release_wait.as_millis() as u64;
+    for owner in owners {
+        match backend.kill_verified(&owner.marker.identity) {
+            KillOutcome::Killed | KillOutcome::Gone => stopped = true,
+            other => {
+                return Err(RetireFailure {
+                    reason: format!("{} owner could not be stopped: {other:?}", owner.role.as_str()),
+                    stopped,
+                });
+            }
+        }
+        retired += 1;
+        if fault_after == Some(retired) {
+            return Err(RetireFailure {
+                reason: "injected retirement failure".into(),
+                stopped,
+            });
+        }
+        let start = backend.monotonic_ms();
+        loop {
+            match backend.probe_owner(data, owner.role, mode) {
+                OwnerProbe::Free { .. } => break,
+                _ if backend.monotonic_ms().saturating_sub(start) < budget_ms => {
+                    backend.sleep_step(gate_release_poll);
+                }
+                _ => {
+                    return Err(RetireFailure {
+                        reason: format!("{} owner did not release its gate", owner.role.as_str()),
+                        stopped,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// Lock ordering: ordinary task gates (`tasks/locks/*.lock`) are never acquired while holding
+// `lifecycle.lock`. `stop_verified_owners_transaction` checks desired state under
+// `lifecycle.lock`, drops `lifecycle.lock`, waits for `hold_stopped_task_gates`, then
+// re-acquires `lifecycle.lock` and re-verifies desired state and revision before kills.
+pub fn stop_verified_owners_transaction(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    expected_revision: u64,
+    roles: &[OwnerRole],
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+) -> Result<(), String> {
+    stop_verified_owners_with_pids(backend, data, expected_revision, roles, policy, mode, &[])
+}
+
+pub fn stop_verified_owners_with_pids(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    expected_revision: u64,
+    roles: &[OwnerRole],
+    policy: &ImagePolicy,
+    mode: ProbeMode,
+    expected_pids: &[(OwnerRole, u32)],
+) -> Result<(), String> {
+    if !policy.is_control_safe() {
+        return Err("read-only health image policy cannot authorize process control".into());
+    }
+    backend.validate_gate_paths(data, mode)?;
+    let desired_gate = backend.lock_desired_gate(data, DESIRED_GATE_WAIT)?;
+    if !matches!(
+        backend.read_desired(data),
+        DesiredRead::Present(record) if record.state == DesiredState::Stopped && record.revision == expected_revision
+    ) {
+        return Err("the stop was superseded by another lifecycle transition".into());
+    }
+    // A running task may itself need the lifecycle gate. Never hold it while
+    // waiting for that task to observe the stopped state and release its gate.
+    drop(desired_gate);
+    let _tasks = backend.hold_stopped_task_gates(data)?;
+    let _desired_gate = backend.lock_desired_gate(data, DESIRED_GATE_WAIT)?;
+    if !matches!(
+        backend.read_desired(data),
+        DesiredRead::Present(record) if record.state == DesiredState::Stopped && record.revision == expected_revision
+    ) {
+        return Err("the stop was superseded by another lifecycle transition".into());
+    }
+    let owners = collect_verified_owners_validated(backend, data, roles, policy, mode, None, expected_pids)?;
+    retire_verified_owners(
+        backend,
+        data,
+        &owners,
+        mode,
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        None,
+    )
+    .map_err(|failure| failure.reason)
+}
+
+/// Stop verified live/console owners when configuration is unreadable and desired state no longer
+/// wants them. Uses the same task-gate drain, revision recheck under `lifecycle.lock`, and
+/// post-kill gate-release wait as `stop_verified_owners_transaction`.
+pub fn stop_unconfigured_owners(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    policy: &ImagePolicy,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !policy.is_control_safe() {
+        notes.push("read-only health image policy cannot authorize process control".into());
+        return notes;
+    }
+    if let Err(error) = backend.validate_gate_paths(data, ProbeMode::Create) {
+        notes.push(format!("owner gate paths are unavailable ({error}); no process stopped"));
+        return notes;
+    }
+    let read_state = |backend: &mut dyn LifecycleBackend| -> (Effective, Option<u64>) {
+        let read = backend.read_desired(data);
+        let revision = match &read {
+            DesiredRead::Present(record) => Some(record.revision),
+            _ => None,
+        };
+        let now_ms = backend.now_ms();
+        (effective(&read, now_ms), revision)
+    };
+    let (initial_eff, initial_rev) = {
+        let Ok(desired_gate) = backend.lock_desired_gate(data, DESIRED_GATE_WAIT) else {
+            notes.push("desired-state gate is unavailable; no process stopped".into());
+            return notes;
+        };
+        let snapshot = read_state(backend);
+        drop(desired_gate);
+        snapshot
+    };
+    let task_gates = if matches!(initial_eff, Effective::Act { wants, .. } if !wants.jobs) {
+        backend.hold_stopped_task_gates(data).ok()
+    } else {
+        None
+    };
+    let Ok(_desired_gate) = backend.lock_desired_gate(data, DESIRED_GATE_WAIT) else {
+        notes.push("desired-state gate is unavailable; no process stopped".into());
+        return notes;
+    };
+    let (current_eff, current_rev) = read_state(backend);
+    if current_rev != initial_rev {
+        notes.push("desired state changed while waiting for tasks; no process stopped".into());
+        return notes;
+    }
+    if let Effective::Act { wants, .. } = current_eff {
+        for (role, stop) in [
+            (OwnerRole::Live, !wants.live),
+            (OwnerRole::Console, !wants.console),
+        ] {
+            if !stop {
+                continue;
+            }
+            if role == OwnerRole::Console && task_gates.is_none() {
+                notes.push("running tasks did not stop; console left running".into());
+                continue;
+            }
+            match verify_owner_validated(backend, data, role, policy, ProbeMode::Create) {
+                OwnerObservation::Free { .. } => {}
+                OwnerObservation::Verified(owner) => {
+                    match retire_verified_owners(
+                        backend,
+                        data,
+                        &[owner],
+                        ProbeMode::Create,
+                        Duration::from_secs(10),
+                        Duration::from_millis(50),
+                        None,
+                    ) {
+                        Ok(()) => notes.push(format!(
+                            "stopped verified {} owner while configuration was unreadable",
+                            role.as_str()
+                        )),
+                        Err(_) => notes.push(format!(
+                            "could not verify stopping {} owner",
+                            role.as_str()
+                        )),
+                    }
+                }
+                _ => notes.push(format!(
+                    "{} owner is unknown; no process stopped",
+                    role.as_str()
+                )),
+            }
+        }
+    }
+    notes
+}
+
+// Lock ordering: holds stopped task gates before taking `lifecycle.lock`, then acquires owner gates.
+pub fn quiesce_stopped_gates(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    expected_revision: u64,
+    roles: &[OwnerRole],
+    claimant: &str,
+) -> Result<QuiescentHold, QuiesceError> {
+    let tasks = backend
+        .hold_stopped_task_gates(data)
+        .map_err(QuiesceError::Gate)?;
+    let desired = backend
+        .lock_desired_gate(data, DESIRED_GATE_WAIT)
+        .map_err(QuiesceError::Gate)?;
+    if !matches!(
+        backend.read_desired(data),
+        DesiredRead::Present(record) if record.state == DesiredState::Stopped && record.revision == expected_revision
+    ) {
+        return Err(QuiesceError::Superseded(
+            "restore stop was superseded".into(),
+        ));
+    }
+    let identity = backend.caller_identity().map_err(QuiesceError::Gate)?;
+    let now = backend.now_ms();
+    let mut owners = Vec::with_capacity(roles.len());
+    for &role in roles {
+        let hold = backend
+            .acquire_owner(data, role, claimant, identity.clone(), now)
+            .map_err(|_| QuiesceError::Gate("bridge owner is not confirmed stopped".into()))?;
+        owners.push(hold);
+    }
+    Ok(QuiescentHold {
+        _tasks: tasks,
+        _desired: desired,
+        _owners: owners,
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct FakeLifecycle {
+    pub caller: Result<ProcessIdentity, String>,
+    pub gate_paths_error: Option<String>,
+    pub probes: std::collections::HashMap<OwnerRole, std::collections::VecDeque<OwnerProbe>>,
+    pub default_probes: std::collections::HashMap<OwnerRole, OwnerProbe>,
+    pub liveness: std::collections::HashMap<u32, Liveness>,
+    pub default_liveness: Liveness,
+    pub kill_results: std::collections::HashMap<u32, KillOutcome>,
+    pub default_kill: KillOutcome,
+    pub desired_reads: std::collections::VecDeque<DesiredRead>,
+    pub default_desired: DesiredRead,
+    pub desired_gate_error: Option<String>,
+    pub task_gate_errors: std::collections::VecDeque<Result<(), String>>,
+    pub acquire_errors: std::collections::HashMap<OwnerRole, String>,
+    pub heartbeat: Option<io::Result<Vec<u8>>>,
+    pub image_override: Option<bool>,
+    pub now_ms: i64,
+    pub monotonic_ms: u64,
+    pub events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pub on_hold_tasks: Option<Box<dyn FnMut(&mut FakeLifecycle)>>,
+    pub on_kill: Option<Box<dyn FnMut(&mut FakeLifecycle, &ProcessIdentity)>>,
+}
+
+#[cfg(test)]
+impl Default for FakeLifecycle {
+    fn default() -> Self {
+        Self {
+            caller: Ok(ProcessIdentity {
+                pid: 1000,
+                start: 1000,
+                exe: "/opt/her/her".into(),
+            }),
+            gate_paths_error: None,
+            probes: std::collections::HashMap::new(),
+            default_probes: std::collections::HashMap::new(),
+            liveness: std::collections::HashMap::new(),
+            default_liveness: Liveness::Matches,
+            kill_results: std::collections::HashMap::new(),
+            default_kill: KillOutcome::Killed,
+            desired_reads: std::collections::VecDeque::new(),
+            default_desired: DesiredRead::Absent,
+            desired_gate_error: None,
+            task_gate_errors: std::collections::VecDeque::new(),
+            acquire_errors: std::collections::HashMap::new(),
+            heartbeat: None,
+            image_override: None,
+            now_ms: 1_000_000,
+            monotonic_ms: 0,
+            events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            on_hold_tasks: None,
+            on_kill: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl FakeLifecycle {
+    fn record(&self, event: impl Into<String>) {
+        self.events.lock().unwrap().push(event.into());
+    }
+}
+
+#[cfg(test)]
+struct FakeDropLog {
+    label: &'static str,
+    events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+impl Drop for FakeDropLog {
+    fn drop(&mut self) {
+        self.events.lock().unwrap().push(self.label.into());
+    }
+}
+
+#[cfg(test)]
+impl LifecycleBackend for FakeLifecycle {
+    fn caller_identity(&mut self) -> Result<ProcessIdentity, String> {
+        self.caller.clone()
+    }
+
+    fn validate_gate_paths(&mut self, _data: &Path, mode: ProbeMode) -> Result<(), String> {
+        self.record(format!("validate:{mode:?}"));
+        self.gate_paths_error.clone().map_or(Ok(()), Err)
+    }
+
+    fn probe_owner(&mut self, _data: &Path, role: OwnerRole, mode: ProbeMode) -> OwnerProbe {
+        self.record(format!("probe:{}:{mode:?}", role.as_str()));
+        if let Some(probe) = self
+            .probes
+            .get_mut(&role)
+            .and_then(std::collections::VecDeque::pop_front)
+        {
+            return probe;
+        }
+        self.default_probes
+            .get(&role)
+            .cloned()
+            .unwrap_or(OwnerProbe::Free { last: None })
+    }
+
+    fn acquire_owner(
+        &mut self,
+        _data: &Path,
+        role: OwnerRole,
+        claimant: &str,
+        identity: ProcessIdentity,
+        now_ms: i64,
+    ) -> Result<GateHold, String> {
+        self.record(format!("acquire:{}:{claimant}", role.as_str()));
+        if let Some(err) = self.acquire_errors.get(&role) {
+            return Err(err.clone());
+        }
+        self.default_probes.insert(
+            role,
+            OwnerProbe::Held {
+                marker: Some(OwnerMarker {
+                    v: FORMAT_VERSION,
+                    role: role.as_str().into(),
+                    identity,
+                    acquired_at: now_ms,
+                    refreshed_at: now_ms,
+                    groups: None,
+                }),
+            },
+        );
+        Ok(GateHold::new(()))
+    }
+
+    fn check_identity(&mut self, expected: &ProcessIdentity) -> Liveness {
+        self.liveness
+            .get(&expected.pid)
+            .cloned()
+            .unwrap_or_else(|| self.default_liveness.clone())
+    }
+
+    fn check_liveness(&mut self, pid: u32, _start: u64) -> Liveness {
+        self.liveness
+            .get(&pid)
+            .cloned()
+            .unwrap_or_else(|| self.default_liveness.clone())
+    }
+
+    fn image_matches(&mut self, policy: &ImagePolicy, caller_exe: &str, owner_exe: &str) -> bool {
+        self.image_override
+            .unwrap_or_else(|| policy.matches(caller_exe, owner_exe))
+    }
+
+    fn read_desired(&mut self, _data: &Path) -> DesiredRead {
+        self.record("read-desired");
+        self.desired_reads
+            .pop_front()
+            .unwrap_or_else(|| self.default_desired.clone())
+    }
+
+    fn lock_desired_gate(&mut self, _data: &Path, _wait: Duration) -> Result<GateHold, String> {
+        self.record("lock-desired");
+        if let Some(err) = &self.desired_gate_error {
+            return Err(err.clone());
+        }
+        Ok(GateHold::new(FakeDropLog {
+            label: "unlock-desired",
+            events: self.events.clone(),
+        }))
+    }
+
+    fn hold_stopped_task_gates(&mut self, _data: &Path) -> Result<GateHold, String> {
+        self.record("hold-tasks");
+        if let Some(mut cb) = self.on_hold_tasks.take() {
+            cb(self);
+            self.on_hold_tasks = Some(cb);
+        }
+        self.task_gate_errors.pop_front().unwrap_or(Ok(()))?;
+        Ok(GateHold::new(()))
+    }
+
+    fn kill_verified(&mut self, expected: &ProcessIdentity) -> KillOutcome {
+        self.record(format!("kill:{}", expected.pid));
+        if let Some(mut cb) = self.on_kill.take() {
+            cb(self, expected);
+            self.on_kill = Some(cb);
+        }
+        self.kill_results
+            .get(&expected.pid)
+            .cloned()
+            .unwrap_or_else(|| self.default_kill.clone())
+    }
+
+    fn read_heartbeat(&mut self, _data: &Path) -> io::Result<Vec<u8>> {
+        match &self.heartbeat {
+            Some(Ok(bytes)) => Ok(bytes.clone()),
+            Some(Err(err)) => Err(io::Error::new(err.kind(), err.to_string())),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    fn now_ms(&mut self) -> i64 {
+        self.now_ms
+    }
+
+    fn monotonic_ms(&mut self) -> u64 {
+        self.monotonic_ms
+    }
+
+    fn sleep_step(&mut self, duration: Duration) {
+        self.monotonic_ms = self.monotonic_ms.saturating_add(duration.as_millis() as u64);
+        self.record(format!("sleep:{}ms", duration.as_millis()));
+    }
 }
 
 fn write_marker(path: &Path, marker: &OwnerMarker) -> io::Result<()> {
@@ -1116,5 +2091,731 @@ mod tests {
         assert!(started.elapsed() >= DESIRED_GATE_WAIT);
         assert_eq!(store.read(), DesiredRead::Absent);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn fake_owner_marker(role: OwnerRole, pid: u32, exe: &str, acquired_at: i64, groups: Option<Vec<&str>>) -> OwnerMarker {
+        OwnerMarker {
+            v: FORMAT_VERSION,
+            role: role.as_str().into(),
+            identity: ProcessIdentity {
+                pid,
+                start: 10_000 + u64::from(pid),
+                exe: exe.into(),
+            },
+            acquired_at,
+            refreshed_at: acquired_at,
+            groups: groups.map(|list| list.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    fn desired_stopped(revision: u64) -> DesiredRead {
+        DesiredRead::Present(DesiredRecord {
+            v: FORMAT_VERSION,
+            state: DesiredState::Stopped,
+            by: "test".into(),
+            reason: "quiesce".into(),
+            at: 1_000,
+            until: None,
+            revision,
+        })
+    }
+
+    #[test]
+    fn verify_live_heartbeat_rejects_stale_pid_groups_and_expired_heartbeats() {
+        let mut fake = FakeLifecycle::default();
+        fake.now_ms = 550_000;
+        let expected = vec!["group:1".to_string(), "private:2".to_string()];
+        let marker = fake_owner_marker(OwnerRole::Live, 42, "/opt/her/her", 500_000, Some(vec!["group:1", "private:2"]));
+        let unused = Path::new("/unused");
+
+        // Missing heartbeat
+        fake.heartbeat = None;
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+
+        // Invalid JSON
+        fake.heartbeat = Some(Ok(b"{not-json".to_vec()));
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("invalid"), "{err}");
+
+        // PID mismatch
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({"ts": 500_000, "pid": 99, "live": true, "groups": ["group:1", "private:2"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("does not belong to the current owner"), "{err}");
+
+        // Stale heartbeat written before this owner acquired its gate (ts < acquired_at)
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({"ts": 499_999, "pid": 42, "live": true, "groups": ["group:1", "private:2"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("does not belong to the current owner"), "{err}");
+
+        // Expired heartbeat (age >= 90_000 ms)
+        fake.now_ms = 590_000;
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({"ts": 500_000, "pid": 42, "live": true, "groups": ["group:1", "private:2"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("not ready"), "{err}");
+
+        // live: false
+        fake.now_ms = 505_000;
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({"ts": 500_000, "pid": 42, "live": false, "groups": ["group:1", "private:2"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("not ready"), "{err}");
+
+        // Heartbeat groups mismatch
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({"ts": 500_000, "pid": 42, "live": true, "groups": ["group:1"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("not ready"), "{err}");
+
+        // Marker groups mismatch
+        let wrong_marker = fake_owner_marker(OwnerRole::Live, 42, "/opt/her/her", 500_000, Some(vec!["group:1"]));
+        let err = verify_live_heartbeat(&mut fake, unused, &wrong_marker, &expected).unwrap_err();
+        assert!(err.contains("does not serve"), "{err}");
+
+        // Fresh heartbeat matching pid, ts >= acquired_at, and groups (regardless of order)
+        fake.now_ms = 589_999;
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({"ts": 500_000, "pid": 42, "live": true, "groups": ["private:2", "group:1"]})
+                .to_string()
+                .into_bytes(),
+        ));
+        verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap();
+    }
+
+    #[test]
+    fn foreign_image_and_health_only_policy_refused_for_process_control() {
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(1);
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(fake_owner_marker(OwnerRole::Live, 55, "/foreign/her", 100, None)),
+            },
+        );
+        let unused = Path::new("/unused");
+
+        // Foreign executable refused by verify_owner and stop transaction without killing.
+        assert!(matches!(
+            verify_owner(&mut fake, unused, OwnerRole::Live, &ImagePolicy::SameReleaseTwin, ProbeMode::Existing),
+            OwnerObservation::Mismatch { marker: Some(_), liveness: None, .. }
+        ));
+        let err = stop_verified_owners_transaction(
+            &mut fake,
+            unused,
+            1,
+            &[OwnerRole::Live],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        )
+        .unwrap_err();
+        assert!(err.contains("another executable"), "{err}");
+        assert!(
+            !fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")),
+            "foreign executable must never be killed"
+        );
+
+        // Role mismatch on lock marker is refused.
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(fake_owner_marker(OwnerRole::Console, 55, "/opt/her/her", 100, None)),
+            },
+        );
+        assert!(matches!(
+            verify_owner(&mut fake, unused, OwnerRole::Live, &ImagePolicy::SameReleaseTwin, ProbeMode::Existing),
+            OwnerObservation::Mismatch { marker: Some(_), liveness: None, .. }
+        ));
+
+        // ImagePolicy::HealthReadOnly is strictly refused for collection, stop, and retirement.
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(fake_owner_marker(OwnerRole::Live, 55, "/opt/her/her", 100, None)),
+            },
+        );
+        let err = collect_verified_owners(
+            &mut fake,
+            unused,
+            &[OwnerRole::Live],
+            &ImagePolicy::HealthReadOnly,
+            ProbeMode::Existing,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("read-only health image policy"), "{err}");
+        let err = stop_verified_owners_transaction(
+            &mut fake,
+            unused,
+            1,
+            &[OwnerRole::Live],
+            &ImagePolicy::HealthReadOnly,
+            ProbeMode::Create,
+        )
+        .unwrap_err();
+        assert!(err.contains("read-only health image policy"), "{err}");
+    }
+
+    #[test]
+    fn trial_authority_is_accepted_only_for_health_read_only() {
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        if std::env::var_os("HER_348_TRIAL_CHILD").is_some() {
+            let link_dir = |link: &Path, target: &Path| {
+                if std::fs::symlink_metadata(link).is_ok() {
+                    #[cfg(windows)]
+                    std::fs::remove_dir(link).unwrap();
+                    #[cfg(not(windows))]
+                    std::fs::remove_file(link).unwrap();
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, link).unwrap();
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    let out = Command::new("cmd.exe")
+                        .args(["/d", "/c", "mklink", "/J"])
+                        .arg(link)
+                        .arg(target)
+                        .creation_flags(0x0800_0000)
+                        .output()
+                        .unwrap();
+                    assert!(out.status.success(), "{out:?}");
+                }
+            };
+
+            let root = crate::install_root::InstallRoot::configured().unwrap();
+            let v1 = root.root().join("releases").join("v1.0.0");
+            let v2 = root.root().join("releases").join("v2.0.0");
+            let bootstrap = root.root().join("releases").join("bootstrap");
+            let outside = root.root().join("outside");
+            let caller = v2.join("her-cli.exe").to_string_lossy().into_owned();
+            let owner = v1.join("her.exe").to_string_lossy().into_owned();
+
+            assert!(ImagePolicy::HealthReadOnly.matches(&caller, &owner));
+            assert!(!ImagePolicy::SameReleaseTwin.matches(&caller, &owner));
+            assert!(ImagePolicy::ReleaseTag { root: root.clone(), tag: "v1.0.0".into() }.matches(&caller, &owner));
+            assert!(!ImagePolicy::ReleaseTag { root: root.clone(), tag: "v2.0.0".into() }.matches(&caller, &owner));
+            assert!(!ImagePolicy::HealthReadOnly.matches(
+                &root.root().join("herupdate.exe").to_string_lossy(),
+                &owner,
+            ));
+            // Non-HER binary inside releases/v2.0.0 and HER binary in non-versioned folder must be refused.
+            assert!(!ImagePolicy::HealthReadOnly.matches(
+                &v2.join("evil.exe").to_string_lossy(),
+                &owner,
+            ));
+            assert!(!ImagePolicy::HealthReadOnly.matches(
+                &bootstrap.join("her-cli.exe").to_string_lossy(),
+                &owner,
+            ));
+
+            let mut fake = FakeLifecycle::default();
+            fake.caller = Ok(ProcessIdentity { pid: 900, start: 900, exe: caller.clone() });
+            fake.default_probes.insert(
+                OwnerRole::Supervisor,
+                OwnerProbe::Held {
+                    marker: Some(fake_owner_marker(OwnerRole::Supervisor, 50, &owner, 100, None)),
+                },
+            );
+            assert!(matches!(
+                verify_owner(&mut fake, &root.root().join("runtime/data"), OwnerRole::Supervisor, &ImagePolicy::HealthReadOnly, ProbeMode::Existing),
+                OwnerObservation::Verified(_)
+            ));
+            assert!(matches!(
+                verify_owner(&mut fake, &root.root().join("runtime/data"), OwnerRole::Supervisor, &ImagePolicy::SameReleaseTwin, ProbeMode::Existing),
+                OwnerObservation::Mismatch { .. }
+            ));
+            assert!(collect_verified_owners(
+                &mut fake,
+                &root.root().join("runtime/data"),
+                &[OwnerRole::Supervisor],
+                &ImagePolicy::HealthReadOnly,
+                ProbeMode::Existing,
+                None,
+            ).is_err());
+
+            // Negative 1: HER_TRIAL_CURRENT pointing to another installed release (v2.0.0 != current v1.0.0).
+            std::env::set_var("HER_TRIAL_CURRENT", &v2);
+            assert!(!ImagePolicy::HealthReadOnly.matches(&caller, &owner));
+
+            // Negative 2: current/HER_TRIAL_CURRENT redirected to a non-vX.Y.Z folder inside releases.
+            link_dir(&root.root().join("current"), &bootstrap);
+            std::env::set_var("HER_TRIAL_CURRENT", root.root().join("current"));
+            assert!(!ImagePolicy::HealthReadOnly.matches(&caller, &bootstrap.join("her.exe").to_string_lossy()));
+
+            // Negative 3: current/HER_TRIAL_CURRENT redirected outside <install>/releases.
+            link_dir(&root.root().join("current"), &outside);
+            std::env::set_var("HER_TRIAL_CURRENT", root.root().join("current"));
+            assert!(!ImagePolicy::HealthReadOnly.matches(&caller, &outside.join("her.exe").to_string_lossy()));
+
+            // ProbeMode::Existing on real LiveLifecycle never creates missing gate directories/locks.
+            let runtime_data = root.root().join("runtime/data");
+            assert!(matches!(
+                verify_owner(&mut LiveLifecycle, &runtime_data, OwnerRole::Supervisor, &ImagePolicy::HealthReadOnly, ProbeMode::Existing),
+                OwnerObservation::Unknown(_)
+            ));
+            assert!(!runtime_data.join("logs").exists());
+            assert!(!runtime_data.join("lifecycle").exists());
+            return;
+        }
+
+        let base = temp_dir("trial-policy");
+        let _cleanup = Cleanup(base.clone());
+        for rel in [
+            base.join("releases").join("v1.0.0"),
+            base.join("releases").join("v2.0.0"),
+            base.join("releases").join("bootstrap"),
+            base.join("outside"),
+            base.join("runtime").join("data"),
+        ] {
+            std::fs::create_dir_all(rel).unwrap();
+        }
+        for rel in [
+            base.join("releases").join("v1.0.0").join("her.exe"),
+            base.join("releases").join("v1.0.0").join("her-cli.exe"),
+            base.join("releases").join("v2.0.0").join("her.exe"),
+            base.join("releases").join("v2.0.0").join("her-cli.exe"),
+            base.join("releases").join("v2.0.0").join("evil.exe"),
+            base.join("releases").join("bootstrap").join("her.exe"),
+            base.join("releases").join("bootstrap").join("her-cli.exe"),
+            base.join("outside").join("her.exe"),
+            base.join("herupdate.exe"),
+        ] {
+            std::fs::write(rel, b"").unwrap();
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("releases").join("v1.0.0"), base.join("current")).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let out = Command::new("cmd.exe")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(base.join("current"))
+                .arg(base.join("releases").join("v1.0.0"))
+                .creation_flags(0x0800_0000)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let output = cmd
+            .args(["--exact", "lifecycle::tests::trial_authority_is_accepted_only_for_health_read_only", "--nocapture"])
+            .env("HER_348_TRIAL_CHILD", "1")
+            .env("HER_INSTALL_ROOT", &base)
+            .env("HER_TRIAL_CURRENT", base.join("current"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn ordered_quiescence_drains_tasks_checks_revision_and_waits_for_gate_release() {
+        let unused = Path::new("/unused");
+
+        // 1. Happy path: lock-desired -> read -> unlock-desired -> hold-tasks -> lock-desired -> read -> kill -> poll Free
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(5);
+        let live_marker = fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None);
+        let console_marker = fake_owner_marker(OwnerRole::Console, 102, "/opt/her/her", 100, None);
+        fake.probes.insert(
+            OwnerRole::Live,
+            std::collections::VecDeque::from([
+                OwnerProbe::Held { marker: Some(live_marker.clone()) }, // verify_owner
+                OwnerProbe::Held { marker: Some(live_marker) },         // 1st poll after kill -> Held
+                OwnerProbe::Free { last: None },                        // 2nd poll -> Free
+            ]),
+        );
+        fake.probes.insert(
+            OwnerRole::Console,
+            std::collections::VecDeque::from([
+                OwnerProbe::Held { marker: Some(console_marker) }, // verify_owner
+                OwnerProbe::Free { last: None },                   // 1st poll after kill -> Free
+            ]),
+        );
+        stop_verified_owners_transaction(
+            &mut fake,
+            unused,
+            5,
+            &[OwnerRole::Live, OwnerRole::Console],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        )
+        .unwrap();
+        let events = fake.events.lock().unwrap().clone();
+        let unlock_pos = events.iter().position(|e| e == "unlock-desired").unwrap();
+        let tasks_pos = events.iter().position(|e| e == "hold-tasks").unwrap();
+        let kill_live_pos = events.iter().position(|e| e == "kill:101").unwrap();
+        let sleep_pos = events.iter().position(|e| e == "sleep:50ms").unwrap();
+        let kill_console_pos = events.iter().position(|e| e == "kill:102").unwrap();
+        assert!(unlock_pos < tasks_pos, "lifecycle.lock must drop before waiting on tasks: {events:?}");
+        assert!(tasks_pos < kill_live_pos, "tasks must drain before killing owners: {events:?}");
+        assert!(kill_live_pos < sleep_pos && sleep_pos < kill_console_pos, "wait for live gate Free before console kill: {events:?}");
+
+        // 2. Revision supersession while holding task gates aborts before any kill.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(5);
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held { marker: Some(fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None)) },
+        );
+        fake.on_hold_tasks = Some(Box::new(|state| {
+            state.default_desired = desired_stopped(6);
+        }));
+        let err = stop_verified_owners_transaction(
+            &mut fake,
+            unused,
+            5,
+            &[OwnerRole::Live],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        )
+        .unwrap_err();
+        assert!(err.contains("superseded"), "{err}");
+        assert!(!fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")));
+
+        // 3. Task-gate failure aborts before any kill.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(5);
+        fake.task_gate_errors.push_back(Err("running tasks did not stop".into()));
+        let err = stop_verified_owners_transaction(
+            &mut fake,
+            unused,
+            5,
+            &[OwnerRole::Live],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        )
+        .unwrap_err();
+        assert!(err.contains("running tasks did not stop"), "{err}");
+        assert!(!fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")));
+
+        // 4. Gate-release timeout fails once monotonic deadline passes.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(5);
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held { marker: Some(fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None)) },
+        );
+        let err = stop_verified_owners_transaction(
+            &mut fake,
+            unused,
+            5,
+            &[OwnerRole::Live],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+        )
+        .unwrap_err();
+        assert!(err.contains("did not release its gate"), "{err}");
+        assert!(fake.monotonic_ms >= 10_000);
+
+        // 5. Partial-stop tracking in retire_verified_owners: fail before stop vs after stop.
+        let owners = vec![
+            VerifiedOwner {
+                role: OwnerRole::Supervisor,
+                marker: fake_owner_marker(OwnerRole::Supervisor, 201, "/opt/her/her", 100, None),
+                gate_path: PathBuf::from("/unused/supervisor.lock"),
+            },
+            VerifiedOwner {
+                role: OwnerRole::Live,
+                marker: fake_owner_marker(OwnerRole::Live, 202, "/opt/her/her", 100, None),
+                gate_path: PathBuf::from("/unused/live.lock"),
+            },
+        ];
+        let mut fake = FakeLifecycle::default();
+        fake.kill_results.insert(201, KillOutcome::Refused("pid reused".into()));
+        let failure = retire_verified_owners(
+            &mut fake,
+            unused,
+            &owners,
+            ProbeMode::Existing,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            None,
+        )
+        .unwrap_err();
+        assert!(!failure.stopped, "refused first kill leaves stopped=false: {failure:?}");
+
+        let mut fake = FakeLifecycle::default();
+        fake.default_probes.insert(OwnerRole::Supervisor, OwnerProbe::Free { last: None });
+        let failure = retire_verified_owners(
+            &mut fake,
+            unused,
+            &owners,
+            ProbeMode::Existing,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(failure.stopped, "failure after first kill sets stopped=true: {failure:?}");
+        assert!(!fake.events.lock().unwrap().iter().any(|e| e == "kill:202"));
+
+        // 6. quiesce_stopped_gates verifies revision and acquires owner gates.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(9);
+        assert!(matches!(
+            quiesce_stopped_gates(&mut fake, unused, 8, &[OwnerRole::Live, OwnerRole::Console], "restore"),
+            Err(QuiesceError::Superseded(_))
+        ));
+        let hold = quiesce_stopped_gates(&mut fake, unused, 9, &[OwnerRole::Live, OwnerRole::Console], "restore").unwrap();
+        drop(hold);
+        assert!(matches!(
+            fake.default_probes.get(&OwnerRole::Live),
+            Some(OwnerProbe::Held { marker: Some(m) }) if m.role == "live"
+        ));
+    }
+
+    #[test]
+    fn handover_owner_probe_ignores_unlocked_stale_and_redirected_markers() {
+        let dir = temp_dir("handover-marker");
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let lock = logs.join(LIVE_LOCK);
+        let gate = OwnerGate::new(&lock);
+
+        // 1. Stale marker left after owner released the lock must be ignored.
+        let guard = match gate.acquire("live", me(), Some(vec!["group:1".into()]), 100, Duration::ZERO) {
+            Acquire::Acquired(guard) => guard,
+            other => panic!("acquire failed: {other:?}"),
+        };
+        drop(guard);
+        assert!(
+            crate::update::probe_held_owner_identity(&lock, "live").is_none(),
+            "unlocked gate with stale .owner.json must be ignored"
+        );
+
+        // 2. Actively held gate with valid marker returns identity.
+        let guard = match gate.acquire("live", me(), Some(vec!["group:1".into()]), 200, Duration::ZERO) {
+            Acquire::Acquired(guard) => guard,
+            other => panic!("acquire failed: {other:?}"),
+        };
+        assert_eq!(crate::update::probe_held_owner_identity(&lock, "live"), Some(me()));
+        assert_eq!(crate::update::probe_held_owner_identity(&lock, "console"), None);
+
+        // 3. Oversized marker (> 64 KiB) is refused.
+        let saved = std::fs::read(gate.marker_path()).unwrap();
+        std::fs::write(gate.marker_path(), vec![b' '; 65 * 1024]).unwrap();
+        assert_eq!(crate::update::probe_held_owner_identity(&lock, "live"), None);
+
+        // 4. Symlinked marker is refused on Unix.
+        #[cfg(unix)]
+        {
+            let target = dir.join("real-marker.json");
+            std::fs::write(&target, &saved).unwrap();
+            std::fs::remove_file(gate.marker_path()).unwrap();
+            std::os::unix::fs::symlink(&target, gate.marker_path()).unwrap();
+            assert_eq!(crate::update::probe_held_owner_identity(&lock, "live"), None);
+        }
+        let _ = saved;
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stop_verified_owners_with_pids_refuses_changed_pid_under_lifecycle_lock() {
+        let unused = Path::new("/unused");
+
+        // Console restarted with a new PID while waiting on task gates: must refuse without killing 999.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(3);
+        fake.default_probes.insert(
+            OwnerRole::Console,
+            OwnerProbe::Held {
+                marker: Some(fake_owner_marker(OwnerRole::Console, 102, "/opt/her/her", 100, None)),
+            },
+        );
+        fake.on_hold_tasks = Some(Box::new(|state| {
+            state.default_probes.insert(
+                OwnerRole::Console,
+                OwnerProbe::Held {
+                    marker: Some(fake_owner_marker(OwnerRole::Console, 999, "/opt/her/her", 200, None)),
+                },
+            );
+        }));
+        let err = stop_verified_owners_with_pids(
+            &mut fake,
+            unused,
+            3,
+            &[OwnerRole::Console],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+            &[(OwnerRole::Console, 102)],
+        )
+        .unwrap_err();
+        assert!(err.contains("console owner is no longer verified"), "{err}");
+        assert!(
+            !fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")),
+            "replacement pid must not be killed"
+        );
+
+        // Free console gate when an explicit PID was expected is also refused.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(3);
+        let err = stop_verified_owners_with_pids(
+            &mut fake,
+            unused,
+            3,
+            &[OwnerRole::Console],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+            &[(OwnerRole::Console, 102)],
+        )
+        .unwrap_err();
+        assert!(err.contains("console owner is no longer verified"), "{err}");
+
+        // Matching PID under the lock succeeds.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(3);
+        fake.probes.insert(
+            OwnerRole::Console,
+            std::collections::VecDeque::from([
+                OwnerProbe::Held {
+                    marker: Some(fake_owner_marker(OwnerRole::Console, 102, "/opt/her/her", 100, None)),
+                },
+                OwnerProbe::Free { last: None },
+            ]),
+        );
+        stop_verified_owners_with_pids(
+            &mut fake,
+            unused,
+            3,
+            &[OwnerRole::Console],
+            &ImagePolicy::SameReleaseTwin,
+            ProbeMode::Create,
+            &[(OwnerRole::Console, 102)],
+        )
+        .unwrap();
+        assert!(fake.events.lock().unwrap().iter().any(|e| e == "kill:102"));
+    }
+
+    #[test]
+    fn stop_unconfigured_owners_drains_tasks_checks_revision_and_waits_for_release() {
+        let unused = Path::new("/unused");
+
+        // 1. Happy path: Stopped rev 4, drains tasks without holding lifecycle.lock, kills live & console, waits for Free.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(4);
+        let live_marker = fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None);
+        fake.probes.insert(
+            OwnerRole::Live,
+            std::collections::VecDeque::from([
+                OwnerProbe::Held { marker: Some(live_marker.clone()) },
+                OwnerProbe::Held { marker: Some(live_marker) },
+                OwnerProbe::Free { last: None },
+            ]),
+        );
+        fake.probes.insert(
+            OwnerRole::Console,
+            std::collections::VecDeque::from([
+                OwnerProbe::Held {
+                    marker: Some(fake_owner_marker(OwnerRole::Console, 102, "/opt/her/her", 100, None)),
+                },
+                OwnerProbe::Free { last: None },
+            ]),
+        );
+        let notes = stop_unconfigured_owners(&mut fake, unused, &ImagePolicy::SameReleaseTwin);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("stopped verified live owner"), "{notes:?}");
+        assert!(notes[1].contains("stopped verified console owner"), "{notes:?}");
+        let events = fake.events.lock().unwrap().clone();
+        let unlock_pos = events.iter().position(|e| e == "unlock-desired").unwrap();
+        let tasks_pos = events.iter().position(|e| e == "hold-tasks").unwrap();
+        let sleep_pos = events.iter().position(|e| e == "sleep:50ms").unwrap();
+        assert!(unlock_pos < tasks_pos && tasks_pos < sleep_pos, "{events:?}");
+
+        // 2. Desired revision changed while waiting on task gates: refuses all stops.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(4);
+        fake.default_probes.insert(
+            OwnerRole::Live,
+            OwnerProbe::Held {
+                marker: Some(fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None)),
+            },
+        );
+        fake.on_hold_tasks = Some(Box::new(|state| {
+            state.default_desired = desired_stopped(5);
+        }));
+        let notes = stop_unconfigured_owners(&mut fake, unused, &ImagePolicy::SameReleaseTwin);
+        assert!(notes.iter().any(|n| n.contains("changed")), "{notes:?}");
+        assert!(!fake.events.lock().unwrap().iter().any(|e| e.starts_with("kill:")));
+
+        // 3. Failed task-gate hold leaves console running while still stopping live.
+        let mut fake = FakeLifecycle::default();
+        fake.default_desired = desired_stopped(4);
+        fake.task_gate_errors.push_back(Err("busy".into()));
+        fake.probes.insert(
+            OwnerRole::Live,
+            std::collections::VecDeque::from([
+                OwnerProbe::Held {
+                    marker: Some(fake_owner_marker(OwnerRole::Live, 101, "/opt/her/her", 100, None)),
+                },
+                OwnerProbe::Free { last: None },
+            ]),
+        );
+        fake.default_probes.insert(
+            OwnerRole::Console,
+            OwnerProbe::Held {
+                marker: Some(fake_owner_marker(OwnerRole::Console, 102, "/opt/her/her", 100, None)),
+            },
+        );
+        let notes = stop_unconfigured_owners(&mut fake, unused, &ImagePolicy::SameReleaseTwin);
+        assert!(notes.iter().any(|n| n.contains("stopped verified live owner")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("console left running")), "{notes:?}");
+        assert!(!fake.events.lock().unwrap().iter().any(|e| e == "kill:102"));
+
+        // 4. HealthReadOnly strictly refused.
+        let mut fake = FakeLifecycle::default();
+        let notes = stop_unconfigured_owners(&mut fake, unused, &ImagePolicy::HealthReadOnly);
+        assert!(notes.iter().any(|n| n.contains("read-only health image policy")), "{notes:?}");
+    }
+
+    #[test]
+    fn validate_owner_gate_paths_handles_concurrent_creation() {
+        for iter in 0..20 {
+            let data = temp_dir(&format!("concurrent-gate-{iter}"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let dir = data.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        validate_owner_gate_paths(&dir)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(()));
+            }
+            let _ = std::fs::remove_dir_all(&data);
+        }
     }
 }

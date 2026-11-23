@@ -231,7 +231,7 @@ fn same_directory(left: &Path, right: &Path) -> bool {
 #[cfg(windows)]
 mod windows {
     use super::*;
-    use crate::lifecycle::{OwnerGate, OwnerProbe};
+    use crate::lifecycle::{self, OwnerRole};
     use crate::process_identity::{self, ProcessIdentity};
     use crate::runtime::{PathIntent, RuntimeArea};
     use serde_json::{json, Value};
@@ -522,13 +522,7 @@ mod windows {
     }
 
     fn console_owner(context: &RuntimeContext) -> Option<ProcessIdentity> {
-        match OwnerGate::new(context.data_dir().join("logs/rbridge-console.lock")).probe_existing()
-        {
-            OwnerProbe::Held {
-                marker: Some(marker),
-            } if marker.role == "console" => Some(marker.identity),
-            _ => None,
-        }
+        lifecycle::probe_existing_role_identity(context.data_dir(), OwnerRole::Console)
     }
 
     // The public CLI delegates to health_check and authorizes the active release's images.

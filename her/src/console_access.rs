@@ -421,15 +421,33 @@ pub(super) fn conversation_scope(context: &RuntimeContext, body: &str) -> Result
 /// `--live-groups` list its owner marker records, fixed at launch: the per-conversation source gates it holds
 /// (`lifecycle::acquire_message_source`) were taken for that list, so it cannot widen it in place.
 fn live_restart(context: &RuntimeContext, target: &[String]) -> Value {
-    let gate = match context.resolve_path(RuntimeArea::Data, &format!("logs/{}", crate::lifecycle::LIVE_LOCK), PathIntent::WriteFile) {
-        Ok(path) => crate::lifecycle::OwnerGate::new(path),
-        Err(_) => return json!({"state": "unknown", "reason": "the live owner gate is unavailable"}),
+    let Ok(path) = context.resolve_path(
+        RuntimeArea::Data,
+        &format!("logs/{}", crate::lifecycle::OwnerRole::Live.lock_file()),
+        PathIntent::ReadOptionalFile,
+    ) else {
+        return json!({"state": "unknown", "reason": "the live owner gate is unavailable"});
     };
-    match gate.probe() {
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({"state": "none", "reason": "no live process runs; the next start serves rollout.rustGroups"});
+        }
+        Ok(meta) if meta.is_file() && !crate::guarded_file::is_link(&meta) => {}
+        _ => return json!({"state": "unknown", "reason": "the live owner gate is unavailable"}),
+    }
+    let mut backend = crate::lifecycle::LiveLifecycle;
+    match crate::lifecycle::LifecycleBackend::probe_owner(
+        &mut backend,
+        context.data_dir(),
+        crate::lifecycle::OwnerRole::Live,
+        crate::lifecycle::ProbeMode::Existing,
+    ) {
         crate::lifecycle::OwnerProbe::Free { .. } => {
             json!({"state": "none", "reason": "no live process runs; the next start serves rollout.rustGroups"})
         }
-        crate::lifecycle::OwnerProbe::Held { marker: Some(marker) } if marker.role == "live" => {
+        crate::lifecycle::OwnerProbe::Held { marker: Some(marker) }
+            if marker.role == crate::lifecycle::OwnerRole::Live.as_str() =>
+        {
             let serving = marker.groups.clone().unwrap_or_default();
             // Compared as sets of canonical keys, whatever spelling either list uses.
             let canonical = |list: &[String]| {

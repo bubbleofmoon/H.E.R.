@@ -1,8 +1,6 @@
 //! The shared, read-only definition of a running HER runtime.
 use crate::dsh_credential::Login;
-use crate::lifecycle::{
-    self, DesiredState, DesiredStore, Effective, OwnerGate, OwnerProbe, SUPERVISOR_LOCK,
-};
+use crate::lifecycle::{self, DesiredState, DesiredStore, Effective, OwnerRole};
 use crate::runtime::RuntimeContext;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -47,31 +45,35 @@ pub struct Verdict {
     cli_model_notice: Option<&'static str>,
 }
 
-fn owner(data: &Path, role: &str, lock: &str) -> Part {
-    if lifecycle::validate_existing_owner_gate_paths(data).is_err() {
-        return Part::new(false, "owner gate paths are unavailable");
-    }
-    match OwnerGate::new(data.join("logs").join(lock)).probe_existing() {
-        OwnerProbe::Held {
-            marker: Some(marker),
-        } if marker.role == role => {
-            let matches_image = crate::process_identity::current_identity()
-                .ok()
-                .is_some_and(|me| crate::update::health_image(&me.exe, &marker.identity.exe));
-            if matches_image
-                && crate::process_identity::check_identity(&marker.identity)
-                    == crate::process_identity::Liveness::Matches
-            {
-                Part::new(true, "supervisor owner process is alive")
-            } else {
-                Part::new(
-                    false,
-                    "supervisor owner process identity cannot be verified",
-                )
-            }
+fn owner(data: &Path, role: OwnerRole) -> Part {
+    match lifecycle::verify_owner(
+        &mut lifecycle::LiveLifecycle,
+        data,
+        role,
+        &lifecycle::ImagePolicy::HealthReadOnly,
+        lifecycle::ProbeMode::Existing,
+    ) {
+        lifecycle::OwnerObservation::Verified(_) => {
+            Part::new(true, format!("{} owner process is alive", role.as_str()))
         }
-        OwnerProbe::Free { .. } => Part::new(false, "supervisor owner is not held"),
-        _ => Part::new(false, "supervisor owner cannot be identified"),
+        lifecycle::OwnerObservation::Free { .. } => {
+            Part::new(false, format!("{} owner is not held", role.as_str()))
+        }
+        lifecycle::OwnerObservation::Mismatch {
+            marker: Some(_), ..
+        } => Part::new(
+            false,
+            format!(
+                "{} owner process identity cannot be verified",
+                role.as_str()
+            ),
+        ),
+        lifecycle::OwnerObservation::Mismatch { .. } => {
+            Part::new(false, format!("{} owner cannot be identified", role.as_str()))
+        }
+        lifecycle::OwnerObservation::Unknown(_) => {
+            Part::new(false, "owner gate paths are unavailable")
+        }
     }
 }
 
@@ -125,7 +127,7 @@ pub(crate) fn check_restore_candidate(root: &Path, deadline: Instant, permit: Op
     );
     parts.insert(
         "supervisor",
-        owner(context.data_dir(), "supervisor", SUPERVISOR_LOCK),
+        owner(context.data_dir(), OwnerRole::Supervisor),
     );
     let recovery = crate::restore::recovery_pending(&context);
     let verifying = permit.is_some_and(|expected| crate::restore::verifying_recovery(&context)
