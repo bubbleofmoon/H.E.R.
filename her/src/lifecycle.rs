@@ -376,8 +376,23 @@ fn validate_owner_gate_paths_with(data: &Path, create: bool) -> Result<(), Strin
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
-                std::fs::create_dir(&dir).map_err(|e| format!("gate directory is unavailable: {}", e.kind()))?;
-                if std::fs::canonicalize(&dir).ok().as_deref().and_then(Path::parent) != Some(base.as_path()) {
+                match std::fs::create_dir(&dir) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        match std::fs::symlink_metadata(&dir) {
+                            Ok(meta) if meta.is_dir() && !crate::guarded_file::is_link(&meta) => {}
+                            _ => {
+                                return Err("gate directory is redirected or unavailable".into());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        return Err(format!("gate directory is unavailable: {}", err.kind()));
+                    }
+                }
+                if std::fs::canonicalize(&dir).ok().as_deref().and_then(Path::parent)
+                    != Some(base.as_path())
+                {
                     return Err("gate directory is redirected".into());
                 }
             }
@@ -2780,5 +2795,27 @@ mod tests {
         let mut fake = FakeLifecycle::default();
         let notes = stop_unconfigured_owners(&mut fake, unused, &ImagePolicy::HealthReadOnly);
         assert!(notes.iter().any(|n| n.contains("read-only health image policy")), "{notes:?}");
+    }
+
+    #[test]
+    fn validate_owner_gate_paths_handles_concurrent_creation() {
+        for iter in 0..20 {
+            let data = temp_dir(&format!("concurrent-gate-{iter}"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let dir = data.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        validate_owner_gate_paths(&dir)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), Ok(()));
+            }
+            let _ = std::fs::remove_dir_all(&data);
+        }
     }
 }
