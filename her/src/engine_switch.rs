@@ -205,9 +205,7 @@ pub(crate) fn handover_needs_dsh(context: &RuntimeContext, key: &str, wanted: En
 }
 
 fn epoch(conv: Option<&Conversation>) -> String {
-    conv.and_then(|c| c.raw_token_str())
-        .map(crate::conversation_state::token_epoch)
-        .unwrap_or_default()
+    conv.and_then(|c| c.generation()).unwrap_or_default()
 }
 
 fn refused(error: String) -> (u16, String) { (503, error) }
@@ -299,7 +297,7 @@ fn prepare_admission(
         return Err((409, NOT_ADMITTED.into()));
     }
     let conversation = ConversationState::for_runtime(context).read(key)?;
-    if expected_token.is_some_and(|token| conversation.as_ref().and_then(Conversation::raw_token_str) != Some(token)) {
+    if expected_token.is_some_and(|token| conversation.as_ref().and_then(Conversation::token) != Some(token)) {
         return Err(admission_changed());
     }
     let generation = epoch(conversation.as_ref());

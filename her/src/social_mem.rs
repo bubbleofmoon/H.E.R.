@@ -151,7 +151,7 @@ pub(crate) fn select_impressions<'a>(
     let mut chosen: Vec<(usize, Option<usize>, i64)> = entries
         .iter()
         .enumerate()
-        .map(|(index, (name, entry))| (index, rank(name), entry.last_seen_at))
+        .map(|(index, (name, entry))| (index, rank(name), entry.last_seen_at.unwrap_or(0)))
         .collect();
     chosen.sort_by(|a, b| match (a.1, b.1) {
         (Some(x), Some(y)) => x.cmp(&y),
@@ -344,7 +344,7 @@ pub(crate) fn append_memory(
         }
         // Only a member speaking refreshes `lastSeenAt` (`note_member_seen`); a write starts it for a new entry.
         let (interaction_count, last_seen_at) = match old {
-            Some(o) => (o.interaction_count.max(0), o.last_seen_at),
+            Some(o) => (o.interaction_count.max(0), o.last_seen_at.unwrap_or(now)),
             None => (0, now),
         };
         impressions.insert(
@@ -352,8 +352,9 @@ pub(crate) fn append_memory(
             MemberImpression {
                 traits,
                 interaction_count,
-                last_seen_at,
+                last_seen_at: Some(last_seen_at),
                 extra: Map::new(),
+                ..Default::default()
             },
         );
         cap_impressions(impressions, policy.max_members);
@@ -366,7 +367,7 @@ fn cap_impressions(impressions: &mut IndexMap<String, MemberImpression>, max_mem
     }
     let mut entries: Vec<(String, i64)> = impressions
         .iter()
-        .map(|(k, v)| (k.clone(), v.last_seen_at))
+        .map(|(k, v)| (k.clone(), v.last_seen_at.unwrap_or(0)))
         .collect();
     entries.sort_by_key(|(_, ts)| *ts);
     for (k, _) in entries.iter().take(entries.len() - max_members) {
@@ -608,7 +609,7 @@ mod tests {
         note_member_seen(&mut st, None, Some("小明"), 5_000);
         note_member_seen(&mut st, Some(""), Some("路人"), 6_000);
         assert_eq!(st.impressions()["小明"].interaction_count, 1);
-        assert_eq!(st.impressions()["小明"].last_seen_at, 5_000);
+        assert_eq!(st.impressions()["小明"].last_seen_at, Some(5_000));
         assert_eq!(st.impressions()["10001"].interaction_count, 1);
 
         // The JS prototype names are ordinary names in a Rust map.
@@ -699,11 +700,11 @@ mod tests {
         let mut st = conv(json!({ "memberImpressions": {"小明": {"traits": ["话少"], "interactionCount": 4, "lastSeenAt": 100}} }));
         let extra = AppendExtra { target: "小明".into(), ..Default::default() };
         append_memory(&mut st, "memberImpression", "爱玩梗", &extra, &[], 9_000, &policy);
-        assert_eq!(st.impressions()["小明"].last_seen_at, 100, "only speaking refreshes lastSeenAt");
+        assert_eq!(st.impressions()["小明"].last_seen_at, Some(100), "only speaking refreshes lastSeenAt");
         assert_eq!(st.impressions()["小明"].interaction_count, 4);
         let fresh = AppendExtra { target: "新人".into(), ..Default::default() };
         append_memory(&mut st, "memberImpression", "新", &fresh, &[], 9_000, &policy);
-        assert_eq!(st.impressions()["新人"].last_seen_at, 9_000, "a brand-new entry starts now");
+        assert_eq!(st.impressions()["新人"].last_seen_at, Some(9_000), "a brand-new entry starts now");
     }
 
     #[test]
@@ -715,7 +716,7 @@ mod tests {
         let im = &st.impressions()["小明"];
         assert_eq!(im.traits, ["丙", "丁", "戊"], "the newest traits are kept, as append does");
         assert_eq!(im.interaction_count, 3, "a write is not an interaction");
-        assert_eq!(im.last_seen_at, 5);
+        assert_eq!(im.last_seen_at, Some(5));
     }
 
     #[test]

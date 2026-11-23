@@ -39,10 +39,7 @@ pub(super) fn admit_in_scope(
         .read(key)?
         .unwrap_or_default();
     let (scope, wait_used) = if let Some(turn) = approved_turn {
-        let epoch = conv
-            .raw_token_str()
-            .map(crate::conversation_state::token_epoch)
-            .unwrap_or_default();
+        let epoch = crate::conversation_state::token_epoch(conv.token().unwrap_or(""));
         (format!("{epoch}:{turn}"), 0)
     } else {
         wait_usage(context, key, &conv)?

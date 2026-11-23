@@ -2121,7 +2121,6 @@ fn handle_unread_from_state_with_auth(
     let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
     let conv_typed = doc.conversation(key).unwrap_or_default();
     let all = conv_typed.unread_values();
-    let st = conv_typed.to_value();
     let limit = limit.clamp(1, 100) as usize;
     let messages: Vec<Value> = match after_seq {
         None => {
@@ -2147,18 +2146,17 @@ fn handle_unread_from_state_with_auth(
     // 结果是**模型读过之后水位不前进**，未读数一直挂着，容易重复唤醒、重复回复。
     //
     // 只在带 agent token 的调用里记（控制台看未读不算「模型看过」），和 JS 一致。
-    let st = if is_agent {
+    let conv = if is_agent {
         note_model_seen_with_auth(context, &mut state, key, &all, &messages, write_auth)?;
-        state
-            .get("conversations")
-            .and_then(|c| c.get(key))
-            .cloned()
-            .unwrap_or_else(|| json!({}))
+        SocialDocument::from_value(state)
+            .ok()
+            .and_then(|doc| doc.conversation(key))
+            .unwrap_or_default()
     } else {
-        st.clone()
+        conv_typed
     };
-    let mut st = st;
-    agent::attach_receipts(context, key, &mut st);
+    let mut st = conv.to_value();
+    agent::attach_receipts_conv(context, key, &conv, &mut st);
     Ok(json!({
         "ok": true,
         "key": key,
@@ -2308,7 +2306,7 @@ fn note_model_seen_with_auth(
     seen_msgs: &[Value],
     auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<(), (u16, String)> {
-    // The receipt is process memory (see `agent::attach_receipts`) and is never written to the state file. In a
+    // The receipt is process memory (see `agent::attach_receipts_conv`) and is never written to the state file. In a
     // selected runtime it is still recorded under the shared state gate against the committed state, so a
     // session that was revoked, replaced or paused while the request waited records nothing.
     if context.is_isolated() {
@@ -2317,14 +2315,17 @@ fn note_model_seen_with_auth(
         if let Some(auth) = auth {
             social_projection_write_denial_doc(context, &fresh_doc, key, auth)?;
         }
+        let receipts = if let Some(conv) = fresh_doc.conversation(key) {
+            let fresh_unread = conv.unread_values();
+            agent::note_receipts_conv(context, key, &conv, &fresh_unread, seen_msgs);
+            Some(agent::receipts_of_conv(context, key, &conv))
+        } else {
+            None
+        };
         let mut fresh = fresh_doc.into_value();
-        let fresh_unread = Conversation::from_value(&fresh["conversations"][key])
-            .map(|c| c.unread_values())
-            .unwrap_or_default();
-        if let Some(conv) = fresh.get("conversations").and_then(|c| c.get(key)) {
-            agent::note_receipts(context, key, conv, &fresh_unread, seen_msgs);
+        if let Some(seen) = receipts {
+            agent::write_state_receipts(&mut fresh, key, seen);
         }
-        agent::attach_state_receipts(context, &mut fresh, key);
         *state = fresh;
         return Ok(());
     }
@@ -2332,10 +2333,14 @@ fn note_model_seen_with_auth(
         let fresh_doc = ConversationState::for_runtime(context).read_document()?;
         social_projection_write_denial_doc(context, &fresh_doc, key, auth)?;
     }
-    if let Some(conv) = state.get("conversations").and_then(|c| c.get(key)) {
-        agent::note_receipts(context, key, conv, unread, seen_msgs);
+    if let Some(conv) = SocialDocument::from_value(state.clone())
+        .ok()
+        .and_then(|doc| doc.conversation(key))
+    {
+        agent::note_receipts_conv(context, key, &conv, unread, seen_msgs);
+        let seen = agent::receipts_of_conv(context, key, &conv);
+        agent::write_state_receipts(state, key, seen);
     }
-    agent::attach_state_receipts(context, state, key);
     Ok(())
 }
 
@@ -2361,13 +2366,10 @@ fn handle_recent_from_state_with_auth(
     is_agent: bool,
     write_auth: Option<SocialProjectionWriteAuth<'_>>,
 ) -> Result<Value, (u16, String)> {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let all: Vec<Value> = st
-        .get("recentMessages")
+    let doc = SocialDocument::from_value(state.clone()).unwrap_or_else(|_| SocialDocument::empty());
+    let conv_typed = doc.conversation(key).unwrap_or_default();
+    let all: Vec<Value> = conv_typed
+        .field("recentMessages")
         .and_then(|u| u.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2378,21 +2380,18 @@ fn handle_recent_from_state_with_auth(
     // limit/offset before subtraction changes results for e.g. (1.5, 0).
     let (start, end) = recent_slice_bounds(all.len(), limit, offset);
     let messages = if start < end { all[start..end].to_vec() } else { Vec::new() };
-    let st = if is_agent {
-        let unread = Conversation::from_value(&st)
-            .map(|c| c.unread_values())
-            .unwrap_or_default();
+    let conv = if is_agent {
+        let unread = conv_typed.unread_values();
         note_model_seen_with_auth(context, &mut state, key, &unread, &messages, write_auth)?;
-        state
-            .get("conversations")
-            .and_then(|conversations| conversations.get(key))
-            .cloned()
-            .unwrap_or_else(|| json!({}))
+        SocialDocument::from_value(state)
+            .ok()
+            .and_then(|doc| doc.conversation(key))
+            .unwrap_or_default()
     } else {
-        st
+        conv_typed
     };
-    let mut st = st;
-    agent::attach_receipts(context, key, &mut st);
+    let mut st = conv.to_value();
+    agent::attach_receipts_conv(context, key, &conv, &mut st);
     Ok(json!({
         "ok": true,
         "key": key,
@@ -2424,14 +2423,15 @@ fn js_slice_index(value: f64, len: usize) -> usize {
 /// `/api/socialV2/my-recent?key=&limit=`：**自己**最近发过的消息。
 ///
 /// 只筛 `isSelf`，取尾部 limit 条；顺序与 recentMessages 一致（旧→新）。
-fn handle_my_recent_from_state(state: &Value, key: &str, limit: i64) -> Value {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let all: Vec<Value> = st
-        .get("recentMessages")
+fn handle_my_recent_from_doc(
+    context: &RuntimeContext,
+    doc: &SocialDocument,
+    key: &str,
+    limit: i64,
+) -> Value {
+    let conv = doc.conversation(key).unwrap_or_default();
+    let all: Vec<Value> = conv
+        .field("recentMessages")
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
@@ -2441,6 +2441,8 @@ fn handle_my_recent_from_state(state: &Value, key: &str, limit: i64) -> Value {
         .collect();
     let limit = limit.clamp(1, 50) as usize;
     let start = mine.len().saturating_sub(limit);
+    let mut st = conv.to_value();
+    agent::attach_receipts_conv(context, key, &conv, &mut st);
     json!({
         "ok": true,
         "key": key,
@@ -2453,14 +2455,10 @@ fn handle_my_recent_from_state(state: &Value, key: &str, limit: i64) -> Value {
 ///
 /// 排序是 `count` 降序、再按 `lastTime` 降序（JS 用的是 `b.count - a.count ||
 /// b.lastTime - a.lastTime`）。同一个人按 `userId` 归并，取不到 userId 时退化成昵称。
-fn handle_active_members_from_state(state: &Value, key: &str, limit: i64) -> Value {
-    let st = state
-        .get("conversations")
-        .and_then(|c| c.get(key))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let msgs = st
-        .get("recentMessages")
+fn handle_active_members_from_doc(doc: &SocialDocument, key: &str, limit: i64) -> Value {
+    let conv = doc.conversation(key).unwrap_or_default();
+    let msgs = conv
+        .field("recentMessages")
         .and_then(|r| r.as_array())
         .cloned()
         .unwrap_or_default();
@@ -5046,7 +5044,7 @@ pub(super) fn handle_wait_post(
     let poll_conversation = || -> Result<Option<Value>, (u16, String)> {
         let Ok(doc) = ConversationState::for_runtime(context).read_document() else { return Ok(None) };
         let current = doc.conversation(&key);
-        let live_token = current.as_ref().and_then(|c| c.raw_token_str()).unwrap_or("");
+        let live_token = current.as_ref().and_then(|c| c.token()).unwrap_or("");
         if is_agent && !credential_eq(live_token, agent_token.unwrap_or("")) {
             return Err((403, CHANGED.to_string()));
         }
@@ -5522,7 +5520,7 @@ pub(crate) fn wait_policy(cfg: &Value) -> WaitPolicy {
 /// Selected turns keep their durable identity across console restarts and DSH re-attachment.
 /// No-ledger callers use the persisted legacy turn ID, retaining lastWakeAt for older records.
 fn wait_usage(context: &RuntimeContext, key: &str, conv: &Conversation) -> Result<(String, u64), (u16, String)> {
-    let epoch = crate::conversation_state::token_epoch(conv.raw_token_str().unwrap_or(""));
+    let epoch = crate::conversation_state::token_epoch(conv.token().unwrap_or(""));
     let turn = if context.is_isolated() {
         let records = crate::turn_ledger::read_records(context).map_err(|_| (503, "wait turn ledger is unavailable".to_string()))?;
         crate::turn_ledger::fold(&records).0.into_iter().rev()
@@ -5676,7 +5674,7 @@ pub(crate) fn observation_wait_turn(context: &RuntimeContext, key: &str) -> Resu
         .unwrap_or_default();
     let Some(pending) = conv.field("activeWait") else { return Ok(None); };
     let epoch = conv
-        .raw_token_str()
+        .token()
         .map(crate::conversation_state::token_epoch)
         .unwrap_or_else(|| crate::conversation_state::token_epoch(""));
     if pending["purpose"] != "messages" || pending["epoch"] != epoch { return Ok(None); }
@@ -9489,7 +9487,7 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
             return Err((503,"wake has no agent token".to_string()));
         };
         let previous = conv.to_value();
-        let token = conv.raw_token_str().ok_or((503,"wake has no agent token".to_string()))?.to_string();
+        let token = conv.token().ok_or((503,"wake has no agent token".to_string()))?.to_string();
         if expected.is_some_and(|expected| !credential_eq(expected, &token)) {
             return Err((409, "queued wake token invalidated".to_string()));
         }
@@ -9514,7 +9512,7 @@ pub(crate) fn claim_reserved2_wake(context: &RuntimeContext, key: &str, reason: 
 /// Called only after the turn and its wake claim are durable. Preserve newer tool configuration.
 pub(crate) fn consume_reserved2_deadline(context: &RuntimeContext, key: &str, token: &str, at: i64, previous: &Value) -> Result<(), String> {
     ConversationState::for_runtime(context).update(key, |conv| {
-        if !credential_eq(conv.raw_token_str().unwrap_or(""), token) {
+        if !credential_eq(conv.token().unwrap_or(""), token) {
             return Err((403, "queued wake token invalidated".into()));
         }
         if let Some(mut wc) = conv.field("wakeConfig").cloned() {
@@ -9550,7 +9548,7 @@ pub(crate) fn rollback_reserved2_wake(context:&RuntimeContext,key:&str,at:i64,pr
 /// Completion is separate from wake admission: reminders do not consume another wake.
 pub(crate) fn complete_reserved2_turn(context: &RuntimeContext, cfg: &Value, key: &str, token: &str, started: Option<i64>, closing_seen: &Value, miss: u32) -> Result<(bool, Value), String> {
     ConversationState::for_runtime(context).update(key, |conv| {
-        if !credential_eq(conv.raw_token_str().unwrap_or(""), token) {
+        if !credential_eq(conv.token().unwrap_or(""), token) {
             return Err((403, "completed turn token invalidated".into()));
         }
         let mut wc = conv.field("wakeConfig").cloned().unwrap_or_else(|| json!({}));
@@ -9801,7 +9799,7 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
             if crate::turn_ledger::blocking_turn(&turns,key).is_some() {return Ok(None);}
         }
         let mapped=crate::session_map::lookup(context,key).map_err(|e|(503,e))?;
-        let prev_token = prev_conv.as_ref().and_then(|c| c.raw_token_str()).unwrap_or("");
+        let prev_token = prev_conv.as_ref().and_then(|c| c.token()).unwrap_or("");
         let partial_rotation=guard.is_some() && old.is_some() && mapped.is_none()
             && crate::session_map::unrevoked_rotation(context,key,prev_token).map_err(|e|(503,e))?.as_deref()==old;
         if mapped.as_deref()!=old && !partial_rotation {return Ok(None);}
@@ -9822,7 +9820,7 @@ fn reset_selected_session_record(context: &RuntimeContext, key: &str, old: Optio
             preserve_reset_sticker_liabilities(&previous,&mut replacement_val);
             Conversation::from_value(&replacement_val).unwrap_or_else(|| Conversation::new_default(context))
         };
-        let token = replacement.raw_token_str().unwrap_or("").to_string();
+        let token = replacement.token().unwrap_or("").to_string();
         doc.set_conversation(key, replacement);
         Ok(Some(token))
     }).map_err(|(_,e)|e)
@@ -12936,7 +12934,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
             }
             // JS is `Number(x) || 10`: zero and invalid values fall back to 10.
             let limit = js_query_number_or(req.query.get("limit").map(String::as_str), 10.0);
-            let result = social_projection_request_state(
+            let result = social_projection_request_doc(
                 context,
                 cfg,
                 &key,
@@ -12944,11 +12942,10 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
                 "getMyRecent",
                 "qq_get_my_recent_messages",
             )
-            .and_then(|(mut state, _)| {
+            .and_then(|(doc, _)| {
                 let storage_key = projection_storage_key(&key)?;
-                agent::attach_state_receipts(context, &mut state, &storage_key);
                 Ok(projection_response_key(
-                    handle_my_recent_from_state(&state, &storage_key, limit as i64),
+                    handle_my_recent_from_doc(context, &doc, &storage_key, limit as i64),
                     &key,
                 ))
             });
@@ -12975,7 +12972,7 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
                 );
             }
             let limit = js_query_number_or(req.query.get("limit").map(String::as_str), 10.0);
-            let result = social_projection_request_state(
+            let result = social_projection_request_doc(
                 context,
                 cfg,
                 &key,
@@ -12983,10 +12980,10 @@ fn route_with_caller(caller: &mut front::VerifiedCaller, req: &Request) -> (u16,
                 "getActiveMembers",
                 "qq_get_active_members",
             )
-            .and_then(|(state, _)| {
+            .and_then(|(doc, _)| {
                 let storage_key = projection_storage_key(&key)?;
                 Ok(projection_response_key(
-                    handle_active_members_from_state(&state, &storage_key, limit as i64),
+                    handle_active_members_from_doc(&doc, &storage_key, limit as i64),
                     &key,
                 ))
             });

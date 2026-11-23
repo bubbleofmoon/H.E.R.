@@ -1089,7 +1089,7 @@ pub fn build_reminder_with_runtime(
 ) -> String {
     let conv = conversation_for_runtime(context, key);
     let cfg = config_for_runtime(context);
-    let token = conv.raw_token_str().unwrap_or("");
+    let token = conv.token().unwrap_or("");
     let pre_sleep_ms = crate::wake::prompt_pre_sleep_wait_ms(&cfg);
 
     let mut out = String::new();
@@ -1198,7 +1198,7 @@ fn build_inner(
     let cfg = config_for_runtime(context);
     let st = state_with_runtime_recent(&persisted_st, runtime_recent);
     let conv = Conversation::from_value(&st).unwrap_or_default();
-    let token = conv.raw_token_str().unwrap_or("");
+    let token = conv.token().unwrap_or("");
 
     let mut out = String::new();
     out.push_str(&role_line_with_runtime(context, key));
@@ -2057,7 +2057,7 @@ pub(crate) fn render_wake(
         .map_err(|(_, e)| e)?
         .conversation(key)
         .unwrap_or_default();
-    if conv.raw_token_str() != Some(epoch) { return Err("wake epoch changed before briefing".into()); }
+    if conv.token() != Some(epoch) { return Err("wake epoch changed before briefing".into()); }
     let st_val = conv.to_value();
     let st = &st_val;
     // Capture the briefing generation before any section is rendered. A persona switch saves the

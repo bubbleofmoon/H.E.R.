@@ -34,7 +34,7 @@ pub(crate) fn candidate(
         .map_err(|(_, e)| e)?;
     let epoch = conv
         .as_ref()
-        .and_then(|c| c.raw_token_str())
+        .and_then(|c| c.token())
         .unwrap_or("");
     let sid = match crate::session_map::lookup(context, key)? {
         Some(sid) => sid,

@@ -40,6 +40,21 @@ fn epoch_of(conv: &Value) -> String {
         .unwrap_or_default()
 }
 
+pub(super) fn receipts_of_conv(context: &RuntimeContext, key: &str, conv: &Conversation) -> Vec<i64> {
+    let epoch = epoch_of_conv(conv);
+    let mut seen: BTreeSet<_> = tool_receipts(context, key, &epoch).into_iter().collect();
+    let mut grants = snapshot_grants().lock().unwrap_or_else(|p| p.into_inner());
+    let slot = (receipt_scope(context), key.to_owned());
+    if let Some(grant) = grants.get(&slot) {
+        if grant.epoch == epoch && !grant.budget.expired(&conv.to_value()) {
+            seen.extend(&grant.seqs);
+        } else if grant.epoch == epoch {
+            grants.remove(&slot);
+        }
+    }
+    seen.into_iter().collect()
+}
+
 /// Seqs the model has been offered in this process under the conversation's current token. They are
 /// deliberately not stored in `social-v2.json`: after a restart the model must fetch unread messages
 /// again (bridge.js `readThroughSeqV2` comment), so a persisted receipt could authorise skipping unseen
@@ -98,25 +113,28 @@ fn urgent_delivery_store() -> &'static Mutex<ReceiptMap> {
     STORE.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-fn receipt_turn(context: &RuntimeContext, key: &str, conv: &Value) -> Option<String> {
+fn receipt_turn_epoch(context: &RuntimeContext, key: &str, epoch: &str) -> Option<String> {
     let records = crate::turn_ledger::read_records(context).ok()?;
     let after_reset = records.iter().rposition(|r| crate::turn_ledger::is_reset_of(r,key)).map_or(0,|i|i+1);
     // A late old-turn read cannot acquire the replacement conversation's reused seqs.
     let (turns, _) = crate::turn_ledger::fold(&records[after_reset..]);
-    let epoch = epoch_of(conv);
-    turns.iter().rev().find(|t| t.key == key && t.state.is_open() && t.epochs.contains(&epoch)).map(|t| t.id.clone())
+    turns.iter().rev().find(|t| t.key == key && t.state.is_open() && t.epochs.iter().any(|e| e == epoch)).map(|t| t.id.clone())
 }
 
-fn note_urgent_delivery(context: &RuntimeContext, key: &str, conv: &Value, offered: &[Value]) {
+fn note_urgent_delivery_epoch(context: &RuntimeContext, key: &str, epoch: &str, offered: &[Value]) {
     let urgent: BTreeSet<_> = offered.iter()
         .filter(|m| m["atSelf"] == true || m["isOwner"] == true)
         .filter_map(|m| js_safe_integer(&m["seq"]).filter(|seq| *seq > 0)).collect();
     if urgent.is_empty() { return; }
-    let Some(turn) = receipt_turn(context, key, conv) else { return };
+    let Some(turn) = receipt_turn_epoch(context, key, epoch) else { return };
     let mut store = urgent_delivery_store().lock().unwrap_or_else(|p| p.into_inner());
     let slot = store.entry((receipt_scope(context), key.to_string())).or_default();
     if slot.0 != turn { *slot = (turn, BTreeSet::new()); }
     slot.1.extend(urgent);
+}
+
+fn note_urgent_delivery(context: &RuntimeContext, key: &str, conv: &Value, offered: &[Value]) {
+    note_urgent_delivery_epoch(context, key, &epoch_of(conv), offered);
 }
 
 /// The live bridge and console share state, but delivery receipts belong to the console process.
@@ -233,6 +251,14 @@ pub(crate) fn build_wake_snapshot_conv(
 }
 
 /// Put this process's receipts into a conversation value (replacing anything the file carried).
+pub(super) fn attach_receipts_conv(context: &RuntimeContext, key: &str, conv: &Conversation, target: &mut Value) {
+    let seen = receipts_of_conv(context, key, conv);
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert("modelSeenSeqs".to_string(), json!(seen));
+    }
+}
+
+/// Put this process's receipts into a conversation value (replacing anything the file carried).
 pub(super) fn attach_receipts(context: &RuntimeContext, key: &str, conv: &mut Value) {
     let seen = receipts_of(context, key, conv);
     if let Some(obj) = conv.as_object_mut() {
@@ -240,29 +266,40 @@ pub(super) fn attach_receipts(context: &RuntimeContext, key: &str, conv: &mut Va
     }
 }
 
-/// `attach_receipts` for the conversation `key` inside a whole state.
-pub(super) fn attach_state_receipts(context: &RuntimeContext, state: &mut Value, key: &str) {
-    if let Some(conv) = state.get_mut("conversations").and_then(|c| c.get_mut(key)) {
-        attach_receipts(context, key, conv);
+/// Write precomputed volatile process receipts onto `conversations[key]` in a projection `Value`.
+pub(super) fn write_state_receipts(state: &mut Value, key: &str, seen: Vec<i64>) {
+    if let Some(conv) = state
+        .get_mut("conversations")
+        .and_then(|c| c.get_mut(key))
+        .and_then(Value::as_object_mut)
+    {
+        conv.insert("modelSeenSeqs".to_string(), json!(seen));
     }
+}
+
+/// JS `noteModelMessagesV2` bookkeeping using a typed `Conversation` record.
+pub(super) fn note_receipts_conv(context: &RuntimeContext, key: &str, conv: &Conversation, unread: &[Value], offered: &[Value]) {
+    let epoch = epoch_of_conv(conv);
+    note_urgent_delivery_epoch(context, key, &epoch, offered);
+    note_offered_receipts_epoch(context, key, &epoch, unread, offered);
 }
 
 /// JS `noteModelMessagesV2` bookkeeping: receipts are bounded by the unread buffer, only seqs that
 /// are in it count. `conv` is the conversation record (its token decides which session the receipts
 /// belong to).
 pub(super) fn note_receipts(context: &RuntimeContext, key: &str, conv: &Value, unread: &[Value], offered: &[Value]) {
-    note_urgent_delivery(context, key, conv, offered);
-    note_offered_receipts(context, key, conv, unread, offered);
+    let epoch = epoch_of(conv);
+    note_urgent_delivery_epoch(context, key, &epoch, offered);
+    note_offered_receipts_epoch(context, key, &epoch, unread, offered);
 }
 
-fn note_offered_receipts(context: &RuntimeContext, key: &str, conv: &Value, unread: &[Value], offered: &[Value]) {
-    let epoch = epoch_of(conv);
+fn note_offered_receipts_epoch(context: &RuntimeContext, key: &str, epoch: &str, unread: &[Value], offered: &[Value]) {
     // JS bounds existing receipts by raw unread membership, even for a legacy unsafe i64.
     // Safe-integer validation applies only when adding a newly offered receipt below.
     let unread_seqs: BTreeSet<i64> = unread.iter().filter_map(|m| {
         m.get("seq").and_then(|seq| seq.as_i64().or_else(|| js_safe_integer(seq)))
     }).collect();
-    let mut seen: BTreeSet<i64> = tool_receipts(context, key, &epoch).into_iter().filter(|s| unread_seqs.contains(s)).collect();
+    let mut seen: BTreeSet<i64> = tool_receipts(context, key, epoch).into_iter().filter(|s| unread_seqs.contains(s)).collect();
     for message in offered {
         if let Some(seq) = message.get("seq").and_then(js_safe_integer) {
             if seq > 0 && unread_seqs.contains(&seq) {
@@ -270,7 +307,7 @@ fn note_offered_receipts(context: &RuntimeContext, key: &str, conv: &Value, unre
             }
         }
     }
-    set_receipts(context, key, &epoch, seen.into_iter().collect());
+    set_receipts(context, key, epoch, seen.into_iter().collect());
 }
 
 // ----- the central agent gate -------------------------------------------------------------------------------

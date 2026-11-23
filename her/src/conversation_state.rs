@@ -21,16 +21,62 @@ const CONVERSATIONS: &str = "conversations";
 const AGENT_TOKEN: &str = "agentToken";
 const UNREAD: &str = "unread";
 const IMPRESSIONS: &str = "memberImpressions";
+const MODEL_SEEN_SEQS: &str = "modelSeenSeqs";
 
 pub(crate) const SOCIAL_STATE_GATE: &str = "locks/social-v2.lock";
 /// Upper bound on how long a writer queues for `locks/social-v2.lock` before returning 503.
 ///
-/// Lock order: `closed_agent::lock` precedes this gate; this gate precedes `locks/authority.lock`,
-/// `locks/settings-store.lock`, `locks/sessions.lock`, `locks/personas.lock`,
-/// `locks/social-v1.lock`, and in-memory agent receipt/grant mutexes. Nothing waits on another
-/// outer lock, channel, sleep, or unrelated store I/O while holding this gate.
+/// Lock order:
+/// 1. `closed_agent::lock` (outermost, when held by access/owner handlers)
+/// 2. Per-request unique `locks/observation-wait-*.lock` (`WaitLease::live` in `console.rs`,
+///    acquired before `WaitLease::publish` enters `update_document`; unique per wait generation
+///    so no writer blocks on it, and `observation_wait_turn` only performs a non-blocking probe)
+/// 3. `SOCIAL_STATE_GATE` (`locks/social-v2.lock`, or [`LEGACY_GATE`] for non-isolated runtimes;
+///    mutually exclusive because `open_locked_file` refuses legacy contexts)
+/// 4. Selected store/coordination locks and in-process leaf mutexes: `locks/authority.lock`,
+///    `locks/settings-store.lock`, `locks/sessions.lock`, `locks/personas.lock`,
+///    `locks/social-v1.lock`, `locks/schedule.lock`, `wait_leases()` (inspected only as a non-I/O
+///    leaf check via `WaitLease::still_current()` inside `WaitLease::publish`; `WaitLease::drop`
+///    drops both `live` and the social gate before taking `wait_leases()`), and in-process agent
+///    receipt/grant mutexes (`receipt_store`, `snapshot_grants`, `urgent_delivery_store`).
+///
+/// Work performed under `SOCIAL_STATE_GATE`: `acquire_social_state_lock` reads runtime config
+/// (`load_config`) and rechecks `console_authority`; document updates perform `social-v2.json`
+/// read/atomic-replace and lower-ranked selected store reads/writes (such as session/turn-ledger
+/// cleanup on reset). Nothing acquires an outer lock, sleeps, waits on channels, or performs
+/// network/gateway I/O while holding `SOCIAL_STATE_GATE`.
 pub(crate) const SOCIAL_STATE_GATE_WAIT: Duration = Duration::from_secs(5);
+/// In-process social gate for legacy (non-isolated) runtimes. Holds the exact same lock rank as
+/// [`SOCIAL_STATE_GATE`] (preceding leaf mutexes like `wait_leases()` and receipt stores, never
+/// combined with `SOCIAL_STATE_GATE` or outer locks, and performing only legacy file atomic
+/// replace under the mutex).
 static LEGACY_GATE: Mutex<()> = Mutex::new(());
+
+fn is_reserved_typed_field(name: &str) -> bool {
+    matches!(name, AGENT_TOKEN | UNREAD | IMPRESSIONS | MODEL_SEEN_SEQS)
+}
+
+fn reorder_map(order: &[String], mut entries: Map<String, Value>) -> Map<String, Value> {
+    if order.is_empty() {
+        return entries;
+    }
+    let mut out = Map::with_capacity(entries.len());
+    for key in order {
+        if let Some(value) = entries.remove(key) {
+            out.insert(key.clone(), value);
+        }
+    }
+    for (key, value) in entries {
+        out.insert(key, value);
+    }
+    out
+}
+
+fn strip_receipts_in_map(conversations: &mut Map<String, Value>) {
+    for conversation in conversations.values_mut().filter_map(Value::as_object_mut) {
+        conversation.remove(MODEL_SEEN_SEQS);
+    }
+}
 
 pub(crate) type Failure = (u16, String);
 
@@ -191,18 +237,30 @@ impl UnreadMessage {
 }
 
 /// Typed impression entry inside a conversation's `memberImpressions` map, tolerating legacy
-/// scalar spellings and preserving unknown fields.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// scalar spellings, keeping missing `lastSeenAt` distinct from `0`, and preserving unknown fields
+/// and insertion order on serialization.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MemberImpression {
     pub traits: Vec<String>,
     pub interaction_count: i64,
-    pub last_seen_at: i64,
+    pub last_seen_at: Option<i64>,
     pub extra: Map<String, Value>,
+    key_order: Vec<String>,
+}
+
+impl PartialEq for MemberImpression {
+    fn eq(&self, other: &Self) -> bool {
+        self.traits == other.traits
+            && self.interaction_count == other.interaction_count
+            && self.last_seen_at == other.last_seen_at
+            && self.extra == other.extra
+    }
 }
 
 impl MemberImpression {
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
+        let key_order: Vec<String> = obj.keys().cloned().collect();
         let mut extra = obj.clone();
         let traits = extra
             .remove("traits")
@@ -214,12 +272,16 @@ impl MemberImpression {
             })
             .unwrap_or_default();
         let interaction_count = num_of(extra.remove("interactionCount").as_ref());
-        let last_seen_at = num_of(extra.remove("lastSeenAt").as_ref());
+        let last_seen_at = extra
+            .remove("lastSeenAt")
+            .filter(|v| !v.is_null())
+            .map(|v| num_of(Some(&v)));
         Some(Self {
             traits,
             interaction_count,
             last_seen_at,
             extra,
+            key_order,
         })
     }
 
@@ -230,18 +292,20 @@ impl MemberImpression {
             Value::Array(self.traits.iter().cloned().map(Value::String).collect()),
         );
         out.insert("interactionCount".to_string(), json!(self.interaction_count));
-        out.insert("lastSeenAt".to_string(), json!(self.last_seen_at));
+        if let Some(last_seen_at) = self.last_seen_at {
+            out.insert("lastSeenAt".to_string(), json!(last_seen_at));
+        }
         for (k, v) in &self.extra {
             out.insert(k.clone(), v.clone());
         }
-        Value::Object(out)
+        Value::Object(reorder_map(&self.key_order, out))
     }
 }
 
 /// Typed conversation record from `social-v2.json` owning `token` (`agentToken`), `generation`
 /// (SHA-256 token epoch), `unread` (`unread`), and `impressions` (`memberImpressions`), while
-/// preserving every other field on atomic write.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// preserving every other field and insertion order on atomic write.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Conversation {
     token_raw: Option<Value>,
     unread: Vec<UnreadMessage>,
@@ -251,13 +315,33 @@ pub(crate) struct Conversation {
     impressions_dirty: bool,
     impressions_raw: Option<Value>,
     extra: Map<String, Value>,
+    key_order: Vec<String>,
+}
+
+impl PartialEq for Conversation {
+    fn eq(&self, other: &Self) -> bool {
+        self.token_raw == other.token_raw
+            && self.unread == other.unread
+            && self.unread_dirty == other.unread_dirty
+            && self.unread_raw == other.unread_raw
+            && self.impressions == other.impressions
+            && self.impressions_dirty == other.impressions_dirty
+            && self.impressions_raw == other.impressions_raw
+            && self.extra == other.extra
+    }
 }
 
 impl Conversation {
     /// Parse a stored conversation JSON object tolerantly. Non-object values return `None`.
     pub(crate) fn from_value(value: &Value) -> Option<Self> {
-        let mut obj = value.as_object()?.clone();
-        obj.remove("modelSeenSeqs");
+        let obj_ref = value.as_object()?;
+        let key_order: Vec<String> = obj_ref
+            .keys()
+            .filter(|k| k.as_str() != MODEL_SEEN_SEQS)
+            .cloned()
+            .collect();
+        let mut obj = obj_ref.clone();
+        obj.remove(MODEL_SEEN_SEQS);
         let token_raw = obj.remove(AGENT_TOKEN);
         let unread_raw = obj.remove(UNREAD);
         let unread = unread_raw
@@ -288,12 +372,13 @@ impl Conversation {
             impressions_dirty: false,
             impressions_raw,
             extra: obj,
+            key_order,
         })
     }
 
     pub(crate) fn to_value(&self) -> Value {
         let mut out = self.extra.clone();
-        out.remove("modelSeenSeqs");
+        out.remove(MODEL_SEEN_SEQS);
         if let Some(token) = &self.token_raw {
             out.insert(AGENT_TOKEN.to_string(), token.clone());
         }
@@ -314,7 +399,7 @@ impl Conversation {
         } else if let Some(raw) = &self.impressions_raw {
             out.insert(IMPRESSIONS.to_string(), raw.clone());
         }
-        Value::Object(out)
+        Value::Object(reorder_map(&self.key_order, out))
     }
 
     /// A fresh v2 conversation record with default wake configuration, empty message windows and a
@@ -345,17 +430,17 @@ impl Conversation {
             impressions_dirty: false,
             impressions_raw: None,
             extra,
+            key_order: Vec::new(),
         }
     }
 
-    /// Active nonempty agent token, if present.
+    /// Active nonempty agent token, treating missing, `null`, non-string, and `""` uniformly as
+    /// `None`.
     pub(crate) fn token(&self) -> Option<&str> {
-        self.raw_token_str().filter(|t| !t.is_empty())
-    }
-
-    /// Stored `agentToken` string, including the empty strings some older records hold.
-    pub(crate) fn raw_token_str(&self) -> Option<&str> {
-        self.token_raw.as_ref().and_then(Value::as_str)
+        self.token_raw
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
     }
 
     pub(crate) fn token_is_null(&self) -> bool {
@@ -499,7 +584,7 @@ impl Conversation {
                 .any(|id| !id.is_empty() && id == name)
             {
                 entry.interaction_count += 1;
-                entry.last_seen_at = now;
+                entry.last_seen_at = Some(now);
                 matched = true;
             }
         }
@@ -509,29 +594,49 @@ impl Conversation {
     }
 
     pub(crate) fn field(&self, name: &str) -> Option<&Value> {
-        debug_assert!(!matches!(name, AGENT_TOKEN | UNREAD | IMPRESSIONS));
+        if is_reserved_typed_field(name) {
+            return None;
+        }
         self.extra.get(name)
+    }
+
+    pub(crate) fn try_set_field(&mut self, name: impl Into<String>, value: Value) -> Result<(), Failure> {
+        let name = name.into();
+        if is_reserved_typed_field(&name) {
+            return Err((
+                500,
+                format!("reserved conversation field `{name}` must use typed accessors"),
+            ));
+        }
+        self.extra.insert(name, value);
+        Ok(())
     }
 
     pub(crate) fn set_field(&mut self, name: impl Into<String>, value: Value) {
         let name = name.into();
-        debug_assert!(!matches!(name.as_str(), AGENT_TOKEN | UNREAD | IMPRESSIONS));
+        if is_reserved_typed_field(&name) {
+            return;
+        }
         self.extra.insert(name, value);
     }
 
     pub(crate) fn remove_field(&mut self, name: &str) -> Option<Value> {
-        debug_assert!(!matches!(name, AGENT_TOKEN | UNREAD | IMPRESSIONS));
+        if is_reserved_typed_field(name) {
+            return None;
+        }
         self.extra.remove(name)
     }
 }
 
-/// Whole `social-v2.json` document preserving top-level unknown fields and non-migrated keys.
+/// Whole `social-v2.json` document preserving top-level unknown fields, key insertion order, and
+/// non-migrated keys.
 #[derive(Debug, Clone)]
 pub(crate) struct SocialDocument {
     paused_raw: Option<Value>,
     reset_epoch_raw: Option<Value>,
     conversations: Map<String, Value>,
     extra: Map<String, Value>,
+    key_order: Vec<String>,
 }
 
 impl SocialDocument {
@@ -541,6 +646,7 @@ impl SocialDocument {
             reset_epoch_raw: None,
             conversations: Map::new(),
             extra: Map::new(),
+            key_order: Vec::new(),
         }
     }
 
@@ -548,14 +654,13 @@ impl SocialDocument {
         let Value::Object(mut obj) = value else {
             return Err((500, "runtime data is invalid".to_string()));
         };
+        let key_order: Vec<String> = obj.keys().cloned().collect();
         let paused_raw = obj.remove("paused");
         let reset_epoch_raw = obj.remove("resetEpoch");
         let conversations = match obj.remove(CONVERSATIONS) {
             None | Some(Value::Null) => Map::new(),
             Some(Value::Object(mut map)) => {
-                for conv in map.values_mut().filter_map(Value::as_object_mut) {
-                    conv.remove("modelSeenSeqs");
-                }
+                strip_receipts_in_map(&mut map);
                 map
             }
             Some(_) => return Err((500, "runtime data is invalid".to_string())),
@@ -565,6 +670,7 @@ impl SocialDocument {
             reset_epoch_raw,
             conversations,
             extra: obj,
+            key_order,
         })
     }
 
@@ -577,7 +683,7 @@ impl SocialDocument {
             out.insert("resetEpoch".to_string(), reset_epoch);
         }
         out.insert(CONVERSATIONS.to_string(), Value::Object(self.conversations));
-        Value::Object(out)
+        Value::Object(reorder_map(&self.key_order, out))
     }
 
     pub(crate) fn paused(&self) -> bool {
@@ -929,23 +1035,48 @@ pub(crate) fn read_reserved_document(context: &RuntimeContext) -> Result<Reserve
     }
 }
 
+/// Acquire a bounded runtime data lock with retries until `SOCIAL_STATE_GATE_WAIT`.
+fn acquire_file_lock<F>(
+    context: &RuntimeContext,
+    relative: &str,
+    sleep_step: Duration,
+    mut on_busy: F,
+    busy_message: &str,
+    error_prefix: &str,
+) -> Result<File, Failure>
+where
+    F: FnMut(),
+{
+    let deadline = Instant::now() + SOCIAL_STATE_GATE_WAIT;
+    loop {
+        match context.open_locked_file(RuntimeArea::Data, relative) {
+            Ok(file) => return Ok(file),
+            Err(error) if error == "runtime file is already locked" => {
+                on_busy();
+                if Instant::now() >= deadline {
+                    return Err((503, busy_message.to_string()));
+                }
+                std::thread::sleep(sleep_step);
+            }
+            Err(error) => return Err((503, format!("{error_prefix}: {error}"))),
+        }
+    }
+}
+
 /// The reserved gate follows the v2 social gate when a reset holds both.
 pub(crate) fn update_reserved_document<T>(
     context: &RuntimeContext,
     update: impl FnOnce(&mut ReservedState) -> Result<T, String>,
 ) -> Result<T, String> {
-    let deadline = Instant::now() + SOCIAL_STATE_GATE_WAIT;
-    let _gate = loop {
-        match context.open_locked_file(RuntimeArea::Data, "locks/social-v1.lock") {
-            Ok(gate) => break gate,
-            Err(error)
-                if error == "runtime file is already locked" && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => return Err(format!("reserved state gate: {error}")),
-        }
-    };
+    let _gate = acquire_file_lock(
+        context,
+        "locks/social-v1.lock",
+        Duration::from_millis(10),
+        || {},
+        "reserved state gate: runtime file is already locked",
+        "reserved state gate",
+    )
+    .map_err(|(_, msg)| msg)?;
     let mut state = read_reserved_document(context)?;
     let result = update(&mut state)?;
     let bytes = serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?;
@@ -1036,9 +1167,7 @@ pub(crate) fn strip_receipts(state: &mut Value) {
         .get_mut(CONVERSATIONS)
         .and_then(Value::as_object_mut)
     {
-        for conversation in conversations.values_mut().filter_map(Value::as_object_mut) {
-            conversation.remove("modelSeenSeqs");
-        }
+        strip_receipts_in_map(conversations);
     }
 }
 
@@ -1091,33 +1220,28 @@ thread_local! {
 /// Acquire `locks/social-v2.lock` with bounded retry. If `context.console_authority` is present,
 /// recheck it under the gate so a request whose credential rotated while waiting commits nothing.
 fn acquire_social_state_lock(context: &RuntimeContext) -> Result<File, Failure> {
-    let deadline = Instant::now() + SOCIAL_STATE_GATE_WAIT;
-    loop {
-        match context.open_locked_file(RuntimeArea::Data, SOCIAL_STATE_GATE) {
-            Ok(file) => {
-                if let Some(proof) = &context.console_authority {
-                    let cfg = context
-                        .load_config()
-                        .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
-                    proof.recheck(context, &cfg)?;
+    let file = acquire_file_lock(
+        context,
+        SOCIAL_STATE_GATE,
+        Duration::from_millis(5),
+        || {
+            #[cfg(test)]
+            ON_GATE_CONTENTION.with(|hook| {
+                if let Some(notify) = hook.take() {
+                    notify();
                 }
-                return Ok(file);
-            }
-            Err(error) if error == "runtime file is already locked" => {
-                #[cfg(test)]
-                ON_GATE_CONTENTION.with(|hook| {
-                    if let Some(notify) = hook.take() {
-                        notify();
-                    }
-                });
-                if Instant::now() >= deadline {
-                    return Err((503, "selected runtime social state is busy".to_string()));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err((503, format!("social-state/gate: {error}"))),
-        }
+            });
+        },
+        "selected runtime social state is busy",
+        "social-state/gate",
+    )?;
+    if let Some(proof) = &context.console_authority {
+        let cfg = context
+            .load_config()
+            .map_err(|_| (503, "runtime config is unavailable".to_string()))?;
+        proof.recheck(context, &cfg)?;
     }
+    Ok(file)
 }
 
 /// Acquire the selected runtime's social gate (`locks/social-v2.lock`). Fails closed on legacy
@@ -1365,7 +1489,7 @@ mod tests {
         let alice = conv.impressions().get("alice").unwrap();
         assert_eq!(alice.traits, vec!["42".to_string(), "calm".to_string()]);
         assert_eq!(alice.interaction_count, 3);
-        assert_eq!(alice.last_seen_at, 500);
+        assert_eq!(alice.last_seen_at, Some(500));
         assert!(!conv.impressions().contains_key("badScalar"));
 
         // Update only token: unread, impressions, and unknown fields stay untouched.
@@ -1407,7 +1531,7 @@ mod tests {
         assert_eq!(after_mut.unread()[0].raw_i64_seq(), Some(unsafe_seq));
         let alice = after_mut.impressions().get("alice").unwrap();
         assert_eq!(alice.interaction_count, 4);
-        assert_eq!(alice.last_seen_at, 999);
+        assert_eq!(alice.last_seen_at, Some(999));
         assert_eq!(alice.extra.get("customImpField"), Some(&json!("keep-me")));
     }
 
@@ -1444,8 +1568,9 @@ mod tests {
                     MemberImpression {
                         traits: vec!["funny".to_string()],
                         interaction_count: 1,
-                        last_seen_at: 200,
+                        last_seen_at: Some(200),
                         extra: Map::new(),
+                        ..Default::default()
                     },
                 );
                 Ok(tok)
@@ -1534,8 +1659,9 @@ mod tests {
                         MemberImpression {
                             traits: vec!["kind".to_string()],
                             interaction_count: 1,
-                            last_seen_at: 42,
+                            last_seen_at: Some(42),
                             extra: Map::new(),
+                            ..Default::default()
                         },
                     );
                     Ok(())
@@ -1557,5 +1683,134 @@ mod tests {
             final_conv.impressions().get("alice").map(|i| &i.traits),
             Some(&vec!["kind".to_string()])
         );
+    }
+
+    #[test]
+    fn round_trip_preserves_insertion_order_and_omits_missing_last_seen() {
+        let fixture = state_fixture();
+        let context = RuntimeContext::from_root(&fixture.0).unwrap();
+        let raw_json = r#"{
+  "topFirst": 1,
+  "paused": false,
+  "conversations": {
+    "group:order": {
+      "firstField": "a",
+      "agentToken": "tok-old",
+      "middleField": "b",
+      "unread": [{ "seq": 1, "text": "hi" }],
+      "memberImpressions": {
+        "alice": {
+          "impFirst": true,
+          "traits": ["calm"],
+          "impMid": 2,
+          "lastSeenAt": 0,
+          "interactionCount": 3,
+          "impLast": "end"
+        },
+        "bob": {
+          "traits": ["quiet"],
+          "interactionCount": 1
+        }
+      },
+      "lastField": "c"
+    }
+  },
+  "resetEpoch": 7,
+  "topLast": "z"
+}"#;
+        let path = context.resolve_path(RuntimeArea::Data, FILE, PathIntent::WriteFile).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, raw_json).unwrap();
+
+        let state = ConversationState::for_runtime(&context);
+        state
+            .update("group:order", |c| {
+                c.set_token("tok-new");
+                c.push_unread(
+                    UnreadMessage::from_value(&json!({ "seq": 2, "text": "next" })).unwrap(),
+                    10,
+                );
+                let alice = c.impressions().get("alice").unwrap();
+                assert_eq!(alice.last_seen_at, Some(0));
+                let bob = c.impressions().get("bob").unwrap();
+                assert_eq!(bob.last_seen_at, None);
+                c.note_member_seen(None, Some("alice"), 555);
+                Ok(())
+            })
+            .unwrap();
+
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let top_keys: Vec<&str> = written.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            top_keys,
+            vec!["topFirst", "paused", "conversations", "resetEpoch", "topLast"]
+        );
+        let conv_obj = written["conversations"]["group:order"].as_object().unwrap();
+        let conv_keys: Vec<&str> = conv_obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            conv_keys,
+            vec![
+                "firstField",
+                "agentToken",
+                "middleField",
+                "unread",
+                "memberImpressions",
+                "lastField",
+            ]
+        );
+        let alice_obj = conv_obj["memberImpressions"]["alice"].as_object().unwrap();
+        let alice_keys: Vec<&str> = alice_obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            alice_keys,
+            vec![
+                "impFirst",
+                "traits",
+                "impMid",
+                "lastSeenAt",
+                "interactionCount",
+                "impLast",
+            ]
+        );
+        let bob_obj = conv_obj["memberImpressions"]["bob"].as_object().unwrap();
+        assert!(
+            !bob_obj.contains_key("lastSeenAt"),
+            "missing lastSeenAt must not be synthesized as 0"
+        );
+    }
+
+    #[test]
+    fn reserved_field_accessors_refuse_typed_keys_without_mutating_extra() {
+        let mut conv = Conversation::default();
+        conv.set_token("live-token");
+        conv.push_unread(UnreadMessage::from_value(&json!({ "seq": 1 })).unwrap(), 5);
+        for key in [AGENT_TOKEN, UNREAD, IMPRESSIONS, MODEL_SEEN_SEQS] {
+            assert!(conv.try_set_field(key, json!("evil")).is_err());
+            conv.set_field(key, json!("evil"));
+            assert!(conv.field(key).is_none());
+            assert!(conv.remove_field(key).is_none());
+        }
+        assert_eq!(conv.token(), Some("live-token"));
+        assert_eq!(conv.unread_count(), 1);
+
+        let serialized = conv.to_value();
+        assert_eq!(serialized[AGENT_TOKEN], json!("live-token"));
+        assert_eq!(serialized[UNREAD].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_null_and_missing_tokens_normalize_uniformly_to_none() {
+        let missing = Conversation::from_value(&json!({})).unwrap();
+        let null = Conversation::from_value(&json!({ "agentToken": null })).unwrap();
+        let empty = Conversation::from_value(&json!({ "agentToken": "" })).unwrap();
+        let wrong_type = Conversation::from_value(&json!({ "agentToken": 42 })).unwrap();
+
+        for conv in [&missing, &null, &empty, &wrong_type] {
+            assert_eq!(conv.token(), None);
+            assert_eq!(conv.generation(), None);
+            assert!(!conv.matches_token(""));
+            assert!(!conv.matches_token("live-token"));
+        }
+        assert_eq!(empty.to_value()["agentToken"], json!(""));
+        assert_eq!(null.to_value()["agentToken"], json!(null));
     }
 }

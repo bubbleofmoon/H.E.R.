@@ -3135,7 +3135,7 @@ impl Hub {
         let doc = self.state_doc()?;
         let current = doc
             .conversation(key)
-            .and_then(|c| c.raw_token_str().map(str::to_string))
+            .and_then(|c| c.token().map(str::to_string))
             .unwrap_or_default();
         let valid = doc.reset_epoch() == self.reset_stamp && !current.is_empty();
         let published = minted.as_ref().is_some_and(|m| m.as_deref() == Some(current.as_str()));
@@ -3534,7 +3534,7 @@ impl Hub {
             return Ok(());
         }
         let token = crate::conversation_state::Conversation::from_value(conv)
-            .and_then(|c| c.raw_token_str().map(str::to_string))
+            .and_then(|c| c.token().map(str::to_string))
             .unwrap_or_default();
         if self.tokens.get(&key).is_some_and(|old| old != &token) {
             self.invalidate_key(&key, now).await?;
@@ -3633,7 +3633,7 @@ impl Hub {
         if console::runtime_mode(&self.context) == "reserved2" && !doc.paused() {
             for turn in turns.iter().filter(|t| t.reattaching && t.state.is_open()) {
                 let conv = doc.conversation(&turn.key);
-                let token = conv.as_ref().and_then(|c| c.raw_token_str()).unwrap_or("");
+                let token = conv.as_ref().and_then(|c| c.token()).unwrap_or("");
                 if !token.is_empty() && console::inbound_admitted(cfg, &turn.key)
                     && turn.epochs.contains(&crate::send_outbox::token_epoch(token))
                     && crate::session_map::lookup(&self.context, &turn.key)?.as_deref() == Some(turn.session_id.as_str()) {
@@ -3645,7 +3645,7 @@ impl Hub {
             .map(|(key, owned)| (key.clone(), owned.clone())).collect();
         self.recovered = running;
         for (key, (turn_id, token)) in ended {
-            if doc.conversation(&key).and_then(|c| c.raw_token_str().map(str::to_string)).as_deref() == Some(token.as_str())
+            if doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).as_deref() == Some(token.as_str())
                 && turns.iter().any(|t| t.id == turn_id && t.state == crate::turn_ledger::State::Completed) {
                 self.settle_turn_coverage(cfg, &key, &token, &turn_id, now).await?;
             }
@@ -3738,8 +3738,8 @@ impl Hub {
                     // use a fresh session, even when the old DSH cancel route is broken.
                     let guard=if retire_unknown {current} else {m.plan.guard.clone()};
                     let guard_token = crate::conversation_state::Conversation::from_value(&guard)
-                        .and_then(|c| c.raw_token_str().map(str::to_string));
-                    if retire_unknown && guard_token.as_deref() != Some(m.plan.epoch.as_str()) {continue;}
+                        .and_then(|c| c.token().map(str::to_string));
+                    if retire_unknown && guard_token.as_deref().unwrap_or("") != m.plan.epoch.as_str() {continue;}
                     let retired=console::rotate_idle_session(&self.context,&key,&m.plan.sid,&guard);
                     if retired.is_err() || (retire_unknown && !retired.as_ref().is_ok_and(|token|token.is_some())) {
                         if retired.is_err() {crate::session_rotation::failure(&self.context,cfg,&m.plan,"reset");}
@@ -3840,7 +3840,7 @@ impl Hub {
                 else if !console::inbound_admitted(&cfg, &key) { "notAllowed" }
                 else if !doc.has_conversation(key.as_str()) { "missing" }
                 else if self.tokens.get(&key).is_some_and(|old| {
-                    old.as_str() != doc.conversation(&key).and_then(|c| c.raw_token_str().map(str::to_string)).unwrap_or_default()
+                    old.as_str() != doc.conversation(&key).and_then(|c| c.token().map(str::to_string)).unwrap_or_default()
                 }) { "tokenChanged" }
                 else { continue; };
             invalid.push((key, predicate));
@@ -3913,7 +3913,7 @@ impl Hub {
                 .entry(key.clone())
                 .or_insert_with(|| {
                     crate::conversation_state::Conversation::from_value(conv)
-                        .and_then(|c| c.raw_token_str().map(str::to_string))
+                        .and_then(|c| c.token().map(str::to_string))
                         .unwrap_or_default()
                 });
             d.arm_proactive_now(now);
@@ -3944,7 +3944,7 @@ impl Hub {
                 let token = crate::conversation_state::SocialDocument::from_value(state.clone())
                     .ok()
                     .and_then(|doc| doc.conversation(&key))
-                    .and_then(|c| c.raw_token_str().map(str::to_string))
+                    .and_then(|c| c.token().map(str::to_string))
                     .unwrap_or_default();
                 console::consume_reserved2_deadline(&self.context, &key, &token, active.at, &active.previous)?;
             }
@@ -4215,7 +4215,7 @@ impl Hub {
                     let conv_typed = self.state_doc()?.conversation(&key);
                     let token = conv_typed
                         .as_ref()
-                        .and_then(|c| c.raw_token_str())
+                        .and_then(|c| c.token())
                         .unwrap_or("")
                         .to_string();
                     let conv = conv_typed
