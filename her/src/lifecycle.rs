@@ -920,12 +920,18 @@ pub fn same_groups(left: &[String], right: &[String]) -> bool {
     a == b
 }
 
-pub fn verify_live_heartbeat(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveHeartbeatState {
+    Ready,
+    WaitingForGateway,
+}
+
+pub fn check_live_heartbeat(
     backend: &mut dyn LifecycleBackend,
     data: &Path,
     marker: &OwnerMarker,
     expected_groups: &[String],
-) -> Result<(), String> {
+) -> Result<LiveHeartbeatState, String> {
     if !marker
         .groups
         .as_deref()
@@ -942,30 +948,38 @@ pub fn verify_live_heartbeat(
             return Err(format!("live heartbeat is unreadable: {}", error.kind()));
         }
     };
-    let heartbeat: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| "live heartbeat is invalid")?;
-    let pid_matches =
-        heartbeat.get("pid").and_then(serde_json::Value::as_u64) == Some(u64::from(marker.identity.pid));
-    let ts_matches = heartbeat.get("ts").is_some_and(|ts| {
-        ts.as_i64().map_or_else(
-            || {
-                ts.as_f64()
-                    .is_some_and(|value| value.is_finite() && value >= marker.acquired_at as f64)
-            },
-            |value| value >= marker.acquired_at,
-        )
-    });
-    if !pid_matches || !ts_matches {
-        return Err("live heartbeat does not belong to the current owner".into());
-    }
     let now_ms = backend.now_ms();
-    match crate::watchdog::read_heartbeat(Ok(bytes), now_ms) {
+    match crate::watchdog::read_heartbeat_for_owner(Ok(bytes), Some(marker), now_ms) {
         crate::watchdog::Heartbeat::Fresh { live: true, groups }
             if same_groups(&groups, expected_groups) =>
         {
-            Ok(())
+            Ok(LiveHeartbeatState::Ready)
         }
+        crate::watchdog::Heartbeat::WaitingForGateway { live: true, groups }
+            if same_groups(&groups, expected_groups) =>
+        {
+            Ok(LiveHeartbeatState::WaitingForGateway)
+        }
+        crate::watchdog::Heartbeat::Invalid => Err("live heartbeat is invalid".into()),
+        crate::watchdog::Heartbeat::WrongOwner => {
+            Err("live heartbeat does not belong to the current owner".into())
+        }
+        crate::watchdog::Heartbeat::Unknown(reason) => Err(reason),
         _ => Err("live heartbeat is not ready for the configured groups".into()),
+    }
+}
+
+pub fn verify_live_heartbeat(
+    backend: &mut dyn LifecycleBackend,
+    data: &Path,
+    marker: &OwnerMarker,
+    expected_groups: &[String],
+) -> Result<(), String> {
+    match check_live_heartbeat(backend, data, marker, expected_groups)? {
+        LiveHeartbeatState::Ready => Ok(()),
+        LiveHeartbeatState::WaitingForGateway => {
+            Err("live bridge is waiting for the OneBot gateway".into())
+        }
     }
 }
 
@@ -2190,6 +2204,28 @@ mod tests {
         let err = verify_live_heartbeat(&mut fake, unused, &wrong_marker, &expected).unwrap_err();
         assert!(err.contains("does not serve"), "{err}");
 
+        // Waiting-for-gateway heartbeat from the current owner is accepted by check_live_heartbeat
+        // (supervisor startup), while verify_live_heartbeat still waits for Ready.
+        fake.now_ms = 505_000;
+        fake.heartbeat = Some(Ok(
+            serde_json::json!({
+                "ts": 500_000,
+                "pid": 42,
+                "live": true,
+                "groups": ["private:2", "group:1"],
+                "state": "waiting-for-gateway",
+                "gatewayConnected": false
+            })
+            .to_string()
+            .into_bytes(),
+        ));
+        assert_eq!(
+            check_live_heartbeat(&mut fake, unused, &marker, &expected),
+            Ok(LiveHeartbeatState::WaitingForGateway)
+        );
+        let err = verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap_err();
+        assert!(err.contains("waiting for the OneBot gateway"), "{err}");
+
         // Fresh heartbeat matching pid, ts >= acquired_at, and groups (regardless of order)
         fake.now_ms = 589_999;
         fake.heartbeat = Some(Ok(
@@ -2197,6 +2233,10 @@ mod tests {
                 .to_string()
                 .into_bytes(),
         ));
+        assert_eq!(
+            check_live_heartbeat(&mut fake, unused, &marker, &expected),
+            Ok(LiveHeartbeatState::Ready)
+        );
         verify_live_heartbeat(&mut fake, unused, &marker, &expected).unwrap();
     }
 
