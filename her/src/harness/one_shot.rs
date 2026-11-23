@@ -52,6 +52,12 @@ pub(crate) trait OneShot: Send + Sync {
     /// One completion: the `system` text (left out when empty), then the user `input`.
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError>;
 
+    /// One completion returning the classified `model_failure::Failure` (preserving `errorCode`) on miss.
+    fn complete_failure(&self, system: &str, input: &str) -> Result<String, crate::model_failure::Failure> {
+        self.complete(system, input)
+            .map_err(|error| crate::model_failure::Failure::new(error.0, error.0))
+    }
+
     /// One completion that takes no longer than `within` and sends no request once `abandoned` is set (a caller that
     /// stopped waiting sets it). The default answers through `complete`, which ignores both: test fakes only.
     fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &Arc<AtomicBool>) -> Result<String, ModelError> {
@@ -111,13 +117,22 @@ pub(crate) fn walk_for(
     Ok(Arc::new(RouteWalk::new(context, job, key, walk, timeout, max_tokens)?))
 }
 
-/// Maps a `ChainError` from `routes::ChainExecutor` to a one-shot `ModelError`.
-fn model_error(error: ChainError) -> ModelError {
+/// Maps a `ChainError` from `routes::ChainExecutor` to a classified `model_failure::Failure`.
+fn chain_failure(error: ChainError) -> crate::model_failure::Failure {
     match error {
-        ChainError::Cancelled => ModelError("cancelled"),
-        ChainError::Aborted(reason) if reason == "timeout" => ModelError("timeout"),
-        ChainError::Aborted(_) => ModelError("network"),
-        ChainError::Missed { class, .. } => ModelError(class),
+        ChainError::Cancelled => crate::model_failure::Failure::new("cancelled", "cancelled"),
+        ChainError::Aborted(reason) if reason == "timeout" => {
+            crate::model_failure::Failure::new("timeout", "TIMEOUT")
+        }
+        ChainError::Aborted(_) => crate::model_failure::Failure::new("network", "MODEL_CONNECTION_ERROR"),
+        ChainError::Missed { class, summary } => {
+            let parsed = crate::model_failure::Failure::classify("", &summary);
+            if parsed.class == class {
+                parsed
+            } else {
+                crate::model_failure::Failure::new(class, &parsed.code)
+            }
+        }
     }
 }
 
@@ -161,7 +176,13 @@ impl RelayModel {
         })
     }
 
-    fn run_within(&self, system: &str, input: &str, within: Duration, mut cancel: Cancellation) -> Result<String, ModelError> {
+    fn run_within_failure(
+        &self,
+        system: &str,
+        input: &str,
+        within: Duration,
+        mut cancel: Cancellation,
+    ) -> Result<String, crate::model_failure::Failure> {
         let context = self.context.clone();
         let route = self.route.clone();
         let key = self.key.clone();
@@ -202,9 +223,9 @@ impl RelayModel {
                 .next_answer(&mut adapter, &mut cancel)
                 .await
                 .map(|success| success.value)
-                .map_err(model_error)
+                .map_err(chain_failure)
         })
-        .unwrap_or(Err(ModelError("network")))
+        .unwrap_or_else(|_| Err(crate::model_failure::Failure::new("network", "MODEL_CONNECTION_ERROR")))
     }
 }
 
@@ -212,7 +233,11 @@ impl OneShot for RelayModel {
     /// One request with a turn number of its own (`usage::next_number`), bounded by the model's timeout; a 429 is
     /// `quota`.
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
-        self.run_within(system, input, self.timeout, Cancellation::none())
+        self.complete_failure(system, input).map_err(|f| ModelError(f.class))
+    }
+
+    fn complete_failure(&self, system: &str, input: &str) -> Result<String, crate::model_failure::Failure> {
+        self.run_within_failure(system, input, self.timeout, Cancellation::none())
     }
 
     /// One request bounded by the lesser of `within` and the model's timeout, unless `abandoned` is set before it.
@@ -220,38 +245,44 @@ impl OneShot for RelayModel {
         if abandoned.load(Ordering::SeqCst) {
             return Err(ModelError("cancelled"));
         }
-        self.run_within(system, input, within.min(self.timeout), Cancellation::from_flag(abandoned.clone()))
+        self.run_within_failure(system, input, within.min(self.timeout), Cancellation::from_flag(abandoned.clone()))
+            .map_err(|f| ModelError(f.class))
     }
 }
 
-/// Async one-shot route walk over `route` via `routes::ChainExecutor` and `OneShotStep`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_walk_async(
-    context: RuntimeContext,
-    mut route: ModelRoute,
-    chain: bool,
-    key: String,
-    usage_job: &'static str,
-    timeout: Duration,
-    max_tokens: u32,
-    unit: Duration,
-    system: String,
-    input: String,
-    within: Duration,
+/// Request configuration for `run_walk_async`.
+pub(crate) struct WalkRequest {
+    pub context: RuntimeContext,
+    pub route: ModelRoute,
+    pub chain: bool,
+    pub key: String,
+    pub usage_job: &'static str,
+    pub timeout: Duration,
+    pub max_tokens: u32,
+    pub unit: Duration,
+    pub system: String,
+    pub input: String,
+    pub within: Duration,
+}
+
+/// Async one-shot route walk over `request.route` via `routes::ChainExecutor` and `OneShotStep`, returning classified
+/// failures.
+async fn run_walk_failure_async(
+    mut request: WalkRequest,
     cancel: &mut Cancellation,
-) -> Result<String, ModelError> {
+) -> Result<String, crate::model_failure::Failure> {
     if cancel.is_cancelled() {
-        return Err(ModelError("cancelled"));
+        return Err(crate::model_failure::Failure::new("cancelled", "cancelled"));
     }
-    routes::select_start(&context, &mut route, &key, "");
+    routes::select_start(&request.context, &mut request.route, &request.key, "");
     let mut executor = ChainExecutor::new(ChainConfig {
-        context: context.clone(),
-        route,
-        key,
+        context: request.context.clone(),
+        route: request.route,
+        key: request.key,
         generation: String::new(),
-        usage_job,
+        usage_job: request.usage_job,
         track_steps: false,
-        observe_health: chain,
+        observe_health: request.chain,
         use_failover_memory: true,
         record_events: true,
         record_usage: true,
@@ -260,23 +291,33 @@ pub(crate) async fn run_walk_async(
         complete_on_answer: true,
         fail_action: "the request ends",
         deadline_error: "timeout",
-        retry_unit: unit,
+        retry_unit: request.unit,
         max_steps: usize::MAX,
         max_tokens: None,
-        job_max_tokens: max_tokens,
-        deadline: tokio::time::Instant::now() + within.min(timeout),
+        job_max_tokens: request.max_tokens,
+        deadline: tokio::time::Instant::now() + request.within.min(request.timeout),
     });
     let mut adapter = OneShotStep {
-        context,
-        system,
-        input,
-        shortened_by_bound: within < timeout,
+        context: request.context,
+        system: request.system,
+        input: request.input,
+        shortened_by_bound: request.within < request.timeout,
     };
     executor
         .next_answer(&mut adapter, cancel)
         .await
         .map(|success| success.value)
-        .map_err(model_error)
+        .map_err(chain_failure)
+}
+
+/// Async one-shot route walk over `request.route` via `routes::ChainExecutor` and `OneShotStep`.
+pub(crate) async fn run_walk_async(
+    request: WalkRequest,
+    cancel: &mut Cancellation,
+) -> Result<String, ModelError> {
+    run_walk_failure_async(request, cancel)
+        .await
+        .map_err(|f| ModelError(f.class))
 }
 
 /// One-shot requests over routes in order, as a harness turn walks its chain (`routes::ChainExecutor`): a first 429 is
@@ -331,48 +372,46 @@ impl RouteWalk {
         self
     }
 
-    fn run_within(&self, system: &str, input: &str, within: Duration, mut cancel: Cancellation) -> Result<String, ModelError> {
-        let context = self.context.clone();
-        let route = self.route.clone();
-        let chain = self.chain;
-        let key = self.key.clone();
-        let usage_job = self.usage_job;
-        let timeout = self.timeout;
-        let max_tokens = self.max_tokens;
-        let unit = self.unit;
-        let system = system.to_string();
-        let input = input.to_string();
-        routes::block_on_shared(async move {
-            run_walk_async(
-                context,
-                route,
-                chain,
-                key,
-                usage_job,
-                timeout,
-                max_tokens,
-                unit,
-                system,
-                input,
-                within,
-                &mut cancel,
-            )
-            .await
-        })
-        .unwrap_or(Err(ModelError("network")))
+    fn run_within_failure(
+        &self,
+        system: &str,
+        input: &str,
+        within: Duration,
+        mut cancel: Cancellation,
+    ) -> Result<String, crate::model_failure::Failure> {
+        let request = WalkRequest {
+            context: self.context.clone(),
+            route: self.route.clone(),
+            chain: self.chain,
+            key: self.key.clone(),
+            usage_job: self.usage_job,
+            timeout: self.timeout,
+            max_tokens: self.max_tokens,
+            unit: self.unit,
+            system: system.to_string(),
+            input: input.to_string(),
+            within,
+        };
+        routes::block_on_shared(async move { run_walk_failure_async(request, &mut cancel).await })
+            .unwrap_or_else(|_| Err(crate::model_failure::Failure::new("network", "MODEL_CONNECTION_ERROR")))
     }
 }
 
 impl OneShot for RouteWalk {
     fn complete(&self, system: &str, input: &str) -> Result<String, ModelError> {
-        self.run_within(system, input, self.timeout, Cancellation::none())
+        self.complete_failure(system, input).map_err(|f| ModelError(f.class))
+    }
+
+    fn complete_failure(&self, system: &str, input: &str) -> Result<String, crate::model_failure::Failure> {
+        self.run_within_failure(system, input, self.timeout, Cancellation::none())
     }
 
     fn complete_within(&self, system: &str, input: &str, within: Duration, abandoned: &Arc<AtomicBool>) -> Result<String, ModelError> {
         if abandoned.load(Ordering::SeqCst) {
             return Err(ModelError("cancelled"));
         }
-        self.run_within(system, input, within, Cancellation::from_flag(abandoned.clone()))
+        self.run_within_failure(system, input, within, Cancellation::from_flag(abandoned.clone()))
+            .map_err(|f| ModelError(f.class))
     }
 }
 

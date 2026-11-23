@@ -1294,7 +1294,7 @@ fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str,
         model: route.model.as_str(),
         effort: route.effort.as_deref(),
     });
-    let text = crate::harness::one_shot::model_for(
+    let model = crate::harness::one_shot::model_for(
         current.as_ref().unwrap_or(context),
         crate::harness::one_shot::Job::SlangLearner,
         key,
@@ -1302,8 +1302,8 @@ fn route_extract(context: &RuntimeContext, cfg: &Value, key: &str, prompt: &str,
         Duration::from_secs(timeout_s),
         route.as_ref().map_or(crate::harness::routes::DEFAULT_MAX_OUTPUT_TOKENS, |route| route.max_output_tokens),
     )
-    .and_then(|model| model.complete("", prompt))
     .map_err(|error| fail(Failure::new(error.0, error.0)))?;
+    let text = model.complete_failure("", prompt).map_err(fail)?;
     if text.trim().is_empty() {
         return Err(fail(Failure::new("empty-response", "EMPTY_ANSWER")));
     }
@@ -3189,6 +3189,74 @@ if ($prompt -notmatch '<message source_id="([0-9]+)" speaker="selected-sender">'
         let error = ask_model(&context, &allowed, "group:fallback", "prompt", 1).unwrap_err();
         assert!(error.contains("missing-learner") && error.contains("harness:"), "both routes are reported: {error}");
         assert!(listener.accept().is_ok(), "the allowed fallback asked the model route");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_shot_learner_preserves_refusal_error_code_on_relay_failure() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let (root, context) = runtime_fixture("learner-refusal-code");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "the request ended early");
+                bytes.extend_from_slice(&chunk[..n]);
+                let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let body = json!({
+                "id": "fixture",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "route-model",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "I cannot assist with that."}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        std::fs::write(
+            root.join("dependencies.json"),
+            json!({"dsh":"http://127.0.0.1:1","model":format!("http://127.0.0.1:{port}"),"onebot":"http://127.0.0.1:2"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(root.join("config/harness-api-key"), "learner-refusal-key").unwrap();
+        let cfg = json!({"consoleToken":"fixture-token","slang":{"enabled":true,"extractMinMessages":1},"harness":{"model":"route-model"}});
+        std::fs::write(root.join("config/config.json"), cfg.to_string()).unwrap();
+        let context = RuntimeContext::from_root(&root).unwrap_or(context);
+        let state = Mutex::new(WindowState::default());
+        fed_batch(&context, &state);
+        let result = extract_once_with_runtime(&context, &state, &cfg, "group:retry", None, None);
+        handle.join().unwrap();
+        assert_eq!(result["ok"], false, "{result}");
+        let log_text = std::fs::read_to_string(root.join("data/logs/model-refusals.jsonl")).unwrap();
+        let rows: Vec<Value> = log_text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["errorClass"], "refusal");
+        assert_eq!(rows[0]["errorCode"], "MODEL_REFUSAL");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

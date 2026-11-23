@@ -37,17 +37,19 @@ pub(crate) async fn summarise_async(
     let route = crate::harness::ModelRoute::for_specs(context, walk.routes.clone(), walk.routes)
         .map_err(|_| ModelError("unconfigured"))?;
     one_shot::run_walk_async(
-        context.clone(),
-        route,
-        walk.chain,
-        usage::DIGEST_KEY.to_string(),
-        usage::DIGEST,
-        timeout(cfg),
-        MAX_TOKENS,
-        Duration::from_secs(1),
-        system.to_string(),
-        input.to_string(),
-        within,
+        one_shot::WalkRequest {
+            context: context.clone(),
+            route,
+            chain: walk.chain,
+            key: usage::DIGEST_KEY.to_string(),
+            usage_job: usage::DIGEST,
+            timeout: timeout(cfg),
+            max_tokens: MAX_TOKENS,
+            unit: Duration::from_secs(1),
+            system: system.to_string(),
+            input: input.to_string(),
+            within,
+        },
         cancel,
     )
     .await

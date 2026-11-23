@@ -765,6 +765,35 @@ struct TurnStepOutput {
     calls: Vec<ToolCall>,
 }
 
+fn missed_step(
+    class: &'static str,
+    summary: String,
+    kept: &[ChatMessage],
+    response_usage: Option<Option<Usage>>,
+    tokens_charged: u32,
+    request_bytes: usize,
+) -> routes::StepResult<TurnStepOutput> {
+    let miss = if class == "empty-response" {
+        routes::Miss::Empty
+    } else {
+        routes::Miss::Failed { class }
+    };
+    let message_refs = if class == "refusal" {
+        model_request_refs(kept)
+    } else {
+        Vec::new()
+    };
+    routes::StepResult::Missed {
+        miss,
+        summary,
+        response_usage,
+        tokens_charged,
+        request_bytes,
+        message_refs,
+        observe_health: true,
+    }
+}
+
 /// Streaming turn adapter for `routes::ChainExecutor`.
 struct TurnStep<'turn> {
     context: &'turn RuntimeContext,
@@ -893,25 +922,7 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
                         }
                     };
                     let class = crate::model_failure::Failure::classify("", &reason).class;
-                    let miss = if class == "empty-response" {
-                        routes::Miss::Empty
-                    } else {
-                        routes::Miss::Failed { class }
-                    };
-                    let message_refs = if class == "refusal" {
-                        model_request_refs(&kept)
-                    } else {
-                        Vec::new()
-                    };
-                    return routes::StepResult::Missed {
-                        miss,
-                        summary: reason,
-                        response_usage,
-                        tokens_charged,
-                        request_bytes,
-                        message_refs,
-                        observe_health: true,
-                    };
+                    return missed_step(class, reason, &kept, response_usage, tokens_charged, request_bytes);
                 }
                 Err(ModelFailure::Dropped(reason)) => {
                     return routes::StepResult::Missed {
@@ -937,25 +948,7 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
                 }
                 Err(ModelFailure::Terminal(reason)) => {
                     let class = crate::model_failure::Failure::classify("", &reason).class;
-                    let miss = if class == "empty-response" {
-                        routes::Miss::Empty
-                    } else {
-                        routes::Miss::Failed { class }
-                    };
-                    let message_refs = if class == "refusal" {
-                        model_request_refs(&kept)
-                    } else {
-                        Vec::new()
-                    };
-                    return routes::StepResult::Missed {
-                        miss,
-                        summary: reason,
-                        response_usage: None,
-                        tokens_charged: 0,
-                        request_bytes,
-                        message_refs,
-                        observe_health: true,
-                    };
+                    return missed_step(class, reason, &kept, None, 0, request_bytes);
                 }
             };
             let response_usage = Some(end.captured_usage.clone());
@@ -1002,25 +995,14 @@ impl<'turn> routes::RouteStep for TurnStep<'turn> {
             let text = content.joined_texts().unwrap_or_default();
             if calls.is_empty() {
                 if let Some(failure) = crate::backend::plain_output_failure(&text) {
-                    let miss = if failure.class == "empty-response" {
-                        routes::Miss::Empty
-                    } else {
-                        routes::Miss::Failed { class: failure.class }
-                    };
-                    let message_refs = if failure.class == "refusal" {
-                        model_request_refs(&kept)
-                    } else {
-                        Vec::new()
-                    };
-                    return routes::StepResult::Missed {
-                        miss,
-                        summary: failure.summary(),
+                    return missed_step(
+                        failure.class,
+                        failure.summary(),
+                        &kept,
                         response_usage,
                         tokens_charged,
                         request_bytes,
-                        message_refs,
-                        observe_health: true,
-                    };
+                    );
                 }
             }
             let message =

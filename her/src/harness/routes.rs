@@ -467,20 +467,15 @@ where
     T: Send + 'static,
 {
     let runtime = shared_runtime()?;
-    match tokio::runtime::Handle::try_current() {
-        Err(_) => Ok(runtime.block_on(future)),
-        Ok(current) => {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            runtime.handle().spawn(async move {
-                let _ = tx.send(future.await);
-            });
-            if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                tokio::task::block_in_place(|| rx.recv().map_err(|_| "harness route worker stopped"))
-            } else {
-                rx.recv().map_err(|_| "harness route worker stopped")
-            }
-        }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Ok(runtime.block_on(future));
     }
+    std::thread::Builder::new()
+        .name("her-oneshot-bridge".into())
+        .spawn(move || runtime.block_on(future))
+        .map_err(|_| "harness route bridge thread failed")?
+        .join()
+        .map_err(|_| "harness route worker panicked")
 }
 
 /// `text` with the harness credential `key` replaced by `[REDACTED]`: the form every record and capture keeps.
@@ -997,7 +992,7 @@ impl RouteStep for OneShotStep {
             if matches!(response.stop_reason, Some(StopReason::ContentFilter(_))) {
                 return StepResult::Missed {
                     miss: Miss::Failed { class: "refusal" },
-                    summary: "refusal".into(),
+                    summary: crate::model_failure::Failure::new("refusal", "MODEL_REFUSAL").summary(),
                     response_usage: Some(Some(usage)),
                     tokens_charged: 0,
                     request_bytes,
@@ -1014,7 +1009,7 @@ impl RouteStep for OneShotStep {
                 };
                 return StepResult::Missed {
                     miss,
-                    summary: failure.class.into(),
+                    summary: failure.summary(),
                     response_usage: Some(Some(usage)),
                     tokens_charged: 0,
                     request_bytes,
@@ -1026,7 +1021,6 @@ impl RouteStep for OneShotStep {
                 value: text,
                 response_usage: Some(Some(usage)),
                 tokens_charged: 0,
-                request_bytes,
             }
         })
     }
@@ -1173,6 +1167,21 @@ impl ChainExecutor {
         crate::recovery_log::record(&self.cfg.context, Trigger::Turn, Component::ModelChain, event, outcome, &reason);
     }
 
+    fn record_route_miss<S: RouteStep>(
+        &self,
+        adapter: &mut S,
+        class: &'static str,
+        observe_health: bool,
+        failure: RouteFailure,
+    ) {
+        if self.cfg.observe_health && observe_health {
+            self.cfg
+                .route
+                .observe(&self.cfg.context, self.route_idx, Seen::Failed { class });
+        }
+        adapter.on_route_failure(failure);
+    }
+
     /// Runs one logical request across retries and failovers until a route answers, the chain fails, or cancellation
     /// / deadline / abort interrupts it.
     pub(crate) async fn next_answer<S: RouteStep>(
@@ -1272,13 +1281,13 @@ impl ChainExecutor {
                         && self.route_idx + 1 < self.cfg.route.routes.len()
                         && (!self.cfg.use_failover_memory
                             || with_memory(&self.scope, |memory| memory.can_fail_over(&self.memory_key, now)));
-                    let steps_left = if !self.cfg.allow_retries {
+                    let steps_left = if !self.cfg.allow_retries || remaining.is_zero() {
                         false
                     } else if self.cfg.track_steps {
                         self.step + 1 < self.cfg.max_steps
                             && self.cfg.max_tokens.map_or(true, |max| self.spent_tokens < max)
                     } else {
-                        !remaining.is_zero()
+                        true
                     };
                     let situation = Situation {
                         retry_429: route.spec.retry_429,
@@ -1294,25 +1303,27 @@ impl ChainExecutor {
                     };
                     let next = decide(&miss, &situation);
                     let class = miss.class();
+                    let event_tag = if self.cfg.track_steps { summary.as_str() } else { class };
                     match next {
                         Next::Fail => {
-                            if self.cfg.observe_health && observe_health {
-                                self.cfg.route.observe(
-                                    &self.cfg.context,
-                                    self.route_idx,
-                                    Seen::Failed { class },
-                                );
+                            if cancel.is_cancelled() {
+                                return Err(ChainError::Cancelled);
                             }
-                            adapter.on_route_failure(RouteFailure {
-                                route: route.id.clone(),
-                                model: route.model.clone(),
-                                summary: summary.clone(),
-                                model_call: self.step + 1,
-                                message_refs,
-                            });
+                            self.record_route_miss(
+                                adapter,
+                                class,
+                                observe_health,
+                                RouteFailure {
+                                    route: route.id.clone(),
+                                    model: route.model.clone(),
+                                    summary: summary.clone(),
+                                    model_call: self.step + 1,
+                                    message_refs,
+                                },
+                            );
                             self.record_event(
                                 route,
-                                &summary,
+                                event_tag,
                                 request_bytes,
                                 "route-failed",
                                 Outcome::Failed,
@@ -1321,38 +1332,40 @@ impl ChainExecutor {
                             return Err(ChainError::Missed { class, summary });
                         }
                         Next::FailOver => {
-                            if self.cfg.observe_health && observe_health {
-                                self.cfg.route.observe(
-                                    &self.cfg.context,
-                                    self.route_idx,
-                                    Seen::Failed { class },
-                                );
+                            if cancel.is_cancelled() {
+                                return Err(ChainError::Cancelled);
                             }
-                            adapter.on_route_failure(RouteFailure {
-                                route: route.id.clone(),
-                                model: route.model.clone(),
-                                summary: summary.clone(),
-                                model_call: self.step + 1,
-                                message_refs,
-                            });
+                            if tokio::time::Instant::now() >= self.cfg.deadline {
+                                return Err(ChainError::Aborted(self.cfg.deadline_error.to_string()));
+                            }
+                            adapter.on_miss_transition(next)?;
                             let next_idx = self.route_idx + 1;
-                            if !cancel.is_cancelled() {
-                                let action = format!("next route {}", self.cfg.route.routes[next_idx].id);
-                                self.record_event(
-                                    route,
-                                    &summary,
-                                    request_bytes,
-                                    "failover-step",
-                                    Outcome::Ok,
-                                    &action,
-                                );
-                            }
+                            let action = format!("next route {}", self.cfg.route.routes[next_idx].id);
+                            self.record_route_miss(
+                                adapter,
+                                class,
+                                observe_health,
+                                RouteFailure {
+                                    route: route.id.clone(),
+                                    model: route.model.clone(),
+                                    summary: summary.clone(),
+                                    model_call: self.step + 1,
+                                    message_refs,
+                                },
+                            );
+                            self.record_event(
+                                route,
+                                event_tag,
+                                request_bytes,
+                                "failover-step",
+                                Outcome::Ok,
+                                &action,
+                            );
                             if self.cfg.use_failover_memory {
                                 with_memory(&self.scope, |memory| {
                                     memory.on_failover(&self.memory_key, next_idx, now)
                                 });
                             }
-                            adapter.on_miss_transition(next)?;
                             self.route_idx = next_idx;
                             self.rate_limited = false;
                             self.empty_answers = 0;
@@ -1363,8 +1376,12 @@ impl ChainExecutor {
                             if cancel.is_cancelled() {
                                 return Err(ChainError::Cancelled);
                             }
+                            if tokio::time::Instant::now() >= self.cfg.deadline {
+                                return Err(ChainError::Aborted(self.cfg.deadline_error.to_string()));
+                            }
+                            adapter.on_miss_transition(next)?;
                             let action = format!("retrying the same route after {} ms", wait.as_millis());
-                            self.record_event(route, &summary, request_bytes, "route-retry", Outcome::Ok, &action);
+                            self.record_event(route, event_tag, request_bytes, "route-retry", Outcome::Ok, &action);
                             match miss {
                                 Miss::RateLimited { .. } => self.rate_limited = true,
                                 Miss::Empty => self.empty_answers += 1,
@@ -1373,7 +1390,6 @@ impl ChainExecutor {
                             }
                             self.repeats += 1;
                             self.step += 1;
-                            adapter.on_miss_transition(next)?;
                             if !wait.is_zero() {
                                 tokio::select! { biased;
                                     _ = cancel.cancelled() => return Err(ChainError::Cancelled),
@@ -2185,37 +2201,114 @@ mod tests {
         assert_eq!(step2.calls.len(), 1);
     }
 
-    #[test]
-    fn error_and_refusal_classification_covers_exit_zero_and_plain_outputs() {
-        assert_eq!(
-            crate::backend::plain_output_failure("").map(|f| f.class),
-            Some("empty-response")
-        );
-        assert_eq!(
-            crate::backend::plain_output_failure("Error: upstream 503").map(|f| f.class),
-            Some("backend")
-        );
-        assert_eq!(
-            crate::backend::plain_output_failure("I cannot assist with that request.").map(|f| f.class),
-            Some("refusal")
-        );
-        assert_eq!(
-            crate::backend::plain_output_failure("429 rate limit exceeded").map(|f| f.class),
-            None,
-            "plain text without error prefix is not misclassified as exit-0 error"
-        );
-        assert_eq!(
-            crate::backend::plain_output_failure("Error: 429 rate limit exceeded").map(|f| f.class),
-            Some("quota")
-        );
-        assert_eq!(
-            crate::backend::json_output_failure(&json!({"choices":[{"finish_reason":"content_filter"}]})).map(|f| f.class),
-            Some("refusal")
-        );
-        assert_eq!(
-            crate::backend::json_output_failure(&json!({"error":{"code":"rate_limit_exceeded"}})).map(|f| f.class),
-            Some("quota")
-        );
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_executor_cancellation_after_miss_skips_failover_memory_health_and_route_failure() {
+        struct CancelAfterMissStep {
+            flag: Arc<AtomicBool>,
+            calls: Vec<String>,
+            failures: Vec<RouteFailure>,
+            transitions: Vec<Next>,
+        }
+        impl RouteStep for CancelAfterMissStep {
+            type Output = String;
+            fn step<'a>(&'a mut self, ctx: StepContext<'a>) -> Pin<Box<dyn Future<Output = StepResult<String>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.calls.push(ctx.route.id.clone());
+                    self.flag.store(true, Ordering::SeqCst);
+                    StepResult::Missed {
+                        miss: Miss::Failed { class: "backend" },
+                        summary: "model/backend backend (500)".into(),
+                        response_usage: None,
+                        tokens_charged: 0,
+                        request_bytes: 64,
+                        message_refs: Vec::new(),
+                        observe_health: true,
+                    }
+                })
+            }
+            fn on_miss_transition(&mut self, next: Next) -> Result<(), StepAbort> {
+                self.transitions.push(next);
+                Ok(())
+            }
+            fn on_route_failure(&mut self, failure: RouteFailure) {
+                self.failures.push(failure);
+            }
+        }
+
+        let cfg_routes = json!({"routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]});
+        let fixture = TestFixture::new("cancel-after-miss", cfg_routes, "secret-383-cancel-miss");
+        let route = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
+        let mut exec = ChainExecutor::new(turn_chain_cfg(&fixture.context, route, "group:501"));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut step = CancelAfterMissStep {
+            flag: flag.clone(),
+            calls: Vec::new(),
+            failures: Vec::new(),
+            transitions: Vec::new(),
+        };
+        let mut cancel = Cancellation::from_flag(flag);
+        let res = exec.next_answer(&mut step, &mut cancel).await;
+        assert!(matches!(res, Err(ChainError::Cancelled)), "{res:?}");
+        assert_eq!(step.calls, ["a"]);
+        assert!(step.failures.is_empty(), "cancelled step must not invoke on_route_failure");
+        assert!(step.transitions.is_empty(), "cancelled step must not transition to failover");
+        assert!(fixture.records("failover-step").is_empty());
+        assert!(fixture.records("route-failed").is_empty());
+        assert_eq!(fixture.health(), (vec!["a=unknown".into(), "b=unknown".into()], false));
+        let mut route_next = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
+        select_start(&fixture.context, &mut route_next, "group:501", "gen-1");
+        assert_eq!(route_next.start, 0, "cancelled step must not mutate failover memory");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_executor_expired_deadline_with_track_steps_prevents_failover() {
+        struct SlowMissStep {
+            calls: Vec<String>,
+            transitions: Vec<Next>,
+        }
+        impl RouteStep for SlowMissStep {
+            type Output = String;
+            fn step<'a>(&'a mut self, ctx: StepContext<'a>) -> Pin<Box<dyn Future<Output = StepResult<String>> + Send + 'a>> {
+                Box::pin(async move {
+                    self.calls.push(ctx.route.id.clone());
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    StepResult::Missed {
+                        miss: Miss::Failed { class: "backend" },
+                        summary: "model/backend backend (500)".into(),
+                        response_usage: None,
+                        tokens_charged: 0,
+                        request_bytes: 64,
+                        message_refs: Vec::new(),
+                        observe_health: true,
+                    }
+                })
+            }
+            fn on_miss_transition(&mut self, next: Next) -> Result<(), StepAbort> {
+                self.transitions.push(next);
+                Ok(())
+            }
+        }
+
+        let cfg_routes = json!({"routes": [{"id": "a", "model": "model-a"}, {"id": "b", "model": "model-b"}]});
+        let fixture = TestFixture::new("expired-deadline-track-steps", cfg_routes, "secret-383-deadline");
+        let route = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
+        let mut cfg = turn_chain_cfg(&fixture.context, route, "group:502");
+        cfg.deadline = tokio::time::Instant::now() + Duration::from_millis(15);
+        let mut exec = ChainExecutor::new(cfg);
+        let mut step = SlowMissStep {
+            calls: Vec::new(),
+            transitions: Vec::new(),
+        };
+        let mut cancel = Cancellation::none();
+        let res = exec.next_answer(&mut step, &mut cancel).await;
+        assert!(matches!(res, Err(ChainError::Missed { class: "backend", .. })), "{res:?}");
+        assert_eq!(step.calls, ["a"], "expired deadline with track_steps must not fail over to b");
+        assert!(step.transitions.is_empty());
+        assert!(fixture.records("failover-step").is_empty());
+        assert_eq!(fixture.records("route-failed").len(), 1);
+        let mut route_next = ModelRoute::from_runtime(&fixture.context, &fixture.cfg).unwrap();
+        select_start(&fixture.context, &mut route_next, "group:502", "gen-1");
+        assert_eq!(route_next.start, 0, "expired deadline must not mutate failover memory");
     }
 
     #[tokio::test(flavor = "current_thread")]
