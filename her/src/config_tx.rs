@@ -1413,7 +1413,7 @@ pub(crate) fn redact_setting(path: &str, value: Value) -> Value {
     }
 }
 
-fn is_setting_writable(path: &str) -> bool {
+pub(crate) fn is_setting_writable(path: &str) -> bool {
     let p = path.trim();
     if p.is_empty() {
         return false;

@@ -66,7 +66,8 @@ fn acquire_social_state_gate(
 use crate::config_tx::redact_setting;
 #[cfg(test)]
 use crate::config_tx::{
-    setting_is_secret, SETTINGS_MIRROR_UNFINISHED, SETTINGS_READ_REFUSED, SETTINGS_WRITABLE,
+    is_setting_writable, setting_is_secret, SETTINGS_MIRROR_UNFINISHED, SETTINGS_READ_REFUSED,
+    SETTINGS_WRITABLE,
 };
 #[cfg(test)]
 use crate::conversation_state::{
